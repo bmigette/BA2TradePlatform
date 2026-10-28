@@ -174,8 +174,9 @@ def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, T
     return max(firsts), last, tuple(stamps)
 
 
-def get_intraday(panel: "G.Panel", st: "G.GridSettings") -> IntradayPanel:
-    """Per-process LRU of the intraday panel of the cell's symbols (keyed by the file stamps and the span)."""
+def get_intraday(panel: "G.Panel", st: "G.GridSettings", timer: Optional[Dict[str, float]] = None) -> IntradayPanel:
+    """Per-process LRU of the intraday panel of the cell's symbols (keyed by the file stamps and the span). A build (a
+    cache miss) adds its seconds to ``timer["build"]`` when a ``timer`` is given."""
     first, last, stamps = intraday_span(panel, st)
     key = (str(panel.cache_root), tuple(panel.symbols), first, last, stamps)
     if key in _INTRADAY:
@@ -185,6 +186,8 @@ def get_intraday(panel: "G.Panel", st: "G.GridSettings") -> IntradayPanel:
     spec = MP.PanelSpec(INTRADAY_TIMEFRAME, first, last, tuple(panel.symbols), INTRADAY_GROUPS)
     df, meta = MP.build_panel(spec, Path(panel.cache_root))
     ip = IntradayPanel(df, list(meta["features"]), first, last, time.perf_counter() - t0)
+    if timer is not None:
+        timer["build"] = ip.seconds
     _INTRADAY[key] = ip
     while len(_INTRADAY) > INTRADAY_CACHE_SIZE:
         _INTRADAY.popitem(last=False)
@@ -281,7 +284,6 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
         raise RuntimeError("device='auto' but CUDA is not available in this GPU worker: refusing to fall back to the "
                            "CPU silently (set params.device to 'cpu' to run a deep cell on the CPU on purpose)")
     adapter = M.make_adapter(base, n_jobs, params)
-    t0 = time.perf_counter()
     try:
         if base == "tsai":
             rows, scores, extra = _tsai_block(cell, seed, panel, br, st, adapter)
@@ -291,7 +293,7 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
         _release_quietly(adapter)
         gc.collect()
     info = adapter.fit_info if adapter.fit_info is not None else {}
-    audit = {**G.block_audit(br, block, window), **extra, "fit_seconds": time.perf_counter() - t0,
+    audit = {**G.block_audit(br, block, window), **extra,
              "device": info["device"] if "device" in info else None,
              "epochs_run": info["epochs_run"] if "epochs_run" in info else None,
              "best_epoch": info["best_epoch"] if "best_epoch" in info else None,
@@ -300,7 +302,9 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
 
 
 def _tsai_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    ip = get_intraday(panel, st)
+    t0 = time.perf_counter()
+    timer: Dict[str, float] = {"build": 0.0}
+    ip = get_intraday(panel, st, timer)
     L = st.seq_lookback
     eod, dof = ip.eod_rows(panel), ip.daily_of(panel)
     is_fit = np.zeros(len(panel.index), dtype=bool)
@@ -325,9 +329,13 @@ def _tsai_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndar
     if not mp.any():
         raise G.SkipBlock("no end-of-day bar to score in the block")
     Xt, Xv, Xp = data.take(rows_t[mt]), data.take(rows_v[mv]), data.take(rows_p[mp])
+    t1 = time.perf_counter()
     adapter.fit(Xt, y_t[mt], Xv, y_v[mv], br.ks.task, int(seed))
     scores = adapter.score(Xp)
-    extra = {"n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)),
+    t2 = time.perf_counter()
+    extra = {"prep_seconds": t1 - t0 - timer["build"], "intraday_build_seconds": timer["build"],
+             "fit_seconds": t2 - t1,
+             "n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)),
              "n_fit_sessions": int(is_fit.sum()), "n_channels": int(data.n_channels), "lookback": L,
              "samples_per_session": st.seq_samples_per_session, "intraday_first": str(ip.first_day),
              "intraday_last": str(ip.last_day)}
@@ -335,6 +343,7 @@ def _tsai_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndar
 
 
 def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    t0 = time.perf_counter()
     H, L = cell.horizon, st.darts_lookback
     cols = panel.group_columns(cell.groups)
     neutral = cell.kind == "rel_return"
@@ -346,9 +355,12 @@ def _darts_block(cell, seed, panel, br, st, adapter) -> Tuple[np.ndarray, np.nda
         raise G.SkipBlock("no scorable daily window in the block")
     fit_rows, val_rows = br.fit_idx[mt], br.val_idx[mv]
     Xt, Xv, Xp = data.take(fit_rows), data.take(val_rows), data.take(br.pr[mp])
+    t1 = time.perf_counter()
     adapter.fit(Xt, br.y_all[fit_rows], Xv, br.y_all[val_rows], "quantile", int(seed))
     scores = adapter.score(Xp)
-    extra = {"n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)), "n_channels": int(data.n_channels),
+    t2 = time.perf_counter()
+    extra = {"prep_seconds": t1 - t0, "intraday_build_seconds": 0.0, "fit_seconds": t2 - t1,
+             "n_fit": int(len(Xt)), "n_val": int(len(Xv)), "n_samples": int(len(Xt)), "n_channels": int(data.n_channels),
              "lookback": L, "horizon_steps": H, "n_series": int(len(np.unique(Xt.series_start[Xt.rows]))),
              "target_series": "market_neutral" if neutral else "own_return"}
     return br.pr[mp], scores, extra

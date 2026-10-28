@@ -9208,7 +9208,8 @@ def _cmd_ml_grid(args) -> int:
     payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
                "settings": _ml_grid_eval_settings(args), "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
-               "rerun_mismatched": args.rerun_mismatched}
+               "rerun_mismatched": args.rerun_mismatched,
+               "retry_timeouts": args.retry_timeouts}
     try:
         res = handle_ml_grid("cli-ml-grid", payload)
     except KeyboardInterrupt:
@@ -10169,6 +10170,8 @@ def main(argv: "list | None" = None) -> int:
                     help="First day of the out-of-sample evaluation (default 2019-01-01); after the data start, before --eval-end.")
     mg.add_argument("--eval-end", default=None, metavar="YYYY-MM-DD",
                     help="Last day of the evaluation (default and latest 2026-10-12).")
+    mg.add_argument("--retry-timeouts", action="store_true",
+                    help="Run again the (cell, seed) tasks that timed out in an earlier run (default: skip them).")
     mg.add_argument("--cores", type=int, default=None, help="Logical cores to share: n_jobs per fit = cores // cpu-slots (default: all).")
 
     # ml-features: the point-in-time daily feature store of the ML exploration v2.

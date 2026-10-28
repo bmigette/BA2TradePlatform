@@ -827,3 +827,192 @@ def test_an_explicit_cpu_device_still_runs_on_the_cpu(world, tmp_path):
     out = tmp_path / "o"
     grun([tsai_cell(world)], out, world)
     assert all(b["device"] == "cpu" for b in G.read_results(out / "results.jsonl")[0]["blocks"])
+
+
+# ---- 4 / 5. the time budget
+import time as _real_time
+
+
+class FakeClock:
+    """``time`` look-alike for ml_grid / ml_grid_seq: perf_counter = the real one + an offset the tests advance."""
+
+    def __init__(self):
+        self.offset = 0.0
+
+    def perf_counter(self):
+        return _real_time.perf_counter() + self.offset
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = FakeClock()
+    monkeypatch.setattr(G, "time", c)
+    monkeypatch.setattr(S, "time", c)
+    return c
+
+
+def _slow_blocks(monkeypatch, clock, costs):
+    """Make every fitted block "take" ``costs[k]`` seconds of the fake clock."""
+    real = G.fit_block
+    n = {"k": 0}
+
+    def wrapped(*a, **k):
+        res = real(*a, **k)
+        clock.offset += costs[min(n["k"], len(costs) - 1)]
+        n["k"] += 1
+        return res
+    monkeypatch.setattr(G, "fit_block", wrapped)
+
+
+def _run_one(world, tmp_path, minutes, **cfg):
+    out = tmp_path / "o"
+    res = grun([tsai_cell(world, **cfg)], out, world, settings=_gsettings(gpu_budget_minutes=minutes))
+    return res, out
+
+
+def test_a_row_that_finished_over_budget_is_kept_and_marked(world, tmp_path, monkeypatch, clock):
+    _slow_blocks(monkeypatch, clock, [40.0, 25.0])                    # 65 s of a 60 s budget, the last block ends it
+    res, out = _run_one(world, tmp_path, 1.0)
+    assert res["done"] == 1 and res["errors"] == 0
+    row = G.read_results(out / "results.jsonl")[0]
+    assert row["status"] == "ok" and row["over_budget"] is True
+
+
+def test_a_row_inside_the_budget_is_not_marked(world, tmp_path, monkeypatch, clock):
+    _slow_blocks(monkeypatch, clock, [10.0, 10.0])
+    res, out = _run_one(world, tmp_path, 1.0)
+    assert G.read_results(out / "results.jsonl")[0]["over_budget"] is False
+
+
+def test_the_projection_aborts_the_task_when_the_blocks_will_not_fit_1_5_times_the_budget(world, tmp_path, monkeypatch,
+                                                                                         clock):
+    _slow_blocks(monkeypatch, clock, [50.0, 1.0])       # 50 s for 1 of 2 blocks: 100 s projected > 1.5 x 60 s = 90 s
+    res, out = _run_one(world, tmp_path, 1.0)
+    assert res["done"] == 0 and res["errors"] == 1
+    err = G.read_results(out / "errors.jsonl")[0]
+    assert "time budget" in err["error"] and "projected" in err["error"] and err["timeout"] is True
+
+
+def test_a_projection_under_1_5_times_the_budget_lets_the_task_finish(world, tmp_path, monkeypatch, clock):
+    _slow_blocks(monkeypatch, clock, [40.0, 1.0])       # 40 s for 1 of 2 blocks: 80 s projected <= 90 s, 41 s in total
+    res, out = _run_one(world, tmp_path, 1.0)
+    assert res["done"] == 1 and G.read_results(out / "results.jsonl")[0]["over_budget"] is False
+
+
+def test_the_overrun_before_a_block_starts_is_a_timeout_error(world, tmp_path, monkeypatch, clock):
+    _slow_blocks(monkeypatch, clock, [70.0, 1.0])       # already over the budget when block 2 would start
+    res, out = _run_one(world, tmp_path, 1.0)
+    err = G.read_results(out / "errors.jsonl")[0]
+    assert res["errors"] == 1 and err["timeout"] is True and "after 1 of 2 blocks" in err["error"]
+
+
+def test_building_the_intraday_panel_does_not_count_against_the_budget(world, tmp_path, monkeypatch, clock):
+    S._INTRADAY.clear()
+    real_build = S.MP.build_panel
+
+    def slow_build(*a, **k):
+        clock.offset += 1000.0                                        # the panel build "takes" 1000 s
+        return real_build(*a, **k)
+    monkeypatch.setattr(S.MP, "build_panel", slow_build)
+    res, out = _run_one(world, tmp_path, 1.0)
+    assert res["done"] == 1 and res["errors"] == 0
+    row = G.read_results(out / "results.jsonl")[0]
+    assert row["over_budget"] is False
+    assert row["blocks"][0]["intraday_build_seconds"] >= 1000.0 and row["blocks"][1]["intraday_build_seconds"] == 0.0
+    assert row["timings"]["intraday_build"] >= 1000.0
+
+
+def test_block_timings_separate_the_build_the_preparation_and_the_fit(world, tmp_path):
+    S._INTRADAY.clear()
+    out = tmp_path / "o"
+    grun([tsai_cell(world)], out, world)
+    row = G.read_results(out / "results.jsonl")[0]
+    first, second = row["blocks"]
+    for b in (first, second):
+        assert b["fit_seconds"] > 0 and b["prep_seconds"] > 0 and b["intraday_build_seconds"] >= 0
+    assert first["intraday_build_seconds"] > 0 and second["intraday_build_seconds"] == 0     # built once, then cached
+    assert row["timings"]["intraday_build"] == pytest.approx(first["intraday_build_seconds"])
+    assert row["timings"]["block_fit"] == pytest.approx(first["fit_seconds"] + second["fit_seconds"])
+    assert row["timings"]["block_prep"] == pytest.approx(first["prep_seconds"] + second["prep_seconds"])
+
+
+def test_a_tabular_row_has_no_budget_fields(world, tmp_path):
+    out = tmp_path / "o"
+    grun([lgbm_cell(world)], out, world)
+    row = G.read_results(out / "results.jsonl")[0]
+    assert "over_budget" not in row and "block_fit" not in row["timings"]
+
+
+# ---- 5. timeouts are not retried by a restart; the master's hard deadline
+def timeout_task(cfg, seed, key):
+    if cfg["family"].startswith("tsai"):
+        return {**G._error_record(key, seed, "BudgetExceeded: time budget of 1 minutes exceeded", "l"), "timeout": True}
+    return G._run_task(cfg, seed, key)
+
+
+def test_a_restart_skips_timed_out_tasks_unless_asked_to_retry_them(world, tmp_path):
+    out = tmp_path / "o"
+    cells = [lgbm_cell(world), tsai_cell(world)]
+    first = grun(cells, out, world, task_fn=timeout_task)
+    assert first["done"] == 1 and first["errors"] == 1
+    again = grun(cells, out, world, task_fn=timeout_task)
+    assert again["tasks"] == 0 and again["skipped_timeouts"] == 1 and again["errors"] == 0
+    retry = grun(cells, out, world, task_fn=timeout_task, retry_timeouts=True)
+    assert retry["tasks"] == 1 and retry["errors"] == 1 and "skipped_timeouts" not in retry
+    ok = grun(cells, out, world, retry_timeouts=True)                          # the real task this time
+    assert ok["done"] == 1 and len(G.read_results(out / "results.jsonl")) == 2
+    assert grun(cells, out, world)["tasks"] == 0                              # finished: nothing to skip or retry
+
+
+def test_an_ordinary_error_is_still_retried_by_a_restart(world, tmp_path):
+    out = tmp_path / "o"
+
+    def fail(cfg, seed, key):
+        return G._error_record(key, seed, "ValueError: x", "l")
+    # (module-level not needed: inline runs in this process)
+    first = grun([tsai_cell(world)], out, world, task_fn=fail)
+    assert first["errors"] == 1
+    assert grun([tsai_cell(world)], out, world, task_fn=fail)["tasks"] == 1
+
+
+def test_the_retry_timeouts_flag_reaches_the_cli_the_route_and_the_payload(monkeypatch, tmp_path):
+    import types
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    from app.api.ml_search import MlGridRequest
+    assert MlGridRequest.model_fields["retry_timeouts"].default is False
+    assert "retry_timeouts" in G.PAYLOAD_KEYS
+    seen = {}
+    monkeypatch.setattr(grid, "handle_ml_grid", lambda tid, payload: (seen.update(payload), {
+        "done": 0, "errors": 0, "skipped_existing": 0, "cancelled": False, "out_dir": str(tmp_path)})[1])
+    L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1"])
+    assert seen["retry_timeouts"] is False
+    L.main(["ml-grid", "--config", "c.json", "--out", str(tmp_path), "--cpu-slots", "1", "--retry-timeouts"])
+    assert seen["retry_timeouts"] is True
+
+
+def slow_or_quick_task(cfg, seed, key):
+    """tsai-inception hangs (a stuck kernel); everything else returns at once."""
+    if cfg["family"] == "tsai-inception":
+        _real_time.sleep(300)
+    return {"cell_key": key, "seed": seed, "track": cfg["track"], "label": G._label_of(cfg), "status": "ok", "n_rows": 1,
+            "skipped_blocks": [], "timings": {"total": 0.1}, "primary": {"name": "quintile_spread_net", "value": 0.0},
+            "controls": {}, "config": {k: v for k, v in cfg.items() if k != "seeds"}}
+
+
+def test_the_master_terminates_a_task_stuck_past_three_times_the_budget(world, tmp_path):
+    out = tmp_path / "o"
+    cells = [tsai_cell(world), tsai_cell(world, family="tsai-minirocket", params={"device": "cpu"})]
+    t0 = _real_time.time()
+    res = grun(cells, out, world, inline=False, cpu_slots=1, gpu_slots=2, task_fn=slow_or_quick_task,
+               settings=_gsettings(gpu_budget_minutes=0.15))                 # hard deadline: 3 x 9 s = 27 s
+    assert _real_time.time() - t0 < 120                                       # not the 300 s of the stuck kernel
+    assert res["done"] == 1 and res["errors"] == 1 and res["pool_rebuilds"] >= 1
+    err = G.read_results(out / "errors.jsonl")[0]
+    assert err["timeout"] is True and "hard deadline" in err["error"] and err["cell_key"] == G.validate_cell(
+        tsai_cell(world)).key
+    done = G.read_results(out / "results.jsonl")
+    assert [r["config"]["family"] for r in done] == ["tsai-minirocket"]       # the innocent task still finished

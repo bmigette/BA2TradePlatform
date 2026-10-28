@@ -117,7 +117,8 @@ def payload(world, cells=None, **over):
     """A complete ``ml_grid`` payload: the handler takes no defaults, every key is explicit."""
     p = {"out_dir": "out", "cpu_slots": 1, "gpu_slots": 0, "config_path": None,
          "cells": cells if cells is not None else [cell(world[0])], "limit_cells": None,
-         "cache_root": str(world[2]), "settings": None, "cores": 2, "rerun_mismatched": False}
+         "cache_root": str(world[2]), "settings": None, "cores": 2, "rerun_mismatched": False,
+         "retry_timeouts": False}
     p.update(over)
     return p
 
@@ -280,7 +281,7 @@ def test_handler_payload_validation(signal_world, tmp_path):
     with pytest.raises(ValueError, match="unknown grid settings"):
         G.handle_ml_grid("t", {**full, "settings": {"nope": 1}})
     for bad in ({"cpu_slots": 0}, {"gpu_slots": -1}, {"limit_cells": 0}, {"cores": None}, {"cores": 0},
-                {"rerun_mismatched": "yes"}):
+                {"rerun_mismatched": "yes"}, {"retry_timeouts": "yes"}):
         with pytest.raises(ValueError):
             G.handle_ml_grid("t", {**full, **bad})
 
@@ -1034,7 +1035,8 @@ def test_the_cli_turns_ctrl_c_into_a_clean_exit(monkeypatch, capsys):
         raise KeyboardInterrupt
     monkeypatch.setattr(grid, "handle_ml_grid", interrupted)
     args = types.SimpleNamespace(config="c.json", out="o", cpu_slots=1, gpu_slots=0, limit_cells=None,
-                                 cache_root=None, cores=2, rerun_mismatched=False, report_only=None)
+                                 cache_root=None, cores=2, rerun_mismatched=False, report_only=None,
+                                 retry_timeouts=False)
     assert L._cmd_ml_grid(args) == 130
     assert "interrupted" in capsys.readouterr().out
 
@@ -1408,7 +1410,7 @@ def test_probation_uses_a_small_window_and_only_tasks_charged_twice_run_alone(si
     assert any(p == 1 for _, p in probation.submitted)                             # ... and really 2 at once (not 1)
     assert alone1.submitted == [(3, 0)] and alone2.submitted == [(3, 0)]           # charged twice: a singleton
     assert sorted(s for s, _ in rest.submitted) == [4, 5, 6, 7, 8]                 # back to the full window afterwards
-    assert len({id(p.kw["initargs"][-1]) for p in fake_pool.instances}) == 5      # each pool has its own stagger counter
+    assert len({id(p.kw["initargs"][-2]) for p in fake_pool.instances}) == 5      # each pool has its own stagger counter
 
 
 def test_a_submit_on_a_pool_that_just_broke_is_retried_not_fatal(signal_world, manual_pool):
