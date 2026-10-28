@@ -384,3 +384,71 @@ def test_the_up_to_date_path_does_not_screen_the_symbols(work, tmp_path, monkeyp
     _touch(path)
     with pytest.raises(AssertionError, match="screened"):
         _ensure(work, out)
+
+
+# ---------------------------------------------------------------------------------------------- typed stale, memo, meta merge
+def test_a_stale_series_is_a_typed_error_not_a_message_match(tmp_path, work, monkeypatch):
+    s = _sessions()
+    _write(work, "STAL", _bars(s[:-5], 4))
+    assert issubclass(F.StaleSeriesError, F.PanelDataError)
+    with pytest.raises(F.StaleSeriesError):
+        F.load_daily(["STAL"], FIRST, LAST, work)
+    usable, permanent, transient = F.screen_symbols(["AAA", "STAL", "NOPE"], FIRST, LAST, work)
+    assert usable == ["AAA"] and set(permanent) == {"NOPE"} and set(transient) == {"STAL"}
+    # classification is by TYPE: a permanent refusal whose text happens to say "stale series" stays permanent
+    real = F.load_daily
+
+    def liar(symbols, *a, **k):
+        if list(symbols) == ["AAA"]:
+            raise F.PanelDataError("AAA: bad file (not a stale series, just wrong)")
+        return real(symbols, *a, **k)
+    monkeypatch.setattr(F, "load_daily", liar)
+    usable, permanent, transient = F.screen_symbols(["AAA", "BBB"], FIRST, LAST, work)
+    assert usable == ["BBB"] and set(permanent) == {"AAA"} and not transient
+
+
+def test_the_store_lists_check_is_typed_too(work):
+    with pytest.raises(F.StaleSeriesError):
+        F._refuse_if_store_lists_ended({"AAA": "2020-01-01"}, work / "screener" / "metric_store_alpaca_20261022")
+
+
+def test_chunked_builds_compute_the_shared_tables_once(rich, tmp_path, monkeypatch):
+    """The macro table, the per-symbol X columns and the S manifests are memoised across chunks of one store build."""
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    root, _groups, _ = rich
+    calls = {"levels": 0, "own": 0, "manifest": 0}
+    real_levels, real_own, real_read = F.macro_levels, F._own_columns, MarketConditionStore.read_manifest
+
+    def levels(*a, **k):
+        calls["levels"] += 1
+        return real_levels(*a, **k)
+
+    def own(d):
+        calls["own"] += 1
+        return real_own(d)
+
+    def read(self, *a, **k):
+        calls["manifest"] += 1
+        return real_read(self, *a, **k)
+    monkeypatch.setattr(F, "macro_levels", levels)
+    monkeypatch.setattr(F, "_own_columns", own)
+    monkeypatch.setattr(MarketConditionStore, "read_manifest", read)
+    res = F.ensure_feature_store(tmp_path / "store", ["AAA", "BBB"], FIRST, LAST, ["x", "mac", "s"], cache_root=root,
+                                 sector_overrides={}, sector_of=SECTOR_OF, chunk_size=1)
+    assert res["chunks"] == 2
+    assert calls["levels"] == len(F.MAC_SERIES)                  # once per series, not once per chunk
+    assert calls["own"] == 2                                     # once per universe member (AAA, BBB), not per chunk
+    assert calls["manifest"] == 2                                # one pinned manifest per profile, read once
+    stored = pd.read_parquet(tmp_path / "store" / "features.parquet")
+    direct = _build(root, ["x", "mac", "s"], symbols=["AAA", "BBB"], sector_of=SECTOR_OF)
+    pd.testing.assert_frame_equal(stored.drop(columns="label_bar_filled"), direct.drop(columns="label_bar_filled"),
+                                  check_exact=True, check_freq=False)
+
+
+def test_the_meta_merges_required_context_and_context_symbols_across_chunks(work, tmp_path):
+    out = tmp_path / "store"
+    F.ensure_feature_store(out, ["AAA", "BBB"], FIRST, LAST, ["t", "m"], cache_root=work, sector_overrides={},
+                           sector_of=SECTOR_OF, chunk_size=1)          # AAA: Technology (XLK), BBB: Financial Services (XLF)
+    meta = _meta(out)
+    assert {"XLK", "XLF"} <= set(meta["required_context"]) and {"XLK", "XLF"} <= set(meta["context_symbols"])
+    assert "AAA" not in meta["context_symbols"] and set(F.MARKET_ETFS) <= set(meta["required_context"])

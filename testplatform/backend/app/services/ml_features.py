@@ -57,6 +57,11 @@ _RAW = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume"
 _INDEX_NAMES = ["symbol", "session"]
 
 
+class StaleSeriesError(PanelDataError):
+    """A series that stops short of the cache end (1..``ENDED_AFTER_SESSIONS`` sessions) or that the metric store still lists
+    after its last bar: a stale download that can clear after a cache refresh, NOT an ended (delisted) series."""
+
+
 # ------------------------------------------------------------------------------------------ daily bars
 def _cache_file(cache_root: Path, symbol: str) -> Path:
     p = Path(cache_root) / "AlpacaHistoryOHLCVProvider" / f"{symbol}_1d.parquet"
@@ -181,7 +186,7 @@ def load_daily(symbols: Iterable[str], first: date, last: date, cache_root: Path
             ended = short > ENDED_AFTER_SESSIONS
             if not ended:
                 gap = sessions[sessions > have_ts]
-                raise PanelDataError(
+                raise StaleSeriesError(
                     f"{sym}: stale series, last cached bar {have_ts.date()} but {len(gap)} sessions up to "
                     f"{sessions[-1].date()} have none" + (
                         f"; it is {short} sessions short of the cache end {cache_end}: too short to count as ended "
@@ -272,6 +277,14 @@ class BuildCache:
         self.daily: Dict[str, pd.DataFrame] = {}
         self.meta: Dict[str, Dict[str, object]] = {"filled": {}, "first_bar": {}, "ended": {}}
         self._tech: Dict[str, pd.DataFrame] = {}
+        self._memo: Dict[object, object] = {}
+
+    def memo(self, key: object, compute: Callable[[], object]) -> object:
+        """``compute()`` once per ``key`` for the life of the cache: tables that are the same for every chunk of one store build
+        (the macro table, the S manifests, a universe member's X columns). The key must contain whatever the value depends on."""
+        if key not in self._memo:
+            self._memo[key] = compute()
+        return self._memo[key]
 
     def load(self, symbols: Sequence[str], first: date, last: date, cache_root: Path,
              cache_end: date) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, object]]]:
@@ -302,6 +315,10 @@ class BuildCache:
         if symbol not in self._tech:
             self._tech[symbol] = _technical_one(live)
         return self._tech[symbol]
+
+
+def _memoised(ctx: "BuildContext", key: object, compute: Callable[[], object]) -> object:
+    return ctx.cache.memo(key, compute) if ctx.cache is not None else compute()
 
 
 def _tech(ctx: "BuildContext", symbol: str, live: pd.DataFrame) -> pd.DataFrame:
@@ -703,7 +720,8 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
             o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_vol_ratio_20_60"])
         else:
             t = _tech(ctx, sym, live)[list(X_RANKED)].reindex(ctx.sessions)
-            o = _own_columns(live).reindex(ctx.sessions)
+            o = _memoised(ctx, ("own", sym, ctx.sessions[0], ctx.sessions[-1]),
+                          lambda live=live: _own_columns(live).reindex(ctx.sessions))
         own[sym] = o
         for c in X_RANKED:
             wide[c][sym] = t[c]
@@ -935,16 +953,20 @@ def macro(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     if Path(fs.CACHE_FOLDER).resolve() != Path(ctx.cache_root).resolve():
         raise PanelDataError(f"group mac reads FRED from {fs.CACHE_FOLDER}, not from cache_root {ctx.cache_root}")
     ctx.provenance["fred"] = check_fred_pins(Path(fs.CACHE_FOLDER))
-    first = (ctx.sessions[0] - pd.Timedelta(days=_MAC_HISTORY_DAYS)).date()
-    grid = _sessions_index(first, ctx.sessions[-1].date())
-    cols: Dict[str, pd.Series] = {}
-    for sid, kind in MAC_SERIES.items():
-        lvl = macro_levels(sid, grid)
-        name = f"mac_{sid.lower()}"
-        cols[f"{name}_{kind}"] = lvl
-        cols[f"{name}_chg20"] = lvl - lvl.shift(20)
-        cols[f"{name}_z252"] = _z252(lvl)
-    table = pd.DataFrame(cols)[list(MAC_COLUMNS)].reindex(ctx.sessions).astype("float64")
+
+    def compute() -> pd.DataFrame:
+        first = (ctx.sessions[0] - pd.Timedelta(days=_MAC_HISTORY_DAYS)).date()
+        grid = _sessions_index(first, ctx.sessions[-1].date())
+        cols: Dict[str, pd.Series] = {}
+        for sid, kind in MAC_SERIES.items():
+            lvl = macro_levels(sid, grid)
+            name = f"mac_{sid.lower()}"
+            cols[f"{name}_{kind}"] = lvl
+            cols[f"{name}_chg20"] = lvl - lvl.shift(20)
+            cols[f"{name}_z252"] = _z252(lvl)
+        return pd.DataFrame(cols)[list(MAC_COLUMNS)].reindex(ctx.sessions).astype("float64")
+    # the same for every symbol and every chunk of one store build; keyed by the grid and the FRED folder it reads
+    table = _memoised(ctx, ("mac", ctx.sessions[0], ctx.sessions[-1], str(fs.CACHE_FOLDER)), compute)
     return pd.concat({sym: table for sym in ctx.symbols}, names=_INDEX_NAMES)
 
 
@@ -1483,7 +1505,8 @@ def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame
         raise PanelDataError(f"group s: no market_conditions store under {root}")
     store = MarketConditionStore(root)
     valid = status_code(STATUS_VALID)
-    by_profile = {p: _s_manifests(store, p) for p in S_MANIFESTS}
+    by_profile = {p: _memoised(ctx, ("s_manifests", p, tuple(S_MANIFESTS[p]), str(root)), lambda p=p: _s_manifests(store, p))
+                  for p in S_MANIFESTS}
     prov: Dict[str, Dict[str, object]] = {}
     per_symbol: Dict[str, Dict[str, np.ndarray]] = {}
     for profile, mans in by_profile.items():
@@ -1608,20 +1631,22 @@ def _refuse_if_store_lists_ended(ended: Dict[str, str], store_path: Path) -> Non
     for sym, last in ended.items():
         newest = ml_universe.last_scan_with(sym, store_path)
         if newest is not None and pd.Timestamp(newest) > pd.Timestamp(last) + limit:
-            raise PanelDataError(f"{sym}: the metric store still lists it on {newest}, more than {ms.STALENESS_MAX_DAYS} "
+            raise StaleSeriesError(f"{sym}: the metric store still lists it on {newest}, more than {ms.STALENESS_MAX_DAYS} "
                                  f"days after its last cached bar {last}; the cached series is stale (a delisted name "
                                  f"leaves the store within {ms.STALENESS_MAX_DAYS} days), not ended")
 
 
-def usable_symbols(symbols: Sequence[str], first: date, last: date, cache_root: Path, groups: Sequence[str] = (),
-                   store_dir: Optional[Path] = None) -> Tuple[List[str], Dict[str, str]]:
-    """Pre-screen ``symbols``: ``(usable, refused)`` where ``refused`` maps each symbol that ``load_daily`` (bars missing,
-    stale, a run of missing sessions, an invalid bar ...), the ended-vs-store check, or group F (``"f" in groups``:
-    missing statement files or keys) would refuse to the reason. Nothing is built."""
+def screen_symbols(symbols: Sequence[str], first: date, last: date, cache_root: Path, groups: Sequence[str] = (),
+                   store_dir: Optional[Path] = None) -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+    """Pre-screen ``symbols``: ``(usable, permanent, transient)``. ``permanent`` maps each symbol that ``load_daily`` (bars
+    missing, a run of missing sessions, an invalid bar ...) or group F (``"f" in groups``: missing statement files or keys)
+    would refuse to the reason; ``transient`` those refused with a ``StaleSeriesError`` (a stale download, or one the metric
+    store still lists after its last bar), which can clear after a cache refresh. Classified by exception TYPE. Nothing is built."""
     cache_end = last_cached_bar("SPY", cache_root)
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
     usable: List[str] = []
-    refused: Dict[str, str] = {}
+    permanent: Dict[str, str] = {}
+    transient: Dict[str, str] = {}
     for sym in symbols:
         try:
             _, meta = load_daily([sym], min(first, first_cached_bar(sym, cache_root).date()), last, cache_root,
@@ -1629,11 +1654,20 @@ def usable_symbols(symbols: Sequence[str], first: date, last: date, cache_root: 
             _refuse_if_store_lists_ended(meta["ended"], store_path)
             if "f" in groups:
                 check_fundamentals_files(sym, cache_root)
+        except StaleSeriesError as e:
+            transient[sym] = str(e)
         except PanelDataError as e:
-            refused[sym] = str(e)
+            permanent[sym] = str(e)
         else:
             usable.append(sym)
-    return usable, refused
+    return usable, permanent, transient
+
+
+def usable_symbols(symbols: Sequence[str], first: date, last: date, cache_root: Path, groups: Sequence[str] = (),
+                   store_dir: Optional[Path] = None) -> Tuple[List[str], Dict[str, str]]:
+    """``(usable, refused)`` of ``screen_symbols`` with the permanent and the transient refusals together."""
+    usable, permanent, transient = screen_symbols(symbols, first, last, cache_root, groups, store_dir)
+    return usable, {**permanent, **transient}
 
 
 def _fingerprint(p: Path) -> Dict[str, object]:
@@ -1877,8 +1911,6 @@ def apply_coverage_mask(df: pd.DataFrame, report: pd.DataFrame, min_share: float
 
 # ------------------------------------------------------------------------------------------ the store build
 ENSURE_VERSION = 1
-#: refusal reasons that can clear after a cache refresh; they are reported, never remembered as exclusions
-_TRANSIENT_MARKERS = ("stale series", "the metric store still lists it")
 _FMP_KINDS_BY_GROUP: Dict[str, Tuple[str, ...]] = {"f": _F_FILES, "ag": ("analyst_grades",), "at": ("price_target",),
                                                    "i": ("insider_v2",)}
 
@@ -2002,9 +2034,11 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         if "ensure" in old and old["ensure"].get("request") == request:           # nothing changed: no symbol is loaded
             return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": old["symbols"],
                     "refused": old["ensure"]["refused"], "transient": old["ensure"]["transient"]}
-    usable_rows, refused_rows = usable_symbols(symbols, first, last, cache_root, groups, store_path)
-    usable_extra, refused_extra = usable_symbols(extra, first, last, cache_root, (), store_path) if extra else ([], {})
-    refused = {**refused_rows, **refused_extra}
+    usable_rows, refused, transient = screen_symbols(symbols, first, last, cache_root, groups, store_path)
+    usable_extra, refused_extra, transient_extra = (screen_symbols(extra, first, last, cache_root, (), store_path)
+                                                    if extra else ([], {}, {}))
+    refused.update(refused_extra)
+    transient.update(transient_extra)
     resolved: Optional[Dict[str, str]] = None
     if any(_spec(g).needs_sector for g in groups):
         if isinstance(sector_of, str):
@@ -2038,8 +2072,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     if not force and meta_path.exists() and _store_complete(out_dir):
         old = json.loads(meta_path.read_text(encoding="utf-8"))
         if "ensure" in old and old["ensure"]["inputs"] == inputs:
-            permanent, transient = _split_refusals(refused)
-            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": permanent,
+            return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": usable_rows, "refused": refused,
                     "transient": transient}
     cache = BuildCache()
     earliest = min(first_cached_bar(s, cache_root) for s in load)
@@ -2060,6 +2093,8 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     meta["ended"] = {k: v for m in metas for k, v in m["ended"].items()}
     meta["sectorless"] = sorted({sym for m in metas for sym in m["sectorless"]})
     meta["sector_overrides"] = dict(sector_overrides or {})
+    meta["required_context"] = sorted({c for m in metas for c in m["required_context"]})
+    meta["context_symbols"] = sorted({c for m in metas for c in m["context_symbols"]} - set(usable_rows))
     meta["load"] = {k: {s: v for m in metas for s, v in m["load"][k].items()} for k in metas[0]["load"]}
     source: Dict[str, object] = {"daily": {}, "fmp_history": {}}
     for m in metas:
@@ -2081,7 +2116,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     report = coverage_report(df, covered_groups, sectorless=meta["sectorless"])
     columns = column_coverage(df, covered_groups)
     meta["ensure"] = {"version": ENSURE_VERSION, "inputs": inputs, "request": request, "chunk_size": chunk_size, "chunks": len(frames),
-                      "refused": _split_refusals(refused)[0], "transient": _split_refusals(refused)[1], "min_share": min_share,
+                      "refused": refused, "transient": transient, "min_share": min_share,
                       "build_seconds": round(time.time() - started, 1),
                       "note": "features.parquet is UNMASKED; apply_coverage_mask(df, coverage_report, min_share) or "
                               "load_feature_store(mask=True) masks thin (group, year) pairs"}
@@ -2110,12 +2145,6 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
 
 def _coverage_has_columns(df: pd.DataFrame, group: str) -> bool:
     return bool(_group_columns(df, group))
-
-
-def _split_refusals(refused: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """(permanent, transient) refusals, each symbol -> reason. Transient = can clear after a cache refresh."""
-    transient = {s_: r for s_, r in refused.items() if any(m in r for m in _TRANSIENT_MARKERS)}
-    return {s_: r for s_, r in refused.items() if s_ not in transient}, transient
 
 
 def load_feature_store(out_dir: Path, mask: bool = True, min_share: Optional[float] = None) -> pd.DataFrame:
