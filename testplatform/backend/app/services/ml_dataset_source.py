@@ -10,11 +10,22 @@ Two flavours, both read from the local cache only:
   group m) are taken over ``daily_universe``, the tickers created together; it is stored with the dataset so a
   regeneration or a duplicate rebuilds the same numbers.
 
+Two properties of the daily source are choices of the wizard, not of the store, and a reader of a result should know
+them:
+
+* the coverage mask is decided per calendar YEAR over the dataset's own span (a (group, year) holding less than
+  ``daily_min_share`` complete rows is blanked and flagged). It is a completeness rule over the rows present, not a
+  look-ahead on any value; a different span can mask a different set of years;
+* the universe is the user's own ticker list (survivorship): ``daily_universe`` is exactly the tickers created together,
+  the cross-sectional ranks (group x) and the market breadth (group m) are taken over them and over nothing else. A
+  breadth over fewer than ``DAILY_BREADTH_MIN_UNIVERSE`` tickers means nothing, so that column is dropped then.
+
 Every dataset build path (create, batch, regenerate, duplicate, update) goes through ``fetch_ohlcv_frame`` so they all
 produce the same frame.
 """
 from __future__ import annotations
 
+import json
 import threading
 from datetime import date, datetime
 from pathlib import Path
@@ -36,8 +47,8 @@ DAILY_TIMEFRAME = "1d"
 DAILY_GROUP_DESCRIPTIONS: Dict[str, str] = {
     "t": "Technical: returns, moving-average distances, RSI / ADX / SAR, ATR, volume z-scores (scale-free)",
     "mtf": "Weekly multi-timeframe: weekly trend and momentum, visible only once the week has ended",
-    "m": "Market: SPY / QQQ / IWM / TLT / GLD returns, relative strength vs SPY and the sector ETF, universe breadth",
-    "x": "Cross-sectional: the symbol's rank and z-score among the batch's tickers (needs at least 5 tickers)",
+    "m": "Market: SPY / QQQ / IWM / TLT / GLD returns, relative strength vs SPY and the sector ETF, breadth of the batch (dropped below 5 tickers)",
+    "x": "Cross-sectional: the symbol's rank and z-score among the batch's tickers (needs at least 5 tickers; your list, so survivorship)",
     "mac": "Macro: FRED first-release series (VIX, yields, spreads, CPI, payrolls, unemployment), as published",
     "f": "Fundamentals: earnings surprise and growth, margins, balance-sheet ratios, after the filing date",
     "ag": "Analyst grades: net upgrades and number of graders over the last 30 / 90 days",
@@ -48,6 +59,9 @@ DAILY_GROUP_DESCRIPTIONS: Dict[str, str] = {
 DAILY_GROUP_IDS: Tuple[str, ...] = tuple(DAILY_GROUP_DESCRIPTIONS)
 #: coverage mask threshold of a (group, year) when the request names none: the store's own (``ensure_feature_store``)
 DAILY_DEFAULT_MIN_SHARE = 0.7
+#: the breadth of group m (share of the universe above its 50-session average) is dropped for a universe thinner than this
+DAILY_BREADTH_MIN_UNIVERSE = 5
+BREADTH_COLUMN = "m_breadth_sma50"
 #: the keys of ``generation_config`` (and of the build config) that carry the daily options
 DAILY_KEYS: Tuple[str, ...] = ("daily_groups", "daily_min_share", "daily_universe")
 #: flag columns of the store that the dataset keeps but a model must not read as a feature (see job_handler)
@@ -174,12 +188,27 @@ def _cache_stamp(cache_root: Path) -> Optional[Tuple[int, int]]:
     return st.st_size, st.st_mtime_ns
 
 
+def _source_stamp(universe: Tuple[str, ...], groups: Tuple[str, ...], cache_root: Path) -> str:
+    """(size, mtime) of every source file the build of ``groups`` reads - the daily bars of the universe and of the context
+    ETFs, the FMP histories of its group, the FRED series, the metric store, the market-condition manifests - as the
+    feature store's own request key computes them (``ml_features._input_fingerprints``)."""
+    from app.services import ml_features as F
+    from app.services import ml_universe
+    uses_sector = any(F.GROUPS[g].needs_sector for g in groups)
+    context = ["SPY"] + (sorted(set(F.MARKET_ETFS) | set(F.SECTOR_ETF.values())) if uses_sector else [])
+    load = list(dict.fromkeys(list(universe) + context))
+    fp = F._input_fingerprints(load, list(universe), list(groups), cache_root, ml_universe.store_dir_for(cache_root),
+                               uses_store=uses_sector)
+    return json.dumps(fp, sort_keys=True, default=str)
+
+
 def _universe_features(universe: Tuple[str, ...], first_day: date, last_day: date, groups: Tuple[str, ...],
                        min_share: float, cache_root: Path) -> pd.DataFrame:
     """The coverage-masked feature store of the whole ``universe`` over ``[first_day, last_day]``, built ONCE for all the
-    datasets of a batch (they run in a thread pool with the same request): the last build is kept."""
+    datasets of a batch (they run in a thread pool with the same request): the last build is kept, and reused only while
+    every source file it read is unchanged (``_source_stamp``)."""
     from app.services import ml_features as F
-    key = (universe, first_day, last_day, groups, min_share, str(cache_root), _cache_stamp(cache_root))
+    key = (universe, first_day, last_day, groups, min_share, str(cache_root), _source_stamp(universe, groups, cache_root))
     with _MEMO_LOCK:
         if _MEMO.get("key") == key:
             return _MEMO["frame"]
@@ -195,7 +224,10 @@ def daily_frame(ticker: str, first_day: date, last_day: date, request: Mapping[s
     chosen groups with the coverage mask applied (a thin (group, year) is NaN with ``<prefix>missing`` = 1).
 
     Only listed sessions are kept. ``label_bar_filled`` is left out: the daily targets (``ml_targets.daily_targets``) are
-    already NaN where their entry or exit bar is not a real print."""
+    already NaN where their entry or exit bar is not a real print. The coverage mask is per calendar year over the
+    built span (a completeness rule, not a value look-ahead) and the universe is the user's own ticker list
+    (survivorship); see the module docstring. ``m_breadth_sma50`` is dropped for a universe below
+    ``DAILY_BREADTH_MIN_UNIVERSE`` tickers."""
     from ba2_common.config import CACHE_FOLDER
     from app.services import ml_features as F
     cache_root = Path(CACHE_FOLDER)
@@ -208,6 +240,9 @@ def daily_frame(ticker: str, first_day: date, last_day: date, request: Mapping[s
         raise ValueError(f"{ticker}: the daily bars and the feature store do not cover the same sessions")
     keep = f["listed"].to_numpy(dtype=bool)
     feature_cols = [c for c in f.columns if c not in ("listed", "ended", "filled", "label_bar_filled")]
+    if len(request["daily_universe"]) < DAILY_BREADTH_MIN_UNIVERSE:
+        # the breadth of one to four tickers is that ticker's own trend, not a market breadth
+        feature_cols = [c for c in feature_cols if c != BREADTH_COLUMN]
     out = pd.DataFrame({"Date": f.index, "Open": b["open"].to_numpy(), "High": b["high"].to_numpy(),
                         "Low": b["low"].to_numpy(), "Close": b["close"].to_numpy(), "Volume": b["volume"].to_numpy(),
                         "filled": f["filled"].to_numpy(dtype=bool)})

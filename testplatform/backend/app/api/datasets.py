@@ -2111,6 +2111,15 @@ def duplicate_dataset(
                                            gen_config.get("daily_universe"))
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        warnings: List[str] = []
+        old_universe = gen_config.get("daily_universe") or []
+        if daily and old_universe and new_ticker not in old_universe and \
+                {"x", "m"} & set(daily["daily_groups"]):
+            warnings.append(
+                f"{new_ticker} joined the daily universe ({len(old_universe)} -> {len(daily['daily_universe'])} tickers): "
+                f"its cross-sectional ranks (x) and market breadth (m) are taken over the larger set and differ from "
+                f"those of the original's datasets, which keep their {len(old_universe)} tickers; regenerate them to "
+                f"compare like with like")
 
         df = fetch_ohlcv_frame(provider_name, new_ticker, original.timeframe, fetch_start_date, end_date,
                                gen_config.get("panel_features"), original.fundamentals_config,
@@ -2177,6 +2186,7 @@ def duplicate_dataset(
         db.refresh(new_dataset)
 
         logger.info(f"Created duplicate dataset with ID {new_dataset.id}")
+        new_dataset.warnings = warnings          # response only (DatasetResponse.warnings), not a column
         return new_dataset
 
     except HTTPException:

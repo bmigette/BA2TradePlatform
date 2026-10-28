@@ -4,7 +4,11 @@ import {
   ALPACA_HIST_INTRADAY_TIMEFRAMES,
   ALPACA_HIST_PROVIDER,
   DAILY_GROUP_OPTIONS,
+  DAILY_MASK_HELP,
   DAILY_TIMEFRAME,
+  DAILY_UNIVERSE_HELP,
+  breadthNote,
+  duplicateUniverseNote,
   allowedTimeframes,
   dailyPayload,
   dailySummary,
@@ -721,6 +725,12 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         throw new Error(errorData.detail || `Failed to ${mode} dataset`);
       }
 
+      // a duplicate that widened a daily universe comes back with a warning: it must reach the user
+      const created = mode === 'duplicate' ? await response.json() : null;
+      if (created && Array.isArray(created.warnings) && created.warnings.length > 0) {
+        alert(created.warnings.join('\n'));
+      }
+
       onComplete();
       onClose();
 
@@ -1079,15 +1089,12 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
               onChange={(e) => setWizardData({ ...wizardData, dailyMinShare: e.target.value })}
               className="w-28 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm bg-white dark:bg-gray-700 dark:text-gray-100"
             />
-            <p className="text-xs text-gray-400 dark:text-gray-300 mt-1">
-              A group whose data covers less than this share of the rows of a year is blanked for that year (NaN) and flagged
-              with a <code>&lt;group&gt;_missing</code> column, instead of showing a few real rows among gaps. Default 0.7.
-            </p>
+            <p className="text-xs text-gray-400 dark:text-gray-300 mt-1">{DAILY_MASK_HELP} Default 0.7.</p>
           </div>
-          <p className="text-xs text-gray-400 dark:text-gray-300">
-            The cross-sectional group (x) and the market breadth are taken over the tickers created together (batch mode, at least 5 for x);
-            a single dataset is built against itself only.
-          </p>
+          <p className="text-xs text-gray-400 dark:text-gray-300">{DAILY_UNIVERSE_HELP}</p>
+          {breadthNote(wizardData.dailyGroups, dailyUniverseSize()) && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">{breadthNote(wizardData.dailyGroups, dailyUniverseSize())}</p>
+          )}
         </div>
       )}
 
@@ -1911,11 +1918,21 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
           </div>
         )}
         {isDailySource(wizardData.dataProvider, wizardData.timeframe) && (
-          <div className="flex justify-between gap-4 py-2 border-b border-gray-200 dark:border-gray-600">
-            <span className="font-medium text-gray-700 dark:text-gray-200">Daily Feature Store:</span>
-            <span className="text-gray-900 dark:text-gray-100 text-right">
-              {dailySummary({ groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }, dailyUniverseSize())}
-            </span>
+          <div className="py-2 border-b border-gray-200 dark:border-gray-600">
+            <div className="flex justify-between gap-4">
+              <span className="font-medium text-gray-700 dark:text-gray-200">Daily Feature Store:</span>
+              <span className="text-gray-900 dark:text-gray-100 text-right">
+                {dailySummary({ groups: wizardData.dailyGroups, minShare: wizardData.dailyMinShare }, dailyUniverseSize())}
+              </span>
+            </div>
+            {breadthNote(wizardData.dailyGroups, dailyUniverseSize()) && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{breadthNote(wizardData.dailyGroups, dailyUniverseSize())}</p>
+            )}
+            {mode === 'duplicate' && initialData && duplicateUniverseNote(initialData.generation_config, wizardData.ticker) && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                {duplicateUniverseNote(initialData.generation_config, wizardData.ticker)}
+              </p>
+            )}
           </div>
         )}
         <div className="flex justify-between py-2 border-b border-gray-200 dark:border-gray-600">

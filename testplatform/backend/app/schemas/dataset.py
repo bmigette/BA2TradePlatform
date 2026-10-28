@@ -81,6 +81,8 @@ class DatasetResponse(BaseModel):
     sentiment_config: Optional[Dict[str, Any]]
     generation_config: Optional[Dict[str, Any]]
     labels: Optional[List[str]] = None
+    # things the caller should know about the result (a duplicate that widened a daily universe)
+    warnings: Optional[List[str]] = None
     file_path: str
     created_at: datetime
     updated_at: Optional[datetime]

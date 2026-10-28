@@ -2,7 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
   DAILY_GROUP_OPTIONS,
   DEFAULT_DAILY_STATE,
+  DAILY_MASK_HELP,
+  DAILY_UNIVERSE_HELP,
   allowedTimeframes,
+  breadthNote,
+  duplicateUniverseNote,
   dailyPayload,
   dailySummary,
   hydrateDailyState,
@@ -100,5 +104,43 @@ describe('payload, hydration and summary', () => {
     expect(text).toContain('coverage threshold 0.7');
     expect(text).toContain('12 tickers');
     expect(dailySummary({ groups: ['t'], minShare: '0.7' }, 1)).toContain('1 ticker');
+  });
+});
+
+describe('notes about the universe and the mask', () => {
+  const gc = { data_provider: 'alpaca_hist', daily_groups: ['t', 'x', 'm'], daily_universe: ['AAA', 'BBB', 'CCC', 'DDD', 'EEE'] };
+
+  it('warns when a duplicate widens the universe of a dataset that uses x or the breadth', () => {
+    const note = duplicateUniverseNote(gc, 'FFF');
+    expect(note).toContain('FFF');
+    expect(note).toContain('5 -> 6');
+    expect(note).toMatch(/differ/);
+  });
+
+  it('is silent for a ticker already in the universe, an empty ticker or groups that do not depend on it', () => {
+    expect(duplicateUniverseNote(gc, 'AAA')).toBeNull();
+    expect(duplicateUniverseNote(gc, '')).toBeNull();
+    expect(duplicateUniverseNote({ ...gc, daily_groups: ['t', 'mtf'] }, 'FFF')).toBeNull();
+    expect(duplicateUniverseNote({ data_provider: 'yfinance' }, 'FFF')).toBeNull();
+  });
+
+  it('says the breadth is dropped for a universe below five tickers', () => {
+    expect(breadthNote(['t', 'm'], 1)).toMatch(/breadth.*dropped/);
+    expect(breadthNote(['t', 'm'], 4)).toMatch(/dropped/);
+    expect(breadthNote(['t', 'm'], 5)).toBeNull();
+    expect(breadthNote(['t'], 1)).toBeNull();
+  });
+
+  it('documents the per-year mask and the survivorship of the universe', () => {
+    expect(DAILY_MASK_HELP).toMatch(/calendar year/);
+    expect(DAILY_MASK_HELP).toMatch(/not a look-ahead/);
+    expect(DAILY_UNIVERSE_HELP).toMatch(/your own ticker list/);
+    expect(DAILY_UNIVERSE_HELP).toMatch(/survivorship/);
+  });
+
+  it('describes group m with the breadth rule and x with the survivorship', () => {
+    const m = DAILY_GROUP_OPTIONS.find((o) => o.id === 'm')!;
+    expect(m.desc).toMatch(/breadth/);
+    expect(m.desc).toMatch(/5 tickers/);
   });
 });

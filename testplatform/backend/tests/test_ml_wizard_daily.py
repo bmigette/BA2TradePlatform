@@ -51,8 +51,13 @@ def _fake_features(symbols, first, last, groups, cache_root, **kw):
     rng = np.random.default_rng(1)
     for g in groups:
         prefix = F.GROUPS[g].prefix
-        for k in ("a", "b"):
-            df[f"{prefix}{k}"] = rng.normal(size=len(df))
+        for name in (F.GROUPS[g].coverage_columns or (f"{prefix}a", f"{prefix}b")):
+            df[name] = rng.normal(size=len(df))
+        if g in ("ag", "mac"):                     # groups whose coverage columns are named: keep an a/b pair too
+            for k in ("a", "b"):
+                df[f"{prefix}{k}"] = rng.normal(size=len(df))
+    if "m" in groups:
+        df["m_breadth_sma50"] = rng.uniform(size=len(df))
     if "f" in groups:
         yr = idx.get_level_values("session").year
         half = (np.arange(len(df)) % 2 == 0)
@@ -291,6 +296,82 @@ class TestDailyPayload:
 
 
 # ---------------------------------------------------------------------------------------------- build paths
+class TestBreadthNeedsAUniverse:
+    def fetch(self, universe, ticker="AAA"):
+        return S.fetch_ohlcv_frame("alpaca_hist", ticker, "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                                   {"daily_groups": ["t", "m"], "daily_min_share": 0.7, "daily_universe": universe})
+
+    def test_the_breadth_of_a_universe_below_five_tickers_is_dropped(self):
+        for universe in (["AAA"], ["AAA", "BBB"], ["AAA", "BBB", "CCC", "DDD"]):
+            df = self.fetch(universe)
+            assert "m_breadth_sma50" not in df.columns
+            assert "m_a" in df.columns and "t_a" in df.columns          # the rest of group m stays
+
+    def test_the_breadth_of_five_or_more_tickers_is_kept(self):
+        assert "m_breadth_sma50" in self.fetch(UNIVERSE5).columns
+
+    def test_a_group_other_than_m_is_not_touched(self):
+        df = S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                                 {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA"]})
+        assert "t_a" in df.columns
+
+    def test_the_group_description_says_so(self):
+        assert "5" in S.DAILY_GROUP_DESCRIPTIONS["m"] and "breadth" in S.DAILY_GROUP_DESCRIPTIONS["m"]
+
+
+class TestMemoKeyCoversTheSourceFiles:
+    """The memoised universe build is reused only while every source file the build reads is unchanged."""
+
+    @pytest.fixture
+    def root(self, tmp_path, monkeypatch):
+        from ba2_providers.macro import fred_series as fs
+        monkeypatch.setattr("ba2_common.config.CACHE_FOLDER", str(tmp_path))
+        monkeypatch.setattr(fs, "CACHE_FOLDER", str(tmp_path))
+        d = tmp_path / "AlpacaHistoryOHLCVProvider"
+        d.mkdir()
+        for sym in ("AAA", "BBB", "SPY", "QQQ", "IWM", "TLT", "GLD"):
+            (d / f"{sym}_1d.parquet").write_bytes(b"x" * 10)
+        (tmp_path / "fred").mkdir()
+        (tmp_path / "fred" / "VIXCLS.json").write_text("{}")
+        fmp = F.fmp_history_path("analyst_grades", "AAA", tmp_path)
+        fmp.parent.mkdir(parents=True, exist_ok=True)
+        fmp.write_text("[]")
+        return tmp_path
+
+    def fetch(self, groups):
+        return S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                                   {"daily_groups": groups, "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+
+    def test_unchanged_files_reuse_the_build(self, root, _daily_env):
+        self.fetch(["t"])
+        self.fetch(["t"])
+        assert len(_daily_env["build"]) == 1
+
+    def test_a_changed_daily_file_of_a_member_rebuilds(self, root, _daily_env):
+        self.fetch(["t"])
+        (root / "AlpacaHistoryOHLCVProvider" / "BBB_1d.parquet").write_bytes(b"y" * 25)
+        self.fetch(["t"])
+        assert len(_daily_env["build"]) == 2
+
+    def test_a_changed_fmp_history_file_rebuilds_when_its_group_is_on(self, root, _daily_env):
+        self.fetch(["t", "ag"])
+        F.fmp_history_path("analyst_grades", "AAA", root).write_text("[1, 2, 3]")
+        self.fetch(["t", "ag"])
+        assert len(_daily_env["build"]) == 2
+
+    def test_a_changed_fred_file_rebuilds_when_mac_is_on(self, root, _daily_env):
+        self.fetch(["t", "mac"])
+        (root / "fred" / "VIXCLS.json").write_text('{"observations": []}')
+        self.fetch(["t", "mac"])
+        assert len(_daily_env["build"]) == 2
+
+    def test_a_changed_market_etf_file_rebuilds_when_m_is_on(self, root, _daily_env):
+        self.fetch(["t", "m"])
+        (root / "AlpacaHistoryOHLCVProvider" / "QQQ_1d.parquet").write_bytes(b"z" * 40)
+        self.fetch(["t", "m"])
+        assert len(_daily_env["build"]) == 2
+
+
 class TestDailyBuildPaths:
     DAILY_GC = {"data_provider": "alpaca_hist", "panel_features": [], "daily_groups": ["t", "mtf"],
                 "daily_min_share": 0.75, "daily_universe": ["AAA", "BBB"], "original_start_date": "2023-01-03",
@@ -368,6 +449,32 @@ class TestDailyBuildPaths:
         gc = new.generation_config
         assert gc["daily_groups"] == ["t", "mtf"] and gc["daily_min_share"] == 0.75
         assert gc["daily_universe"] == ["AAA", "BBB", "CCC"]
+
+    def _duplicate(self, tmp_path, groups, new_ticker):
+        from app.api import datasets as D
+        from app.models.dataset import Dataset
+        from app.schemas.dataset import DatasetDuplicate
+        original = Dataset(id=7, name="o", ticker="AAA", timeframe="1d", start_date=datetime(2023, 1, 3),
+                           end_date=datetime(2024, 12, 31), rows_count=1, file_path="x.csv", technical_indicators=None,
+                           generation_config={**self.DAILY_GC, "daily_groups": groups})
+        db = _FakeDb()
+        db.query = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = original
+        with patch.object(D, "DATASETS_DIR", tmp_path), \
+                patch.object(D, "fetch_ohlcv_frame", side_effect=lambda *a: self._frame()):
+            return D.duplicate_dataset(7, DatasetDuplicate(new_ticker=new_ticker), db)
+
+    def test_a_duplicate_that_widens_the_universe_warns_about_x_and_breadth(self, tmp_path):
+        new = self._duplicate(tmp_path, ["t", "m"], "CCC")
+        assert len(new.warnings) == 1
+        w = new.warnings[0]
+        assert "CCC" in w and "2 -> 3" in w and "breadth" in w and "differ" in w
+        from app.schemas.dataset import DatasetResponse
+        assert "warnings" in DatasetResponse.model_fields
+
+    def test_no_warning_when_the_universe_is_unchanged_or_nothing_depends_on_it(self, tmp_path):
+        assert not self._duplicate(tmp_path, ["t", "m"], "BBB").warnings      # already a member
+        assert not self._duplicate(tmp_path, ["t", "mtf"], "CCC").warnings    # neither x nor breadth in use
 
 
 class TestDailyUpdatePath:
