@@ -708,36 +708,44 @@ def cross_section(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataF
     universe symbol always (the NDQ30 stage). A build in chunks over the same universe and membership gives the same
     values as one build."""
     members = sorted(ctx.universe)            # a fixed column order: float sums (mean, std) must not depend on the caller
-    mask = ctx.member_mask()
-    members_n = mask.sum(axis=1)
-    wide = {c: {} for c in X_RANKED + ("x_mom_12_1",)}
-    own: Dict[str, pd.DataFrame] = {}
-    for sym in members:
-        d = daily[sym]
-        live = d[d["listed"]]
-        if live.empty:
-            t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
-            o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_vol_ratio_20_60"])
-        else:
-            t = _tech(ctx, sym, live)[list(X_RANKED)].reindex(ctx.sessions)
-            o = _memoised(ctx, ("own", sym, ctx.sessions[0], ctx.sessions[-1]),
-                          lambda live=live: _own_columns(live).reindex(ctx.sessions))
-        own[sym] = o
+
+    def compute_parts() -> Dict[str, pd.DataFrame]:
+        mask = ctx.member_mask()
+        members_n = mask.sum(axis=1)
+        wide = {c: {} for c in X_RANKED + ("x_mom_12_1",)}
+        own: Dict[str, pd.DataFrame] = {}
+        for sym in members:
+            d = daily[sym]
+            live = d[d["listed"]]
+            if live.empty:
+                t = pd.DataFrame(np.nan, index=ctx.sessions, columns=list(X_RANKED))
+                o = pd.DataFrame(np.nan, index=ctx.sessions, columns=["x_mom_12_1", "x_weinstein", "x_vol_ratio_20_60"])
+            else:
+                t = _tech(ctx, sym, live)[list(X_RANKED)].reindex(ctx.sessions)
+                o = _memoised(ctx, ("own", sym, ctx.sessions[0], ctx.sessions[-1]),
+                              lambda live=live: _own_columns(live).reindex(ctx.sessions))
+            own[sym] = o
+            for c in X_RANKED:
+                wide[c][sym] = t[c]
+            wide["x_mom_12_1"][sym] = o["x_mom_12_1"]
+        parts: Dict[str, pd.DataFrame] = {}
         for c in X_RANKED:
-            wide[c][sym] = t[c]
-        wide["x_mom_12_1"][sym] = o["x_mom_12_1"]
-    parts: Dict[str, pd.DataFrame] = {}
-    for c in X_RANKED:
-        w = pd.DataFrame(wide[c], columns=members).astype("float64").where(mask)
-        parts[f"x_rk_{c[2:]}"] = _cross_rank(w, members_n)
-        parts[f"x_z_{c[2:]}"] = _cross_z(w, members_n)
-    mom = pd.DataFrame(wide["x_mom_12_1"], columns=members).astype("float64")
-    parts["x_mom_12_1"] = mom
-    parts["x_mom_12_1_rk"] = _cross_rank(mom.where(mask), members_n)
-    parts["x_weinstein"] = pd.DataFrame({s: own[s]["x_weinstein"] for s in members}, columns=members)
-    parts["x_vol_ratio_20_60"] = pd.DataFrame({s: own[s]["x_vol_ratio_20_60"] for s in members}, columns=members)
-    codes = _sector_codes(ctx)
-    parts["x_sector"] = pd.DataFrame({s: pd.Series(codes[s], index=ctx.sessions) for s in members}, columns=members)
+            w = pd.DataFrame(wide[c], columns=members).astype("float64").where(mask)
+            parts[f"x_rk_{c[2:]}"] = _cross_rank(w, members_n)
+            parts[f"x_z_{c[2:]}"] = _cross_z(w, members_n)
+        mom = pd.DataFrame(wide["x_mom_12_1"], columns=members).astype("float64")
+        parts["x_mom_12_1"] = mom
+        parts["x_mom_12_1_rk"] = _cross_rank(mom.where(mask), members_n)
+        parts["x_weinstein"] = pd.DataFrame({s: own[s]["x_weinstein"] for s in members}, columns=members)
+        parts["x_vol_ratio_20_60"] = pd.DataFrame({s: own[s]["x_vol_ratio_20_60"] for s in members}, columns=members)
+        codes = _sector_codes(ctx)
+        parts["x_sector"] = pd.DataFrame({s: pd.Series(codes[s], index=ctx.sessions) for s in members}, columns=members)
+        return parts
+
+    key = ("x_core", tuple(members), ctx.sessions[0], ctx.sessions[-1],
+           None if ctx.membership is None else _membership_digest(ctx.membership), X_MIN_MEMBERS, X_MIN_SHARE,
+           tuple(sorted(ctx.sector_of.items())), tuple(sorted(ctx.sector_overrides.items())), str(ctx.store_dir))
+    parts = _memoised(ctx, key, compute_parts)         # the same for every chunk of one store build
     frames = {sym: pd.DataFrame({name: parts[name][sym] for name in X_COLUMNS}, index=ctx.sessions)[list(X_COLUMNS)]
               for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
@@ -1216,9 +1224,10 @@ COVERAGE_WARMUP_DAYS = 90
 #: rows is capped and its first retained filing is a truncation, not the symbol's first filing.
 INSIDER_ROW_CAP = 2000
 #: Earliest ``publishedDate`` of ANY ``price_target`` file in the cache (3729 non-empty files, checked 2026-10-28): the feed holds
-#: nothing before it for any symbol. It is not a spike of first rows - the first rows of the files spread over the following
-#: months - so it is the vendor's retention floor, not a per-file cap: before floor + 90 days no price_target window is complete
-#: for any symbol, and an empty window there means "the feed did not exist", not "no targets".
+#: nothing before it for any symbol. It is a FLOOR, not the day the feed was complete: the feed onboards symbols over time (the
+#: first rows of the files spike in 2022-04/05; Agilent has no target before 2022-04-29; AAPL has only 3 in 2021), so each
+#: file's coverage starts at max(its first row, this floor) + 90 days - an empty window before that means "the feed did not cover
+#: the symbol yet", not "no targets". (The feed also thins from 2023-03: a density measure for later, not modelled here.)
 PRICE_TARGET_VENDOR_START = date(2021, 4, 12)
 _FAR_PAST = np.datetime64("1900-01-01", "D")
 
@@ -1304,47 +1313,70 @@ def analyst_grades(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Data
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
-def _targets_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFrame:
-    sessions = ctx.sessions
-    targets = _read_fmp_rows("price_target", symbol, ctx)
-    keep = [i for i, r in enumerate(targets) if _num(r, "adjPriceTarget") > 0]       # the other rows carry no target
-    td = _event_days([targets[i] for i in keep], "publishedDate", symbol, "price_target")
-    adj = np.array([_num(targets[i], "adjPriceTarget") for i in keep])
+def _target_arrays(rows: List[dict], symbol: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(dates, adjusted targets, analyst codes) of the rows that carry a target, sorted by date."""
+    keep = [i for i, r in enumerate(rows) if _num(r, "adjPriceTarget") > 0]       # the other rows carry no target
+    td = _event_days([rows[i] for i in keep], "publishedDate", symbol, "price_target")
+    adj = np.array([_num(rows[i], "adjPriceTarget") for i in keep])
     order = np.argsort(td, kind="stable")
-    td, adj = td[order], adj[order]
-    codes = _codes([targets[keep[i]].get("analystCompany") for i in order])
-    cov = _covered_from(td, sessions, capped=False, floor_day=PRICE_TARGET_VENDOR_START)
-    cov_before = _covered_from(td, sessions, capped=False, floor_day=PRICE_TARGET_VENDOR_START, shift_days=30)
+    return td[order], adj[order], _codes([rows[keep[i]].get("analystCompany") for i in order])
+
+
+def _target_means(sessions: pd.DatetimeIndex, td: np.ndarray, adj: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(covered flag, mean of the 90-day window now, the same mean as it stood 30 calendar days earlier); the means are NaN
+    outside coverage or when the window has no target."""
+    cov = _covered_from(td, sessions, capped=True, floor_day=PRICE_TARGET_VENDOR_START)
+    cov_before = _covered_from(td, sessions, capped=True, floor_day=PRICE_TARGET_VENDOR_START, shift_days=30)
     csum = _csum(adj)
 
     def mean90(shift_days: int) -> np.ndarray:
-        """The 90-day window mean as it stood ``shift_days`` calendar days before each session."""
         lo, hi = _window_bounds(td, sessions, 90, shift_days)
         count = (hi - lo).astype("float64")
         out = np.full(len(sessions), np.nan)
         has = count > 0
         out[has] = _window_sum(csum, lo, hi)[has] / count[has]
         return out
-    now = np.where(cov, mean90(0), np.nan)
-    before = np.where(cov_before, mean90(30), np.nan)
-    out: Dict[str, np.ndarray] = {}
+    return cov, np.where(cov, mean90(0), np.nan), np.where(cov_before, mean90(30), np.nan)
+
+
+def _target_ratios(symbol: str, sessions: pd.DatetimeIndex, close: np.ndarray, now: np.ndarray,
+                   before: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(at_target_gap, at_target_rev_30). A value beyond +-MAX_TARGET_GAP is not a view but a price-adjustment mismatch between
+    the target feed and the price series (or a broken target): it refuses, naming the symbol, column and first date, and is never
+    clipped."""
     gap = np.full(len(sessions), np.nan)
     ok = np.isfinite(now) & (close > 0)
     gap[ok] = now[ok] / close[ok] - 1.0
-    wild = ok & (np.abs(gap) > MAX_TARGET_GAP)
-    if wild.any():
-        i = int(np.argmax(wild))
-        raise PanelDataError(f"{symbol}: at_target_gap {gap[i]:+.1f} on {sessions[i].date()} (mean adjPriceTarget {now[i]:.2f} "
-                             f"vs close {close[i]:.2f}) is beyond +-{MAX_TARGET_GAP:g}: a price-adjustment mismatch, refusing "
-                             f"to clip it")
-    out["at_target_gap"] = gap
     rev = np.full(len(sessions), np.nan)
-    ok = np.isfinite(now) & np.isfinite(before) & (before > 0)
-    rev[ok] = np.clip(now[ok] / before[ok] - 1.0, -5.0, 5.0)
-    out["at_target_rev_30"] = rev
+    ok_r = np.isfinite(now) & np.isfinite(before) & (before > 0)
+    rev[ok_r] = now[ok_r] / before[ok_r] - 1.0
+    for name, series in (("at_target_gap", gap), ("at_target_rev_30", rev)):
+        wild = np.isfinite(series) & (np.abs(series) > MAX_TARGET_GAP)
+        if wild.any():
+            i = int(np.argmax(wild))
+            raise PanelDataError(f"{symbol}: {name} {series[i]:+.1f} on {sessions[i].date()} (mean adjPriceTarget {now[i]:.2f}, "
+                                 f"close {close[i]:.2f}, 30 days earlier {before[i]:.2f}) is beyond +-{MAX_TARGET_GAP:g}: a "
+                                 f"price-adjustment mismatch or a broken target, refusing to clip it")
+    return gap, rev
+
+
+def check_target_ratios(symbol: str, daily: pd.DataFrame, cache_root: Path) -> None:
+    """The pre-screen of group AT: the ratio refusals of ``_targets_one`` for one symbol, on its loaded daily frame."""
+    from app.services import ml_panel
+    td, adj, _ = _target_arrays(ml_panel._load_json(cache_root, "price_target", symbol), symbol)
+    sessions = daily.index
+    _, now, before = _target_means(sessions, td, adj)
+    _target_ratios(symbol, sessions, daily["close"].to_numpy(dtype="float64"), now, before)
+
+
+def _targets_one(ctx: BuildContext, symbol: str, close: np.ndarray) -> pd.DataFrame:
+    sessions = ctx.sessions
+    td, adj, codes = _target_arrays(_read_fmp_rows("price_target", symbol, ctx), symbol)
+    cov, now, before = _target_means(sessions, td, adj)
+    gap, rev = _target_ratios(symbol, sessions, close, now, before)
     lo, hi = _window_bounds(td, sessions, 90)
-    out["at_n_analysts_90"] = np.where(cov, _distinct(codes, lo, hi), np.nan)
-    out["at_covered"] = cov.astype("float64")
+    out = {"at_target_gap": gap, "at_target_rev_30": rev,
+           "at_n_analysts_90": np.where(cov, _distinct(codes, lo, hi), np.nan), "at_covered": cov.astype("float64")}
     return pd.DataFrame(out, index=sessions)[list(AT_COLUMNS)]
 
 
@@ -1357,12 +1389,13 @@ def analyst_targets(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Dat
     * ``at_target_rev_30``: that 90-day mean over the same mean as seen 30 CALENDAR days earlier, minus 1 (NaN unless both
       instants are covered and have a target);
     * ``at_n_analysts_90``: distinct ``analystCompany`` in the window (two targets of one company count once);
-    * ``at_covered``: 1 from ``PRICE_TARGET_VENDOR_START`` + ``COVERAGE_WARMUP_DAYS`` (the feed holds nothing earlier for any
-      symbol), else 0; for an empty file always 0. After the floor an uncapped file is covered: a quiet period is real.
+    * ``at_covered``: 1 from max(the file's first row, ``PRICE_TARGET_VENDOR_START``) + ``COVERAGE_WARMUP_DAYS``: the feed
+      onboards symbols over time, so every file is treated as capped at its own first row; always 0 for an empty file.
 
     Before coverage every column but the flag is NaN; an empty window after it is 0 names and no gap (``at_n_analysts_90`` is
     the availability measure; the gap is NaN where no target was published, which is information, not a hole). A gap beyond
-    ``MAX_TARGET_GAP`` refuses (naming symbol and date). A missing file refuses."""
+    ``MAX_TARGET_GAP`` refuses (naming symbol and date), and so does a revision beyond it; the pre-screen (``screen_symbols``)
+    finds both so a bad symbol is listed as refused instead of aborting the build. A missing file refuses."""
     frames = {sym: _targets_one(ctx, sym, daily[sym]["close"].to_numpy(dtype="float64")) for sym in ctx.symbols}
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
@@ -1649,11 +1682,18 @@ def screen_symbols(symbols: Sequence[str], first: date, last: date, cache_root: 
     transient: Dict[str, str] = {}
     for sym in symbols:
         try:
-            _, meta = load_daily([sym], min(first, first_cached_bar(sym, cache_root).date()), last, cache_root,
-                                 cache_end=cache_end)
+            frames, meta = load_daily([sym], min(first, first_cached_bar(sym, cache_root).date()), last, cache_root,
+                                      cache_end=cache_end)
             _refuse_if_store_lists_ended(meta["ended"], store_path)
             if "f" in groups:
                 check_fundamentals_files(sym, cache_root)
+            from app.services import ml_panel
+            for g in groups:                                              # the event files a group reads must exist
+                for kind in _FMP_KINDS_BY_GROUP.get(g, ()):
+                    if g != "f":
+                        ml_panel._load_json(cache_root, kind, sym)
+            if "at" in groups:
+                check_target_ratios(sym, frames[sym], cache_root)
         except StaleSeriesError as e:
             transient[sym] = str(e)
         except PanelDataError as e:
@@ -1944,6 +1984,25 @@ def _store_complete(out_dir: Path) -> bool:
     return all((Path(out_dir) / name).exists() for name in STORE_FILES)
 
 
+def _sweep_leftovers(out_dir: Path) -> None:
+    """At the start of a build: a ``<out>.old-*`` directory that is a COMPLETE store while ``out_dir`` is missing is a crash
+    between the two renames of a swap - it is restored; every other ``<out>.building-*`` / ``<out>.old-*`` directory is a
+    leftover of an earlier run and is removed."""
+    import os
+    import shutil
+    out_dir = Path(out_dir)
+    if not out_dir.parent.exists():
+        return
+    olds = sorted(out_dir.parent.glob(f"{out_dir.name}.old-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not out_dir.exists():
+        for old in olds:
+            if _store_complete(old):
+                os.replace(old, out_dir)
+                break
+    for d in list(out_dir.parent.glob(f"{out_dir.name}.old-*")) + list(out_dir.parent.glob(f"{out_dir.name}.building-*")):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _swap_in(built: Path, out_dir: Path) -> None:
     """Replace ``out_dir`` by the fully written ``built`` directory: a reader sees the old store or the new one, never half of
     each (a crash between the two renames leaves no ``features.parquet.meta.json`` at ``out_dir``, i.e. "not built")."""
@@ -2013,6 +2072,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         _spec(g)
     cache_root = Path(CACHE_FOLDER if cache_root is None else cache_root)
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
+    _sweep_leftovers(out_dir)
     symbols = list(dict.fromkeys(symbols))
     extra = [c for c in dict.fromkeys((list(membership.columns) if membership is not None else []) + list(universe or []))
              if c not in symbols]
@@ -2031,7 +2091,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
                                             uses_store=uses_sector and isinstance(sector_of, str))}, sort_keys=True))
     if not force and meta_path.exists() and _store_complete(out_dir):
         old = json.loads(meta_path.read_text(encoding="utf-8"))
-        if "ensure" in old and old["ensure"].get("request") == request:           # nothing changed: no symbol is loaded
+        if "ensure" in old and "request" in old["ensure"] and old["ensure"]["request"] == request:   # unchanged: nothing is loaded
             return {"status": "up_to_date", "out_dir": str(out_dir), "symbols": old["symbols"],
                     "refused": old["ensure"]["refused"], "transient": old["ensure"]["transient"]}
     usable_rows, refused, transient = screen_symbols(symbols, first, last, cache_root, groups, store_path)
@@ -2126,7 +2186,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     building = out_dir.with_name(f"{out_dir.name}.building-{os.getpid()}")      # written whole, then swapped in
     shutil.rmtree(building, ignore_errors=True)
     building.mkdir(parents=True)
-    try:
+    try:                                                             # an incomplete write is useless: removed
         save_features(df, building / "features.parquet")
         report.to_parquet(building / "coverage_report.parquet")
         report.to_csv(building / "coverage_report.csv")
@@ -2135,9 +2195,13 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
         missing = [n for n in STORE_FILES if not (building / n).exists()]
         if missing:
             raise RuntimeError(f"the store build did not write {missing}")
-        _swap_in(building, out_dir)
-    finally:
+    except BaseException:
         shutil.rmtree(building, ignore_errors=True)
+        raise
+    try:
+        _swap_in(building, out_dir)
+    except OSError as e:                                            # the finished build is NOT thrown away
+        raise OSError(f"{e}; the finished build is kept at {building} (the previous store is untouched)") from e
     return {"status": "built", "out_dir": str(out_dir), "symbols": usable_rows, "chunks": len(frames),
             "rows": int(len(df)), "seconds": meta["ensure"]["build_seconds"], "refused": meta["ensure"]["refused"],
             "transient": meta["ensure"]["transient"], "coverage": report}

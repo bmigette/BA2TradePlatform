@@ -452,3 +452,68 @@ def test_the_meta_merges_required_context_and_context_symbols_across_chunks(work
     meta = _meta(out)
     assert {"XLK", "XLF"} <= set(meta["required_context"]) and {"XLK", "XLF"} <= set(meta["context_symbols"])
     assert "AAA" not in meta["context_symbols"] and set(F.MARKET_ETFS) <= set(meta["required_context"])
+
+
+# ---------------------------------------------------------------------------------------------- swap failures, sweep, memo
+def test_a_failed_swap_keeps_the_finished_build_directory(work, tmp_path, monkeypatch):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+
+    def boom(built, target):
+        raise OSError("target is in use")
+    monkeypatch.setattr(F, "_swap_in", boom)
+    with pytest.raises(OSError, match=r"target is in use.*store\.building-"):
+        _ensure(work, out, groups=["t", "mtf", "m"])
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before                  # the old store is intact
+    kept = [p for p in tmp_path.iterdir() if ".building-" in p.name]
+    assert len(kept) == 1 and set(F.STORE_FILES) == {p.name for p in kept[0].iterdir()}      # the finished build survives
+
+
+def test_stale_build_directories_of_other_processes_are_swept(work, tmp_path):
+    out = tmp_path / "store"
+    stale = [tmp_path / "store.building-99999", tmp_path / "store.old-88888"]
+    keep = [tmp_path / "other.building-99999", tmp_path / "store2.old-5", tmp_path / "unrelated"]
+    for d in stale + keep:
+        d.mkdir()
+        (d / "x").write_text("x")
+    _ensure(work, out)
+    assert not any(d.exists() for d in stale)
+    assert all(d.exists() for d in keep)                                               # only this store's leftovers
+
+
+def test_a_store_lost_between_the_two_renames_is_restored_from_the_old_directory(work, tmp_path):
+    out = tmp_path / "store"
+    _ensure(work, out)
+    (tmp_path / "store.old-4242").mkdir()
+    for p in out.iterdir():
+        shutil.move(str(p), str(tmp_path / "store.old-4242" / p.name))
+    out.rmdir()                                                                         # the crash window: no store, an .old dir
+    res = _ensure(work, out)
+    assert set(F.STORE_FILES) == {p.name for p in out.iterdir()} and res["status"] == "up_to_date"
+
+
+def test_the_x_cross_sections_are_computed_once_per_build(work, tmp_path, monkeypatch):
+    calls = {"rank": 0, "z": 0}
+    real_rank, real_z = F._cross_rank, F._cross_z
+    monkeypatch.setattr(F, "_cross_rank", lambda *a, **k: (calls.__setitem__("rank", calls["rank"] + 1), real_rank(*a, **k))[1])
+    monkeypatch.setattr(F, "_cross_z", lambda *a, **k: (calls.__setitem__("z", calls["z"] + 1), real_z(*a, **k))[1])
+    res = _ensure(work, tmp_path / "store", groups=["t", "x"], chunk_size=1)
+    assert res["chunks"] == 3
+    assert calls["rank"] == len(F.X_RANKED) + 1 and calls["z"] == len(F.X_RANKED)       # 7 features + the momentum rank, ONCE
+    direct = _build(work, ["t", "x"], symbols=SYMBOLS, sector_of=SECTOR_OF)
+    stored = pd.read_parquet(tmp_path / "store" / "features.parquet")
+    pd.testing.assert_frame_equal(stored.drop(columns="label_bar_filled"), direct.drop(columns="label_bar_filled"),
+                                  check_exact=True, check_freq=False)
+
+
+def test_the_request_key_is_checked_explicitly_not_through_get(work, tmp_path):
+    """A store written before the request key existed (no "request" in its meta) is simply rebuilt."""
+    out = tmp_path / "store"
+    _ensure(work, out)
+    meta = _meta(out)
+    del meta["ensure"]["request"]
+    (out / "features.parquet.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert _ensure(work, out)["status"] in ("up_to_date", "built")                      # falls through to the inputs comparison
+    import inspect
+    assert '.get("request")' not in inspect.getsource(F.ensure_feature_store)

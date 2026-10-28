@@ -57,7 +57,7 @@ def _reference(sessions, close, grades=GRADES, targets=TARGETS):
     """Brute force: every column from the rows, session by session (window = rows dated in [T - N days, T))."""
     g = [(pd.Timestamp(d), c, a) for d, c, a in grades]
     t = [(pd.Timestamp(d[:10]), c, v) for d, c, v in targets]
-    t_cov = FLOOR
+    t_cov = max(min(x[0] for x in t) + pd.Timedelta(days=90), FLOOR)       # per file: first row + 90 days, never before the floor
 
     def win(rs, T, n):
         return [r for r in rs if T - pd.Timedelta(days=n) <= r[0] < T]
@@ -116,9 +116,9 @@ def test_hand_checked_values(analyst_cache):
     d = t("2023-04-10")
     assert f.loc[d, "ag_covered"] == 1 and f.loc[d, "ag_net_upgrades_90"] == 2 and f.loc[d, "ag_net_upgrades_30"] == 1
     assert f.loc[d, "ag_n_graders_90"] == 3                                                  # Alpha counted once
-    # targets: covered from the vendor floor (2021-07-11) on; a quiet period before the first row is real (no gap, 0 analysts)
-    assert f.loc[t("2023-01-03"), "at_covered"] == 1 and np.isnan(f.loc[t("2023-01-03"), "at_target_gap"])
-    assert f.loc[t("2023-01-03"), "at_n_analysts_90"] == 0
+    # targets: the feed onboards symbols over time, so coverage starts 90 days after THIS file's first row (2023-02-01 -> 05-02)
+    assert f.loc[t("2023-05-01"), "at_covered"] == 0 and f.loc[t("2023-05-01"), ["at_target_gap", "at_n_analysts_90"]].isna().all()
+    assert f.loc[t("2023-01-03"), "at_covered"] == 0
     d = t("2023-05-02")
     assert f.loc[d, "at_covered"] == 1 and f.loc[d, "at_target_gap"] == pytest.approx(115.0 / close.loc[d] - 1)
     assert f.loc[d, "at_n_analysts_90"] == 3                                                # Alpha twice counts once
@@ -171,19 +171,24 @@ def test_only_the_per_analyst_files_are_opened_each_group_its_own(analyst_cache,
     assert names() == ["price_target__AAA.json", "price_target__BBB.json"]
 
 
-def test_price_target_coverage_starts_90_days_after_the_vendor_floor_not_the_files_first_row(analyst_cache, tmp_path):
+def test_price_target_coverage_starts_at_the_later_of_first_row_plus_90_and_the_vendor_floor_plus_90(analyst_cache, tmp_path):
     root = tmp_path / "c"
     shutil.copytree(analyst_cache, root)
+    t = pd.Timestamp
+    assert F.PRICE_TARGET_VENDOR_START == date(2021, 4, 12)
+    # a symbol present from the feed's first day: covered from the floor + 90 days (2021-07-11, a Sunday)
     write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", [("2021-04-12T10:00:00.000Z", "Alpha", 100.0),
                                                                     ("2023-02-01T10:00:00.000Z", "Beta", 100.0)]))
     f = _abuild(root, groups=("at",), symbols=("AAA",), first=date(2021, 6, 1), last=date(2021, 9, 30)).loc["AAA"]
-    t = pd.Timestamp
-    assert F.PRICE_TARGET_VENDOR_START == date(2021, 4, 12)
     assert f.loc[t("2021-07-09"), "at_covered"] == 0 and f.loc[t("2021-07-09"), ["at_target_gap", "at_n_analysts_90"]].isna().all()
-    assert f.loc[t("2021-07-12"), "at_covered"] == 1                                       # 2021-04-12 + 90 days = 07-11 (Sunday)
-    # an uncapped file whose first row is years later is covered from the same floor: its quiet months are real
-    g = _abuild(root, groups=("at",), symbols=("AAA",), first=date(2021, 9, 1), last=date(2021, 9, 30)).loc["AAA"]
-    assert (g["at_covered"] == 1).all() and (g["at_n_analysts_90"] >= 0).all() and g["at_target_gap"].isna().sum() > 0
+    assert f.loc[t("2021-07-12"), "at_covered"] == 1
+    # a symbol the feed onboarded later (its first target is 2022-04-29): covered 90 days after THAT row, not at the floor
+    write_fmp_rows(root, "price_target", "BBB", _target_rows("BBB", [("2022-04-29T14:00:00.000Z", "Alpha", 100.0),
+                                                                    ("2022-06-01T14:00:00.000Z", "Beta", 100.0)]))
+    g = _abuild(root, groups=("at",), symbols=("BBB",), first=date(2022, 7, 1), last=date(2022, 8, 31)).loc["BBB"]
+    assert g.loc[t("2022-07-27"), "at_covered"] == 0 and g.loc[t("2022-07-27"), ["at_target_gap", "at_n_analysts_90"]].isna().all()
+    assert g.loc[t("2022-07-28"), "at_covered"] == 1 and g.loc[t("2022-07-28"), "at_n_analysts_90"] == 2   # 04-29 + 90 days
+    assert (g.loc["2022-07-28":, "at_covered"] == 1).all()
 
 
 def test_a_target_gap_beyond_the_limit_refuses_instead_of_clipping(analyst_cache, tmp_path):
@@ -191,8 +196,8 @@ def test_a_target_gap_beyond_the_limit_refuses_instead_of_clipping(analyst_cache
     shutil.copytree(analyst_cache, root)
     close = _raw(analyst_cache, "AAA")["Close"]
     write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", [("2023-02-01T10:00:00.000Z", "Alpha", float(close.iloc[100]) * 20)]))
-    with pytest.raises(P.PanelDataError, match=r"AAA.*at_target_gap \+\d.*on 2023-02-0\d.*adjustment mismatch"):
-        _abuild(root, groups=("at",), symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 3, 31))
+    with pytest.raises(P.PanelDataError, match=r"AAA.*at_target_gap \+\d.*on 2023-05-0\d.*adjustment mismatch"):         # coverage starts 90 days after the file's first row
+        _abuild(root, groups=("at",), symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 6, 30))
     assert F.MAX_TARGET_GAP == 5.0
 
 
@@ -230,6 +235,32 @@ def _truncate_analyst(trunc, day):
             key = "date" if p.name.startswith("analyst_grades") else "publishedDate"
             rows = json.loads(p.read_text())
             p.write_text(json.dumps([r for r in rows if str(r[key])[:10] < str(day)]))
+
+
+def test_a_wild_target_revision_refuses_instead_of_clipping(analyst_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(analyst_cache, root)
+    close = _raw(analyst_cache, "AAA")["Close"]
+    now = float(close.loc["2023-06-01"]) * 3.0                                   # a sane gap (+2) ...
+    rows = [("2021-05-01T10:00:00.000Z", "Old", now / 19.0), ("2023-03-01T10:00:00.000Z", "Alpha", now / 19.0),
+            ("2023-05-15T10:00:00.000Z", "Beta", now)]                            # ... but the mean moved 19x in 30 days
+    write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", rows))
+    with pytest.raises(P.PanelDataError, match=r"AAA.*at_target_rev_30 \+\d+\.\d on 2023-0[56]-\d\d.*beyond"):
+        _abuild(root, groups=("at",), symbols=("AAA",), first=date(2023, 1, 3), last=date(2023, 7, 31))
+
+
+def test_the_target_ratio_refusals_are_found_by_the_pre_screen_not_late_in_the_build(analyst_cache, tmp_path):
+    root = tmp_path / "c"
+    shutil.copytree(analyst_cache, root)
+    close = _raw(analyst_cache, "AAA")["Close"]
+    write_fmp_rows(root, "price_target", "AAA", _target_rows("AAA", [("2021-05-01T10:00:00.000Z", "Old", float(close.iloc[100]) * 20),
+                                                                    ("2023-02-01T10:00:00.000Z", "Alpha", float(close.iloc[100]) * 20)]))
+    usable, permanent, transient = F.screen_symbols(["AAA", "BBB", "SPY"], FIRST, LAST, root, ["at"])
+    assert usable == ["BBB"] and not transient
+    assert "at_target_gap" in permanent["AAA"] and "SPY" in permanent["SPY"]         # a file the group needs but SPY lacks
+    res = F.ensure_feature_store(tmp_path / "store", ["AAA", "BBB"], FIRST, LAST, ["t", "at"], cache_root=root, chunk_size=1)
+    assert res["status"] == "built" and set(res["refused"]) == {"AAA"} and res["symbols"] == ["BBB"]
+    assert "at_target_gap" in res["refused"]["AAA"]
 
 
 @pytest.mark.parametrize("day", [date(2023, 11, 15), date(2023, 4, 10), date(2023, 5, 2), date(2023, 6, 1)])
