@@ -467,9 +467,68 @@ def account_available_equity_detail(account: Any, *, exclude_transaction_id: Opt
         reason = f"account {account.id} buying power unreadable ({type(e).__name__}: {e})"
         logger.error(f"Option entry (no expert) REFUSED: {reason}", exc_info=True)
         return None, (reason,)
+    if actual is not None:
+        try:
+            actual -= overalloc_reserved_by_others(account, exclude_expert_id=None, equity_base=True)
+        except CapitalUnmeasurable as e:
+            return None, e.names
+        except ValueError as e:
+            return None, (f"account {account.id} over-allocation reserve unreadable: {e}",)
     if actual is not None and actual < available:
         available = actual
     return available, ()
+
+
+#: Expert setting: the share of the ACCOUNT (%) kept for this expert when the experts on the
+#: account are over-allocated (their virtual_equity_pct sum past 100 %). 0 = no reserve.
+OVERALLOC_MIN_RES_PCT = "overalloc_min_res_pct"
+
+
+def overalloc_reserved_by_others(account: Any, *, exclude_expert_id: Optional[int],
+                                 equity_base: bool) -> float:
+    """The capital the OTHER enabled experts on ``account`` hold in reserve, which an entry by
+    ``exclude_expert_id`` (``None``: an expert-less entry, every expert counts) may not spend.
+
+    Per expert E with ``overalloc_min_res_pct`` r > 0:
+    ``max(0, min(r, E.virtual_equity_pct) / 100 x account figure - E.used)`` -- the part of its
+    reserve E has not deployed yet. The account figure and the used convention are the caller's
+    path's (``equity_base``: option capital equity, no loss adjustment; else the tradable balance,
+    loss-adjusted), so the reserve is measured the way E's own available balance is.
+
+    Applied to the ACCOUNT'S real spendable balance, never to an expert's virtual bookkeeping: it only
+    binds when the account cannot fund every expert's slice, i.e. when it is over-allocated. With no
+    reserving expert (every backtest: one expert per account) it is 0.0 and reads no account figure.
+
+    Raises ``ValueError`` on a reserve outside [0, 100] or an unreadable account figure, and
+    ``CapitalUnmeasurable`` when a reserving expert's commitment cannot be valued: unknown never reads
+    as room.
+    """
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.instance_resolver import get_instance_resolver
+    reserving = []
+    for row in get_all_instances(ExpertInstance):
+        if row.account_id != account.id or not row.enabled or row.id == exclude_expert_id:
+            continue
+        pct = get_instance_resolver().get_expert_instance(row.id).settings[OVERALLOC_MIN_RES_PCT]
+        pct = 0.0 if pct is None else float(pct)
+        if not 0.0 <= pct <= 100.0:
+            raise ValueError(f"expert {row.id} {OVERALLOC_MIN_RES_PCT}={pct} is outside [0, 100]")
+        if pct > 0.0:
+            reserving.append((row, pct))
+    if not reserving:
+        return 0.0
+    figure = account.option_capital_equity() if equity_base else account.get_tradable_balance()
+    reserved = 0.0
+    for row, pct in reserving:
+        cap = figure * min(pct, row.virtual_equity_pct) / 100.0
+        used = used_balance_for_transactions(account, capital_transactions(row.id),
+                                             loss_adjusted=not equity_base)
+        if cap > used:
+            reserved += cap - used
+        logger.debug(f"Account {account.id}: expert {row.id} reserves {pct}% (${cap:,.2f}), "
+                     f"uses ${used:,.2f}, still held back ${max(0.0, cap - used):,.2f}")
+    return reserved
+
 
 #: The programming errors that no handler turns into a "reason" (they are bugs, not broker conditions).
 _PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, ImportError, ZeroDivisionError,
@@ -662,6 +721,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "float", "required": False, "default": 10.0,
                     "description": "Minimum available balance percentage required to enter new market positions (%)",
                     "tooltip": "Minimum percentage of virtual balance that must remain available before the expert stops opening new positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management."
+                },
+                "overalloc_min_res_pct": {
+                    "type": "float", "required": False, "default": 0.0,
+                    "description": "Account share reserved for this expert when the account is over-allocated (%)",
+                    "tooltip": "When the experts on this account are given more than 100% of it in total (virtual equity % summed), the other experts may not spend the part of this reserve this expert has not deployed yet. E.g. 15 keeps 15% of the account for this expert (capped at its own virtual equity %). It never limits this expert itself. 0 (default) = no reserve."
                 },
                 # Risk Management Settings
                 "max_virtual_equity_per_instrument_percent": {
@@ -1847,6 +1911,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # the account can actually spend. Cap it at the broker's real available balance so an
             # expert is never told it can afford more than the account actually has.
             actual_available = self._get_actual_available_balance(account, expert_id=self.id)
+            if actual_available is not None:
+                # The undeployed reserve of the OTHER experts (overalloc_min_res_pct) is not this
+                # expert's to spend: on an over-allocated account the reserving expert keeps it.
+                try:
+                    reserved = overalloc_reserved_by_others(account, exclude_expert_id=self.id,
+                                                            equity_base=equity_base)
+                except CapitalUnmeasurable as e:
+                    if failure is not None:
+                        failure.extend(e.names)
+                    logger.error(f"Expert {self.id}: another expert's reserve is unmeasurable: {e}")
+                    return None
+                if reserved > 0.0:
+                    logger.debug(f"Expert {self.id}: account available=${actual_available} less "
+                                 f"${reserved:,.2f} reserved by other experts")
+                    actual_available -= reserved
             if actual_available is not None and actual_available < available_balance:
                 logger.debug(f"Expert {self.id}: virtual available=${available_balance} exceeds "
                             f"actual account available=${actual_available} (oversubscription or "
