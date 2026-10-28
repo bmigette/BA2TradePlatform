@@ -1035,7 +1035,7 @@ def test_the_cli_turns_ctrl_c_into_a_clean_exit(monkeypatch, capsys):
         raise KeyboardInterrupt
     monkeypatch.setattr(grid, "handle_ml_grid", interrupted)
     args = types.SimpleNamespace(config="c.json", out="o", cpu_slots=1, gpu_slots=0, limit_cells=None,
-                                 cache_root=None, cores=2, rerun_mismatched=False)
+                                 cache_root=None, cores=2, rerun_mismatched=False, report_only=None)
     assert L._cmd_ml_grid(args) == 130
     assert "interrupted" in capsys.readouterr().out
 
@@ -1558,3 +1558,125 @@ def test_workers_stagger_their_first_panel_load_by_their_index(signal_world, tmp
     G._panel_for(c1, str(signal_world[2]))
     assert slept == [] and G._WORKER["index"] == 0
     G._WORKER["limits"].restore_original_limits()
+
+
+# ------------------------------------------------------------------ gate / report / dashboard hooks
+def fake_task(cfg, seed, key):
+    """A module-level per-task function that fabricates a finished row (no fitting)."""
+    name = G.PRIMARY[cfg["track"]]
+    c = G.validate_cell(cfg)                           # a resumable row: the real identity and a predictions file
+    syms = tuple(sorted(G.resolve_symbols(c.symbols)))
+    first, last, _ = G.store_span(c.store, syms)
+    ident = G.identity_of(c, G._WORKER["settings"], G.daily_fingerprint(G._WORKER["cache_root"], syms, first, last))
+    pred = Path(G._WORKER["out_dir"]) / "predictions" / f"{key}_{seed}.parquet"
+    pred.parent.mkdir(parents=True, exist_ok=True)
+    pred.write_bytes(b"")
+    return {"cell_key": key, "seed": seed, "track": cfg["track"], "label": G._label_of(cfg), "status": "ok",
+            "n_rows": 10, "skipped_blocks": [], "timings": {"total": 0.1}, "config": {k: v for k, v in cfg.items()
+                                                                                       if k != "seeds"},
+            "n_blocks": 31, "n_blocks_fitted": 31, "seeds_run": 1, "low_iter_share": 0.0,
+            "primary": {"name": name, "value": 0.01 * seed},
+            "regimes": {name: {"all": {"mean": 0.01, "t": 1.0, "n": 10}}},
+            "controls": {"p_value": 0.5, "primary": "shuffle_symbols", "shuffle_symbols": {"mean": 0.0}},
+            "identity": ident, "versions": {"code": "c0de"}}
+
+
+def _horizon_cells(world, n):
+    return [cell(world[0], target={"kind": "rel_return", "horizon": h}) for h in (1, 3, 5, 10, 20)[:n]]
+
+
+@pytest.mark.parametrize("n_cells, expected", [
+    (5, [(0, False), (2, False), (4, False), (5, True)]),
+    (4, [(0, False), (2, False), (4, True)]),            # the cadence build at 4 would duplicate the final one
+])
+def test_the_dashboard_is_rebuilt_at_the_start_every_n_finished_rows_and_at_the_end(signal_world, tmp_path,
+                                                                                    monkeypatch, n_cells, expected):
+    calls = []
+    monkeypatch.setattr(G, "DASHBOARD_EVERY", 2)
+    monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
+    run(_horizon_cells(signal_world, n_cells), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert calls == expected
+
+
+def test_errors_count_as_finished_rows_for_the_cadence(signal_world, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(G, "DASHBOARD_EVERY", 2)
+    monkeypatch.setattr(G, "_refresh_outputs", lambda out, summary, final, finished: calls.append((finished, final)))
+
+    def sometimes_error(cfg, seed, key):
+        if cfg["target"]["horizon"] in (3, 10):
+            return G._error_record(key, seed, "boom", "l")
+        return fake_task(cfg, seed, key)
+    run(_horizon_cells(signal_world, 4), tmp_path / "o", signal_world, task_fn=sometimes_error)
+    assert calls == [(0, False), (2, False), (4, True)]
+
+
+def test_the_default_cadence_is_twenty_rows():
+    assert G.DASHBOARD_EVERY == 20
+
+
+def test_a_finished_run_leaves_report_dashboard_and_run_summary(signal_world, tmp_path):
+    out = tmp_path / "o"
+    res = run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task)
+    assert res["done"] == 3
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    saved = json.loads((out / "run_summary.json").read_text(encoding="utf-8"))
+    assert saved["done"] == 3 and saved["errors"] == 0 and saved["pool_rebuilds"] == 0 and saved["planned_tasks"] == 3
+    md = (out / "report.md").read_text(encoding="utf-8")
+    assert re.search(r"rows done\D+3 of 3", md) and "pool_rebuilds" in md
+    assert not list(out.glob("*.tmp"))
+
+
+def test_a_resumed_run_with_nothing_left_still_rebuilds_the_outputs(signal_world, tmp_path):
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    (out / "report.md").unlink()
+    (out / "dashboard.html").unlink()
+    res = run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    assert res["done"] == 0 and (out / "report.md").exists() and (out / "dashboard.html").exists()
+
+
+def test_a_failing_dashboard_rebuild_never_stops_the_grid(signal_world, tmp_path, monkeypatch):
+    import app.services.ml_grid_report as RP
+
+    def boom(*a, **k):
+        raise OSError("the dashboard file is open in another program")
+    monkeypatch.setattr(RP, "refresh", boom)
+    res = run(_horizon_cells(signal_world, 2), tmp_path / "o", signal_world, task_fn=fake_task)
+    assert res["done"] == 2 and len(G.read_results(tmp_path / "o" / "results.jsonl")) == 2
+
+
+def test_a_cancelled_run_still_writes_the_final_outputs(signal_world, tmp_path):
+    out = tmp_path / "o"
+    n = {"i": 0}
+
+    def cancel_after_one():
+        n["i"] += 1
+        return n["i"] > 1
+    res = run(_horizon_cells(signal_world, 3), out, signal_world, task_fn=fake_task, cancel_check=cancel_after_one)
+    assert res["cancelled"] and res["done"] == 1
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    assert json.loads((out / "run_summary.json").read_text(encoding="utf-8"))["cancelled"] is True
+
+
+def test_report_only_rebuilds_from_an_existing_dir_and_runs_nothing(signal_world, tmp_path, monkeypatch, capsys):
+    import ba2test_launcher as L
+    import app.services.ml_grid as grid
+    out = tmp_path / "o"
+    run(_horizon_cells(signal_world, 2), out, signal_world, task_fn=fake_task)
+    for name in ("report.md", "dashboard.html"):
+        (out / name).unlink()
+    monkeypatch.setattr(grid, "handle_ml_grid", lambda *a, **k: pytest.fail("report-only must not run the grid"))
+    monkeypatch.setattr(grid, "run_grid", lambda *a, **k: pytest.fail("report-only must not run the grid"))
+    assert L.main(["ml-grid", "--report-only", str(out)]) == 0
+    assert (out / "report.md").exists() and (out / "dashboard.html").exists()
+    printed = capsys.readouterr().out
+    assert "dashboard.html" in printed and "report.md" in printed
+
+
+def test_report_only_refuses_a_missing_dir_and_the_other_flags_stay_required_without_it(tmp_path, capsys):
+    import ba2test_launcher as L
+    assert L.main(["ml-grid", "--report-only", str(tmp_path / "nope")]) != 0
+    assert "results.jsonl" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        L.main(["ml-grid", "--out", str(tmp_path)])                      # no --report-only, no --config / --cpu-slots

@@ -149,7 +149,8 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
     the top ``max_survivors`` of its track), ``rank`` (among the track's passing cells), ``state`` (survivor / capped /
     fail / pending / excluded / baseline / not gated), ``reasons`` (one string per failed condition) and ``note``.
     ``survivors``: the survivors of both tracks, each track best first; ``by_track`` the same per track; ``effects``:
-    the ``factor_effects`` tables per track under the same coverage / low-iteration filters."""
+    the ``factor_effects`` tables per track (coverage filter only: near-constant models are still in the factor tables);
+    ``excluded``: per track the cells the gate dropped (coverage or near-constant models) with the reason."""
     rows = G.read_results(cell_results) if isinstance(cell_results, (str, Path)) else list(cell_results)
     last: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for r in rows:
@@ -160,13 +161,16 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
     params = {"max_p": max_p, "min_regimes": min_regimes, "max_survivors": max_survivors, "regimes": list(GATE_REGIMES),
               "hard_regimes": list(HARD_REGIMES), "cost_bps": min_cost_bps, "min_coverage": min_coverage,
               "max_low_iter_share": max_low_iter_share}
-    effects, kept, excluded = {}, {}, {}
+    # The factor tables and the baselines see every cell with enough coverage; the gate also drops near-constant models.
+    effects, kept, excluded, excluded_tables = {}, {}, {}, {}
     for track in G.TRACKS:
-        fx = G.factor_effects(rows, track, min_coverage, max_low_iter_share)
+        fx = G.factor_effects(rows, track, min_coverage, None)
         effects[track] = fx
         for _, c in fx["cells"].iterrows():
             kept[c["cell_key"]] = c
-        for _, c in fx["excluded"].iterrows():
+        gated = fx if max_low_iter_share is None else G.factor_effects(rows, track, min_coverage, max_low_iter_share)
+        excluded_tables[track] = gated["excluded"]
+        for _, c in gated["excluded"].iterrows():
             excluded[c["cell_key"]] = c["reason"]
     metric_of = lambda track: G.PRIMARY[track]                                                 # noqa: E731
     # baselines: kept cells of the baseline families, by match key
@@ -202,14 +206,16 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
                 c = kept[key]
                 rec.update(mean=float(c["mean"]), std=float(c["std"]), score=float(c["score"]))
             continue
+        c = kept[key] if key in kept else None
+        if c is not None:
+            rec.update(mean=float(c["mean"]), std=float(c["std"]), score=float(c["score"]),
+                       p_value=float(c["p_value"]))
         if key in excluded:
             rec.update(state="excluded", reasons=[f"excluded: {excluded[key]}"])
             continue
-        c = kept[key] if key in kept else None
         if c is None:
             rec.update(state="excluded", reasons=["excluded: no usable seed (no primary metric)"])
             continue
-        rec.update(mean=float(c["mean"]), std=float(c["std"]), score=float(c["score"]), p_value=float(c["p_value"]))
         rec["null_mean"] = _null_mean(ok)
         reasons: List[str] = []
         planned = max([int(r["seeds_run"]) for r in ok if "seeds_run" in r] or [len(ok)])
@@ -285,7 +291,7 @@ def gate(cell_results: Union[str, Path, Sequence[Dict[str, Any]]], *, max_p: flo
     records.sort(key=lambda r: (G.TRACKS.index(r["track"]), state_order[r["state"]],
                                 -(r["score"] if math.isfinite(r["score"]) else -math.inf), r["key"]))
     return {"cells": records, "survivors": [r for t in G.TRACKS for r in by_track[t]], "by_track": by_track,
-            "params": params, "effects": effects}
+            "params": params, "effects": effects, "excluded": excluded_tables}
 
 
 # ================================================================== run state
@@ -332,11 +338,11 @@ def collect_state(out_dir: Union[str, Path], summary: Optional[Dict[str, Any]] =
                     and "code" in r["versions"]})
     return {"out_dir": out, "rows": rows, "n_rows": len(keys), "n_errors": len(err_keys - keys), "summary": merged,
             "gate": gate(rows), "identity": {"dir": out.name, "code": G.library_versions()["code"], "row_codes": codes,
-                                            "updated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")}}
+                                            "updated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC%z")}}
 
 
 def _excluded_counts(state: Dict[str, Any]) -> Dict[str, int]:
-    return {t: int(len(state["gate"]["effects"][t]["excluded"])) for t in G.TRACKS}
+    return {t: int(len(state["gate"]["excluded"][t])) for t in G.TRACKS}
 
 
 # ================================================================== report.md
@@ -433,7 +439,7 @@ def render_report(state: Dict[str, Any]) -> str:
     out += ["## Excluded cells", ""]
     any_ex = False
     for track in G.TRACKS:
-        ex = g["effects"][track]["excluded"]
+        ex = g["excluded"][track]
         if len(ex):
             any_ex = True
             out += [f"### {track}", "", _md_table(

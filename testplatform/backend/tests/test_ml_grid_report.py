@@ -171,6 +171,10 @@ def test_cells_excluded_by_coverage_or_near_constant_models_fail_with_that_reaso
     assert cs["flat"]["state"] == "excluded" and any("low_iter_share" in r for r in cs["flat"]["reasons"])
     assert cs["ok"]["passed"]
     assert [s["key"] for s in res["survivors"]] == ["ok"]
+    assert cs["flat"]["mean"] == pytest.approx(0.05) and cs["flat"]["p_value"] == pytest.approx(0.01)   # still shown
+    assert set(res["excluded"]["selection"]["cell_key"]) == {"thin", "flat"}
+    eff = set(res["effects"]["selection"]["cells"]["cell_key"])
+    assert "flat" in eff and "thin" not in eff                  # the factor tables only drop what coverage drops
     loose = cells_of(R.gate(rows, max_low_iter_share=None, min_coverage=0.0))
     assert loose["thin"]["passed"] and loose["flat"]["passed"]
 
@@ -282,7 +286,7 @@ def test_report_md_holds_the_factor_tables_the_gate_table_survivors_and_the_run_
         assert needle in md, needle
     assert re.search(r"rows done\D+\d+", md, re.I) and re.search(r"errors\D+1\b", md, re.I)
     assert re.search(r"pool_rebuilds\D+2\b", md)
-    assert re.search(r"excluded\D+1\b", md, re.I)                              # 'thin': coverage
+    assert re.search(r"\| excluded cells \| 1 \(selection 1, timing 0\)", md)      # 'thin': coverage
     assert "coverage" in md                                                     # the exclusion reason is shown
     assert "| train_months |" in md or "train_months" in md and "groups" in md
     surv = md.split("## Survivors")[1].split("\n## ")[0]

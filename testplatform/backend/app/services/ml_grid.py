@@ -1542,6 +1542,21 @@ def run_grid(cells: Sequence[Cell], out_dir: Union[str, Path], cpu_slots: int, g
         release_lock(lock)
 
 
+#: the dashboard is rebuilt after every this many finished rows (results and errors alike), at the start and at the end
+DASHBOARD_EVERY = 20
+
+
+def _refresh_outputs(out: Path, summary: Dict[str, Any], final: bool, finished: int) -> None:
+    """Rebuild ``dashboard.html`` (``final``: also the gate, ``report.md`` and ``run_summary.json`` is saved either way).
+    Reporting must never stop a grid: whatever goes wrong (an open file, a bad row) is logged and the run goes on."""
+    try:
+        from app.services import ml_grid_report
+        ml_grid_report.refresh(out, summary, final)
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning(f"ml_grid: could not rebuild the dashboard / report in {out} after {finished} rows: {e}",
+                       exc_info=True)
+
+
 def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: str, st: GridSettings,
                 progress, inline: bool, rerun_mismatched: bool, cancelled, task_fn) -> Dict[str, Any]:
     res_path, err_path = out / "results.jsonl", out / "errors.jsonl"
@@ -1558,8 +1573,13 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
     summary = {"tasks": len(tasks), "done": 0, "skipped_existing": skipped_existing, "errors": 0, "cancelled": False,
                "pool_rebuilds": 0, "out_dir": str(out)}
     say(f"ml_grid: {len(cells)} cells, {len(tasks)} (cell, seed) tasks to run, {skipped_existing} already finished")
+
+    def refresh(final: bool, finished: int) -> None:
+        _refresh_outputs(out, {**summary, "planned_tasks": len(plan), "planned_cells": len(cells)}, final, finished)
     if not tasks:
+        refresh(True, 0)
         return summary
+    refresh(False, 0)
     import shutil
     est = estimate_disk(tasks, st)
     free = shutil.disk_usage(out).free
@@ -1574,17 +1594,20 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
             summary["errors"] += 1
             _append(err_path, r)
             say(f"ml_grid ERROR cell {r['cell_key']} seed {r['seed']} ({r['label']}): {r['error']}")
-            return
-        _append(res_path, r)
-        summary["done"] += 1
-        p = r["primary"]
-        c = r["controls"] if isinstance(r["controls"], dict) else {}
-        pv = c["p_value"] if "p_value" in c else None
-        say(f"ml_grid [{summary['done'] + summary['errors']}/{len(tasks)}] cell {r['cell_key']} seed {r['seed']} "
-            f"{r['label']}: {p['name']}={'n/a' if p['value'] is None else format(p['value'], '+.4f')}"
-            f"{'' if pv is None else f' p={pv:.3f}'} rows={r['n_rows']} "
-            f"skipped={len(r['skipped_blocks'])} ({r['timings']['total']:.0f}s)",
-            min(99.0, 100.0 * (summary["done"] + summary["errors"]) / len(tasks)))
+        else:
+            _append(res_path, r)
+            summary["done"] += 1
+            p = r["primary"]
+            c = r["controls"] if isinstance(r["controls"], dict) else {}
+            pv = c["p_value"] if "p_value" in c else None
+            say(f"ml_grid [{summary['done'] + summary['errors']}/{len(tasks)}] cell {r['cell_key']} seed {r['seed']} "
+                f"{r['label']}: {p['name']}={'n/a' if p['value'] is None else format(p['value'], '+.4f')}"
+                f"{'' if pv is None else f' p={pv:.3f}'} rows={r['n_rows']} "
+                f"skipped={len(r['skipped_blocks'])} ({r['timings']['total']:.0f}s)",
+                min(99.0, 100.0 * (summary["done"] + summary["errors"]) / len(tasks)))
+        n = summary["done"] + summary["errors"]
+        if n % DASHBOARD_EVERY == 0 and n < len(tasks):          # the final rebuild covers the last row
+            refresh(False, n)
 
     if inline:
         _init_worker(*init_args)
@@ -1593,8 +1616,9 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
                 summary["cancelled"] = True
                 break
             finish(task_fn(c.config(with_seeds=True), sd, c.key))
-        return summary
-    _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
+    else:
+        _drive_pool(tasks, cpu_slots, init_args, task_fn, finish, cancelled, summary)
+    refresh(True, summary["done"] + summary["errors"])
     return summary
 
 

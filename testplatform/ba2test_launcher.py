@@ -8950,11 +8950,34 @@ def _cmd_ml_search(args) -> int:
     return 0
 
 
+def _ml_grid_report_only(directory: str) -> int:
+    """``ba2-test ml-grid --report-only DIR``: rebuild report.md and dashboard.html from DIR/results.jsonl (the gate
+    included) without running anything."""
+    from pathlib import Path as _Path
+    from app.services import ml_grid_report
+    d = _Path(directory)
+    if not (d / "results.jsonl").exists():
+        print(f"ml-grid --report-only: {d / 'results.jsonl'} not found")
+        return 2
+    st = ml_grid_report.build_outputs(d, report=True)
+    g = st["gate"]
+    print(f"ml-grid --report-only: {st['n_rows']} rows, {st['n_errors']} unresolved errors, "
+          f"{len(g['survivors'])} survivors "
+          f"({', '.join(f'{t} {len(g['by_track'][t])}' for t in ('selection', 'timing'))})")
+    print(f"  report:    {d / ml_grid_report.REPORT_NAME}")
+    print(f"  dashboard: {d / ml_grid_report.DASHBOARD_NAME}")
+    return 0
+
+
 def _cmd_ml_grid(args) -> int:
     """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
     its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
     (cell_key, seed) rows of --out/results.jsonl are skipped."""
     from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
+    if getattr(args, "report_only", None):
+        return _ml_grid_report_only(args.report_only)
+    if args.config is None or args.out is None or args.cpu_slots is None:
+        raise SystemExit("ml-grid: --config, --out and --cpu-slots are required unless --report-only DIR is given")
     payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
                "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
                "settings": None, "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
@@ -9898,9 +9921,11 @@ def main(argv: "list | None" = None) -> int:
 
     # ml-grid: ML exploration v2 stage-1 grid (cells x seeds, out-of-sample walk-forward signals).
     mg = sub.add_parser("ml-grid", help="Stage-1 grid of the ML exploration v2 (cells x seeds, signal-level scoring).")
-    mg.add_argument("--config", required=True, help="JSON file: a list of cells (or {\"cells\": [...]}).")
-    mg.add_argument("--out", required=True, help="Output directory (results.jsonl, predictions/, errors.jsonl).")
-    mg.add_argument("--cpu-slots", type=int, required=True, help="Worker processes for the tabular families.")
+    mg.add_argument("--config", default=None, help="JSON file: a list of cells (or {\"cells\": [...]}). Required unless --report-only.")
+    mg.add_argument("--out", default=None, help="Output directory (results.jsonl, predictions/, errors.jsonl, report.md, dashboard.html). Required unless --report-only.")
+    mg.add_argument("--cpu-slots", type=int, default=None, help="Worker processes for the tabular families. Required unless --report-only.")
+    mg.add_argument("--report-only", default=None, metavar="DIR",
+                    help="Rebuild report.md and dashboard.html (gate included) from DIR/results.jsonl and exit; runs nothing.")
     mg.add_argument("--gpu-slots", type=int, default=0, help="Worker processes for sequence families (none yet).")
     mg.add_argument("--limit-cells", type=int, default=None, help="Run only the first N cells of the config.")
     mg.add_argument("--cache-root", default=None, help="Cache folder holding AlpacaHistoryOHLCVProvider (default: the platform cache).")
