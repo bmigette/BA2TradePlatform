@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.data_preparation import DataPreparationService, frame_bounds, purged_train_row_count
 from app.services.masked_fill import (build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells,
                                        masked_groups, ticker_key)
 
@@ -167,7 +167,7 @@ class TSAITrainingService(ITrainingService):
                 frame is all train.
 
         Cells blanked by the daily source's coverage mask (``<prefix>missing`` == 1) are filled with the
-        train-block median before the scaling (``darts_training.fill_masked_covariates``: the flag stays a
+        train-block median before the scaling (``masked_fill.fill_masked_covariates``: the flag stays a
         feature, a group masked in every row is dropped from ``feature_columns`` with a warning). A frame that
         is not the training one cannot fit that median: it must arrive already filled (the split methods
         do it on the whole frame, fitted on its train rows) or the call is refused.

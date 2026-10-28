@@ -123,6 +123,18 @@ export function storedUniverseSize(generationConfig: Record<string, unknown> | n
   return Array.isArray(universe) && universe.length > 0 ? universe.length : 1;
 }
 
+/**
+ * Size of the universe a dataset will be built over when it is edited or duplicated with `ticker`: the stored universe plus
+ * the ticker when it is not in it yet (the backend always adds the dataset's own ticker); 1 when nothing is stored.
+ */
+export function universeSizeWith(generationConfig: Record<string, unknown> | null | undefined, ticker: string): number {
+  const universe = generationConfig?.daily_universe;
+  const stored = Array.isArray(universe) ? universe.map((s) => String(s).trim().toUpperCase()) : [];
+  const t = ticker.trim().toUpperCase();
+  if (stored.length === 0) return 1;
+  return new Set(t ? [...stored, t] : stored).size;
+}
+
 /** One line for the review step. */
 export function dailySummary(state: DailySourceState, nTickers: number): string {
   const names = DAILY_GROUP_OPTIONS.filter((o) => state.groups.includes(o.id)).map((o) => `${o.name} (${o.id})`);

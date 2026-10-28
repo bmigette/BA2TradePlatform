@@ -334,7 +334,13 @@ class TestRegressionFitness:
     def test_classification_metrics_pass_through(self):
         from app.services.job_handler import metric_fitness
         assert metric_fitness('f1_score', {'f1_score': 0.7}) == 0.7
-        assert metric_fitness('balanced_accuracy', {}) == 0.0
+        assert metric_fitness('balanced_accuracy', {'balanced_accuracy': None}) == 0.0     # no value: the worst fitness
+
+    def test_a_classification_metric_that_was_not_computed_raises_like_the_other_branches(self):
+        from app.services.job_handler import metric_fitness
+        for name in ('balanced_accuracy', 'f1_score', 'mae', 'r2'):
+            with pytest.raises(KeyError, match=name):
+                metric_fitness(name, {'accuracy': 0.5})
 
 
 @pytest.mark.usefixtures('tsai_stack')

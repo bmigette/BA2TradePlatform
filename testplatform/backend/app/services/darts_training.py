@@ -45,7 +45,7 @@ except ImportError:
 
 
 from app.services.masked_fill import (  # noqa: E402  (re-exported: the daily mask fill lives in masked_fill)
-    all_masked_columns, build_masked_fill, fill_masked_covariates, has_daily_flags, has_masked_cells, masked_groups,
+    all_masked_columns, build_masked_fill, fill_masked_covariates, has_daily_flags, masked_groups,
     ticker_key)
 
 

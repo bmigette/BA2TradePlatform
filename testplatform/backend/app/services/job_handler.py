@@ -18,10 +18,9 @@ from pathlib import Path
 
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
-from app.services.data_preparation import frame_bounds, purged_train_row_count, three_way_bounds
+from app.services.data_preparation import frame_bounds
 from app.services.masked_fill import all_masked_columns
-from app.services.ml_dataset_source import is_daily_source
-from app.services.ml_dataset_source import is_alpaca_hist
+from app.services.ml_dataset_source import is_alpaca_hist, is_daily_source
 from app.services.ml_wizard_targets import (
     CROSS_SECTIONAL_DAILY_TYPES, DAILY_TARGET_TYPES, SPARSE_DAILY_TYPES, WIZARD_TARGET_TYPES, WizardTargetError,
     build_cross_sectional_daily_targets, build_daily_target, build_wizard_target, column_names as wizard_column_names)
@@ -1470,7 +1469,9 @@ def metric_fitness(optimize_metric: str, eval_result: Dict[str, Any]) -> float:
 
     Error metrics (mape, mae, mse, rmse) are lower-is-better and map to ``1 / (1 + error)``. R2 is
     higher-is-better but unbounded below; ``1 / (1 + (1 - r2))`` keeps it monotone and positive (the
-    GA only tracks a best above 0). Classification metrics (f1_score, accuracy, ...) pass through.
+    GA only tracks a best above 0). Classification metrics (f1_score, accuracy, ...) pass through. A metric the
+    evaluation did not compute raises ``KeyError`` in every branch (a missing key is a bug, not a fitness of 0); a ``None``
+    value is the worst fitness, 0.
     """
     if optimize_metric in {'mape', 'mae', 'mse', 'rmse'}:
         # The metric must have been computed (a missing key is a bug, not a fitness of 100); a None
@@ -1488,7 +1489,10 @@ def metric_fitness(optimize_metric: str, eval_result: Dict[str, Any]) -> float:
         if r2 is None:
             return 0.0
         return 1.0 / (1.0 + (1.0 - r2))
-    return eval_result.get(optimize_metric, 0.0)
+    if optimize_metric not in eval_result:
+        raise KeyError(f"evaluation result has no '{optimize_metric}' to optimise: {sorted(eval_result)}")
+    value = eval_result[optimize_metric]
+    return 0.0 if value is None else value
 
 
 class TargetBuildError(ValueError):

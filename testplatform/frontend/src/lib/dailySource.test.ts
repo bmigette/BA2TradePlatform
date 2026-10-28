@@ -15,6 +15,7 @@ import {
   timeframeChangeSelections,
   createdNotice,
   storedUniverseSize,
+  universeSizeWith,
   toggleDailyGroup,
   validateDailySource,
 } from './dailySource';
@@ -92,6 +93,15 @@ describe('payload, hydration and summary', () => {
     const generationConfig = { data_provider: 'alpaca_hist', ...payload, daily_universe: ['AAA', 'BBB', 'CCC'] };
     expect(hydrateDailyState(generationConfig)).toEqual({ groups: ['t', 's'], minShare: '0.55' });
     expect(storedUniverseSize(generationConfig)).toBe(3);
+  });
+
+  it('counts the new ticker of a duplicate (or edit) in the universe it joins', () => {
+    const cfg = { daily_universe: ['AAA', 'BBB', 'CCC'] };
+    expect(universeSizeWith(cfg, '')).toBe(3);        // nothing typed yet
+    expect(universeSizeWith(cfg, 'DDD')).toBe(4);     // joins the stored universe
+    expect(universeSizeWith(cfg, ' bbb ')).toBe(3);   // already in it, whatever the spelling
+    expect(universeSizeWith({}, 'DDD')).toBe(1);      // no stored universe: the ticker alone
+    expect(universeSizeWith(undefined, '')).toBe(1);
   });
 
   it('hydrates defaults from a dataset that has no daily options', () => {

@@ -17,8 +17,8 @@ import {
   dailySummary,
   DEFAULT_DAILY_STATE,
   hydrateDailyState,
+  universeSizeWith,
   isDailySource,
-  storedUniverseSize,
   toggleDailyGroup,
   validateDailySource,
 } from '../lib/dailySource';
@@ -232,6 +232,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         macroProvider: savedFundamentals.macroProvider || savedFundamentals.macro_provider || 'fred'
       };
 
+      const dailyState = hydrateDailyState(initialData.generation_config);
       setWizardData({
         name: mode === 'duplicate' ? '' : (initialData.name || ''),  // Clear name for duplicate
         ticker: mode === 'duplicate' ? '' : initialData.ticker,  // Clear ticker for duplicate
@@ -240,8 +241,8 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         endDate,
         dataProvider: initialData.generation_config?.data_provider || 'yfinance',
         panelFeatures: Array.isArray(initialData.generation_config?.panel_features) ? initialData.generation_config.panel_features : [],
-        dailyGroups: hydrateDailyState(initialData.generation_config).groups,
-        dailyMinShare: hydrateDailyState(initialData.generation_config).minShare,
+        dailyGroups: dailyState.groups,
+        dailyMinShare: dailyState.minShare,
         indicators,
         sentiment: sentimentConfig,
         fundamentals: fundamentalsConfig
@@ -569,7 +570,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
   // duplicating (a duplicate with a new ticker joins it), else the single ticker.
   const dailyUniverseSize = (): number => {
     if (batchMode) return batchSymbols.length;
-    if ((mode === 'edit' || mode === 'duplicate') && initialData) return storedUniverseSize(initialData.generation_config);
+    if ((mode === 'edit' || mode === 'duplicate') && initialData) return universeSizeWith(initialData.generation_config, wizardData.ticker);
     return 1;
   };
 
