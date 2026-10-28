@@ -344,3 +344,15 @@ def test_sample_bars_refuses_a_bad_count(cache):
     for bad in (0, -1, 2.5, True):
         with pytest.raises(ValueError, match="per_session"):
             P.sample_bars(panel, bad, seed=0)
+
+
+def test_context_symbols_are_loaded_only_when_the_market_group_is_requested(cache):
+    spec = P.PanelSpec("1h", FIRST, LAST, ("AAA",), ("technical", "daily"), ("SPY", "ZZZ"))     # ZZZ has no cache file
+    panel, meta = P.build_panel(spec, cache)                                     # would raise if ZZZ were loaded
+    assert meta["context"] == [] and not [c for c in meta["features"] if c.startswith("m_")]
+    assert set(meta["source"]) == {"SPY", "AAA"}                                 # SPY: the calendar reference
+    with pytest.raises(P.PanelDataError, match="ZZZ"):
+        P.build_panel(P.PanelSpec("1h", FIRST, LAST, ("AAA",), P.FEATURE_GROUPS, ("SPY", "ZZZ")), cache)
+    plain, plain_meta = P.build_panel(P.PanelSpec("1h", FIRST, LAST, ("AAA",), ("technical", "daily")), cache)
+    pd.testing.assert_frame_equal(panel, plain)                                  # the unused context changes nothing
+    assert plain_meta["context"] == []

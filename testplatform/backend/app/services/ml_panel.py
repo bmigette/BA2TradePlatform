@@ -402,7 +402,8 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
     sessions = regular_sessions(spec.first_day, spec.last_day)
     bps = bars_per_session(spec.timeframe)
     ref = load_bars("SPY", spec.timeframe, sessions, cache_root)
-    loaded = tuple(dict.fromkeys(("SPY",) + tuple(spec.context) + tuple(spec.symbols)))   # SPY: the calendar
+    context = tuple(spec.context) if "market" in spec.groups else ()      # only the market group reads them
+    loaded = tuple(dict.fromkeys(("SPY",) + context + tuple(spec.symbols)))   # SPY: the calendar
     meta_fills: Dict[str, List[str]] = {}
     per: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]] = {}
     for sym in loaded:
@@ -413,7 +414,7 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
         tech = technical_features(b, bps)
         dctx, atr_d = daily_context(b, daily_from_bars(b))
         per[sym] = (b, tech, dctx, atr_d)
-    ctx = {s: per[s][:3] for s in spec.context}
+    ctx = {s: per[s][:3] for s in context}
     sess_list = [d for d in sessions["session"]]
     frames = []
     for sym in spec.symbols:
@@ -436,7 +437,7 @@ def build_panel(spec: PanelSpec, cache_root: Path) -> Tuple[pd.DataFrame, Dict]:
     panel = pd.concat(frames, ignore_index=True)
     feats = feature_columns(panel, spec.groups)
     meta = {"timeframe": spec.timeframe, "bars_per_session": bps, "first_day": str(spec.first_day),
-            "last_day": str(spec.last_day), "symbols": list(spec.symbols), "context": list(spec.context),
+            "last_day": str(spec.last_day), "symbols": list(spec.symbols), "context": list(context),
             "groups": list(spec.groups), "features": feats, "fwd_horizons": list(FWD_HORIZONS),
             "filled_bars": meta_fills, "rows": int(len(panel)),
             "source": {s: _fingerprint(_cache_file(cache_root, s)) for s in loaded}}

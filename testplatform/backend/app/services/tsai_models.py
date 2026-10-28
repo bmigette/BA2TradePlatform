@@ -194,6 +194,8 @@ class TSAIModelService(IModelService):
             'description': 'Extremely fast, minimal training (Dempster 2021)',
             'default_params': {
                 'num_features': 10000,
+                'fc_dropout': 0,
+                'random_state': None,
             },
             'param_ranges': {
                 'num_features': [5000, 10000, 20000],
@@ -397,9 +399,9 @@ class TSAIModelService(IModelService):
             # whatever batch comes first). ml_models_seq.TsaiAdapter does that.
             model = model_class(
                 c_in=c_in, c_out=c_out, seq_len=seq_len,
-                num_features=p.get('num_features', 10000),
-                fc_dropout=p.get('fc_dropout', 0),
-                random_state=p.get('random_state'),
+                num_features=p['num_features'],
+                fc_dropout=p['fc_dropout'],
+                random_state=p['random_state'],
             )
         elif model_type == 'patchtst':
             # PatchTST for classification - ensure patch_len divides evenly into seq_len

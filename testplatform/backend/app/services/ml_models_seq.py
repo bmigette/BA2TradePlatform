@@ -28,17 +28,26 @@ mapped back at predict), quantile (darts) = the realised H-step return (validate
 fitted on the fold's training rows only, float32 throughout, optional symbol id channel or one-hot, warm-up windows
 dropped).
 
-Determinism. Every random draw is seeded (weights, shuffling, dropout, MiniRocket kernels, Darts sampling) inside a
-``fork_rng`` scope, so the global torch / numpy generators are left as they were. On the GPU the result is bitwise
-repeatable only with ``torch.backends.cudnn.deterministic = True`` (and ``benchmark = False``): the adapters do not
-change those global flags, the caller does.
+Determinism and numerics policy. Every random draw is seeded (weights, shuffling, dropout, MiniRocket kernels) inside
+a ``fork_rng`` scope, so the global torch / numpy generators are left as they were; the Darts deciles use one fixed
+set of uniform draws seeded with the fit seed. On the GPU the result is bitwise repeatable only with
+``torch.backends.cudnn.deterministic = True`` and ``cudnn.benchmark = False``. The adapters NEVER change global
+backend flags or precision: ``cudnn.deterministic`` / ``benchmark``, ``cudnn.allow_tf32`` (PyTorch default: on for
+convolutions), ``cuda.matmul.allow_tf32`` and ``set_float32_matmul_precision`` (default: full float32 matmul) are set
+once per process by the caller, who owns the speed / reproducibility trade-off. Fits made with different TF32
+settings are not comparable.
+
+GPU memory. ``release()`` (both adapters) hands it back after a fit's predictions are done.
 """
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -47,6 +56,8 @@ import pandas as pd
 
 from app.services.ml_models import (QUANTILE_LEVELS, SUPPORTED_TASKS, TASKS, ModelAdapter, UnsupportedTaskError,
                                     _as_labels, _check_classes, _is_int)
+
+logger = logging.getLogger(__name__)
 
 TSAI_ARCHS: Tuple[str, ...] = ("inception", "tst", "lstm_fcn", "minirocket", "patchtst", "tcn", "resnet")
 DARTS_ARCHS: Tuple[str, ...] = ("nhits", "nbeats", "tcn", "tft")
@@ -194,17 +205,18 @@ def arch_params(arch: str, width: int, dropout: float, lookback: int, rocket_fea
 
 
 # ------------------------------------------------------------------ shared helpers
-def n_batches(n: int, batch_size: int) -> int:
+def _n_batches(n: int, batch_size: int) -> int:
     """Batches per epoch: ceil(n / batch_size), fewer when that would leave a batch of one row (BatchNorm cannot train
-    on it): the remainder is merged into the others, so every batch has at least 2 rows (n >= 2)."""
+    on it): the remainder is merged into the others, so every batch has between 2 and max(batch_size, 3) rows
+    (n >= 2)."""
     steps = max(1, math.ceil(n / batch_size))
     return max(1, min(steps, n // 2))
 
 
-def batch_splits(perm, batch_size: int):
-    """``perm`` cut into ``n_batches`` near-equal chunks (sizes differ by at most one, none below 2)."""
+def _batch_splits(perm, batch_size: int):
+    """``perm`` cut into ``_n_batches`` near-equal chunks (sizes differ by at most one, none below 2)."""
     import torch
-    return torch.tensor_split(torch.as_tensor(perm), n_batches(len(perm), batch_size))
+    return torch.tensor_split(torch.as_tensor(perm), _n_batches(len(perm), batch_size))
 
 
 def _check_seq(X, where: str) -> SequenceData:
@@ -334,8 +346,10 @@ class TsaiAdapter(_SequenceAdapter):
     weights each class by n / (k x count) of the training labels); ``regression``: MSE on the standardised label.
 
     Training = the loop of the earlier ``ml_search.train_classifier``: AdamW (``lr``, ``weight_decay``), OneCycle over
-    ``epochs``, gradient clipping at ``grad_clip``, mini-batches of ``batch_size``, validation loss (UNWEIGHTED
-    cross-entropy / MSE) after every epoch, stop after ``patience`` epochs without an improvement of 1e-4, the best
+    ``epochs``, gradient clipping at ``grad_clip``, mini-batches of ``batch_size`` (a one-row remainder is merged
+    into the others, so a batch has between 2 and max(batch_size, 3) rows), validation loss (UNWEIGHTED
+    cross-entropy / MSE) after every epoch, stop after ``patience`` epochs without an improvement of 1e-4 (never before ``min_epochs``, so a stop cannot
+    land on OneCycle's warm-up at peak learning rate), the best
     epoch's weights restored. Data and windows live on the GPU (a window is a gather from the resident matrix).
 
     MiniRocket is a frozen random-kernel feature extractor plus a BatchNorm / Linear head: only the head (zero
@@ -423,7 +437,7 @@ class TsaiAdapter(_SequenceAdapter):
             val_sum = torch.nn.MSELoss(reduction="sum") if task == "regression" else torch.nn.CrossEntropyLoss(reduction="sum")
 
             bs = p["batch_size"]
-            steps = n_batches(len(rt), bs)
+            steps = _n_batches(len(rt), bs)
             opt = torch.optim.AdamW([q for q in net.parameters() if q.requires_grad], lr=p["lr"],
                                     weight_decay=p["weight_decay"])
             sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=p["lr"], total_steps=steps * p["epochs"])
@@ -432,7 +446,7 @@ class TsaiAdapter(_SequenceAdapter):
             for ep in range(p["epochs"]):
                 net.train()
                 perm = torch.randperm(len(rt), generator=gen).to(device)
-                for pos in batch_splits(perm, bs):                # near-equal batches, none of size 1
+                for pos in _batch_splits(perm, bs):                # near-equal batches, none of size 1
                     opt.zero_grad(set_to_none=True)
                     loss = train_loss(net(window(Ft, rt[pos])), yt_t[pos])
                     loss.backward()
@@ -440,20 +454,20 @@ class TsaiAdapter(_SequenceAdapter):
                     opt.step()
                     sched.step()
                 net.eval()
-                vl = 0.0
+                vl_sum = torch.zeros((), device=device)
                 with torch.no_grad():
                     for i in range(0, len(rv), EVAL_BATCH):
                         out = net(window(Fv, rv[i:i + EVAL_BATCH]))
                         yb = yv_t[i:i + EVAL_BATCH]
-                        vl += float(val_sum(out.squeeze(-1), yb) if task == "regression" else val_sum(out, yb))
-                vl /= len(rv)
+                        vl_sum += val_sum(out.squeeze(-1), yb) if task == "regression" else val_sum(out, yb)
+                vl = float(vl_sum) / len(rv)                      # the epoch's only device -> host sync
                 curve.append(vl)
                 if vl < best_loss - 1e-4:
                     best_loss, best_epoch, bad = vl, ep + 1, 0
                     best = {k: v.detach().clone() for k, v in net.state_dict().items()}
                 else:
                     bad += 1
-                    if bad >= p["patience"]:
+                    if bad >= p["patience"] and ep + 1 >= min(p["min_epochs"], p["epochs"]):
                         break
             if best is None:
                 raise RuntimeError(f"tsai {p['arch']}: the validation loss was never finite ({curve})")
@@ -498,9 +512,42 @@ BATCHED_ARCHS: Tuple[str, ...] = ("nhits", "nbeats", "tcn")
 
 
 def _quiet_lightning() -> None:
-    import logging
+    """No Lightning banners ("GPU available", "Tip: ... litlogger", "Trainer.fit stopped"): they are INFO records, and
+    importing Lightning resets its logger to INFO, so the package is imported FIRST and the levels set after it. The
+    Tensor Cores hint and one deprecation notice are warnings and are filtered by message only (the matmul precision
+    is the caller's policy, see the module docstring)."""
+    import warnings
+    import pytorch_lightning  # noqa: F401  (its import sets the logger level)
     for name in ("pytorch_lightning", "lightning", "lightning.pytorch", "lightning_fabric", "darts"):
         logging.getLogger(name).setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message=r".*has Tensor Cores.*")
+    warnings.filterwarnings("ignore", message=r".*isinstance\(treespec, LeafSpec\).*")
+
+
+def _best_checkpoint(ckpt) -> Tuple[int, float]:
+    """(1-based best epoch, best validation loss) of a Lightning ``ModelCheckpoint``; raises rather than guessing when
+    Darts / Lightning did not record them or changed the file naming."""
+    if ckpt.best_model_score is None:
+        raise RuntimeError("darts: the checkpoint callback recorded no best_model_score (no validation loss?)")
+    loss = float(ckpt.best_model_score)
+    if not math.isfinite(loss):
+        raise RuntimeError(f"darts: the best validation loss is not finite ({loss})")
+    found = re.search(r"epoch=(\d+)", os.path.basename(str(ckpt.best_model_path)))
+    if not found:
+        raise RuntimeError(f"darts: cannot read the best epoch from the checkpoint name {ckpt.best_model_path!r} "
+                           f"(expected 'epoch=<n>')")
+    return int(found.group(1)) + 1, loss
+
+
+def _remove_dir(path: str) -> None:
+    """Delete a temporary checkpoint directory; failures (Windows file locks) are logged, never swallowed silently."""
+    errors: List[Tuple[str, BaseException]] = []
+    try:
+        shutil.rmtree(path, onexc=lambda func, p, exc: errors.append((str(p), exc)))
+    except TypeError:                                    # Python < 3.12
+        shutil.rmtree(path, onerror=lambda func, p, info: errors.append((str(p), info[1])))
+    for p, exc in errors:
+        logger.warning("could not remove the temporary checkpoint path %s: %s", p, exc)
 
 
 def _darts_ts(values: np.ndarray, start: int):
@@ -567,6 +614,7 @@ def _darts_model(p: Dict[str, Any], lookback: int, n_out: int, seed: int, device
                   model_name=name, work_dir=work_dir,
                   pl_trainer_kwargs={"accelerator": "gpu" if device.type == "cuda" else "cpu", "devices": 1,
                                      "enable_progress_bar": False, "enable_model_summary": False, "logger": False,
+                                     "min_epochs": min(p["min_epochs"], p["epochs"]),
                                      "callbacks": [EarlyStopping(monitor="val_loss", patience=p["patience"],
                                                                  min_delta=1e-4)]})
     arch, w, do = p["arch"], p["width"], p["dropout"]
@@ -650,7 +698,6 @@ class DartsAdapter(_SequenceAdapter):
         return self
 
     def _train(self, Xt: SequenceData, Xv: SequenceData, sp_t, sp_v, n_out: int, seed: int):
-        import tempfile
         p = self.params
         _quiet_lightning()
         device = _resolve_device(p["device"])
@@ -662,15 +709,16 @@ class DartsAdapter(_SequenceAdapter):
         va_s = [_darts_ts(Xv.returns[sp_v[k][0]:sp_v[k][1] + 1] / sd, sp_v[k][0]) for k in keys]
         va_c = [_darts_ts(Xv.features[sp_v[k][0]:sp_v[k][1] + 1], sp_v[k][0]) for k in keys]
         name = f"ba2_{p['arch']}_{id(self)}_{seed}"
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, _seeded(seed, device):
-            model = _darts_model(p, Xt.lookback, n_out, seed, device, tmp, name)
-            model.fit(tr_s, past_covariates=tr_c, val_series=va_s, val_past_covariates=va_c, verbose=False)
-            epochs_run = int(model.epochs_trained)
-            ckpt = model.trainer.checkpoint_callback
-            val_loss = float(ckpt.best_model_score)
-            found = re.search(r"epoch=(\d+)", os.path.basename(ckpt.best_model_path))
-            best_epoch = int(found.group(1)) + 1 if found else None
-            best = type(model).load_from_checkpoint(name, work_dir=tmp, best=True)     # the best validation epoch
+        tmp = tempfile.mkdtemp(prefix="ba2_darts_")
+        try:
+            with _seeded(seed, device):
+                model = _darts_model(p, Xt.lookback, n_out, seed, device, tmp, name)
+                model.fit(tr_s, past_covariates=tr_c, val_series=va_s, val_past_covariates=va_c, verbose=False)
+                epochs_run = int(model.epochs_trained)
+                best_epoch, val_loss = _best_checkpoint(model.trainer.checkpoint_callback)
+                best = type(model).load_from_checkpoint(name, work_dir=tmp, best=True)   # the best validation epoch
+        finally:
+            _remove_dir(tmp)
         info = {"epochs_run": epochs_run, "best_epoch": best_epoch, "val_loss": val_loss, "n_series": len(keys),
                 "target_sd": sd, "device": device.type, "arch": p["arch"]}
         return best, device, info, sd

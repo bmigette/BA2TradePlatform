@@ -91,22 +91,25 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
                  "l2_leaf_reg": 3.0, "subsample": 0.8},
     "linear": {"C": 1.0, "max_iter": 2000, "alpha": 1.0},
     "naive": {"column": "t_ret_20"},
+    # ``min_epochs``: epochs that always run before early stopping may trigger (OneCycle warms up to its peak learning
+    # rate first); clamped to ``epochs``.
     # tsai: ``arch`` one of ml_models_seq.TSAI_ARCHS; ``width`` is the architecture's main size (nf = width / 2 for
     # inception, d_model for tst / patchtst, hidden size for lstm_fcn, filters for tcn; resnet and minirocket have
     # none); ``class_weights`` "none" | "balanced" (classification only); ``device`` "auto" | "cuda" | "cpu";
     # ``rocket_features`` is the MiniRocket feature count (about; it is rounded to the kernel grid)
     "tsai": {"arch": "inception", "width": 64, "dropout": 0.1, "lr": 1e-3, "epochs": 20, "batch_size": 512,
-             "patience": 3, "weight_decay": 1e-2, "grad_clip": 1.0, "class_weights": "none", "device": "auto",
-             "rocket_features": 10000},
+             "patience": 3, "min_epochs": 3, "weight_decay": 1e-2, "grad_clip": 1.0, "class_weights": "none",
+             "device": "auto", "rocket_features": 10000},
     # darts: ``arch`` one of ml_models_seq.DARTS_ARCHS; ``num_samples`` = sampled paths per forecast (the deciles
     # are percentiles of the summed paths)
     "darts": {"arch": "nhits", "width": 64, "dropout": 0.1, "lr": 1e-3, "epochs": 10, "batch_size": 256,
-              "patience": 3, "num_samples": 200, "device": "auto"},
+              "patience": 3, "min_epochs": 3, "num_samples": 200, "device": "auto"},
 }
 
 # value rules for ``params`` (every key in DEFAULTS that is not listed here is a free-form string, i.e. ``column``)
 _POS_INT = {"n_estimators", "num_leaves", "early_stopping_rounds", "min_child_samples", "rank_eval_at", "max_depth",
-            "depth", "max_iter", "width", "epochs", "batch_size", "patience", "rocket_features", "num_samples"}
+            "depth", "max_iter", "width", "epochs", "batch_size", "patience", "min_epochs", "rocket_features",
+            "num_samples"}
 _NONNEG_INT = {"subsample_freq"}
 _POS_FLOAT = {"learning_rate", "C", "alpha", "lr", "grad_clip"}
 _DROPOUT = {"dropout"}                                              # [0, 1)

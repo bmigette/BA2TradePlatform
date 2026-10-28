@@ -299,7 +299,7 @@ def test_a_signal_in_the_future_cannot_be_learnt_the_window_is_causal():
     assert roc_auc_score(yte, ad.score(Xte)) < 0.6
 
 
-@pytest.mark.parametrize("arch", ["inception", "tst", "minirocket"])
+@pytest.mark.parametrize("arch", ["inception", "tst", "minirocket", "lstm_fcn", "patchtst"])
 def test_same_seed_is_identical_and_another_seed_differs(arch):
     d = tiny("binary")
     X = d["test"][0]
@@ -762,14 +762,16 @@ def test_darts_refuses_every_ordering_where_training_targets_reach_the_first_val
         fit(block_rows(2, DN, DL - 1, 280 - DH - 1), val)
 
 
-def test_batches_are_never_of_size_one():
+def test_batches_are_never_of_size_one_and_never_larger_than_max_batch_size_or_three():
     for n in range(2, 60):
         for bs in range(2, 12):
-            sizes = [len(c) for c in MS.batch_splits(np.arange(n), bs)]
+            sizes = [len(c) for c in MS._batch_splits(np.arange(n), bs)]
             assert sum(sizes) == n and min(sizes) >= 2, (n, bs, sizes)
-    assert [len(c) for c in MS.batch_splits(np.arange(1000), 512)] == [500, 500]     # unchanged where it was fine
-    assert [len(c) for c in MS.batch_splits(np.arange(3), 2)] == [3]
-    assert [len(c) for c in MS.batch_splits(np.arange(5), 2)] == [3, 2]
+            assert max(sizes) <= max(bs, 3), (n, bs, sizes)
+    assert [len(c) for c in MS._batch_splits(np.arange(1000), 512)] == [500, 500]     # unchanged where it was fine
+    assert [len(c) for c in MS._batch_splits(np.arange(3), 2)] == [3]
+    assert [len(c) for c in MS._batch_splits(np.arange(5), 2)] == [3, 2]
+    assert "max(batch_size, 3)" in MS.TsaiAdapter.__doc__
 
 
 @pytest.mark.parametrize("n_train", [3, 5])
@@ -846,3 +848,138 @@ def test_the_device_feature_tensor_is_cached_per_feature_array(family):
                             horizon_steps=X.horizon_steps)
     ad.predict(other)                                                      # a different array replaces it
     assert ad._dev_cache["features"][1] is not first
+
+
+# ------------------------------------------------------------------ review items
+def test_the_validation_loss_is_accumulated_on_the_device_with_one_sync_per_epoch(monkeypatch):
+    monkeypatch.setattr(MS, "EVAL_BATCH", 16)                                # several evaluation batches per epoch
+    calls = {"n": 0}
+    orig_item, orig_float = torch.Tensor.item, torch.Tensor.__float__
+
+    def ours():
+        import sys
+        return sys._getframe(2).f_code.co_filename.endswith("ml_models_seq.py")     # the optimizer syncs on its own
+
+    def item(self):
+        calls["n"] += ours()
+        return orig_item(self)
+
+    def as_float(self):
+        calls["n"] += ours()
+        return orig_float(self)
+
+    d = tiny("binary", n=200)
+    monkeypatch.setattr(torch.Tensor, "item", item)
+    monkeypatch.setattr(torch.Tensor, "__float__", as_float)
+    ad = fit_tsai(d, "binary", epochs=3, patience=10)
+    monkeypatch.undo()
+    assert ad.fit_info["epochs_run"] == 3 and len(d["val"][0]) > 3 * 16
+    assert calls["n"] <= 3, calls["n"]
+
+
+def test_early_stopping_cannot_trigger_before_min_epochs_and_the_default_is_three():
+    assert MM.DEFAULTS["tsai"]["min_epochs"] == 3 and MM.DEFAULTS["darts"]["min_epochs"] == 3
+    d = tiny("binary", n=200)
+    Xtr, ytr = d["train"]
+    Xv, yv = d["val"]
+    rng = np.random.default_rng(0)
+    noise, vnoise = (rng.random(len(ytr)) > 0.5).astype(np.int64), (rng.random(len(yv)) > 0.5).astype(np.int64)
+    ad = MM.make_adapter("tsai", params={**FAST, "epochs": 12, "lr": 3e-3, "patience": 1, "min_epochs": 6})
+    ad.fit(Xtr, noise, Xv, vnoise, task="binary", seed=1)
+    assert ad.fit_info["epochs_run"] >= 6
+    short = MM.make_adapter("tsai", params={**FAST, "epochs": 2})                      # min_epochs (3) > epochs: clamped
+    short.fit(Xtr, ytr, Xv, yv, task="binary", seed=1)
+    assert short.fit_info["epochs_run"] == 2
+    for bad in (0, 2.5, True):
+        with pytest.raises(ValueError):
+            MM.make_adapter("tsai", params={"min_epochs": bad})
+
+
+def test_darts_min_epochs_holds_back_early_stopping():
+    d = darts_data(drift=0.0)
+    ad = fit_darts(d, seed=2, epochs=15, patience=1, lr=1e-2, min_epochs=7)
+    assert ad.fit_info["epochs_run"] >= 7
+
+
+def test_darts_checkpoint_bookkeeping_raises_instead_of_guessing():
+    class Ckpt:
+        def __init__(self, score, path):
+            self.best_model_score, self.best_model_path = score, path
+
+    assert MS._best_checkpoint(Ckpt(torch.tensor(0.5), "/tmp/x/best-epoch=4-val_loss=0.5000.ckpt")) == (5, 0.5)
+    with pytest.raises(RuntimeError, match="best_model_score"):
+        MS._best_checkpoint(Ckpt(None, "/tmp/x/best-epoch=4-val_loss=0.5.ckpt"))
+    with pytest.raises(RuntimeError, match="epoch"):
+        MS._best_checkpoint(Ckpt(torch.tensor(0.5), "/tmp/x/last.ckpt"))
+    with pytest.raises(RuntimeError, match="finite"):
+        MS._best_checkpoint(Ckpt(torch.tensor(float("nan")), "/tmp/x/best-epoch=1.ckpt"))
+
+
+def test_a_failed_checkpoint_dir_cleanup_is_logged(monkeypatch, caplog, tmp_path):
+    import logging
+    import os
+    import shutil
+    victim = tmp_path / "ckpt"
+    victim.mkdir()
+
+    def failing_rmtree(path, **kw):
+        if "onexc" in kw:
+            kw["onexc"](os.remove, str(path), PermissionError("locked"))
+        else:
+            kw["onerror"](os.remove, str(path), (PermissionError, PermissionError("locked"), None))
+
+    monkeypatch.setattr(shutil, "rmtree", failing_rmtree)
+    with caplog.at_level(logging.WARNING, logger=MS.logger.name):
+        MS._remove_dir(str(victim))
+    assert any("ckpt" in r.getMessage() and "locked" in r.getMessage() for r in caplog.records)
+
+
+def test_a_darts_fit_and_predict_print_no_lightning_banner_or_tip():
+    import os
+    import subprocess
+    import sys
+    code = (
+        "import numpy as np\n"
+        "from app.services import ml_models as MM, ml_models_seq as MS\n"
+        "rng = np.random.default_rng(0)\n"
+        "F = rng.normal(size=(300, 3)).astype(np.float32); R = 0.01 + 0.02 * rng.normal(size=300)\n"
+        "st = np.zeros(300, dtype=np.int64)\n"
+        "mk = lambda a, b: MS.SequenceData(F, np.arange(a, b), 16, st, returns=R, horizon_steps=4)\n"
+        "tr, va = mk(15, 200), mk(210, 290)\n"
+        "ad = MM.make_adapter('darts', params={'epochs': 2, 'width': 16, 'batch_size': 64, 'num_samples': 50})\n"
+        "ad.fit(tr, np.zeros(len(tr)), va, np.zeros(len(va)), task='quantile', seed=1)\n"
+        "ad.predict(va)\n"
+        "ad2 = MM.make_adapter('darts', params={'arch': 'tft', 'epochs': 1, 'width': 16, 'batch_size': 64, 'num_samples': 50})\n"
+        "ad2.fit(tr, np.zeros(len(tr)), va, np.zeros(len(va)), task='quantile', seed=1)\n"
+        "ad2.predict(va.take(va.rows[:5]))\n"
+        "print('DONE-MARKER')\n")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                       cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))), timeout=300)
+    out = r.stdout + r.stderr
+    assert "DONE-MARKER" in r.stdout, out[-2000:]
+    noise = [line for line in out.splitlines() if line.strip() and "DONE-MARKER" not in line
+             and any(k in line for k in ("GPU available", "TPU available", "HPU", "LOCAL_RANK", "Tip", "litlogger",
+                                         "Trainer.fit", "Tensor Cores", "LeafSpec", "max_epochs"))]
+    assert not noise, noise
+
+
+def test_the_module_states_the_tf32_and_determinism_policy():
+    assert "TF32" in MS.__doc__ and "caller" in MS.__doc__
+    assert "cudnn.deterministic" in MS.__doc__
+
+
+def test_the_minirocket_branch_reads_its_parameters_without_defaults():
+    from app.services.tsai_models import TSAIModelService
+    dp = TSAIModelService.MODEL_ARCHITECTURES["minirocket"]["default_params"]
+    assert set(dp) == {"num_features", "fc_dropout", "random_state"} and dp["num_features"] == 10000
+    svc = TSAIModelService(use_gpu=False)
+    net = svc.create_model("minirocket", {"num_features": 500, "fc_dropout": 0.25, "random_state": 3}, c_in=3, c_out=2,
+                           seq_len=32)
+    assert net.backbone.num_features <= 500 and any(isinstance(m, torch.nn.Dropout) and m.p == 0.25 for m in net.modules())
+    default = svc.create_model("minirocket", {}, c_in=3, c_out=2, seq_len=32)
+    assert default.backbone.num_features > 5000 and not any(isinstance(m, torch.nn.Dropout) for m in default.modules())
+    import inspect
+    src = inspect.getsource(TSAIModelService.create_model)
+    branch = src[src.index("elif model_type == 'minirocket'"):src.index("elif model_type == 'patchtst'")]
+    assert ".get(" not in branch
