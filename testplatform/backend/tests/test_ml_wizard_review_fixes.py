@@ -43,3 +43,46 @@ class TestStaleModelBacktestIsFailed:
         assert backtest.status == "failed"
         assert "retrain" in backtest.error_message
         assert backtest.status != "completed"
+
+
+# ---------------------------------------------------------------------------------------------- 2. heterogeneous frames
+class TestFramesMissingAColumn:
+    def hetero(self):
+        a = frame(1, "AAA")
+        b = frame(2, "BBB").drop(columns=["f_b"])
+        return a, b
+
+    def test_the_helpers_skip_a_column_a_frame_does_not_have(self):
+        a, b = self.hetero()
+        assert MF.all_masked_columns([a, b], COLS) == []
+        c = frame(3, "CCC", all_masked=True).drop(columns=["f_b"])
+        assert MF.all_masked_columns([a, c], COLS) == ["f_a"]
+        out, cols = MF.apply_saved_fill(b, COLS, MF.build_masked_fill({"BBB": {"f_a": 1.0}}, []), "BBB")
+        assert "f_b" not in cols and not out["f_a"].isna().any()
+
+    def test_an_old_model_with_a_missing_column_still_refuses_only_for_masked_cells(self):
+        a, b = self.hetero()
+        clean = frame(4, masked=None).drop(columns=["f_b"])
+        out, cols = MF.apply_saved_fill(clean, COLS, None)
+        assert out is clean and cols == [c for c in COLS if c != "f_b"]
+        with pytest.raises(MF.StaleMaskedModel):
+            MF.apply_saved_fill(b, COLS, None)
+
+    def test_darts_prepares_frames_that_do_not_share_all_columns(self):
+        from app.services.darts_training import DartsTrainingService
+        a, b = self.hetero()
+        svc = DartsTrainingService()
+        out = svc.prepare_split_three_way([a, b], 0.7, 0.5, "y", COLS, timeframe="1d", label_horizon=3)
+        assert out["train_covariates"][0].width == 5 and out["train_covariates"][1].width == 4
+
+    def test_the_job_path_does_not_raise_on_frames_missing_a_feature(self, monkeypatch):
+        from tests.test_ml_wizard_daily_targets import TestJobIntegration, daily_frame, pt
+        frames = [daily_frame(10), daily_frame(11)]
+        for f in frames:
+            f["f_a"] = np.random.default_rng(0).normal(size=len(f))
+            f["f_b"] = np.random.default_rng(1).normal(size=len(f))
+            f["f_missing"] = 0.0
+        frames[1] = frames[1].drop(columns=["f_b"])
+        result, cap = TestJobIntegration()._job(frames, [pt("daily_up", horizonSessions=3)], monkeypatch)
+        assert result["status"] == "dry_run_success", result
+        assert "f_b" in cap["features"] and "f_a" in cap["features"]

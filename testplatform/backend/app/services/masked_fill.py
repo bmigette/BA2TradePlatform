@@ -61,7 +61,8 @@ def all_masked_columns(frames: Sequence[pd.DataFrame], feature_columns: Sequence
     cols = list(feature_columns)
     dropped: set = set()
     for df in frames:
-        for _, group, flagged in masked_groups(df[cols]):
+        # frames of a job need not share every column (a provider that lacks one): look at the ones this frame has
+        for _, group, flagged in masked_groups(df[[c for c in cols if c in df.columns]]):
             if flagged.all():
                 dropped |= set(group)
     return [c for c in cols if c in dropped]
@@ -143,7 +144,7 @@ def apply_saved_fill(df: pd.DataFrame, feature_columns: Sequence[str], params: O
     masked-cell handling existed: a frame without masked cells passes through, one with them raises ``StaleMaskedModel``.
     The medians are the training ones: nothing is fitted on ``df``. A ``ticker`` column of ``df`` picks each row's
     ticker; otherwise ``ticker`` does; a ticker the model never trained on gets the pooled medians."""
-    cols = list(feature_columns)
+    cols = [c for c in feature_columns if c in df.columns]          # a frame need not have every column of the model
     if params is None:
         if has_masked_cells(df[cols]):
             raise StaleMaskedModel("retrain: this model predates masked-cell handling, and this frame has cells blanked "
