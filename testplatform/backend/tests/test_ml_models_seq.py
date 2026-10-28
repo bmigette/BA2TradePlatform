@@ -592,17 +592,81 @@ def test_darts_one_series_and_several_series_both_fit():
         MM.make_adapter("darts", params=DFAST).fit(Xt, yt, b, yv[Xv.rows < DN], task="quantile", seed=1)
 
 
+def _ref_paths(u, q):
+    """numpy reference of the inverse-CDF draw: linear between neighbouring levels, flat beyond the outer ones."""
+    levels = np.asarray(MS.DARTS_QUANTILES)
+    out = np.empty_like(u)
+    for t in range(u.shape[1]):
+        out[:, t] = np.interp(u[:, t], levels, q[t])
+    return out
+
+
 def test_quantile_sampling_interpolates_linearly_and_is_flat_beyond_the_outer_levels():
     levels = np.asarray(MS.DARTS_QUANTILES)
-    q = np.tile(levels * 10.0, (3, 1))                             # value = 10 x level, the same at every step
-    u = np.array([[0.0, 0.05, 0.075], [0.5, 0.95, 1.0 - 1e-9], [0.3, 0.02, 0.99]])
-    got = MS._sample_quantile_paths(u, q)
-    want = np.clip(u, 0.05, 0.95) * 10.0
-    np.testing.assert_allclose(got, want, atol=1e-9)
-    # step t reads its own quantile row
-    q2 = np.stack([np.linspace(0, 1, 11), np.linspace(10, 11, 11), np.linspace(20, 21, 11)])
-    got2 = MS._sample_quantile_paths(np.full((1, 3), 0.5), q2)[0]
-    np.testing.assert_allclose(got2, [q2[0, 5], q2[1, 5], q2[2, 5]], atol=1e-9)
+    rng = np.random.default_rng(0)
+    u = np.vstack([[0.0, 0.05, 0.075, 0.5], [0.95, 1.0 - 1e-9, 0.3, 0.02], rng.random((20, 4))])
+    q = np.sort(rng.normal(size=(2, 4, 11)), axis=2)                      # two rows, four steps, 11 quantiles
+    plan = MS._interp_plan(u, torch.device("cpu"))
+    got = MS._sample_paths(torch.as_tensor(q, dtype=torch.float32), plan).numpy()        # (rows, samples, steps)
+    for r in range(2):
+        np.testing.assert_allclose(got[r], _ref_paths(u, q[r]), atol=1e-5)
+    # a ramp: value = 10 x level at every step
+    ramp = np.tile(levels * 10.0, (1, 4, 1))
+    got = MS._sample_paths(torch.as_tensor(ramp, dtype=torch.float32), plan).numpy()[0]
+    np.testing.assert_allclose(got, np.clip(u, 0.05, 0.95) * 10.0, atol=1e-5)
+
+
+def test_the_vectorised_deciles_equal_a_numpy_percentile_reference():
+    rng = np.random.default_rng(1)
+    q = np.sort(rng.normal(0.003, 0.02, size=(7, 5, 11)), axis=2)
+    u = rng.random((200, 5))
+    sd = 0.013
+    plan = MS._interp_plan(u, torch.device("cpu"))
+    got = MS._deciles_from_quantiles(torch.as_tensor(q, dtype=torch.float32), plan, sd).numpy()
+    want = np.array([np.percentile(np.expm1((_ref_paths(u, q[r]) * sd).sum(1)), MS.DECILE_PERCENTILES) for r in range(7)])
+    np.testing.assert_allclose(got, want, atol=1e-5)
+    assert got.shape == (7, 9) and (np.diff(got, axis=1) >= 0).all()
+    # unsorted (crossing) model outputs are rearranged, not trusted
+    shuffled = torch.as_tensor(q[:, :, ::-1].copy(), dtype=torch.float32)
+    np.testing.assert_allclose(MS._deciles_from_quantiles(shuffled, plan, sd).numpy(), got, atol=1e-6)
+
+
+@pytest.mark.parametrize("arch", ["nhits", "nbeats", "tcn"])
+def test_the_batched_forward_equals_the_public_darts_forecast(arch):
+    d = darts_data()
+    ad = fit_darts(d, seed=2, arch=arch)
+    X = d["test"][0].take(d["test"][0].rows[:30])
+    L, sd = X.lookback, ad._sd
+    ser = [MS._darts_ts(X.returns[r - L + 1:r + 1] / sd, int(r) - L + 1) for r in X.rows]
+    cov = [MS._darts_ts(X.features[r - L + 1:r + 1], int(r) - L + 1) for r in X.rows]
+    pub = ad._net.predict(DH, series=ser, past_covariates=cov, predict_likelihood_parameters=True, verbose=False,
+                          show_warnings=False)
+    want = np.stack([p.values() for p in pub])
+    np.testing.assert_allclose(ad._forecast_quantiles(X), want, atol=2e-5)
+
+
+def test_darts_predict_throughput_on_20_symbols_of_5000_bars():
+    """Was 0.67 ms per row (two TimeSeries per row, a Python percentile loop). Target: 10x faster."""
+    import time
+    ns, n, lb, h, c = 20, 5000, 32, 35, 8
+    rng = np.random.default_rng(0)
+    F = rng.normal(size=(ns * n, c)).astype(np.float32)
+    ret = 0.0005 + 0.003 * rng.normal(size=ns * n)
+    start = np.repeat(np.arange(ns) * n, n)
+
+    def sd(a, b):
+        return MS.SequenceData(F, block_rows(ns, n, a, b), lb, start, returns=ret, horizon_steps=h)
+
+    tr, va, te = sd(lb - 1, 1000 - h - 1), sd(1000, 1300 - h - 1), sd(4000, n - h - 1)
+    ad = MM.make_adapter("darts", params={"epochs": 1, "width": 32, "batch_size": 1024, "num_samples": 200})
+    ad.fit(tr, np.zeros(len(tr)), va, np.zeros(len(va)), task="quantile", seed=1)
+    ad.predict(te.take(te.rows[:64]))                                      # warm-up (CUDA kernels, plan)
+    t0 = time.perf_counter()
+    q = ad.predict(te)
+    ms_per_row = 1000 * (time.perf_counter() - t0) / len(te)
+    print(f"darts predict: {len(te)} rows, {ms_per_row:.4f} ms/row")
+    assert q.shape == (len(te), 9) and (np.diff(q, axis=1) >= 0).all()
+    assert ms_per_row < 0.067, ms_per_row                                  # 10x faster than 0.668
 
 
 def test_darts_rows_are_predicted_independently_of_the_other_rows_in_x():
@@ -669,3 +733,11 @@ def test_minirocket_trains_on_three_or_five_samples_at_batch_size_two(n_train):
     ad = MM.make_adapter("tsai", params={**FAST, "arch": "minirocket", "batch_size": 2, "epochs": 2})
     ad.fit(Xt.take(rows), y, Xv, yv, task="binary", seed=1)
     assert ad.fit_info["epochs_run"] >= 1 and np.isfinite(ad.predict(Xv)).all()
+
+
+def test_darts_tcn_needs_a_lookback_longer_than_the_horizon():
+    d = darts_data(h=DL + 4)                       # horizon 20 bars, lookback 16
+    (Xt, yt), (Xv, yv) = d["train"], d["val"]
+    with pytest.raises(ValueError, match="tcn"):
+        MM.make_adapter("darts", params={**DFAST, "arch": "tcn"}).fit(Xt, yt, Xv, yv, task="quantile", seed=1)
+    MM.make_adapter("darts", params={**DFAST, "arch": "nhits"}).fit(Xt, yt, Xv, yv, task="quantile", seed=1)

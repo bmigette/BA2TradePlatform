@@ -451,7 +451,9 @@ class TsaiAdapter(_SequenceAdapter):
 #: levels the Darts likelihood learns; the deciles are percentiles of the SAMPLED H-step cumulative return
 DARTS_QUANTILES: Tuple[float, ...] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
 DECILE_PERCENTILES: Tuple[int, ...] = tuple(int(round(100 * q)) for q in QUANTILE_LEVELS)
-PREDICT_CHUNK = 1024
+PREDICT_CHUNK = 2048
+#: architectures whose network is called directly on batched windows (verified equal to the public forecast)
+BATCHED_ARCHS: Tuple[str, ...] = ("nhits", "nbeats", "tcn")
 
 
 def _quiet_lightning() -> None:
@@ -479,18 +481,39 @@ def _spans(X: SequenceData, n_out: int, where: str) -> Dict[int, Tuple[int, int]
     return out
 
 
-def _sample_quantile_paths(u: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """Inverse-CDF draws from the learned quantiles: ``u`` (samples, steps) uniforms, ``q`` (steps, 11) quantile values
-    at ``DARTS_QUANTILES``; linear between neighbouring levels and flat beyond the outer ones (the interpolation Darts'
-    own ``QuantileRegression.sample`` uses, with an RNG of ours so that the draw is reproducible). Steps are drawn
-    independently, as Darts does."""
+def _interp_plan(u: np.ndarray, device):
+    """Inverse-CDF plan for the uniform draws ``u`` (samples, steps): for every draw the two neighbouring learned
+    quantile levels and the interpolation weight -- linear between levels, flat beyond the outer ones (the
+    interpolation Darts' own ``QuantileRegression.sample`` uses). The same plan serves every row (see
+    ``DartsAdapter``: common random numbers)."""
+    import torch
     levels = np.asarray(DARTS_QUANTILES)
     idx = np.searchsorted(levels, u)
     lo, hi = np.clip(idx - 1, 0, len(levels) - 1), np.clip(idx, 0, len(levels) - 1)
     ql, qh = levels[lo], levels[hi]
     w = np.where(qh > ql, (u - ql) / np.where(qh > ql, qh - ql, 1.0), 0.0)
-    step = np.arange(q.shape[0])[None, :]
-    return q[step, lo] + w * (q[step, hi] - q[step, lo])
+    step = np.broadcast_to(np.arange(u.shape[1])[None, :], u.shape)
+    return (torch.as_tensor(np.ascontiguousarray(step), device=device), torch.as_tensor(lo, device=device),
+            torch.as_tensor(hi, device=device), torch.as_tensor(w, dtype=torch.float32, device=device))
+
+
+def _sample_paths(q, plan):
+    """(rows, samples, steps) per-bar log returns drawn from the learned quantiles ``q`` (rows, steps, 11), which
+    are first sorted along the level axis (a network's quantile outputs may cross)."""
+    import torch
+    step, lo, hi, w = plan
+    q = torch.sort(q, dim=2).values
+    ql, qh = q[:, step, lo], q[:, step, hi]
+    return ql + w * (qh - ql)
+
+
+def _deciles_from_quantiles(q, plan, sd: float):
+    """(rows, 9) deciles of the H-step return: every sampled path is summed in log space, mapped with ``expm1`` and
+    the nine percentiles of the samples are taken (linear interpolation, as ``np.percentile``)."""
+    import torch
+    tot = torch.expm1(_sample_paths(q, plan).sum(2) * sd)
+    levels = torch.tensor(DECILE_PERCENTILES, dtype=tot.dtype, device=tot.device) / 100.0
+    return torch.quantile(tot, levels, dim=1).T
 
 
 def _darts_model(p: Dict[str, Any], lookback: int, n_out: int, seed: int, device, work_dir: str, name: str):
@@ -528,6 +551,12 @@ class DartsAdapter(_SequenceAdapter):
     ``predict`` = those deciles, shape (n, 9), non-decreasing along each row (percentiles of one sample); ``score`` = P(up) from the deciles (``ba2_common.core.ml_forecast.mapping.p_up_from_deciles``,
     clamped to [0.05, 0.95]), ``score_kind`` "probability".
 
+    Throughput: n-hits / n-beats / tcn run the network directly on batched windows held on the device (no TimeSeries
+    per row), and the deciles come from ONE set of uniform draws shared by all rows (common random numbers), computed
+    on the device: about 0.01 ms per row, 50x the per-row Darts forecast (tft keeps that slow path: 0.5 ms per row).
+    The runner scores ONLY the end-of-day decision rows of a Darts cell (one row per symbol and session), never every
+    intraday bar. The tcn needs ``lookback > horizon_steps`` (a Darts rule).
+
     Input contract beyond ``SequenceData``: ``returns`` and ``horizon_steps`` (= forecast length n_out) are required.
     Darts trains on EVERY window of each series' contiguous span, so ``rows`` only mark the span of decision bars per
     series (first row .. last row) and ``y`` (the realised H-step return) is validated but not trained on. The
@@ -558,6 +587,8 @@ class DartsAdapter(_SequenceAdapter):
         _as_labels(y_train, "regression", len(Xt), "y_train")
         _as_labels(y_val, "regression", len(Xv), "y_val")
         n_out = Xt.horizon_steps
+        if p["arch"] == "tcn" and n_out >= Xt.lookback:
+            raise ValueError(f"darts: the tcn needs a lookback longer than the horizon ({Xt.lookback} <= {n_out} bars)")
         sp_t, sp_v = _spans(Xt, n_out, "X_train"), _spans(Xv, n_out, "X_val")
         if set(sp_t) != set(sp_v):
             raise ValueError("darts: X_train and X_val must cover the same series")
@@ -603,26 +634,72 @@ class DartsAdapter(_SequenceAdapter):
                 "target_sd": sd, "device": device.type, "arch": p["arch"]}
         return best, device, info, sd
 
-    def predict(self, X) -> np.ndarray:
+    def _check_darts_input(self, X) -> SequenceData:
         X = self._check_predict_input(X)
         if X.returns is None:
             raise ValueError("darts: X needs the bar returns (SequenceData.returns)")
         if X.horizon_steps != self._n_out:
             raise ValueError(f"darts: X has horizon_steps {X.horizon_steps}, the model was fitted with {self._n_out}")
-        L, sd, ns, n_out = X.lookback, self._sd, self.params["num_samples"], self._n_out
+        return X
+
+    def _quantiles_chunk(self, X: SequenceData, rows: np.ndarray, F, R):
+        """(len(rows), n_out, 11) learned quantiles of the standardised bar returns, a torch tensor on the device."""
+        import torch
+        L, n_out = X.lookback, self._n_out
+        if self.params["arch"] in BATCHED_ARCHS:
+            # the network itself, on batched windows (no TimeSeries objects): the input Darts builds for a model with
+            # past covariates is the target window and the covariate window side by side
+            from darts.utils.data.torch_datasets.utils import PLModuleInput
+            idx = torch.as_tensor(rows, device=self._device)[:, None] + torch.arange(-L + 1, 1, device=self._device)[None, :]
+            out = self._net.model(PLModuleInput(past_target=R[idx].unsqueeze(-1), past_covariates=F[idx]))
+            return out.prediction.reshape(len(rows), n_out, -1)
+        # tft (relative index, static inputs): the public Darts forecast, one TimeSeries pair per row (slow)
+        sd = self._sd
+        ser = [_darts_ts(X.returns[r - L + 1:r + 1] / sd, int(r) - L + 1) for r in rows]
+        cov = [_darts_ts(X.features[r - L + 1:r + 1], int(r) - L + 1) for r in rows]
+        preds = self._net.predict(n_out, series=ser, past_covariates=cov, predict_likelihood_parameters=True,
+                                  verbose=False, show_warnings=False)
+        return torch.as_tensor(np.stack([pr.values(copy=False) for pr in preds]), device=self._device)
+
+    def _device_inputs(self, X: SequenceData):
+        import torch
+        dev = self._device
+        if self.params["arch"] in BATCHED_ARCHS:
+            net = self._net.model
+            net.to(dev)
+            net.eval()
+            return (torch.as_tensor(X.features, device=dev),
+                    torch.as_tensor((X.returns / self._sd).astype(np.float32), device=dev))
+        return None, None
+
+    def _forecast_quantiles(self, X: SequenceData) -> np.ndarray:
+        """(len(X), n_out, 11) float32 learned quantiles (unsorted, as the network emits them)."""
+        import torch
+        X = self._check_darts_input(X)
+        F, R = self._device_inputs(X)
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(X), PREDICT_CHUNK):
+                out.append(self._quantiles_chunk(X, X.rows[i:i + PREDICT_CHUNK], F, R).float().cpu().numpy())
+        return np.concatenate(out) if out else np.zeros((0, self._n_out, len(DARTS_QUANTILES)), dtype=np.float32)
+
+    def predict(self, X) -> np.ndarray:
+        import torch
+        X = self._check_darts_input(X)
         out = np.empty((len(X), len(DECILE_PERCENTILES)))
-        for i in range(0, len(X), PREDICT_CHUNK):
-            rows = X.rows[i:i + PREDICT_CHUNK]
-            ser = [_darts_ts(X.returns[r - L + 1:r + 1] / sd, int(r) - L + 1) for r in rows]
-            cov = [_darts_ts(X.features[r - L + 1:r + 1], int(r) - L + 1) for r in rows]
-            preds = self._net.predict(n_out, series=ser, past_covariates=cov, predict_likelihood_parameters=True,
-                                      verbose=False, show_warnings=False)
-            for j, pr in enumerate(preds):
-                q = np.sort(pr.values(copy=False).astype(np.float64), axis=1)       # (n_out, 11) learned quantiles
-                # one RNG per decision bar: its draws do not depend on the other rows or on the chunking
-                u = np.random.default_rng((self.seed, int(rows[j]))).random((ns, n_out))
-                paths = _sample_quantile_paths(u, q) * sd                           # (ns, n_out) log returns
-                out[i + j] = np.percentile(np.expm1(paths.sum(1)), DECILE_PERCENTILES)
+        if not len(X):
+            return out
+        sd, ns, n_out = self._sd, self.params["num_samples"], self._n_out
+        # ONE set of uniform draws for every row (common random numbers): a row's deciles are a deterministic function
+        # of its own forecast quantiles -- independent of the other rows and of the chunking -- and differences
+        # between rows are never sampling noise.
+        plan = _interp_plan(np.random.default_rng(self.seed).random((ns, n_out)), self._device)
+        F, R = self._device_inputs(X)
+        with torch.no_grad():
+            for i in range(0, len(X), PREDICT_CHUNK):
+                rows = X.rows[i:i + PREDICT_CHUNK]
+                q = self._quantiles_chunk(X, rows, F, R).float()
+                out[i:i + len(rows)] = _deciles_from_quantiles(q, plan, sd).double().cpu().numpy()
         if not np.isfinite(out).all():
             raise ValueError("darts: non-finite prediction")
         return out
