@@ -639,6 +639,7 @@ class Panel:
     load_seconds: float
     daily_fingerprint: str = ""
     cache_root: str = ""
+    store_last: Optional[date] = None       # ``store_span(...)[1]``: the store's last day (the intraday panel ends there)
     _targets: Dict[int, pd.DataFrame] = field(default_factory=dict)
     _exc: Dict[int, T.DailyExcursions] = field(default_factory=dict)
 
@@ -716,7 +717,8 @@ def load_panel(store: Union[str, Path], symbols: Tuple[str, ...], track: str, ca
           & (lbf == False).fillna(False).astype(bool)).to_numpy()          # noqa: E712  (NA = unknown: not usable)
     X = allrows[list(cols)].to_numpy(dtype=np.float32)
     return Panel(symbols, track, index, pd.DatetimeIndex(index.get_level_values("session")), tuple(cols), X, ok, bars,
-                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint, str(cache_root))
+                 arrays, tuple(n for n, _ in used), time.perf_counter() - t0, fingerprint, str(cache_root),
+                 store_span(store, symbols)[1])
 
 
 #: panels (stores + bars + targets, ~100-200 MB each) a worker process keeps; the least recently used is evicted
@@ -1124,8 +1126,17 @@ def library_versions() -> Dict[str, Any]:
     return out
 
 
-#: a GPU task is aborted after block k when elapsed / k x n_blocks exceeds this many budgets
+#: a GPU task is aborted when its projected total time exceeds this many budgets
 BUDGET_PROJECTION = 1.5
+
+
+def budget_projection(elapsed: float, fitted_times: Sequence[float], remaining: int) -> Optional[float]:
+    """Projected total seconds of a GPU task: the time so far plus the mean time of the FITTED blocks times the blocks still
+    to process. None until two blocks were fitted (the first pays the CUDA warm-up and the cuDNN setup, so one block is
+    no rate); skipped blocks cost next to nothing and are neither in the rate nor counted as a fitted block."""
+    if len(fitted_times) < 2:
+        return None
+    return elapsed + sum(fitted_times) / len(fitted_times) * remaining
 #: the master kills a GPU task that has been in flight longer than this many budgets
 HARD_DEADLINE_BUDGETS = 3.0
 
@@ -1174,6 +1185,7 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
     t_fit = 0.0
     budget_s = st.gpu_budget_minutes * 60.0
     excluded = 0.0                  # seconds the budget clock does not count (the intraday panel build: shared work)
+    fitted_times: List[float] = []  # the budget-clock seconds of every fitted block (the projection's rate)
 
     def elapsed() -> float:
         return time.perf_counter() - t_start - excluded
@@ -1183,10 +1195,11 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
             if elapsed() > budget_s:
                 raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes exceeded after "
                                      f"{done_blocks} of {len(blocks)} blocks ({elapsed():.0f} s)")
-            if done_blocks and elapsed() / done_blocks * len(blocks) > BUDGET_PROJECTION * budget_s:
-                raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes: {elapsed():.0f} s for "
-                                     f"{done_blocks} of {len(blocks)} blocks, projected "
-                                     f"{elapsed() / done_blocks * len(blocks):.0f} s in all, over {BUDGET_PROJECTION:g} x the budget")
+            proj = budget_projection(elapsed(), fitted_times, len(blocks) - done_blocks)
+            if proj is not None and proj > BUDGET_PROJECTION * budget_s:
+                raise BudgetExceeded(f"time budget of {st.gpu_budget_minutes:g} minutes: after {done_blocks} of "
+                                     f"{len(blocks)} blocks ({elapsed():.0f} s, {len(fitted_times)} fitted) the task is "
+                                     f"projected at {proj:.0f} s in all, over {BUDGET_PROJECTION:g} x the budget")
         win = W.train_window(b, cell.train_months, st.data_start)
         if win.clipped:
             clipped.append({"block": b.name, "window_start": str(win.start)})
@@ -1197,9 +1210,11 @@ def run_cell_seed(cell: Cell, seed: int, panel: Panel, st: GridSettings, n_jobs:
             skipped.append({"block": b.name, "reason": str(e)})
             continue
         finally:
-            t_fit += time.perf_counter() - t0
-        if gpu and "intraday_build_seconds" in res.audit:
-            excluded += res.audit["intraday_build_seconds"]
+            dt = time.perf_counter() - t0
+            t_fit += dt
+        built = res.audit["intraday_build_seconds"] if gpu and "intraday_build_seconds" in res.audit else 0.0
+        excluded += built
+        fitted_times.append(dt - built)
         rows_l.append(res.rows)
         scores_l.append(res.scores)
         block_l.append(np.full(len(res.rows), b.name, dtype=object))
@@ -1560,6 +1575,7 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
     inflight: Dict[Any, Tuple[Cell, int, int]] = {}
     order = {(c.key, sd): i for i, (c, sd) in enumerate(tasks)}
     submitted: Dict[Any, float] = {}                                  # future -> when it went to the pool
+    hard: Dict[Tuple[str, int], int] = {}                             # (cell_key, seed) -> hard deadlines so far
     workers = min(cpu_slots, len(tasks))
 
     def new_pool() -> ProcessPoolExecutor:
@@ -1600,6 +1616,7 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                 submitted[fu] = time.monotonic()
             done, _ = wait(list(inflight), timeout=POLL_SECONDS, return_when=FIRST_COMPLETED)
             broken: List[Tuple[Cell, int, int]] = []
+            sticky = False
             for fu in done:
                 c, sd, a = inflight.pop(fu)
                 try:
@@ -1609,18 +1626,27 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                     continue
                 except Exception as e:                            # noqa: BLE001  (e.g. an unpicklable result)
                     r = _error_record(c.key, sd, f"{type(e).__name__}: {e}", c.label, traceback.format_exc())
+                if isinstance(r, dict) and "cuda_error" in r and r["cuda_error"] == "sticky":
+                    sticky = True                                 # its CUDA context is poisoned: do not wait for its next task
                 finish(r)                                         # outside the try: an OSError here is not "broken"
             late = [] if deadline is None else [fu for fu in inflight if time.monotonic() - submitted[fu] > deadline]
-            if late:                                              # stuck: record the timeouts, kill the pool, requeue the rest
+            if late or sticky:                                    # stuck / poisoned: kill the pool, requeue the rest
+                again: List[Tuple[Cell, int, int]] = []
                 for fu in late:
                     c, sd, a = inflight.pop(fu)
+                    n_hard = hard[(c.key, sd)] = (hard[(c.key, sd)] if (c.key, sd) in hard else 0) + 1
+                    first = n_hard == 1
                     rec = _error_record(c.key, sd, f"hard deadline of {deadline:.0f} s exceeded: the task was stuck "
-                                                   f"and its worker process was terminated", c.label)
-                    rec["timeout"] = True
+                                                   f"and its worker process was terminated"
+                                                   f"{' (retried once)' if first else ''}", c.label)
+                    rec["hard_deadline"] = True
+                    rec["retrying" if first else "timeout"] = True   # the first is retried (a transient hang), the second is a timeout
                     finish(rec)
+                    if first:
+                        again.append((c, sd, a))
                 _terminate_pool(pool)
                 pool.shutdown(wait=False, cancel_futures=True)
-                innocent = []
+                innocent = list(again)
                 for fu, (c, sd, a) in list(inflight.items()):
                     if fu.done() and not fu.cancelled() and fu.exception() is None:
                         finish(fu.result())
@@ -1630,8 +1656,11 @@ def _drive_pool(tasks: Sequence[Tuple[Cell, int]], cpu_slots: int, init_args: Tu
                 submitted.clear()
                 for c, sd, a in sorted(innocent, key=lambda t: order[(t[0].key, t[1])], reverse=True):
                     (retry if a else queue).appendleft((c, sd, a))
-                logger.warning(f"ml_grid: {len(late)} task(s) passed the hard deadline of {deadline:.0f} s; the pool's "
-                               f"workers were terminated, rebuilding")
+                logger.warning(f"ml_grid: {len(late)} task(s) passed the hard deadline of {deadline:.0f} s"
+                               f"{' and a worker reported a sticky CUDA error' if sticky else ''}; the pool's "
+                               f"workers were terminated, rebuilding" if late else
+                               "ml_grid: a worker reported a sticky CUDA error; the pool's workers were terminated, "
+                               "rebuilding")
                 summary["pool_rebuilds"] += 1
                 pool = new_pool()
                 continue
@@ -2008,11 +2037,31 @@ def _refresh_outputs(out: Path, summary: Dict[str, Any], final: bool, finished: 
             logger.warning(f"ml_grid: {n} dashboard / report rebuilds failed in this run (the first was logged in full)")
 
 
+def _sweep_leftovers(out: Path, cells: Sequence[Cell], say: Callable[..., None]) -> None:
+    """At the start of a run, with the output directory's lock held (so no other run writes here): delete the prediction temp
+    files a killed worker left (``predictions/*.tmp``) and, when GPU cells are in the run, the stale ``ba2_darts_*``
+    checkpoint directories of killed Darts fits."""
+    n = 0
+    for tmp in (out / "predictions").glob("*.tmp"):
+        try:
+            tmp.unlink()
+            n += 1
+        except OSError:
+            logger.warning(f"could not delete the leftover {tmp}", exc_info=True)
+    d = 0
+    if any(c.pool == "gpu" for c in cells):
+        from app.services import ml_grid_seq
+        d = ml_grid_seq.sweep_stale_darts_dirs()
+    if n or d:
+        say(f"ml_grid: swept {n} leftover prediction temp file(s) and {d} stale darts checkpoint dir(s)")
+
+
 def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: str, st: GridSettings,
                 progress, inline: bool, rerun_mismatched: bool, cancelled, task_fn,
                 retry_timeouts: bool = False) -> Dict[str, Any]:
     res_path, err_path = out / "results.jsonl", out / "errors.jsonl"
     say = progress or (lambda m, pct=None: logger.warning(m))
+    _sweep_leftovers(out, cells, say)
     finished = _check_resume(read_results(res_path), cells, st, cache_root, rerun_mismatched, res_path)
     plan = plan_tasks(cells)
     tasks = [(c, sd) for c, sd in plan if (c.key, sd) not in finished]
@@ -2063,6 +2112,11 @@ def _run_locked(cells, out: Path, cpu_slots: int, gpu_slots: int, cache_root: st
     init_args = (st.to_dict(), cache_root, str(out), n_jobs_for(max(1, workers), st.cores))
 
     def finish(r: Dict[str, Any]) -> None:
+        if "error" in r and "retrying" in r and r["retrying"]:     # a first hard deadline: kept on file, not a finished task
+            _append(err_path, r)
+            say(f"ml_grid: cell {r['cell_key']} seed {r['seed']} ({r['label']}) passed the hard deadline once and is "
+                f"retried automatically; a second time is a timeout")
+            return
         if "error" in r:
             summary["errors"] += 1
             _append(err_path, r)

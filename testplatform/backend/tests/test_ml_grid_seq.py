@@ -888,13 +888,60 @@ def test_a_row_inside_the_budget_is_not_marked(world, tmp_path, monkeypatch, clo
     assert G.read_results(out / "results.jsonl")[0]["over_budget"] is False
 
 
-def test_the_projection_aborts_the_task_when_the_blocks_will_not_fit_1_5_times_the_budget(world, tmp_path, monkeypatch,
-                                                                                         clock):
-    _slow_blocks(monkeypatch, clock, [50.0, 1.0])       # 50 s for 1 of 2 blocks: 100 s projected > 1.5 x 60 s = 90 s
+def test_the_projection_needs_two_fitted_blocks_and_counts_only_fitted_time():
+    assert G.budget_projection(50.0, [50.0], 5) is None                          # one block: no rate yet (cold start)
+    assert G.budget_projection(0.0, [], 5) is None
+    assert G.budget_projection(30.0, [10.0, 20.0], 2) == pytest.approx(30.0 + 15.0 * 2)
+    assert G.budget_projection(30.0, [10.0, 20.0], 0) == pytest.approx(30.0)
+
+
+def _six_blocks(monkeypatch, repeats):
+    """The real blocks followed by ``repeats`` copies of the last one (the world has only 2-3 half-year blocks)."""
+    real = G.W.blocks
+
+    def blocks(*a, **k):
+        b = list(real(*a, **k))
+        return b + [b[-1]] * repeats
+    monkeypatch.setattr(G.W, "blocks", blocks)
+
+
+def test_the_projection_aborts_the_task_when_the_remaining_blocks_will_not_fit_1_5_times_the_budget(
+        world, tmp_path, monkeypatch, clock):
+    _six_blocks(monkeypatch, 4)                          # 6 blocks in all
+    _slow_blocks(monkeypatch, clock, [20.0, 20.0])       # 2 fitted: 40 s so far, 20 s each, 4 to go: 120 s > 1.5 x 60 s
     res, out = _run_one(world, tmp_path, 1.0)
     assert res["done"] == 0 and res["errors"] == 1
     err = G.read_results(out / "errors.jsonl")[0]
     assert "time budget" in err["error"] and "projected" in err["error"] and err["timeout"] is True
+    assert "after 2 of 6" in err["error"]
+
+
+def test_skipped_blocks_do_not_enter_the_rate_or_the_remaining_count(world, tmp_path, monkeypatch, clock):
+    _six_blocks(monkeypatch, 3)                          # 5 blocks: the first is skipped, then 2 fitted, 2 still to come
+    real = G.fit_block
+    n = {"k": 0}
+
+    def wrapped(*a, **k):
+        n["k"] += 1
+        if n["k"] == 1:
+            raise G.SkipBlock("no data")                 # costs nothing
+        res = real(*a, **k)
+        clock.offset += 20.0
+        return res
+    monkeypatch.setattr(G, "fit_block", wrapped)
+    res, out = _run_one(world, tmp_path, 1.0)
+    # 40 s of fitted work, 20 s a block, 2 blocks to come: 80 s <= 90 s -> it goes on (the old formula divided the
+    # elapsed time by the 3 processed blocks and multiplied by all 5: 67 s -- and a mean over skipped blocks is noise)
+    assert res["errors"] == 0 or "projected" not in G.read_results(out / "errors.jsonl")[0]["error"]
+
+
+def test_a_slow_cold_start_does_not_abort_the_task(world, tmp_path, monkeypatch, clock):
+    _slow_blocks(monkeypatch, clock, [50.0, 3.0, 3.0])   # the first block pays the CUDA warm-up; 3 blocks
+    out = tmp_path / "o"
+    res = grun([tsai_cell(world)], out, world, settings=_gsettings(gpu_budget_minutes=1.0, eval_start=date(2019, 7, 1)))
+    assert res["done"] == 1 and res["errors"] == 0, G.read_results(out / "errors.jsonl")
+    row = G.read_results(out / "results.jsonl")[0]
+    assert row["n_blocks"] == 3 and row["n_blocks_fitted"] == 3                    # the old rule projected 150 s and aborted
 
 
 def test_a_projection_under_1_5_times_the_budget_lets_the_task_finish(world, tmp_path, monkeypatch, clock):
@@ -1004,21 +1051,55 @@ def slow_or_quick_task(cfg, seed, key):
             "controls": {}, "config": {k: v for k, v in cfg.items() if k != "seeds"}}
 
 
-def test_the_master_terminates_a_task_stuck_past_three_times_the_budget(world, tmp_path):
+def test_a_task_stuck_twice_is_retried_once_and_then_recorded_as_a_timeout(world, tmp_path):
     out = tmp_path / "o"
     cells = [tsai_cell(world), tsai_cell(world, family="tsai-minirocket", params={"device": "cpu"})]
     t0 = _real_time.time()
     res = grun(cells, out, world, inline=False, cpu_slots=1, gpu_slots=2, task_fn=slow_or_quick_task,
-               settings=_gsettings(gpu_budget_minutes=0.15))                 # hard deadline: 3 x 9 s = 27 s
-    assert _real_time.time() - t0 < 120                                       # not the 300 s of the stuck kernel
-    assert res["done"] == 1 and res["errors"] == 1 and res["pool_rebuilds"] >= 1
-    err = G.read_results(out / "errors.jsonl")[0]
-    assert err["timeout"] is True and "hard deadline" in err["error"] and err["cell_key"] == G.validate_cell(
-        tsai_cell(world)).key
+               settings=_gsettings(gpu_budget_minutes=0.1))                  # hard deadline: 3 x 6 s = 18 s, twice
+    assert _real_time.time() - t0 < 150                                       # not the 300 s of the stuck kernel
+    assert res["done"] == 1 and res["errors"] == 1 and res["pool_rebuilds"] >= 2
+    errs = G.read_results(out / "errors.jsonl")
+    key = G.validate_cell(tsai_cell(world)).key
+    assert len(errs) == 2 and all(e["cell_key"] == key and e["hard_deadline"] is True for e in errs)
+    assert "timeout" not in errs[0] and errs[0]["retrying"] is True                # the first one: a retry follows
+    assert errs[1]["timeout"] is True and "retrying" not in errs[1]                # the second: given up
+    assert "hard deadline" in errs[1]["error"]
     done = G.read_results(out / "results.jsonl")
     assert [r["config"]["family"] for r in done] == ["tsai-minirocket"]       # the innocent task still finished
+    again = grun([tsai_cell(world)], out, world, task_fn=slow_or_quick_task_ok)     # a restart skips the timeout
+    assert again["tasks"] == 0 and again["skipped_timeouts"] == 1
 
 
+def hang_once_task(cfg, seed, key):
+    """The first run of tsai-inception hangs (a transient driver hang), the retry returns at once."""
+    if cfg["family"] == "tsai-inception":
+        marker = Path(os.environ["HANG_ONCE_MARKER"])
+        if not marker.exists():
+            marker.write_text("hung", encoding="utf-8")
+            _real_time.sleep(300)
+    return slow_or_quick_task({**cfg, "family": "x"}, seed, key)
+
+
+def test_a_transient_hang_is_absorbed_by_the_one_automatic_retry(world, tmp_path, monkeypatch):
+    monkeypatch.setenv("HANG_ONCE_MARKER", str(tmp_path / "hung"))
+    out = tmp_path / "o"
+    res = grun([tsai_cell(world)], out, world, inline=False, cpu_slots=1, gpu_slots=1, task_fn=hang_once_task,
+               settings=_gsettings(gpu_budget_minutes=0.1))
+    assert res["done"] == 1 and res["errors"] == 0 and res["pool_rebuilds"] >= 1
+    errs = G.read_results(out / "errors.jsonl")
+    assert len(errs) == 1 and errs[0]["hard_deadline"] is True and errs[0]["retrying"] is True
+    assert "timeout" not in errs[0]
+    assert len(G.read_results(out / "results.jsonl")) == 1
+
+
+def test_a_run_that_dies_after_the_first_hard_deadline_retries_it_on_restart(world, tmp_path):
+    out = tmp_path / "o"
+    key = G.validate_cell(tsai_cell(world)).key
+    out.mkdir()
+    (out / "errors.jsonl").write_text(json.dumps({"cell_key": key, "seed": 1, "error": "hard deadline", "label": "l",
+                                                  "hard_deadline": True, "retrying": True}) + "\n", encoding="utf-8")
+    assert grun([tsai_cell(world)], out, world)["tasks"] == 1                  # not a timeout: it runs again
 # ---- 6. cancel, Ctrl-C, lanes
 class SnapshotPool(G.ProcessPoolExecutor):
     """A real pool that remembers its worker processes and the keyword arguments it was built with."""
@@ -1444,3 +1525,157 @@ def test_other_warnings_of_a_block_are_not_swallowed(world, tmp_path, monkeypatc
 def test_the_comments_do_not_promise_bitwise_repeatability():
     text = Path(S.__file__).read_text(encoding="utf-8")
     assert "bitwise repeatable" not in re.sub(r"not bitwise repeatable", "", text, flags=re.I)
+
+
+# ---------------------------------------------------------------- 3. a sticky CUDA record restarts the pool at once
+def sticky_or_slow_task(cfg, seed, key):
+    """train_months 24 (B): hangs the first time (until the pool is restarted), then returns at once. train_months 12 (A):
+    waits until B has started hanging (so the restart really interrupts it), then returns a sticky CUDA error record."""
+    marker = Path(os.environ["STICKY_TEST_MARKER"])
+    if cfg["train_months"] == 12:
+        for _ in range(1200):
+            if marker.exists():
+                break
+            _real_time.sleep(0.1)
+        rec = G._error_record(key, seed, "RuntimeError: CUDA error: device-side assert triggered", "l")
+        rec["cuda_error"] = "sticky"
+        return rec
+    if not marker.exists():
+        marker.write_text("started", encoding="utf-8")
+        _real_time.sleep(240)
+    return slow_or_quick_task({**cfg, "family": "x"}, seed, key)
+
+
+def test_a_sticky_cuda_record_terminates_the_pool_and_requeues_the_other_tasks_uncharged(world, tmp_path, monkeypatch):
+    monkeypatch.setenv("STICKY_TEST_MARKER", str(tmp_path / "started"))
+    SnapshotPool.instances = []
+    monkeypatch.setattr(G, "ProcessPoolExecutor", SnapshotPool)
+    a = G.validate_cell(tsai_cell(world))
+    b = G.validate_cell(tsai_cell(world, train_months=24))
+    rows, summary = [], {}
+    t0 = _real_time.time()
+    G._drive_pool([(a, 1), (b, 1)], 2, (_gsettings().to_dict(), str(world[2]), str(tmp_path), 1), sticky_or_slow_task,
+                  rows.append, lambda: False, summary, window_factor=1)
+    assert _real_time.time() - t0 < 150                                       # not the 240 s the slow task would have taken
+    assert summary["pool_rebuilds"] >= 1 and len(SnapshotPool.instances) >= 2
+    bad = [r for r in rows if "error" in r]
+    assert len(bad) == 1 and bad[0]["cuda_error"] == "sticky"                  # the sticky one is recorded ...
+    assert not any("worker process died" in r["error"] for r in bad)           # ... nobody else was charged
+    assert [r["cell_key"] for r in rows if "error" not in r] == [b.key]       # the slow task ran again and finished
+
+
+# ---------------------------------------------------------------- 4. the runtime panel end
+def test_the_runtime_intraday_span_ends_where_the_master_and_the_resume_check_say(world):
+    panel = G.load_panel(str(world[0]), tuple(sorted(GSYMS)), "selection", str(world[2]))
+    store_last = G.store_span(str(world[0]), tuple(sorted(GSYMS)))[1]
+    assert panel.store_last == store_last
+    st = _gsettings()
+    first, last, _ = S.intraday_span(panel, st)
+    assert last == min(store_last, st.eval_end)
+    panel.store_last = date(2020, 3, 2)                                        # whatever the store says is what counts
+    assert S.intraday_span(panel, st)[1] == date(2020, 3, 2)
+    assert S.intraday_fingerprint(str(world[2]), GSYMS, st.eval_end, date(2020, 3, 2)) == \
+        S.intraday_fingerprint(str(world[2]), GSYMS, st.eval_end, panel.store_last)
+
+
+def test_the_panel_uses_the_stores_last_day_not_the_last_bar_of_the_daily_panel(world, tmp_path):
+    w = _copy_world(world, tmp_path / "w")
+    mp = w[1] / "features.parquet.meta.json"
+    meta = json.loads(mp.read_text(encoding="utf-8"))
+    meta["last_day"] = "2020-12-30"                                           # one session before the data ends
+    mp.write_text(json.dumps(meta), encoding="utf-8")
+    panel = G.load_panel(str(w[0]), tuple(sorted(GSYMS)), "selection", str(w[2]))
+    assert panel.store_last == date(2020, 12, 30) == G.store_span(str(w[0]), tuple(sorted(GSYMS)))[1]
+    assert S.intraday_span(panel, _gsettings())[1] == date(2020, 12, 30)
+
+
+# ---------------------------------------------------------------- 5. housekeeping
+def test_a_run_sweeps_leftover_prediction_temp_files_under_the_lock(world, tmp_path):
+    out = tmp_path / "o"
+    (out / "predictions").mkdir(parents=True)
+    stale = out / "predictions" / "abc_1.parquet.4242.tmp"
+    stale.write_bytes(b"half a file")
+    keep = out / "predictions" / "other.parquet"
+    keep.write_bytes(b"x")
+    grun([lgbm_cell(world)], out, world)
+    assert not stale.exists() and keep.exists() and not list((out / "predictions").glob("*.tmp"))
+
+
+def test_stale_darts_temp_dirs_are_swept_but_a_fresh_one_is_left_alone(tmp_path):
+    import os as _os
+    old, fresh, other = tmp_path / "ba2_darts_old", tmp_path / "ba2_darts_fresh", tmp_path / "unrelated_dir"
+    for d in (old, fresh, other):
+        d.mkdir()
+        (d / "x.ckpt").write_bytes(b"x")
+    long_ago = _real_time.time() - 24 * 3600
+    _os.utime(old, (long_ago, long_ago))
+    _os.utime(other, (long_ago, long_ago))
+    n = S.sweep_stale_darts_dirs(tmp_path, max_age_hours=6)
+    assert n == 1 and not old.exists() and fresh.exists() and other.exists()
+
+
+def test_a_run_with_gpu_cells_sweeps_the_darts_temp_dirs(world, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(S, "sweep_stale_darts_dirs", lambda *a, **k: calls.append(1) or 0)
+    grun([tsai_cell(world)], tmp_path / "o", world)
+    assert calls
+    calls.clear()
+    grun([lgbm_cell(world)], tmp_path / "o2", world)
+    assert not calls                                                            # a tabular run has no darts dirs
+
+
+def test_the_warning_collector_counts_per_op_and_keeps_a_bounded_set_of_others():
+    import warnings
+    c = S.WarningCollector(max_others=5)
+
+    def warn(text):                                                              # one call site: one key per message
+        warnings.warn(text, UserWarning)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with c:
+            for _ in range(5000):
+                warn(NONDET)
+            for i in range(200):
+                warn(f"unrelated {i}")
+            for _ in range(10):
+                warn("unrelated 0")
+    assert c.ops == {"upsample_linear1d_backward_out_cuda": 5000}
+    assert len(c.others) == 5 and c.dropped == 195                              # a bound, and the overflow is counted
+    assert sum(c.others.values()) == 15                                         # 1 + 10 of "unrelated 0", 1 each of 1-4
+
+
+def test_the_collector_reemits_what_it_kept_and_restores_the_warning_machinery():
+    import warnings
+    orig = warnings.showwarning
+    with pytest.warns(UserWarning, match="unrelated 7") as rec:
+        with S.WarningCollector():
+            warnings.warn("unrelated 7", UserWarning)
+    assert warnings.showwarning is orig
+
+
+def test_the_counts_per_op_are_on_the_block_audit(world, tmp_path, monkeypatch):
+    import warnings
+    real = MS.TsaiAdapter.fit
+
+    def fit(self, *a, **k):
+        for _ in range(300):
+            warnings.warn(NONDET, UserWarning)
+        return real(self, *a, **k)
+    monkeypatch.setattr(MS.TsaiAdapter, "fit", fit)
+    out = tmp_path / "o"
+    grun([tsai_cell(world)], out, world)
+    row = G.read_results(out / "results.jsonl")[0]
+    assert all(b["nondeterministic_counts"] == {"upsample_linear1d_backward_out_cuda": 300} for b in row["blocks"])
+    assert row["nondeterministic_ops"] == ["upsample_linear1d_backward_out_cuda"]
+
+
+def test_warnings_are_kept_when_the_fit_fails(world, tmp_path, monkeypatch):
+    import warnings
+
+    def fit(self, *a, **k):
+        warnings.warn("a warning before the crash", UserWarning)
+        raise RuntimeError("boom")
+    monkeypatch.setattr(MS.TsaiAdapter, "fit", fit)
+    with pytest.warns(UserWarning, match="a warning before the crash"):
+        res = grun([tsai_cell(world)], tmp_path / "o", world)
+    assert res["errors"] == 1

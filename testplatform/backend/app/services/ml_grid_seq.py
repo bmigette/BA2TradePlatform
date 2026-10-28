@@ -180,8 +180,8 @@ def _file_span(path: str, size: int, mtime_ns: int) -> Tuple[date, date]:
 
 def intraday_bounds(cache_root: Any, symbols: Any, eval_end: date, store_last: date) -> Tuple[date, date, Tuple]:
     """(first day, last day, file stamps) of the intraday panel of ``symbols``: from the first day every symbol and the
-    context symbols (SPY, QQQ) have 5-minute bars to ``min(eval_end, the last cached day, store_last)`` (the daily
-    panel's last session). The stamps (size, mtime) only key caches: they are never part of an identity."""
+    context symbols (SPY, QQQ) have 5-minute bars to ``min(eval_end, the last cached day, store_last)``: the store's last
+    day (``store_span(...)[1]``), the same value the master's resume check and the identity use. The stamps (size, mtime) only key caches: they are never part of an identity."""
     names = tuple(dict.fromkeys(tuple(symbols) + MP.CONTEXT_SYMBOLS))
     firsts, lasts, stamps = [], [], []
     for s in names:
@@ -196,7 +196,7 @@ def intraday_bounds(cache_root: Any, symbols: Any, eval_end: date, store_last: d
 
 def intraday_span(panel: "G.Panel", st: "G.GridSettings") -> Tuple[date, date, Tuple]:
     """``intraday_bounds`` of a daily ``panel``'s symbols under the run's ``eval_end``."""
-    return intraday_bounds(panel.cache_root, panel.symbols, st.eval_end, panel.sessions.max().date())
+    return intraday_bounds(panel.cache_root, panel.symbols, st.eval_end, panel.store_last)
 
 
 @lru_cache(maxsize=1024)
@@ -219,6 +219,29 @@ def intraday_fingerprint(cache_root: Any, symbols: Any, eval_end: date, store_la
         h.update(sym.encode("utf-8"))
         h.update(_intraday_hash(str(cache_root), sym, size, mtime, first, last))
     return h.hexdigest()[:16]
+
+
+#: a ``ba2_darts_*`` temp directory untouched for this long belongs to a killed worker
+STALE_TEMP_HOURS = 6.0
+
+
+def sweep_stale_darts_dirs(root: Optional[Path] = None, max_age_hours: float = STALE_TEMP_HOURS) -> int:
+    """Delete the ``ba2_darts_*`` checkpoint directories (``ml_models_seq`` makes one per Darts fit and removes it when the fit
+    ends) that a killed worker left behind: only those untouched for ``max_age_hours``, so another live run's directory
+    is never taken. Returns how many were removed."""
+    import shutil
+    import tempfile
+    base = Path(root) if root is not None else Path(tempfile.gettempdir())
+    cutoff = time.time() - max_age_hours * 3600.0
+    n = 0
+    for d in base.glob("ba2_darts_*"):
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+        except OSError:
+            logger.warning("could not sweep %s", d, exc_info=True)
+    return n
 
 
 @lru_cache(maxsize=4)
@@ -324,6 +347,51 @@ def _adapter_params(cell: "G.Cell", st: "G.GridSettings") -> Tuple[str, Dict[str
     return base, p
 
 
+class WarningCollector:
+    """Context manager that takes over the warnings of a block WITHOUT keeping each one: warnings of an op without a
+    deterministic CUDA kernel are COUNTED per op name (``ops``; with ``torch.set_warn_always`` such an op warns at every
+    call, thousands of times a block), any other warning is kept once with its count, up to ``max_others`` distinct ones
+    (``others``; the overflow is counted in ``dropped``). On exit, also when the block raised, the filters and
+    ``showwarning`` are restored and the kept warnings are re-emitted (with their count), so a failed fit loses none."""
+
+    def __init__(self, max_others: int = 50) -> None:
+        self.max_others = max_others
+        self.ops: Dict[str, int] = {}
+        self.others: "OrderedDict[Tuple, int]" = OrderedDict()
+        self.dropped = 0
+        self._ctx: Optional[Any] = None
+
+    def _show(self, message: Any, category: Any, filename: str, lineno: int, file: Any = None, line: Any = None) -> None:
+        text = str(message)
+        m = NONDETERMINISTIC_OP.match(text)
+        if m:
+            self.ops[m.group(1)] = (self.ops[m.group(1)] if m.group(1) in self.ops else 0) + 1
+            return
+        key = (category, text, filename, lineno)
+        if key in self.others:
+            self.others[key] += 1
+        elif len(self.others) < self.max_others:
+            self.others[key] = 1
+        else:
+            self.dropped += 1
+
+    def __enter__(self) -> "WarningCollector":
+        self._ctx = warnings.catch_warnings()
+        self._ctx.__enter__()
+        warnings.simplefilter("always")
+        warnings.showwarning = self._show                             # type: ignore[assignment]
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        self._ctx.__exit__(*exc)                                      # filters and showwarning are back
+        for (category, text, filename, lineno), n in self.others.items():
+            warnings.warn_explicit(text + (f" [repeated {n} times]" if n > 1 else ""), category, filename, lineno)
+        if self.dropped:
+            logger.warning("%d further distinct warnings of a GPU block were dropped (the first %d are kept)",
+                           self.dropped, self.max_others)
+        return False
+
+
 #: torch's warning for an op without a deterministic CUDA kernel (under ``use_deterministic_algorithms(warn_only=True)``)
 NONDETERMINISTIC_OP = re.compile(r"^(\S+) does not have a deterministic implementation")
 
@@ -354,9 +422,9 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
                            "CPU silently (set params.device to 'cpu' to run a deep cell on the CPU on purpose)")
     adapter = M.make_adapter(base, n_jobs, params)
     warn_always = torch.is_warn_always_enabled()
+    collector = WarningCollector()
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with collector:
             torch.set_warn_always(True)                               # an op warns every time, not once per process
             try:
                 if base == "tsai":
@@ -368,11 +436,8 @@ def fit_block_seq(cell: "G.Cell", seed: int, panel: "G.Panel", br: "G.BlockRows"
     finally:
         _release_quietly(adapter)
         gc.collect()
-    ops = sorted({m.group(1) for w in caught for m in [NONDETERMINISTIC_OP.match(str(w.message))] if m})
-    for w in caught:                                                  # what is not ours goes on its way
-        if not NONDETERMINISTIC_OP.match(str(w.message)):
-            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
-    extra = {**extra, "gpu_nondeterministic": bool(ops), "nondeterministic_ops": ops}
+    extra = {**extra, "gpu_nondeterministic": bool(collector.ops), "nondeterministic_ops": sorted(collector.ops),
+             "nondeterministic_counts": dict(collector.ops)}
     info = adapter.fit_info if adapter.fit_info is not None else {}
     audit = {**G.block_audit(br, block, window), **extra,
              "device": info["device"] if "device" in info else None,
