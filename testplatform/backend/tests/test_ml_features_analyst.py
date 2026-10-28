@@ -258,7 +258,8 @@ def test_the_target_ratio_refusals_are_found_by_the_pre_screen_not_late_in_the_b
     usable, permanent, transient = F.screen_symbols(["AAA", "BBB", "SPY"], FIRST, LAST, root, ["at"])
     assert usable == ["BBB"] and not transient
     assert "at_target_gap" in permanent["AAA"] and "SPY" in permanent["SPY"]         # a file the group needs but SPY lacks
-    res = F.ensure_feature_store(tmp_path / "store", ["AAA", "BBB"], FIRST, LAST, ["t", "at"], cache_root=root, chunk_size=1)
+    res = F.ensure_feature_store(tmp_path / "store", ["AAA", "BBB"], FIRST, LAST, ["t", "at"], cache_root=root, chunk_size=1,
+                                  holdout=True)
     assert res["status"] == "built" and set(res["refused"]) == {"AAA"} and res["symbols"] == ["BBB"]
     assert "at_target_gap" in res["refused"]["AAA"]
 

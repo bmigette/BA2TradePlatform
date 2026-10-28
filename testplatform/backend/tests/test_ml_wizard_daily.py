@@ -15,7 +15,7 @@ from app.services import ml_panel as P
 from app.services import ml_wizard_targets as W
 
 FIRST, LAST = date(2023, 1, 3), date(2024, 12, 31)
-UNIVERSE5 = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+UNIVERSE5 = ["AAB", "BBB", "CCC", "DDD", "EEE"]
 
 
 def _sessions(first=FIRST, last=LAST):
@@ -53,7 +53,7 @@ def _fake_features(symbols, first, last, groups, cache_root, **kw):
         prefix = F.GROUPS[g].prefix
         for name in (F.GROUPS[g].coverage_columns or (f"{prefix}a", f"{prefix}b")):
             df[name] = rng.normal(size=len(df))
-        if g in ("ag", "mac"):                     # groups whose coverage columns are named: keep an a/b pair too
+        if g in ("ag", "mac", "f", "i"):                     # groups whose coverage columns are named: keep an a/b pair too
             for k in ("a", "b"):
                 df[f"{prefix}{k}"] = rng.normal(size=len(df))
     if "m" in groups:
@@ -61,7 +61,7 @@ def _fake_features(symbols, first, last, groups, cache_root, **kw):
     if "f" in groups:
         yr = idx.get_level_values("session").year
         half = (np.arange(len(df)) % 2 == 0)
-        for c in ("f_a", "f_b"):
+        for c in [c for c in df.columns if c.startswith("f_")]:          # the group's coverage columns and the a / b pair
             df.loc[(yr == 2023) & half, c] = np.nan
     df.attrs["meta"] = {"sectorless": [], "groups": {g: [] for g in groups}}
     return df
@@ -121,13 +121,13 @@ class TestCatalogue:
 class TestValidateDailyRequest:
     def v(self, **kw):
         args = dict(provider_name="alpaca_hist", timeframe="1d", daily_groups=["t", "m"], daily_min_share=None,
-                    ticker="AAA", universe=None)
+                    ticker="AAB", universe=None)
         args.update(kw)
         return S.validate_daily_request(**args)
 
     def test_normalised_request(self):
         r = self.v()
-        assert r == {"daily_groups": ["t", "m"], "daily_min_share": 0.7, "daily_universe": ["AAA"]}
+        assert r == {"daily_groups": ["t", "m"], "daily_min_share": 0.7, "daily_universe": ["AAB"]}
 
     def test_other_sources_carry_no_daily_keys(self):
         assert self.v(provider_name="yfinance", daily_groups=None) == {}
@@ -154,7 +154,7 @@ class TestValidateDailyRequest:
         assert r["daily_universe"] == UNIVERSE5 and r["daily_min_share"] == 0.5
 
     def test_ticker_is_added_to_the_universe(self):
-        assert self.v(universe=["BBB", "CCC"], ticker="AAA")["daily_universe"] == ["BBB", "CCC", "AAA"]
+        assert self.v(universe=["BBB", "CCC"], ticker="AAB")["daily_universe"] == ["BBB", "CCC", "AAB"]
 
     def test_panel_features_are_intraday_only(self):
         with pytest.raises(ValueError, match="'1h', '15m'"):
@@ -164,22 +164,22 @@ class TestValidateDailyRequest:
 
 # ---------------------------------------------------------------------------------------------- the build helper
 class TestDailyBuild:
-    def fetch(self, daily=None, ticker="AAA", **kw):
-        daily = daily or {"daily_groups": ["t", "f"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]}
+    def fetch(self, daily=None, ticker="AAB", **kw):
+        daily = daily or {"daily_groups": ["t", "f"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]}
         return S.fetch_ohlcv_frame("alpaca_hist", ticker, "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
                                    daily, **kw)
 
     def test_calls_build_features_with_the_chosen_groups_and_universe(self, _daily_env):
         df = self.fetch()
         (args, kwargs), = _daily_env["build"]
-        assert list(args[0]) == ["AAA", "BBB"] and args[1] == FIRST and args[2] == LAST
+        assert list(args[0]) == ["AAB", "BBB"] and args[1] == FIRST and args[2] == LAST
         assert list(args[3]) == ["t", "f"]
         assert kwargs["sector_of"] == "store"
         assert {"Date", "Open", "High", "Low", "Close", "Volume", "filled", "t_a", "f_a"} <= set(df.columns)
         assert df["Date"].is_monotonic_increasing and len(df) == len(_sessions())
 
     def test_the_coverage_threshold_masks_the_thin_group_year(self):
-        df = self.fetch({"daily_groups": ["t", "f"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+        df = self.fetch({"daily_groups": ["t", "f"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]})
         year = pd.to_datetime(df["Date"]).dt.year
         assert df.loc[year == 2023, ["f_a", "f_b"]].isna().all().all()            # 50% covered < 0.7: the year is absent
         assert (df.loc[year == 2023, "f_missing"] == 1.0).all() and (df.loc[year == 2024, "f_missing"] == 0.0).all()
@@ -187,7 +187,7 @@ class TestDailyBuild:
         assert df["t_a"].notna().all() and (df["t_missing"] == 0.0).all()        # the t group is whole: not masked
 
     def test_a_lower_threshold_keeps_the_year(self):
-        df = self.fetch({"daily_groups": ["t", "f"], "daily_min_share": 0.4, "daily_universe": ["AAA", "BBB"]})
+        df = self.fetch({"daily_groups": ["t", "f"], "daily_min_share": 0.4, "daily_universe": ["AAB", "BBB"]})
         year = pd.to_datetime(df["Date"]).dt.year
         assert df.loc[year == 2023, "f_a"].notna().mean() == pytest.approx(0.5, abs=0.02)
         assert (df["f_missing"] == 0.0).all()
@@ -197,26 +197,26 @@ class TestDailyBuild:
         assert df["filled"].dtype == bool and not df["filled"].any()
         assert "listed" not in df.columns and "ended" not in df.columns and "label_bar_filled" not in df.columns
         (symbols, first, last, cache_end), = _daily_env["load"]
-        assert symbols == ["AAA"] and cache_end == date(2026, 10, 22)
+        assert symbols == ["AAB"] and cache_end == date(2026, 10, 22)
 
     def test_the_universe_is_built_once_for_all_of_a_batch(self, _daily_env):
-        daily = {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB", "CCC"]}
-        for t in ("AAA", "BBB", "CCC"):
+        daily = {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB", "CCC"]}
+        for t in ("AAB", "BBB", "CCC"):
             self.fetch(daily, ticker=t)
         assert len(_daily_env["build"]) == 1
-        self.fetch({**daily, "daily_min_share": 0.5}, ticker="AAA")
+        self.fetch({**daily, "daily_min_share": 0.5}, ticker="AAB")
         assert len(_daily_env["build"]) == 2                                      # another request: another build
 
     def test_unlisted_rows_are_dropped_and_the_listing_flag_is_not_a_feature(self, monkeypatch):
         def late(symbols, first, last, groups, cache_root, **kw):
             df = _fake_features(symbols, first, last, ["t"], cache_root)
             idx = df.index.get_level_values("session")
-            early = (idx < pd.Timestamp("2023-03-01")) & (df.index.get_level_values("symbol") == "AAA")
+            early = (idx < pd.Timestamp("2023-03-01")) & (df.index.get_level_values("symbol") == "AAB")
             df.loc[early, "listed"] = False
             df.loc[early, ["t_a", "t_b"]] = np.nan
             return df
         monkeypatch.setattr(F, "build_features", late)
-        df = self.fetch({"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+        df = self.fetch({"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]})
         assert pd.to_datetime(df["Date"]).min() >= pd.Timestamp("2023-03-01") and df["t_a"].notna().all()
 
     def test_a_missing_daily_request_is_refused_loudly(self):
@@ -225,10 +225,10 @@ class TestDailyBuild:
 
     def test_intraday_and_other_sources_are_unchanged(self, monkeypatch):
         monkeypatch.setattr(P, "ticker_frame", lambda *a, **k: _tiny_intraday().set_index("Date"))
-        out = S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1h", datetime(2024, 1, 2), datetime(2024, 1, 5), ["daily"])
+        out = S.fetch_ohlcv_frame("alpaca_hist", "AAB", "1h", datetime(2024, 1, 2), datetime(2024, 1, 5), ["daily"])
         assert "Date" in out.columns
         with pytest.raises(ValueError, match="need the alpaca_hist data provider with timeframe '1d'"):
-            S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1h", datetime(2024, 1, 2), datetime(2024, 1, 5), [], None,
+            S.fetch_ohlcv_frame("alpaca_hist", "AAB", "1h", datetime(2024, 1, 2), datetime(2024, 1, 5), [], None,
                                 {"daily_groups": ["t"]})
 
 
@@ -297,12 +297,12 @@ class TestDailyPayload:
 
 # ---------------------------------------------------------------------------------------------- build paths
 class TestBreadthNeedsAUniverse:
-    def fetch(self, universe, ticker="AAA"):
+    def fetch(self, universe, ticker="AAB"):
         return S.fetch_ohlcv_frame("alpaca_hist", ticker, "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
                                    {"daily_groups": ["t", "m"], "daily_min_share": 0.7, "daily_universe": universe})
 
     def test_the_breadth_of_a_universe_below_five_tickers_is_dropped(self):
-        for universe in (["AAA"], ["AAA", "BBB"], ["AAA", "BBB", "CCC", "DDD"]):
+        for universe in (["AAB"], ["AAB", "BBB"], ["AAB", "BBB", "CCC", "DDD"]):
             df = self.fetch(universe)
             assert "m_breadth_sma50" not in df.columns
             assert "m_a" in df.columns and "t_a" in df.columns          # the rest of group m stays
@@ -311,8 +311,8 @@ class TestBreadthNeedsAUniverse:
         assert "m_breadth_sma50" in self.fetch(UNIVERSE5).columns
 
     def test_a_group_other_than_m_is_not_touched(self):
-        df = S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
-                                 {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA"]})
+        df = S.fetch_ohlcv_frame("alpaca_hist", "AAB", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                                 {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAB"]})
         assert "t_a" in df.columns
 
     def test_the_group_description_says_so(self):
@@ -330,28 +330,28 @@ class TestMemoKeyCoversTheSourceFiles:
         monkeypatch.setattr(fs, "CACHE_FOLDER", str(tmp_path))
         d = tmp_path / "AlpacaHistoryOHLCVProvider"
         d.mkdir()
-        for sym in ("AAA", "BBB", "SPY", "QQQ", "IWM", "TLT", "GLD"):
+        for sym in ("AAB", "BBB", "SPY", "QQQ", "IWM", "TLT", "GLD"):
             (d / f"{sym}_1d.parquet").write_bytes(b"x" * 10)
         (tmp_path / "fred").mkdir()
         (tmp_path / "fred" / "VIXCLS.json").write_text("{}")
-        fmp = F.fmp_history_path("analyst_grades", "AAA", tmp_path)
+        fmp = F.fmp_history_path("analyst_grades", "AAB", tmp_path)
         fmp.parent.mkdir(parents=True, exist_ok=True)
         fmp.write_text("[]")
         return tmp_path
 
     def fetch(self, groups):
-        return S.fetch_ohlcv_frame("alpaca_hist", "AAA", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
-                                   {"daily_groups": groups, "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+        return S.fetch_ohlcv_frame("alpaca_hist", "AAB", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
+                                   {"daily_groups": groups, "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]})
 
     def test_the_source_files_are_stat_ed_once_per_batch(self, root, _daily_env, monkeypatch):
         monkeypatch.setattr(S, "STAMP_TTL_SECONDS", 60.0)
         calls = []
         real = F._input_fingerprints
         monkeypatch.setattr(F, "_input_fingerprints", lambda *a, **k: calls.append(1) or real(*a, **k))
-        for t in ("AAA", "BBB", "AAA", "BBB"):
-            self.fetch(["t"]) if t == "AAA" else S.fetch_ohlcv_frame(
+        for t in ("AAB", "BBB", "AAB", "BBB"):
+            self.fetch(["t"]) if t == "AAB" else S.fetch_ohlcv_frame(
                 "alpaca_hist", "BBB", "1d", datetime(2023, 1, 3), datetime(2024, 12, 31), [], None,
-                {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]})
+                {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]})
         assert len(calls) == 1 and len(_daily_env["build"]) == 1
 
     def test_unchanged_files_reuse_the_build(self, root, _daily_env):
@@ -367,7 +367,7 @@ class TestMemoKeyCoversTheSourceFiles:
 
     def test_a_changed_fmp_history_file_rebuilds_when_its_group_is_on(self, root, _daily_env):
         self.fetch(["t", "ag"])
-        F.fmp_history_path("analyst_grades", "AAA", root).write_text("[1, 2, 3]")
+        F.fmp_history_path("analyst_grades", "AAB", root).write_text("[1, 2, 3]")
         self.fetch(["t", "ag"])
         assert len(_daily_env["build"]) == 2
 
@@ -386,11 +386,11 @@ class TestMemoKeyCoversTheSourceFiles:
 
 class TestDailyBuildPaths:
     DAILY_GC = {"data_provider": "alpaca_hist", "panel_features": [], "daily_groups": ["t", "mtf"],
-                "daily_min_share": 0.75, "daily_universe": ["AAA", "BBB"], "original_start_date": "2023-01-03",
+                "daily_min_share": 0.75, "daily_universe": ["AAB", "BBB"], "original_start_date": "2023-01-03",
                 "original_end_date": "2024-12-31"}
 
     def _frame(self):
-        return _fake_features(["AAA"], FIRST, LAST, ["t"], None).xs("AAA", level="symbol").reset_index().rename(
+        return _fake_features(["AAB"], FIRST, LAST, ["t"], None).xs("AAB", level="symbol").reset_index().rename(
             columns={"session": "Date"}).assign(Open=1.0, High=1.0, Low=1.0, Close=1.0, Volume=1.0)
 
     def test_background_build(self, tmp_path):
@@ -402,12 +402,12 @@ class TestDailyBuildPaths:
         with patch.object(D, "SessionLocal", return_value=session), \
                 patch.object(D, "fetch_ohlcv_frame", side_effect=lambda *a: calls.append(a) or self._frame()):
             D._build_dataset_in_background(1, {
-                "ticker": "AAA", "timeframe": "1d", "start_date": "2023-01-03", "end_date": "2024-12-31",
+                "ticker": "AAB", "timeframe": "1d", "start_date": "2023-01-03", "end_date": "2024-12-31",
                 "data_provider": "alpaca_hist", "panel_features": [], "technical_indicators": [],
                 "sentiment_config": {}, "fundamentals_config": {}, "daily_groups": ["t", "mtf"],
-                "daily_min_share": 0.75, "daily_universe": ["AAA", "BBB"]})
-        assert calls[0][:3] == ("alpaca_hist", "AAA", "1d")
-        assert calls[0][7] == {"daily_groups": ["t", "mtf"], "daily_min_share": 0.75, "daily_universe": ["AAA", "BBB"]}
+                "daily_min_share": 0.75, "daily_universe": ["AAB", "BBB"]})
+        assert calls[0][:3] == ("alpaca_hist", "AAB", "1d")
+        assert calls[0][7] == {"daily_groups": ["t", "mtf"], "daily_min_share": 0.75, "daily_universe": ["AAB", "BBB"]}
         assert "t_a" in pd.read_csv(tmp_path / "ds.csv").columns
 
     def test_regeneration_reads_the_daily_options_from_generation_config(self, tmp_path):
@@ -417,7 +417,7 @@ class TestDailyBuildPaths:
         with patch.object(D, "SessionLocal", return_value=MagicMock()), \
                 patch.object(D, "fetch_ohlcv_frame", side_effect=lambda *a: calls.append(a) or self._frame()):
             D._regenerate_dataset_in_background(1, {
-                "regen_options": DatasetRegenerate(), "ticker": "AAA", "timeframe": "1d",
+                "regen_options": DatasetRegenerate(), "ticker": "AAB", "timeframe": "1d",
                 "file_path": str(tmp_path / "ds.csv"), "technical_indicators": None, "fundamentals_config": None,
                 "sentiment_config": None, "start_date": datetime(2023, 1, 3), "end_date": datetime(2024, 12, 31),
                 "gen_config": dict(self.DAILY_GC)})
@@ -435,7 +435,7 @@ class TestDailyBuildPaths:
                 patch.object(D, "fetch_ohlcv_frame", side_effect=AssertionError("OHLCV not regenerated")):
             D._regenerate_dataset_in_background(1, {
                 "regen_options": DatasetRegenerate(regenerate_ohlcv=False, regenerate_technical=True),
-                "ticker": "AAA", "timeframe": "1d", "file_path": str(path), "technical_indicators": None,
+                "ticker": "AAB", "timeframe": "1d", "file_path": str(path), "technical_indicators": None,
                 "fundamentals_config": None, "sentiment_config": None, "start_date": datetime(2023, 1, 3),
                 "end_date": datetime(2024, 12, 31), "gen_config": dict(self.DAILY_GC)})
         kept = set(pd.read_csv(path).columns)
@@ -446,7 +446,7 @@ class TestDailyBuildPaths:
         from app.models.dataset import Dataset
         from app.schemas.dataset import DatasetDuplicate
         calls = []
-        original = Dataset(id=7, name="o", ticker="AAA", timeframe="1d", start_date=datetime(2023, 1, 3),
+        original = Dataset(id=7, name="o", ticker="AAB", timeframe="1d", start_date=datetime(2023, 1, 3),
                            end_date=datetime(2024, 12, 31), rows_count=1, file_path="x.csv", technical_indicators=None,
                            generation_config=dict(self.DAILY_GC))
         db = _FakeDb()
@@ -457,16 +457,16 @@ class TestDailyBuildPaths:
             new = D.duplicate_dataset(7, DatasetDuplicate(new_ticker="CCC"), db)
         assert calls[0][:3] == ("alpaca_hist", "CCC", "1d")
         assert calls[0][7] == {"daily_groups": ["t", "mtf"], "daily_min_share": 0.75,
-                               "daily_universe": ["AAA", "BBB", "CCC"]}
+                               "daily_universe": ["AAB", "BBB", "CCC"]}
         gc = new.generation_config
         assert gc["daily_groups"] == ["t", "mtf"] and gc["daily_min_share"] == 0.75
-        assert gc["daily_universe"] == ["AAA", "BBB", "CCC"]
+        assert gc["daily_universe"] == ["AAB", "BBB", "CCC"]
 
     def _duplicate(self, tmp_path, groups, new_ticker):
         from app.api import datasets as D
         from app.models.dataset import Dataset
         from app.schemas.dataset import DatasetDuplicate
-        original = Dataset(id=7, name="o", ticker="AAA", timeframe="1d", start_date=datetime(2023, 1, 3),
+        original = Dataset(id=7, name="o", ticker="AAB", timeframe="1d", start_date=datetime(2023, 1, 3),
                            end_date=datetime(2024, 12, 31), rows_count=1, file_path="x.csv", technical_indicators=None,
                            generation_config={**self.DAILY_GC, "daily_groups": groups})
         db = _FakeDb()
@@ -490,7 +490,7 @@ class TestDailyBuildPaths:
 
 
 class TestDailyUpdatePath:
-    def _update(self, generation_config, update, fetched, ticker="AAA", timeframe="1d"):
+    def _update(self, generation_config, update, fetched, ticker="AAB", timeframe="1d"):
         from app.api import datasets as D
         from app.models.dataset import Dataset
         from app.schemas.dataset import DatasetUpdate
@@ -500,7 +500,7 @@ class TestDailyUpdatePath:
         session = MagicMock()
         session.query.return_value.filter.return_value.first.return_value = ds
         queue = MagicMock()
-        frame = _fake_features(["AAA"], FIRST, LAST, ["t"], None).xs("AAA", level="symbol").reset_index().rename(
+        frame = _fake_features(["AAB"], FIRST, LAST, ["t"], None).xs("AAB", level="symbol").reset_index().rename(
             columns={"session": "Date"})
         with patch("app.models.database.SessionLocal", return_value=session), \
                 patch("app.services.task_queue.get_task_queue", return_value=queue), \
@@ -510,15 +510,15 @@ class TestDailyUpdatePath:
         return ds, queue
 
     GC = {"data_provider": "alpaca_hist", "panel_features": [], "daily_groups": ["t"], "daily_min_share": 0.7,
-          "daily_universe": ["AAA", "BBB"], "original_start_date": "2023-01-03", "original_end_date": "2024-12-31"}
+          "daily_universe": ["AAB", "BBB"], "original_start_date": "2023-01-03", "original_end_date": "2024-12-31"}
 
     def test_edit_keeps_and_updates_the_daily_options(self):
         fetched = []
         ds, _ = self._update(dict(self.GC), {}, fetched)
-        assert fetched[0][7] == {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAA", "BBB"]}
+        assert fetched[0][7] == {"daily_groups": ["t"], "daily_min_share": 0.7, "daily_universe": ["AAB", "BBB"]}
         ds, _ = self._update(dict(self.GC), {"daily_groups": ["t", "mac"], "daily_min_share": 0.5}, fetched)
         assert ds.generation_config["daily_groups"] == ["t", "mac"] and ds.generation_config["daily_min_share"] == 0.5
-        assert ds.generation_config["daily_universe"] == ["AAA", "BBB"]
+        assert ds.generation_config["daily_universe"] == ["AAB", "BBB"]
 
     def test_leaving_the_daily_source_drops_the_daily_options(self):
         fetched = []

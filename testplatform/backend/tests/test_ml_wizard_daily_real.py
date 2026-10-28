@@ -21,7 +21,7 @@ from tests.test_ml_universe import write_metric_store
 def wiz_cache(tmp_path_factory):
     root = tmp_path_factory.mktemp("wizcache")
     s = TF._sessions()
-    for i, sym in enumerate(("AAA", "BBB") + TF.CTX):
+    for i, sym in enumerate(("BBB", "CCC") + TF.CTX):
         TF._write(root, sym, TF._bars(s, 100 + i))
     write_metric_store(root / "screener" / "metric_store_alpaca_20261022", TF._store_rows())
     TM._synthetic_fred(root)
@@ -41,10 +41,10 @@ def _env(monkeypatch, wiz_cache):
     fs.reset_cache()
 
 
-def _fetch(groups, ticker="AAA", min_share=0.7):
+def _fetch(groups, ticker="BBB", min_share=0.7):
     return S.fetch_ohlcv_frame("alpaca_hist", ticker, "1d", datetime(2022, 6, 1), datetime(2024, 3, 28), [], None,
                                {"daily_groups": groups, "daily_min_share": min_share,
-                                "daily_universe": ["AAA", "BBB"]})
+                                "daily_universe": ["BBB", "CCC"]})
 
 
 def test_mac_is_read_only_inside_the_hermetic_context(monkeypatch):

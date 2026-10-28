@@ -42,7 +42,7 @@ import pandas as pd
 from ba2_providers.macro import fred_series as fs
 from ba2_providers.screener import metric_store as ms
 
-from app.services import ml_universe
+from app.services import ml_holdout, ml_universe
 from app.services.ml_panel import PanelDataError, ema, regular_sessions, true_range, wilder
 
 #: The longest run of consecutive sessions missing BETWEEN two cached bars that is filled flat (previous close, volume
@@ -987,6 +987,9 @@ _F_PANEL_COLUMNS: Tuple[str, ...] = (
 _F_STATEMENT_COLUMNS: Tuple[str, ...] = (
     "f_debt_assets", "f_current_ratio", "f_fcf_margin", "f_fcf_yield", "f_buyback_yield", "f_sbc_rev", "f_capex_rev")
 F_COLUMNS: Tuple[str, ...] = _F_PANEL_COLUMNS + _F_STATEMENT_COLUMNS
+#: the columns that divide by the SCREENER market cap: NaN before the metric store's first scan (2020-01) and for a symbol the
+#: scan lacks, so they are not coverage columns of the group (the other columns are not masked for that reason)
+F_MARKET_CAP_COLUMNS: Tuple[str, ...] = ("f_fcf_yield", "f_buyback_yield")
 #: Sessions before the first built one that ``fundamentals_table`` is run over, so an earnings date before the grid
 #: keeps its real session (``f_days_since_earn`` would otherwise count from the grid's first session).
 _F_HISTORY_DAYS = 450
@@ -1129,7 +1132,9 @@ def fundamentals(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFr
       ``f_sbc_rev`` = stockBasedCompensation / revenue, ``f_capex_rev`` = -capitalExpenditure / revenue (revenue of the
       income statement of the same fiscal date), ``f_fcf_yield`` = freeCashFlow / market cap and ``f_buyback_yield`` =
       -commonStockRepurchased / market cap, the market cap being the metric-store scan visible at the session (NaN
-      before the first scan, 2020-01, and for a symbol the scan lacks).
+      before the first scan, 2020-01, and for a symbol the scan lacks). These two (``F_MARKET_CAP_COLUMNS``) are NaN
+      BEFORE 2020 by design and are left out of the group's coverage columns, so the coverage mask does not blank the
+      other fourteen columns for the years before the metric store starts; ``column_coverage`` still shows their holes.
 
     Ratios are clipped to [-5, 5]; a non-positive denominator gives NaN. The statements are FMP's latest restated
     figures with their filing dates (``acceptedDate``): the figures are not first-print, the visibility is."""
@@ -1402,6 +1407,8 @@ def analyst_targets(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.Dat
 
 # ------------------------------------------------------------------------------------------ group I (insider)
 I_COLUMNS: Tuple[str, ...] = ("i_net_buy_90", "i_n_buyers_90", "i_covered")
+#: the column that divides by the SCREENER market cap (NaN before the metric store's first scan, 2020-01): not a coverage column
+I_MARKET_CAP_COLUMNS: Tuple[str, ...] = ("i_net_buy_90",)
 
 
 def _insider_one(ctx: BuildContext, symbol: str, market_cap: np.ndarray) -> pd.DataFrame:
@@ -1442,7 +1449,9 @@ def insiders(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     dates.
 
     * ``i_net_buy_90``: (shares x price of ``P-`` purchases minus ``S-`` sales, Form 4 only) over the window, over the
-      store's market cap visible at S (NaN before the first scan, 2020-01, and for a symbol the scan lacks);
+      store's market cap visible at S (NaN before the first scan, 2020-01, and for a symbol the scan lacks; this column
+      is not a coverage column of the group - ``I_MARKET_CAP_COLUMNS`` - so the mask does not blank ``i_n_buyers_90``
+      before 2020 for it);
     * ``i_n_buyers_90``: distinct reporting persons (``reportingCik``) with a purchase in the window;
     * ``i_covered``: for a CAPPED file (``INSIDER_ROW_CAP`` = 2000 rows, FMP's limit) 1 from ``COVERAGE_WARMUP_DAYS`` (90)
       calendar days after the first retained filing, else 0: the oldest filings were dropped, and a window reaching back
@@ -1583,10 +1592,13 @@ GROUPS: Dict[str, GroupSpec] = {
     "x": GroupSpec(cross_section, "x_"),
     "mac": GroupSpec(macro, "mac_", coverage_columns=tuple(
         c for c in MAC_COLUMNS if not any(c.startswith(f"mac_{sid.lower()}_") for sid in KNOWN_STALLS))),
-    "f": GroupSpec(fundamentals, "f_"),
+    # the screener market cap starts with the metric store (2020-01): the yield columns divide by it and are NaN before it BY
+    # DESIGN (documented in ``fundamentals``), so they must not make the whole group look uncovered and masked before 2020
+    "f": GroupSpec(fundamentals, "f_", coverage_columns=tuple(c for c in F_COLUMNS if c not in F_MARKET_CAP_COLUMNS)),
     "ag": GroupSpec(analyst_grades, "ag_", coverage_columns=("ag_net_upgrades_30", "ag_net_upgrades_90", "ag_n_graders_90")),
     "at": GroupSpec(analyst_targets, "at_", coverage_columns=("at_n_analysts_90",)),
-    "i": GroupSpec(insiders, "i_"),
+    "i": GroupSpec(insiders, "i_", coverage_columns=tuple(c for c in I_COLUMNS if c not in I_MARKET_CAP_COLUMNS
+                                                         and c != "i_covered")),
     "s": GroupSpec(structure, "s_", coverage_columns=tuple(
         c for c in S_COLUMNS if c not in ("s_dist_support_atr", "s_dist_resistance_atr", "s_support_touches",
                                           "s_resistance_touches", "s_bars_since_bos", "s_bars_since_choch", S_COVERED))),
@@ -2086,9 +2098,14 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
                          membership: Optional[pd.DataFrame] = None, *, cache_root: Optional[Path] = None,
                          chunk_size: int = 25, sector_of: Union[None, str, Dict[str, str]] = "store",
                          sector_overrides: Optional[Dict[str, str]] = None, universe: Optional[Sequence[str]] = None,
-                         store_dir: Optional[Path] = None, min_share: float = 0.7, force: bool = False) -> Dict[str, object]:
+                         store_dir: Optional[Path] = None, min_share: float = 0.7, force: bool = False,
+                         holdout: bool = False) -> Dict[str, object]:
     """Build (or find up to date) the feature store of ``symbols`` over ``[first, last]`` in ``out_dir``.
 
+    * the HOLDOUT guard: the stored symbols, the ``universe`` and the membership columns must all be unlocked
+      (``ml_holdout.assert_unlocked``, ``LockedSymbolError`` otherwise) unless ``holdout=True`` is given, which is
+      recorded as ``meta["purpose"] = "holdout"`` (a dev store says ``"dev"``) and is part of the rebuild key. The grid
+      refuses a store whose purpose is holdout or that lists a locked symbol (``ml_grid.check_dev_store``);
     * pre-screens every symbol ONCE with ``usable_symbols`` (rows with ``groups``, membership-only names on their bars) and
       filters the membership columns by the usable list once. ``meta["ensure"]["refused"]`` lists the permanent refusals with
       reasons; ``meta["ensure"]["transient"]`` is a SEPARATE list of the refusals that can clear after a cache refresh (a
@@ -2111,6 +2128,13 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     groups = list(groups)
     for g in groups:
         _spec(g)
+    if not isinstance(holdout, bool):
+        raise ValueError(f"holdout must be True or False, got {holdout!r}")
+    purpose = "holdout" if holdout else "dev"
+    if not holdout:
+        ml_holdout.assert_unlocked(
+            list(dict.fromkeys(list(symbols) + list(universe or []) + (list(membership.columns) if membership is not None else []))),
+            "a dev feature store (pass holdout=True / --holdout to build the holdout store on purpose)")
     cache_root = Path(CACHE_FOLDER if cache_root is None else cache_root)
     store_path = Path(store_dir) if store_dir is not None else ml_universe.store_dir_for(cache_root)
     symbols = list(dict.fromkeys(symbols))
@@ -2122,7 +2146,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     meta_path = Path(str(out_dir / "features.parquet") + ".meta.json")
     request = json.loads(json.dumps({
         "version": ENSURE_VERSION, "code": code_version(), "packages": _package_versions(), "min_share": min_share,
-        "groups": groups, "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": symbols,
+        "purpose": purpose, "groups": groups, "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": symbols,
         "extra": extra, "universe": list(universe) if universe is not None else None, "first": str(first), "last": str(last),
         "membership": None if membership is None else _membership_digest(membership),
         "sector_of": sector_of if (sector_of is None or isinstance(sector_of, str)) else dict(sector_of),
@@ -2175,7 +2199,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     load = list(dict.fromkeys(usable_rows + uni + sorted(required)))
     inputs = json.loads(json.dumps({
         "version": ENSURE_VERSION, "code": code_version(), "packages": _package_versions(), "min_share": min_share,
-        "groups": groups,
+        "purpose": purpose, "groups": groups,
         "coverage_columns": {g: _spec(g).coverage_columns for g in groups}, "symbols": usable_rows, "universe": uni, "first": str(first),
         "last": str(last), "membership": None if members is None else _membership_digest(members), "sectors": resolved,
         "fingerprints": _input_fingerprints(load, usable_rows, groups, cache_root, store_path)}, sort_keys=True))
@@ -2199,6 +2223,7 @@ def ensure_feature_store(out_dir: Path, symbols: Sequence[str], first: date, las
     df = pd.concat(frames)
     meta = dict(metas[0])
     meta["symbols"], meta["universe"] = usable_rows, uni
+    meta["purpose"] = purpose
     meta["rows"], meta["columns"], meta["nan_rate"] = int(len(df)), list(df.columns), _nan_rates(df, groups)
     meta["ended"] = {k: v for m in metas for k, v in m["ended"].items()}
     meta["sectorless"] = sorted({sym for m in metas for sym in m["sectorless"]})

@@ -9253,7 +9253,7 @@ def _cmd_ml_features(args) -> int:
                                                    store_dir=_mu.store_dir_for(_bc.CACHE_FOLDER))
     res = _mf.ensure_feature_store(args.out, symbols, first, last, groups, membership, cache_root=_bc.CACHE_FOLDER,
                                    chunk_size=args.chunk_size, sector_overrides=overrides, min_share=args.min_share,
-                                   force=args.force)
+                                   force=args.force, holdout=args.holdout)
     print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
           + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
     for sym, reason in res["refused"].items():
@@ -10195,6 +10195,9 @@ def main(argv: "list | None" = None) -> int:
     mf.add_argument("--min-share", type=float, default=0.7,
                     help="Coverage share under which a (group, year) is masked when the store is loaded (default 0.7).")
     mf.add_argument("--force", action="store_true", help="Rebuild even when the inputs are unchanged.")
+    mf.add_argument("--holdout", action="store_true",
+                    help="Build the HOLDOUT store: allow locked holdout symbols (refused otherwise) and record "
+                         "purpose=holdout in the meta. The stage-1 grid refuses such a store.")
 
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")

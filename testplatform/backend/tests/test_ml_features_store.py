@@ -31,6 +31,7 @@ def _ensure(root, out, symbols=SYMBOLS, groups=GROUPS, **kw):
     kw.setdefault("sector_overrides", {})
     kw.setdefault("sector_of", SECTOR_OF)
     kw.setdefault("chunk_size", 2)
+    kw.setdefault("holdout", True)          # the synthetic AAA is hash-locked; the guard itself: test_ml_final_review_data.py
     return F.ensure_feature_store(out, symbols, FIRST, LAST, groups, cache_root=root, **kw)
 
 
@@ -161,13 +162,13 @@ def cli(work, tmp_path, monkeypatch):
     monkeypatch.setattr(bc, "CACHE_FOLDER", str(work))
     counter = []
 
-    def run(symbols, *args, groups="t,mtf"):
+    def run(symbols, *args, groups="t,mtf", holdout=True):
         symfile = tmp_path / f"symbols{len(counter)}.txt"
         symfile.write_text("\n".join(symbols) + "\n", encoding="utf-8")
         out = tmp_path / f"cli{len(counter)}"
         counter.append(1)
         argv = ["ml-features", "--symbols-file", str(symfile), "--start", str(FIRST), "--end", str(LAST), "--out", str(out),
-                "--chunk-size", "1"] + (["--groups", groups] if groups else []) + list(args)
+                "--chunk-size", "1"] + (["--groups", groups] if groups else []) + (["--holdout"] if holdout else []) + list(args)
         return mod.main(argv), out
     run.mod = mod
     return run
@@ -307,7 +308,7 @@ def rich(work, tmp_path, monkeypatch):
 def _rich_ensure(rich, out):
     root, groups, _ = rich
     return F.ensure_feature_store(out, ["AAA", "BBB"], FIRST, LAST, groups, cache_root=root, sector_overrides={},
-                                  sector_of=SECTOR_OF, chunk_size=2)
+                                  sector_of=SECTOR_OF, chunk_size=2, holdout=True)
 
 
 def _touch(path, bump=100):
@@ -434,7 +435,7 @@ def test_chunked_builds_compute_the_shared_tables_once(rich, tmp_path, monkeypat
     monkeypatch.setattr(F, "_own_columns", own)
     monkeypatch.setattr(MarketConditionStore, "read_manifest", read)
     res = F.ensure_feature_store(tmp_path / "store", ["AAA", "BBB"], FIRST, LAST, ["x", "mac", "s"], cache_root=root,
-                                 sector_overrides={}, sector_of=SECTOR_OF, chunk_size=1)
+                                 sector_overrides={}, sector_of=SECTOR_OF, chunk_size=1, holdout=True)
     assert res["chunks"] == 2
     assert calls["levels"] == len(F.MAC_SERIES)                  # once per series, not once per chunk
     assert calls["own"] == 2                                     # once per universe member (AAA, BBB), not per chunk
@@ -448,7 +449,7 @@ def test_chunked_builds_compute_the_shared_tables_once(rich, tmp_path, monkeypat
 def test_the_meta_merges_required_context_and_context_symbols_across_chunks(work, tmp_path):
     out = tmp_path / "store"
     F.ensure_feature_store(out, ["AAA", "BBB"], FIRST, LAST, ["t", "m"], cache_root=work, sector_overrides={},
-                           sector_of=SECTOR_OF, chunk_size=1)          # AAA: Technology (XLK), BBB: Financial Services (XLF)
+                           sector_of=SECTOR_OF, chunk_size=1, holdout=True)          # AAA: Technology (XLK), BBB: Financial Services (XLF)
     meta = _meta(out)
     assert {"XLK", "XLF"} <= set(meta["required_context"]) and {"XLK", "XLF"} <= set(meta["context_symbols"])
     assert "AAA" not in meta["context_symbols"] and set(F.MARKET_ETFS) <= set(meta["required_context"])

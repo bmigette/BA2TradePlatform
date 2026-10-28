@@ -25,6 +25,11 @@ them:
   the cross-sectional ranks (group x) and the market breadth (group m) are taken over them and over nothing else. A
   breadth over fewer than ``DAILY_BREADTH_MIN_UNIVERSE`` tickers means nothing, so that column is dropped then.
 
+HOLDOUT. The locked holdout symbols (``ml_holdout``) must never train a model, and a wizard dataset is a training set: the
+daily source refuses them (``validate_daily_request`` raises a ValueError naming them, which the API turns into a 400;
+``daily_frame`` re-checks with ``LockedSymbolError``). The intraday sources are not affected: they build no cross-sectional
+or universe-wide values and the ML exploration's stores are the daily ones.
+
 Every dataset build path (create, batch, regenerate, duplicate, update) goes through ``fetch_ohlcv_frame`` so they all
 produce the same frame.
 """
@@ -38,7 +43,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
-from app.services import ml_panel
+from app.services import ml_holdout, ml_panel
 
 ALPACA_HIST_PROVIDER = "alpaca_hist"
 ALPACA_HIST_TIMEFRAMES = ("1h", "15m")
@@ -164,6 +169,11 @@ def validate_daily_request(provider_name: Optional[str], timeframe: str, daily_g
     if not 0.0 < share <= 1.0:
         raise ValueError(f"daily_min_share must be in (0, 1], got {daily_min_share!r}")
     members = list(dict.fromkeys(list(universe or []) + [ticker]))
+    locked = sorted({m.strip().upper() for m in members if ml_holdout.is_locked_largecap(m.strip().upper())})
+    if locked:
+        raise ValueError(
+            f"the daily source refuses locked holdout symbols (they must never train a model): {', '.join(locked)}; "
+            f"remove them from the ticker / universe")
     if "x" in groups:
         from app.services import ml_features
         if len(members) < ml_features.X_MIN_MEMBERS:
@@ -239,6 +249,8 @@ def daily_frame(ticker: str, first_day: date, last_day: date, request: Mapping[s
     ``DAILY_BREADTH_MIN_UNIVERSE`` tickers."""
     from ba2_common.config import CACHE_FOLDER
     from app.services import ml_features as F
+    ml_holdout.assert_unlocked([s.strip().upper() for s in list(request["daily_universe"]) + [ticker]],
+                               "a wizard dataset of the daily source")
     cache_root = Path(CACHE_FOLDER)
     feats = _universe_features(tuple(request["daily_universe"]), first_day, last_day, tuple(request["daily_groups"]),
                                float(request["daily_min_share"]), cache_root)
