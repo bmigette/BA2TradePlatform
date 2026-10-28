@@ -1307,6 +1307,115 @@ def insiders(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
     return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
 
 
+# ------------------------------------------------------------------------------------------ group S (market structure)
+#: Pinned manifests of the platform's market-condition store (``<cache>/market_conditions/<profile>/manifests/<sha>.json``),
+#: oldest first; for a symbol the first manifest that covers it is used. They are the newest ALPACA-sourced
+#: (``alpaca-daily-split-verified-v1``, calc-2, ``prior_session_v1``) manifests: the option-universe one (97 symbols) and
+#: the 753-symbol one. Rows exist 2020-01-02 .. 2025-12-31 only, for those universes only; anything else is NaN.
+S_MANIFESTS: Dict[str, Tuple[str, ...]] = {
+    "ohlcv-v1": ("2b958769b8a44539d90b4f9b3e156a3e9a5461c425cb717c118400eb999c275f",
+                 "59f8826b7381baa6039c8b5c2467c785aa0770e2435cf717537880183fa78d65"),
+    "ta-structure-v1": ("7e1904763ec74ca61aa6f580f1328630c160e4de141bd93a4252fb71bdc42070",
+                        "8fac4e9de1d2b68669d34b87ed121765979ae3f51a22e7eeefd8ea40869859d7")}
+#: column -> (profile, store field, scale). ADX is divided by 100 (as ``t_adx``) and the bars-since counts by the 128-session
+#: window, so every column is a ratio / ATR multiple / small count / 0-1 value.
+S_FIELDS: Dict[str, Tuple[str, str, float]] = {
+    "s_trend_slope_atr": ("ohlcv-v1", "underlying_trend_slope_50_atr14", 1.0),
+    "s_adx": ("ohlcv-v1", "underlying_adx_14", 0.01),
+    "s_rv_ratio": ("ohlcv-v1", "underlying_realized_vol_ratio_5_20", 1.0),
+    "s_dist_support_atr": ("ta-structure-v1", "structure_dist_support_atr", 1.0),
+    "s_dist_resistance_atr": ("ta-structure-v1", "structure_dist_resistance_atr", 1.0),
+    "s_support_touches": ("ta-structure-v1", "structure_support_touches", 1.0),
+    "s_resistance_touches": ("ta-structure-v1", "structure_resistance_touches", 1.0),
+    "s_channel_slope_20_atr": ("ta-structure-v1", "channel_slope_20_atr", 1.0),
+    "s_channel_width_20_atr": ("ta-structure-v1", "channel_width_20_atr", 1.0),
+    "s_channel_pos_20": ("ta-structure-v1", "channel_pos_20", 1.0),
+    "s_close_vs_prior_high_20_atr": ("ta-structure-v1", "close_vs_prior_high_20_atr", 1.0),
+    "s_close_vs_prior_low_20_atr": ("ta-structure-v1", "close_vs_prior_low_20_atr", 1.0),
+    "s_structure_state": ("ta-structure-v1", "structure_state", 1.0),
+    "s_bars_since_bos": ("ta-structure-v1", "structure_bars_since_bos", 1.0 / 128.0),
+    "s_bars_since_choch": ("ta-structure-v1", "structure_bars_since_choch", 1.0 / 128.0)}
+S_COLUMNS: Tuple[str, ...] = tuple(S_FIELDS)
+
+
+def _s_manifests(store, profile: str) -> List[Dict[str, object]]:
+    """The pinned manifests of ``profile``, read with the platform's own reader and checked consistent: every one Alpaca-sourced
+    (never FMP prices), on the registered calculator version, ``prior_session_v1``, with the profile's declared fields."""
+    from ba2_common.core import market_conditions as mc
+    out = []
+    for digest in S_MANIFESTS[profile]:
+        try:
+            man = store.read_manifest(digest, profile)
+        except (FileNotFoundError, ValueError) as e:
+            raise PanelDataError(f"group s: {profile} manifest {digest[:12]} cannot be read ({e})") from e
+        if not str(man["source_profile"]).startswith("alpaca"):
+            raise PanelDataError(f"group s: {profile} manifest {digest[:12]} is sourced from {man['source_profile']!r}; only "
+                                 f"Alpaca-sourced bars are allowed (never FMP prices)")
+        if not mc.calc_version_accepted(profile, str(man["calc_version"])) or man["timing_policy"] != "prior_session_v1":
+            raise PanelDataError(f"group s: {profile} manifest {digest[:12]} has calc {man['calc_version']!r} / timing "
+                                 f"{man['timing_policy']!r}")
+        if tuple(man["fields"]) != tuple(f.name for f in mc.PROFILES[profile].fields):
+            raise PanelDataError(f"group s: {profile} manifest {digest[:12]} carries other fields than the registry's")
+        out.append(man)
+    if len({(m["source_profile"], m["calc_version"]) for m in out}) != 1:
+        raise PanelDataError(f"group s: the pinned {profile} manifests mix sources or calculator versions")
+    return out
+
+
+def structure(daily: Dict[str, pd.DataFrame], ctx: BuildContext) -> pd.DataFrame:
+    """Group ``s_``: chart-structure measurements from the platform's market-condition store (``ohlcv-v1``: trend slope, ADX,
+    realised-volatility ratio; ``ta-structure-v1``: support / resistance distance and touches, 20-session channel, closes
+    vs the prior 20-session high / low, structure state, bars since a break of structure / change of character), read through
+    ``MarketConditionStore`` at the pinned manifests (``S_MANIFESTS``).
+
+    TIMING. The store row of session T is computed from the 128 bars ENDING AT T (the retained window's last bar is T; pivots are
+    only used once confirmed), so it is public at T's close: the row of S is used at S, unshifted. (The platform's own
+    ``prior_session_v1`` policy has a decision on D read the row of the session BEFORE D; our decision is at the close of
+    S, with S's bar complete. A test on the real store checks the window's last bar equals the row's session.)
+
+    A value whose status is not ``valid`` is NaN: ``insufficient_history`` is meaningful (no confirmed pivot above the close
+    means no resistance), so several structure columns are NaN by design on many rows. Symbols the manifests do not cover,
+    and sessions outside their window (2020-01-02 .. 2025-12-31), are NaN; the uncovered symbols are listed in
+    ``meta["source"]["market_conditions"]``."""
+    from ba2_common.core.market_condition_store import MarketConditionStore, status_code
+    from ba2_common.core.market_conditions import STATUS_VALID
+
+    root = Path(ctx.cache_root)
+    if not (root / "market_conditions").is_dir():
+        raise PanelDataError(f"group s: no market_conditions store under {root}")
+    store = MarketConditionStore(root)
+    valid = status_code(STATUS_VALID)
+    by_profile = {p: _s_manifests(store, p) for p in S_MANIFESTS}
+    prov: Dict[str, Dict[str, object]] = {}
+    per_symbol: Dict[str, Dict[str, np.ndarray]] = {}
+    for profile, mans in by_profile.items():
+        uncovered: List[str] = []
+        for sym in ctx.symbols:
+            man = next((m for m in mans if sym in m["coverage"]), None)
+            cols = {c: np.full(len(ctx.sessions), np.nan) for c, (p, _, _) in S_FIELDS.items() if p == profile}
+            if man is None:
+                uncovered.append(sym)
+            else:
+                rf = store.rows_frame(man, sym)
+                pos = ctx.sessions.values.astype("datetime64[D]")
+                where = np.searchsorted(rf.sessions, pos)
+                where_c = np.minimum(where, max(len(rf) - 1, 0))
+                have = (where < len(rf)) & (rf.sessions[where_c] == pos) if len(rf) else np.zeros(len(pos), dtype=bool)
+                for c in cols:
+                    _, field, scale = S_FIELDS[c]
+                    j = rf.fields.index(field)
+                    good = have & (rf.status[where_c, j] == valid) if len(rf) else have
+                    cols[c][good] = rf.values[where_c[good], j] * scale
+            per_symbol.setdefault(sym, {}).update(cols)
+        prov[profile] = {"manifests": list(S_MANIFESTS[profile]), "source_profile": mans[0]["source_profile"],
+                         "calc_version": mans[0]["calc_version"],
+                         "window": [min(m["window_start"] for m in mans), max(m["window_end"] for m in mans)],
+                         "uncovered": uncovered}
+    ctx.provenance["market_conditions"] = prov
+    frames = {sym: pd.DataFrame(per_symbol[sym], index=ctx.sessions)[list(S_COLUMNS)] for sym in ctx.symbols}
+    return pd.concat(frames, names=_INDEX_NAMES).astype("float64")
+
+
 #: group name -> spec. The name is the grid factor; the spec's prefix names its columns. Later tasks register here.
 GROUPS: Dict[str, GroupSpec] = {
     "t": GroupSpec(technical, "t_"),
@@ -1317,6 +1426,7 @@ GROUPS: Dict[str, GroupSpec] = {
     "f": GroupSpec(fundamentals, "f_"),
     "a": GroupSpec(analysts, "a_"),
     "i": GroupSpec(insiders, "i_"),
+    "s": GroupSpec(structure, "s_"),
 }
 
 
