@@ -6671,17 +6671,25 @@ class AccountGrowthTab:
                 inc = {m: monthly_income.get(m) for m in months}
                 pnl = [conv(m, inc[m]['pnl'], pct) if inc[m] else None for m in months]
                 div = [conv(m, inc[m]['div'], pct) if inc[m] else None for m in months]
-                total = [conv(m, round(inc[m]['pnl'] + inc[m]['div'], 2), pct) if inc[m] else None
-                         for m in months]
                 # Forecast is $ only (no honest % denominator for a future month) and is
-                # its OWN series: never part of Closed P&L, Dividends or Total.
+                # its OWN series: never part of Closed P&L or Dividends.
                 fc = [None if pct or m not in forecast else round(forecast[m]['total'], 2)
                       for m in months]
+                # Total adds up what the bars show: in $ mode that includes the forecast
+                # segment (named so in the legend); in % mode there is no forecast bar.
+                total = []
+                for m, f in zip(months, fc):
+                    if inc[m] is None and f is None:
+                        total.append(None)
+                        continue
+                    actual = round(inc[m]['pnl'] + inc[m]['div'], 2) if inc[m] else 0.0
+                    total.append(conv(m, round(actual + (f or 0.0), 2), pct))
+                total_name = 'Total' if pct or not any(f is not None for f in fc) else 'Total (incl. forecast)'
                 fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': ['Closed P&L', 'Dividends', 'Dividends (forecast, estimated)', 'Total'],
+                    'legend': {'data': ['Closed P&L', 'Dividends', 'Dividends (forecast, estimated)', total_name],
                                'textStyle': {'color': '#a0aec0'}, 'top': 5},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
@@ -6694,7 +6702,7 @@ class AccountGrowthTab:
                         {'name': 'Dividends (forecast, estimated)', 'type': 'bar', 'data': fc, 'stack': 'div',
                          'itemStyle': {'color': _rgba('#22c55e', 0.35), 'borderColor': '#22c55e',
                                        'borderType': 'dashed', 'borderWidth': 1}},
-                        {'name': 'Total', 'type': 'bar', 'data': total, 'itemStyle': {'color': '#f59e0b'}},
+                        {'name': total_name, 'type': 'bar', 'data': total, 'itemStyle': {'color': '#f59e0b'}},
                     ],
                 }
 
