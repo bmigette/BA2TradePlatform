@@ -5186,7 +5186,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # Keep one existing DB-only WAITING_TRIGGER order if it already has the
         # target type (update prices in place); cancel everything else.
         keep: TradingOrder | None = None
+        terminal = OrderStatus.get_terminal_statuses()
         for order in all_orders:
+            if (order.parent_order_id == entry_order.id and order.broker_order_id
+                    and order.status not in terminal):
+                # A leg of the entry's OWN complex order (the OTO/bracket of the wash-trade
+                # escape). Cancelling it cancels the unfilled entry at Alpaca: 2026-10-29 RAPP
+                # entry 1438 had filled 34 of 35 shares when its stop leg was cancelled here,
+                # and the order died with the 34 shares untracked. The leg stays; once the
+                # entry fills, TradeManager cancels it and submits the exit staged below.
+                logger.info(f"Keeping leg {order.id} of entry {entry_order.id}'s own complex order "
+                            f"until the entry fills")
+                continue
             if (spec and keep is None
                     and order.order_type == spec[0]
                     and order.status == OrderStatus.WAITING_TRIGGER

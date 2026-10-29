@@ -1881,6 +1881,54 @@ class TradeManager:
             exc_info=True)
         return None
 
+    def _rechain_behind_entry_legs(self, account, dependent_order, parent_order_id) -> bool:
+        """Chain an exit that fires on its ENTRY's fill behind the cancellation of that entry's
+        own live OTO/bracket legs (the wash-trade escape path), and cancel those legs.
+
+        Submitted while the legs still hold the shares, the exit is refused (2026-10-22 DY /
+        APLD: 40310000 insufficient qty) and the position keeps only the leg. Returns True when
+        the exit was re-chained (it then waits for the newest leg's CANCELED, the ordinary
+        cancel-and-replace path, qty gate included)."""
+        trig = getattr(dependent_order.depends_order_status_trigger, "value",
+                       dependent_order.depends_order_status_trigger)
+        if str(trig).lower() != OrderStatus.FILLED.value:
+            return False
+        from sqlmodel import select
+        from .db import get_db
+        terminal = OrderStatus.get_terminal_statuses()
+        with get_db() as session:
+            legs = [o for o in session.exec(select(TradingOrder).where(
+                        TradingOrder.parent_order_id == parent_order_id,
+                        TradingOrder.broker_order_id.isnot(None))).all()
+                    if o.status not in terminal and o.id != dependent_order.id]
+        if not legs:
+            return False
+        legs.sort(key=lambda o: o.id, reverse=True)
+        dependent_order.depends_on_order = legs[0].id
+        dependent_order.depends_order_status_trigger = OrderStatus.CANCELED
+        dependent_order.comment = (f"{dependent_order.comment or ''} "
+                                   f"(chained on cancel of entry leg {legs[0].id})")
+        update_instance(dependent_order)
+        failed = []
+        for leg in legs:
+            try:
+                ok = account.cancel_order(leg.id)
+            except Exception as e:  # noqa: BLE001 -- reported below
+                ok = False
+                self.logger.error(f"Failed to cancel entry leg {leg.id}: {e}", exc_info=True)
+            if not ok:
+                failed.append(leg.id)
+        if failed:
+            self.logger.error(
+                f"Exit {dependent_order.id} ({dependent_order.symbol}) waits on entry leg "
+                f"{legs[0].id}, but the broker did not accept the cancel of leg(s) {failed}: "
+                f"the leg keeps protecting the position and the exit is not submitted")
+        else:
+            self.logger.info(
+                f"Exit {dependent_order.id} ({dependent_order.symbol}) chained on the cancel of "
+                f"entry {parent_order_id}'s leg(s) {[leg.id for leg in legs]}, which hold the shares")
+        return True
+
     def _check_all_waiting_trigger_orders(self):
         """
         Check all orders in WAITING_TRIGGER status to see if their parent orders have reached the trigger status.
@@ -2241,6 +2289,9 @@ class TradeManager:
                         self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        continue
+
+                    if self._rechain_behind_entry_legs(account, dependent_order, parent_order_id):
                         continue
 
                     # Gate cancel-and-replace orders (e.g. a trailing-stop OCO swap): only
