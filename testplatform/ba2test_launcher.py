@@ -9139,9 +9139,10 @@ def _ml_grid_report_only(directory: str) -> int:
         return 2
     st = ml_grid_report.build_outputs(d, report=True)
     g = st["gate"]
+    # No same-quote nesting inside an f-string: that is Python 3.12+ and the masters run 3.11.
+    per_track = ", ".join(f"{t} {len(g['by_track'][t])}" for t in ("selection", "timing"))
     print(f"ml-grid --report-only: {st['n_rows']} rows, {st['n_errors']} unresolved errors, "
-          f"{len(g['survivors'])} survivors "
-          f"({', '.join(f'{t} {len(g['by_track'][t])}' for t in ('selection', 'timing'))})")
+          f"{len(g['survivors'])} survivors ({per_track})")
     print(f"  report:    {d / ml_grid_report.REPORT_NAME}")
     print(f"  dashboard: {d / ml_grid_report.DASHBOARD_NAME}")
     return 0
