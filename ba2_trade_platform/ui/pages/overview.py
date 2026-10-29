@@ -14,6 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
+from ..utils.position_prices import held_position_prices
 from types import SimpleNamespace
 from datetime import date
 
@@ -3497,7 +3498,7 @@ class TransactionsTab:
                         symbols_list = list(symbols)
                         logger.debug(f"[BATCH] Fetching {len(symbols_list)} symbols for account {account_id}: {symbols_list}")
                         # Batch fetch - returns dict {symbol: price}
-                        prices_dict = account_inst.get_instrument_current_price(symbols_list)
+                        prices_dict = held_position_prices(account_inst, account_id, symbols_list)
                         if prices_dict:
                             current_prices.update(prices_dict)
                 except Exception as e:

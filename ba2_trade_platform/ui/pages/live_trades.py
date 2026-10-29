@@ -14,6 +14,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
+from ..utils.position_prices import held_position_prices
 from ..components.secret_display import masked_json_view
 from ..components.LiveTradesTable import bracket_level_cell, related_order_rows, transaction_status_color
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
@@ -603,7 +604,7 @@ class LiveTradesTab:
                 if account_inst and symbols:
                     symbols_list = list(symbols)
                     logger.debug(f"Fetching prices for account {account_id}, symbols: {symbols_list}")
-                    prices_dict = account_inst.get_instrument_current_price(symbols_list)
+                    prices_dict = held_position_prices(account_inst, account_id, symbols_list)
                     logger.debug(f"Got prices: {prices_dict}")
                     if prices_dict:
                         current_prices.update(prices_dict)

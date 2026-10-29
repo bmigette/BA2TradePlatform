@@ -941,7 +941,7 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
 
     Returns:
         Tuple of (expert_options_list, expert_id_map)
-        - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'SmartRisk-2']
+        - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'my-alias-2']
         - expert_id_map: Dict mapping display names to expert instance IDs
 
     Example:
@@ -969,8 +969,9 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
         expert_options = ['All']
         expert_map = {'All': 'All'}
         for expert in experts:
-            # Create shortname: use alias, user_description, or fallback to "expert_name-id"
-            shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
+            # "<alias, user_description or expert class>-<id>": the id is always shown, as on the
+            # overview cards, and two experts sharing an alias stay two distinct options
+            shortname = f"{expert.alias or expert.user_description or expert.expert}-{expert.id}"
             expert_options.append(shortname)
             expert_map[shortname] = expert.id
 
