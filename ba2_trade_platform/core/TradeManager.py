@@ -73,9 +73,9 @@ _WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
 _STRANDED_ENTRY_GRACE_MINUTES = 5.0
 
 
-def classify_waiting_trigger(parent_status, trigger_status):
+def classify_waiting_trigger(parent_status, trigger_status, parent_filled_qty=None):
     """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
-    status and the configured trigger status.
+    status, the configured trigger status and how much the parent filled.
 
     Returns one of:
         "submit" - parent reached the trigger status; submit the dependent now
@@ -115,6 +115,13 @@ def classify_waiting_trigger(parent_status, trigger_status):
     # auto-submit was ever intended (see test_no_trigger_status_waits), and this branch must
     # not quietly override that contract.
     if trigger_status is not None and parent_status == OrderStatus.FILLED:
+        return "submit"
+    # A parent that ended CANCELED/EXPIRED after a PARTIAL fill still traded those shares, and
+    # its fill-triggered exit is what protects them. 2026-10-29 RAPP (dev account 1): entry
+    # 1438 filled 34 of 35 and was cancelled; its staged OCO was cancelled with it and the 34
+    # shares sat with no stop. The caller sizes the exit to the filled quantity.
+    if (trigger_status == OrderStatus.FILLED and parent_filled_qty
+            and parent_filled_qty > 0 and parent_status in OrderStatus.get_terminal_statuses()):
         return "submit"
     if parent_status in OrderStatus.get_terminal_statuses():
         return "cancel"
@@ -1995,7 +2002,17 @@ class TradeManager:
                         # Decide: submit (parent reached trigger), cancel (parent hit a
                         # different terminal status), or wait (still in flight, incl. the
                         # explicit PARTIALLY_FILLED no-op).
-                        action = classify_waiting_trigger(current_status, trigger_status)
+                        action = classify_waiting_trigger(current_status, trigger_status,
+                                                          parent_order.filled_qty)
+                        if action == "submit" and current_status != trigger_status \
+                                and current_status != OrderStatus.FILLED:
+                            # Partial fill, then cancelled: protect what filled, not what was ordered.
+                            self.logger.warning(
+                                f"Parent order {parent_order_id} ended {current_status} after filling "
+                                f"{parent_order.filled_qty} of {parent_order.quantity}; submitting dependent "
+                                f"order {dependent_order.id} for the filled {parent_order.filled_qty} "
+                                f"(was {dependent_order.quantity})")
+                            dependent_order.quantity = parent_order.filled_qty
                         if action == "submit":
                             self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
                             

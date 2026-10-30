@@ -2260,8 +2260,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     market_entry_orders = [o for o in orders if not o.depends_on_order]
                     dependent_orders = [o for o in orders if o.depends_on_order]
 
-                    # Check if any market entry order is filled (to open transaction)
-                    has_filled_entry_order = any(order.status in executed_statuses for order in market_entry_orders)
+                    # Check if any market entry order is filled (to open transaction). An entry
+                    # CANCELED after a PARTIAL fill counts: those shares traded. 2026-10-29 RAPP
+                    # (dev account 1): entry 1438 filled 34 of 35, was cancelled, and transaction
+                    # 432 was never opened, then closed as all_orders_terminal with 34 held.
+                    def _entry_filled(order):
+                        return order.status in executed_statuses or (order.filled_qty or 0) > 0
+                    has_filled_entry_order = any(_entry_filled(order) for order in market_entry_orders)
 
                     # Check if all MARKET ENTRY orders are in terminal state
                     all_entry_orders_terminal = (
@@ -2468,7 +2473,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # Update open_price from the oldest filled market entry order
                     filled_entry_orders = [
                         order for order in market_entry_orders
-                        if order.status in executed_statuses and order.open_price
+                        if _entry_filled(order) and order.open_price
                     ]
                     if filled_entry_orders:
                         oldest_order = min(filled_entry_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
@@ -2659,8 +2664,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         new_status = TransactionStatus.CLOSED
                         has_changes = True
 
-                    # ANY STATUS -> CLOSED: If all orders are in terminal state
-                    elif all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
+                    # ANY STATUS -> CLOSED: If all orders are in terminal state AND nothing is
+                    # still held. A transaction whose orders are all done but whose fills do not
+                    # balance still owns those shares; closing it leaves them untracked (the
+                    # RAPP 34 above). It stays OPENED so exit management and the breached-stop
+                    # sweep keep covering it.
+                    elif (all_orders_terminal and transaction.status != TransactionStatus.CLOSED
+                          and equity_position_is_flat):
                         from ba2_common.core.utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,
