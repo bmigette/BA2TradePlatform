@@ -114,6 +114,17 @@ and partly SPY beta. They may return later as a separate low-DD carry job.
 4. Fitness with an equity cap (`--equity-cap`), so compounding into illiquid sizes is not rewarded.
 5. The 753-name universe (the §1 table and the universe decision); measure the cost in the §4
    pilot.
+6. **Live decision time 09:45** (user 2026-11-02, "9h45 or 50"). Option grids run on the daily
+   clock (decide on D's close, fill at D+1's open), so the GA has no time gene; the deployed
+   instances fire at 09:45, not 09:30, for both entry and position management. Reason: at
+   09:30-09:34 option chains came back empty (8082: APH 10-15/10-20, BHP 10-20) and the opening
+   spread is the day's widest. `tools/import_deploy_payload.py` writes 09:45 for every daily-clock
+   payload (`DAILY_CLOCK_LIVE_TIME`, branch `fix/option-live-0945`); the 8082 instances 3-11 were
+   moved to 09:45 the same day.
+7. **Seeding job C** (user 2026-11-02): no DeterministicScorer re-runs of the stage-1.5 FMPRating
+   jobs (O_LEAP/O_PMCC/O_CBS). Seed with each FMPRating winner's structure genes plus the DS expert
+   genes of the closest DS result (convex-DS opt 143, or stage-1 DS O_LC/O_BULLCS); the GA
+   re-optimizes everything. The seeding tool must support that graft.
 
 ### 0.4 Order (user 2026-10-24)
 
@@ -135,7 +146,7 @@ and partly SPY beta. They may return later as a separate low-DD carry job.
 | Engine | dev `3b3465c8` or later: split-basis lots + re-key, daily stepping while holding, fixed DD refinement, structure-level concentration, ledger checks, close by transaction id. | engine-fix plan 2026-09-24 |
 | Stage-1 option flags, carried over | `option_size_within_fill_volume` ON; `option_min_one_contract` ON for every cost-sized structure except O_CONVEX*; `option_entry_cross` gene 0.75-1.0; `rel_volume` gene ≤ 1.5; debit IV/RV floor ≥ 1.0; DeterministicScorer `macro_short_side="mirror"` on option jobs. | user decisions 2026-09-24 |
 | Fitness | `option_car_target_soft30`, robust ON (concentration on structures, share lots joined with overlays). | stage 1 |
-| Expert | DeterministicScorer (stage 1 runs DS only). Whether FMPRating joins is open (§5). | stage 1 |
+| Expert | **DeterministicScorer only** (user 2026-11-02: FMPRating has no bearish signal on large caps; the stage-1.5 FMPRating O_PBS was stopped and its convex arm dropped). | stage 1; user 2026-11-02 |
 | Bearish members | O_LP / O_BEARCS stay members like everything else (no survival gate). The stage-1 "hold puts if no viable genome by ~gen 10" rule governs STAGE 1 only. | user, 2026-09-24 |
 | Window | 2020-01-01..2025-12-31 (the same as stage 1). | stage 1 |
 | Capital | $20k account, virtual equity 100%. | spec §6 |
@@ -307,7 +318,7 @@ before using them as stage-2 seeds, or seed only from jobs run on `2183554d` or 
 2. **Style grouping and membership** (after stage 1 + the LEAPS grid), then the population and
    generations per group after measuring each genome (spec reference for all structures: 300 / 80 /
    patience 10).
-3. **Experts:** DS only, or also FMPRating (it has no bearish signal on large caps, per memory).
+3. **Experts:** DECIDED 2026-11-02: DeterministicScorer only (see §1).
 4. **Universe fallback** if the pilot says 820 is too slow.
 5. **Deploy route** for the stage-2 winner (8082 forward test first).
 
