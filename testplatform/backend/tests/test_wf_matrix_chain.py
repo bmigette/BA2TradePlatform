@@ -158,7 +158,8 @@ def test_stale_fold_report_with_other_thresholds_is_not_trusted(tmp_path):
     r = ChainRunner([BAD, BAD, BAD], completed={"cell-wf1", "cell-wf2", "cell-wf3", "cell-refit"})
     res = C.run_cell(_spec(thresholds=WF.Thresholds(10.0, 1.5, 2)), r, str(tmp_path),
                      log=lambda *_: None)
-    assert [e[0] for e in r.events] == ["oos", "oos", "oos"]      # re-evaluated, cache ignored
+    # re-evaluated, cache ignored (fold 3 is never reached: 0 of 2 passed, the cell is eliminated)
+    assert [e[0] for e in r.events] == ["oos", "oos"]
     assert res.verdict == "FAIL"
 
 
@@ -245,7 +246,7 @@ def test_exclusive_return_flows_through_the_cell_and_its_stored_fold_key(tmp_pat
     C.run_cell(_spec(), ChainRunner([flat, flat, flat]), str(tmp_path / "b"), log=lambda *_: None)
     r2 = ChainRunner([flat, flat, flat], completed={"cell-wf1", "cell-wf2", "cell-wf3"})
     res2 = C.run_cell(_spec(exclusive_return=True), r2, str(tmp_path / "b"), log=lambda *_: None)
-    assert res2.verdict == "FAIL" and [e[0] for e in r2.events] == ["oos", "oos", "oos"]
+    assert res2.verdict == "FAIL" and [e[0] for e in r2.events] == ["oos", "oos"]   # eliminated
 
 
 # ------------------------------------------------------------------ review fixes
@@ -302,3 +303,125 @@ def test_a_retrained_fold_invalidates_its_own_and_every_later_stored_report(tmp_
     # fold 1 is still trusted; folds 2 and 3 (seeded from the retrained job) are re-evaluated
     assert [e for e in r.events if e[0] == "oos"] == [("oos", "cell-wf2"), ("oos", "cell-wf3")]
     assert any("key mismatch" in x.getMessage() for x in caplog.records)
+
+
+# ------------------------------------------------------------------ deferred last test (train now, test later)
+
+
+def test_defer_keeps_every_fold_whole_and_marks_the_last_one():
+    folds = C.build_cell_folds(D("2020-01-01"), [2024, 2025, 2026], D("2025-12-31"),
+                               defer_last_test=True)
+    assert folds[-1].test_end == D("2026-12-31")               # never clamped: the test runs later
+    assert C.deferred_fold(folds, D("2025-12-31"), True).index == 3
+    assert C.deferred_fold(folds, None, True) is None          # data reaches the test: run it
+    assert C.deferred_fold(folds, D("2025-12-31"), False) is None
+
+
+def test_defer_with_a_data_end_inside_the_last_test_year_is_refused():
+    with pytest.raises(WF.WalkForwardError, match="inside the last test year"):
+        C.build_cell_folds(D("2020-01-01"), [2024, 2025, 2026], D("2026-10-12"), defer_last_test=True)
+
+
+def test_defer_is_refused_when_the_deferred_fold_cannot_train_yet():
+    with pytest.raises(WF.WalkForwardError, match="trains to 2025-12-31"):
+        C.build_cell_folds(D("2020-01-01"), [2024, 2025, 2026], D("2025-06-30"), defer_last_test=True)
+
+
+def test_defer_of_a_single_fold_plan_is_refused():
+    with pytest.raises(WF.WalkForwardError, match="nothing would be tested"):
+        C.build_cell_folds(D("2020-01-01"), [2026], D("2025-12-31"), defer_last_test=True)
+
+
+def test_without_defer_the_old_refusal_names_the_flag():
+    with pytest.raises(WF.WalkForwardError, match="--wf-defer-last-test"):
+        C.build_cell_folds(D("2020-01-01"), [2024, 2025, 2026], D("2025-12-31"))
+
+
+def test_deferred_cell_trains_the_last_fold_tests_nothing_and_is_pending(tmp_path):
+    r = LineageRunner([GOOD, GOOD, GOOD])
+    res = C.run_cell(_spec(data_end=D("2025-12-31"), defer_last_test=True), r, str(tmp_path),
+                     log=lambda *_: None)
+    assert r.events == [("train", "cell-wf1"), ("oos", "cell-wf1"), ("train", "cell-wf2"),
+                        ("oos", "cell-wf2"), ("train", "cell-wf3")]
+    assert _arg(dict(r.trained)["cell-wf3"], "--chain-seed-from") == "cell-wf2"
+    assert res.verdict == "PENDING" and res.refit_job is None
+    cell = json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8"))
+    assert cell["verdict"] == "PENDING" and cell["refit"] is None
+    assert [f["fold"] for f in cell["folds"]] == [1, 2]
+    assert cell["deferred"] == {"fold": 3, "job": "cell-wf3", "train": ["2020-01-01", "2025-12-31"],
+                                "test": ["2026-01-01", "2026-12-31"], "seeded_from": "cell-wf2"}
+    assert not (tmp_path / "cell" / "fold3.json").exists()
+
+
+def test_january_rerun_of_a_deferred_cell_only_tests_wf3_then_refits(tmp_path):
+    C.run_cell(_spec(data_end=D("2025-12-31"), defer_last_test=True), ChainRunner([GOOD, GOOD, GOOD]),
+               str(tmp_path), log=lambda *_: None)
+    jan = ChainRunner([GOOD, GOOD, GOOD], completed={"cell-wf1", "cell-wf2", "cell-wf3"})
+    res = C.run_cell(_spec(data_end=None, defer_last_test=True), jan, str(tmp_path), log=lambda *_: None)
+    assert jan.events == [("oos", "cell-wf3"), ("train", "cell-refit")]
+    assert res.verdict == "PASS"
+    assert _arg(dict(jan.trained)["cell-refit"], "--end") == "2026-12-31"
+
+
+def test_a_deferred_wf3_still_needs_wf2_completed(tmp_path):
+    class NoWf2(ChainRunner):
+        def train_completed(self, name):
+            return False if name == "cell-wf2" else super().train_completed(name)
+    r = NoWf2([GOOD, GOOD, GOOD], completed={"cell-wf1"})
+    with pytest.raises(WF.WalkForwardError):
+        C.run_cell(_spec(data_end=D("2025-12-31"), defer_last_test=True), r, str(tmp_path),
+                   log=lambda *_: None)
+
+
+# ------------------------------------------------------------------ early elimination
+
+
+def test_a_cell_that_can_no_longer_pass_stops_before_the_next_fold(tmp_path):
+    r = ChainRunner([BAD, BAD, GOOD])          # 0 of 2 passed, 1 left, 2 needed
+    res = C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None)
+    assert r.events == [("train", "cell-wf1"), ("oos", "cell-wf1"), ("train", "cell-wf2"),
+                        ("oos", "cell-wf2")]
+    assert res.verdict == "FAIL" and res.refit_job is None
+    cell = json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8"))
+    assert cell["eliminated"]["before_fold"] == 3 and "0 fold(s) passed" in cell["eliminated"]["reason"]
+    assert [f["fold"] for f in cell["folds"]] == [1, 2]
+
+
+def test_elimination_also_skips_training_a_deferred_fold(tmp_path):
+    r = ChainRunner([BAD, BAD, GOOD])
+    res = C.run_cell(_spec(data_end=D("2025-12-31"), defer_last_test=True), r, str(tmp_path),
+                     log=lambda *_: None)
+    assert ("train", "cell-wf3") not in r.events and res.verdict == "FAIL"
+
+
+def test_a_failed_required_fold_stops_the_chain_at_once(tmp_path):
+    r = ChainRunner([BAD, GOOD, GOOD])
+    res = C.run_cell(_spec(require_test_years=(2024, 2026)), r, str(tmp_path), log=lambda *_: None)
+    assert r.events == [("train", "cell-wf1"), ("oos", "cell-wf1")]
+    assert res.verdict == "FAIL"
+    assert "2024" in json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8")
+                                )["eliminated"]["reason"]
+
+
+def test_one_failed_fold_with_enough_left_carries_on(tmp_path):
+    r = ChainRunner([BAD, GOOD, GOOD])
+    assert C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None).verdict == "PASS"
+
+
+def test_run_all_folds_disables_elimination(tmp_path):
+    r = ChainRunner([BAD, BAD, GOOD])
+    res = C.run_cell(_spec(run_all_folds=True), r, str(tmp_path), log=lambda *_: None)
+    assert ("oos", "cell-wf3") in r.events and res.verdict == "FAIL"
+    cell = json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8"))
+    assert cell["eliminated"] is None and len(cell["folds"]) == 3
+
+
+def test_summary_marks_pending_and_eliminated_cells(tmp_path):
+    def make(sp):
+        return ChainRunner([BAD, BAD, GOOD] if sp.name == "gone" else [GOOD, GOOD, GOOD],
+                           prefix=sp.name)
+    specs = [_spec(name=n, data_end=D("2025-12-31"), defer_last_test=True) for n in ("wait", "gone")]
+    C.run_cells(specs, make, str(tmp_path), log=lambda *_: None)
+    md = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "| wait | PENDING" in md and "fold 3 test deferred" in md
+    assert "| gone | FAIL" in md and "eliminated before fold 3" in md

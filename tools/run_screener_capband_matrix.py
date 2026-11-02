@@ -52,7 +52,10 @@ the refit; --generations and the per-strategy budget overrides are not used. FMP
 is skipped and its stored report (<--wf-report-dir>/<cell>/fold<k>.json) reused. Pass rule:
 --pass-min-oos-return / --pass-max-dd-mult / --pass-min-folds (no defaults) and --pass-require-fold
 <test-year> (repeatable). --wf-data-end clamps the last test window and the refit end (rehearsal on
-data that stops short). Out-of-sample re-runs are local, ~14 GB each. Reports: per cell
+data that stops short). --wf-defer-last-test with a data end BEFORE the last test year trains the last
+fold now and tests it when the same command later runs without --wf-data-end (cell PENDING meanwhile;
+docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md). A cell that can no longer pass stops early
+as FAIL unless --wf-run-all-folds. Out-of-sample re-runs are local, ~14 GB each. Reports: per cell
 <--wf-report-dir>/<cell>/{cell,report}.json + report.md, grid-wide <--wf-report-dir>/summary.{json,md}.
 """
 import argparse
@@ -728,6 +731,15 @@ def main() -> int:
     ap.add_argument("--wf-data-end", default=None, metavar="YYYY-MM-DD",
                     help="Last day of data: clamps the LAST test window and the refit end "
                          "(rehearsal). Refused when it leaves that window empty.")
+    ap.add_argument("--wf-defer-last-test", action="store_true",
+                    help="Two-phase year: with a --wf-data-end BEFORE the last test year, train the "
+                         "last fold now and test it later (cell PENDING). Rerun the SAME command "
+                         "without --wf-data-end once the data exists: every train job is found "
+                         "completed and only the last test, the verdict and the refit run. Keep the "
+                         "flag on both runs (it is part of the cell name; the data end is not).")
+    ap.add_argument("--wf-run-all-folds", action="store_true",
+                    help="Run every fold even after the cell can no longer pass (default: stop, "
+                         "FAIL, and save the train jobs of the remaining folds).")
     ap.add_argument("--wf-first-generations", type=int, default=None,
                     help="Generation budget of fold 1 (cold start; default 30).")
     ap.add_argument("--wf-next-generations", type=int, default=None,
@@ -764,6 +776,8 @@ def main() -> int:
     if not args.walk_forward:
         _stray = [("--" + k.replace("_", "-")) for k in _wf_opt if getattr(args, k) is not None]
         _stray += ["--wf-force-memory"] if args.wf_force_memory else []
+        _stray += ["--wf-defer-last-test"] if args.wf_defer_last_test else []
+        _stray += ["--wf-run-all-folds"] if args.wf_run_all_folds else []
         _stray += ["--pass-min-oos-return-exclusive"] if args.pass_min_oos_return_exclusive else []
         _stray += ["--pass-require-fold"] if args.pass_require_fold else []
         if _stray:
@@ -911,7 +925,8 @@ def main() -> int:
             try:
                 wf_folds = WFC.build_cell_folds(args.wf_train_start_d, args.wf_years_l,
                                                 args.wf_data_end_d,
-                                                date.fromisoformat(_floor) if _floor else None)
+                                                date.fromisoformat(_floor) if _floor else None,
+                                                args.wf_defer_last_test)
             except WF.WalkForwardError as e:
                 raise SystemExit(f"--walk-forward: {e}")
             job_start = wf_folds[0].train_start.isoformat()
@@ -1041,9 +1056,12 @@ def main() -> int:
         cmd += er_tokens
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
-        # window, top-N or pass rule must never resume an older cell's -wf/-refit names.
+        # window, top-N or pass rule must never resume an older cell's -wf/-refit names. Under
+        # --wf-defer-last-test the data end is NOT: it only decides whether the last test runs yet
+        # (no window is clamped), and the January run must resume phase A's jobs by name.
         wf_tokens = ([] if not args.walk_forward else [
-            "--wf-spec", args.wf_train_start, args.wf_test_years, str(args.wf_data_end),
+            "--wf-spec", args.wf_train_start, args.wf_test_years,
+            "defer" if args.wf_defer_last_test else str(args.wf_data_end),
             str(args.wf_first_generations), str(args.wf_next_generations), str(args.wf_top_n),
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
@@ -1061,6 +1079,7 @@ def main() -> int:
                                          args.pass_min_folds),
                 require_test_years=tuple(args.pass_require_fold),
                 exclusive_return=args.pass_min_oos_return_exclusive,
+                defer_last_test=args.wf_defer_last_test, run_all_folds=args.wf_run_all_folds,
                 test_parallel=args.wf_test_parallel, selection=_wf_selection_defaults(),
                 expert=expert, strategy=strat, band=band,
                 floor=date.fromisoformat(_EXPERT_MIN_START[expert])

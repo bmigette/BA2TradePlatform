@@ -3,6 +3,8 @@
 *Status 2026-10-25: design approved by the owner, section by section, in a brainstorm. Nothing is built yet.
 Launch target: about 2027-01-10 on remote227.*
 
+*Amended 2026-11-02 by [2026-11-02-goal2027-two-phase-walk-forward.md](2026-11-02-goal2027-two-phase-walk-forward.md): phase A (wf1, wf2, wf3 training on 2020-2025 data) runs Nov-Dec 2026; the master runs on the owner PC with configurable remote workers.*
+
 The goal2027 grid is the next baseline for the classic stock experts. It replaces the goal2020 grid and the deferred
 ATR re-run ([atr_grid_2027_design.md](../strategy_research/atr_grid/atr_grid_2027_design.md)). It differs from
 goal2020 in four ways:

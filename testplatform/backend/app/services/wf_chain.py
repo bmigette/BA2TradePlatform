@@ -12,6 +12,12 @@ out-of-sample re-run, evaluated). This module adds what the matrix needs around 
 (expert data floor, ``--wf-data-end`` clamp), a stored per-fold report so a completed fold is skipped
 on resume, the refit, the per-cell report and the grid summary. Pure orchestration over the engine's
 ``Runner`` protocol: the tools supply the real runner, the tests a fake one.
+
+Two-phase year (``--wf-defer-last-test``, docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md):
+with data ending before the last test year, wf1/wf2 run whole and wf3 is only TRAINED (cell
+PENDING); the same command with the full data later finds every train job completed and only runs
+wf3's test, the verdict and the refit. A cell that can no longer pass stops early (FAIL, the
+``eliminated`` block) unless ``run_all_folds``.
 """
 from __future__ import annotations
 
@@ -32,26 +38,57 @@ logger = logging.getLogger(__name__)
 
 
 def build_cell_folds(train_start: date, test_years: Sequence[int], data_end: Optional[date],
-                     floor: Optional[date] = None) -> List[WF.Fold]:
+                     floor: Optional[date] = None, defer_last_test: bool = False) -> List[WF.Fold]:
     """The cell's anchored folds. ``floor`` is the expert's data floor (FMPRating 2022-01-01): the
     train start of EVERY fold and of the refit is the later of ``train_start`` and ``floor``.
     ``data_end`` (``--wf-data-end``) shortens the LAST test window; it must leave that window
     non-empty and fall inside the last test year or later (a data end before the last year would
-    silently drop whole folds, so it is refused instead)."""
+    silently drop whole folds, so it is refused instead).
+
+    ``defer_last_test`` (``--wf-defer-last-test``, goal2027 phase A): a data end BEFORE the last
+    test year is allowed when the last fold's TRAIN window still fits in the data. That fold is then
+    trained now and tested once the data exists (``deferred_fold``); its windows are never clamped,
+    so the January run with the full data rebuilds the very same jobs. A data end INSIDE the last
+    test year is refused under the flag: a partly clamped test and refit would carry the same job
+    names as the full ones."""
     start = max(train_start, floor) if floor else train_start
     years = list(test_years)
     test_end = None
     if data_end is not None and years:
         last_start, last_end = date(years[-1], 1, 1), date(years[-1], 12, 31)
-        if data_end <= last_start:
+        if defer_last_test:
+            if last_start <= data_end < last_end:
+                raise WalkForwardError(
+                    f"--wf-defer-last-test with --wf-data-end {data_end}: the data end is inside the "
+                    f"last test year {years[-1]}; give one before {last_start} (train the last fold "
+                    f"now, test it later) or none (test it)")
+        elif data_end <= last_start:
             raise WalkForwardError(
                 f"--wf-data-end {data_end}: the last test window {last_start}..{last_end} would be "
-                f"empty (data must reach beyond {last_start})")
-        if data_end < last_end:
+                f"empty (data must reach beyond {last_start}; --wf-defer-last-test trains that "
+                f"fold now and tests it later)")
+        elif data_end < last_end:
             test_end = data_end
     folds = WF.build_year_folds(start, years, test_end)
     WF.validate_folds(folds)
+    last = deferred_fold(folds, data_end, defer_last_test)
+    if last is not None:
+        if len(folds) == 1:
+            raise WalkForwardError(f"--wf-defer-last-test: the plan has one fold and it is deferred, "
+                                   f"so nothing would be tested")
+        if last.train_end > data_end:
+            raise WalkForwardError(
+                f"--wf-defer-last-test: fold {last.index} trains to {last.train_end}, after the data "
+                f"end {data_end}")
     return folds
+
+
+def deferred_fold(folds: Sequence[WF.Fold], data_end: Optional[date],
+                  defer_last_test: bool) -> Optional[WF.Fold]:
+    """The fold trained now and tested later: the last one, when its test starts after the data."""
+    if not defer_last_test or data_end is None or not folds or folds[-1].test_start <= data_end:
+        return None
+    return folds[-1]
 
 
 def refit_window(folds: Sequence[WF.Fold]) -> Tuple[date, date]:
@@ -82,12 +119,14 @@ class CellSpec:
     band: str
     floor: Optional[date] = None
     exclusive_return: bool = False      # fold return must be ABOVE the threshold
+    defer_last_test: bool = False       # train the last fold now, test it when the data exists
+    run_all_folds: bool = False         # no early elimination: every fold runs even if the cell cannot pass
 
 
 @dataclass
 class CellResult:
     name: str
-    verdict: str                    # PASS | FAIL
+    verdict: str                    # PASS | FAIL | PENDING (last fold's test deferred)
     refit_job: Optional[str]
     walk_forward: WF.WalkForwardResult
     report: Dict[str, Any]
@@ -100,7 +139,8 @@ def _fold_extra_args(spec: CellSpec, folds: Sequence[WF.Fold]) -> Dict[int, List
 
 
 def make_cell_plan(spec: CellSpec) -> Tuple[WF.Plan, List[WF.Fold]]:
-    folds = build_cell_folds(spec.train_start, spec.test_years, spec.data_end, spec.floor)
+    folds = build_cell_folds(spec.train_start, spec.test_years, spec.data_end, spec.floor,
+                             spec.defer_last_test)
     plan = WF.make_plan(
         spec.name, folds, spec.optimize_args, spec.launcher, spec.top_n, spec.thresholds,
         test_parallel=spec.test_parallel, skip_train=False, only_fold=None, embargo_days=0,
@@ -218,32 +258,80 @@ def _fold_summary(spec: CellSpec, runner: Any, plan: WF.Plan, f: WF.Fold,
             "seeded_from": _lineage(runner, spec, job, planned)}
 
 
+def cannot_pass(plan: WF.Plan, folds: Sequence[WF.Fold], genomes: Sequence[WF.GenomeFold]
+                ) -> Optional[str]:
+    """Why the cell can no longer pass whatever the folds still to run do, or None. The verdict
+    needs ``min_folds`` passing fold winners and every required year passing, so a failed required
+    year, or too few folds left to reach ``min_folds``, decides FAIL already: running the rest
+    would cost a train job per fold and change nothing."""
+    done = {g.fold: g.passed for g in genomes if g.rank == 1}
+    failed_req = sorted(f.test_start.year for f in folds
+                        if f.index in done and not done[f.index]
+                        and f.test_start.year in plan.require_test_years)
+    if failed_req:
+        return f"required test year(s) {', '.join(map(str, failed_req))} failed"
+    passed = sum(done.values())
+    left = sum(1 for f in folds if f.index not in done)
+    if passed + left < plan.thresholds.min_folds:
+        return (f"{passed} fold(s) passed with {left} left, {plan.thresholds.min_folds} needed")
+    return None
+
+
 def run_cell(spec: CellSpec, runner: Any, report_dir: str,
              log: Callable[[str], None] = print) -> CellResult:
     """Run (or resume) one cell's chain. Raises ``WalkForwardError`` on a refusal or a failed job;
-    ``run_cells`` turns that into an ERROR row so the grid carries on."""
+    ``run_cells`` turns that into an ERROR row so the grid carries on.
+
+    Verdicts: PASS (refit run), FAIL (no refit; ``eliminated`` says which folds were skipped because
+    the cell could no longer pass), PENDING (the deferred last fold is trained, its test waits for
+    the data: the same command with that data tests it and finishes the cell)."""
     plan, folds = make_cell_plan(spec)
+    deferred = deferred_fold(folds, spec.data_end, spec.defer_last_test)
     genomes: List[WF.GenomeFold] = []
+    ran: List[WF.Fold] = []
+    eliminated: Optional[Dict[str, Any]] = None
     for f in folds:
+        why = None if spec.run_all_folds else cannot_pass(plan, folds, genomes)
+        if why is not None:
+            eliminated = {"before_fold": f.index, "reason": why}
+            log(f"[{spec.name}] cell can no longer pass ({why}) -- fold {f.index} onward not run")
+            break
+        if f is deferred:
+            WF.train_fold(plan, runner, f, log)
+            log(f"[{spec.name}] fold {f.index}: trained; its test {f.test_start}..{f.test_end} "
+                f"waits for data past {spec.data_end}")
+            break
         name = WF.train_job_name(spec.name, f.index)
         stored = (_load_fold(report_dir, plan, f, _identities(runner, plan, f))
                   if runner.train_completed(name) else None)
         if stored is not None:
             log(f"[{spec.name}] fold {f.index}: completed -- reusing its stored report")
             genomes.extend(stored)
-            continue
-        got = WF.run_fold(plan, runner, f, log)
-        _save_fold(report_dir, plan, f, got, _identities(runner, plan, f))
-        genomes.extend(got)
-    res = WF.aggregate(spec.name, folds, len(folds), spec.top_n, genomes, spec.thresholds,
+        else:
+            got = WF.run_fold(plan, runner, f, log)
+            _save_fold(report_dir, plan, f, got, _identities(runner, plan, f))
+            genomes.extend(got)
+        ran.append(f)
+    res = WF.aggregate(spec.name, ran, len(folds), spec.top_n, genomes, spec.thresholds,
                        spec.selection, require_test_years=plan.require_test_years,
                        exclusive_return=plan.exclusive_return)
     cell_dir = os.path.join(report_dir, spec.name)
     WF.write_report(res, cell_dir)
-    passed = bool(res.overall_passed)
+    pending = deferred is not None and eliminated is None
+    passed = bool(res.overall_passed) and not pending and eliminated is None
     refit_job: Optional[str] = None
     refit_block: Optional[Dict[str, Any]] = None
-    if passed:
+    deferred_block: Optional[Dict[str, Any]] = None
+    if pending:
+        job = WF.train_job_name(spec.name, deferred.index)
+        prev = plan.previous_fold(deferred)
+        deferred_block = {"fold": deferred.index, "job": job,
+                          "train": [deferred.train_start.isoformat(), deferred.train_end.isoformat()],
+                          "test": [deferred.test_start.isoformat(), deferred.test_end.isoformat()],
+                          "seeded_from": _lineage(runner, spec, job, WF.train_job_name(
+                              spec.name, prev.index) if prev else None)}
+        log(f"[{spec.name}] cell PENDING -- fold {deferred.index} trained, test deferred")
+    elif passed:
         refit_job = refit_job_name(spec.name)
         cmd = refit_command(spec, folds)
         if runner.train_completed(refit_job):
@@ -263,18 +351,21 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
                        "seeded_from": _lineage(runner, spec, refit_job, src)}
     else:
         log(f"[{spec.name}] cell FAILED -- no refit "
-            f"({res.winners_passed}/{len(folds)} folds passed"
-            + (f"; required {res.required_failed} failed" if res.required_failed else "") + ")")
+            f"({res.winners_passed}/{len(ran)} folds passed"
+            + (f"; required {res.required_failed} failed" if res.required_failed else "")
+            + (f"; eliminated before fold {eliminated['before_fold']}" if eliminated else "") + ")")
     winners = {g.fold: g for g in res.genomes if g.rank == 1}
     report = {
         "cell": spec.name, "expert": spec.expert, "strategy": spec.strategy, "band": spec.band,
-        "verdict": "PASS" if passed else "FAIL", "refit_job": refit_job, "refit": refit_block,
+        "verdict": "PENDING" if pending else "PASS" if passed else "FAIL",
+        "refit_job": refit_job, "refit": refit_block,
+        "deferred": deferred_block, "eliminated": eliminated,
         "required_failed": list(res.required_failed),
         "thresholds": {**asdict(spec.thresholds), "top_n": spec.top_n,
                        "exclusive_return": spec.exclusive_return,
                        "require_test_years": list(res.require_test_years)},
         "data_end": spec.data_end.isoformat() if spec.data_end else None,
-        "folds": [_fold_summary(spec, runner, plan, f, winners[f.index]) for f in folds],
+        "folds": [_fold_summary(spec, runner, plan, f, winners[f.index]) for f in ran],
         "winner_stitch": asdict(res.winner_stitch) if res.winner_stitch else None,
     }
     os.makedirs(cell_dir, exist_ok=True)
@@ -304,7 +395,10 @@ def render_summary(cells: Sequence[Dict[str, Any]]) -> str:
                             f"{_f(x['oos']['return'])} / {_f(x['oos']['max_dd'])}")
             else:
                 cols.append("-")
-        note = c.get("error") or c.get("refit_job") or "-"
+        note = (c.get("error") or c.get("refit_job")
+                or (c.get("deferred") and f"fold {c['deferred']['fold']} test deferred")
+                or (c.get("eliminated") and f"eliminated before fold {c['eliminated']['before_fold']}")
+                or "-")
         out.append(f"| {c['cell']} | {c['verdict']} | " + " | ".join(cols) + f" | {note} |")
     return "\n".join(out) + "\n"
 

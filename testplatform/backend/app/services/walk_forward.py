@@ -559,9 +559,9 @@ def check_seed_lineage(plan: Plan, runner: Any, f: Fold, name: str) -> None:
             f"fold {f.index}: {name!r} recorded seed source {got!r}, expected {want!r}")
 
 
-def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print
-             ) -> List[GenomeFold]:
-    """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold."""
+def train_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print) -> str:
+    """Train ONE fold (or skip when completed) and check its recorded seed. Returns the job name.
+    Also the whole of a DEFERRED fold's work (wf_chain: train now, test when the data exists)."""
     name = train_job_name(plan.prefix, f.index)
     if plan.skip_train:
         if not runner.train_completed(name):
@@ -582,6 +582,13 @@ def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = p
         if not runner.train_completed(name):
             raise WalkForwardError(f"training job {name!r} did not reach status 'completed'")
     check_seed_lineage(plan, runner, f, name)
+    return name
+
+
+def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print
+             ) -> List[GenomeFold]:
+    """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold."""
+    name = train_fold(plan, runner, f, log)
     picks = runner.select(name, plan.top_n)
     if not picks:
         raise WalkForwardError(f"fold {f.index}: {name!r} has no eligible genome to test")

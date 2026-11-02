@@ -42,6 +42,7 @@ class Fake(FakeRunner):
         return [_pick(1), _pick(2)][:top_n]
 
     def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+        self.tested.append((train_name, fold.index))
         return {p.rank: self.oos_by_fold[fold.index - 1] for p in picks}
 
 
@@ -249,3 +250,69 @@ def test_a_changed_walk_forward_budget_or_spec_changes_the_cell_name(env, monkey
 
 def test_same_walk_forward_spec_gives_the_same_cell_name(env, monkeypatch):
     assert _cell_name(env, monkeypatch) == _cell_name(env, monkeypatch)
+
+
+# ------------------------------------------------------------------ two-phase year (--wf-defer-last-test)
+
+
+def test_phase_a_trains_wf3_without_testing_it_and_reports_pending(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--wf-data-end", "2025-12-31",
+                                           experts=("DeterministicScorer",)))
+    assert M.main() == 0                                       # PENDING is a result, not an error
+    cell = env.fake.order[0][:-4]
+    assert env.fake.order == [f"{cell}-wf1", f"{cell}-wf2", f"{cell}-wf3"]
+    assert _flag(_cmds(env.fake)[f"{cell}-wf3"], "--end") == "2025-12-31"
+    assert [t[1] for t in env.fake.tested] == [1, 2]          # wf3 is never tested
+    summ = json.loads(open(os.path.join(env.report, "summary.json"), encoding="utf-8").read())
+    assert [c["verdict"] for c in summ["cells"]] == ["PENDING"]
+
+
+def test_phase_a_and_the_january_run_share_every_job_name(env, monkeypatch):
+    """The January command (full data: no --wf-data-end) must resume phase A's jobs, not start over."""
+    a = _cell_name(env, monkeypatch, "--wf-defer-last-test", "--wf-data-end", "2025-12-31")
+    jan = _cell_name(env, monkeypatch, "--wf-defer-last-test")
+    assert a == jan
+    assert a != _cell_name(env, monkeypatch)                   # but never a plain cell's name
+
+
+def test_january_run_after_phase_a_tests_wf3_and_refits(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--wf-data-end", "2025-12-31",
+                                           experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    done = set(env.fake.order)
+    jan = Fake()
+    jan.completed = set(done)
+    monkeypatch.setattr(M, "_make_wf_runner", lambda args: jan)
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    assert [n[-6:] for n in jan.order] == ["-refit"]           # only the refit trains
+    assert [t[1] for t in jan.tested] == [3]                   # wf1/wf2 reports reused, wf3 tested
+
+
+def test_defer_with_a_data_end_inside_the_last_year_is_refused(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--wf-data-end", "2026-10-12",
+                                           experts=("DeterministicScorer",)))
+    with pytest.raises(SystemExit, match="inside the last test year"):
+        M.main()
+    assert env.fake.order == []
+
+
+@pytest.mark.parametrize("flag", ["--wf-defer-last-test", "--wf-run-all-folds"])
+def test_phase_flags_without_walk_forward_are_refused(env, monkeypatch, flag):
+    monkeypatch.setattr(sys, "argv", ["run_screener_capband_matrix.py", flag])
+    with pytest.raises(SystemExit):
+        M.main()
+
+
+def test_run_all_folds_keeps_running_a_cell_that_cannot_pass(env, monkeypatch):
+    env.fake.oos_by_fold = (BAD, BAD, GOOD)
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-run-all-folds", experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    assert [n[-4:] for n in env.fake.order] == ["-wf1", "-wf2", "-wf3"]
+
+
+def test_by_default_a_cell_that_cannot_pass_stops_early(env, monkeypatch):
+    env.fake.oos_by_fold = (BAD, BAD, GOOD)
+    monkeypatch.setattr(sys, "argv", _argv(env, experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    assert [n[-4:] for n in env.fake.order] == ["-wf1", "-wf2"]
