@@ -126,3 +126,24 @@ boundary (step 5 below) or delete that job and retrain it in January.
   and storing it as `-wf4` would make January 2028 a pure "test 2027, refit 2020-2027". The pass rule
   would then need a form such as "latest year required, 2 of the last 3". Decide before January 2027's
   refits run, since the name is fixed then.
+
+## Master on remote227 and copy-back (owner 2026-11-02)
+
+The master runs on remote227, away from Windows Update restarts. Its layout follows the stage-1/2
+masters, per grid2020-remote227:
+- its own checkout (e.g. `/home/debian/ba2-grid/repo-goal2027`), with the fleet venv and PYTHONPATH
+  isolation;
+- its own `BA2_HOME` with its own test DB; `common` is a symlink to the workers' cache;
+- a `sudo systemd-run` transient unit with a `MemoryMax` cap.
+
+`tools/grid_goal2027.sh` enforces all of this.
+
+Results come back with `tools/merge_remote_test_db.py`:
+1. Copy the remote `dl_forecasting.db` and the `reports/goal2027_wf` directory to the PC.
+2. Run `--source <copy> --source-tag remote227-goal2027 --name-like '%goal2027%' --rewrite-reports <copied reports dir>`.
+
+How the merge works:
+- Every row gets `source id + a per-table offset` (the next multiple of 1000). The offsets and every
+  mapped pair are recorded in the local DB, so the January copy adds only the new rows, under the same ids.
+- Still-running jobs are skipped until a later copy.
+- It runs in one transaction, and the source is attached read-only.
