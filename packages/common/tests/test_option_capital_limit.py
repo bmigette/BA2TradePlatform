@@ -481,7 +481,7 @@ def test_a_credit_spread_that_does_not_fit_is_refused_loudly(world):
     e = world.expert(acct)
     _credit(e, EQUITY - 100.0, strategy="iron_condor")
     res = _bps(acct, e, 40.0)
-    assert res["success"] is False and "Insufficient buying power" in res["message"]
+    assert res["success"] is False and "exceeds the expert's capital headroom" in res["message"]
     assert acct.submitted == []
 
 
@@ -490,7 +490,7 @@ def test_a_credit_spread_cannot_reserve_cash_a_working_debit_entry_is_about_to_s
     e = world.expert(acct)
     _pending_debit(e, 100, 9.5)                              # 95,000 in flight
     res = _bps(acct, e, 40.0)
-    assert res["success"] is False and "Insufficient buying power" in res["message"]
+    assert res["success"] is False and "exceeds the expert's capital headroom" in res["message"]
 
 
 def test_a_credit_spread_cannot_reserve_capital_an_open_stock_position_holds(world):
@@ -498,7 +498,7 @@ def test_a_credit_spread_cannot_reserve_capital_an_open_stock_position_holds(wor
     e = world.expert(acct)
     _stock(e, 990, 100.0)                                    # 99,000 of shares
     res = _bps(acct, e, 40.0)
-    assert res["success"] is False and "Insufficient buying power" in res["message"]
+    assert res["success"] is False and "exceeds the expert's capital headroom" in res["message"]
 
 
 # ------------------------------------------------------------------ the invariant

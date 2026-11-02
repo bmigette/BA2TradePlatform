@@ -461,7 +461,7 @@ def account_available_equity_detail(account: Any, *, exclude_transaction_id: Opt
         # A non-OSError error escaping the buying-power read (an SDK error class from a third-party
         # adapter; the live adapters swallow theirs). This path serves ONE expert-less option entry, and
         # ``(None, names)`` is the contract every caller already treats as "unknown: REFUSE this entry"
-        # (``_capital_headroom`` -> ``_fit_debit_to_capital`` / ``_reserve_fits``). Refusing that one
+        # (``_capital_headroom`` -> ``_fit_debit_to_capital`` / ``_reserve_refusal``). Refusing that one
         # entry loudly is right: an uncaught exception would instead abort the caller's whole pass, and
         # sizing without the broker's real figure would be guessing.
         reason = f"account {account.id} buying power unreadable ({type(e).__name__}: {e})"

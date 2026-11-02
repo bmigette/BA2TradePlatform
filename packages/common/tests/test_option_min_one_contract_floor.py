@@ -248,7 +248,7 @@ def test_the_floored_contract_still_faces_the_buying_power_guard():
     acct.hold(held_short_put(strike=50.0, qty=1, reserve=8_000.0, symbol="OTHER"))
     res = _floored(acct, "sell_cash_secured_put", 80.0, **CSP).execute()
     assert not res["success"]
-    assert "Insufficient buying power" in res["message"], res["message"]
+    assert "broker limit" in res["message"], res["message"]
     assert acct.submitted == []
 
 

@@ -83,7 +83,7 @@ def test_an_unbalanced_fly_is_sized_by_its_true_max_loss_and_reserves_the_excess
 
 def test_the_loss_beyond_the_debit_is_refused_when_buying_power_cannot_cover_it():
     acct, res = _run({90.0, 100.0, 115.0}, bp_ok=False)
-    assert res["success"] is False and "Insufficient BP" in res["message"]
+    assert res["success"] is False and "broker limit" in res["message"]
     assert acct.submitted == []
 
 
