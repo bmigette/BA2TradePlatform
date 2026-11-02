@@ -51,8 +51,22 @@ case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) IS_WIN=1 ;; *) IS_WIN=0 ;; esac
 CMD="${1:-}"; shift || true
 
 GRID_LOG="${GRID_LOG:-grid_goal2027.log}"
-VENV="${VENV:-$HOME/ba2-venvs/goal2027}"
-if [ "$IS_WIN" = "1" ]; then PY="${PY:-$VENV/Scripts/python.exe}"; else PY="${PY:-$VENV/bin/python}"; fi
+# INTERPRETER + CODE ISOLATION. Windows: a dedicated venv (`setup`). remote227 (Linux): the FLEET venv
+# (/opt/ba2worker/ba2-venvs/test, as the stage-1/2 masters; no uv, system python 3.13) and isolation by
+# PYTHONPATH only. That venv's EDITABLE finders point at the fleet checkout, so without the PYTHONPATH
+# below the master would silently run fleet code; check_venv asserts every module resolves HERE.
+if [ "$IS_WIN" = "1" ]; then
+  VENV="${VENV:-$HOME/ba2-venvs/goal2027}"; PY="${PY:-$VENV/Scripts/python.exe}"; _PSEP=";"
+else
+  VENV="${VENV:-/opt/ba2worker/ba2-venvs/test}"; PY="${PY:-$VENV/bin/python}"; _PSEP=":"
+fi
+export PYTHONPATH="${REPO_ROOT}/packages/common${_PSEP}${REPO_ROOT}/packages/providers${_PSEP}${REPO_ROOT}/packages/experts${_PSEP}${REPO_ROOT}/testplatform/backend${_PSEP}${REPO_ROOT}/testplatform${PYTHONPATH:+${_PSEP}$PYTHONPATH}"
+# DATA HOME. remote227: REQUIRED and its OWN (own test DB; never share a DB between two masters),
+# e.g. /home/debian/ba2-grid/home-goal2027 with common -> /opt/ba2worker/Documents/ba2/common (the
+# workers' cache). The stage-2 master's home is forbidden. Windows: the default ~/Documents/ba2.
+FORBIDDEN_HOMES="${FORBIDDEN_HOMES:-/home/debian/ba2-grid/home}"
+MEMORY_MAX="${MEMORY_MAX:-80G}"     # remote227 transient unit's cgroup cap (box: 251 GB, 24 worker slots)
+UNIT="${UNIT:-ba2-goal2027}"
 DRIVER=tools/run_screener_capband_matrix.py
 WF_REPORT_DIR="${WF_REPORT_DIR:-${REPO_ROOT}/reports/goal2027_wf}"
 TRAIN_START="${TRAIN_START:-2020-01-01}"
@@ -102,6 +116,11 @@ check_checkout() {
     wd="$(systemctl show -p WorkingDirectory --value ba2-worker 2>/dev/null)"
     [ -n "$wd" ] && bad="$bad $wd"
   fi
+  case "$here/" in /opt/ba2worker/*)
+    echo "FATAL: $REPO_ROOT is under /opt/ba2worker (the fleet worker's tree); the master needs its own checkout," >&2
+    echo "  e.g. /home/debian/ba2-grid/repo-goal2027 (fetch from GitHub: the fleet origin lags)." >&2
+    return 1 ;;
+  esac
   for d in $bad; do
     [ -d "$d" ] || continue
     if [ "$(cd "$d" && pwd -P)" = "$here" ]; then
@@ -114,6 +133,11 @@ check_checkout() {
 
 cmd_setup() {
   check_checkout || exit 1
+  if [ "$IS_WIN" = "0" ]; then
+    # remote227: no venv of our own (no uv, python 3.13): the fleet venv + PYTHONPATH isolation.
+    check_venv && check_home && echo "setup OK: $PY with PYTHONPATH -> $REPO_ROOT; BA2_HOME=$BA2_HOME"
+    return
+  fi
   local inst=(-e packages/common -e packages/providers -e packages/experts -e testplatform
               -r testplatform/backend/requirements.txt)
   if [ -x "$PY" ]; then
@@ -131,6 +155,35 @@ cmd_setup() {
   check_venv && echo "setup OK: $VENV -> $REPO_ROOT"
 }
 
+# remote227: the master's OWN data home (own test DB). Exports DB_FILE / DATABASE_URL like stage1_run.sh.
+check_home() {
+  [ "$IS_WIN" = "1" ] && return 0
+  if [ -z "${BA2_HOME:-}" ]; then
+    echo "FATAL: BA2_HOME is required on remote227 (the master's own home + test DB), e.g." >&2
+    echo "  BA2_HOME=/home/debian/ba2-grid/home-goal2027 with common -> /opt/ba2worker/Documents/ba2/common" >&2
+    return 1
+  fi
+  local h f; h="$(cd "$BA2_HOME" 2>/dev/null && pwd -P)" || { echo "FATAL: BA2_HOME $BA2_HOME does not exist" >&2; return 1; }
+  for f in $FORBIDDEN_HOMES; do
+    [ -d "$f" ] && [ "$(cd "$f" && pwd -P)" = "$h" ] && {
+      echo "FATAL: BA2_HOME $BA2_HOME is another master's home (never share a DB between two masters)" >&2; return 1; }
+  done
+  [ -d "$BA2_HOME/common" ] || { echo "FATAL: $BA2_HOME/common missing (symlink it to the workers' cache)" >&2; return 1; }
+  mkdir -p "$BA2_HOME/test"
+  export BA2_HOME DB_FILE="$BA2_HOME/test/dl_forecasting.db" DATABASE_URL="sqlite:///$BA2_HOME/test/dl_forecasting.db"
+}
+
+# The FMP key from the master's own DB, exported for the children (never printed, never passed on a
+# command line: systemd-run args are visible in ps and the unit's properties).
+export_fmp_key() {
+  [ -n "${FMP_API_KEY:-}" ] && return 0
+  [ -f "${DB_FILE:-}" ] || return 0
+  FMP_API_KEY="$("$PY" -c 'import sqlite3, sys
+r = sqlite3.connect(sys.argv[1]).execute("SELECT value_str FROM appsetting WHERE key=?", ("FMP_API_KEY",)).fetchone()
+print(r[0] if r and r[0] else "")' "$DB_FILE" 2>/dev/null)"
+  [ -n "$FMP_API_KEY" ] && export FMP_API_KEY
+}
+
 # The metric store under the venv's own ba2_common cache root (BA2_HOME / CACHE_FOLDER), unless STORE is set.
 resolve_store() {
   [ -n "$STORE" ] && return 0
@@ -145,11 +198,11 @@ check_venv() {
   "$PY" - "$REPO_ROOT" <<'EOF'
 import os, sys
 root = os.path.normcase(os.path.abspath(sys.argv[1]))
-import ba2test_launcher, ba2_common
-bad = [m.__name__ for m in (ba2test_launcher, ba2_common)
+import ba2test_launcher, ba2_common, ba2_providers, ba2_experts, app
+bad = [f"{m.__name__} ({m.__file__})" for m in (ba2test_launcher, ba2_common, ba2_providers, ba2_experts, app)
        if not os.path.normcase(os.path.abspath(m.__file__)).startswith(root)]
 if bad:
-    sys.exit(f"FATAL: {bad} import from outside {root} -- the venv points at another checkout")
+    sys.exit(f"FATAL: {bad} import from outside {root} -- the interpreter runs another checkout's code")
 print(f"venv imports this checkout: {root}")
 EOF
 }
@@ -160,6 +213,7 @@ preflight() {
   case "${PHASE:-}" in A|B) ;; *) echo "FATAL: PHASE must be A (Nov-Dec, data to 2025) or B (January, data to 2026)" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
   check_checkout || exit 1
+  check_home || exit 1
   check_venv || exit 1
   resolve_store || exit 1
   [ -n "${MC_OHLCV:-}" ] && [ -n "${MC_TA:-}" ] || {
@@ -256,9 +310,10 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
 cmd_run() {                        # $1 = "dry" for a dry run
   local end; end="$(data_end)"
   preflight "$end"
+  export_fmp_key
   echo "=================================================================="
   echo "=== goal2027  phase $PHASE  train from $TRAIN_START  data end ${end:-2026-12-31 (full)}  $(date)"
-  echo "=== checkout $REPO_ROOT ($(git rev-parse --short HEAD 2>/dev/null))  venv $VENV"
+  echo "=== checkout $REPO_ROOT ($(git rev-parse --short HEAD 2>/dev/null))  python $PY  BA2_HOME ${BA2_HOME:-(default)}"
   echo "=== workers: ${WORKERS:-local-only}  local parallel: $PARALLEL  remote slots: $BA2_MAX_REMOTE_SLOTS"
   echo "=== steps: $STEPS"
   echo "=== reports: $WF_REPORT_DIR"
@@ -329,6 +384,10 @@ if (\$kill) { 'live platform (ba2-trade) processes: {0}  <- must still be > 0' -
 
 cmd_stop() {
   if [ "${1:-}" = "--dry-run" ]; then ps_tiers 0; echo "DRY RUN -- nothing was stopped."; return; fi
+  if [ "$IS_WIN" = "0" ] && systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+    echo "stopping unit $UNIT (the whole cgroup: wrapper, driver, optimize, re-runs)"
+    sudo systemctl stop "$UNIT"
+  fi
   ps_tiers 1
   echo
   echo "Stopped mid-job: that job resumes from its last completed generation on the next start (same"
@@ -338,6 +397,9 @@ cmd_stop() {
 
 cmd_status() {
   echo "=================== goal2027 status  $(date) ==================="
+  if [ "$IS_WIN" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+    echo "unit $UNIT: $(systemctl is-active "$UNIT" 2>/dev/null)  (journalctl -u $UNIT)"
+  fi
   ps_tiers 0
   echo
   if [ -f "$GRID_LOG" ]; then
@@ -358,9 +420,20 @@ case "$CMD" in
   dry-run) cmd_run dry ;;
   start)
     preflight "$(data_end)" || exit 1      # refuse here, in the operator's terminal, not in the log
-    # setsid on Linux: the run must outlive the ssh session that started it (remote227 master).
     if [ "$IS_WIN" = "1" ]; then
       GRID_SKIP_PREFLIGHT=1 nohup bash tools/grid_goal2027.sh run >/dev/null 2>&1 &
+    elif command -v systemd-run >/dev/null 2>&1; then
+      # remote227: a transient unit (as the stage-1/2 masters) -- survives logout, cgroup RAM cap,
+      # `journalctl -u`. The settings travel as --setenv; the FMP key does NOT (args and unit
+      # properties are readable): `run` reads it from the master's own DB.
+      sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
+      local_env=()
+      for v in PHASE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
+        [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
+      done
+      sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1
+      echo "started unit $UNIT (MemoryMax $MEMORY_MAX); journalctl -u $UNIT; log: $REPO_ROOT/$GRID_LOG"
+      exit 0
     else
       GRID_SKIP_PREFLIGHT=1 setsid nohup bash tools/grid_goal2027.sh run >/dev/null 2>&1 < /dev/null &
     fi
