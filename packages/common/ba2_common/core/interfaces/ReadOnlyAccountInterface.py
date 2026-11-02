@@ -2900,14 +2900,23 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 if any(o.asset_class == AssetClass.OPTION for o in txn_orders):
                     continue
 
-                # Stamp a close price from the last known market price (best-effort, so P&L
-                # is recorded). Leave it unset if unavailable rather than guessing.
-                try:
-                    price = self.get_instrument_current_price(txn.symbol)
-                    if price:
-                        txn.close_price = float(price)
-                except Exception:  # noqa: BLE001
-                    pass
+                # THE CLOSE PRICE IS THE FILL THAT CLOSED THE POSITION. This used to stamp the
+                # market price AT RECONCILE TIME, which is a guess. A broker-side TP fill at 24.13
+                # was recorded as 23.49 (EVER tx 202, 2026-09-11), and positions sold by hand at
+                # 18:16 got that day's 20:15 price (2026-06-29, 11 rows). Unknown stays unknown:
+                # no fill found means no close price, logged at ERROR, never a substitute.
+                fill = self._external_close_fill(txn, txn_orders)
+                if fill is None:
+                    logger.error(
+                        f"[Account {self.id}] reconcile: no fill found that closed transaction "
+                        f"{txn.id} ({txn.symbol}); closing it WITHOUT a close price, so its "
+                        f"realised P/L is unknown until it is repaired by hand")
+                else:
+                    txn.close_price, fill_time, source = fill
+                    if fill_time is not None:
+                        txn.close_date = fill_time
+                    logger.info(f"[Account {self.id}] reconcile: transaction {txn.id} "
+                                f"({txn.symbol}) close price {txn.close_price} from {source}")
 
                 # Cancel any still-resting orders for this transaction (the broker has
                 # already released the position, so these can never fill correctly).
@@ -2933,6 +2942,55 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 session.commit()
 
         return closed_count
+
+    def _external_close_fill(self, txn, txn_orders) -> Optional[Tuple[float, Optional[datetime], str]]:
+        """``(price, fill time or None, source)`` of the fill that closed ``txn``, or None.
+
+        Asked when the broker no longer holds the position. In order:
+
+        1. the transaction's OWN filled closing orders (a broker-side TP/SL/OCO fill the
+           order-driven refresh had not turned into a close yet). Used only when they cover the
+           whole quantity; the price is their quantity-weighted average fill price
+           (``TradingOrder.open_price``);
+        2. the BROKER's fill history (``get_closing_fill``), for a position closed outside
+           the platform.
+
+        None when neither knows. Callers record no price then: the market price at the time of
+        the check is not what the position was sold at.
+        """
+        from ba2_common.core.types import OrderDirection
+        closing_side = OrderDirection.SELL if txn.side == OrderDirection.BUY else OrderDirection.BUY
+        want = abs(float(txn.quantity or 0))
+        qty = value = 0.0
+        for o in txn_orders:
+            if o.side != closing_side or o.status != OrderStatus.FILLED:
+                continue
+            px = o.open_price                 # TradingOrder's fill price ("opened at")
+            q = float(o.filled_qty or o.quantity or 0)
+            if px is None or q <= 0:
+                continue
+            qty += q
+            value += q * float(px)
+        if want > 0 and qty >= want - 1e-9:
+            return value / qty, None, "its own filled closing order(s)"
+
+        since = txn.open_date
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        broker = self.get_closing_fill(txn.symbol, closing_side, want, since)
+        if broker is None:
+            return None
+        price, when = broker
+        return float(price), when, "the broker's fill history"
+
+    def get_closing_fill(self, symbol: str, side, quantity: float,
+                         since: Optional[datetime]) -> Optional[Tuple[float, datetime]]:
+        """``(quantity-weighted average price, time of the last fill)`` of the broker fills on
+        ``side`` that closed ``quantity`` of ``symbol`` after ``since``, or None.
+
+        The base has no fill history and answers None. Accounts that can read their broker's
+        executions override it (``AlpacaAccount``)."""
+        return None
 
     @abstractmethod
     def get_dividends(self, symbol: Optional[str] = None, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> List[Dict]:

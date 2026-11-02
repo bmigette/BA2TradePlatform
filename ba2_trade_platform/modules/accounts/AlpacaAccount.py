@@ -2730,6 +2730,53 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return raw
         return [raw] if raw else []
 
+    #: Pages of 100 FILL activities read at most when looking for an external close: enough for
+    #: months of this platform's trading, and a hard stop so a lookup can never loop.
+    CLOSING_FILL_MAX_PAGES = 20
+
+    def get_closing_fill(self, symbol: str, side, quantity: float,
+                         since: Optional[datetime]) -> Optional[Tuple[float, datetime]]:
+        """The Alpaca FILL activities on ``side`` that closed ``quantity`` of ``symbol`` after
+        ``since``: ``(quantity-weighted average price, time of the last fill)``, or None.
+
+        Fills are taken oldest first from ``since`` (the transaction's open) until they cover
+        ``quantity``: the first closing fills after the entry are the ones that closed it, and
+        partial fills of one order arrive as separate activities. None when they never cover
+        the quantity, or when the activities cannot be read (logged at ERROR); a partly matched
+        close is not a price."""
+        from ba2_common.core.types import OrderDirection
+        sides = {"sell", "sell_short"} if side == OrderDirection.SELL else {"buy"}
+        params: Dict[str, Any] = {"direction": "asc", "page_size": 100}
+        if since is not None:
+            params["after"] = since.astimezone(timezone.utc).isoformat()
+        qty = value = 0.0
+        last_time = None
+        for _ in range(self.CLOSING_FILL_MAX_PAGES):
+            try:
+                page = self.client.get("/account/activities/FILL", params)
+            except Exception as e:  # noqa: BLE001 -- the REST client raises its own types
+                logger.error(f"[Account {self.id}] Could not read FILL activities for "
+                             f"{symbol}: {e}", exc_info=True)
+                return None
+            page = page if isinstance(page, list) else ([page] if page else [])
+            for act in page:
+                if act.get("symbol") != symbol or act.get("side") not in sides:
+                    continue
+                q = float(act["qty"])
+                take = min(q, quantity - qty)
+                qty += take
+                value += take * float(act["price"])
+                last_time = datetime.fromisoformat(
+                    str(act["transaction_time"]).replace("Z", "+00:00"))
+                if qty >= quantity - 1e-9:
+                    return value / qty, last_time
+            if len(page) < params["page_size"]:
+                return None
+            params["page_token"] = page[-1]["id"]
+        logger.error(f"[Account {self.id}] Closing fill for {symbol} not found within "
+                     f"{self.CLOSING_FILL_MAX_PAGES} pages of FILL activities after {since}")
+        return None
+
     def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
         """Deposits, withdrawals and dividends over a window, from the activities API.
 
