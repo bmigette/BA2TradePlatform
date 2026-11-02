@@ -109,3 +109,25 @@ def test_main_refuses_a_payload_with_no_interval(tool, capsys, monkeypatch, tmp_
     monkeypatch.setattr(sys, "argv", ["import_deploy_payload.py", path])
     assert tool.main() == 1
     assert "no execution_interval" in capsys.readouterr().out
+
+
+# THE LIVE DECISION TIME OF A DAILY-CLOCK DEPLOY (owner 2026-11-02). A daily-clock backtest decides
+# on D's close and fills at D+1's open: it has no intraday decision time, so the stored "09:30" is
+# nominal. Live fires at DAILY_CLOCK_LIVE_TIME instead, after the opening minutes when option
+# chains can be empty and spreads are widest (8082: APH/BHP empty chains at 09:31-09:34).
+def test_daily_clock_deploys_fire_at_the_post_open_live_time(tool):
+    assert tool.DAILY_CLOCK_LIVE_TIME == "09:45"
+    times, note = tool.live_decision_times(["09:30"], "1d")
+    assert times == ["09:45"]
+    assert "09:45" in note
+
+
+@pytest.mark.parametrize("interval", ["5m", "1h", "15min"])
+def test_intraday_clock_deploys_keep_the_backtest_decision_time(tool, interval):
+    times, _ = tool.live_decision_times(["09:40", "10:00"], interval)
+    assert times == ["09:40", "10:00"]
+
+
+def test_unknown_clock_decision_time_is_refused(tool):
+    with pytest.raises(ValueError):
+        tool.live_decision_times(["09:30"], "1wk")

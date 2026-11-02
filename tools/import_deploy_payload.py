@@ -227,6 +227,32 @@ def live_entry_days(days: dict, execution_interval, *, shift_daily_clock: bool =
                  f"shifted to the next trading weekday ({_SHIFT_DAILY_FLAG})")
 
 
+#: The live decision time of a DAILY-clock deploy (owner 2026-11-02). A daily-clock backtest decides
+#: on D's close and fills at D+1's open, so it has no intraday decision time and the stored "09:30"
+#: is nominal. Live fires after the opening minutes instead: at 09:30-09:34 option chains came back
+#: empty (APH 2026-10-15/20, BHP 2026-10-20 on 8082) and the opening spread is the day's widest,
+#: which a live entry pays at the touch. The same reason moved the stock grids to 09:45/10:00.
+DAILY_CLOCK_LIVE_TIME = "09:45"
+
+
+def live_decision_times(times, execution_interval) -> tuple[list, str]:
+    """The LIVE decision time(s) for a backtest's stored ``times``, and a one-line note.
+
+    INTRADAY clock: the backtest decided at those bars, so live fires at the same times (copied).
+    DAILY clock: no intraday time exists to copy; live fires at ``DAILY_CLOCK_LIVE_TIME``.
+    Any other clock is refused, like ``live_entry_days``."""
+    kind = _clock_kind(execution_interval)
+    if kind == "intraday":
+        return list(times), f"decision time(s) {list(times)} copied (intraday clock)"
+    if kind != "daily":
+        raise ValueError(
+            f"execution_interval {execution_interval!r} is neither intraday nor the 1d daily "
+            f"clock; the live decision time is not defined, refusing to copy the schedule")
+    return [DAILY_CLOCK_LIVE_TIME], (
+        f"daily clock: stored time(s) {list(times)} are nominal; live fires at "
+        f"{DAILY_CLOCK_LIVE_TIME} (DAILY_CLOCK_LIVE_TIME, after the opening minutes)")
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:]]
     shift_daily_clock = _SHIFT_DAILY_FLAG in argv
@@ -340,6 +366,11 @@ def main() -> int:
                 print(f"FATAL: {label}: {e}")
                 return 1
             print(f"entry weekday clock: {clock_note}")
+            _interval = entry["settings"].get("execution_interval")
+            live_times, time_note = live_decision_times(sched_pre["times"], _interval)
+            live_manage_times = (None if _manage_pre is None
+                                 else live_decision_times(_manage_pre, _interval)[0])
+            print(f"decision time: {time_note}")
 
         created = False
         if inst_id is None:
@@ -503,10 +534,11 @@ def main() -> int:
         if sched.get("days"):
             days = dict(live_days)   # clock-resolved above (identity on the intraday clock)
             # The deployment fires at the backtest's OWN decision time (a strategy optimized at
-            # 09:40 is deployed at 09:40): copied from the stored schedule, never defaulted. The
-            # check ran before any write (the entry-weekday block above).
-            times = list(sched["times"])
-            manage_times = list((entry["settings"].get("execution") or {}).get("manage_times") or times)
+            # 09:40 is deployed at 09:40): copied from the stored schedule, never defaulted. A
+            # DAILY-clock backtest has no intraday time, so it fires at DAILY_CLOCK_LIVE_TIME
+            # (``live_decision_times``). Resolved before any write (the entry-weekday block above).
+            times = list(live_times)
+            manage_times = list(live_manage_times or times)
             prior = (expert.get_setting_with_interface_default(
                 "execution_schedule_enter_market", log_warning=False) or {}).get("days") or {}
             expert_params["execution_schedule_enter_market"] = {
