@@ -235,6 +235,22 @@ def exploration_range_tokens(args, expert, strat) -> list:
     return []
 
 
+#: Flags whose VALUE says WHICH data a job reads, not how it trades: the market-condition snapshots, the
+#: exclusions, the screener store and the universe list. Under --wf-defer-last-test they are not part of
+#: the cell name (``mask_data_tokens``): January's rebuilt data must find phase A's jobs, and each job's
+#: row keeps the values it really ran on; the deferred tests read the current ones (``_rebase_run_data``).
+_DATA_FLAGS = ("--market-condition-manifest", "--exclude-symbols", "--screener-store", "--universe")
+
+
+def mask_data_tokens(cmd) -> list:
+    """``cmd`` with the value of every ``_DATA_FLAGS`` flag replaced by ``<data>`` (for the name digest)."""
+    out = list(cmd)
+    for k, tok in enumerate(out[:-1]):
+        if tok in _DATA_FLAGS:
+            out[k + 1] = "<data>"
+    return out
+
+
 def read_universe_file(path) -> str:
     """Comma-joined symbols of a symbol-per-line file; '#' comment lines and blank lines skipped (the
     same format as ``tools/run_senate_matrix.py``'s ``--universe-file``)."""
@@ -1127,7 +1143,9 @@ def main() -> int:
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
         if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or wf_tokens:
-            job_name = _job_name(name, cmd + wf_tokens)
+            ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
+                     else cmd)
+            job_name = _job_name(name, ident + wf_tokens)
             cmd[cmd.index("--name") + 1] = job_name
         if args.walk_forward:
             wf_specs.append(WFC.CellSpec(

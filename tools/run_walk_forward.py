@@ -201,17 +201,17 @@ class RealRunner:
         return WF.OosMetrics(backtest_id=row[0], total_return=row[6], max_drawdown=row[7],
                              trades=row[8], reused=reused)
 
-    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         # Standalone re-runs bypass the GA's logging suppression (10x+ slower), as in
         # tools/run_genome_once.py. The caller's level is restored afterwards.
         prior = logging.root.manager.disable
         logging.disable(logging.WARNING)
         try:
-            return self._run_oos(train_name, fold, picks, name_prefix, labels, parallel)
+            return self._run_oos(train_name, fold, picks, name_prefix, labels, parallel, data_args)
         finally:
             logging.disable(prior)
 
-    def _run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def _run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         P = self._tool()
         L = self._launcher
         from app.models.database import SessionLocal
@@ -249,12 +249,15 @@ class RealRunner:
             except P.Refused as e:
                 raise WF.WalkForwardError(str(e)) from e
         self._rerun_chunks(todo, parallel, L, opt_id, expert, name_prefix, labels, window,
-                           names, train_name, out)
+                           names, train_name, out, data_args=data_args)
         return out
 
     def _rerun_chunks(self, todo, parallel, L, opt_id, expert, name_prefix, labels, window,
-                      names, train_name, out):
+                      names, train_name, out, data_args=None):
+        """``data_args``: the CURRENT optimize command (two-phase walk-forward) -- its data choices
+        replace the train job's stored ones for the test (``_rebase_run_data``); None keeps them."""
         from app.models.database import SessionLocal
+        rebase = L._data_rebase_from_optimize_args(data_args) if data_args else None
         for i in range(0, len(todo), parallel):
             chunk = todo[i:i + parallel]
             ids: List[tuple] = []
@@ -262,7 +265,7 @@ class RealRunner:
                 opt_id, expert, n=len(chunk), parallel=parallel,
                 candidates=[(p.params, p.key, p.fitness) for p in chunk],
                 ranks=[p.rank for p in chunk], name_prefix=name_prefix, extra_labels=list(labels),
-                use_remote_workers=False, persisted_ids=ids, window=window)
+                use_remote_workers=False, persisted_ids=ids, window=window, data_rebase=rebase)
             db = SessionLocal()
             try:
                 got = {rank: bid for rank, bid in ids}

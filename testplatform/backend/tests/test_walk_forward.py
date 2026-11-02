@@ -182,7 +182,7 @@ class FakeRunner:
     def select(self, train_name, top_n):
         return self.is_picks[train_name][:top_n]
 
-    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         self.tested.append((train_name, fold.index, name_prefix, list(labels), parallel,
                             [p.rank for p in picks]))
         return {p.rank: self.oos[(fold.index, p.rank)] for p in picks}

@@ -145,7 +145,8 @@ def make_cell_plan(spec: CellSpec) -> Tuple[WF.Plan, List[WF.Fold]]:
         spec.name, folds, spec.optimize_args, spec.launcher, spec.top_n, spec.thresholds,
         test_parallel=spec.test_parallel, skip_train=False, only_fold=None, embargo_days=0,
         selection=spec.selection, seed_chain=True, fold_extra_args=_fold_extra_args(spec, folds),
-        require_test_years=spec.require_test_years, exclusive_return=spec.exclusive_return)
+        require_test_years=spec.require_test_years, exclusive_return=spec.exclusive_return,
+        rebase_test_data=spec.defer_last_test)
     return plan, folds
 
 

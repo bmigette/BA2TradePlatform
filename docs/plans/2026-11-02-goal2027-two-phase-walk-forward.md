@@ -45,22 +45,29 @@ the `senate` band only, and only Senate runs there. The walk-forward summary MER
 calls, so the wrapper's one-call-per-band loop (per-band spread) fills one grid summary; a rerun cell
 is replaced in place. `tools/run_senate_matrix.py` stays for the old lanes only.
 
-## Blocking for phase B (build in November, before January)
+## Phase B reads January's data (built)
 
-Found while integrating Senate; affects every cell, not only Senate:
+Two gaps found while integrating Senate, both affecting every cell, both fixed:
 
-1. **Job names carry data locations.** The name digest includes `--market-condition-manifest`
-   digests, `--exclude-symbols`, and for Senate the universe list. January's new manifests, exclusions
-   and the regenerated 2020-2026 Senate universe would give NEW names, so phase B would not find
-   phase A's jobs. Fix: under `--wf-defer-last-test`, digest these tokens as placeholders; the real
-   values stay on each job's row and are written into `cell.json` per phase.
-2. **The out-of-sample re-run uses the TRAIN job's stored config** (`_persist_top_backtests` reads
-   `optimization_config["backtest"]` and only replaces the window). wf3's 2026 test would therefore
-   run on phase A's manifests, universe and exclusions. Fix: a deferred fold's test takes those data
-   keys from the current command's config, everything else (genome, fixed settings, budgets) from the
-   train job, and records both in the report.
+1. **Job names no longer carry data locations under `--wf-defer-last-test`.** The name digest masks
+   the values of `--market-condition-manifest`, `--exclude-symbols`, `--screener-store` and `--universe`
+   (`mask_data_tokens`), so January's new manifests, exclusions, store path and regenerated Senate
+   universe still find phase A's jobs. Each job's row keeps the values it really ran on. Without the
+   flag, a data change still means a new job, as before.
+2. **Tests read the current command's data.** The out-of-sample re-run rebuilt its trial from the
+   TRAIN job's stored config, only replacing the window. Under the flag, every fold's test now passes
+   the current command to `_persist_top_backtests(data_rebase=)`, and `_rebase_run_data` replaces the
+   data choices on the windowed block: a static universe (Senate) becomes the current one, a screener
+   run keeps its stored superset and reads the current store, exclusions are the stored list PLUS the
+   current one (never lifted), and manifests become the current digests, validated for coverage and
+   window on the TEST window. The profile set must match the train job's; any mismatch is refused.
+   Phase A's own tests are unaffected (current data = train data).
 
-The refit is a fresh optimize from the current command, so it already uses the new data.
+The refit is a fresh optimize from the current command, so it already used the new data.
+
+**Rule for the boundary:** a train job must be COMPLETED before the January data replaces phase A's.
+A wf3 interrupted mid-GA and resumed on the new data would mix stores inside one GA; stop at a fold
+boundary (step 5 below) or delete that job and retrain it in January.
 
 ## Hosts
 

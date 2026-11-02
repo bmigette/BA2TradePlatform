@@ -75,7 +75,7 @@ class ChainRunner(FakeRunner):
         self.events.append(("train", name))
         super().run_train(cmd, name)
 
-    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         self.events.append(("oos", train_name))
         return super().run_oos(train_name, fold, picks, name_prefix, labels, parallel)
 

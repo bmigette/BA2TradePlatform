@@ -6347,6 +6347,113 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     return recorded
 
 
+def _data_rebase_from_optimize_args(tokens) -> dict:
+    """The DATA choices an ``optimize`` command line states, for ``_rebase_run_data``.
+
+    goal2027 two-phase walk-forward (docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md): a fold
+    trained in phase A is tested in phase B on the data of the command that runs the test. Returns
+    ``static_universe`` (the ``--universe`` list of a non-screener job, else None), ``screener_store``
+    (``--screener-store`` of a screener job, else None), ``manifests`` (``{profile: digest}`` from
+    ``--market-condition-manifest``, both spellings, else None) and ``exclude_symbols`` (the current
+    ``--exclude-symbols``; ``[]`` when the command excludes nothing). Pure: no launcher global is set.
+    """
+    tokens = list(tokens)
+
+    def value(flag):
+        return tokens[tokens.index(flag) + 1] if flag in tokens and tokens.index(flag) + 1 < len(tokens) else None
+
+    screener = "--screener" in tokens
+    universe = value("--universe")
+    profiles = [p.strip() for p in str(value("--market-condition-profile") or "").split(",")
+                if p.strip() and p.strip() != "none"]
+    raw = [t.strip() for t in str(value("--market-condition-manifest") or "").split(",") if t.strip()]
+    manifests = None
+    if raw:
+        if any("=" in t for t in raw):
+            if not all("=" in t for t in raw):
+                raise ValueError(f"--market-condition-manifest {raw!r} mixes bare digests with profile=digest pairs")
+            manifests = {t.partition("=")[0].strip(): t.partition("=")[2].strip() for t in raw}
+        elif len(raw) != len(profiles):
+            raise ValueError(f"{len(raw)} --market-condition-manifest digest(s) for profile(s) {profiles!r}")
+        else:
+            manifests = dict(zip(profiles, raw))
+    return {"static_universe": (None if screener or not universe
+                                else [s.strip().upper() for s in universe.split(",") if s.strip()]),
+            "screener_store": value("--screener-store") if screener else None,
+            "manifests": manifests,
+            "exclude_symbols": _resolve_exclude_symbols_arg(value("--exclude-symbols"))}
+
+
+def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forward test") -> dict:
+    """A COPY of a stored run block whose DATA choices are the current command's (``spec`` from
+    ``_data_rebase_from_optimize_args``); the genome, the expert settings, the gene lists and every
+    other key stay the stored run's. Applied by ``_persist_top_backtests(data_rebase=)`` AFTER the window
+    override, so the manifest checks run on the TEST window.
+
+    * universe: a static run takes the current ``--universe``; a screener run keeps its stored superset
+      (the train job's, as every out-of-sample re-run does) and reads the current ``--screener-store``;
+    * exclusions: the stored list PLUS the current one, removed from the universe (an exclusion is
+      never lifted by a rebase);
+    * market-condition manifests: the current digest per profile, validated for coverage and window
+      like a launch. The profile SET must be the train job's (it is part of the gene space).
+
+    Every mismatch is a ``ValueError``: a test on data the command did not state is not a test of it.
+    """
+    import copy as _copy
+    block = _copy.deepcopy(backtest_block)
+    screener = bool(block.get("screener_opt"))
+    if screener and spec.get("static_universe") is not None:
+        raise ValueError(f"{command}: the run is a screener run; a static --universe cannot replace its universe")
+    if not screener and spec.get("screener_store"):
+        raise ValueError(f"{command}: --screener-store given for a static-universe (non-screener) run")
+    if screener:
+        if spec.get("screener_store"):
+            block["screener_opt"]["store"] = spec["screener_store"]
+        universe = list(block.get("enabled_instruments") or [])
+    else:
+        if not spec.get("static_universe"):
+            raise ValueError(f"{command}: a static-universe run needs the current --universe to be tested on")
+        universe = list(spec["static_universe"])
+    # UNION with the stored list, never a replacement: the per-bar screener gate and FactorRanker read
+    # ``excluded_instruments`` directly, so dropping a stored exclusion could readmit a symbol.
+    excluded = list(block.get("excluded_instruments") or [])
+    excluded += [s for s in (spec.get("exclude_symbols") or []) if s.upper() not in {e.upper() for e in excluded}]
+    ex = {s.upper() for s in excluded}
+    kept = [s for s in universe if s.upper() not in ex]
+    if not kept:
+        raise ValueError(f"{command}: the current exclusions remove the entire universe ({len(universe)} symbols)")
+    block["enabled_instruments"] = kept
+    block["excluded_instruments"] = excluded
+
+    stored = dict(block.get("market_condition_manifests") or {})
+    current = dict(spec.get("manifests") or {})
+    if stored or current:
+        if not stored:
+            raise ValueError(f"{command}: manifest(s) {current!r} given for a run trained without market conditions")
+        if not current:
+            raise ValueError(f"{command}: the run was trained with market-condition manifests {stored!r}; the test "
+                             f"command states none (pass --market-condition-manifest for the new data)")
+        if set(current) != set(stored):
+            raise ValueError(f"{command}: profile(s) {sorted(current)} differ from the train job's {sorted(stored)}")
+        from types import SimpleNamespace
+
+        from app.services.backtest import seam_wiring as _sw
+        facts_by_profile = {}
+        for profile, digest in current.items():
+            facts = dict(_market_condition_manifest_facts(digest, profile))
+            reader = facts.pop("reader")
+            check = {"enabled_instruments": kept, "start_date": str(block["start_date"]),
+                     "end_date": str(block["end_date"]), "_ga_trial": True}
+            _sw.check_market_condition_coverage(check, SimpleNamespace(mapped_reader=reader))
+            _sw.check_market_condition_window(check, SimpleNamespace(mapped_reader=reader))
+            facts_by_profile[profile] = facts
+        block["market_condition_manifests"] = current
+        if isinstance(block.get("market_condition"), dict):
+            block["market_condition"]["manifests"] = dict(current)
+            block["market_condition"]["facts"] = facts_by_profile
+    return block
+
+
 def _apply_benchmark_regime(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
     """Record the SPY regime gate on a run's backtest block, or do nothing.
 
@@ -8632,7 +8739,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                             extra_labels: Optional[List[str]] = None,
                             use_remote_workers: bool = True,
                             persisted_ids: Optional[List[tuple]] = None,
-                            window: Optional[tuple] = None) -> int:
+                            window: Optional[tuple] = None,
+                            data_rebase: Optional[dict] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
@@ -8656,6 +8764,9 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         NOT an optimize path -- ``_assert_option_window_excludes_holdout`` guards only the
         optimize CLI handlers and is deliberately not consulted here (a re-run is a single
         measurement, not a search).
+      * ``data_rebase`` -- the current command's data choices (``_data_rebase_from_optimize_args``),
+        applied by ``_rebase_run_data`` after ``window``: a phase-A train job tested in phase B on the
+        new data (goal2027 two-phase walk-forward). None keeps the stored data.
 
     The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
     INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
@@ -8689,6 +8800,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         bt_block = dict(cfg["backtest"])
         if window is not None:
             bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
+        if data_rebase is not None:
+            bt_block = _rebase_run_data(bt_block, data_rebase)
         # Apply the SAME screener hoisted state the GA scored each individual with, so the persisted
         # top-N are the actual optimized SCREENER runs (universe_source=screener + the per-individual
         # screener genes) — not static-universe runs. Without this the persisted top-N silently

@@ -41,7 +41,7 @@ class Fake(FakeRunner):
     def select(self, train_name, top_n):
         return [_pick(1), _pick(2)][:top_n]
 
-    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         self.tested.append((train_name, fold.index))
         return {p.rank: self.oos_by_fold[fold.index - 1] for p in picks}
 
@@ -405,6 +405,52 @@ def test_one_grid_summary_across_band_invocations(senate, monkeypatch):
     assert M.main() == 0
     again = json.loads(open(os.path.join(senate.report, "summary.json"), encoding="utf-8").read())
     assert [c["cell"] for c in again["cells"]] == names
+
+
+_MC = ["--market-condition-profile", "ohlcv-v1"]
+
+
+@pytest.mark.parametrize("phase_a,january", [
+    (_MC + ["--market-condition-manifest", "aaa"], _MC + ["--market-condition-manifest", "bbb"]),
+    (["--exclude-symbols", "XX"], ["--exclude-symbols", "XX,YY"]),
+    (["--store", "C:/old/metric_store"], ["--store", "C:/new/metric_store"]),
+])
+def test_under_defer_the_january_data_keeps_phase_a_job_names(env, monkeypatch, phase_a, january):
+    a = _cell_name(env, monkeypatch, "--wf-defer-last-test", "--wf-data-end", "2025-12-31", *phase_a)
+    assert _cell_name(env, monkeypatch, "--wf-defer-last-test", *january) == a
+
+
+def test_without_defer_new_data_still_means_a_new_job(env, monkeypatch):
+    a = _cell_name(env, monkeypatch, *_MC, "--market-condition-manifest", "aaa")
+    assert _cell_name(env, monkeypatch, *_MC, "--market-condition-manifest", "bbb") != a
+
+
+def test_under_defer_a_regenerated_senate_universe_keeps_the_job_names(senate, monkeypatch):
+    def name(*extra):
+        senate.fake.order.clear()
+        senate.fake.completed.clear()
+        monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate", "--wf-defer-last-test", *extra))
+        assert M.main() == 0
+        return sorted({n.rsplit("-", 1)[0] for n in senate.fake.order})
+    a = name("--wf-data-end", "2025-12-31")
+    with open(senate.uni, "a", encoding="utf-8") as fh:
+        fh.write("NEW2026\n")
+    assert name() == a
+
+
+def test_under_defer_the_tests_get_the_current_command(env, monkeypatch):
+    seen = []
+
+    class Rec(Fake):
+        def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
+            seen.append(data_args)
+            return super().run_oos(train_name, fold, picks, name_prefix, labels, parallel)
+    rec = Rec()
+    monkeypatch.setattr(M, "_make_wf_runner", lambda args: rec)
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--exclude-symbols", "ZZ",
+                                           experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    assert len(seen) == 3 and all(_flag(a, "--exclude-symbols") == "ZZ" for a in seen)
 
 
 def test_by_default_a_cell_that_cannot_pass_stops_early(env, monkeypatch):

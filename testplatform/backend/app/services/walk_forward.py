@@ -470,6 +470,7 @@ class Plan:
     fold_extra_args: Dict[int, List[str]] = field(default_factory=dict)   # per-fold optimize args
     require_test_years: Tuple[int, ...] = ()   # --pass-require-fold: these folds must pass
     exclusive_return: bool = False      # --pass-min-oos-return-exclusive: return must be ABOVE the threshold
+    rebase_test_data: bool = False      # out-of-sample tests read the CURRENT command's data (two-phase)
 
     def previous_fold(self, fold: Fold) -> Optional[Fold]:
         before = [f for f in self.folds if f.index < fold.index]
@@ -494,7 +495,8 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
               top_n: int, thresholds: Thresholds, *, test_parallel: int, skip_train: bool,
               only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any],
               seed_chain: bool = False, fold_extra_args: Optional[Dict[int, List[str]]] = None,
-              require_test_years: Sequence[int] = (), exclusive_return: bool = False) -> Plan:
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False,
+              rebase_test_data: bool = False) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
         raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
@@ -513,7 +515,7 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     plan = Plan(prefix, list(folds), list(optimize_args), launcher, top_n, thresholds,
                 test_parallel, skip_train, only_fold, embargo_days, dict(selection),
                 seed_chain, {k: list(v) for k, v in (fold_extra_args or {}).items()},
-                tuple(sorted(set(require_test_years))), exclusive_return)
+                tuple(sorted(set(require_test_years))), exclusive_return, rebase_test_data)
     plan.selected_folds()          # refuses an unknown --only-fold
     return plan
 
@@ -598,8 +600,11 @@ def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = p
         log(f"fold {f.index}: only {len(picks)} behaviour-distinct genome(s) (< --top-n "
             f"{plan.top_n})")
     log(f"fold {f.index}: testing {len(picks)} genome(s) on {f.test_start}..{f.test_end}")
+    # Two-phase year: the test reads the data the CURRENT command states (manifests, exclusions, a
+    # static universe), not the train job's stored choice -- see _rebase_run_data in the launcher.
+    extra = {"data_args": list(plan.optimize_args)} if plan.rebase_test_data else {}
     oos = runner.run_oos(name, f, picks, oos_name_prefix(f.index), oos_labels(f.index),
-                         plan.test_parallel)
+                         plan.test_parallel, **extra)
     out = []
     for p in picks:
         if p.rank not in oos:
