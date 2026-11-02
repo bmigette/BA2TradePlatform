@@ -20,11 +20,13 @@
 #      chains for the cells phase A did not reach. --wf-defer-last-test is passed in BOTH phases:
 #      it is part of the cell names, and it makes the tests read the current data.
 #
-# HOSTS: the master runs on THIS PC from a DEDICATED checkout + venv (`setup`), never the main
-# clone (the live apps import it). No local GA slots by default (PARALLEL=0: 8080/8081/8082 run
-# here). Remote workers are a setting: WORKERS=remote227 (default), or remote150, or both
-# ("remote227,remote150"); change it between steps (stop, set, start). Out-of-sample re-runs run
-# HERE, one at a time (~14 GB each, 20 GB free floor).
+# HOSTS (owner 2026-11-02): the master runs on remote227 (Linux), away from Windows Update restarts;
+# the script also runs on Windows (Git Bash). Either way from a DEDICATED checkout + venv (`setup`):
+# never the owner PC's main clone (the live apps import it), never the ba2-worker service's tree (a
+# worker re-sync git-pulls it); FORBIDDEN_CHECKOUTS adds more. Local GA slots: PARALLEL (default 0).
+# Remote workers are a setting: WORKERS=remote227 (default) or a comma list; change it between
+# steps (stop, set, start). Out-of-sample re-runs run on the MASTER, one at a time (~14 GB each,
+# 20 GB free floor). Results are copied back to the owner PC afterwards.
 #
 # STEPS (design 4.2 run order; STEPS="..." runs a subset, in the order given):
 #   fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small
@@ -44,18 +46,19 @@
 set -u
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd -W 2>/dev/null || pwd)"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) IS_WIN=1 ;; *) IS_WIN=0 ;; esac
 
 CMD="${1:-}"; shift || true
 
 GRID_LOG="${GRID_LOG:-grid_goal2027.log}"
 VENV="${VENV:-$HOME/ba2-venvs/goal2027}"
-PY="${PY:-$VENV/Scripts/python.exe}"
+if [ "$IS_WIN" = "1" ]; then PY="${PY:-$VENV/Scripts/python.exe}"; else PY="${PY:-$VENV/bin/python}"; fi
 DRIVER=tools/run_screener_capband_matrix.py
 WF_REPORT_DIR="${WF_REPORT_DIR:-${REPO_ROOT}/reports/goal2027_wf}"
 TRAIN_START="${TRAIN_START:-2020-01-01}"
 FITNESS="${FITNESS:-consistent_annual_return}"
 INTERVAL="${INTERVAL:-5min}"
-STORE="${STORE:-$HOME/Documents/ba2/common/cache/screener/metric_store}"
+STORE="${STORE:-}"     # default: <ba2_common CACHE_FOLDER>/screener/metric_store (resolve_store)
 PLAN_FILE="${PLAN_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/strategy_plan.json}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/excluded_symbols.txt}"
 SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/senate_universe_2020_2025.txt}"
@@ -89,16 +92,50 @@ skip_all_but() { local out=""; for e in $ALL_EXPERTS; do [ "$e" = "$1" ] || out=
 data_end() { case "${PHASE:-}" in A) echo 2025-12-31 ;; B) echo "" ;; esac; }
 
 # ------------------------------------------------------------------------------------------- setup
-cmd_setup() {
-  if [ "$REPO_ROOT" = "$(cd "$HOME/Documents/dev/BA2TradePlatform" 2>/dev/null && (pwd -W 2>/dev/null || pwd))" ]; then
-    echo "FATAL: this is the MAIN clone (the live apps import it). Create a run checkout first:" >&2
-    echo "  git -C ~/Documents/dev/BA2TradePlatform worktree add --detach ../BA2-goal2027-run <ref>" >&2
-    exit 1
+# Checkouts the master must never run from: the owner PC's main clone (the live apps import it), the
+# ba2-worker service's tree (a re-sync git-pulls it), plus FORBIDDEN_CHECKOUTS (space-separated).
+check_checkout() {
+  local here bad="${FORBIDDEN_CHECKOUTS:-}" d wd
+  here="$(cd "$REPO_ROOT" && pwd -P)"
+  [ "$IS_WIN" = "1" ] && bad="$bad $HOME/Documents/dev/BA2TradePlatform"
+  if command -v systemctl >/dev/null 2>&1; then
+    wd="$(systemctl show -p WorkingDirectory --value ba2-worker 2>/dev/null)"
+    [ -n "$wd" ] && bad="$bad $wd"
   fi
-  [ -x "$PY" ] && { echo "venv exists: $VENV"; } || uv venv "$VENV" --python 3.12 || exit 1
-  uv pip install -p "$PY" -e packages/common -e packages/providers -e packages/experts -e testplatform \
-      -r testplatform/backend/requirements.txt || exit 1
+  for d in $bad; do
+    [ -d "$d" ] || continue
+    if [ "$(cd "$d" && pwd -P)" = "$here" ]; then
+      echo "FATAL: $REPO_ROOT is a forbidden checkout for the master ($d: live apps or ba2-worker run from it)." >&2
+      echo "  Create a run checkout: git worktree add --detach ../BA2-goal2027-run <ref>" >&2
+      return 1
+    fi
+  done
+}
+
+cmd_setup() {
+  check_checkout || exit 1
+  local inst=(-e packages/common -e packages/providers -e packages/experts -e testplatform
+              -r testplatform/backend/requirements.txt)
+  if [ -x "$PY" ]; then
+    echo "venv exists: $VENV"
+  elif command -v uv >/dev/null 2>&1; then
+    uv venv "$VENV" --python 3.12 || exit 1
+  else
+    python3.12 -m venv "$VENV" || exit 1
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install -p "$PY" "${inst[@]}" || exit 1
+  else
+    "$PY" -m pip install "${inst[@]}" || exit 1
+  fi
   check_venv && echo "setup OK: $VENV -> $REPO_ROOT"
+}
+
+# The metric store under the venv's own ba2_common cache root (BA2_HOME / CACHE_FOLDER), unless STORE is set.
+resolve_store() {
+  [ -n "$STORE" ] && return 0
+  STORE="$("$PY" -c 'import os; from ba2_common.config import CACHE_FOLDER; print(os.path.join(CACHE_FOLDER, "screener", "metric_store"))')" || return 1
+  echo "metric store: $STORE"
 }
 
 # The master must import THIS checkout's code: a venv pointing at another clone would run code the
@@ -122,7 +159,9 @@ preflight() {
   local end="$1"
   case "${PHASE:-}" in A|B) ;; *) echo "FATAL: PHASE must be A (Nov-Dec, data to 2025) or B (January, data to 2026)" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
+  check_checkout || exit 1
   check_venv || exit 1
+  resolve_store || exit 1
   [ -n "${MC_OHLCV:-}" ] && [ -n "${MC_TA:-}" ] || {
     echo "FATAL: MC_OHLCV and MC_TA (market-condition manifest digests covering the cap bands to the data end)" >&2
     echo "       are required; there is no default, since each phase has its own data." >&2; exit 1; }
@@ -236,6 +275,33 @@ cmd_run() {                        # $1 = "dry" for a dry run
 # the next step). Patterns are scoped to this grid: the wrapper script, drivers carrying the goal2027
 # suffix, and processes of the goal2027 venv. The live apps (ba2-trade venv) never match.
 ps_tiers() {                       # $1 = 1 to kill, 0 to list
+  if [ "$IS_WIN" = "1" ]; then ps_tiers_win "$1"; else ps_tiers_linux "$1"; fi
+}
+
+# Linux (remote227 master): the same tiers from `ps`. Fork children of a GA pool carry their parent's
+# command line, so the venv tier covers them; a killed parent's reparented children still match it.
+ps_tiers_linux() {
+  local kill="$1" venv_abs snap n pat pids
+  venv_abs="$(cd "$VENV" 2>/dev/null && pwd -P || echo "$VENV")"
+  snap="$(ps -eo pid=,args= | awk -v me="$$" '$1 != me')"
+  for n in 1 2 3; do
+    case $n in
+      1) pat='bash .*tools/grid_goal2027\.sh run( |$)'; label="1. wrapper" ;;
+      2) pat='run_screener_capband_matrix.*-goal2027'; label="2. matrix driver" ;;
+      3) pat="$venv_abs/"; label="3. optimize / re-runs (goal2027 venv)" ;;
+    esac
+    if [ $n = 3 ]; then pids="$(printf '%s\n' "$snap" | grep -F -- "$pat" | awk '{print $1}')"
+    else pids="$(printf '%s\n' "$snap" | grep -E -- "$pat" | awk '{print $1}')"; fi
+    if [ -z "$pids" ]; then echo "$label: none"; continue; fi
+    echo "$label: $(echo "$pids" | wc -l) process(es)"
+    for p in $pids; do
+      echo "    [$p] $(printf '%s\n' "$snap" | awk -v p="$p" '$1 == p {sub(/^ *[0-9]+ /, ""); print substr($0, 1, 90)}')"
+    done
+    if [ "$kill" = "1" ]; then kill $pids 2>/dev/null; sleep 3; kill -9 $pids 2>/dev/null; fi
+  done
+}
+
+ps_tiers_win() {
   local venv_win; venv_win="$(cd "$VENV" 2>/dev/null && pwd -W 2>/dev/null || echo "$VENV")"
   powershell -NoProfile -Command "
 \$kill = $1
@@ -292,7 +358,12 @@ case "$CMD" in
   dry-run) cmd_run dry ;;
   start)
     preflight "$(data_end)" || exit 1      # refuse here, in the operator's terminal, not in the log
-    GRID_SKIP_PREFLIGHT=1 nohup bash tools/grid_goal2027.sh run >/dev/null 2>&1 &
+    # setsid on Linux: the run must outlive the ssh session that started it (remote227 master).
+    if [ "$IS_WIN" = "1" ]; then
+      GRID_SKIP_PREFLIGHT=1 nohup bash tools/grid_goal2027.sh run >/dev/null 2>&1 &
+    else
+      GRID_SKIP_PREFLIGHT=1 setsid nohup bash tools/grid_goal2027.sh run >/dev/null 2>&1 < /dev/null &
+    fi
     echo "started (pid $!); log: $GRID_LOG   status: bash tools/grid_goal2027.sh status" ;;
   stop)    cmd_stop "$@" ;;
   status)  cmd_status "$@" ;;
