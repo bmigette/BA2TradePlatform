@@ -98,6 +98,12 @@ _PLACEHOLDER_UNIVERSE = ("AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD
 # settle lower than the truth. That biases one gene, not the run.
 _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "DeterministicScorer"]
 _RANKER = "FactorRanker"
+# goal2027 runs Senate INSIDE the grid (owner 2026-11-02: no separate Senate grid). Its cells live on
+# the pseudo-band ``senate``: a STATIC disclosure-derived universe (--senate-universe-file), not a
+# cap-band screen -- congressional trades are too sparse per symbol to split by cap. Only Senate runs
+# there, and Senate runs nowhere else. Every other flag (genes, budgets, walk-forward) is the grid's.
+_SENATE = "FMPSenateTraderWeight"
+SENATE_BAND = "senate"
 # Experts with no usable data in the large-cap band (skipped on `large` unless --include-no-data).
 _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # Strategies restricted to experts producing a REAL, updating analyst price target. S4 (which
@@ -229,6 +235,23 @@ def exploration_range_tokens(args, expert, strat) -> list:
     return []
 
 
+def read_universe_file(path) -> str:
+    """Comma-joined symbols of a symbol-per-line file; '#' comment lines and blank lines skipped (the
+    same format as ``tools/run_senate_matrix.py``'s ``--universe-file``)."""
+    with open(path, encoding="utf-8") as f:
+        return ",".join(s.strip() for s in f.read().splitlines()
+                        if s.strip() and not s.strip().startswith("#"))
+
+
+def universe_tokens(band, store, senate_universe) -> list:
+    """How a job states its universe: the senate band's static symbol list, or the screener (the
+    placeholder universe the screener replaces, the store and the band's screen)."""
+    if band == SENATE_BAND:
+        return ["--universe", senate_universe]
+    return ["--universe", _PLACEHOLDER_UNIVERSE, "--screener", "--screener-store", store,
+            *band_screener_tokens(band)]
+
+
 def band_screener_tokens(band) -> list:
     """The launcher tokens that state a band's screen: ``--screener-cap-band <band>`` for the searched cap bands (the
     historical argv, unchanged), ``--screen-preset <band>`` for a fixed-screen band (goal2027 ``xl``). The two are
@@ -342,6 +365,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
     def _eligible(band, expert):
         if expert in skip_experts:
             return False
+        if (band == SENATE_BAND) != (expert == _SENATE):
+            return False   # the senate band runs Senate only, and Senate runs on it only
         # ``xl`` (a fixed screen of cap >= $10B) is a large-cap universe too: the same experts have no data there.
         if expert in _NO_LARGE_CAP and (band == "large" or band in SCREEN_PRESET_BANDS) and not include_no_data:
             return False
@@ -359,8 +384,18 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
                 # FMPRating row can never be read as, or resumed as, a full-window "goal2020" run.
                 yield (f"scr-{band}-FMPRating-{s}{name_suffix}{_window_tag('FMPRating')}",
                        "FMPRating", s, band)
-    # 2) then the remaining classic experts + FactorRanker, band by band.
+    # 2) then the remaining classic experts + FactorRanker, band by band (Senate on its own band).
     for band in bands:
+        if band == SENATE_BAND:
+            if _eligible(band, _SENATE):
+                if strategy_plan is not None and _SENATE not in strategy_plan:
+                    raise SystemExit(f"--bands {SENATE_BAND}: the --strategy-plan has no "
+                                     f"{_SENATE} entry")
+                for s in _strategies_for(_SENATE):
+                    if EXPERT_ONLY_STRATEGIES.get(s, _SENATE) != _SENATE:
+                        continue
+                    yield (f"sen-{s}{name_suffix}", _SENATE, s, band)
+            continue
         for expert in _CLASSIC:
             if expert == "FMPRating" or not _eligible(band, expert):
                 continue
@@ -391,7 +426,10 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 # round guess), and briefly {7, 22, 45} -- which was the p90 read as if it were absolute and so
 # actually stressed to median+p90.
 #: ``xl`` (fixed screen, cap >= $10B) takes the large-cap widening: same cap range as ``large``.
-_STRESS_BAND_DEFAULTS = {"large": 4.0, "mid": 13.0, "small": 28.0, "xl": 4.0}
+_STRESS_BAND_DEFAULTS = {"large": 4.0, "mid": 13.0, "small": 28.0, "xl": 4.0,
+                         # Senate's universe spans every cap band: one blended value, the mid widening
+                         # (its baseline spread was the mid median, 9 bps, in the atr27 Senate lane).
+                         SENATE_BAND: 13.0}
 
 #: Bands that are a FIXED screen preset (``--screen-preset``), not a searched cap band (``--screener-cap-band``).
 SCREEN_PRESET_BANDS = frozenset({"xl"})
@@ -510,7 +548,14 @@ def _wf_import():
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--bands", default="large,mid,small")
+    ap.add_argument("--bands", default="large,mid,small",
+                    help=f"Comma list of cap bands, fixed-screen bands (xl) and '{SENATE_BAND}' "
+                         f"(the {_SENATE} cells, on --senate-universe-file).")
+    ap.add_argument("--senate-universe-file", default=None,
+                    help=f"Symbol-per-line universe of the '{SENATE_BAND}' band ('#' lines and blank "
+                         f"lines skipped), e.g. docs/strategy_research/atr_grid/"
+                         f"senate_universe_2020_2025.txt. Required with --bands {SENATE_BAND}, "
+                         f"refused without it.")
     ap.add_argument("--strategies", default="S1,S2,S3")  # S4 merged into S1
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--end", default="2026-01-01")
@@ -863,6 +908,15 @@ def main() -> int:
     print(_dt_header, flush=True)
 
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    senate_universe = None
+    if SENATE_BAND in bands:
+        if not args.senate_universe_file:
+            ap.error(f"--bands {SENATE_BAND} requires --senate-universe-file")
+        senate_universe = read_universe_file(args.senate_universe_file)
+        if not senate_universe:
+            ap.error(f"--senate-universe-file {args.senate_universe_file}: no symbols")
+    elif args.senate_universe_file:
+        ap.error(f"--senate-universe-file needs '{SENATE_BAND}' in --bands")
     stress_by_band = _parse_stress_spread(args.stress_spread_bps)
     if stress_by_band:
         print(f"spread stress (bps, per band): "
@@ -889,7 +943,7 @@ def main() -> int:
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
-          f"{sum(1 for j in jobs if with_universe_rule_name(j[0], simulated=j[2] is not None) in done)} already completed"
+          f"{sum(1 for j in jobs if (j[0] if j[3] == SENATE_BAND else with_universe_rule_name(j[0], simulated=j[2] is not None)) in done)} already completed"
           f" (by base name + universe-rule token; digest/time-gene-suffixed names are checked per job).")
     # --dry-run walks the SAME loop below and stops short of launching: a job's final name can
     # carry a digest of its resolved argv (market-condition flags), which only exists once the
@@ -910,7 +964,8 @@ def main() -> int:
         # The static-universe RULE is part of the job's identity (every job here is a --screener job):
         # a name without the token was launched under the old cap-ranked top-50 list and must never be
         # skipped as "completed" or resumed as this job.
-        name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
+        if band != SENATE_BAND:   # Senate is a static-universe job: no screener rule or gate
+            name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
         # The OHLCV history is part of the job's identity too (an alpaca job never resumes an fmp one).
         name = with_history_source_name(name, args.ohlcv_history_source)
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
@@ -950,15 +1005,17 @@ def main() -> int:
             # whichever key is absent.
             population = budget.get("population", population)
             generations = budget.get("generations", generations)
-        cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
-               "--screener", "--screener-store", args.store, *band_screener_tokens(band),
+        cmd = [exe, "optimize", "--expert", expert,
+               *universe_tokens(band, args.store, senate_universe),
                # Per-expert floor, not the raw --start: see _EXPERT_MIN_START. An expert whose
                # signal data does not reach --start would otherwise burn the early years as dead
                # window and bucket empty calendar years into the consistency fitness.
                "--start", job_start, "--end", job_end, "--fitness", args.fitness,
                "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
                "--population", str(population),
-               "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
+               "--generations", str(generations),
+               # (screener jobs only; the token ORDER is unchanged so existing name digests hold)
+               *([] if band == SENATE_BAND else ["--screener-cadence-days", str(args.cadence_days)]),
                # --run-schedule-day now only seeds the STATIC fallback (used as a base for the
                # scan time-of-day, and for any bypass expert that skips the per-day genes
                # entirely) -- every non-bypass strategy (S1-S7) searches WHICH day(s) itself via
@@ -1029,7 +1086,10 @@ def main() -> int:
         # skipped above: it cannot carry the gene.)
         dt_tokens = decision_times_tokens(job_dt_times, split=decision_times_split(args.decision_times))
         cmd += dt_tokens
-        unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached else []
+        unc_tokens = ["--screener-exclude-uncached"] if args.exclude_uncached and band != SENATE_BAND else []
+        if args.exclude_uncached and band == SENATE_BAND:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: --exclude-uncached is a screener flag, not applied "
+                  f"to the static Senate universe", flush=True)
         cmd += unc_tokens
         # --search-sizing-mode: appended last (same reasoning); digest on its own. A bypass job is
         # not given the gene (the launcher would refuse it).
@@ -1090,7 +1150,9 @@ def main() -> int:
                 raise SystemExit(f"--walk-forward {job_name}: {e}")
             continue
         if args.dry_run:
-            if band in SCREEN_PRESET_BANDS:
+            if band == SENATE_BAND:
+                _uni_note = f"static Senate universe {len(senate_universe.split(','))} symbols"
+            elif band in SCREEN_PRESET_BANDS:
                 _uni_note = f"fixed screen preset {band} (see the launcher's --print-universe for the size)"
             else:
                 _uni_note = screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)

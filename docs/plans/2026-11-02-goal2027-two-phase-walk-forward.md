@@ -1,6 +1,6 @@
 # goal2027: two-phase walk-forward (2020-2025 now, 2026 in January)
 
-*Owner request 2026-11-02. Amends [2026-10-25-goal2027-grid-design.md](2026-10-25-goal2027-grid-design.md)
+*Owner requests 2026-11-02 (two phases; Senate inside the grid). Amends [2026-10-25-goal2027-grid-design.md](2026-10-25-goal2027-grid-design.md)
 sections 1.2, 2.5-2.7 and 4. Status: driver change built on `feat/goal2027-wf-defer`; wrapper not built.*
 
 ## Why it splits cleanly
@@ -34,6 +34,34 @@ refit in January.
 - Code: `wf_chain.build_cell_folds(defer_last_test=)`, `deferred_fold`, `cannot_pass`;
   `walk_forward.train_fold` (the train half of `run_fold`).
 
+## Senate is a band of the grid (built)
+
+Owner 2026-11-02: no separate Senate grid. `run_screener_capband_matrix.py --bands senate
+--senate-universe-file <file>` runs the `FMPSenateTraderWeight` cells (strategy plan: S1, S3, S5, S6)
+on the static disclosure-derived universe, with every grid flag (genes, budgets, walk-forward,
+deferral) exactly as the other cells. Jobs are named `sen-<S><suffix>`; no screener tokens, no
+`-sup1`/`-lds2`; the scalar stress reaches it (default widening 13 bps, the mid value). Senate runs on
+the `senate` band only, and only Senate runs there. The walk-forward summary MERGES across driver
+calls, so the wrapper's one-call-per-band loop (per-band spread) fills one grid summary; a rerun cell
+is replaced in place. `tools/run_senate_matrix.py` stays for the old lanes only.
+
+## Blocking for phase B (build in November, before January)
+
+Found while integrating Senate; affects every cell, not only Senate:
+
+1. **Job names carry data locations.** The name digest includes `--market-condition-manifest`
+   digests, `--exclude-symbols`, and for Senate the universe list. January's new manifests, exclusions
+   and the regenerated 2020-2026 Senate universe would give NEW names, so phase B would not find
+   phase A's jobs. Fix: under `--wf-defer-last-test`, digest these tokens as placeholders; the real
+   values stay on each job's row and are written into `cell.json` per phase.
+2. **The out-of-sample re-run uses the TRAIN job's stored config** (`_persist_top_backtests` reads
+   `optimization_config["backtest"]` and only replaces the window). wf3's 2026 test would therefore
+   run on phase A's manifests, universe and exclusions. Fix: a deferred fold's test takes those data
+   keys from the current command's config, everything else (genome, fixed settings, budgets) from the
+   train job, and records both in the report.
+
+The refit is a fresh optimize from the current command, so it already uses the new data.
+
 ## Hosts
 
 - **Master on this PC** (owner 2026-11-02), as the atr27 lane: `PARALLEL=0` (prod 8081, dev 8080 and
@@ -57,7 +85,7 @@ refit in January.
 6. **January 1-9:** design section 3 data steps (re-download about 4 days, build, verify, metric store,
    manifests, Senate shards, prewarm, push to the workers).
 7. **About January 10, phase B:** rerun every phase A cell without `--wf-data-end`, then full chains for
-   the cells not reached, Senate last.
+   the cells not reached, Senate (the `senate` band) last.
 
 ## Accepted trade-offs and rules
 
@@ -66,8 +94,8 @@ refit in January.
   genomes are parameters, so this is accepted rather than retraining wf3 in January.
 - **Code freeze per cell:** a GA-affecting change (minimum raise) lands only between cells. If one lands
   between phase A and B, the 2026 tests run on newer code than the training; record it in the report.
-- **Senate has no walk-forward mode** (`tools/run_senate_matrix.py`): build it before Senate's turn
-  (January).
+- **Senate cells need Senate-covering market-condition manifests:** build the January manifests over
+  the band union PLUS the Senate universe, so one manifest pair serves every cell.
 
 ## Open for later
 

@@ -311,6 +311,102 @@ def test_run_all_folds_keeps_running_a_cell_that_cannot_pass(env, monkeypatch):
     assert [n[-4:] for n in env.fake.order] == ["-wf1", "-wf2", "-wf3"]
 
 
+@pytest.fixture
+def senate(env, tmp_path):
+    plan = tmp_path / "plan_sen.json"
+    plan.write_text(json.dumps({"experts": {**PLAN["experts"], "FMPSenateTraderWeight": ["S1", "S3"]}}),
+                    encoding="utf-8")
+    uni = tmp_path / "senate_universe.txt"
+    uni.write_text("# provenance header\nAAPL\nNVDA\n\nXOM\n", encoding="utf-8")
+    env.plan, env.uni = str(plan), str(uni)
+    return env
+
+
+def _sen_argv(env, bands, *extra, experts=("DeterministicScorer",)):
+    argv = _argv(env, *extra, experts=experts)
+    argv[argv.index("--bands") + 1] = bands
+    return argv + ["--senate-universe-file", env.uni]
+
+
+def test_senate_band_runs_senate_cells_on_its_static_universe(senate, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate"))
+    assert M.main() == 0
+    cells = sorted({n.rsplit("-", 1)[0] for n in senate.fake.order})
+    assert [c.split("-goal2027")[0] for c in cells] == ["sen-S1", "sen-S3"]
+    c = _cmds(senate.fake)
+    for name, cmd in c.items():
+        assert _flag(cmd, "--expert") == "FMPSenateTraderWeight"
+        assert _flag(cmd, "--universe") == "AAPL,NVDA,XOM"
+        for screener_flag in ("--screener", "--screener-store", "--screener-cap-band",
+                              "--screen-preset", "--screener-cadence-days"):
+            assert screener_flag not in cmd, (name, screener_flag)
+        assert "-sup1" not in name and "-lds2" not in name     # no screener universe-rule tokens
+    assert {_flag(cmd, "--strategy") for cmd in c.values()} == {"S1", "S3"}
+
+
+def test_senate_and_cap_bands_mix_in_one_run_without_crossing(senate, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "mid,senate",
+                                               experts=("DeterministicScorer", "FactorRanker")))
+    assert M.main() == 0
+    experts_by_band = {}
+    for cmd in _cmds(senate.fake).values():
+        band = "senate" if "--screener" not in cmd else _flag(cmd, "--screener-cap-band")
+        experts_by_band.setdefault(band, set()).add(_flag(cmd, "--expert"))
+    assert experts_by_band == {"mid": {"DeterministicScorer", "FactorRanker"},
+                               "senate": {"FMPSenateTraderWeight"}}
+
+
+def test_scalar_stress_reaches_the_senate_band(senate, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate", "--stress-spread-bps", "13.5"))
+    assert M.main() == 0
+    assert {_flag(cmd, "--stress-spread-bps") for cmd in _cmds(senate.fake).values()} == {"13.5"}
+
+
+def test_exclude_uncached_is_not_forwarded_to_senate(senate, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate", "--exclude-uncached"))
+    assert M.main() == 0
+    assert all("--screener-exclude-uncached" not in cmd for cmd in _cmds(senate.fake).values())
+
+
+def test_senate_band_without_a_universe_file_is_refused(senate, monkeypatch):
+    argv = _sen_argv(senate, "senate")
+    monkeypatch.setattr(sys, "argv", argv[:-2])
+    with pytest.raises(SystemExit):
+        M.main()
+
+
+def test_universe_file_without_the_senate_band_is_refused(senate, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "mid"))
+    with pytest.raises(SystemExit):
+        M.main()
+
+
+def test_senate_band_with_a_plan_lacking_senate_is_refused(senate, monkeypatch):
+    senate.plan = env_plan = senate.plan.replace("plan_sen", "plan_nosen")
+    with open(env_plan, "w", encoding="utf-8") as fh:
+        json.dump(PLAN, fh)
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate"))
+    with pytest.raises(SystemExit, match="FMPSenateTraderWeight"):
+        M.main()
+
+
+def test_one_grid_summary_across_band_invocations(senate, monkeypatch):
+    """The wrapper runs the driver once per band (per-band spread); every run adds to ONE summary."""
+    monkeypatch.setattr(sys, "argv", _argv(senate, experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    monkeypatch.setattr(sys, "argv", _sen_argv(senate, "senate"))
+    assert M.main() == 0
+    summ = json.loads(open(os.path.join(senate.report, "summary.json"), encoding="utf-8").read())
+    names = [c["cell"] for c in summ["cells"]]
+    assert len(names) == 3 and names[0].startswith("scr-mid-DeterministicScorer")
+    assert [n.split("-goal2027")[0] for n in names[1:]] == ["sen-S1", "sen-S3"]
+    # a rerun of a band REPLACES its cells in place, it never duplicates them
+    monkeypatch.setattr(sys, "argv", _argv(senate, experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    again = json.loads(open(os.path.join(senate.report, "summary.json"), encoding="utf-8").read())
+    assert [c["cell"] for c in again["cells"]] == names
+
+
 def test_by_default_a_cell_that_cannot_pass_stops_early(env, monkeypatch):
     env.fake.oos_by_fold = (BAD, BAD, GOOD)
     monkeypatch.setattr(sys, "argv", _argv(env, experts=("DeterministicScorer",)))

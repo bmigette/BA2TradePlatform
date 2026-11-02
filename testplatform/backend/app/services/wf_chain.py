@@ -411,11 +411,37 @@ def write_summary(cells: Sequence[Dict[str, Any]], report_dir: str) -> None:
         fh.write(render_summary(cells))
 
 
+def _load_summary_cells(report_dir: str) -> List[Dict[str, Any]]:
+    """The cells an earlier driver run wrote to this report dir's summary ([] when none). The grid is
+    run as one driver call per band (per-band spread), so every call ADDS to one grid summary."""
+    path = os.path.join(report_dir, "summary.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return list(json.load(fh)["cells"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise WalkForwardError(f"grid summary {path} is unreadable ({type(e).__name__}: {e}); "
+                               f"fix or move it -- overwriting would drop other bands' cells") from e
+
+
+def _merge_cell(cells: List[Dict[str, Any]], cell: Dict[str, Any]) -> None:
+    """Replace the cell of the same name in place (a rerun), else append it."""
+    for k, c in enumerate(cells):
+        if c["cell"] == cell["cell"]:
+            cells[k] = cell
+            return
+    cells.append(cell)
+
+
 def run_cells(specs: Sequence[CellSpec], runner_factory: Callable[[CellSpec], Any],
               report_dir: str, log: Callable[[str], None] = print) -> List[Dict[str, Any]]:
     """Run every cell in order. A cell that raises ANY exception is recorded as ERROR (type and
     message, logged with its traceback) and the grid goes on (a failed train job of one cell must not stop 34 others); the
-    summary is rewritten after each cell so a killed driver leaves a current one."""
+    summary is rewritten after each cell so a killed driver leaves a current one. The summary
+    MERGES with the one already in ``report_dir`` (other bands' cells are kept, a rerun cell is
+    replaced in place); the return value is this call's cells only."""
+    grid = _load_summary_cells(report_dir)
     cells: List[Dict[str, Any]] = []
     for spec in specs:
         try:
@@ -426,5 +452,6 @@ def run_cells(specs: Sequence[CellSpec], runner_factory: Callable[[CellSpec], An
             cells.append({"cell": spec.name, "expert": spec.expert, "strategy": spec.strategy,
                           "band": spec.band, "verdict": "ERROR", "error": f"{type(e).__name__}: {e}",
                           "refit_job": None, "folds": []})
-        write_summary(cells, report_dir)
+        _merge_cell(grid, cells[-1])
+        write_summary(grid, report_dir)
     return cells
