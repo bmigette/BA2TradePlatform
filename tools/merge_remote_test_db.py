@@ -71,15 +71,10 @@ def _ensure_provenance(con: sqlite3.Connection) -> None:
                 "id_offset INTEGER NOT NULL, PRIMARY KEY (source_tag, tbl))")
 
 
-def _remap_opt_ids(node: Any, opt_map: Dict[int, int], missing: Set[int]) -> Any:
-    """Every optimization id inside an optimization_config, remapped (an id the source does not hold is kept
-    and reported: it points at a row outside this merge)."""
+def _remap_opt_ids(node: Any, resolve) -> Any:
+    """Every optimization id inside an optimization_config, passed through ``resolve`` (source id -> target id)."""
     def m(v):
-        if isinstance(v, int) and not isinstance(v, bool):
-            if v in opt_map:
-                return opt_map[v]
-            missing.add(v)
-        return v
+        return resolve(v) if isinstance(v, int) and not isinstance(v, bool) else v
 
     if isinstance(node, dict):
         out = {}
@@ -87,20 +82,35 @@ def _remap_opt_ids(node: Any, opt_map: Dict[int, int], missing: Set[int]) -> Any
             if k in _OPT_ID_KEYS:
                 out[k] = m(v)
             elif k == "seededFrom" and isinstance(v, dict):
-                out[k] = {kk: (m(vv) if kk == "optimization_id" else _remap_opt_ids(vv, opt_map, missing))
+                out[k] = {kk: (m(vv) if kk == "optimization_id" else _remap_opt_ids(vv, resolve))
                           for kk, vv in v.items()}
             else:
-                out[k] = _remap_opt_ids(v, opt_map, missing)
+                out[k] = _remap_opt_ids(v, resolve)
         return out
     if isinstance(node, list):
-        return [_remap_opt_ids(v, opt_map, missing) for v in node]
+        return [_remap_opt_ids(v, resolve) for v in node]
     return node
+
+
+def load_prior_mapping(path: str) -> Dict[str, Any]:
+    """A mapping of source rows merged BEFORE, not under this tag: this tool's ``--mapping-out`` JSON
+    (``{"tables": {table: {src: tgt}}}``) or the 2026-10-24 hand-merge file (``{"opts": {...}, "strategies":
+    {...}, "backtests_kept_ids": true}``). Returns ``{"tables": {...}, "identity": set(tables)}``."""
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if "tables" in doc:
+        tables = {t: {int(k): int(v) for k, v in m.items()} for t, m in doc["tables"].items()}
+        return {"tables": tables, "identity": set()}
+    tables = {"strategy_optimizations": {int(k): int(v) for k, v in (doc.get("opts") or {}).items()},
+              "strategies": {int(k): int(v) for k, v in (doc.get("strategies") or {}).items()}}
+    return {"tables": tables, "identity": {"backtests"} if doc.get("backtests_kept_ids") else set()}
 
 
 class Merger:
     def __init__(self, target: str, source: str, tag: str, *, name_like: Optional[str] = None,
                  refresh: bool = False, running_as_cancelled: bool = False,
-                 offsets: Optional[Dict[str, int]] = None, log=print):
+                 offsets: Optional[Dict[str, int]] = None, prior: Optional[Dict[str, Any]] = None,
+                 allow_outside_refs: bool = False, log=print):
         if not os.path.isfile(source):
             raise MergeError(f"source DB not found: {source}")
         if not os.path.isfile(target):
@@ -117,11 +127,14 @@ class Merger:
         self.tag, self.name_like, self.refresh = tag, name_like, refresh
         self.running_as_cancelled = running_as_cancelled
         self.forced_offsets = dict(offsets or {})
+        self.prior = prior or {"tables": {}, "identity": set()}
+        self.allow_outside_refs = allow_outside_refs
+        self._outside: List[Tuple[str, int, Optional[str]]] = []
         self.log = log
         self.maps: Dict[str, Dict[int, int]] = {t: {} for t in _ID_TABLES}
         self.offsets: Dict[str, int] = {}
         self.report: Dict[str, Any] = {"inserted": {}, "refreshed": {}, "skipped_merged": {}, "skipped_running": [],
-                                       "imported_cancelled": [], "dangling_opt_ids": []}
+                                       "imported_cancelled": [], "dangling_opt_ids": [], "outside_refs": []}
 
     # ----------------------------------------------------------------------------------- plan
     def _check_schema(self) -> None:
@@ -206,6 +219,43 @@ class Merger:
         self.report["refreshed"][table] = upd
         self.report["skipped_merged"][table] = skip
 
+    def _src_name(self, table: str, sid: int) -> Optional[str]:
+        r = self.con.execute(f"SELECT name FROM src.{table} WHERE id = ?", (sid,)).fetchone()
+        return r[0] if r else None
+
+    def _ref(self, table: str, sid: Optional[int]) -> Optional[int]:
+        """A reference to a source row, resolved in order: copied in this run; merged earlier under this tag;
+        a --prior-mapping (verified: the local row must carry the source row's name); --allow-outside-refs (its
+        tag-stable id, reported). Anything else is collected and REFUSED at the end of the run: a reference mapped
+        to an id that does not exist locally would point at the wrong row or at nothing."""
+        if sid is None:
+            return None
+        if sid in self.maps[table]:
+            return self.maps[table][sid]
+        done = self._merged(table)
+        if sid in done:
+            return done[sid]
+        name = self._src_name(table, sid)
+        if name is None and table == "strategy_optimizations":
+            self.report["dangling_opt_ids"].append(sid)      # not in the source either: kept as is, reported
+            return sid
+        prior = self.prior["tables"].get(table, {})
+        tid = prior.get(sid, sid if table in self.prior["identity"] else None)
+        if tid is not None:
+            local = self.con.execute(f"SELECT name FROM main.{table} WHERE id = ?", (tid,)).fetchone()
+            if local is None or local[0] != name:
+                raise MergeError(f"--prior-mapping maps {table} {sid} ({name!r}) to local {tid}, which is "
+                                 f"{'missing' if local is None else repr(local[0])}")
+            return tid
+        if self.allow_outside_refs:
+            tid = sid + self.offsets[table]
+            if (table, sid, name, tid) not in self.report["outside_refs"]:
+                self.report["outside_refs"].append((table, sid, name, tid))
+            return tid
+        if (table, sid, name) not in self._outside:
+            self._outside.append((table, sid, name))
+        return sid
+
     def _map(self, table: str, sid: Optional[int]) -> Optional[int]:
         if sid is None:
             return None
@@ -254,10 +304,8 @@ class Merger:
             # running, or outside --name-like): a later merge of this tag gives it exactly that id.
             omerged = self._merged("strategy_optimizations")
             ooff = self.offsets["strategy_optimizations"]
-            src_opt_ids = [r[0] for r in self.con.execute("SELECT id FROM src.strategy_optimizations")]
-            all_opt_map = {o: omerged.get(o, o + ooff) for o in src_opt_ids}
             for oid in opts:
-                self.maps["strategy_optimizations"][oid] = all_opt_map[oid]
+                self.maps["strategy_optimizations"][oid] = omerged.get(oid, oid + ooff)
 
             self._copy_rows("strategies", strategies, lambda r: r)
 
@@ -265,11 +313,7 @@ class Merger:
 
             def bt_row(r):
                 r["strategy_id"] = self._map("strategies", r.get("strategy_id"))
-                if r.get("optimization_id") is not None:
-                    if r["optimization_id"] not in all_opt_map:
-                        raise MergeError(f"backtest {r['id']}: optimization_id {r['optimization_id']} is not in the "
-                                         f"source DB")
-                    r["optimization_id"] = all_opt_map[r["optimization_id"]]
+                r["optimization_id"] = self._ref("strategy_optimizations", r.get("optimization_id"))
                 for k in ("model_id", "prediction_dataset_id", "execution_dataset_id"):
                     if r.get(k) is not None:
                         raise MergeError(f"backtest {r['id']}: {k}={r[k]} references a table this tool does not "
@@ -279,14 +323,14 @@ class Merger:
                 return r
             self._copy_rows("backtests", bts, bt_row)
 
-            missing: Set[int] = set()
 
             def opt_row(r):
                 r["strategy_id"] = self._map("strategies", r.get("strategy_id"))
                 r["backtest_id"] = self._map("backtests", r.get("backtest_id"))
                 if r.get("optimization_config"):
                     cfg = json.loads(r["optimization_config"])
-                    r["optimization_config"] = json.dumps(_remap_opt_ids(cfg, all_opt_map, missing))
+                    r["optimization_config"] = json.dumps(
+                        _remap_opt_ids(cfg, lambda v: self._ref("strategy_optimizations", v)))
                 if r.get("status") in _RUNNING:
                     was = r["status"]
                     r["status"] = "cancelled"
@@ -295,7 +339,7 @@ class Merger:
                                           f"{was} at copy time]").strip()
                 return r
             self._copy_rows("strategy_optimizations", opts, opt_row)
-            self.report["dangling_opt_ids"] = sorted(missing)
+            self.report["dangling_opt_ids"] = sorted(set(self.report["dangling_opt_ids"]))
 
             # chain-seed populations: keyed by optimization_id (no id column)
             pops = 0
@@ -326,6 +370,12 @@ class Merger:
                         r["variant_backtest_ids"] = json.dumps([self.maps["backtests"].get(i, i) for i in ids])
                     return r
                 self._copy_rows("robustness_runs", rr, rr_row)
+            if self._outside:
+                shown = ", ".join(f"{t} {sid} ({name!r})" for t, sid, name in self._outside[:12])
+                raise MergeError(
+                    f"{len(self._outside)} reference(s) to source rows outside this merge with no known local id: "
+                    f"{shown}{' ...' if len(self._outside) > 12 else ''}. Pass --prior-mapping <json> (rows merged "
+                    f"before, e.g. the 2026-10-24 file), widen --name-like, or --allow-outside-refs.")
             return self.report
         except BaseException:
             self.con.execute("ROLLBACK")
@@ -402,6 +452,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="Import still-running source rows as cancelled (default: skip them).")
     ap.add_argument("--offset", action="append", default=[], metavar="TABLE=N",
                     help="Force a table's id offset on the FIRST merge of this tag.")
+    ap.add_argument("--prior-mapping", default=None, metavar="JSON",
+                    help="Rows of this source merged BEFORE, not under this tag (this tool's mapping JSON, or the "
+                         "2026-10-24 hand-merge file dl_forecasting.db.merge227_mapping.json). References to them "
+                         "resolve to their local ids, checked by name.")
+    ap.add_argument("--allow-outside-refs", action="store_true",
+                    help="Resolve references to unmerged, unmapped source rows to their tag-stable ids (reported) "
+                         "instead of refusing.")
     ap.add_argument("--mapping-out", default=None, help="Mapping JSON (default: <target>.merge_<tag>.json).")
     ap.add_argument("--rewrite-reports", default=None, metavar="DIR",
                     help="Also remap ids inside the walk-forward report JSONs under DIR (copied from the remote).")
@@ -409,7 +466,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
     try:
         m = Merger(a.target, a.source, a.source_tag, name_like=a.name_like, refresh=a.refresh,
-                   running_as_cancelled=a.running_as_cancelled, offsets=_parse_offsets(a.offset))
+                   running_as_cancelled=a.running_as_cancelled, offsets=_parse_offsets(a.offset),
+                   prior=load_prior_mapping(a.prior_mapping) if a.prior_mapping else None,
+                   allow_outside_refs=a.allow_outside_refs)
         rep = m.run()
     except MergeError as e:
         print(f"merge_remote_test_db: REFUSED: {e}")

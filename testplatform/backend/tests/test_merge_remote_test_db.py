@@ -223,3 +223,60 @@ def test_the_source_is_attached_read_only(dbs):
     m = MR.Merger(tgt, src, "t", log=lambda *_: None)
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         m.con.execute("DELETE FROM src.backtests")
+
+
+# ------------------------------------------------------------------ references outside the merge (stage 2 seeded
+# from stage-1 jobs that were hand-merged on 2026-10-24 with opt ids +100)
+
+
+@pytest.fixture
+def seeded(dbs, tmp_path):
+    src, tgt = dbs
+    with sqlite3.connect(src) as c:
+        _opt(c, 6, "stage2-jobC", 2, cfg={"ga": {"chainSeedFromOptimizationId": 3},
+                                         "seededFrom": {"optimization_id": 3, "name": "other-job"}})
+    with sqlite3.connect(tgt) as c:                              # the hand-merged stage-1 row: 3 -> 103
+        _opt(c, 103, "other-job", 1)
+    legacy = tmp_path / "merge227_mapping.json"
+    legacy.write_text(json.dumps({"opt_offset": 100, "opts": {"3": 103}, "strategies": {},
+                                  "backtests_kept_ids": True}), encoding="utf-8")
+    return src, tgt, str(legacy)
+
+
+def test_a_reference_outside_the_merge_is_refused_without_a_mapping(seeded):
+    src, tgt, _ = seeded
+    with pytest.raises(MR.MergeError, match="outside this merge.*other-job"):
+        _merge(src, tgt, name_like="stage2-%")
+    assert _q(tgt, "SELECT count(*) FROM strategy_optimizations WHERE name='stage2-jobC'") == [(0,)]
+
+
+def test_the_2026_10_24_hand_merge_file_resolves_it_checked_by_name(seeded):
+    src, tgt, legacy = seeded
+    _merge(src, tgt, name_like="stage2-%", prior=MR.load_prior_mapping(legacy))
+    cfg = json.loads(_q(tgt, "SELECT optimization_config FROM strategy_optimizations WHERE name='stage2-jobC'")[0][0])
+    assert cfg["ga"]["chainSeedFromOptimizationId"] == 103 and cfg["seededFrom"]["optimization_id"] == 103
+
+
+def test_a_prior_mapping_pointing_at_another_row_is_refused(seeded, tmp_path):
+    src, tgt, _ = seeded
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"opts": {"3": 1}, "strategies": {}}), encoding="utf-8")   # local 1 = local-opt
+    with pytest.raises(MR.MergeError, match="local-opt"):
+        _merge(src, tgt, name_like="stage2-%", prior=MR.load_prior_mapping(str(bad)))
+
+
+def test_allow_outside_refs_maps_to_the_tag_stable_id_and_reports_it(seeded):
+    src, tgt, _ = seeded
+    _, rep = _merge(src, tgt, name_like="stage2-%", allow_outside_refs=True)
+    assert rep["outside_refs"] == [("strategy_optimizations", 3, "other-job", 1003)]
+
+
+def test_this_tools_own_mapping_file_works_as_a_prior_mapping(dbs, tmp_path):
+    src, tgt = dbs
+    assert MR.main(["--source", src, "--target", tgt, "--source-tag", "first", "--name-like", "cell-%"]) == 0
+    with sqlite3.connect(src) as c:
+        _opt(c, 7, "later-job", 1, cfg={"seededFrom": {"optimization_id": 2}})
+    prior = MR.load_prior_mapping(f"{tgt}.merge_first.json")
+    _merge(src, tgt, tag="second", name_like="later-%", prior=prior)
+    cfg = json.loads(_q(tgt, "SELECT optimization_config FROM strategy_optimizations WHERE name='later-job'")[0][0])
+    assert cfg["seededFrom"]["optimization_id"] == 1002
