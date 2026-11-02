@@ -1201,6 +1201,12 @@ def _run_walk_forward_cells(args, specs, WF, WFC) -> int:
             print(f"\n=== cell {spec.name} ({spec.expert} {spec.strategy or '(bypass)'} / "
                   f"{spec.band}) ===")
             print(WF.render_dry_run(plan))
+            later = WFC.deferred_fold(folds, spec.data_end, spec.defer_last_test)
+            if later is not None:
+                print(f"  fold {later.index}: TEST DEFERRED -- the data ends {spec.data_end}; this run only "
+                      f"TRAINS {WF.train_job_name(spec.name, later.index)}. Rerun the same command without "
+                      f"--wf-data-end to test it, decide the cell and refit.")
+                continue
             print("  refit (only if the cell passes): " + " ".join(WFC.refit_command(spec, folds)))
         return 0
     runner = _make_wf_runner(args)

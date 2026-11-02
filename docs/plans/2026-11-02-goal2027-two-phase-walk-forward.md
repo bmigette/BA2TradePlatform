@@ -82,9 +82,20 @@ boundary (step 5 below) or delete that job and retrain it in January.
 ## Order and timeline
 
 1. **Now:** merge the driver change at a job boundary (TEST bump; O_CBS is mid-job on remote227).
-2. **Build `tools/grid_goal2027.sh`** (design 2.6): start/stop/status/resume, `WORKERS`/`PARALLEL`
-   settings, `PHASE_A=1` adds `--wf-defer-last-test --wf-data-end 2025-12-31`, preflight checks coverage
-   to the data end (metric store, manifests, expert caches), pinned Alpaca-era paths.
+2. **`tools/grid_goal2027.sh` (built).** `setup` / `start` / `run` / `dry-run` / `status` / `stop`.
+   `PHASE=A|B` is required (A adds `--wf-data-end 2025-12-31`; both pass `--wf-defer-last-test`).
+   15 steps in the design run order, one driver call each (`STEPS=` runs a subset): fr/ds large, mid,
+   ed/icb mid, small, fr/ds small, sqm-xl, FactorRanker x3, senate. Settings: `WORKERS` (default
+   remote227), `PARALLEL` (0), `BA2_MAX_REMOTE_SLOTS` (28), `MC_OHLCV`/`MC_TA` required (no default:
+   each phase has its own manifests), `MC_SEN_*` for the Senate step until one union manifest exists,
+   `SENATE_UNIVERSE_FILE`, `EXCLUDE_FILE`, `WF_REPORT_DIR`. Preflight: the venv must import THIS
+   checkout (refuses the main clone), metric store to the data end, 5-min coverage at the window start
+   AND end (`check_window_coverage.py --end`, new). Run setup:
+   `git -C ~/Documents/dev/BA2TradePlatform worktree add --detach ../BA2-goal2027-run <ref>`, then
+   `bash tools/grid_goal2027.sh setup` there (uv venv, Python 3.12, editable packages + testplatform).
+   Dry-run verified 2026-11-02 on fr-large, ds-large, sqm-xl, rank-large, senate (12 cells).
+   **Not in it: the SPY regime gate for stocks (design 2.3) is not built.** It changes the gene space, so
+   it lands before the first cell or is dropped from goal2027.
 3. **First cell = rehearsal:** FMPRating large. Its minutes per generation set how far phase A gets.
 4. **Phase A, design run order:** FMPRating + DeterministicScorer large/mid (traded live), then
    EarningsDrift + InsiderCluster mid/small, then the small caps, then FactorRanker.

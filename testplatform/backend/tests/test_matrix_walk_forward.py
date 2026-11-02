@@ -267,6 +267,16 @@ def test_phase_a_trains_wf3_without_testing_it_and_reports_pending(env, monkeypa
     assert [c["verdict"] for c in summ["cells"]] == ["PENDING"]
 
 
+def test_phase_a_dry_run_says_the_last_test_is_deferred(env, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--wf-data-end", "2025-12-31", "--dry-run",
+                                           experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    out = capsys.readouterr().out
+    assert "fold 3: TEST DEFERRED -- the data ends 2025-12-31" in out
+    assert "refit (only if the cell passes)" not in out
+    assert env.fake.order == []
+
+
 def test_phase_a_and_the_january_run_share_every_job_name(env, monkeypatch):
     """The January command (full data: no --wf-data-end) must resume phase A's jobs, not start over."""
     a = _cell_name(env, monkeypatch, "--wf-defer-last-test", "--wf-data-end", "2025-12-31")
