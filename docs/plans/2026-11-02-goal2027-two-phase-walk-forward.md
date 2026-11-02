@@ -94,8 +94,13 @@ boundary (step 5 below) or delete that job and retrain it in January.
    `git -C ~/Documents/dev/BA2TradePlatform worktree add --detach ../BA2-goal2027-run <ref>`, then
    `bash tools/grid_goal2027.sh setup` there (uv venv, Python 3.12, editable packages + testplatform).
    Dry-run verified 2026-11-02 on fr-large, ds-large, sqm-xl, rank-large, senate (12 cells).
-   **Not in it: the SPY regime gate for stocks (design 2.3) is not built.** It changes the gene space, so
-   it lands before the first cell or is dropped from goal2027.
+   **SPY regime gate for stocks (design 2.3): built 2026-11-02, in every classic step** (`-spyreg`).
+   `--benchmark-regime-gates` now accepts S1-S7: `_append_equity_benchmark_regime_gates` appends
+   `<kind>-spy-trend` / `<kind>-spy-vol` LAST to every entry tree (S1's tiers share one pair), never to
+   an exit; independent of the market-profile gene; refused for SQM and for a strategy with no gate
+   (bypass). Backtest calendar, trial config, live publish and export were already strategy-agnostic
+   (tests added for the equity path). Real smoke 2026-11-02 (DS S2, 15 large caps, 2023-2025-06, scratch
+   DB): gated trials trade (`off`/`not_calm` 55 trades) and `bear_rally`+`stressed` blocks every entry.
 3. **First cell = rehearsal:** FMPRating large. Its minutes per generation set how far phase A gets.
 4. **Phase A, design run order:** FMPRating + DeterministicScorer large/mid (traded live), then
    EarningsDrift + InsiderCluster mid/small, then the small caps, then FactorRanker.

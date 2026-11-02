@@ -226,6 +226,19 @@ EXPLORATION_RANGE_PAIRS = {
 }
 
 
+#: The strategies whose entry rules carry the SPY regime gates (the launcher's ``_EQUITY_MARKET_CONDITION_STRATEGIES``).
+SPY_GATE_STRATEGIES = frozenset({"S1", "S2", "S3", "S4", "S5", "S6", "S7"})
+
+
+def benchmark_regime_tokens(args, strat) -> list:
+    """`--benchmark-regime-gates` for an S1-S7 job when the matrix searches the SPY regime gates (goal2027 2.3), else
+    []. A bypass job (``strat is None``) has no entry rules and SQM takes no SPY genes: both are refused by the
+    launcher, so neither is given the flag (the caller prints a NOTE)."""
+    if getattr(args, "benchmark_regime_gates", False) and strat in SPY_GATE_STRATEGIES:
+        return ["--benchmark-regime-gates"]
+    return []
+
+
 def exploration_range_tokens(args, expert, strat) -> list:
     """`--search-exploration-ranges` for a job whose (expert, strategy) pair the flag is defined for (goal2027 item
     2.9), else []. The launcher refuses the flag for any other pair, so it is not forwarded (the caller prints a
@@ -710,6 +723,10 @@ def main() -> int:
                          "the analyst target window and minimum; w_analyst widened to 0.8) in every "
                          "DeterministicScorer job (goal2027 item 2.8). REQUIRES --name-suffix to contain 'dsfw'. "
                          "Not forwarded to any other expert's job; folds into the job's name digest.")
+    ap.add_argument("--benchmark-regime-gates", action="store_true", default=False,
+                    help="Search the SPY regime ENTRY gates (spy-trend, spy-vol mode genes with an off value; goal2027 "
+                         "2.3) on every S1-S7 job. REQUIRES --name-suffix to contain 'spyreg'. Not forwarded to the "
+                         "FactorRanker job (bypass) or SQM (no SPY genes).")
     ap.add_argument("--search-exploration-ranges", action="store_true", default=False,
                     help="Widen the time-exit lattices and add the FMPEarningsDrift S5 time exit so every "
                          "exploration phase-1 timeout and its control is searchable (goal2027 item 2.9). REQUIRES "
@@ -877,6 +894,10 @@ def main() -> int:
             ap.error(f"--search-sizing-mode requires --name-suffix to contain 'sizegene' "
                      f"(got {args.name_suffix!r}): its gene space differs from a pinned run's, so it "
                      f"must not share a job name. Example: --name-suffix goal2027-sizegene")
+    if args.benchmark_regime_gates and "spyreg" not in args.name_suffix.replace("_", "").lower():
+        ap.error(f"--benchmark-regime-gates requires --name-suffix to contain 'spyreg' (got {args.name_suffix!r}): its "
+                 f"gene space differs from an ungated run's, so it must not share a job name. "
+                 f"Example: --name-suffix goal2027-spyreg")
     if args.search_market_profile:
         _need = ("ohlcv-v1", "ta-structure-v1")
         _profiles = [t.strip() for t in (args.market_condition_profile or "").split(",") if t.strip()]
@@ -1130,6 +1151,13 @@ def main() -> int:
         # --search-exploration-ranges: appended last (same reasoning); digest on its own.
         er_tokens = exploration_range_tokens(args, expert, strat)
         cmd += er_tokens
+        # --benchmark-regime-gates (goal2027 2.3): appended last; digest on its own. S1-S7 only: a bypass job has no
+        # entry rules and SQM takes no SPY genes (both refused by the launcher), so neither is given the flag.
+        spy_tokens = benchmark_regime_tokens(args, strat)
+        cmd += spy_tokens
+        if args.benchmark_regime_gates and not spy_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no SPY regime gate, flag not applied",
+                  flush=True)
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names. Under
@@ -1142,7 +1170,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
             job_name = _job_name(name, ident + wf_tokens)

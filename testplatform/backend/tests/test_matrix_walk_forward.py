@@ -463,6 +463,52 @@ def test_under_defer_the_tests_get_the_current_command(env, monkeypatch):
     assert len(seen) == 3 and all(_flag(a, "--exclude-symbols") == "ZZ" for a in seen)
 
 
+# ------------------------------------------------------------------ SPY regime gate (goal2027 2.3)
+
+
+def _plain_argv(env, *extra, experts=("DeterministicScorer",)):
+    """The cell argv WITHOUT walk-forward (the flag is a matrix flag; the chain is not involved)."""
+    skip = ",".join(e for e in ("FMPRating", "DeterministicScorer", "FMPEarningsDrift",
+                                "FMPInsiderClusterBuy", "FactorRanker") if e not in experts)
+    return ["run_screener_capband_matrix.py", "--bands", "mid", "--skip-experts", skip,
+            "--strategy-plan", env.plan, "--name-suffix=-goal2027-spyreg", *extra]
+
+
+def test_spy_gate_flag_reaches_classic_jobs_only(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _plain_argv(env, "--benchmark-regime-gates",
+                                                 experts=("DeterministicScorer", "FactorRanker")))
+    assert M.main() == 0
+    by_expert = {_flag(c, "--expert"): c for c in env.calls}
+    assert "--benchmark-regime-gates" in by_expert["DeterministicScorer"]
+    assert "--benchmark-regime-gates" not in by_expert["FactorRanker"]   # bypass: no entry rules
+
+
+def test_spy_gate_flag_is_not_given_to_sqm(env, monkeypatch):
+    argv = _plain_argv(env, "--benchmark-regime-gates", "--strategies", "SQM")
+    argv[argv.index("--strategy-plan"):argv.index("--strategy-plan") + 2] = []
+    argv[argv.index("--bands") + 1] = "xl"
+    monkeypatch.setattr(sys, "argv", argv)
+    assert M.main() == 0
+    assert env.calls and all("--benchmark-regime-gates" not in c for c in env.calls)
+
+
+def test_spy_gate_flag_requires_its_name_token(env, monkeypatch):
+    argv = [a if a != "--name-suffix=-goal2027-spyreg" else "--name-suffix=-goal2027"
+            for a in _plain_argv(env, "--benchmark-regime-gates")]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        M.main()
+
+
+def test_spy_gate_flag_changes_the_job_name(env, monkeypatch):
+    monkeypatch.setattr(sys, "argv", _plain_argv(env))
+    assert M.main() == 0
+    plain = _flag(env.calls[-1], "--name")
+    monkeypatch.setattr(sys, "argv", _plain_argv(env, "--benchmark-regime-gates"))
+    assert M.main() == 0
+    assert _flag(env.calls[-1], "--name") != plain
+
+
 def test_by_default_a_cell_that_cannot_pass_stops_early(env, monkeypatch):
     env.fake.oos_by_fold = (BAD, BAD, GOOD)
     monkeypatch.setattr(sys, "argv", _argv(env, experts=("DeterministicScorer",)))

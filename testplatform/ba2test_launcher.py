@@ -6461,22 +6461,39 @@ def _apply_benchmark_regime(command: str, backtest_block: dict, strat, kind: str
     the checkpoint identity of every existing run stay unchanged. With it on:
 
     * REFUSED for a key whose builders emit no SPY leaves (anything outside
-      ``_PURE_OPTION_STRATEGIES``): the job would be labelled gated and search no such gene;
+      ``_PURE_OPTION_STRATEGIES`` and the equity S1-S7, goal2027 2.3), and for a job whose built
+      strategy carries none (a bypass expert's minimal strategy): the job would be labelled gated
+      and search no such gene;
     * REQUIRES the job's resolved ``ohlcv_history_source``: the SPY series the regime is computed
       from is the job's own history, so it is stamped here and printed.
     """
     if not _BENCHMARK_REGIME_GATES:
         return {}
-    if kind and kind not in _PURE_OPTION_STRATEGIES:
+    gated_keys = _PURE_OPTION_STRATEGIES | _EQUITY_MARKET_CONDITION_STRATEGIES
+    if kind and kind not in gated_keys:
         sys.exit(f"{command}: --benchmark-regime-gates: {kind!r} emits no SPY regime gates "
-                 f"(gated keys: {sorted(_PURE_OPTION_STRATEGIES)}). Drop the flag, or run the "
+                 f"(gated keys: {sorted(gated_keys)}). Drop the flag, or run the "
                  f"gated keys in a job of their own.")
     source = backtest_block.get("ohlcv_history_source")
     if not source:
         sys.exit(f"{command}: --benchmark-regime-gates needs the job's resolved "
                  f"ohlcv_history_source (the SPY series is read from it); none on the run config")
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS
+
     from app.services.strategy_param_space import collect_param_space
 
+    bench = set(BENCHMARK_FIELDS)
+
+    def _has_gate(node) -> bool:
+        if isinstance(node, list):
+            return any(_has_gate(n) for n in node)
+        if isinstance(node, dict):
+            return node.get("field") in bench or any(_has_gate(v) for v in node.values())
+        return False
+
+    if not _has_gate(getattr(strat, "entry_rules", None) or []):
+        sys.exit(f"{command}: --benchmark-regime-gates: the built strategy carries no SPY regime "
+                 f"gate (a bypass expert builds no entry rules); drop the flag for this job")
     genes = sorted(g for g in collect_param_space(strat) if "-spy-" in g)
     recorded = {"symbol": "SPY", "history_source": source, "trend": "sma200+sma50slope10",
                 "vol": "rv20-rank504", "genes": genes, "gene_count": len(genes)}
@@ -6841,6 +6858,36 @@ def _append_equity_market_condition_gates(strategy, kind: str):
         rule["market_master_gene"] = True
         if _SEARCH_MARKET_PROFILE:
             rule["market_profile_gene"] = True   # goal2027 2.2: market:profile replaces market:enabled
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _append_equity_benchmark_regime_gates(strategy, kind: str):
+    """Append the SPY regime ENTRY leaves (``<kind>-spy-trend``, ``<kind>-spy-vol``) LAST to every
+    initial-entry AND tree of an equity strategy (S1-S7), never to an exit rule (goal2027 design 2.3).
+
+    The same leaves the option builders append (``benchmark_regime_leaves``), with the same sharing
+    as ``_append_equity_market_condition_gates``: S1's three conviction tiers get the SAME ids, so one
+    pair of mode genes drives all three. Appended after the market-condition leaves, so every existing
+    leaf keeps its index. Independent of the market profile: the SPY fields are a separate registry
+    (``BENCHMARK_FIELDS``), so ``market:profile`` / ``market:enabled`` never switch them; each has its
+    own ``off`` mode. A no-op with ``--benchmark-regime-gates`` off: every existing command is byte
+    for byte unchanged."""
+    gates = _benchmark_regime_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the SPY regime gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
     strategy.entry_rules = normalize_trade_rules(rules)
     return strategy
 
@@ -7659,6 +7706,7 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         # attach here, once, generically, since every one of them returns a plain Strategy with no
         # further per-kind splicing to interact with.
         strat = _append_equity_market_condition_gates(strat, kind)
+        strat = _append_equity_benchmark_regime_gates(strat, kind)   # goal2027 2.3; no-op flag off
         strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
@@ -9437,8 +9485,9 @@ def _add_market_condition_args(p) -> None:
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
     p.add_argument("--benchmark-regime-gates", action="store_true", default=False,
-                   help="OPT-IN, option structures only (O_*, groups, O_WHEEL; refused for any "
-                        "other key). Append two SPY-regime entry gates to every member's "
+                   help="OPT-IN, option structures (O_*, groups, O_WHEEL) and the equity S1-S7 "
+                        "(goal2027; refused for any other key). Append two SPY-regime entry gates "
+                        "to every member's / equity entry rule's "
                         "INITIAL-ENTRY tree: <member>-spy-trend (off/up/pullback/bear_rally/down/"
                         "above_200/below_200) and <member>-spy-vol (off/calm/normal/stressed/"
                         "not_stressed/not_calm), one categorical mode gene each (2 added genes "

@@ -36,12 +36,11 @@
 #
 # GENES per kind (design 1.3):
 #   classic (S1-S7, Senate too): sizing gene, ATR searched, market profile gene + exits, SL loosen,
-#            entry/manage time genes; DS adds the factor genes; explr where the pair has ranges.
-#   sqm:     sizing, time and factor genes + explr; no market, ATR or SL-loosen genes (SQM's stop
-#            is its own gene and min_stop_loss_pct is pinned; its market flags are refused).
-#   rank:    FactorRanker is a bypass expert: no RM, market, sizing or schedule genes.
-# NOT YET: the SPY regime gate for stock entries (design 2.3) is not built; adding it later changes
-# the gene space, so it must land before the first cell starts or be left out of goal2027.
+#            SPY regime entry gates (spy-trend, spy-vol), entry/manage time genes; DS adds the factor
+#            genes; explr where the pair has ranges.
+#   sqm:     sizing, time and factor genes + explr; no market, SPY, ATR or SL-loosen genes (SQM's
+#            stop is its own gene and min_stop_loss_pct is pinned; its market/SPY flags are refused).
+#   rank:    FactorRanker is a bypass expert: no RM, market, SPY, sizing or schedule genes.
 set -u
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd -W 2>/dev/null || pwd)"
@@ -195,8 +194,8 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
              --market-condition-profile ohlcv-v1,ta-structure-v1
              --market-condition-manifest "ohlcv-v1=${mc_o},ta-structure-v1=${mc_t}"
              --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
-             --exclude-symbols "@$EXCLUDE_FILE")
-      suffix="${suffix}-atr27-sizegene-mktprof"
+             --benchmark-regime-gates --exclude-symbols "@$EXCLUDE_FILE")
+      suffix="${suffix}-atr27-sizegene-mktprof-spyreg"
       if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
       if [ "$kind" != "senate" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
     sqm)

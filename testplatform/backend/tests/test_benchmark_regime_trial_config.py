@@ -98,3 +98,26 @@ def test_the_spy_genes_reach_the_decoded_rules_and_the_engine_triggers(monkeypat
             if isinstance(r.get("conditions"), dict) and r["conditions"].get("conditions")][0]
     events = {t["event_type"] for t in triggers_from_condition_tree(tree["conditions"]).values()}
     assert {"spy_trend_regime", "spy_vol_regime"} <= events
+
+
+@pytest.mark.parametrize("kind", ["S1", "S2", "S6"])
+def test_equity_spy_genes_reach_the_trial_rules_and_mark_the_run_gated(monkeypatch, kind):
+    """goal2027 2.3: an S1-S7 trial carries the decoded SPY leaves into the engine's triggers, and the
+    backtest handler detects the run as gated (it then builds the SPY calendar or refuses)."""
+    from ba2_common.core.rule_builders import triggers_from_condition_tree
+
+    from app.services.backtest.daily_backtest_handler import _config_uses_benchmark_regime
+
+    monkeypatch.setattr(mod, "_BENCHMARK_REGIME_GATES", True)
+    strat = mod._build_strategy(kind, f"btc-{kind}", "FMPRating")
+    k = kind.lower()
+    genome = {f"cond:{k}-spy-trend:mode": "up", f"cond:{k}-spy-vol:mode": "calm"}
+    assert set(genome) <= set(collect_param_space(strat))
+    _, cfg = _trial({**_backtest_cfg(strat, "FMPRating"), "benchmark_regime_gates": True}, strat, genome)
+    trees = [r for r in cfg["entry_rules"]
+             if isinstance(r.get("conditions"), dict) and r["conditions"].get("conditions")]
+    for tree in trees:
+        events = {t["event_type"] for t in triggers_from_condition_tree(tree["conditions"]).values()}
+        assert {"spy_trend_regime", "spy_vol_regime"} <= events
+    assert _config_uses_benchmark_regime(cfg)
+    assert _config_uses_benchmark_regime({k2: v for k2, v in cfg.items() if k2 != "benchmark_regime_gates"})

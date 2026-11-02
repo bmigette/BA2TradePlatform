@@ -102,6 +102,8 @@ merges only between jobs.
 
 ### 2.3 SPY regime gate for stock entries
 
+*Built 2026-11-02 (branch feat/goal2027-wf-defer): see the two-phase plan, step 2.*
+
 - This reuses `ba2_common/core/benchmark_regime.py` and the `SpyTrendRegimeCondition` and `SpyVolRegimeCondition`
   conditions from `feat/spy-regime-gate`, which is first in the merge queue.
 - Add the genes `cond:entry-spy-trend:mode` and `cond:entry-spy-vol:mode`, each with an off value, on S1-S7 entry

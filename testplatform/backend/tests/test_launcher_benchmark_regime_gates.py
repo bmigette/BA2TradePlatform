@@ -147,7 +147,7 @@ def test_decode_off_removes_leaf_and_non_off_resolves_to_code(gates_on):
     assert leaf["op"] == "==" and float(leaf["value"]) == 5.0 and leaf["mode"] == "above_200"
 
 
-@pytest.mark.parametrize("kind", ["S1", "O_CC", "O_PP", "O_STK"])
+@pytest.mark.parametrize("kind", ["SQM", "O_CC", "O_PP", "O_STK"])  # S1-S7: goal2027 2.3, test_equity_benchmark_regime_gates.py
 def test_refused_for_non_pure_option_kinds(kind, gates_on):
     with pytest.raises(SystemExit) as e:
         mod._apply_benchmark_regime("optimize", {"ohlcv_history_source": "fmp"},
