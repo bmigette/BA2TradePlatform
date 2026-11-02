@@ -111,7 +111,7 @@ def _ref_rv(C):
 
 def test_window_constant_is_128_and_field_names_are_canonical():
     assert WINDOW == 128
-    assert CALC_VERSION == "ohlcv-v1/calc-1"
+    assert CALC_VERSION == "ohlcv-v1/calc-2"
     assert FIELD_TREND_SLOPE == "underlying_trend_slope_50_atr14"
     assert FIELD_ADX == "underlying_adx_14"
     assert FIELD_RV_RATIO == "underlying_realized_vol_ratio_5_20"
@@ -178,37 +178,41 @@ def test_adx_with_atr_positive_and_both_dm_zero_is_zero_not_unknown():
     assert res.adx.value == 0.0
 
 
-def test_atr_zero_makes_slope_and_adx_unknown_but_rv_ratio_still_computed():
-    # h == l == c == constant on every bar: TR == 0 so ATR == 0.  (ATR[127] == 0
-    # forces every TR to 0, so closes cannot move; the RV ratio is still
-    # computed on its own terms and reports its own reason, not the ATR one.)
+def test_all_flat_window_is_neutral_not_invalid():
+    # calc-2 (operator decision 2026-10-01): h == l == c == constant on every bar is a thin-trading
+    # market state. ATR[127] == 0, so: slope 0.0, ADX 0.0 (no directional movement), RV ratio
+    # 1.0 (zero denominator -> neutral). Never NaN/inf, never invalid_prices.
     flat = np.full(WINDOW, 100.0)
     o, h, l, c = flat.copy(), flat.copy(), flat.copy(), flat.copy()
     res = compute_market_conditions(o, h, l, c, np.full(WINDOW, 1e6))
     assert atr14_wilder(h, l, c)[127] == 0.0
-    assert res.trend_slope.status == STATUS_INVALID_PRICES and res.trend_slope.value is None
-    assert "atr<=0" in res.trend_slope.reason
-    assert res.adx.status == STATUS_INVALID_PRICES and res.adx.value is None
-    assert "atr<=0" in res.adx.reason
-    # computed, and flat closes give a zero denominator -> unknown (never 1)
-    assert res.rv_ratio.status == STATUS_INVALID_PRICES and res.rv_ratio.value is None
-    assert "atr" not in res.rv_ratio.reason
+    assert (res.trend_slope.status, res.trend_slope.value) == (STATUS_VALID, 0.0)
+    assert (res.adx.status, res.adx.value) == (STATUS_VALID, 0.0)
+    assert (res.rv_ratio.status, res.rv_ratio.value) == (STATUS_VALID, 1.0)
 
 
-def test_zero_atr_inside_adx_warmup_is_unknown_not_zero():
-    # Documented edge (module docstring): all OHLC identical over the first 20
-    # bars, so ATR is exactly 0 at indices 14..19; prices then move so
-    # ATR[127] > 0.  DX is undefined where ATR <= 0, the seeded ADX mean over
-    # DX[14..27] is therefore unknown, and so is ADX[127].  The slope, whose
-    # denominator is only ATR[127], stays valid.
+def test_one_bad_bar_in_a_flat_window_is_still_invalid():
+    flat = np.full(WINDOW, 100.0)
+    o, h, l, c = flat.copy(), flat.copy(), flat.copy(), flat.copy()
+    h[70] = 90.0                                       # high < low
+    res = compute_market_conditions(o, h, l, c, np.full(WINDOW, 1e6))
+    for obs in (res.trend_slope, res.adx, res.rv_ratio):
+        assert obs.status == STATUS_INVALID_PRICES
+    c2 = c.copy(); c2[5] = np.nan
+    res = compute_market_conditions(o, h * 0 + 100.0, l, c2, np.full(WINDOW, 1e6))
+    assert res.adx.status == STATUS_INVALID_PRICES
+
+
+def test_zero_atr_inside_adx_warmup_gives_dx_zero_and_a_valid_adx():
+    # All OHLC identical over the first 20 bars (ATR exactly 0 at indices 14..19), then prices
+    # move. calc-2 defines DX == 0 where ATR == 0, so the seeded ADX mean is defined.
     c = np.concatenate([np.full(20, 100.0), _walk(WINDOW - 20, seed=5, start=100.0)])
     o, h, l = c.copy(), c.copy(), c.copy()
     h[20:] += 0.5; l[20:] -= 0.5
     res = compute_market_conditions(o, h, l, c, np.full(WINDOW, 1e6))
     assert atr14_wilder(h, l, c)[14] == 0.0
     assert res.trend_slope.status == STATUS_VALID
-    assert res.adx.status == STATUS_INVALID_PRICES and res.adx.value is None
-    assert res.adx.reason == "adx undefined: atr<=0 at index 14"
+    assert res.adx.status == STATUS_VALID and math.isfinite(res.adx.value)
 
 
 def test_rv_ratio_uses_ddof1_and_no_annualization():
@@ -223,12 +227,11 @@ def test_rv_ratio_uses_ddof1_and_no_annualization():
     assert res.rv_ratio.value == obs.value
 
 
-def test_rv_ratio_zero_numerator_is_valid_zero_and_zero_denominator_is_unknown():
+def test_rv_ratio_zero_numerator_is_valid_zero_and_zero_denominator_is_neutral_one():
     c = _walk(WINDOW, seed=9)
     flat20 = c.copy(); flat20[-21:] = flat20[-21]   # last 20 returns all zero
     res = compute_market_conditions(*_bars(flat20))
-    assert res.rv_ratio.status == STATUS_INVALID_PRICES
-    assert res.rv_ratio.value is None
+    assert res.rv_ratio.status == STATUS_VALID and res.rv_ratio.value == 1.0
     flat5 = c.copy(); flat5[-6:] = flat5[-6]        # last 5 returns zero only
     res = compute_market_conditions(*_bars(flat5))
     assert res.rv_ratio.status == STATUS_VALID

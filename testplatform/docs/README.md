@@ -17,8 +17,7 @@ are not kept up to date afterwards.
 - [optimization-plan-2026-06.md](optimization-plan-2026-06.md) and [optimization-jobs-plan-2026-06-17.md](optimization-jobs-plan-2026-06-17.md) — the June 2026 expert-optimization plan and job list
 - [2026-06-17-5min-optimization-grid-analysis.md](2026-06-17-5min-optimization-grid-analysis.md) — tests and performance of the 5-minute optimization grid
 - [2026-06-13-phase5-ohlcv-resource-cutover.md](2026-06-13-phase5-ohlcv-resource-cutover.md) — the `OHLCV_SOURCE` flag for re-sourcing ML datasets through the shared cache
-- [superpowers/](superpowers/) — designs (`specs/`) and implementation plans (`plans/`) for the backtest interface rework, options backtests, the exit-ruleset UI and screener-settings optimization
-- [plans/](plans/) — deep-learning module plans (prediction targets, classification/regression jobs, multi-dataset training), OHLCV date ranges with the news batch fetch, and the original backtest strategy builder
+- [superpowers/](superpowers/) — the backtest interface rework design and backend plan, and the options backtest design
 
 ## Data
 
@@ -29,5 +28,5 @@ are not kept up to date afterwards.
 
 The test platform began as a standalone deep-learning forecasting app built over many agent
 sessions. Its original specification (`spec/`), feature checklist (`feature_list.json`) and
-session hand-offs (`implementation/`) are kept for the record; they do not describe the
+a few session hand-offs (`implementation/`) are kept for the record; they do not describe the
 current platform.

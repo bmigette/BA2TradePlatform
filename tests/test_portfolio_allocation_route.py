@@ -87,7 +87,9 @@ def test_the_page_opens_the_dry_run_gate_and_the_invest_scope():
     assert "open_invest_scope(" in source
     assert "open_allocation_wizard(" in source
     assert "render_income_panel(" in source
-    assert "render_outcomes(" in source
+    # No results popup: the dry-run table is the result.
+    assert "render_outcomes(" not in source
+    assert "notify_outcomes(" in source
 
 
 def test_the_allocate_button_exists_and_calls_the_flow():

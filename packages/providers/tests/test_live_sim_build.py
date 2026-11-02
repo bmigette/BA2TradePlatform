@@ -1,0 +1,189 @@
+"""End to end on a tiny synthetic cache: the panel build (fingerprint-named directory, coverage lists, split-aware raw shares,
+resumability) and the prewarm/refusal contract."""
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ba2_providers.screener import live_sim as ls
+from ba2_providers.screener import live_sim_build as lb
+
+SESSIONS = [d.date() for d in pd.bdate_range("2023-10-02", "2024-03-28")]
+
+
+def _bars(path, last_day=None, close=100.0):
+    days = [d for d in SESSIONS if last_day is None or d <= last_day]
+    df = pd.DataFrame({"Date": pd.to_datetime(days), "Open": close, "High": close * 1.01, "Low": close * 0.99,
+                       "Close": close, "Volume": 1_000_000})
+    df.to_parquet(path, index=False)
+
+
+@pytest.fixture()
+def cache(tmp_path):
+    c = tmp_path / "cache"
+    (c / "FMPOHLCVProvider").mkdir(parents=True)
+    fund = c / "screener_fundamentals"
+    for k in ("market_cap", "shares", "splits"):
+        (fund / k).mkdir(parents=True)
+    # A: normal, has the vendor share history; B: a 10:1 split on 2024-02-15 (cache adjusted), implied-only shares;
+    # C: LISTED but stale bars; D: not listed, stale bars (delisted); E: no share source at all
+    _bars(c / "FMPOHLCVProvider" / "A_1d.parquet")
+    _bars(c / "FMPOHLCVProvider" / "B_1d.parquet", close=10.0)
+    _bars(c / "FMPOHLCVProvider" / "C_1d.parquet", last_day=SESSIONS[20])
+    _bars(c / "FMPOHLCVProvider" / "D_1d.parquet", last_day=SESSIONS[20])
+    _bars(c / "FMPOHLCVProvider" / "E_1d.parquet")
+    pd.DataFrame({"date": ["2023-06-01"], "outstanding": [2e7]}).to_parquet(fund / "shares" / "A.parquet", index=False)
+    pd.DataFrame({"date": ["2023-06-01"], "outstanding": [2e7]}).to_parquet(fund / "shares" / "C.parquet", index=False)
+    pd.DataFrame({"date": ["2023-06-01"], "outstanding": [2e7]}).to_parquet(fund / "shares" / "D.parquet", index=False)
+    # B: as-traded cap 1e9 before the split (raw price 100 x 1e7 shares), 1e9 after (raw 10 x 1e8)
+    caps = [(d.isoformat(), 1.0e9) for d in SESSIONS]
+    pd.DataFrame({"date": [x[0] for x in caps], "market_cap": [x[1] for x in caps]}).to_parquet(fund / "market_cap" / "B.parquet", index=False)
+    for s in ("A", "C", "D"):
+        pd.DataFrame({"date": [x[0] for x in caps], "market_cap": [2e9] * len(caps)}).to_parquet(fund / "market_cap" / f"{s}.parquet", index=False)
+    for s, sp in (("A", []), ("B", [{"date": "2024-02-15", "numerator": 10, "denominator": 1}]), ("C", []), ("D", []), ("E", [])):
+        (fund / "splits" / f"{s}.json").write_text(json.dumps({"symbol": s, "historical": sp}))
+    snap_dir = c / "screener" / "vendor_shares"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / "2024-04-01.json").write_text(json.dumps({
+        "fetched_at_ny": "2024-04-01T20:00:00", "rows": {"A": 2e7, "B": 1e8, "C": 2e7},
+        "caps": {"A": [2e9, 100.0], "B": [1e9, 10.0], "C": [2e9, 100.0], "E": [2e9, 100.0]}}))
+    return c
+
+
+def test_build_writes_a_fingerprint_directory_with_explicit_coverage_lists(cache):
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
+    path = man["path"]
+    assert os.path.basename(path) == man["panel_fingerprint"] and os.path.dirname(path) == ls.panel_root(str(cache))
+    assert not any(n.endswith((".tmp", ".building")) for n in os.listdir(path))
+    assert man["stale_listed_symbols"] == ["C"]                       # in the vendor's current listing, bars stale
+    assert man["delisted_symbols"] == ["D"] and man["delisted_symbols_count"] == 1
+    assert man["shares_missing_listed"] == ["E"]                      # listed, no share source
+    assert man["splits_unknown"] == [] and man["split_report"]["symbols_with_split_in_window"] == 1
+    probs = ls.panel_problems(path, "2024-02-01", "2024-03-20", warmup_days=20)
+    assert any("CURRENT listing" in p and "C" in p for p in probs) and any("no share-count source" in p for p in probs)
+    # rebuilt with the stale symbol acknowledged and the share-less one dropped from the universe: clean
+    man2 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2,
+                                log=lambda m: None, acknowledged_stale=["C"], history_source="fmp")
+    assert ls.panel_problems(man2["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
+    assert man2["panel_fingerprint"] != man["panel_fingerprint"]       # another universe -> another directory
+    assert {d for d, _, _ in ls.list_panels(str(cache))} == {man["path"], man2["path"]}
+
+
+def test_split_name_keeps_one_as_traded_cap_across_the_split(cache):
+    man = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
+    pan = ls.load_panel(man["path"])
+    i = pan.sym_index["B"]
+    for day in ("2024-02-13", "2024-02-14", "2024-02-15", "2024-02-16", "2024-03-20"):
+        p = pan.pos(day)
+        cap = float(pan.arrays["lc"][p, i]) * float(pan.arrays["shares"][p, i]) * float(pan.arrays["fac"][p, i])
+        assert cap == pytest.approx(1.0e9, rel=1e-6), (day, cap)       # no 10x step at the split
+
+
+def test_an_up_to_date_panel_is_a_no_op_and_force_rebuilds(cache):
+    logs = []
+    m1 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
+    m2 = lb.build_daily_panel(str(cache), ["A", "B"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
+    assert m1["status"] == "built" and m2["status"] == "up_to_date" and m1["path"] == m2["path"]
+
+
+def test_a_vendor_listing_without_a_snapshot_refuses(tmp_path):
+    with pytest.raises(ls.SimulationRefusal, match="no vendor share table"):
+        lb.build_daily_panel(str(tmp_path), ["A"], "2023-10-02", "2024-03-28", log=lambda m: None, history_source="fmp")
+
+
+def test_reviewed_exclusion_list_replaces_a_refusal_with_a_printed_record(cache, tmp_path):
+    ex = tmp_path / "excl.json"
+    ex.write_text(json.dumps({"entries": [
+        {"symbol": "C", "reason": "top-up refused: vendor bars disagree", "added": "2026-10-08", "reviewed_by": "owner"},
+        {"symbol": "E", "reason": "no share source", "added": "2026-10-08", "reviewed_by": "owner"},
+        {"symbol": "A", "reason": "needless entry", "added": "2026-10-08", "reviewed_by": "owner"}]}))
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D", "E"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
+                               exclusions_path=str(ex), history_source="fmp")
+    assert man["stale_listed_symbols"] == [] and man["shares_missing_listed"] == []
+    assert [e["symbol"] for e in man["excluded_unusable"]] == ["A", "C", "E"]
+    assert man["exclusions_not_needed"] == ["A"]
+    assert any("EXCLUDED (reviewed list) C" in m for m in logs) and any("NOTE exclusion A" in m for m in logs)
+    assert ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"entries": [{"symbol": "C", "reason": "x", "added": "2026-10-08"}]}))
+    with pytest.raises(ls.SimulationRefusal, match="reviewed_by"):
+        lb.load_exclusions(str(bad))
+    shipped = lb.load_exclusions()
+    assert {"GORO", "PARA", "CICC"} <= set(shipped) and not ({"MIDD", "MOD", "RBKB", "SNFCA"} & set(shipped))
+    assert not any(str(e["reviewed_by"]).lower().startswith("pending") for e in lb.load_entries() if e["symbol"] in {"GORO", "PARA", "CICC"})
+    assert {"DBRG", "IPEXU", "QRVO"} <= set(lb.load_acknowledged_delistings())
+    assert {"IAC", "ADEA", "IPEXR"} <= set(lb.load_exclusions()) and "IPEXR" not in lb.load_acknowledged_delistings()
+
+
+def _ack_file(tmp_path, *, last_session, reviewed_by="owner", name="ack.json"):
+    ex = tmp_path / name
+    ex.write_text(json.dumps({"entries": [{"symbol": "C", "kind": "delisted", "last_session": last_session,
+                                           "reason": "delisted, data fine", "added": "2026-10-12", "reviewed_by": reviewed_by}]}))
+    return str(ex)
+
+
+def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cache, tmp_path):
+    last = SESSIONS[20].isoformat()
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append,
+                               exclusions_path=_ack_file(tmp_path, last_session=last), history_source="fmp")
+    assert man["stale_listed_symbols"] == [] and [e["symbol"] for e in man["acknowledged_delisted"]] == ["C"]
+    assert man["acknowledged_delisted"][0]["last_session"] == last and man["excluded_unusable"] == []
+    assert any("ACKNOWLEDGED DELISTING (reviewed list) C" in m for m in logs)
+    assert ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20) == []
+    pan = ls.load_panel(man["path"])
+    i = pan.sym_index["C"]
+
+    def candidate(day):
+        c = pan.columns(pan.pos(day))
+        return bool(np.isfinite(c["last_close"][i] * c["shares"][i]))
+    assert candidate(SESSIONS[20].isoformat()) and candidate(SESSIONS[5].isoformat())       # on days it has bars
+    assert not candidate(SESSIONS[21].isoformat()) and not candidate(SESSIONS[22].isoformat())   # never after
+    assert np.isfinite(pan.arrays["c"][pan.pos(SESSIONS[20].isoformat()), i])                # the history is kept
+    # the same symbol WITHOUT the entry is a refusal (stale-listed), and its previous close lingers in live's 35-day window
+    man0 = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None, history_source="fmp")
+    assert man0["stale_listed_symbols"] == ["C"]
+    assert man0["panel_fingerprint"] != man["panel_fingerprint"]          # the file is part of the identity
+    pan0 = ls.load_panel(man0["path"])
+    assert np.isfinite(pan0.arrays["lc"][pan0.pos(SESSIONS[22].isoformat()), pan0.sym_index["C"]])
+
+
+def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_refuses(cache, tmp_path):
+    with pytest.raises(ls.SimulationRefusal, match="does not describe this data"):
+        lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
+                             exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[19].isoformat()), history_source="fmp")
+    man = lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
+                               exclusions_path=_ack_file(tmp_path, last_session=SESSIONS[20].isoformat(),
+                                                         reviewed_by="pending owner review", name="p.json"), history_source="fmp")
+    probs = ls.panel_problems(man["path"], "2024-02-01", "2024-03-20", warmup_days=20)
+    assert any("NOT reviewed" in p and "C" in p for p in probs)
+    bad = tmp_path / "bad2.json"
+    bad.write_text(json.dumps({"entries": [{"symbol": "C", "kind": "delisted", "reason": "x", "added": "d", "reviewed_by": "o"}]}))
+    with pytest.raises(ls.SimulationRefusal, match="last_session"):
+        lb.load_entries(str(bad))
+
+
+def test_stale_listed_is_judged_against_the_job_window_not_today(cache):
+    logs = []
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=logs.append, history_source="fmp")
+    last = SESSIONS[20].isoformat()                                    # C's last bar (listed by the vendor, stale)
+    # the manifest RECORDS it (count, names, last bar) and the build prints it, whatever window a job reads
+    assert man["stale_listed_symbols"] == ["C"] and man["stale_listed_count"] == 1 and man["stale_listed_last_bar"] == {"C": last}
+    assert any("RECORDED stale-listed C" in m and last in m for m in logs)
+    assert man["delisted_symbols"] == ["D"]                            # the "treated as delisted" class is untouched
+    path = man["path"]
+
+    def probs(end):
+        return [p for p in ls.panel_problems(path, "2023-10-02", end, warmup_days=0) if "CURRENT listing" in p]
+    assert probs("2023-10-20") == []                                  # the window ends BEFORE its last bar: never a problem
+    assert probs(SESSIONS[22].isoformat()) == []                       # ends 2 days after: inside the 6-day tolerance
+    inside = probs("2024-01-31")                                       # stale INSIDE the window: a problem, rule named
+    assert len(inside) == 1 and "C (last bar " + last + ")" in inside[0] and "reference date 2024-01-31" in inside[0]
+    reach = probs("2024-03-28")                                        # a window reaching the panel end: refuses
+    assert len(reach) == 1 and "reference date 2024-03-28" in reach[0]
+    assert len(probs("2024-04-05")) == 1 and "reference date 2024-03-28" in probs("2024-04-05")[0]   # past the last bar: judged at it

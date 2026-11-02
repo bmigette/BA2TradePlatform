@@ -1,0 +1,310 @@
+{
+ "_doc": "REVIEWED decisions on individual split events, applied by split_table.decide_splits. An entry decides the event of its symbol on event_date (any date a vendor lists for it, or a date nobody lists: an 'accept' then ADDS the split) outright, whatever the price jump says. Never a silent tolerance: every entry needs symbol, event_date (ISO), decision ('accept' needs a ratio = new shares / old shares; 'reject' drops the event), reason, added and reviewed_by; an entry whose reviewed_by starts with 'pending' REFUSES the build. A 'reject' also silences the 'unexplained_jump' review row at its date. The file's bytes are part of the split table's fingerprint. A 'reject' decides a split LISTING only: spin-off adjustments are computed from Alpaca's spin_offs and are never blocked by an override. KINDS: 'split' (default), 'spinoff' (ratio = the factor prices before the date are divided by; a split and a spinoff entry on one symbol/date compose, both applied) and 'bar_cap' (needs field High|Low and decision 'accept', no ratio): the BUILD caps that daily High/Low at the 5-minute all-session envelope bound, no witness needed (a row of bar_repairs.csv with witness 'override'); split_table.decide_splits never sees bar_cap entries.",
+ "entries": [
+  {
+   "symbol": "VTOL",
+   "event_date": "2020-06-12",
+   "decision": "accept",
+   "ratio": 0.3333333333333333,
+   "reason": "Bristow/Era 1:3; FMP lists 0.5 but applied 0.333; jump 0.316",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "WHWK",
+   "event_date": "2021-08-27",
+   "decision": "accept",
+   "ratio": 0.06666666666666667,
+   "reason": "FMP lists the ratio inverted (15) but applied 1/15; jump 0.073",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ENOV",
+   "event_date": "2022-04-05",
+   "decision": "accept",
+   "ratio": 0.3333333333333333,
+   "reason": "Colfax 1:3 reverse split on the day of the ESAB spin-off; the jump mixes both",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "IRON",
+   "event_date": "2022-12-30",
+   "decision": "accept",
+   "ratio": 0.1,
+   "reason": "FMP-only, FMP applied it; jump 0.065 just outside x1.5",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "JBIO",
+   "event_date": "2025-04-29",
+   "decision": "accept",
+   "ratio": 0.02857142857142857,
+   "reason": "Aerovate 1:35 reverse split with the Jade merger; both vendors list it",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CRESY",
+   "event_date": "2025-11-28",
+   "decision": "reject",
+   "reason": "0.85% share distribution, not a split; immaterial, not adjusted (owner 2026-10-20)",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "AMC",
+   "event_date": "2022-08-22",
+   "decision": "reject",
+   "reason": "split LISTING rejected: FMP lists the APE preferred-unit distribution as a 2:1 split; it is not one (any spin-off adjustment is separate)",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "BIP",
+   "event_date": "2020-03-31",
+   "decision": "reject",
+   "reason": "split LISTING rejected: the BIPC share distribution is not a split",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "NVS",
+   "event_date": "2019-04-09",
+   "decision": "reject",
+   "reason": "split LISTING rejected: FMP lists the Alcon spin-off as a split; the spin-off is adjusted by the spin-off rule where Alpaca lists it",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ADEA",
+   "event_date": "2022-10-03",
+   "decision": "reject",
+   "reason": "split LISTING rejected: FMP lists the Xperi/Adeia separation as a 3.78 split",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CTVA",
+   "event_date": "2026-10-01",
+   "decision": "reject",
+   "reason": "split LISTING rejected: FMP lists the Vylr spin-off as a split but did not apply it; the spin-off is adjusted by the spin-off rule (Alpaca spin_offs lists VYLR)",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "QH",
+   "event_date": "2022-08-12",
+   "decision": "accept",
+   "ratio": 0.1,
+   "reason": "ADS ratio change 1 ADS = 10 Class A shares (Quhuo 6-K, 2022-08-09), effect of a 1-for-10 reverse ADS split; Yahoo does not list it",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "STSS",
+   "event_date": "2025-04-28",
+   "decision": "accept",
+   "ratio": 0.0033333333333333335,
+   "reason": "1-for-300 reverse split effective 2025-04-27 11:59 PM ET, post-split trading 2025-04-28 (Sharps Technology 8-K); FMP's step reads ~1/303",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "JFB",
+   "event_date": "2026-03-25",
+   "decision": "accept",
+   "ratio": 2.0,
+   "reason": "2-for-1 forward split, split-adjusted trading from 2026-03-25 (JFB Form 425, 2026-03-12 update)",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "SM",
+   "event_date": "2020-03-09",
+   "decision": "reject",
+   "reason": "no split; the -52% move is the 2020-03-09 oil/COVID crash; Yahoo lists none; FMP data error",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "DBVT",
+   "event_date": "2020-03-17",
+   "decision": "reject",
+   "reason": "no split in 2020 (Yahoo lists only 2024-06-07 1:2); COVID crash move; FMP data error",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "RLMD",
+   "event_date": "2024-12-04",
+   "decision": "reject",
+   "reason": "no split; -70% on the REL-1017 futility readout (2024-12-04); FMP data error",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CLSK",
+   "event_date": "2020-04-09",
+   "decision": "reject",
+   "reason": "no split; CleanSpark's 1-for-10 reverse split was 2019-12-11 (SEC 10-K FY2020); FMP data error",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "FWDI",
+   "event_date": "2018-01-19",
+   "decision": "reject",
+   "reason": "no split found in 2018 (Forward Industries' only reverse split is 1-for-10 on 2024-06-18); FMP data error",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2016-11-30",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2016 10-K: '23rd consecutive year', distributed 2016-12-19 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235617000009/cbsh1231201610k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2017-11-29",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2017 10-K: '24th', distributed 2017-12-18 (https://www.sec.gov/Archives/edgar/data/0000022356/000002235618000015/cbsh1231201710k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CBSH",
+   "event_date": "2019-12-02",
+   "decision": "accept",
+   "ratio": 1.05,
+   "reason": "5% stock dividend listed by FMP only (FMP step equals it); the company's 10-K confirms it: FY2019 10-K: '26 years' (https://www.sec.gov/Archives/edgar/data/22356/000002235620000009/cbsh1231201910k.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CENT",
+   "event_date": "2024-02-09",
+   "decision": "reject",
+   "reason": "split LISTING rejected: the 1.277 split is the CENTA spin-off listed as a split; there is no corporate action: raw close 49.82 -> 41.43 (0.832), CENTA 43.31 -> 35.90 (0.829) the same day (earnings), FMP flat",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CENT",
+   "event_date": "2024-02-09",
+   "decision": "reject",
+   "kind": "spinoff",
+   "reason": "spin-off adjustment rejected: CENT and CENTA fell together (0.832 / 0.829) on earnings, FMP's series is flat: no corporate action",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "CRESY",
+   "event_date": "2023-12-06",
+   "decision": "reject",
+   "reason": "split LISTING rejected (the owner's earlier decision, as for 2025-11-28): a 1.00985 stock dividend, immaterial and not adjusted; the IRS spin-off of the same day is adjusted by the spin-off rule (factor ~1.0368, FMP adj/raw step ~1.0093)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "VGR",
+   "event_date": "2021-12-30",
+   "decision": "reject",
+   "reason": "split LISTING rejected: the 1.41 'split' is the Douglas Elliman (DOUG) spin-off; raw close 17.16 -> 11.30 (1/1.519) is the spin-off drop (0.5 x 12.13 / 11.30 + 1 = 1.5367), no price support beyond it; FMP applied its own 1.41 listing",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "VGR",
+   "event_date": "2021-12-30",
+   "kind": "spinoff",
+   "decision": "accept",
+   "ratio": 1.5367,
+   "reason": "Douglas Elliman (DOUG) spin-off, 0.5 DOUG per VGR share: factor 1 + 0.5 x 12.13 / 11.30 = 1.5367; the raw drop 17.16 -> 11.30 (1/1.519) matches",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "KG",
+   "event_date": "2025-05-28",
+   "decision": "accept",
+   "ratio": 0.05,
+   "reason": "1-for-20: Maiden Holdings -> Kestrel Group combination, Kestrel began trading as KG on 2025-05-28; sources https://us.trendlyne.com/us/equity/corporate-actions/KG/3120360/kestrel-group-ltd and https://www.digrin.com/stocks/detail/KG/stock_split; FMP lists 0.05",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "SPRB",
+   "event_date": "2025-08-05",
+   "decision": "accept",
+   "ratio": 0.013333333333333334,
+   "reason": "Spruce Biosciences 1-for-75 reverse split effective 2025-08-04 (SEC 8-K https://www.sec.gov/Archives/edgar/data/1683553/000095017025098340/sprb-20250722.htm); OTC as SPRBD from 2025-08-07, back on Nasdaq as SPRB 2025-09-15 (10-Q https://www.sec.gov/Archives/edgar/data/1683553/000119312525274234/sprb-20250930.htm). FMP lists it on 2025-08-05; Alpaca has no traded bar 2025-04-29..2025-09-12, so the jump cannot prove it",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "TIGO",
+   "event_date": "2022-05-20",
+   "decision": "accept",
+   "ratio": 1.273,
+   "reason": "Millicom rights offering, 7 new shares per 10 at USD 10.61, record date 2022-05-23 (ex 2022-05-20; SEC FWP https://www.sec.gov/Archives/edgar/data/912958/000095010322008225/dp172826_fwp.htm); TERP factor (10 x 22.195 + 7 x 10.61) / 17 -> 1.274; FMP lists 1.273 as a split and does not adjust its prices, Yahoo does not adjust either (gate yahoo run 2019-01-09..2022-05-19 at 0.7855 = 1 / 1.273); adjusted like a split so a holder does not book the rights' value as a loss",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-22"
+  },
+  {
+   "symbol": "LENZ",
+   "event_date": "2024-03-22",
+   "decision": "accept",
+   "ratio": 0.14285714285714285,
+   "reason": "Graphite Bio 1-for-7 reverse split with the LENZ merger, split-adjusted trading from 2024-03-22 (SEC 8-K https://www.sec.gov/Archives/edgar/data/1815776/000162828024012633/lenz-20240321.htm)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "ENLV",
+   "event_date": "2017-09-25",
+   "decision": "accept",
+   "ratio": 0.2,
+   "reason": "Bioblast Pharma 1-for-5 reverse split effective 2017-09-25 (https://www.biospace.com/bioblast-pharma-announces-effectiveness-of-five-to-one-reverse-split); FMP and Yahoo both apply it",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "ENOV",
+   "event_date": "2022-04-05",
+   "kind": "spinoff",
+   "decision": "accept",
+   "ratio": 1.743,
+   "reason": "ESAB distribution (1 ESAB per 3 Colfax shares) on the same day as the accepted 1:3 reverse split: composes with it; factor 1.743 = FMP's adjustment step (prices before the date are divided by it)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "KORE",
+   "event_date": "2023-05-23",
+   "kind": "bar_cap",
+   "field": "Low",
+   "decision": "accept",
+   "reason": "bad print: daily Low 0.60 against the 5-minute all-session envelope 8.1; FMP carries the same bad print, Yahoo has no data; capped at the envelope bound",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "SHMD",
+   "event_date": "2024-04-23",
+   "kind": "bar_cap",
+   "field": "High",
+   "decision": "accept",
+   "reason": "bad print: daily High 11.42 against the 5-minute all-session envelope 10.82; no witness available (pre-listing day); capped at the envelope bound",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  }
+ ]
+}

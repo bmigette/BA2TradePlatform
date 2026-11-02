@@ -570,7 +570,13 @@ def _job_status(job_id: str) -> dict:
         _rebuild_pool(e)
         result = {"ok": False, "error": repr(e), "fatal": False, "retryable": True}
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the poller
-        result = {"ok": False, "error": repr(e), "fatal": False}
+        # Type, message and traceback go BACK to the master in the result (it logs them in its job
+        # log) and are logged here too, so the failure is visible from both ends.
+        import traceback as _tb
+        _tb_text = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-6000:]
+        logger.error("job %s raised %s: %s\n%s", job_id, type(e).__name__, e, _tb_text)
+        result = {"ok": False, "error": repr(e), "fatal": False, "error_type": type(e).__name__,
+                  "traceback": _tb_text}
     # A market-condition preparation is admitted HERE, where its result is collected: this is the
     # one place every finished job passes through (the registry entry is popped above, so the
     # result is delivered exactly once).
@@ -1111,10 +1117,21 @@ def market_conditions_prepare(req: PrepareMarketConditionsReq, request: Request,
 
 
 @worker_app.get("/cache/manifest")
-def cache_manifest(request: Request, with_hash: bool = False,
+def cache_manifest(request: Request, with_hash: bool = False, hash_dirs: Optional[str] = None,
                    authorization: str = Header(default=None)):
+    """The worker's cache file list. ``hash_dirs`` (comma-separated TOP-LEVEL folder names) adds a
+    ``crc32`` to the entries under those folders only -- the push's content check of the folders
+    rebuilt in place (``cache_sync.add_crc32``; unchanged files come from the per-host crc cache).
+    ``with_hash`` hashes EVERY file (the slow full integrity check)."""
     _verify(authorization, request)
-    return _cached_manifest(with_hash=with_hash)
+    manifest = _cached_manifest(with_hash=with_hash)
+    if not hash_dirs or with_hash:
+        return manifest
+    dirnames = [d for d in hash_dirs.split(",") if d]
+    bad = [d for d in dirnames if d in (".", "..") or "/" in d or "\\" in d]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"hash_dirs must be top-level folder names: {bad}")
+    return cache_sync.add_crc32(manifest, dirnames)
 
 
 @worker_app.post("/cache/push")

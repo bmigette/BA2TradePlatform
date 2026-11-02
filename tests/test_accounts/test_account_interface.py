@@ -209,19 +209,32 @@ class _StubExpertResolver:
 
 
 class _StubExpertInterface:
-    """Only the one method ``_validate_expert_available_balance`` calls.
+    """A canned ``get_available_balance`` for ``_validate_expert_available_balance``,
+    delegating everything else -- notably ``get_setting_with_interface_default`` -- to a
+    REAL expert instance so ``max_virtual_equity_per_instrument_percent`` keeps reading the
+    ``ExpertSetting`` row ``_expert_with_cap`` wrote, exactly as before
+    ``_validate_position_size_limits`` started resolving the cap through this same
+    resolver seam (2026-09-29) instead of a raw DB-rows read.
 
     Records the ``exclude_transaction_id`` it was called with: which branch excludes
     the order's own WAITING transaction is a real money decision, not a detail.
     """
 
-    def __init__(self, available_balance):
+    def __init__(self, available_balance, expert_instance_id=None):
         self._available_balance = available_balance
         self.exclude_calls = []
+        self._real = MockExpert(expert_instance_id) if expert_instance_id is not None else None
 
     def get_available_balance(self, exclude_transaction_id=None):
         self.exclude_calls.append(exclude_transaction_id)
         return self._available_balance
+
+    def get_setting_with_interface_default(self, key, log_warning=True):
+        if self._real is None:
+            raise AttributeError(
+                "_StubExpertInterface has no real expert to delegate "
+                f"get_setting_with_interface_default({key!r}) to -- pass expert_instance_id.")
+        return self._real.get_setting_with_interface_default(key, log_warning=log_warning)
 
 
 class TestPositionSizeGuardsRunForDictShapedBrokers:
@@ -242,7 +255,7 @@ class TestPositionSizeGuardsRunForDictShapedBrokers:
         # Expert balance is not the constraint here -- the per-instrument cap is.
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
 
         transaction = create_transaction(
@@ -271,7 +284,7 @@ class TestPositionSizeGuardsRunForDictShapedBrokers:
 
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000.0, expert_instance_id=expert_instance.id)),
         )
 
         transaction = create_transaction(
@@ -305,7 +318,7 @@ class TestPositionSizeGuardsRunForDictShapedBrokers:
 
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
 
         transaction = create_transaction(
@@ -334,6 +347,16 @@ class TestPositionSizeGuardsRunForDictShapedBrokers:
         account = _MuteAccount(acct_def.id)
         account._prices["AAPL"] = 150.0
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        # The cap is now resolved through the live InstanceResolver seam BEFORE the
+        # equity read; "MockExpert" is a test-only Python double, not registered in the
+        # live class registry, so this must be stubbed like every sibling test below --
+        # otherwise the (unrelated) unresolvable-expert-type path fires first and masks
+        # the equity failure this test exists to pin.
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(
+                available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
+        )
 
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
@@ -379,6 +402,259 @@ class TestPositionSizeGuardsRunForDictShapedBrokers:
 
         assert errors, "a crashed risk control must not report success"
         assert any("could not be completed" in e for e in errors), errors
+
+
+class TestPositionSizeCapHonoursTheDeclaredDefault:
+    """2026-09-29 fix (unify FactorRanker's per-name cap with the platform-wide one).
+
+    ``_validate_position_size_limits`` used to load ONLY stored ``ExpertSetting`` rows
+    (``_get_expert_settings_for_validation``) and did ``settings.get(key)`` with no
+    fallback, so an expert instance with NO stored
+    ``max_virtual_equity_per_instrument_percent`` row skipped this defense-in-depth gate
+    entirely -- while the classic risk manager (``TradeRiskManagement.py``, which always
+    reads through ``get_setting_with_interface_default``) applied the class's declared
+    10%. Every FactorRanker instance deployed before this fix had no stored row for this
+    key. The fix resolves the cap through the SAME resolver + interface-default seam.
+    """
+
+    def test_no_stored_row_falls_back_to_the_declared_default(self, monkeypatch):
+        """No ExpertSetting row at all for this key. Before the fix this returned []
+        (the check silently skipped); MockExpert declares no override, so
+        MarketExpertInterface's builtin 10% must now apply."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = create_expert_instance(
+            account_id=acct_def.id, expert="MockExpert", virtual_equity_pct=100.0)
+        # Deliberately no _expert_with_cap call -- no stored row for the cap setting.
+        # "MockExpert" is a test-only Python double, not in the live class registry, so
+        # the resolver must be stubbed (as every other test below does) -- the stub still
+        # delegates get_setting_with_interface_default to a REAL MockExpert(id), so the
+        # declared-default fallback under test still runs for real.
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(
+                available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
+        )
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        # $100k equity x 100% virtual x declared-default 10% = $10k max. 100 x $150 = $15k.
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeds expert's max allowed" in e for e in errors), errors
+        assert any("$10000.00" in e for e in errors), errors
+
+    def test_no_stored_row_and_an_order_within_the_declared_default_passes(self, monkeypatch):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = create_expert_instance(
+            account_id=acct_def.id, expert="MockExpert", virtual_equity_pct=100.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(
+                available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
+        )
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        # 50 x $150 = $7,500, under the declared-default $10,000 cap.
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=50.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_stored_row_still_wins_over_the_declared_default(self, monkeypatch):
+        """The fallback only fires when nothing is stored -- an explicit stored value
+        (however loose) must still be honoured, exactly as before."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=50.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(
+                available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
+        )
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        # 100 x $150 = $15k, over the declared 10% ($10k) but under the STORED 50% ($50k).
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+
+class TestPositionSizeCapRefusesAnUnresolvableExpertType:
+    """The cap is resolved through the SAME InstanceResolver seam the classic risk
+    manager uses (TradeRiskManagement.py); an expert type the resolver cannot
+    instantiate must fail the validation loudly, never skip it silently."""
+
+    def test_a_resolver_returning_no_expert_refuses_the_order(self, monkeypatch):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = create_expert_instance(
+            account_id=acct_def.id, expert="NoSuchExpertClass", virtual_equity_pct=100.0)
+
+        class _NoneResolver:
+            def get_expert_instance(self, expert_id):
+                return None
+
+            def get_account_instance(self, account_id):
+                raise NotImplementedError
+
+            def get_account_instance_from_transaction(self, transaction):
+                raise NotImplementedError
+
+        monkeypatch.setattr("ba2_common.core.instance_resolver._resolver", _NoneResolver())
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "an unresolvable expert type must refuse, not silently pass"
+        assert any("could not be resolved" in e for e in errors), errors
+
+    def test_a_resolver_that_raises_for_an_unknown_type_still_refuses_loudly(self, monkeypatch):
+        """The REAL LiveInstanceResolver raises ValueError for an unregistered expert
+        name (``get_expert_instance_from_id``) rather than returning None -- the
+        method's outer crash-is-not-a-pass handler must still catch it and refuse."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = create_expert_instance(
+            account_id=acct_def.id, expert="NoSuchExpertClass", virtual_equity_pct=100.0)
+
+        class _RaisingResolver:
+            def get_expert_instance(self, expert_id):
+                raise ValueError("Unknown expert type: NoSuchExpertClass")
+
+            def get_account_instance(self, account_id):
+                raise NotImplementedError
+
+            def get_account_instance_from_transaction(self, transaction):
+                raise NotImplementedError
+
+        monkeypatch.setattr("ba2_common.core.instance_resolver._resolver", _RaisingResolver())
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a crashed expert resolution must not report success"
+
+
+class TestBypassExpertSkipsTheAvailableBalanceGuard:
+    """Found 2026-09-29 fixing the per-instrument cap default: a ``bypasses_classic_rm``
+    expert (e.g. FactorRanker) sizes a WHOLE basket off ONE equity snapshot taken up
+    front, but ``_validate_expert_available_balance`` models the classic RM's world --
+    one order at a time, each spending down a remaining cash-like balance. Before the
+    cap-default fix, any instance with no stored per-instrument-cap row skipped BOTH
+    guards via one early return, so this mismatch was never reached for a real
+    FactorRanker order. The cap now always resolves (stored or declared default), so the
+    available-balance guard must be explicitly skipped for a bypass expert instead of
+    firing on a metric its sizer never consulted."""
+
+    def test_a_bypass_expert_is_not_gated_by_available_balance(self, monkeypatch):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+
+        class _BypassExpert:
+            bypasses_classic_rm = True
+
+            def get_available_balance(self, exclude_transaction_id=None):
+                return -1_000_000.0   # would refuse ANY order if this guard ran
+
+            def get_setting_with_interface_default(self, key, log_warning=True):
+                return MockExpert(expert_instance.id).get_setting_with_interface_default(
+                    key, log_warning=log_warning)
+
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_BypassExpert()),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_non_bypass_expert_is_still_gated_by_available_balance(self, monkeypatch):
+        """The inverse: an ordinary expert (no bypasses_classic_rm) must still hit the
+        available-balance guard -- this is not a general weakening of the check."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(
+                available_balance=-1_000_000.0, expert_instance_id=expert_instance.id)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+        assert any("available balance" in e for e in errors), errors
 
 
 class TestGetInstrumentPrice:
@@ -466,7 +742,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=None)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=None, expert_instance_id=expert_instance.id)),
         )
         errors_logged = _capture_errors(monkeypatch)
         order, transaction = self._order_and_txn(acct_def, expert_instance)
@@ -488,7 +764,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=None)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=None, expert_instance_id=expert_instance.id)),
         )
         order, transaction = self._order_and_txn(acct_def, expert_instance)
         # An existing SAME-SIDE entry order makes this an "adding to position" order.
@@ -519,7 +795,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=0.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=0.0, expert_instance_id=expert_instance.id)),
         )
         order, transaction = self._order_and_txn(acct_def, expert_instance)
         create_trading_order(
@@ -543,7 +819,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=10_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=10_000.0, expert_instance_id=expert_instance.id)),
         )
         order, transaction = self._order_and_txn(acct_def, expert_instance)
         create_trading_order(
@@ -565,7 +841,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=0.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=0.0, expert_instance_id=expert_instance.id)),
         )
         order, transaction = self._order_and_txn(acct_def, expert_instance)
 
@@ -584,7 +860,7 @@ class TestUnreadableBalanceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=10_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=10_000.0, expert_instance_id=expert_instance.id)),
         )
         order, transaction = self._order_and_txn(acct_def, expert_instance)
 
@@ -602,7 +878,7 @@ class TestUnreadablePriceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         # A dead quote feed: the symbol resolves to no price at all.
         monkeypatch.setattr(account, "get_instrument_current_price", lambda *_a, **_k: None)
@@ -633,7 +909,7 @@ class TestUnreadablePriceIsNotAPass:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
@@ -676,7 +952,7 @@ class TestAZeroQuoteIsNotAPrice:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         # Patch the SEAM, not ``_prices``: get_instrument_current_price caches any
         # non-None price in a CLASS-level dict keyed by account id, so a canned 0.0
@@ -779,7 +1055,7 @@ class TestAZeroQuoteIsNotAPrice:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
@@ -855,7 +1131,7 @@ class TestTheGatesActuallyStopTheOrder:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         monkeypatch.setattr(account, "get_instrument_current_price",
                             lambda *_a, **_k: price)
@@ -1120,7 +1396,7 @@ class TestPerInstrumentCapHonoursItsOwnNumbers:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=0.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
@@ -1150,7 +1426,7 @@ class TestPerInstrumentCapHonoursItsOwnNumbers:
                                            virtual_equity_pct=50.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         # Already holding 30 shares = $4,500 -- inside the cap on its own.
         transaction = create_transaction(
@@ -1183,7 +1459,7 @@ class TestPerInstrumentCapHonoursItsOwnNumbers:
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
-        stub = _StubExpertInterface(available_balance=10_000.0)
+        stub = _StubExpertInterface(available_balance=10_000.0, expert_instance_id=expert_instance.id)
         monkeypatch.setattr("ba2_common.core.instance_resolver._resolver",
                             _StubExpertResolver(stub))
         transaction = create_transaction(
@@ -1214,7 +1490,7 @@ class TestPerInstrumentCapHonoursItsOwnNumbers:
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
-        stub = _StubExpertInterface(available_balance=10_000.0)
+        stub = _StubExpertInterface(available_balance=10_000.0, expert_instance_id=expert_instance.id)
         monkeypatch.setattr("ba2_common.core.instance_resolver._resolver",
                             _StubExpertResolver(stub))
         transaction = create_transaction(
@@ -1271,7 +1547,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=ordered_qty, side=OrderDirection.BUY,
@@ -1382,7 +1658,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=999.0, side=OrderDirection.BUY,
@@ -1423,7 +1699,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
@@ -1456,7 +1732,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
                                            virtual_equity_pct=0.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
@@ -1491,7 +1767,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
@@ -1575,7 +1851,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=60.0, side=OrderDirection.SELL,
@@ -1649,7 +1925,7 @@ class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
@@ -1693,7 +1969,7 @@ class TestTheLimitsAreMaximaNotExclusiveBounds:
         expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
         monkeypatch.setattr(
             "ba2_common.core.instance_resolver._resolver",
-            _StubExpertResolver(_StubExpertInterface(available_balance=available_balance)),
+            _StubExpertResolver(_StubExpertInterface(available_balance=available_balance, expert_instance_id=expert_instance.id)),
         )
         transaction = create_transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,

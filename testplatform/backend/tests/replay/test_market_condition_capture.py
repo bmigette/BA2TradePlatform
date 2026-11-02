@@ -124,7 +124,7 @@ def test_one_observation_per_symbol_session_window(recorded):
         assert o.request_identity["session"] == PRIOR.isoformat()
         assert o.request_identity["source_profile"] == "fmp-daily-split-adjusted-v1"
         assert o.request_identity["timing_policy"] == "prior_session_v1"
-        assert o.request_identity["calc_version"] == "ohlcv-v1/calc-1"
+        assert o.request_identity["calc_version"] == "ohlcv-v1/calc-2"
     assert recorded["results"][("AAA", ExpertEventType.N_UNDERLYING_ADX)][:2] == (True, STATUS_VALID)
     assert recorded["results"][("YNG", ExpertEventType.N_UNDERLYING_ADX)][:2] == (False, STATUS_INSUFFICIENT_HISTORY)
 

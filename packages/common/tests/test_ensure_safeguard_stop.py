@@ -71,3 +71,62 @@ def test_short_order_safeguard_stop_is_above_price():
     order = _order(stop_price=None, side=OrderDirection.SELL)
     rm._ensure_safeguard_stop(order, "CALX", current_price=36.80, expert=expert)
     assert order.stop_price == pytest.approx(36.80 * (1 + 0.14), abs=0.01)
+
+
+@pytest.mark.parametrize("stored, expected", [
+    (False, False),
+    (True, True),
+    (0, False),
+    (1, True),
+    ("0", False),   # THE historic defect: bool("0") is True. coerce_bool must read it False.
+    ("1", True),
+    ("true", True),
+    ("false", False),
+])
+def test_use_atr_stop_is_read_through_coerce_bool_not_bool(stored, expected, monkeypatch):
+    """Parity test (atr_grid_2027 design §3.2 item 7): the value reaching _ensure_safeguard_stop
+    must be a REAL bool for both the shape a GA int gene arrives in (backtest path: 0/1) and the
+    shape a stored live setting can arrive in (legacy string spellings, incl. the "1"/"0" defect
+    coerce_bool exists for). bool("0") is True; this pins the read goes through coerce_bool
+    instead, so the off-by-stringification defect that pinned use_atr_stop off in EVERY run on
+    record cannot resurface through this one call site."""
+    import ba2_common.core.position_sizing as ps
+
+    seen = {}
+
+    def _fake_synth(price, is_long, risk_pct, *, atr=None, atr_multiplier=2.0, min_stop_pct=7.0,
+                    trace=None):
+        seen["risk_pct"] = risk_pct
+        seen["atr"] = atr
+        return price * 0.9
+
+    monkeypatch.setattr(ps, "get_latest_atr", lambda *a, **k: 5.0)
+    monkeypatch.setattr(ps, "synthesize_safeguard_stop", _fake_synth)
+    rm = TradeRiskManagement()
+    expert = _ExpertStub({
+        "risk_per_trade_pct": 1.5, "atr_multiplier": 2.0, "atr_period": 14,
+        "min_stop_loss_pct": 3.0, "use_atr_stop": stored,
+    })
+    order = _order(stop_price=None)
+    rm._ensure_safeguard_stop(order, "AAPL", current_price=100.0, expert=expert)
+    # ATR was fetched (and therefore fed into the synthesiser as non-None) iff the coerced value
+    # is True -- an indirect but unambiguous read of what use_atr_stop resolved to.
+    assert (seen["atr"] is not None) is expected
+
+
+def test_safeguard_candidate_is_recorded_on_the_trace():
+    """atr_grid_2027 design §3.3: the trace must name WHICH candidate (atr / risk_pct /
+    min_stop_floor) the safeguard stop actually came from, next to the existing 'binding'
+    fields, so results can report the ATR-bound share of entries. Result-neutral: stop_price is
+    unaffected by whether a trace is passed."""
+    rm = TradeRiskManagement()
+    expert = _ExpertStub({
+        "risk_per_trade_pct": 1.5, "atr_multiplier": 2.0, "atr_period": 14,
+        "min_stop_loss_pct": 0.0, "use_atr_stop": False,
+    })
+    order = _order(stop_price=None)
+    trace: dict = {}
+    rm._ensure_safeguard_stop(order, "AAPL", current_price=100.0, expert=expert, trace=trace)
+    # use_atr_stop is off, so no ATR candidate exists -- the risk% distance must win.
+    assert trace.get("safeguard_candidate") == "risk_pct"
+    assert order.stop_price == pytest.approx(100.0 * (1 - 0.015), abs=0.01)

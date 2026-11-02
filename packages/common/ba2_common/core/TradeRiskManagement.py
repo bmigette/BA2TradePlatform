@@ -10,15 +10,22 @@ import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
+from ba2_common.core.knowability import require_decision_price
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
-from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission
+from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
-from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, OrderStatus, OrderDirection,
+                                   TransactionStatus)
 from ba2_common.core.db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.share_grid import (
+    PROTECTIVE_ORDERS_BLOCK_FRACTIONAL, WHOLE_SHARE, floor_to_unit, fractional_unit,
+    is_whole_grid,
+)
 
 if TYPE_CHECKING:
     from ba2_common.core.interfaces import MarketExpertInterface
@@ -71,7 +78,7 @@ DECISION_TRACE_FIELDS = (
     "existing_allocation", "cap_available", "balance_before",
     "max_qty_by_instrument", "max_qty_by_balance", "balance_after", "binding",
     "stop_price", "stop_distance_pct", "risk_budget_pct", "risk_dollars", "qty_by_risk",
-    "refusal_reason",
+    "refusal_reason", "safeguard_candidate",
 )
 
 
@@ -140,6 +147,20 @@ def apply_lot_size(order_data: dict, quantity: int) -> int | None:
     return (int(quantity) // lot) * lot
 
 
+#: Host seam: ``fn(expert_id) -> indicator provider | None`` (plan 2026-10-24-history-source-task11: ATR follows the
+#: account's history source; None = the default stack). Unwired = always the injected provider.
+_indicator_provider_resolver = None
+
+
+def set_indicator_provider_resolver(fn) -> None:
+    global _indicator_provider_resolver
+    _indicator_provider_resolver = fn
+
+
+def get_indicator_provider_resolver():
+    return _indicator_provider_resolver
+
+
 class TradeRiskManagement:
     """
     Risk management system for automated trading orders.
@@ -173,6 +194,15 @@ class TradeRiskManagement:
         self.logger = logger
         self.indicator_provider = indicator_provider
         self.as_of = as_of
+
+    def _indicator_provider_for(self, expert):
+        """The ATR indicator provider for ``expert``'s orders. LIVE only (``as_of`` None): the host seam may name a
+        provider built on the expert's account history source (an ``alpaca`` account); None (an ``fmp`` account, no seam)
+        keeps the injected default, exactly as before. A backtest (``as_of`` given) always uses its injected provider."""
+        if self.as_of is not None or _indicator_provider_resolver is None:
+            return self.indicator_provider
+        override = _indicator_provider_resolver(expert.id)
+        return override if override is not None else self.indicator_provider
     
     def review_and_prioritize_pending_orders(self, expert_instance_id: int) -> List[TradingOrder]:
         """
@@ -409,9 +439,16 @@ class TradeRiskManagement:
         # the capital-mapping line below reports. Asking for those separately would run
         # the whole pass -- a transactions query and a bulk price fetch -- a second time,
         # and would explain a DIFFERENT instant than the one this sizing decision used.
-        balances = expert._available_balance_breakdown()
+        from ba2_common.core.interfaces.MarketExpertInterface import CAPITAL_REPAIR_HINT
+        capital_failure: List[str] = []
+        balances = expert._available_balance_breakdown(failure=capital_failure)
         if balances is None:
+            # An expert that HOLDS OPTIONS can reach this because one of its option rows cannot be
+            # valued (``used_balance_for_transactions`` refuses: unknown is never zero). Name it,
+            # and say how to repair it. A stock-only expert has no option row to be unreadable.
             error_msg = f"Could not get available balance for expert {expert_instance_id}"
+            if capital_failure:
+                error_msg += ": " + "; ".join(capital_failure) + ". " + CAPITAL_REPAIR_HINT
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
         # ...net of the collateral this expert's open option positions reserve (stage-2 E1b):
@@ -494,7 +531,8 @@ class TradeRiskManagement:
         return (orders_to_update, orders_to_delete, symbol_prices,
                 total_virtual_balance, max_equity_per_instrument)
 
-    def size_candidate_orders(self, expert_instance_id: int, candidates):
+    def size_candidate_orders(self, expert_instance_id: int, candidates,
+                              option_decisions: Optional[List[Dict[str, Any]]] = None):
         """Size a list of IN-MEMORY candidate (TradingOrder, ExpertRecommendation) pairs and return
         the funded subset — the temp-order-list order flow.
 
@@ -514,14 +552,21 @@ class TradeRiskManagement:
         path — this IS the live enter path, so it is the one that must carry the "why did
         nothing trade today?" record, not just the DB path nothing on dev actually calls (see
         ``_record_candidate_run``).
+
+        ``option_decisions``: rows (``risk_manager_run.option_entry_decision``) for the
+        OPTION entries this pass already executed. They size and submit themselves and never
+        reach this sizing, but they are part of the same pass, so they are appended to its
+        run -- and recorded on their own when the pass had no equity candidate to size.
         """
         from ba2_common.core.instance_resolver import get_instance_resolver
 
         # Monotonic, so the recorded duration cannot jump if the wall clock is adjusted
         # mid-run. Taken before ANY work, matching review_and_prioritize_pending_orders.
         run_started_at = time.monotonic()
+        option_decisions = list(option_decisions or [])
 
         if not candidates:
+            self._record_option_only_run(expert_instance_id, option_decisions, run_started_at)
             return []
 
         expert = get_instance_resolver().get_expert_instance(expert_instance_id)
@@ -557,6 +602,7 @@ class TradeRiskManagement:
         for o in dropped_by_permission:
             self.logger.debug(f"candidate {o.symbol} {o.side} dropped by buy/sell permission filter")
         if not pairs:
+            self._record_option_only_run(expert_instance_id, option_decisions, run_started_at)
             return []
 
         run_record: Dict[str, Any] = {}
@@ -582,8 +628,32 @@ class TradeRiskManagement:
             traces=run_record.get("traces"),
             context=self._run_context_with_permissions(
                 run_record, enable_buy=enable_buy, enable_sell=enable_sell),
+            extra_decisions=option_decisions,
         )
         return funded
+
+    def _record_option_only_run(self, expert_instance_id: int,
+                                option_decisions: List[Dict[str, Any]],
+                                started_at: float) -> None:
+        """A classic run holding only this pass's option entries (no equity was sized).
+
+        Nothing when there are none: a pass with nothing to say writes no row, as before.
+        """
+        if not option_decisions:
+            return
+        try:
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                return
+            from ba2_common.core.risk_manager_run import MODE_CLASSIC, record_run
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            record_run(expert_instance_id=expert_instance_id,
+                       account_id=getattr(expert_instance, "account_id", None),
+                       mode=MODE_CLASSIC, decisions=option_decisions,
+                       context={"option_entries_only": True}, started_at=started_at)
+        except Exception as e:  # noqa: BLE001 -- observability must not fail the pass
+            self.logger.warning(f"Failed to record the option entries of expert "
+                                f"{expert_instance_id}'s pass: {e}")
 
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
         """Get all pending orders for an expert (RM-2: single JOIN, no N+1)."""
@@ -1074,7 +1144,7 @@ class TradeRiskManagement:
     def _record_candidate_run(self, *, expert_instance_id, account_id, started_at,
                               candidates, dropped_by_permission,
                               orders_to_update, orders_to_delete, symbol_prices,
-                              context, traces=None) -> None:
+                              context, traces=None, extra_decisions=None) -> None:
         """The in-memory-candidate twin of ``_record_classic_run``.
 
         ``size_candidate_orders`` (the LIVE enter path) never persists a qty=0 order — that
@@ -1115,6 +1185,9 @@ class TradeRiskManagement:
                 prices=symbol_prices or {},
                 cap=context.get("max_per_instrument"),
                 traces=traces)
+            # The pass's option entries (sized by their own actions), after the ranked
+            # equity rows: they carry no rank, so the funding order above is untouched.
+            decisions = list(decisions) + list(extra_decisions or [])
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,
@@ -1211,11 +1284,12 @@ class TradeRiskManagement:
         try:
             from ba2_common.core.trade_store import transactions_where, orders_where, inmem_trades_active
 
-            # Get existing transactions for this expert that are still open (dual-path: the
+            # Get existing transactions for this expert that still HOLD capital -- WAITING, OPENED and
+            # CLOSING (a resting close has not released the position; dual-path: the
             # in-memory store in a backtest, SQLite in live — same rows either way).
             transactions = transactions_where(
                 expert_id=expert_instance_id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES))
 
             for transaction in transactions:
                 symbol = transaction.symbol
@@ -1353,6 +1427,24 @@ class TradeRiskManagement:
         self.logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk")
         symbol_prices = account.get_instrument_current_price(all_symbols)
         self.logger.info(f"Bulk fetched {len(symbol_prices)} prices in single API call")
+
+        # FRACTIONAL SHARES: never here. This risk manager ALWAYS arms a protective stop --
+        # the ruleset's own SL, else the safeguard stop (notional) or the risk stop
+        # (risk_atr) -- and a broker will not carry a fractional protective order (see
+        # share_grid "NO FRACTIONS UNDER PROTECTIVE ORDERS"). An opted-in expert is told so
+        # and sized in whole shares, i.e. exactly as before the setting existed: no broker
+        # lookup, every unit below is the whole share. The grid plumbing stays so a broker
+        # that can protect a fraction only needs this line changed.
+        if expert.get_setting_with_interface_default('allow_fractional_shares', log_warning=False):
+            self.logger.warning(
+                f"allow_fractional_shares is ignored by the classic risk manager: it always "
+                f"attaches a stop-loss, and {PROTECTIVE_ORDERS_BLOCK_FRACTIONAL}. "
+                f"Sizing in whole shares.")
+            context["allow_fractional_shares_ignored"] = True
+        allow_fractional = False
+        fractionable_by_symbol = self._fractionable_by_symbol(account, all_symbols,
+                                                              allow_fractional)
+        context["allow_fractional_shares"] = allow_fractional
         
         # ``rank`` is the 1-based position in the FUNDING order -- the list is already sorted by
         # the priority score, so rank 1 is served first and the budget runs out somewhere down
@@ -1380,7 +1472,20 @@ class TradeRiskManagement:
                                      balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
+                # the anchor of the size (budget / price) and of the safeguard stop below: on an
+                # intraday clock it must be the decision price, never a daily bar
+                require_decision_price(current_price, what="position size", symbol=symbol)
                 self._trace_note(trace, price=current_price)
+
+                # THE GRID for this symbol: 1.0 (whole shares) unless the expert opted in AND
+                # the broker said True AND no round lot applies. ``min_share_cost`` is what
+                # "can afford one unit" means on that grid -- a share, or a sliver of one.
+                unit = self._quantity_unit(order, fractionable_by_symbol.get(symbol),
+                                           allow_fractional)
+                whole_grid = is_whole_grid(unit)
+                min_share_cost = current_price * unit
+                if not whole_grid:
+                    self._trace_note(trace, quantity_unit=unit)
 
                 # Log calculation inputs
                 self.logger.info(f"Order {order.id} ({symbol}) - Calculating quantity:")
@@ -1394,7 +1499,7 @@ class TradeRiskManagement:
                 # per-instrument limit. The order is marked qty=0 -> deleted (transaction
                 # cancelled) rather than left stuck PENDING. Respects the user's limit with
                 # no special-case bypass.
-                if available_for_instrument < current_price:
+                if available_for_instrument < min_share_cost:
                     self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds available per-instrument "
                                       f"${available_for_instrument:.2f} (can't afford 1 share within limit) - marking for deletion")
                     order.quantity = 0
@@ -1404,7 +1509,7 @@ class TradeRiskManagement:
                     updated_orders.append(order)
                     continue
 
-                if remaining_balance < current_price:
+                if remaining_balance < min_share_cost:
                     self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds remaining balance "
                                       f"${remaining_balance:.2f} (can't afford 1 share) - marking for deletion")
                     order.quantity = 0
@@ -1414,27 +1519,37 @@ class TradeRiskManagement:
                     updated_orders.append(order)
                     continue
 
-                # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
-                # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
-                sized_by_risk = False
-                quantity = 0
-                if sizing_mode == 'risk_atr':
-                    sized_by_risk = True
-                    quantity = self._risk_atr_quantity(
-                        order, symbol, current_price, expert,
-                        max_position_value=available_for_instrument,
-                        available_balance=remaining_balance,
-                        account=account,
-                        trace=trace,
-                        context=context,
-                    )
-                else:
-                    # notional mode still sizes purely by equity/balance below (unaffected), but
-                    # a strategy whose exit conditions set NO stop-loss must not trade fully
-                    # unprotected just because it isn't in risk_atr mode -- attach the same
-                    # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
-                    # existing bracket mechanism creates a protective SL leg).
-                    self._ensure_safeguard_stop(order, symbol, current_price, expert)
+                try:
+                    # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
+                    # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
+                    sized_by_risk = False
+                    quantity = 0
+                    if sizing_mode == 'risk_atr':
+                        sized_by_risk = True
+                        quantity = self._risk_atr_quantity(
+                            order, symbol, current_price, expert,
+                            max_position_value=available_for_instrument,
+                            available_balance=remaining_balance,
+                            account=account,
+                            trace=trace,
+                            context=context,
+                            quantity_unit=unit,
+                        )
+                    else:
+                        # notional mode still sizes purely by equity/balance below (unaffected), but
+                        # a strategy whose exit conditions set NO stop-loss must not trade fully
+                        # unprotected just because it isn't in risk_atr mode -- attach the same
+                        # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
+                        # existing bracket mechanism creates a protective SL leg).
+                        self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
+                except HistoryUnavailable as e:
+                    # the history the stop / size depends on is not usable (lock timeout, gap, stale corporate actions, a symbol too new for
+                    # the window): the order is REFUSED loudly, never sized or protected on a silently missing ATR
+                    self.logger.error(f"  Order {order.id} ({symbol}) REFUSED: history unavailable ({type(e).__name__}: {e})")
+                    order.quantity = 0
+                    self._trace_note(trace, binding="history_unavailable", quantity=0, balance_after=remaining_balance)
+                    updated_orders.append(order)
+                    continue
 
                 if not sized_by_risk:
                     # Calculate maximum affordable quantity based on available equity per instrument
@@ -1467,7 +1582,7 @@ class TradeRiskManagement:
                         quantity = 0
                         self._trace_note(trace, binding=BINDING_INSTRUMENT_CAP)
                         self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
-                    elif remaining_balance <= current_price:
+                    elif remaining_balance <= min_share_cost:
                         quantity = 0
                         self._trace_note(trace, binding=BINDING_BALANCE)
                         self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
@@ -1497,12 +1612,19 @@ class TradeRiskManagement:
                             self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
                                           f"applied factor {diversification_factor}: {original_max:.2f} -> {max_quantity:.2f} shares")
 
-                        # First rounding: float to int
-                        quantity = max(0, int(max_quantity))
-                        self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
+                        # First rounding: onto the grid. ``int`` on whole shares exactly as
+                        # before; the shared grid's floor on a fractional one.
+                        quantity = (max(0, int(max_quantity)) if whole_grid
+                                    else floor_to_unit(max_quantity, unit))
+                        self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares "
+                                         f"({'int conversion' if whole_grid else f'fractional grid {unit:g}'})")
 
-                        # Ensure we don't allocate less than 1 share unless we can't afford it
-                        if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
+                        # Ensure we don't allocate less than 1 share unless we can't afford it.
+                        # WHOLE GRID ONLY: on a fractional grid the floor above already bought
+                        # the affordable fraction, and bumping it to a whole share would spend
+                        # money the cap did not grant.
+                        if (whole_grid and quantity == 0 and max_quantity_by_balance >= 1
+                                and max_quantity_by_instrument >= 1):
                             quantity = 1
                             self._trace_note(trace, binding=BINDING_MIN_ONE_SHARE)
                             self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
@@ -1525,14 +1647,15 @@ class TradeRiskManagement:
                             self.logger.info(f"  Instrument weight {instrument_weight}%: "
                                            f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
                         
-                            # Second rounding: weighted quantity to int
-                            quantity = max(0, int(weighted_quantity))
+                            # Second rounding: weighted quantity onto the grid
+                            quantity = (max(0, int(weighted_quantity)) if whole_grid
+                                        else floor_to_unit(weighted_quantity, unit))
                             self._trace_note(trace, binding=BINDING_WEIGHT)
                             self.logger.info(f"  Second rounding: {weighted_quantity:.2f} -> {quantity} shares (int conversion)")
 
                             # CRITICAL: Ensure minimum quantity of 1 if we have funds for at least 1 share
                             # This covers the case where weighting reduces quantity below 1 after rounding
-                            if quantity == 0 and max_quantity_by_balance >= 1:
+                            if whole_grid and quantity == 0 and max_quantity_by_balance >= 1:
                                 quantity = 1
                                 self._trace_note(trace, binding=BINDING_MIN_ONE_SHARE)
                                 self.logger.info(f"  Minimum allocation enforced after weighting: setting quantity to 1 share "
@@ -1624,6 +1747,43 @@ class TradeRiskManagement:
 
         return orders_to_update, orders_to_delete, symbol_prices
 
+    def _fractionable_by_symbol(self, account, symbols, allow_fractional: bool
+                                ) -> Dict[str, Optional[bool]]:
+        """``{symbol: True/False/None}`` for this batch, or ``{}`` when not opted in.
+
+        Empty when the expert did not opt in, so an expert that never asked for fractions
+        makes no new broker call at all. A failed lookup also returns ``{}`` -- every
+        symbol then reads as unknown, which the grid sizes in WHOLE shares: the safe
+        direction, never a fraction the broker might refuse.
+        """
+        if not allow_fractional or not symbols:
+            return {}
+        getter = getattr(account, 'get_fractionable', None)
+        if getter is None:
+            return {}
+        try:
+            return getter(list(symbols)) or {}
+        except Exception as e:  # noqa: BLE001 -- sizing must degrade to whole shares
+            absorb_if_benign(e)
+            self.logger.warning(f"Fractionability lookup failed ({e}); sizing in whole shares")
+            return {}
+
+    @staticmethod
+    def _quantity_unit(order, fractionable: Optional[bool], allow_fractional: bool) -> float:
+        """The grid STEP for one order: 1.0 unless fractions are allowed AND possible.
+
+        A round lot (``order.data['lot_size'] > 1``) forces whole shares whatever the
+        broker says -- it exists for an option overlay, one contract per 100 shares, and a
+        fractional share can never be part of one.
+        """
+        try:
+            lot = int(((order.data or {}) if order.data else {}).get('lot_size') or 0)
+        except (TypeError, ValueError):
+            lot = 0
+        if lot > 1:
+            return WHOLE_SHARE
+        return fractional_unit(fractionable, allow_fractional=allow_fractional)
+
     def _commission_per_trade(self, account) -> float:
         """Per-fill commission to RESERVE out of cash before sizing, or 0.0 when unknown.
 
@@ -1670,7 +1830,8 @@ class TradeRiskManagement:
         from ba2_common.core.regime_overlay import get_stressed, regime_scale
         return regime_scale(expert, setting_name, get_stressed())
 
-    def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert) -> None:
+    def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert,
+                               trace: Optional[Dict[str, Any]] = None) -> None:
         """Write a protective stop-loss to ``order.stop_price`` when the strategy's exit
         conditions left none — REGARDLESS of ``sizing_mode``. An entry with no explicit SL must
         never trade fully unprotected just because it happens to be sized in ``notional`` mode
@@ -1680,6 +1841,11 @@ class TradeRiskManagement:
         wins). The caller (live TradeManager / backtest daily_engine, both share this method) must
         pass the result as ``submit_order(..., sl_price=order.stop_price)`` — the EXISTING bracket
         mechanism — for the WAITING_TRIGGER protective SL leg to actually be created.
+
+        ``trace`` (optional, result-neutral): the caller's per-order sizing trace, if it has one.
+        Records ``safeguard_candidate`` (atr_grid_2027 design §3.3) next to the other DECISION_
+        TRACE_FIELDS -- which candidate (ATR / risk% / the min_stop_pct floor) the safeguard stop
+        actually came from, so results can report the ATR-bound share of entries.
         """
         if order.stop_price:
             return
@@ -1703,7 +1869,13 @@ class TradeRiskManagement:
         # use_atr_stop off -> ignore ATR entirely and size purely off risk_per_trade_pct%
         # (still floored at min_stop_loss_pct%). Lets the GA/user drop ATR when its implied
         # stops are too tight and causing frequent whipsaw (see synthesize_safeguard_stop).
-        use_atr_stop = bool(expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
+        #
+        # coerce_bool, NOT bool(): the setting arrives as a GA int gene (backtest path) or a
+        # stored string (live path), and bool("0") is True -- the exact historical defect that
+        # kept this toggle silently on/off backwards until coerce_bool existed (see
+        # _INERT_RM_TOGGLES / strategy_param_space.INERT_RM_TOGGLES).
+        use_atr_stop = coerce_bool(
+            expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
 
         # REGIME OVERLAY (stop distance): all three inputs are DISTANCES here -- risk_pct and
         # min_stop_pct as percents of price, atr_mult as a multiple of ATR -- and
@@ -1723,19 +1895,22 @@ class TradeRiskManagement:
         sl_atr = None
         if use_atr_stop:
             sl_atr = get_latest_atr(
-                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+                symbol, self._indicator_provider_for(expert), period=atr_period, end_date=self.as_of)
+        _synth_trace: Dict[str, Any] = {}
         sl = synthesize_safeguard_stop(
             current_price, order.side == OrderDirection.BUY, risk_pct,
-            atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+            atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct, trace=_synth_trace)
         if sl:
             order.stop_price = sl
             self.logger.info(
                 f"  safeguard SL for {symbol}: ${sl:.2f} "
                 f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
+        self._trace_note(trace, safeguard_candidate=_synth_trace.get("safeguard_candidate"))
 
     def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
                            max_position_value: float, available_balance: float,
-                           account=None, trace=None, context=None) -> int:
+                           account=None, trace=None, context=None,
+                           quantity_unit: float = 1.0) -> float:
         """Risk-based share count for one order (risk_atr sizing mode).
 
         Stop distance comes from the order's explicit SL price when present, else
@@ -1781,7 +1956,7 @@ class TradeRiskManagement:
         # fallback; safeguard: min-of-two floored) — when they disagreed (e.g. use_atr_stop=0
         # with risk% > min_stop%) the realized loss at the stop exceeded risk_per_trade_pct by up
         # to risk%/min_stop%.
-        self._ensure_safeguard_stop(order, symbol, current_price, expert)
+        self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
 
         lot = (order.data or {}).get('lot_size') if order.data else None
         # Hoisted to a local ONLY so the run record can report the same figure the cash clamp
@@ -1796,6 +1971,7 @@ class TradeRiskManagement:
             max_position_value=max_position_value, available_balance=available_balance,
             commission_per_trade=commission,
             lot_size=int(lot) if lot else None,
+            quantity_unit=quantity_unit,
         )
         # The operands, straight off the result -- ``stop_distance_pct`` is the same
         # risk-per-share the sizer used, expressed against the price so a 7% stop is legible
@@ -1827,7 +2003,9 @@ class TradeRiskManagement:
             refusal_reason=result["reason"] or None,
         )
 
-        qty = int(result["quantity"])
+        # Already on the grid: an ``int`` on whole shares exactly as before, a float on a
+        # fractional one. Re-``int``-ing here would silently floor 2.5 shares back to 2.
+        qty = result["quantity"]
         if qty <= 0:
             self.logger.warning(f"  risk_atr sizing -> 0 for {symbol}: {result['reason']}")
             return qty

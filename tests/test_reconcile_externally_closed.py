@@ -304,3 +304,80 @@ class TestReconcileShortPositions:
 
         assert account.reconcile_externally_closed_transactions() == 0
         assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+
+class TestReconcileClosePrice:
+    """The close price of an externally closed transaction is the FILL that closed it.
+
+    It used to be the market price at reconcile time: EVER tx 202 (2026-09-11) was filled by
+    its broker-side OCO at 24.13 and recorded at 23.49, and 11 positions sold by hand at 18:16 on
+    2026-06-29 were recorded at the 20:15 price.
+    """
+
+    @staticmethod
+    def _market_price_must_not_be_used(monkeypatch, account):
+        monkeypatch.setattr(account, "get_instrument_current_price",
+                            lambda *a, **k: pytest.fail("the market price is not the close price"))
+
+    def test_its_own_filled_closing_order_sets_the_close_price(self, monkeypatch):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = []
+        txn = _open_txn(acct.id, "EVER", qty=6.0)
+        create_trading_order(
+            account_id=acct.id, symbol="EVER", quantity=6.0, side=OrderDirection.SELL,
+            order_type=OrderType.OCO, status=OrderStatus.FILLED, filled_qty=6.0,
+            open_price=24.13, transaction_id=txn.id)
+        self._market_price_must_not_be_used(monkeypatch, account)
+        monkeypatch.setattr(account, "get_closing_fill",
+                            lambda *a: pytest.fail("own fills cover the quantity"))
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        assert get_instance(Transaction, txn.id).close_price == pytest.approx(24.13)
+
+    def test_a_close_outside_the_platform_takes_the_brokers_fill(self, monkeypatch):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = []
+        txn = _open_txn(acct.id, "AMPX", qty=2.0)
+        sold_at = datetime(2026, 6, 29, 18, 16, 1, tzinfo=timezone.utc)
+        asked = []
+
+        def closing_fill(symbol, side, quantity, since):
+            asked.append((symbol, side, quantity, since))
+            return 13.6701, sold_at
+        monkeypatch.setattr(account, "get_closing_fill", closing_fill)
+        self._market_price_must_not_be_used(monkeypatch, account)
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        fresh = get_instance(Transaction, txn.id)
+        assert fresh.close_price == pytest.approx(13.6701)
+        assert fresh.close_date.replace(tzinfo=timezone.utc) == sold_at
+        assert asked[0][:3] == ("AMPX", OrderDirection.SELL, 2.0)
+
+    def test_no_fill_found_leaves_the_close_price_unknown(self, monkeypatch, caplog):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = []
+        txn = _open_txn(acct.id, "AMPX")
+        self._market_price_must_not_be_used(monkeypatch, account)
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        fresh = get_instance(Transaction, txn.id)
+        assert fresh.status == TransactionStatus.CLOSED
+        assert fresh.close_price is None
+
+    def test_partial_own_fills_defer_to_the_broker(self, monkeypatch):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = []
+        txn = _open_txn(acct.id, "AMPX", qty=2.0)
+        create_trading_order(
+            account_id=acct.id, symbol="AMPX", quantity=1.0, side=OrderDirection.SELL,
+            order_type=OrderType.MARKET, status=OrderStatus.FILLED, filled_qty=1.0,
+            open_price=13.0, transaction_id=txn.id)
+        monkeypatch.setattr(account, "get_closing_fill",
+                            lambda *a: (13.5, datetime(2026, 6, 29, tzinfo=timezone.utc)))
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        assert get_instance(Transaction, txn.id).close_price == pytest.approx(13.5)

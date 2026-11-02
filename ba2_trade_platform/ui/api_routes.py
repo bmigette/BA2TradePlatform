@@ -47,6 +47,12 @@ def reload_from_db(body: ReloadRequest = ReloadRequest()):
     from ..core.instance_registry import drop_market_condition_resolver
     from ..core.JobManager import get_job_manager
 
+    try:      # the iv_rank gate answer of the ATM-IV analysis-task hook is cached 5 min
+        from ..modules.dataproviders.options.atm_iv_task_hook import invalidate_gate_cache
+        invalidate_gate_cache()
+    except Exception as e:  # noqa: BLE001 - never block a reload
+        logger.warning(f"atm_iv_task_hook.invalidate_gate_cache failed: {e}")
+
     if body.expert_instance_id is None and body.account_id is None:
         experts_reloaded = ExpertInstanceCache.get_cache_stats()["expert_instance_ids"]
         ExpertInstanceCache.clear_cache()

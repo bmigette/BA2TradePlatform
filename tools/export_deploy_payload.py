@@ -35,6 +35,7 @@ import app.models  # noqa: F401,E402
 from app.models.database import SessionLocal  # noqa: E402
 from app.models.backtest import Backtest  # noqa: E402
 from app.api.backtests import _derive_export_payload  # noqa: E402
+from ba2_common.export.backtest_export import build_deploy_entry  # noqa: E402
 
 def _parse_plan(argv):
     """['881:new:label', '842:29:other'] -> [(bt_id, inst_id|None, label)]."""
@@ -78,16 +79,16 @@ def main() -> int:
             print(f"FATAL: backtest {bt_id} cannot be exported: "
                   f"{getattr(e, 'detail', None) or e}")
             return 1
-        payloads.append({
-            "backtest_id": bt_id,
-            "target_instance_id": inst_id,          # None -> import creates the instance
-            "account_id": args.account,
-            "virtual_equity_pct": args.equity_pct,
-            "expert_name": bt.expert_name,
-            "label": label,
-            "ruleset": ruleset,
-            "settings": settings,
-        })
+        payloads.append(build_deploy_entry(
+            backtest_id=bt_id,
+            target_instance_id=inst_id,          # None -> import creates the instance
+            account_id=args.account,
+            virtual_equity_pct=args.equity_pct,
+            expert_name=bt.expert_name,
+            label=label,
+            ruleset=ruleset,
+            settings=settings,
+        ))
         print(f"backtest {bt_id} -> instance {inst_id or 'NEW'} ({label}) [{bt.expert_name}]: "
               f"{len(ruleset['entry_rules'])} entry rules, {len(ruleset['exit_rules'])} exit rules, "
               f"{len(settings['settings']['expert_params'])} expert params")

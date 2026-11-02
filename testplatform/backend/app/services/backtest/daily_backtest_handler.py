@@ -29,11 +29,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, forced_expert_settings, member_hold_tags_fact)
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY, resolve_job_history_source
 from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
 from app.models.database import SessionLocal
 from app.services.backtest.equity_cap import validate_equity_cap
+from app.services.backtest.history_source import (
+    job_history_provider, load_job_store, refuse_option_job_on_unsupported_source)
 from app.services.task_queue import get_task_queue
 
 logger = logging.getLogger(__name__)
@@ -263,6 +266,8 @@ _SUPPORTED_EXPERTS = {
     "ETFTrend": "ba2_experts.ETFTrend",
     # Research-only RSI pullback reversion (like ETFTrend: backtest-registered, not live).
     "PullbackReversion": "ba2_experts.PullbackReversion",
+    # Research-only ML forecast expert over a precomputed forecast store (ml_forecast design 2026-10-25).
+    "MLForecast": "ba2_experts.MLForecast",
     # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
     # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
     # the event date + days-to-earnings onto its recommendations, which is what the strategy's
@@ -295,6 +300,8 @@ _EXPERT_WARMUP_BARS = {
     # exact runs where the import is broken. Pinned equal by
     # test_option_grid_foundations.test_the_earnings_expert_warmup_table_matches_the_class.
     "FMPEarningsEvent": 620,
+    # = MLForecast.BACKTEST_WARMUP_BARS: ATR14 over a 60-calendar-day window at 1.45 days/bar.
+    "MLForecast": 42,
 }
 _WARMUP_FLOOR_DAYS = 60           # never warm up less than this (ATR + safety)
 _BARS_TO_CALDAYS = 1.45           # trading bars -> calendar days (≈252 bars/year -> ~365 days)
@@ -555,8 +562,16 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         _default_option_spread_model(account_settings, payload.get("backtest_id"))
     validate_options_window(start_date, uses_options or bool(options_cache_db),
                             backtest_options_provider(payload))
+    # WHICH OHLCV history the run reads (ohlcv_history.py): the payload's stamp, else the legacy
+    # source. The caller stamps a NEW run (the CLI's --ohlcv-history-source); a payload without a
+    # stamp is a stored/legacy one and runs on fmp, never on a silently different history.
+    history_source = resolve_job_history_source(payload)
+    refuse_option_job_on_unsupported_source(
+        {OHLCV_HISTORY_SOURCE_KEY: history_source},
+        uses_options=uses_options or bool(options_cache_db), where="_build_config")
 
     return {
+        OHLCV_HISTORY_SOURCE_KEY: history_source,
         "backtest_id": payload["backtest_id"],
         "name": payload.get("name", f"daily-backtest-{payload['backtest_id']}"),
         "start_date": start_date,
@@ -615,6 +630,10 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
         # cached) — same mechanism the optimizer uses. None for static runs (engine gate no-op).
         "screener_runtime": _build_screener_runtime(payload),
+        # The universe above is the union of THIS run's own screen over the visible scans, so the gate
+        # can never select outside it: the guard REFUSES if it ever does (None for static runs).
+        "screener_universe_guard": ("refuse" if (payload.get("universe") or {}).get("mode") == "screener"
+                                    else None),
         # A standalone (API/CLI) backtest is PERSISTED: its option trade rows carry the option
         # trade record (see results.require_option_trade_records).
         "option_trade_records": True,
@@ -651,10 +670,14 @@ def _resolve_enabled_instruments(
         # preloading the full store loads/holds OHLCV for ~800 never-touched symbols (huge memory
         # + load time, and one data-less symbol aborts the run). The per-bar screener_runtime gate
         # still restricts entries each bar; this only bounds what OHLCV gets loaded.
-        df = ms.load_store(store)
+        df = load_job_store(store, payload)  # refuses a store built from the other OHLCV history
         settings = _metric_store_settings(universe.get("screener_settings") or {})
-        instruments = ms.screened_symbol_union(
-            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings
+        # The scans the per-decision gate can resolve to (visible_scan_window), not "last scan <= start":
+        # on an intraday clock the first decision of start_day reads the scan dated BEFORE it.
+        from ba2_providers.screener.universe_superset import interval_is_intraday
+        instruments = ms.screened_symbol_union_visible(
+            df, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), settings,
+            intraday=interval_is_intraday(payload.get("execution_interval", "1d")),
         )
         if not instruments:
             raise ValueError(
@@ -681,13 +704,68 @@ _REGIME_BENCHMARK = "SPY"
 # derived from indicator lookbacks and is far shorter. 800 sessions of slack in calendar days.
 _REGIME_LOOKBACK_DAYS = 1200
 
+# Worker-process memo of the Alpaca cache's exchange suspension events, keyed on the file's identity so a rebuilt cache is re-read.
+_SUSPENSION_EVENTS_MEMO: Dict[Any, Any] = {}
+
+
+def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).
+
+    ``{}`` for any source but ``alpaca`` -- FMP carries OTC prices, so an FMP run is byte-identical to before.  An ``alpaca`` run
+    REFUSES (``AlpacaCacheNotCertified``) unless the cache's gate certificate covers its current manifest and suspensions.json:
+    every GA worker reads its OWN local cache copy (the same ``run_daily_backtest`` runs in workers), and a copy without the
+    events (or with older ones) would otherwise trade without the liquidations the master applies.  A malformed file raises."""
+    from ba2_common.core.suspension_events import SUSPENSIONS_FILE, load_suspension_events
+    from app.services.backtest.history_source import job_history_cache_dir, verify_alpaca_cache_certified
+
+    if resolve_job_history_source(config) != "alpaca":
+        return {}
+    cache_dir = job_history_cache_dir(config)
+    verify_alpaca_cache_certified(cache_dir)           # raises AlpacaCacheNotCertified: the events below are the certified ones
+    path = os.path.join(cache_dir, SUSPENSIONS_FILE)
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _SUSPENSION_EVENTS_MEMO:
+        _SUSPENSION_EVENTS_MEMO.clear()
+        _SUSPENSION_EVENTS_MEMO[key] = load_suspension_events(cache_dir)
+    return _SUSPENSION_EVENTS_MEMO[key]
+
+
 # Worker-process memo: the calendar is market-wide and identical for every GA individual of a
-# run, so building it once per (benchmark, window) instead of once per trial keeps it off the hot
-# path entirely. Keyed on the window because a grid may run several date ranges in one worker.
+# run, so building it once per (benchmark, source, window) instead of once per trial keeps it off the hot
+# path entirely. Keyed on the window because a grid may run several date ranges in one worker, and on the
+# HISTORY SOURCE because one worker may serve an fmp job and an alpaca job: the two closes differ, and a
+# calendar built from one must never be reused for the other. (Before 2026-10-24 this key had no source;
+# for a single-source worker the change is behaviour-neutral.)
 _REGIME_CALENDAR_MEMO: Dict[Any, Any] = {}
+_BENCHMARK_CALENDAR_MEMO: Dict[Any, Any] = {}
 
 
-def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
+def _benchmark_daily_series(raw_ohlcv: Any, start_date: Any, end_date: Any):
+    """``(dates, closes)`` of the benchmark's DAILY history for a run window, or None when the cache
+    has none. ONE read serves the overlay calendar and the benchmark-regime calendar so their inputs
+    are identical."""
+    from datetime import timedelta
+
+    from app.services.backtest.price_source import MemoizedOHLCVProvider
+
+    # A SEPARATE bounded reader: the run's own MemoizedOHLCVProvider is clamped to
+    # [start - warmup_days, end] at the EXECUTION interval, which is both too short and
+    # (on an intraday run) the wrong granularity for a 504-DAILY-bar rank window.
+    bench = MemoizedOHLCVProvider(
+        raw_ohlcv,
+        start_date - timedelta(days=_REGIME_LOOKBACK_DAYS),
+        end_date,
+        interval="1d",
+        cached_only=True,
+    )
+    df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")
+    if df is None or not len(df):
+        return None
+    return df["Date"].tolist(), df["Close"].tolist()
+
+
+def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any, history_source: str):
     """The run's ``StressedCalendar``, or None when the benchmark's history is unavailable.
 
     Returning None is NOT silently fine: ``DailyBacktestEngine.run`` refuses to start when any
@@ -695,33 +773,21 @@ def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
     can never turn the overlay genes into dead search space (the ``use_atr_stop`` failure mode).
     Runs that don't use the overlay are unaffected and just carry None.
     """
-    from datetime import timedelta
-
     from ba2_common.core.regime_overlay import StressedCalendar
-    from app.services.backtest.price_source import MemoizedOHLCVProvider
 
-    key = (_REGIME_BENCHMARK, str(start_date), str(end_date))
+    key = (_REGIME_BENCHMARK, history_source, str(start_date), str(end_date))
     if key in _REGIME_CALENDAR_MEMO:
         return _REGIME_CALENDAR_MEMO[key]
 
     cal = None
     try:
-        # A SEPARATE bounded reader: the run's own MemoizedOHLCVProvider is clamped to
-        # [start - warmup_days, end] at the EXECUTION interval, which is both too short and
-        # (on an intraday run) the wrong granularity for a 504-DAILY-bar rank window.
-        bench = MemoizedOHLCVProvider(
-            raw_ohlcv,
-            start_date - timedelta(days=_REGIME_LOOKBACK_DAYS),
-            end_date,
-            interval="1d",
-            cached_only=True,
-        )
-        df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")
-        if df is not None and len(df):
-            cal = StressedCalendar(df["Date"].tolist(), df["Close"].tolist())
+        series = _benchmark_daily_series(raw_ohlcv, start_date, end_date)
+        if series is not None:
+            dates, closes = series
+            cal = StressedCalendar(dates, closes)
             logger.info(
-                f"Regime calendar built from {len(df)} {_REGIME_BENCHMARK} daily closes "
-                f"({df['Date'].iloc[0]} -> {df['Date'].iloc[-1]})")
+                f"Regime calendar built from {len(dates)} {_REGIME_BENCHMARK} daily closes "
+                f"({dates[0]} -> {dates[-1]})")
         else:
             logger.warning(f"Regime calendar: no {_REGIME_BENCHMARK} daily bars in the cache")
     except Exception as e:  # noqa: BLE001 -- a missing benchmark must not break non-overlay runs
@@ -729,6 +795,56 @@ def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
 
     _REGIME_CALENDAR_MEMO[key] = cal
     return cal
+
+
+def _build_benchmark_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any,
+                                     history_source: str):
+    """The run's ``BenchmarkRegimeCalendar`` (SPY trend + vol regime), or None when SPY history is
+    unreadable. None is fatal for a gated run (``DailyBacktestEngine._check_regime_calendar``), so an
+    unreadable benchmark cannot turn the ``spy-*`` genes into dead search space."""
+    from ba2_common.core.benchmark_regime import BENCHMARK_SYMBOL, BenchmarkRegimeCalendar
+
+    key = (BENCHMARK_SYMBOL, history_source, str(start_date), str(end_date))
+    if key in _BENCHMARK_CALENDAR_MEMO:
+        return _BENCHMARK_CALENDAR_MEMO[key]
+
+    cal = None
+    try:
+        series = _benchmark_daily_series(raw_ohlcv, start_date, end_date)
+        if series is not None:
+            dates, closes = series
+            cal = BenchmarkRegimeCalendar(dates, closes)
+            logger.info(
+                f"Benchmark regime calendar built from {len(dates)} {BENCHMARK_SYMBOL} daily closes "
+                f"({dates[0]} -> {dates[-1]}, source {history_source})")
+        else:
+            logger.warning(f"Benchmark regime calendar: no {BENCHMARK_SYMBOL} daily bars in the "
+                           f"{history_source} cache")
+    except Exception as e:  # noqa: BLE001 -- surfaced by the engine refusal if the run is gated
+        logger.warning(f"Benchmark regime calendar unavailable ({type(e).__name__}: {e})")
+
+    _BENCHMARK_CALENDAR_MEMO[key] = cal
+    return cal
+
+
+def _config_uses_benchmark_regime(config: Any) -> bool:
+    """True when the run is gated on the SPY regime: the launcher flag, or ANY benchmark leaf
+    anywhere in the config (run-level rules, expert settings, JSON-encoded rule trees). The leaf walk
+    is what makes a stored-row re-run (no flag in its config) still get its calendar."""
+    from ba2_common.core.benchmark_regime import TREND_FIELD, VOL_FIELD
+    from app.services.backtest.seam_wiring import named_field_leaves_in
+
+    if isinstance(config, dict) and config.get("benchmark_regime_gates"):
+        return True
+    return bool(named_field_leaves_in(config, {TREND_FIELD, VOL_FIELD}))
+
+
+def _benchmark_calendar_for_run(raw_ohlcv: Any, config: Dict[str, Any]):
+    """The benchmark calendar when this run is gated, else None WITHOUT touching the cache."""
+    if not _config_uses_benchmark_regime(config):
+        return None
+    return _build_benchmark_regime_calendar(
+        raw_ohlcv, config["start_date"], config["end_date"], resolve_job_history_source(config))
 
 
 _SPREAD_KEYS = ("option_spread_model", "option_spread_pct", "option_spread_min_tick")
@@ -836,7 +952,6 @@ def run_daily_backtest(
     """
     from ba2_common.core.db import activity_logging_disabled
     from ba2_common.logger import file_logging_disabled
-    from ba2_providers import get_provider
     from ba2_providers.fmp_common import frozen_ttl_cache, hermetic_fmp_history
 
     from app.services.backtest.backtest_account import BacktestAccount
@@ -858,6 +973,7 @@ def run_daily_backtest(
         install_backtest_market_conditions,
         make_indicator_provider,
         normalize_market_condition_keys,
+        set_backtest_history_source,
         set_backtest_ohlcv_override,
         wire_backtest_seams,
     )
@@ -871,6 +987,9 @@ def run_daily_backtest(
         **config,
         "start_date": _parse_dt(config["start_date"], "start_date"),
         "end_date": _parse_dt(config["end_date"], "end_date"),
+        # The OHLCV history this run reads, resolved ONCE (unstamped = the legacy fmp; an unknown
+        # stamp refuses) and written back so every later reader of this config agrees.
+        OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(config),
         # Per-day DYNAMIC screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); the
         # engine reads it (``self._screener_runtime``) to gate ENTRIES to the per-day screened
@@ -901,6 +1020,7 @@ def run_daily_backtest(
         config.get("execution_interval", "1d"),
         str(config["start_date"]), str(config["end_date"]),
         int(config.get("warmup_days") or 0),
+        config[OHLCV_HISTORY_SOURCE_KEY],
     ))
 
     # Options seam: a present ``options_cache_db`` flags an options run. Validate the SERVING
@@ -953,7 +1073,12 @@ def run_daily_backtest(
         # re-reading + re-parsing the disk cache on every bar (the dominant cost — ~370s of an
         # 836s 6-month profile). Used by the fill-engine preload, the expert price/data path
         # (via the seam override below) AND the clamped indicator/ATR path.
-        raw_ohlcv = get_provider("ohlcv", "fmp")
+        # The job's own history (fmp | alpaca): the ONE place the raw provider is chosen. Option
+        # runs on a source other than fmp refuse here, before any bar is read.
+        refuse_option_job_on_unsupported_source(
+            config, uses_options=bool(config.get("options_cache_db")), where="run_daily_backtest")
+        raw_ohlcv = job_history_provider(config)
+        set_backtest_history_source(resolve_job_history_source(config))
         fetch_start = config["start_date"] - timedelta(days=int(config["warmup_days"]))
         # cached_only=True: a backtest is HERMETIC — serve bars from the on-disk caches only and
         # raise a clear BacktestCacheMiss (aggregated by preload) for any symbol absent from every
@@ -964,6 +1089,17 @@ def run_daily_backtest(
         )
 
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        # The ONE knowability rule for daily data lives on the price source (the clock owner);
+        # binding makes every DAILY read through the memoized provider obey it on an intraday
+        # clock (no-op on a daily clock). See AsOfPriceSource.knowable_daily_end.
+        ohlcv.bind_price_source(ps)
+        # CROSS-INTERVAL BASIS PREFLIGHT (job start, on THIS process: a worker's cache can differ from the
+        # master's). An intraday-clock job, or an options job whose drawdown refinement reads 5-minute bars,
+        # must find every symbol's intraday cache on the daily cache's price level; otherwise it raises
+        # IntradayBasisMismatch / IntradayBasisStale (job-fatal) before the first bar is loaded. Once per
+        # process per (universe, window): see intraday_basis_preflight.
+        from app.services.backtest.intraday_basis_preflight import require_for_config
+        basis_report = require_for_config(config, provider=type(raw_ohlcv).__name__)
         ps.preload(
             config["enabled_instruments"],
             config["start_date"],
@@ -994,6 +1130,7 @@ def run_daily_backtest(
             option_trade_records=(require_option_trade_records(config) if uses_options
                                   else True),
         )
+        account.set_suspension_events(_suspension_events_for(config))
         resolver.register_account(account_id, account)
 
         experts = _build_experts(config, resolver, account_id)
@@ -1034,16 +1171,48 @@ def run_daily_backtest(
                 progress_cb=progress,
                 indicator_provider=indicator_provider,
                 regime_calendar=_build_regime_calendar(
-                    raw_ohlcv, config["start_date"], config["end_date"]),
+                    raw_ohlcv, config["start_date"], config["end_date"],
+                    resolve_job_history_source(config)),
+                benchmark_calendar=_benchmark_calendar_for_run(raw_ohlcv, config),
+                benchmark_regime_required=_config_uses_benchmark_regime(config),
                 market_condition_record=market_condition_record,
             )
-            engine.run()
+            # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
+            # item only from the instant it was public (ba2_common.core.knowability); the flag is
+            # thread-local and lives exactly as long as this run.
+            from ba2_common.core.knowability import intraday_decisions
+            with intraday_decisions(ps.is_intraday, scan_cutoff=ps.scan_cutoff_date):
+                engine.run()
+            # NO SILENT FAILURE at the result level: an expert whose analysis passes mostly raised
+            # (and were skipped per symbol / per bar) traded nothing for a reason that is not the
+            # strategy. Refuse the run (no result, no fitness; a GA trial reports "trial failed").
+            engine.refuse_if_analysis_failing()
+            # Same discipline for the fill-time stop/target re-base: one summary line, and a refusal
+            # when too many stops had no anchor to re-base from.
+            fill_rebase = engine.refuse_if_rebase_unanchored()
+            # ...and at the universe level: a gate selection outside the loaded static universe is a pick
+            # the run could never trade (the screener-universe bug). Refused (job-fatal) under the
+            # superset rule; a legacy frozen list only warns.
+            engine.refuse_if_screener_universe_outside()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            if ps.is_intraday:
+                # What the intraday-clock rule dropped, so a REDUCED universe / lost decision is
+                # visible in the persisted result (intraday runs only; absent on a daily clock).
+                results["intraday_clock"] = {
+                    **engine.intraday_counters,
+                    **account.intraday_counters,
+                    "sessions_without_decision_bar": dict(
+                        getattr(engine, "sessions_without_decision_bar", {})),
+                }
             # How option fills were priced (plan Part F). Options runs only, so an equity
             # run's results are exactly what they were.
             apply_option_spread_record(results, account)
+            # Which risk-free rate the option greeks and Black-Scholes marks used: the as-of
+            # FRED DGS3MO series, or an explicit constant the run chose. Options runs only.
+            from app.services.backtest.options_store import apply_risk_free_rate_record
+            apply_risk_free_rate_record(results, account)
             if market_condition_record is not None:
                 # RESEARCH METADATA, added after the metrics are computed so it cannot reach
                 # any of them: the per-run counters, and the entry state attached to the trades
@@ -1055,12 +1224,55 @@ def run_daily_backtest(
             # ITS cadence, not the platform default. Done here because run_daily_backtest is the
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
+            results["analysis_failures"] = engine.analysis_failures_record()
+            # Whether the entry's stop/target were re-based to the real fill (as live does) and what
+            # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
+            results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
+            results["fill_rebase"] = fill_rebase
+            _su_rec = engine.screener_universe_record()
+            if _su_rec is not None:
+                results["screener_universe"] = _su_rec
+            _sr = config.get("screener_runtime") or {}
+            if getattr(engine, "_screen_gate", None) is not None:
+                engine._screen_gate.assert_complete()                  # job-fatal: a selectable name without bars
+                _gd = engine._screen_gate.diagnostics()
+                (logger.warning if _gd["no_price_candidate_decisions"] or _gd["outside_preload_candidate_decisions"] else logger.info)(
+                    f"screener gate: {_gd['no_price_candidate_decisions']} candidate decisions without a price "
+                    f"({_gd['no_price_symbol_count']} symbols), {_gd['outside_preload_candidate_decisions']} outside the preloaded set")
+            if _sr.get("criteria_version"):
+                # WHICH definition and WHICH data this run was gated by
+                results["screener_gate"] = {"criteria_version": _sr["criteria_version"],
+                                            "panel_fingerprint": _sr.get("panel_fingerprint"), "behaviour": "post-fix",
+                                            **(engine._screen_gate.diagnostics()
+                                               if getattr(engine, "_screen_gate", None) is not None else {})}
             results.update(_car_trade_thresholds_for_experts(config))
+            if basis_report is not None:
+                # Recorded on the result: what was judged, and every symbol that could NOT be (never ok).
+                results["intraday_basis_preflight"] = basis_report.to_dict()
+            _record = _decision_time_record(engine, config)
+            if _record is not None:
+                results["decision_time"] = _record
             return results
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
+            set_backtest_history_source(None)
             clear_backtest_market_conditions()
+
+
+def _decision_time_record(engine, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``decision_time`` section of a persisted result: the time(s) each pass ran at and how
+    many scheduled (session, time) pairs had NO bar (a 15:30 schedule on a 13:00 half day), so a
+    stored row shows the decisions it never made. None on a daily clock or without schedule times
+    (every run before the decision-time gene keeps the result shape it had)."""
+    if config.get("execution_interval", "1d") == "1d":
+        return None
+    entry = (config.get("run_schedule_override") or {}).get("times")
+    manage = (config.get("manage_schedule_override") or {}).get("times")
+    if not entry and not manage:
+        return None
+    return {"entry_times": list(entry or []), "manage_times": list(manage or []),
+            "sessions_without_decision_bar": dict(engine.sessions_without_decision_bar)}
 
 
 def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:

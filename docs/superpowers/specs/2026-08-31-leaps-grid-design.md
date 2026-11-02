@@ -28,6 +28,88 @@ The parquet cache (`TastyTradeOptionsProvider`, 857 underlyings, bars
   causal**, including at LEAPS range; iv is measurable for the earnings-crush
   and iv-rank gates.
 
+## 1b. Re-measured on ThetaData, 2020–2025 (2026-09-30)
+
+§1 was measured on the old TastyTrade cache (bars from 2023). The option grids
+now run on `ThetaDataOptionsProvider` over **2020-01-02..2025-12-31**, so depth
+was re-measured with `tools/probe_leaps_depth.py` (read-only). "Entry day" means
+a CALL with a two-sided quote at a DTE inside the band. Universes: the stage-1
+97 (`options_universe_top100.txt`) and the 796-name stage-2 union.
+
+**Data quality inside the band: good, much better than §1.**
+- Two-sided quote on 98–99% of in-band call rows; iv present on 96%.
+- Per-strike density: a median of 117–119 quoted days out of a maximum of about
+  127 trading days in the band (§1 measured 50–65% on TastyTrade).
+- Bars exist from 2020-01-02. The Jan-2022 expiry is quoted about 750 DTE out,
+  so 2020–2021 entries are possible. Strikes are as-traded (e.g. AAPL at
+  pre-split levels), which the split-basis guard already handles.
+
+**LEAPS listing: most large caps, not all.**
+
+| Universe | Symbols with a LEAPS expiry (quoted ≥365 DTE) |
+|---|---|
+| Stage-1 97 | 95 (none for SMFG, SNDK) |
+| Stage-2 union 796 | 653 (143 never list one, e.g. AEE, ARE, BBVA, BRKR) |
+
+Expiry months of LEAPS contracts (stage-2 union):
+
+| Month | Jan | Jun | Mar | Dec | Sep | Other |
+|---|---|---|---|---|---|---|
+| Contracts | 2,841 | 931 | 407 | 395 | 273 | small |
+
+§5's per-strategy preflight must drop the 143 no-LEAPS names from O_LEAP/O_PMCC,
+or a job carries names that can never enter.
+
+**Entry availability is structurally partial (the listing cycle, not data gaps).**
+Median share of trading days with an in-band call, stage-1 97:
+
+| Band | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+|---|---|---|---|---|---|---|
+| full design band 365–550 | 52% | 71% | 68% | 92% | 94% | **20%** |
+| one genome window, 365–455 | 25% | 44% | 47% | 49% | 54% | 20% |
+| one genome window, 455–545 | 25% | 25% | 25% | 42% | 48% | **0%** |
+| wider band 270–550 (not in the code) | 82% | 100% | 98% | 100% | 100% | 47% |
+
+On the stage-2 union the 365–550 medians are lower (35% in 2020, about 52% in
+2021–2024, 4% in 2025), because fewer names carry non-January LEAPS.
+
+- **Cause.** A January-only LEAPS sits inside a 185-day band for about half of
+  each year. The landed genes (`O_LEAPC`/`O_LEAPP`/`O_PMCC`: centres 410–500,
+  ±45 → windows [365,455]..[455,545]) are narrower still. So any single
+  genome can enter on only about 25–50% of days per name.
+- **Effect on results.** Trade counts are lower than §1 assumed. This pairs
+  with the commented low trade floor `_OPTION_LOW_TRADE_FLOOR_STRATEGIES =
+  {"O_LEAP", "O_PMCC"}`.
+- **Option to consider.** Lowering the entry floor to about 270 DTE
+  (§1 originally said "270–540") roughly doubles availability. Whether a
+  270-DTE entry is still a "LEAPS" is a design call; it is not changed here.
+  **ADOPTED (operator decision 2026-09-30).** `O_LEAPC`/`O_LEAPP`/`O_PMCC`'s
+  entry DTE floor is lowered from 365 to 270: authored half-width stays 45,
+  step stays 15, and the searched centres move from 410–500 to 315–495 (13
+  levels instead of 7), decoding to windows [270,360]..[450,540] (was
+  [365,455]..[455,545]). See §2's own LANDED AS note and §5's updated
+  preflight threshold.
+
+**BLOCKER for a 2020–2025 window: the cache stops at 2026-09 expiries.**
+- The latest cached expiry is 2026-09-xx for all 796 names. `warm_options_history.py` only
+  fetches contracts *expiring* inside its window, and that window ended on the backfill date.
+- So no Dec-2026 / Jan-2027+ LEAPS exist in the store.
+- The last day a 365+ DTE entry is possible is a median of **2025-03-20** (stage-1 97;
+  2025-02-20 on the 796), max 2025-08/09. **About 3/4 of 2025 has no possible LEAPS entry.**
+- A grid run as-is would look at 2025 as "no signal", which is the store talking.
+- **Fix before launch:** a ThetaData backfill of expiries 2026-09..2027-06 (the LEAPS
+  months only, bars ≤ 2025-12-31) for the LEAPS-listing names. Or end the long-dated
+  keys' entry window at 2025-06-30.
+- Either choice must be recorded with the results.
+
+> **RESOLVED for the stage-1 universe (2026-09-30):** backfill run (`warm_options_history.py
+> --provider thetadata --discovery rest --monthly-only --start 2026-09-12 --end 2027-06-30
+> --bars-start 2025-06-01 --bars-end 2025-12-31`, 95 LEAPS-listing stage-1 names, 13h10m,
+> 332 partitions / 4.07M rows written, 405 empty, 0 failed). Probe on the 97 at 270–550:
+> 2025 median coverage 47% → **100%**, latest possible entry median 2025-06-23 → **2025-12-31**.
+> The other ~558 stage-2 LEAPS names are NOT backfilled yet (projected 80–145 h); do that
+> before any stage-2 LEAPS/convex run on the 753-name universe.
+
 ## 2. Strategy keys and genes (each its own searched space)
 
 ### Long-dated family
@@ -49,13 +131,28 @@ method, §6.1). Genes: target delta 0.70–0.90 step 0.05; entry DTE 365–550;
 roll/exit DTE floor 90–240 (exit before the decay/gamma zone); `opt_sl_ml`;
 sizing.
 
+> **LANDED AS / changed 2026-09-30 (operator decision, §1b): entry DTE floor
+> lowered 365 → 270.** Searched centres move 410–500 → 315–495 (step 15
+> unchanged, half-width 45 unchanged), decoding to windows [270,360]..
+> [450,540] (was [365,455]..[455,545]). The roll/exit DTE floor (90–240,
+> unchanged) still clears every decoded entry window with margin: the
+> thinnest case is a 270-DTE entry against a 240-DTE exit floor, a 30-day
+> gap (was 125 days pre-change) — checked exhaustively by
+> `_assert_entry_dte_clears_exit_floor` at launcher import, so a future
+> change to either band that closes the gap fails loudly rather than
+> producing a same-day exit.
+
 **`O_LEAPP` — bearish arm.** Same builder, `buy_put`, same genes. The grid's
-only bearish long-dated arm.
+only bearish long-dated arm. Same 2026-09-30 floor change as O_LEAPC.
 
 **`O_PMCC` — poor man's covered call** (diagonal, wheel-pattern lifecycle, §3–4).
 LEAPS leg delta 0.75–0.85, DTE ≥365; short-call overlay delta 0.15–0.30, DTE
 30–45, rolled at expiry or buyback trigger (% of credit decayed — searched);
 shares the LEAPS roll-floor gene.
+
+> **LANDED AS / changed 2026-09-30: same floor change as O_LEAPC** — the
+> LEAPS long leg's entry DTE floor is 270, not 365 (the 30–45-DTE overlay is
+> unaffected).
 
 > **LANDED AS (2026-09-02, plan Task 6): a launchable phase-1 key.** The two-expiry
 > lifecycle is a RULESET, not an engine hook — `open_pmcc` opens both legs as one
@@ -151,10 +248,11 @@ Applies to `O_PMCC` and `O_CAL`:
 
 **Listed-depth ∩ stage-1 universe, measured at preflight** with a
 per-strategy DTE threshold: LEAPS/PMCC keys need January-cycle bars at
-DTE ≥365; O_CBS/O_PBS/O_CAL need DTE ≥180; O_ERN needs only earnings dates +
-DTE ≥7 chains (nearly the whole stage-1 universe). One probe tool, threshold
-parameterised; preflight prints kept/dropped per strategy — no silent
-no-contract trials.
+DTE ≥270 (lowered from ≥365, operator decision 2026-09-30, matching the
+entry-gene floor change above); O_CBS/O_PBS/O_CAL need DTE ≥180; O_ERN needs
+only earnings dates + DTE ≥7 chains (nearly the whole stage-1 universe). One
+probe tool, threshold parameterised; preflight prints kept/dropped per
+strategy — no silent no-contract trials.
 
 ## 6. Build items (dependency order)
 
@@ -181,7 +279,9 @@ no-contract trials.
   §2 above; O_PMCC became launchable 2026-09-02, plan Task 6). Phase 2 adds
   O_CAL.
 - **Fitness `option_car`** for every key in this grid. Window 2023-01 →
-  2025-12, 2026 held out. Long-dated keys get the explicit commented lower
+  2025-12, 2026 held out. *(2026-09-30: the option grids now run 2020-01 → 2025-12 on
+  ThetaData with `option_car_target_soft30`; see §1b for what that window needs before
+  this grid can use it.)* Long-dated keys get the explicit commented lower
   trade floor; O_ERN does not need it.
 - **Pop 40 / gen 6, elitism 10%** — modest by design: the sample supports
   "does any region work," not fine-tuning. Group jobs (an OS5-style umbrella)
@@ -189,7 +289,8 @@ no-contract trials.
 
 ## 8. Limitations (read results through these)
 
-- **One regime.** 2023–2025 was mostly up; long calls and PMCC flatter
+- **One regime** *(on the 2023–2025 TastyTrade window; the 2020–2025 ThetaData window
+  adds the 2020 crash and the 2022 bear, see §1b)*. 2023–2025 was mostly up; long calls and PMCC flatter
   themselves; O_PBS (crash hedge) will look useless in a window with no crash
   — that is the window talking, not the structure.
 - **Spread costs at long-dated/OTM range are a guess** — the

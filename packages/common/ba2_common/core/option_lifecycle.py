@@ -466,10 +466,11 @@ def put_assignment_cost(strike: Optional[float],
     ``strike x contracts x multiplier``, and nothing else: when a short put is assigned
     the account buys the shares at the strike, in cash, that night. No credit is netted
     off (the premium was banked at entry and is already in the balance this is measured
-    against), and no long wing is netted off either — the long put is OUR right, which
-    we would have to choose to exercise, on a LATER day, *after* paying for the shares.
+    against). This is the cost of ONE short put on its own; a long put of the same
+    expiry that covers it is netted by ``netted_put_assignment_cost``, which every
+    account-level caller now goes through (operator decision 2026-10-15).
 
-    THE single definition of the arithmetic, deliberately shared by the two callers so
+    THE single definition of the arithmetic, deliberately shared by the callers so
     they cannot fork the way the two IV-rank implementations did:
 
     * ``option_book.book_totals`` — the PURE sleeve rail, summing over ``LifecycleLeg``
@@ -501,6 +502,67 @@ def put_assignment_cost(strike: Optional[float],
         # less than nothing on.
         return None
     return strike * contracts * multiplier
+
+
+def netted_put_assignment_cost(short_puts: Iterable[Tuple[Optional[float], Optional[float]]],
+                               long_puts: Iterable[Tuple[Optional[float], Optional[float]]],
+                               multiplier: Optional[int]) -> Optional[float]:
+    """Cash to take delivery on a GROUP of short puts, net of the long puts that cover them.
+
+    ONE group = one underlying and one expiry. The caller does the grouping, because a long
+    put that expires before the short, or on another underlying, protects nothing.
+
+    The long put is counted (operator decision 2026-10-15, superseding the full-strike rule
+    in ``put_assignment_cost``): a short put assigned at ``Ks`` while a long put at ``Kl``
+    of the same expiry is held costs ``max(0, Ks - Kl)`` per share, the wing width, which
+    is what a broker margins a put vertical at and what the backtest settles a
+    defined-risk combo at (``settle_defined_risk_combo_expiry`` moves only the net
+    payoff). A long put at or above the short strike covers it fully.
+
+    Pairing is highest short with highest long, contract by contract. That maximises the
+    covered amount ``sum(min(Ks, Kl))``, so the result is the smallest obligation the held
+    legs can prove. A short left unpaired costs its full strike; a long left unpaired
+    covers nothing.
+
+    ``short_puts`` / ``long_puts`` are ``(strike, contracts)`` with ``contracts`` a
+    MAGNITUDE. Returns ``None`` (UNMEASURABLE) when any short cannot be priced by
+    ``put_assignment_cost`` or a long carries no usable strike or count. An unpriced long
+    could be dropped (that only overstates), but a malformed row is a defect to surface,
+    not to absorb.
+    """
+    shorts: List[Tuple[float, float]] = []
+    for strike, contracts in short_puts:
+        if put_assignment_cost(strike, contracts, multiplier) is None:
+            return None
+        if float(contracts) > 0:
+            shorts.append((float(strike), float(contracts)))
+    longs: List[Tuple[float, float]] = []
+    for strike, contracts in long_puts:
+        if put_assignment_cost(strike, contracts, multiplier) is None:
+            return None
+        if float(contracts) > 0:
+            longs.append((float(strike), float(contracts)))
+    if not shorts:
+        return 0.0
+    mult = float(multiplier)    # validated above by put_assignment_cost on every short
+    shorts.sort(key=lambda s: -s[0])
+    longs.sort(key=lambda l: -l[0])
+
+    total = 0.0
+    li = 0
+    long_left = longs[0][1] if longs else 0.0
+    for ks, n in shorts:
+        remaining = n
+        while remaining > 0 and li < len(longs):
+            take = min(remaining, long_left)
+            total += max(0.0, ks - longs[li][0]) * take * mult
+            remaining -= take
+            long_left -= take
+            if long_left <= 0:
+                li += 1
+                long_left = longs[li][1] if li < len(longs) else 0.0
+        total += ks * remaining * mult
+    return total
 
 
 # ---------------------------------------------------------------------------

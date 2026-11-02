@@ -111,7 +111,12 @@ def option_chain(
     as_of: str = Query(..., description="YYYY-MM-DD, from /options/dates"),
     store: str = Query(..., description="alpaca-chain | alpaca-bars | tastytrade-parquet"),
     spot: Optional[float] = Query(None, gt=0, description="Underlying price, for computed greeks"),
-    rate: float = Query(0.0, ge=-0.1, le=1.0, description="Risk-free rate for the greek model"),
+    # DISPLAY-ONLY: the cache browser's own greek model input, chosen by the viewer. No backtest
+    # reads it -- runs price at the as-of FRED DGS3MO rate (ba2_providers.macro.risk_free_rate).
+    rate: float = Query(0.0, ge=-0.1, le=1.0,
+                        description="DISPLAY-ONLY risk-free rate for this browser's computed "
+                                    "greeks (0.0 unless the viewer sets one); backtests never "
+                                    "use it -- they read the as-of FRED DGS3MO rate"),
     dividend_yield: float = Query(0.0, ge=0.0, le=1.0),
 ):
     """One chain: expiries as groups, strikes down the middle, calls and puts either side.

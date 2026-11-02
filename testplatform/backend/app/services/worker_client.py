@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 import httpx
 
 from ba2_common.core.db_maintenance import format_bytes
+from ba2_common.core.ohlcv_history import history_cache_dirname, other_history_cache_dirnames
 
-from app.services import cache_sync, self_update
+from app.services import cache_sync, package_versions, self_update
 
 logger = logging.getLogger(__name__)
 
@@ -284,25 +285,68 @@ def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: flo
     return _submit_and_poll(worker, "/submit-trial-full", payload, timeout)
 
 
-def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
+def _history_manifest(history_source: str) -> dict:
+    """The master's cache manifest for a push of *history_source*'s OHLCV history.
+
+    The OTHER sources' history folders are left out of the manifest, so they are not copied; the
+    callers also drop them from the stale list, so the worker's copy is not pruned either (option
+    jobs still read the FMP cache and share workers with equity jobs). A master that does not hold
+    the source's own folder (not built yet) REFUSES: the job would have no history on the worker.
+    """
+    own = history_cache_dirname(history_source)        # raises UnknownHistorySource on a bad name
+    local = cache_sync.build_manifest(
+        exclude_dirnames=other_history_cache_dirnames(history_source))
+    if local["files"] and not any(f["rel_path"].startswith(own + "/") for f in local["files"]):
+        raise ValueError(
+            f"cache push refused: the master has no {own}/ folder under {local['root']} "
+            f"(history source {history_source!r}); pushing would prune the worker's other history "
+            f"and leave it with none. Build the {history_source} history first.")
+    return local
+
+
+def push_cache(worker: dict, *, history_source: str,
+               log: Callable[[str], None] = logger.info) -> dict:
     """Diff the master's cache against the worker's manifest and stream the missing files as ONE
     tar, THEN prune anything the worker has that the master's CURRENT manifest no longer lists
     (leftovers from a local rebuild/compaction, e.g. old screener metric_store fragments — see
     ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
 
+    *history_source* (``fmp`` | ``alpaca``, required, never defaulted) is the OHLCV history the
+    pushed job runs on: only that source's folder is replicated; the other source's history
+    folder is neither copied nor pruned (see ``_history_manifest``).
+
+    The source's own history folder is rebuilt IN PLACE, so it is also compared by crc32 on both
+    ends (``cache_sync.add_crc32``): a file rewritten at its old size is re-sent. A worker that
+    reports no crc32 there (older code) is REFUSED, never assumed equal.
+
     The prune step is skipped outright when the master's own manifest is empty (see below).
     """
+    crc_dirs = (history_cache_dirname(history_source),)
+    local = cache_sync.add_crc32(_history_manifest(history_source), crc_dirs)
     base, headers = _base(worker), _headers(worker)
     # Manifest GET: a worker with a very large cache (remote150: 312k files / 36GB) enumerates
-    # from disk on a cold call (~140s on Windows FS). Warm workers answer in ms; this timeout
-    # just has to survive the cold case after a restart. (Workers >= 2026.08.0054 cache the
-    # manifest server-side, so this is belt-and-braces.)
-    with httpx.Client(timeout=300.0) as c:
-        r = c.get(f"{base}/cache/manifest", headers=headers)
+    # from disk on a cold call (~140s on Windows FS), and the first content check after this change
+    # (or after a rebuild) crc32s the whole history folder there (~20 GB, a few minutes); later
+    # calls take the unchanged files' crc from the worker's cache. The timeout covers the cold case.
+    with httpx.Client(timeout=1800.0) as c:
+        r = c.get(f"{base}/cache/manifest", headers=headers,
+                  params={"hash_dirs": ",".join(crc_dirs)})
         r.raise_for_status()
         remote = r.json()
-    local = cache_sync.build_manifest()
+    unverifiable = cache_sync.missing_crc32(local["files"], remote, crc_dirs)
+    if unverifiable:
+        raise ValueError(
+            f"cache push refused: worker {worker['name']} reports no crc32 for "
+            f"{len(unverifiable)} file(s) under {', '.join(crc_dirs)} (e.g. {unverifiable[0]}), "
+            f"so a file rebuilt at its old size could not be told apart. Its code predates the "
+            f"content check: update the worker, then push again.")
     missing = cache_sync.diff_missing(local["files"], remote)
+    changed = cache_sync.diff_content_mismatch(local["files"], remote)
+    if changed:
+        log(f"cache push -> {worker['name']}: {len(changed)} file(s) under {', '.join(crc_dirs)} "
+            f"changed content at the same size (e.g. {changed[0]}); re-sending them")
+        already = set(missing)
+        missing = missing + [p for p in changed if p not in already]
     res = {"pushed": 0, "extracted": 0}
     if not missing:
         log(f"cache push -> {worker['name']}: already in sync ({local['count']} files)")
@@ -329,7 +373,9 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
         logger.warning(msg)
         return {**res, "pruned": 0}
 
-    stale = cache_sync.diff_stale(local["files"], remote)
+    stale = cache_sync.without_dirs(cache_sync.diff_stale(local["files"], remote),
+                                    other_history_cache_dirnames(history_source))
+    cache_sync.assert_prunable(stale, local["root"])   # nothing outside the cache root, ever
     if stale:
         log(f"cache prune -> {worker['name']}: removing {len(stale)} stale leftover file(s)...")
         with httpx.Client(timeout=120.0) as c:
@@ -436,7 +482,7 @@ def _poll_prepare(worker: dict, job_id: str, deadline: float,
             time.sleep(_PREPARE_POLL_S)
 
 
-def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
+def check_cache_integrity(worker: dict, *, history_source: str, timeout: float = 600.0) -> dict:
     """Deep, content-hash-based comparison of the master's cache against *worker*'s.
 
     Unlike ``push_cache`` (fast, size-only — the normal per-job pre-flight path), this reads +
@@ -447,16 +493,23 @@ def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
     much faster non-cryptographic checksum is the right tradeoff at cache-wide scale.
 
     Returns ``{ok, missing, stale, content_mismatch, local_count, remote_count}`` — ``ok`` is
-    True only when all three lists are empty.
+    True only when all three lists are empty. *history_source* (required) selects the OHLCV
+    history compared, exactly as in ``push_cache``: the other source's history folder is neither
+    compared nor reported stale.
     """
     base, headers = _base(worker), _headers(worker)
     with httpx.Client(timeout=timeout) as c:
         r = c.get(f"{base}/cache/manifest", headers=headers, params={"with_hash": "true"})
         r.raise_for_status()
         remote = r.json()
-    local = cache_sync.build_manifest(with_hash=True)
+    own = history_cache_dirname(history_source)
+    local = cache_sync.build_manifest(
+        with_hash=True, exclude_dirnames=other_history_cache_dirnames(history_source))
+    if local["files"] and not any(f["rel_path"].startswith(own + "/") for f in local["files"]):
+        raise ValueError(f"cache integrity check refused: the master has no {own}/ folder")
     missing = cache_sync.diff_missing(local["files"], remote)
-    stale = cache_sync.diff_stale(local["files"], remote)
+    stale = cache_sync.without_dirs(cache_sync.diff_stale(local["files"], remote),
+                                    other_history_cache_dirnames(history_source))
     mismatch = cache_sync.diff_content_mismatch(local["files"], remote)
     return {
         "ok": not (missing or stale or mismatch),
@@ -511,12 +564,104 @@ def _is_pre_split(info: dict) -> bool:
     return info.get("version_scheme") != self_update.VERSION_SCHEME
 
 
+def _warn(log: Callable[[str], None], msg: str) -> None:
+    """Emit *msg* as a visible WARNING even when *log* is a plain print/list-append sink."""
+    log(f"WARNING {msg}")
+    if log is not logger.info:  # avoid a double line when log IS the module logger
+        logger.warning(msg)
+
+
+def sync_reasons(info: dict, master_version: str,
+                 required_packages: Optional[Mapping[str, str]] = None) -> list[str]:
+    """Why *info* (a worker's ``/version`` payload) must re-sync; ``[]`` means usable as is.
+
+    Rule: re-sync when (a) the worker is pre-split code, (b) its ``app_version`` differs from the
+    master's ``TEST_APP_VERSION`` -- both exactly as before -- or (c) *required_packages* is given
+    and a package the worker reports is BELOW its declared minimum, or the worker reports no
+    version for it ("unknown" -- every pre-2026-10-03 worker). Package versions merely DIFFERING
+    from the master's while at/above the minimum are not a reason (see ``package_drift``).
+
+    A ``"worker-ahead:<pkgs>"`` reason is different in kind: the worker declares a HIGHER minimum
+    than the master for those packages, i.e. it carries GA-relevant code the master lacks. ``/update``
+    only pulls, so it cannot fix that; ``ensure_synced`` EXCLUDES such a worker (the old
+    ``TEST_APP_VERSION`` equality rule excluded a worker ahead of the master too).
+    """
+    reasons: list[str] = []
+    if required_packages is not None and not required_packages:
+        raise ValueError("required_packages is empty: the master's minimums are unreadable "
+                         "(use master_sync_policy at the entry point)")
+    if required_packages:
+        ahead = package_versions.worker_ahead(info.get("required_package_versions"), required_packages)
+        if ahead:
+            reasons.append("worker-ahead:" + ",".join(ahead))
+    if _is_pre_split(info):
+        reasons.append("pre-split")
+    elif info.get("app_version") != master_version:
+        reasons.append("app_version")
+    if required_packages:
+        below, unknown = package_versions.below_minimum(info.get("package_versions"), required_packages)
+        if below:
+            reasons.append("packages-below-minimum:" + ",".join(below))
+        if unknown:
+            reasons.append("packages-unknown:" + ",".join(unknown))
+    return reasons
+
+
+def package_drift(worker: dict, info: dict, master_packages: Optional[Mapping[str, str]],
+                  log: Callable[[str], None], drift_seen: Optional[set] = None) -> None:
+    """WARN about packages whose version differs master vs worker while within the minimum.
+
+    The operator's chosen semantics: a worker at/above the minimum may run OLDER package code than
+    the master (the change was declared GA-neutral). That is allowed, never silent. With
+    *drift_seen* (a per-job set owned by the caller) each distinct drift is logged once.
+    """
+    if not master_packages:
+        return
+    d = package_versions.drift(info.get("package_versions"), master_packages)
+    if not d:
+        return
+    key = (worker["name"], repr(sorted(d.items(), key=lambda kv: kv[0])))
+    if drift_seen is not None:
+        if key in drift_seen:
+            return
+        drift_seen.add(key)
+    detail = ", ".join(f"{pkg} master={m} worker={w}" for pkg, (m, w) in sorted(d.items()))
+    _warn(log, f"worker {worker['name']} package version DRIFT within the declared minimum "
+               f"(running different package code than the master by design): {detail}")
+
+
+def _warn_ahead(worker: dict, info: dict, reason: str, required_packages: Mapping[str, str],
+                log: Callable[[str], None], drift_seen: Optional[set]) -> None:
+    """Loud, actionable WARN for a worker NEWER than the master (once per job via *drift_seen*)."""
+    pk = reason.split(":", 1)[1]
+    key = ("ahead", worker["name"], pk, repr(info.get("required_package_versions")))
+    if drift_seen is not None:
+        if key in drift_seen:
+            return
+        drift_seen.add(key)
+    try:
+        master_commit = self_update._git_commit(self_update.resolve_repo_root()) or "unknown"
+    except Exception:  # noqa: BLE001 -- diagnostics only
+        master_commit = "unknown"
+    worker_commit = info.get("git_commit") or "unknown"
+    _warn(log, f"worker {worker['name']} is NEWER than the master for package(s) {pk} (its declared "
+               f"minimum {info.get('required_package_versions')} is above the master's "
+               f"{dict(required_packages)}); excluding it WITHOUT /update -- an update cannot "
+               f"downgrade. master commit {master_commit}, worker commit {worker_commit}. FIX, one of: "
+               f"(a) move the master forward: `git pull` (or `git checkout {worker_commit}`) in the "
+               f"master's checkout and RESTART it; (b) move the worker back: on the worker run "
+               f"`git fetch && git checkout {master_commit}` then restart `ba2-test worker`.")
+
+
 def ensure_synced(worker: dict, master_version: Optional[str],
                   log: Callable[[str], None] = logger.info, max_wait: float = 300.0,
-                  poll_interval: float = 3.0) -> bool:
+                  poll_interval: float = 3.0,
+                  required_packages: Optional[Mapping[str, str]] = None,
+                  master_packages: Optional[Mapping[str, str]] = None,
+                  drift_seen: Optional[set] = None) -> bool:
     """Make the worker run a compatible build: if its app version differs from the master's,
-    trigger its /update and wait (polling /version) until it matches. Returns True if usable,
-    False to exclude.
+    or a shared package is below its required minimum, trigger its /update and wait (polling
+    /version) until it is compatible. Returns True if usable, False to exclude.
 
     Compatibility is keyed on ``app_version`` (not the git commit) so that ordinary pushes —
     docs, scratch scripts, unrelated fixes — don't force every connected worker to self-update
@@ -529,6 +674,14 @@ def ensure_synced(worker: dict, master_version: Optional[str],
     version string says. One pull carries both the new ``self_update.py`` and
     ``testplatform/version.py`` (same commit), so it converges in that single cycle; if it cannot,
     it is excluded with an explicit reason instead of silently running stale code.
+
+    Per-package versions (2026-10-03): shared-package changes no longer force a re-sync by
+    themselves. *required_packages* is the master's ``REQUIRED_PACKAGE_VERSIONS``; a worker is
+    re-synced when it reports a package below the minimum or reports none (an OLD worker: logged
+    loudly, synced once). *master_packages* are the master's own package versions, used only to
+    log drift (a worker at/above the minimum but different from the master -- allowed, WARNed
+    once per *drift_seen* set). ``required_packages=None`` (the default) disables package gating,
+    which is the pre-change behaviour.
     """
     try:
         info = version(worker)
@@ -537,15 +690,38 @@ def ensure_synced(worker: dict, master_version: Optional[str],
         return False
     wv = info.get("app_version")
     pre_split = _is_pre_split(info)
-    if not master_version or not wv:
-        return True  # caller isn't version-gating (or the worker reports no version at all)
-    if wv == master_version and not pre_split:
+    if not master_version:
+        return True  # caller isn't version-gating
+    if not wv:
+        # Pre-existing leniency kept, but never silent: nothing (not even the package minimums)
+        # can be checked for a worker that reports no app_version.
+        _warn(log, f"worker {worker['name']} reports NO app_version; accepting it UNCHECKED "
+                   f"(no version or package-minimum gating applied)")
+        return True
+    reasons = sync_reasons(info, master_version, required_packages)
+    ahead = [r for r in reasons if r.startswith("worker-ahead:")]
+    if ahead:
+        _warn_ahead(worker, info, ahead[0], required_packages, log, drift_seen)
+        return False
+    if not reasons:
+        package_drift(worker, info, master_packages, log, drift_seen)
         return True
     if pre_split:
         log(f"worker {worker['name']} is running PRE-SPLIT code (reports app_version {wv} from "
             f"the trade app, no version_scheme); updating + waiting...")
-    else:
+    elif wv != master_version:
         log(f"worker {worker['name']} version {wv} != master {master_version}; updating + waiting...")
+    for r in reasons:
+        if r.startswith("packages-unknown:"):
+            _warn(log, f"worker {worker['name']} reports NO version for package(s) "
+                       f"{r.split(':', 1)[1]} (a build older than per-package versioning, or an "
+                       f"unreadable version file); treating as unknown and syncing once")
+        elif r.startswith("packages-below-minimum:"):
+            have = info.get("package_versions") or {}
+            detail = ", ".join(f"{p} {have.get(p)} < required {required_packages[p]}"
+                               for p in r.split(":", 1)[1].split(","))
+            log(f"worker {worker['name']} package(s) below the required minimum ({detail}); "
+                f"updating + waiting...")
     _post_update(worker)
     deadline = time.time() + max_wait
     while time.time() < deadline:
@@ -555,10 +731,19 @@ def ensure_synced(worker: dict, master_version: Optional[str],
         except Exception:  # noqa: BLE001 — still restarting
             continue
         pre_split = _is_pre_split(info)
-        if info.get("app_version") == master_version and not pre_split:
+        post = sync_reasons(info, master_version, required_packages)
+        ahead_post = [r for r in post if r.startswith("worker-ahead:")]
+        if ahead_post:  # an update cannot fix this: stop waiting now instead of after max_wait
+            _warn_ahead(worker, info, ahead_post[0], required_packages, log, drift_seen)
+            return False
+        if not post:
             log(f"worker {worker['name']} updated to {master_version}")
+            package_drift(worker, info, master_packages, log, drift_seen)
             return True
     detail = " (still PRE-SPLIT — its `git pull` never reached the split commit)" if pre_split else ""
+    pkg_reasons = [r for r in sync_reasons(info, master_version, required_packages) if r.startswith("packages-")]
+    if pkg_reasons:
+        detail += f" (still failing package minimums: {'; '.join(pkg_reasons)})"
     log(f"worker {worker['name']} did not converge to {master_version} in {max_wait:.0f}s{detail}; "
         f"excluding")
     return False

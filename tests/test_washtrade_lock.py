@@ -733,7 +733,8 @@ class TestPendingCancelDirectLookup:
             account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
             order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING_CANCEL,
             broker_order_id=broker_order_id,
-            created_at=datetime.now(timezone.utc) - timedelta(hours=age_hours))
+            created_at=datetime.now(timezone.utc) - timedelta(hours=age_hours),
+            data={"pending_cancel_since": (datetime.now(timezone.utc) - timedelta(hours=age_hours)).isoformat()})
         return acct_def, order
 
     def test_broker_says_canceled_so_the_order_is_canceled(self):
@@ -850,7 +851,8 @@ class TestPendingCancelLookupBudget:
             account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
             order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING_CANCEL,
             broker_order_id=broker_order_id,
-            created_at=datetime.now(timezone.utc) - timedelta(hours=age_hours))
+            created_at=datetime.now(timezone.utc) - timedelta(hours=age_hours),
+            data={"pending_cancel_since": (datetime.now(timezone.utc) - timedelta(hours=age_hours)).isoformat()})
 
     def test_a_healthy_account_issues_ZERO_by_id_calls(self):
         """No PENDING_CANCEL at all: not one extra API call. If this ever fails,
@@ -1026,3 +1028,138 @@ class TestComplexOrderRejectionRecorded:
 
         assert not was_rejected_as_washtrade(get_instance(TradingOrder, entry.id))
         assert get_instance(Transaction, txn.id).status == TransactionStatus.FAILED
+
+
+class TestPendingCancelAgeMeasuredFromTheCancel:
+    """P3: the 24 h limit runs from when the cancel was SENT, not from created_at."""
+
+    def _order(self, created_h, cancel_h=None):
+        from ba2_trade_platform.core.pending_cancel import mark_pending_cancel
+        acct_def = create_account_definition()
+        order = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.NEW,
+            broker_order_id="b-leg-1",
+            created_at=datetime.now(timezone.utc) - timedelta(hours=created_h))
+        if cancel_h is not None:
+            mark_pending_cancel(order, now=datetime.now(timezone.utc) - timedelta(hours=cancel_h))
+            update_instance(order)
+        return acct_def, order
+
+    def test_old_order_cancelled_one_hour_ago_is_not_reset(self):
+        acct_def, order = self._order(created_h=72, cancel_h=1)
+        acct = _alpaca_double(acct_def.id, _FakeClient(_FakeAlpacaOrder("b-leg-1", "new")))
+        acct._reconcile_pending_cancel_orders(listed_broker_ids=())
+        assert get_instance(TradingOrder, order.id).status == OrderStatus.PENDING_CANCEL
+
+    def test_25_hours_after_the_cancel_the_timeout_applies(self):
+        acct_def, order = self._order(created_h=72, cancel_h=25)
+        acct = _alpaca_double(acct_def.id, _FakeClient(_FakeAlpacaOrder("b-leg-1", "new")))
+        acct._reconcile_pending_cancel_orders(listed_broker_ids=())
+        assert get_instance(TradingOrder, order.id).status == OrderStatus.NEW
+
+    def test_legacy_row_without_stamp_is_stamped_not_reset_and_warned_once(self):
+        acct_def, order = self._order(created_h=72)
+        order.status = OrderStatus.PENDING_CANCEL      # legacy: no stamp
+        update_instance(order)
+        acct = _alpaca_double(acct_def.id, _FakeClient(_FakeAlpacaOrder("b-leg-1", "new")))
+        with capture_logs("ba2_trade_platform") as records:
+            acct._reconcile_pending_cancel_orders(listed_broker_ids=())
+            acct._reconcile_pending_cancel_orders(listed_broker_ids=())
+        row = get_instance(TradingOrder, order.id)
+        assert row.status == OrderStatus.PENDING_CANCEL
+        assert row.data["pending_cancel_since"]
+        assert sum("no pending_cancel_since" in m for m in _messages(records, logging.WARNING)) == 1
+
+    def test_mark_pending_cancel_keeps_other_data(self):
+        from ba2_trade_platform.core.pending_cancel import mark_pending_cancel, get_pending_cancel_since
+        o = TradingOrder(account_id=1, symbol="X", quantity=1, side=OrderDirection.SELL,
+                         order_type=OrderType.MARKET, data={"k": 1})
+        mark_pending_cancel(o)
+        assert o.status == OrderStatus.PENDING_CANCEL and o.data["k"] == 1
+        assert get_pending_cancel_since(o.data) is not None
+
+
+class TestEverySiteStampsTheCancel:
+    """P3 follow-up: the SL type-change and OCO replace-failure sites stamp too, and the
+    replacement order does not inherit the stamp."""
+
+    def _acct(self, acct_def, client=None):
+        acct = _alpaca_double(acct_def.id, client)
+        acct.cancel_order = lambda *a, **k: True
+        return acct
+
+    def test_sl_type_change_stamps_and_replacement_has_no_stamp(self):
+        from sqlmodel import Session, select
+        from ba2_trade_platform.core.db import get_db
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="NVDA")
+        txn.take_profit = 120.0
+        update_instance(txn)
+        sl = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.NEW,
+            broker_order_id="b-sl", transaction_id=txn.id, data={"sl_percent_target": 3,
+            "pending_cancel_since": "2020-01-01T00:00:00+00:00"})
+        acct = self._acct(acct_def)
+        with Session(get_db().bind) as session:
+            row = session.get(TradingOrder, sl.id)
+            assert acct._replace_broker_sl_order(session, row, 95.0) is True
+        old = get_instance(TradingOrder, sl.id)
+        assert old.status == OrderStatus.PENDING_CANCEL
+        assert old.data["pending_cancel_since"] != "2020-01-01T00:00:00+00:00"
+        with Session(get_db().bind) as session:
+            new = session.exec(select(TradingOrder).where(TradingOrder.depends_on_order == sl.id)).one()
+            assert "pending_cancel_since" not in (new.data or {})
+
+    def test_oco_replace_failure_stamps(self):
+        from sqlmodel import Session
+        from ba2_trade_platform.core.db import get_db
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="NVDA")
+        oco = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.OCO, status=OrderStatus.NEW, broker_order_id="b-oco",
+            transaction_id=txn.id)
+
+        class _C:
+            def replace_order_by_id(self, **kw):
+                raise APIError('{"code":42210000,"message":"cannot replace order"}')
+        acct = self._acct(acct_def, _C())
+        with Session(get_db().bind) as session:
+            row = session.get(TradingOrder, oco.id)
+            acct._replace_broker_oco_order(session, row, 120.0, 95.0)
+        old = get_instance(TradingOrder, oco.id)
+        assert old.status == OrderStatus.PENDING_CANCEL
+        assert old.data["pending_cancel_since"]
+
+    def test_corrupt_stamp_on_one_row_does_not_abort_the_others(self):
+        acct_def = create_account_definition()
+        bad = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING_CANCEL,
+            broker_order_id="b-bad", data={"pending_cancel_since": "garbage"})
+        good = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING_CANCEL,
+            broker_order_id="b-good",
+            data={"pending_cancel_since": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()})
+        acct = _alpaca_double(acct_def.id, _FakeClient(answers={
+            "b-bad": _FakeAlpacaOrder("b-bad", "new"),
+            "b-good": _FakeAlpacaOrder("b-good", "canceled")}))
+        with capture_logs("ba2_trade_platform") as records:
+            assert acct._reconcile_pending_cancel_orders(listed_broker_ids=()) == 1
+        assert get_instance(TradingOrder, good.id).status == OrderStatus.CANCELED
+        assert get_instance(TradingOrder, bad.id).status == OrderStatus.PENDING_CANCEL
+        assert any("b-bad" in m or str(bad.id) in m for m in _messages(records))
+
+    def test_stamp_cleared_when_order_leaves_pending_cancel(self):
+        acct_def = create_account_definition()
+        o = create_trading_order(
+            account_id=acct_def.id, symbol="NVDA", side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING_CANCEL,
+            broker_order_id="b1", data={"pending_cancel_since": datetime.now(timezone.utc).isoformat(), "k": 1})
+        acct = _alpaca_double(acct_def.id, None)
+        acct._write_pending_cancel_result(o.id, OrderStatus.CANCELED, None)
+        row = get_instance(TradingOrder, o.id)
+        assert row.status == OrderStatus.CANCELED and "pending_cancel_since" not in row.data and row.data["k"] == 1

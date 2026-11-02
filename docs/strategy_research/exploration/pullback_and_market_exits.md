@@ -191,6 +191,9 @@ Up to four rules per job, each emitted only when its profile is selected:
 - **GA budget (A4):** in genetic mode each job is sized from its own gene count: population
   clamp(4 × genes, 24, 120), 25 generations (30 above 20 genes), early stop 8. `--population`,
   `--generations` and `--early-stop` override it. Grid mode is unchanged.
+  *Revised 2026-09-28:* early stop 5 with a 1% minimum relative improvement
+  (`earlyStoppingMinRelativeImprovement: 0.01`, `--early-stop-min-rel`), the option grid's rule;
+  see the README.
 
 ### Parity
 

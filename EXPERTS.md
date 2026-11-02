@@ -148,7 +148,7 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
   - **Self-rebalancing** via `FactorPortfolioManager` (diffs targets vs holdings → buy/sell deltas) — **no `ExpertRecommendation`, no SmartRiskManager** (`uses_risk_manager=False`)
   - Renders **only** the Enter-Market schedule (`schedules_open_positions=False`); supports weekly *or* monthly (Nth-weekday) schedules
 
-**Key Settings**: `universe_source`, `factor_weight_momentum` / `factor_weight_value` / `factor_weight_quality` / `factor_weight_pead`, `top_n`, `weighting`, `max_weight_per_name`, `gross_exposure`, `winsorize_pct`, `pead_drift_window_days`, `min_price` (+ `screener_*` when `universe_source=screener`).
+**Key Settings**: `universe_source`, `factor_weight_momentum` / `factor_weight_value` / `factor_weight_quality` / `factor_weight_pead`, `top_n`, `weighting`, `max_virtual_equity_per_instrument_percent` (the platform-wide per-instrument cap, shared with every other expert — FactorRanker's own `max_weight_per_name` was retired into it 2026-09-29), `gross_exposure`, `winsorize_pct`, `pead_drift_window_days`, `min_price` (+ `screener_*` when `universe_source=screener`).
 
 📖 **Full guide:** [docs/FACTORRANKER_EXPERT.md](docs/FACTORRANKER_EXPERT.md)
 

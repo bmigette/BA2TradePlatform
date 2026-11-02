@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._capital_double import EquityFromBalance
+
 from ba2_common.core import TradeActions
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract
@@ -36,6 +38,7 @@ class _Acct:
     """Minimal options account double: serves a chain, a price, a balance, records submits."""
 
     def __init__(self, chain):
+        self.id = 1     # a debit entry now reads the account's open book (its capital headroom)
         self._chain = chain
         self.submitted = []
 
@@ -97,7 +100,7 @@ def _recommendation():
 def _action(cls, **kw):
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
     acct = _Acct(CHAIN)
-    acct.__class__ = type("_A", (_Acct, OptionsAccountInterface), {})
+    acct.__class__ = type("_A", (EquityFromBalance, _Acct, OptionsAccountInterface), {})
     params = dict(strike_method="delta", strike_param=0.30, dte_min=1, dte_max=60,
                   sizing=10.0)
     params.update(kw)
@@ -284,7 +287,8 @@ def test_the_per_instrument_cap_still_clamps_the_shared_tails_budget(monkeypatch
 
     inst_id = add_instance(ExpertInstance(account_id=1, expert="MockExpert",
                                           virtual_equity_pct=100.0))
-    capped = SimpleNamespace(settings={"max_virtual_equity_per_instrument_percent": 1.0})
+    capped = SimpleNamespace(settings={"max_virtual_equity_per_instrument_percent": 1.0},
+                             get_available_equity_balance_detail=lambda: (1e12, ()))
     monkeypatch.setattr(
         ir_mod, "get_instance_resolver",
         lambda: SimpleNamespace(get_expert_instance=lambda _id: capped))

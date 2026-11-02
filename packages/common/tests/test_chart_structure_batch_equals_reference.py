@@ -102,9 +102,10 @@ def test_the_degenerate_history_actually_exercises_the_unusual_branches():
     o, h, l, c, v = _degenerate()
     rows = [r for r in chart_structure_rows(o, h, l, c, v) if r is not None]
     statuses = {f: {r.by_field()[f].status for r in rows} for f in STRUCTURE_FIELDS}
-    assert STATUS_INVALID_PRICES in statuses["channel_width_20_atr"], "no sigma == 0 window"
-    assert any(all(o_.status == STATUS_INVALID_PRICES for o_ in r.by_field().values())
-               and "atr<=0" in r.dist_support.reason for r in rows), "no atr<=0 window"
+    # calc-2: flat windows are DEFINED neutral values, never invalid
+    assert any(r.channel_width.value == 0.0 and r.channel_pos.value == 0.5 for r in rows),         "no sigma == 0 window"
+    assert any(r.dist_support.status != STATUS_INVALID_PRICES and r.channel_slope.value == 0.0
+               and "flat window" in r.dist_support.reason for r in rows), "no all-flat (ATR 0) window"
     assert any(r.structure_state.value == 0.0 for r in rows), "no 'none' structure"
     assert any(r.dist_resistance.value is not None for r in rows), "no resistance ever resolved"
     assert any(r.dist_resistance.value is None and r.dist_resistance.status != STATUS_INVALID_PRICES

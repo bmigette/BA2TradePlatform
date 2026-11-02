@@ -16,7 +16,7 @@ from ba2_common.core.types import (
     get_option_entry_action_values,
     is_option_action,
 )
-from ba2_common.core.market_conditions import PROFILES
+from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 from ba2_common.core.entry_tag import (
     ORDER_ENTRY_TAG_KEY,
     coerce_entry_tag,
@@ -133,6 +133,17 @@ def register_market_condition_field_events() -> List[str]:
 
 
 register_market_condition_field_events()
+
+
+def register_benchmark_field_events() -> None:
+    """``FIELD_EVENT`` for the SPY benchmark regime fields (``market_conditions.BENCHMARK_FIELDS``,
+    which are not in ``PROFILES``). Without it ``triggers_from_condition_tree`` silently DROPS a
+    gate leaf."""
+    for name in BENCHMARK_FIELDS:
+        FIELD_EVENT[name] = ExpertEventType(name)
+
+
+register_benchmark_field_events()
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
 # (open_positions) rules whose triggers include sentiment / term / risk / rating-change /

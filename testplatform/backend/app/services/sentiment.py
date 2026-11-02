@@ -351,9 +351,11 @@ class SentimentService:
             row_date = row['Date']
             row_date_only = row_date.date() if hasattr(row_date, 'date') else row_date
 
-            # Count news for this exact day
+            # Count news for this day UP TO the row's own timestamp. It used to count the whole
+            # calendar day, so an intraday row at 10:00 included the 15:00 headline. (This matches the
+            # lookback periods below, which already stop at row_date.)
             if len(news_df) > 0:
-                day_mask = news_df['date'].dt.date == row_date_only
+                day_mask = (news_df['date'].dt.date == row_date_only) & (news_df['date'] <= row_date)
                 result_df.at[idx, 'news_count'] = day_mask.sum()
 
             for period_name, period_days in self.LOOKBACK_PERIODS.items():

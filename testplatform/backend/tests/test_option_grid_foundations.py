@@ -1133,12 +1133,16 @@ def test_the_structure_gene_submits_a_DIFFERENT_builder():
 
 def test_the_grid2_dte_gene_moves_the_selection_window():
     """Gene family: ``option_dte``. Decoded as a window CENTRE, so the pin is on the WINDOW
-    the action ends up carrying -- the two numbers the selector filters the chain by."""
+    the action ends up carrying -- the two numbers the selector filters the chain by.
+
+    Bounds independently computed, not read back from the launcher: entry floor 270 lowered
+    from 365 (operator decision 2026-09-30) means the searched centres are 315..495 step 15
+    (hw=45 unchanged), so the extremes decode to [315-45,315+45] and [495-45,495+45]."""
     m = _launcher()
-    lo = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 410})
-    hi = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 500})
-    assert (lo["option_dte_min"], lo["option_dte_max"]) == (365, 455)
-    assert (hi["option_dte_min"], hi["option_dte_max"]) == (455, 545)
+    lo = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 315})
+    hi = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 495})
+    assert (lo["option_dte_min"], lo["option_dte_max"]) == (270, 360)
+    assert (hi["option_dte_min"], hi["option_dte_max"]) == (450, 540)
 
 
 @pytest.mark.parametrize("key,prefix", [("O_LEAPC", "o_leapc"), ("O_ERN", "o_ern"),
@@ -1764,15 +1768,79 @@ def _decoded_dte_windows(m, key):
 
 
 @pytest.mark.parametrize("key", ["O_PMCC", "O_LEAP"])
-def test_the_leaps_entry_dte_gene_can_never_decode_below_365(key):
-    """Design §2's "DTE >= 365" (entry band 365-550), checked on what the GA DECODES, not on the
-    table: ``_apply_option_dte`` decodes the gene as a window CENTRE and subtracts a half-width
-    fixed by the AUTHORED window, and the GA snaps the centre to the lattice before that."""
+def test_the_leaps_entry_dte_gene_can_never_decode_below_270(key):
+    """Design §2/§1b's "DTE >= 270" (entry band 270-540, floor LOWERED from 365 on 2026-09-30),
+    checked on what the GA DECODES, not on the table: ``_apply_option_dte`` decodes the gene as
+    a window CENTRE and subtracts a half-width fixed by the AUTHORED window, and the GA snaps
+    the centre to the lattice before that.
+
+    Bounds independently computed: searched centres 315..495 step 15 (13 levels), hw=45
+    unchanged -- every window is ``(c-45, c+45)`` for ``c`` in that range."""
     m = _launcher()
     windows = _decoded_dte_windows(m, key)
-    assert min(lo for lo, _ in windows) >= 365, sorted(windows)
+    assert min(lo for lo, _ in windows) >= 270, sorted(windows)
     assert max(hi for _, hi in windows) <= 550, sorted(windows)
-    assert windows == {(c - 45, c + 45) for c in range(410, 501, 15)}
+    assert windows == {(c - 45, c + 45) for c in range(315, 496, 15)}
+
+
+@pytest.mark.parametrize("key", ["O_PMCC", "O_LEAP"])
+def test_every_leaps_entry_dte_window_lies_inside_270_550(key):
+    """Every decoded entry-DTE window for the long-dated keys must lie inside [270, 550] --
+    the band §1b measured and the operator approved 2026-09-30, checked exhaustively over the
+    gene's own lattice rather than at a couple of sampled points."""
+    m = _launcher()
+    windows = _decoded_dte_windows(m, key)
+    assert windows, f"{key} produced no decoded windows"
+    for lo, hi in windows:
+        assert 270 <= lo, (lo, hi)
+        assert hi <= 550, (lo, hi)
+
+
+@pytest.mark.parametrize("key,exit_kind", [("O_LEAP", "O_LEAP"), ("O_PMCC", "O_PMCC")])
+def test_the_leaps_entry_floor_never_reaches_the_exit_dte_ceiling(key, exit_kind):
+    """Design §2's roll/exit DTE floor (``_OPTION_DTE_EXIT_BANDS``) and the entry DTE window
+    are searched by INDEPENDENT genes, so nothing stops the GA pairing the LOWEST decoded entry
+    window with the HIGHEST exit-floor threshold. If that pairing ever let
+    ``entry_dte <= exit_floor``, the position would exit the same day it opened -- a silent
+    no-op trade.
+
+    Computed independently of ``_assert_entry_dte_clears_exit_floor`` (the launcher's own
+    import-time guard, added alongside the 2026-09-30 floor change): the lowest decoded entry
+    DTE is 270 (this module's own ``_decoded_dte_windows``, exhaustive over the real lattice);
+    the exit floor's ceiling is read straight off ``_OPTION_DTE_EXIT_BANDS`` (index 2 = max).
+    30 days of margin is the thinnest this ever gets (was 125 days pre-2026-09-30, at the old
+    365 floor)."""
+    m = _launcher()
+    windows = _decoded_dte_windows(m, key)
+    lowest_entry_dte = min(lo for lo, _ in windows)
+    _, _, exit_ceiling, _ = m._OPTION_DTE_EXIT_BANDS[exit_kind]
+    assert lowest_entry_dte > exit_ceiling, (
+        f"{key}: lowest entry dte {lowest_entry_dte} does not clear the exit floor's own "
+        f"ceiling {exit_ceiling} -- a genome could exit the day it opens")
+    assert lowest_entry_dte == 270
+    assert exit_ceiling == 240
+
+
+def test_a_lowered_entry_floor_that_reaches_the_exit_ceiling_is_refused_loudly():
+    """The launcher's own guard (``_assert_entry_dte_clears_exit_floor``, called at import for
+    O_LEAP/O_PMCC) must actually refuse a bad pairing, not just happen to pass on today's
+    numbers. Rigs a fresh copy of O_LEAPC's row with an entry floor that does NOT clear the
+    real exit ceiling and asserts the guard raises -- the "impossible, not silently wrong" half
+    of the requirement, exercised directly rather than only inferred from today's config."""
+    m = _launcher()
+    bad_cfg = dict(m._OPTION_STRATS["O_LEAPC"])
+    exit_ceiling = m._OPTION_DTE_EXIT_BANDS["O_LEAP"][2]
+    # hw stays 45 (option_dte_min/max unchanged at 380/470); set the searched floor so the
+    # lowest decodable entry dte (option_dte_min_range - hw) lands AT the exit ceiling --
+    # entry_dte <= exit_floor, the exact defect the guard exists to catch.
+    bad_cfg["option_dte_min_range"] = exit_ceiling + 45
+    orig = m._OPTION_STRATS["O_LEAPC"]
+    m._OPTION_STRATS["O_LEAPC"] = bad_cfg
+    try:
+        with pytest.raises(RuntimeError, match="silent no-op trade"):
+            m._assert_entry_dte_clears_exit_floor("O_LEAP", ["O_LEAPC"])
+    finally:
+        m._OPTION_STRATS["O_LEAPC"] = orig
 
 
 def test_the_earnings_entry_dte_windows_stay_inside_the_designed_7_to_30_band():
@@ -1908,7 +1976,8 @@ def test_the_matrix_driver_lists_the_pmcc_with_the_LEAPS_chain_depth():
     spec.loader.exec_module(mod)
 
     assert "O_PMCC" in mod._DEFAULT_STRATEGIES
-    assert mod._MIN_DTE["O_PMCC"] == mod._MIN_DTE["O_LEAP"] == 365
+    # 270, not 365: the entry floor was lowered 2026-09-30 (operator decision, design §1b).
+    assert mod._MIN_DTE["O_PMCC"] == mod._MIN_DTE["O_LEAP"] == 270
 
 
 def test_no_option_row_declares_a_gene_its_own_builder_cannot_read():

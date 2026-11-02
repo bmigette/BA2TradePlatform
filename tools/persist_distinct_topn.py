@@ -180,19 +180,27 @@ def _expert_of(bt_block: Dict[str, Any]) -> str:
     raise Refused("optimization_config.backtest names no expert")
 
 
-def _existing_rows(db, opt_id: int) -> List[Tuple[int, str, str, Optional[tuple]]]:
-    """(id, name, params_key, fingerprint) of every completed Backtest of this optimization.
+def _existing_rows(db, opt_id: int, opt_window: Tuple[str, str]
+                   ) -> List[Tuple[int, str, str, Optional[tuple]]]:
+    """(id, name, params_key, fingerprint) of every completed IN-SAMPLE Backtest of this
+    optimization: rows run on the optimization's own window (``opt_window`` = its start/end) and
+    not walk-forward out-of-sample rows (same optimization_id and genes, other window; matching
+    one would make ``--skip-already-persisted`` skip the real in-sample row).
     Never the curve/trade blobs (see the backtests blob-layout note). ``fingerprint`` is None
     for a row flagged ``ga_fitness_divergence``: its metrics come from a re-run that did NOT
     reproduce the GA's score, so they must not stand in for a GA record's behaviour."""
     from app.models.backtest import Backtest
-    from app.services.distinct_topn import behaviour_fingerprint, params_key
+    from app.services.distinct_topn import (behaviour_fingerprint, is_oos_row, params_key,
+                                            row_in_window)
     rows = (db.query(Backtest.id, Backtest.name, Backtest.strategy_params, Backtest.total_trades,
-                     Backtest.total_return, Backtest.max_drawdown, Backtest.results)
+                     Backtest.total_return, Backtest.max_drawdown, Backtest.results,
+                     Backtest.labels, Backtest.start_date, Backtest.end_date)
               .filter(Backtest.optimization_id == opt_id, Backtest.status == "completed")
               .order_by(Backtest.id).all())
     out = []
-    for bid, name, sp, trades, ret, dd, res in rows:
+    for bid, name, sp, trades, ret, dd, res, labels, bstart, bend in rows:
+        if is_oos_row(name, labels) or not row_in_window(bstart, bend, *opt_window):
+            continue
         diverged = isinstance(res, dict) and res.get("ga_fitness_divergence") is not None
         fp = (behaviour_fingerprint(trades, ret, dd)
               if None not in (trades, ret, dd) and not diverged else None)
@@ -212,6 +220,22 @@ def _match_existing(pick, existing) -> Optional[Tuple[int, str, str]]:
         if fp is not None and fp == pick.fingerprint:
             return bid, name, "fingerprint"
     return None
+
+
+def select_picks(opt, n: int, min_trade_rows: int, tol):
+    """The behaviour-distinct selection of ONE optimization row: ``(bt_block, expert, years,
+    picks, stats)``. Shared with tools/run_walk_forward.py so both pick the same genomes.
+    Refuses (``Refused``) a row without an ``optimization_config.backtest`` block."""
+    from app.services.distinct_topn import select_behaviour_distinct
+    if not isinstance((opt.optimization_config or {}).get("backtest"), dict):
+        raise Refused(f"optimization {opt.id} has no optimization_config.backtest block")
+    bt_block = dict(opt.optimization_config["backtest"])
+    expert = _expert_of(bt_block)
+    years = _window_years(bt_block)
+    stats: Dict[str, int] = {}
+    picks = select_behaviour_distinct(opt.all_results, n, min_trades=min_trade_rows,
+                                      tolerances=tol, years=years, stats=stats)
+    return bt_block, expert, years, picks, stats
 
 
 def _fmt(v, spec=".1f", suffix="%"):
@@ -310,7 +334,7 @@ def main(argv=None) -> int:
 def _main(args) -> int:
     L = _bootstrap()
     from app.models.database import SessionLocal
-    from app.services.distinct_topn import Tolerances, select_behaviour_distinct
+    from app.services.distinct_topn import Tolerances
 
     tol = Tolerances(return_rel_pct=args.min_return_rel_pct, dd_pts=args.min_dd_pts,
                      trades_rel_pct=args.min_trades_rel_pct)
@@ -321,16 +345,9 @@ def _main(args) -> int:
             raise Refused(f"optimization {opt.id} ({opt.name}) is {opt.status!r}, not "
                           f"'completed'. Pass --allow-running (meant for --dry-run on a live "
                           f"job) to proceed anyway.")
-        if not isinstance((opt.optimization_config or {}).get("backtest"), dict):
-            raise Refused(f"optimization {opt.id} has no optimization_config.backtest block")
-        bt_block = dict(opt.optimization_config["backtest"])
-        expert = _expert_of(bt_block)
-        years = _window_years(bt_block)
-        stats: Dict[str, int] = {}
-        picks = select_behaviour_distinct(opt.all_results, args.n,
-                                          min_trades=args.min_trade_rows,
-                                          tolerances=tol, years=years, stats=stats)
-        existing = _existing_rows(db, opt.id)
+        bt_block, expert, years, picks, stats = select_picks(
+            opt, args.n, args.min_trade_rows, tol)
+        existing = _existing_rows(db, opt.id, (bt_block["start_date"], bt_block["end_date"]))
         existing_by_rank = {p.rank: m for p in picks
                             if (m := _match_existing(p, existing)) is not None}
         opt_id, opt_name, opt_status = opt.id, opt.name, opt.status

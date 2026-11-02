@@ -9,6 +9,28 @@ React/Vite UI, a `ba2-test` console command, and optional remote workers that sh
 
 ![Dashboard](docs/screenshots/01-dashboard.png)
 
+## Quick start
+
+From the monorepo root:
+
+```bash
+./install.sh --test-only --editable      # Windows: .\install.ps1 -TestOnly -Editable
+source ~/ba2-venvs/test/bin/activate     # Windows: ~\ba2-venvs\test\Scripts\Activate.ps1
+ba2-test serve                           # API on :8000, UI on :5173
+```
+
+Open http://localhost:5173 and enter provider API keys (FMP at least) under
+**Settings -> API Keys**. Then run a backtest or a GA job from the CLI:
+
+```bash
+ba2-test backtest --expert FMPRating --universe AAPL,MSFT,NVDA --start 2024-01-01 --end 2024-12-31 --save
+ba2-test optimize --expert FMPRating --strategy S2 --universe AAPL,MSFT,NVDA --start 2023-01-01 --end 2024-12-31
+```
+
+`start.bat` / `start.sh` wrap `ba2-test serve`. [QUICK_START.md](QUICK_START.md) has the longer
+walkthrough; [Install and first run](#install-and-first-run) and
+[Command-line tools](#command-line-tools) have the details.
+
 ## How it relates to the trade platform
 
 Both apps live in one monorepo and share three installable packages:
@@ -101,7 +123,8 @@ fill clock (`--interval`, e.g. `5min`, for intraday TP/SL). It uses as-of data o
 Supported experts are listed in `_SUPPORTED_EXPERTS` in
 `backend/app/services/backtest/daily_backtest_handler.py`. Today they are FMPRating,
 FMPEarningsDrift, FMPEarningsEvent, FMPInsiderClusterBuy, FMPSenateTraderWeight,
-FMPSenateTraderCopy, FinnHubRating, FactorRanker, DeterministicScorer and ETFTrend.
+FMPSenateTraderCopy, FinnHubRating, FactorRanker, DeterministicScorer, ETFTrend and
+PullbackReversion (research-only, backtest-registered).
 Classic-RM experts use enter/exit rulesets. Bypass experts such as FactorRanker rebalance to
 target weights. The Smart (agentic) risk manager is not modelled, and a run that asks for it is
 refused.
@@ -183,8 +206,9 @@ is hermetic and seeded, so its fitness does not depend on which host ran it.
   `--worker NAME` (repeatable) or `--workers A,B` to `ba2-test optimize` or `optimize-batch`.
 - **Pre-flight** (`services/distributed_eval.py`): for each selected worker, the master calls
   `ensure_synced` (`services/worker_client.py`). This compares the worker's `TEST_APP_VERSION`
-  with the master's and triggers `/update` (git pull, package reinstall, restart) on a
-  mismatch. The master then pushes missing cache files as a tar stream, and prepares the
+  with the master's, and the worker's reported package versions with the master's
+  `REQUIRED_PACKAGE_VERSIONS`, and triggers `/update` (git pull, package reinstall, restart) on a
+  mismatch or a package below its minimum. The master then pushes missing cache files as a tar stream, and prepares the
   market-condition snapshot if the run pins one. A worker that fails pre-flight is dropped.
   The master re-checks dropped workers during the run and re-admits any that recover.
 - **During a run**: the master's local consumer threads and the remote dispatcher threads all
@@ -230,7 +254,12 @@ installer's default `~/ba2-venvs/test`.
   `frontend/src/lib/config.ts`).
 - On startup the backend creates its tables and runs `backend/scripts/migrate_db.py`.
 - Set provider API keys (FMP, Alpaca, Finnhub, ...) in **Settings -> API Keys**, or copy them from
-  the trade platform's DB.
+  the trade platform's DB. The FRED key is the AppSetting `fred_api_key` (what the page saves;
+  env `FRED_API_KEY` overrides it); a row under the old name `FRED_API_KEY` is refused until
+  `tools/migrate_fred_api_key.py` moves it. Option backtests need no key but do need
+  `<CACHE_FOLDER>/fred/DGS3MO.json` (their risk-free rate). See
+  [../docs/REPRODUCE-BACKTESTS.md](../docs/REPRODUCE-BACKTESTS.md) for which keys reproducing
+  results needs.
 - Set `BA2_ADMIN_TOKEN` to enable the token-protected admin endpoints (`/api/admin/*`:
   version, update, logs, DB cleanup).
 
@@ -305,12 +334,14 @@ pass `--apply` to move files, and restart running instances afterwards.
 ## Versioning
 
 `version.py` holds `TEST_APP_VERSION` (`YYYY.MM.NNNNN`). Increment the build number before
-every push that touches `testplatform/` **or `packages/`**. Changes confined to
-`ba2_trade_platform/` bump `ba2_trade_platform/version.py` instead. Workers compare
-`TEST_APP_VERSION` only, not the git commit. An unbumped shared-package change would leave
-workers running different code while they report themselves as synced. Commit and push the
-bump: the master refuses to sync workers to a version that a `git pull` cannot reach
-(`self_update.unsyncable_reason`).
+every push that touches `testplatform/`. Each shared package has its own `PACKAGE_VERSION`
+(`packages/<dir>/<pkg>/version.py`), bumped on every change to that package; the test platform
+requires workers to run at least `REQUIRED_PACKAGE_VERSIONS` (`required_package_versions.py`), and
+that minimum is raised only when a package change can affect GA results (GA-neutral paths are
+listed in `ga_neutral_package_paths.py`). Workers compare `TEST_APP_VERSION` and those minimums, not
+the git commit. `python tools/check_package_versions.py` enforces the bump rules. Commit and push
+the bump: the master WARNS (`self_update.unsyncable_reason`) when a version that a `git pull` cannot reach
+is about to be synced.
 
 ## Testing
 

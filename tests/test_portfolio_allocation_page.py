@@ -1441,6 +1441,54 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     assert len(runs) == 1 and runs[0].order_ids
 
 
+def test_submit_opens_NO_results_dialog_and_reports_into_the_dry_run_table(
+        monkeypatch, nicegui_client, account_id):
+    """The dry-run table IS the result: each row gets its outcome (icon, marking,
+    details) through ``set_row_outcome``, the summary and the Retry hook go through
+    ``finish_submit``, and no second dialog is drawn on top."""
+    from nicegui import ui
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+
+    class _Wizard:
+        def __init__(self):
+            self.outcomes, self.finished = [], None
+
+        def set_row_outcome(self, outcome):
+            self.outcomes.append(outcome)
+
+        def finish_submit(self, summary, **kwargs):
+            self.finished = (summary, kwargs)
+
+    wizard, opened, pending = _Wizard(), {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: (opened.update(kw, base=a[0], plan=a[1]),
+                                          wizard)[1])
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _delay, callback, once=False: pending.append(callback)
+                        or type('T', (), {'deactivate': lambda self: None})())
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop(0))
+
+    assert [o.symbol for o in wizard.outcomes] == ['AAPL']
+    summary, kwargs = wizard.finished
+    assert summary.startswith('Run ')
+    assert [o.symbol for o in kwargs['outcomes']] == ['AAPL']
+    assert callable(kwargs['on_retry']) and kwargs['run_id']
+    assert [el for el in nicegui_client.layout.descendants()
+            if isinstance(el, ui.dialog)] == []
+    assert not hasattr(page, 'render_outcomes')
+
+
 def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
                                                               nicegui_client,
                                                               account_id):
@@ -3399,7 +3447,10 @@ def test_the_target_column_is_renamed_so_it_cannot_be_read_as_the_label_target()
     Neither was: one is a share of the label, the other of the portfolio."""
     from ba2_trade_platform.ui.pages import portfolio_allocation as module
     import inspect
-    source = inspect.getsource(module._render_label_body)
+    # The column list moved out of ``_render_label_body`` into ``symbol_table_columns``
+    # (one list read by the table and by the phone card spec); the pin follows it.
+    source = (inspect.getsource(module._render_label_body)
+              + inspect.getsource(module.symbol_table_columns))
     assert "'label': 'Share of label %'" in source
     assert "'label': 'Target %'" not in source
 
@@ -4269,12 +4320,13 @@ def test_the_swatch_only_ever_takes_a_PARSED_colour(monkeypatch, nicegui_client,
 def test_the_reserve_controls_can_express_a_two_decimal_reserve(nicegui_client,
                                                                 account_id):
     """The slider steps in whole percent because dragging a 10,000-notch track is
-    unusable; the BOX is what makes 12.5 reachable, so its step has to allow it."""
+    unusable; the BOX is what makes 12.5 reachable. ``step=any`` keeps every decimal valid
+    while the browser's spinner arrows move it by a whole 1 (not 0.01)."""
     root = _draw(nicegui_client, account_id, _one_label(account_id))
     slider, number = _reserve_controls(root)
 
     assert slider._props['step'] == 1
-    assert number._props['step'] == 0.01
+    assert number._props['step'] == 'any'
     assert (slider._props['min'], slider._props['max']) == (0, 100)
     assert (number._props['min'], number._props['max']) == (0, 100)
 
@@ -8730,3 +8782,218 @@ def test_an_invest_run_stamps_the_weights_but_leaves_the_labels_last_alone(accou
 
     assert get_symbol_rows(account_id, 'ARK26')['AAPL'].previous_weight_pct == 70.0
     assert get_managed_labels(account_id)[0].previous_target_pct is None
+
+
+# ---------------------------------------------------------------------------
+# WHERE THE DIALOGS LIVE, and what ``refresh()`` may clear
+#
+# A NiceGUI element is a child of the slot that is current when it is built, and a
+# click handler / timer callback runs in the slot of the element that fired it. Two
+# consequences were live on this page: the income panel was drawn into whatever slot
+# ran ``_refresh`` (after a Submit: the dry-run dialog's own footer, whose
+# ``_do_submit`` runs in the Submit button's slot), and the Invest button's timer put
+# the invest-scope dialog -- and the dry run opened from it -- inside the income
+# panel, which a refresh clears.
+# ---------------------------------------------------------------------------
+
+def _income_labels(root):
+    return [e for e in root.descendants()
+            if isinstance(e, _ui().label) and e._text == 'Income (last 30 days)']
+
+
+def _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client, account_id):
+    """Review -> Submit through the page's REAL closures, each step run in the slot
+    NiceGUI would run it in (the clicked element's parent)."""
+    # The page starts a background thread per refresh to top up the ⓘ stats; on the
+    # in-memory test DB that thread is the SQLite native-crash flake, and nothing here
+    # is about it.
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    ui = _ui()
+    timers = []
+
+    class _Timer:
+        def deactivate(self):
+            pass
+
+    def _fake_timer(_delay, callback, once=False):
+        from nicegui import context
+        timers.append((callback, context.slot.parent))
+        return _Timer()
+
+    monkeypatch.setattr(page.ui, 'timer', _fake_timer)
+
+    captured = {}
+    real_flow = page._open_allocation_flow
+
+    async def _spy(*args, **kwargs):
+        captured['refresh'] = args[2]
+
+    monkeypatch.setattr(page, '_open_allocation_flow', _spy)
+    review = _review_button(root)
+    _press(review)
+    monkeypatch.setattr(page, '_open_allocation_flow', real_flow)
+
+    async def _open():
+        with review.parent_slot:
+            await real_flow(account_id, VALUATION_MODE_COST, captured['refresh'])
+
+    asyncio.run(_open())
+    def _submit_button(d):
+        return next((e for e in d.descendants()
+                     if isinstance(e, ui.button) and e._props.get('label') == 'Submit'),
+                    None)
+
+    dialog = next(d for d in root.descendants()
+                  if isinstance(d, ui.dialog) and _submit_button(d) is not None)
+    submit = _submit_button(dialog)
+    handler = next(l.handler for l in submit._event_listeners.values()
+                   if l.type.split('.')[0] == 'click')
+    with submit.parent_slot:
+        handler(None)
+    callback, _parent = timers.pop()          # the Submit timer (the painter comes later)
+
+    async def _submit():
+        with submit.parent_slot:
+            result = callback()
+            if asyncio.iscoroutine(result):
+                await result
+
+    asyncio.run(_submit())
+    return root, dialog, timers
+
+
+def test_the_refresh_that_ends_a_submit_does_not_delete_the_dry_run_dialog(
+        monkeypatch, nicegui_client, account_id):
+    root, dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                         account_id)
+    assert dialog.is_deleted is False
+    assert any('pf-dry-row' in getattr(e, '_classes', []) for e in dialog.descendants())
+
+
+def test_the_income_panel_is_not_drawn_into_the_dry_run_dialog(
+        monkeypatch, nicegui_client, account_id):
+    """``_do_submit`` runs in the Submit button's slot and ends with ``refresh()``; the
+    income panel used to be drawn wherever that slot was -- inside the dialog."""
+    root, dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                         account_id)
+    assert _income_labels(dialog) == []
+
+
+def test_refreshing_replaces_the_income_panel_instead_of_stacking_another(
+        monkeypatch, nicegui_client, account_id):
+    root, _dialog, _timers = _flow_to_a_submitted_dry_run(monkeypatch, nicegui_client,
+                                                          account_id)
+    assert len(_income_labels(root)) == 1
+
+
+def test_a_dialog_opened_from_the_income_panel_is_built_outside_what_refresh_clears(
+        monkeypatch, nicegui_client, account_id):
+    """The Invest button's timer must be parented to the page's dialog host, not to the
+    income panel: invest-scope and the dry run opened from it hang off that parent."""
+    ui = _ui()
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    parents = []
+
+    class _Timer:
+        def deactivate(self):
+            pass
+
+    def _fake_timer(_delay, callback, once=False):
+        from nicegui import context
+        parents.append(context.slot.parent)
+        return _Timer()
+
+    monkeypatch.setattr(page.ui, 'timer', _fake_timer)
+    invest = next(e for e in root.descendants()
+                  if isinstance(e, ui.button) and e._props.get('label') == 'Invest')
+    income_card = next(e for e in invest.ancestors()
+                       if any(isinstance(c, ui.label) and c._text == 'Income (last 30 days)'
+                              for c in e.descendants()))
+    _press(invest)
+    assert parents, 'the Invest click scheduled nothing'
+    host = parents[-1]
+    assert host is not income_card and income_card not in list(host.ancestors())
+    assert host not in list(income_card.descendants())
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: ordering on the exception path, overlapping refreshes
+# ---------------------------------------------------------------------------
+
+def test_a_submit_that_dies_paints_what_landed_before_it_marks_the_rest_unknown(
+        monkeypatch, nicegui_client, account_id):
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+
+    calls = []
+
+    class _Wizard:
+        def set_row_outcome(self, outcome):
+            calls.append(('outcome', outcome.symbol))
+
+        def finish_submit(self, summary, **kwargs):
+            calls.append(('finish', kwargs.get('interrupted', False)))
+
+    wizard, opened, pending = _Wizard(), {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: (opened.update(kw, base=a[0], plan=a[1]),
+                                          wizard)[1])
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _d, cb, once=False: pending.append(cb)
+                        or type('T', (), {'deactivate': lambda self: None})())
+
+    def _dies_after_one_order(*args, on_outcome=None, **kwargs):
+        # recorded by the worker in the last moments before it blew up -- and the
+        # 200 ms painter timer never ran (it is a queued fake here)
+        on_outcome(svc.RowOutcome(symbol='AAPL', action='new',
+                                  status=svc.OUTCOME_FAILED, quantity=1.0))
+        raise RuntimeError('broker connection reset')
+
+    monkeypatch.setattr(page, '_submit_plan', _dies_after_one_order)
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop(0))
+
+    assert calls == [('outcome', 'AAPL'), ('finish', True)]
+
+
+def test_two_overlapping_refreshes_draw_one_income_panel(monkeypatch, nicegui_client,
+                                                         account_id):
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', lambda *a, **k: None)
+    root = _drawn_page(monkeypatch, nicegui_client, account_id)
+    captured = {}
+    real_flow = page._open_allocation_flow
+
+    async def _spy(*args, **kwargs):
+        captured['refresh'] = args[2]
+
+    monkeypatch.setattr(page, '_open_allocation_flow', _spy)
+    _press(_review_button(root))
+    monkeypatch.setattr(page, '_open_allocation_flow', real_flow)
+    refresh = captured['refresh']
+
+    # A to_thread that really YIELDS, so the two refreshes interleave at every await the
+    # way two browser taps do (the autouse fixture runs thread bodies inline and never
+    # suspends, which hides the overlap).
+    async def _yielding(func, /, *args, **kwargs):
+        await asyncio.sleep(0)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(page.asyncio, 'to_thread', _yielding)
+
+    async def _both():
+        with nicegui_client:
+            await asyncio.gather(refresh(), refresh())
+
+    asyncio.run(_both())
+    assert len(_income_labels(root)) == 1

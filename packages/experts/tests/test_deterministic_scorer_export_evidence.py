@@ -23,6 +23,19 @@ _DF = pd.DataFrame({
     "Low": [c - 1 for c in _CLOSES], "Close": _CLOSES,
     "Volume": [1_000_000] * 280,
 })
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_macro(monkeypatch):
+    """Hermetic: these tests are about the export wiring, not the macro inputs, and the live
+    path (as_of=None) reads the REAL FRED cache under ba2/common/cache/fred, which a first-release
+    series refuses once its fetch day is before today's New York date ("fetched ... before the
+    decision label") -- a wall-clock/real-file dependence. Same inputs as
+    test_deterministic_scorer_series_parity: VIX only, no series."""
+    monkeypatch.setattr(_data, "fetch_macro_series", lambda *a, **k: {
+        "vix": 16.0, "unrate_series": None, "spread_10y3m_series": None, "oas_series": None})
+
+
 _LAST_CLOSE = _CLOSES[-1]          # 239.5
 _SHARES = 1_000_000_000.0
 
@@ -56,7 +69,11 @@ _CASHFLOW = [{"operating_cash_flow": 8_000_000_000.0} for _ in range(6)]
 
 
 class _FakeOHLCV:
-    def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d"):
+    def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d",
+                       lookback_days=None):
+        # ``lookback_days``: the export bypass instance prices the symbol through
+        # ``LiveProviderBundle.price_at_date`` (end_date=now, lookback_days=7), the same seam
+        # every expert's export price goes through (ExpertDataExportInterface._bypass_instance).
         return _DF
 
 
@@ -81,6 +98,25 @@ def export():
     result = DeterministicScorer.export_symbol_data("AAPL", providers_resolver=_resolver)
     assert result.error is None, result.error
     return result
+
+
+def test_the_export_prices_through_the_bypass_seam_and_is_not_a_no_price_skip(export, monkeypatch):
+    """An explain/evidence export has NO account: the bypass instance answers the decision price
+    through ``providers.price_at_date(symbol, now)`` (the provider's last daily close <= now), so a
+    symbol with history is never silently skipped as ``no_price``."""
+    assert export.skipped is not True, export.metrics
+    calls = []
+    real = _FakeOHLCV.get_ohlcv_data
+
+    def spy(self, *a, **kw):
+        calls.append(kw)
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(_FakeOHLCV, "get_ohlcv_data", spy)
+    _data.reset_caches()
+    again = DeterministicScorer.export_symbol_data("AAPL", providers_resolver=_resolver)
+    assert again.error is None and again.skipped is not True
+    assert any(kw.get("lookback_days") == 7 and kw.get("interval") == "1d" for kw in calls), calls
 
 
 def _row(export, label):

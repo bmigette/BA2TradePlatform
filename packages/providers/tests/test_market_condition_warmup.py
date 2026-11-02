@@ -140,8 +140,9 @@ def fast_claims(monkeypatch):
     monkeypatch.setenv("BA2_MC_MAX_HOST_BUILDERS", "4")
 
 
-def _warm(root, source, *, start=START, end=END, fetch_missing=False, universe=UNIVERSE, concurrency=2):
-    p = W.plan(PROFILE, universe, start, end, cache_root=root, source=source)
+def _warm(root, source, *, start=START, end=END, fetch_missing=False, universe=UNIVERSE, concurrency=2,
+         gap_fill=None):
+    p = W.plan(PROFILE, universe, start, end, cache_root=root, source=source, gap_fill=gap_fill)
     rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=fetch_missing,
                   concurrency=concurrency, source=source)
     return p, rep
@@ -375,6 +376,131 @@ def test_negative_row_is_invalidated_when_the_bar_appears(root):
     assert "CCC" not in r2.exceptions
 
 
+def test_gap_fill_previous_resolves_a_hole_and_changes_the_manifest_identity(root):
+    """Operator decision 2026-09-30. Same fixture as the test right above (CCC missing its
+    2025-03-03 bar), but built with ``gap_fill="previous"``: the hole is carried forward instead
+    of becoming a negative row, the plan/report say so, and the published manifest is a
+    DIFFERENT, independently valid object from the unfilled one -- never a silent reinterpretation
+    of it."""
+    src = FakeSource(root)
+    hole = pd.Timestamp("2025-03-03")
+    df = TRUTH["CCC"]
+    _write(root, "CCC", df[df["Date"] != hole])
+
+    p_unfilled, r_unfilled = _warm(root, src)
+    assert r_unfilled.ok
+
+    p_filled, r_filled = _warm(root, src, gap_fill="previous")
+    assert r_filled.ok
+    assert p_filled.gap_fill == "previous"
+    assert p_filled.symbol("CCC").gap_fill_missing_sessions == 1
+    assert p_filled.symbol("CCC").gap_fill_invalid_sessions == 0
+    assert p_filled.symbol("CCC").holes == 1          # the raw-cache diagnostic is UNCHANGED
+    assert p_filled.summary()["gap_fill_missing_sessions"] == 1
+
+    store = MarketConditionStore(root)
+    rows = list(store.iter_rows(store.read_manifest(r_filled.manifest_digest), "CCC"))
+    assert all(o.status == STATUS_VALID for _s, r in rows for o in r.by_field().values())
+    assert r_filled.counters["gap_fill_missing_sessions"] == 1
+    assert any(e.get("kind") == "gap_filled" for e in r_filled.exceptions.get("CCC", []))
+
+    # A DIFFERENT manifest from the unfilled one, each independently verifiable.
+    assert r_filled.manifest_digest != r_unfilled.manifest_digest
+    assert W.verify(r_filled.manifest_digest, root).ok
+    assert W.verify(r_unfilled.manifest_digest, root).ok
+    filled_manifest = store.read_manifest(r_filled.manifest_digest)
+    unfilled_manifest = store.read_manifest(r_unfilled.manifest_digest)
+    assert filled_manifest["gap_fill_policy"] == "previous"
+    assert "gap_fill_policy" not in unfilled_manifest
+
+
+def test_gap_fill_default_build_is_unaffected_and_old_manifest_still_verifies(root):
+    """No ``gap_fill`` (the default) must build and publish EXACTLY as it did before this
+    feature existed -- this is the regression pin, not just a doc claim."""
+    src = FakeSource(root)
+    _p1, r1 = _warm(root, src)
+    assert r1.ok
+    store = MarketConditionStore(root)
+    manifest = store.read_manifest(r1.manifest_digest)
+    assert "gap_fill_policy" not in manifest
+    assert store.verify(manifest, r1.manifest_digest).ok
+    assert W.verify(r1.manifest_digest, root).ok
+
+
+def test_gap_fill_refusal_is_isolated_to_its_own_symbol_never_crashes_the_plan(root):
+    """A bar dated off the regular-session calendar (a genuine upstream data defect FMP really
+    produces -- e.g. BEP's 2025-11-08, a Saturday) must not crash the WHOLE plan/build for every
+    other symbol in the universe. It is isolated exactly like an unreadable split calendar:
+    recorded, waivable, excludable."""
+    src = FakeSource(root)
+    df = TRUTH["CCC"]
+    bad_row = df.iloc[[-1]].copy()
+    bad_row["Date"] = pd.Timestamp("2025-01-04")  # a Saturday, not a regular session
+    corrupt = pd.concat([df, bad_row]).sort_values("Date").reset_index(drop=True)
+    _write(root, "CCC", corrupt)
+
+    plan = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src, gap_fill="previous")
+    assert plan.symbol("CCC").gap_fill_error and "not a regular session" in plan.symbol("CCC").gap_fill_error
+    assert plan.symbol("AAA").gap_fill_error is None
+    msg = plan.waivable_preflight_errors()
+    assert any("CCC" in m for m in msg)
+    assert plan.fatal_preflight_errors() == []       # waivable, not fatal
+
+    rep_refused = W.build(plan, fetch_missing=False, source=src)
+    assert not rep_refused.ok                        # not published without allow_exclusions
+
+    rep = W.build(plan, fetch_missing=False, source=src, allow_exclusions=True)
+    assert rep.ok, rep
+    assert rep.excluded.get("CCC") and rep.excluded["CCC"][0]["kind"] == "gap_fill_refused"
+    store = MarketConditionStore(root)
+    manifest = store.read_manifest(rep.manifest_digest)
+    assert "CCC" not in {o["symbol"] for o in manifest["objects"]}
+    assert {"AAA", "BBB"} <= {o["symbol"] for o in manifest["objects"]}
+
+
+def test_gap_fill_hole_at_start_is_recorded_but_not_fabricated(root):
+    """A hole in the symbol's very FIRST available session (no earlier valid bar anywhere in its
+    own history) is reported, never filled."""
+    src = FakeSource(root)
+    df = TRUTH["CCC"]
+    first_bar = df["Date"].min()
+    corrupt = df.copy()
+    i = int(np.flatnonzero(corrupt["Date"] == first_bar)[0])
+    corrupt.loc[i, "High"] = corrupt.loc[i, "Low"] - 1.0  # the very first bar is invalid
+    _write(root, "CCC", corrupt)
+
+    p, rep = _warm(root, src, gap_fill="previous")
+    assert rep.ok
+    assert p.symbol("CCC").gap_fill_hole_at_start == first_bar.date().isoformat()
+
+
+def test_gap_fill_round_trips_through_the_saved_plan_json(root, tmp_path):
+    """``build`` reads the policy back off the SAVED plan (the CLI's `plan` -> `build` split), not
+    from a fresh call: a plan built with ``--gap-fill previous`` must still apply it after being
+    written to disk and reloaded, exactly the way the CLI's two subcommands use it."""
+    src = FakeSource(root)
+    plan = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src, gap_fill="previous")
+    assert plan.gap_fill == "previous"
+    out = tmp_path / "plan.json"
+    plan.save(out)
+    reloaded = W.MarketConditionWarmPlan.load(out)
+    assert reloaded.gap_fill == "previous"
+    rep = W.build(reloaded, fetch_missing=False, source=src)
+    assert rep.ok
+    manifest = MarketConditionStore(root).read_manifest(rep.manifest_digest)
+    assert manifest["gap_fill_policy"] == "previous"
+
+
+def test_build_rejects_a_tampered_unknown_gap_fill_policy(root):
+    """Defense at ``build`` time too, not only at ``plan`` time: a plan JSON hand-edited (or from
+    a future version) to carry an unknown policy is refused loudly, never guessed at."""
+    src = FakeSource(root)
+    plan = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    plan.gap_fill = "not-a-real-policy"
+    with pytest.raises(ValueError, match="unknown gap_fill policy"):
+        W.build(plan, fetch_missing=False, source=src)
+
+
 def test_cache_only_with_missing_raw_stops_with_inventory_and_fetches_nothing(root):
     src = FakeSource(root)
     df = TRUTH["BBB"]
@@ -532,11 +658,11 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
     total = p1.row_sessions * len(UNIVERSE)
     assert r1.counters["rows_computed"] == total
 
-    bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-2")
+    bumped = dc_replace(MC.PROFILES[PROFILE], calc_version="ohlcv-v1/calc-3")
     monkeypatch.setitem(MC.PROFILES, PROFILE, bumped)
 
     p2, r2 = _warm(root, src)
-    assert p2.calc_version == "ohlcv-v1/calc-2"
+    assert p2.calc_version == "ohlcv-v1/calc-3"
     assert r2.counters["rows_computed"] == total and r2.counters["rows_reused"] == 0
     assert r2.manifest_digest != r1.manifest_digest
     # Objects are addressed by CONTENT, so this fixture's unchanged calculator re-derives the same
@@ -544,10 +670,10 @@ def test_a_calc_version_bump_recomputes_every_row(root, monkeypatch):
     # WITHOUT being recomputed, which the counters above pin.
     assert r2.counters["objects_written"] == 0 and r2.counters["objects_reused"] == 36
     store = MarketConditionStore(root)
-    assert store.read_manifest(r2.manifest_digest)["calc_version"] == "ohlcv-v1/calc-2"
+    assert store.read_manifest(r2.manifest_digest)["calc_version"] == "ohlcv-v1/calc-3"
     # The old manifest is untouched and still readable at its own version.
     old = store.read_manifest(r1.manifest_digest)
-    assert old["calc_version"] == "ohlcv-v1/calc-1" and store.verify(old, r1.manifest_digest).ok
+    assert old["calc_version"] == "ohlcv-v1/calc-2" and store.verify(old, r1.manifest_digest).ok
     assert len(list(store.iter_rows(old, "AAA"))) == p1.row_sessions
 
     # Back at the original version (the bump undone), the original rows are reused again and the
@@ -791,3 +917,102 @@ def test_a_file_adjusted_on_the_wrong_day_is_mixed_basis_and_refetched(root):
     p2 = W.plan(PROFILE, ("MIX",), START, END, cache_root=root, source=src)
     assert not p2.symbol("MIX").refetch_required
     assert [c["verdict"] for c in p2.symbol("MIX").split_checks] == ["refetched"]
+
+
+# ------------------------------------------------ repair: the FMP step alone (stage-2, 2026-09-26)
+def test_repair_refetches_the_refused_and_publishes_nothing(root):
+    """``W.repair`` is the split-basis repair on its own: the same fetch phase ``build`` runs
+    (a FULL re-fetch for every ``refetch_required`` symbol, a range fetch for missing coverage),
+    then the same re-check -- and no feature row, object or manifest."""
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=77)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = FakeSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    p = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+    assert p.symbol("SPL").refetch_required
+
+    rep = W.repair(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), source=src)
+
+    assert rep["ok"] and rep["refetched"] == ["SPL"] and rep["range_fetched"] == []
+    assert rep["still_refused"] == {} and rep["fetch_errors"] == {}
+    assert rep["provider_calls"] == 1
+    assert src.full_refetches == ["SPL"] and src.fetches == []
+    assert not any("manifest" in f.lower() for _d, _s, fs in os.walk(root) for f in fs), \
+        "repair publishes nothing"
+    p2 = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+    assert [c["verdict"] for c in p2.symbol("SPL").split_checks] == ["refetched"]
+
+
+class _RefusingRefetchSource(FakeSource):
+    """The SATS shape: the vendor's full history ends before the cache, so the provider's own
+    guard refuses the replacement."""
+
+    def force_full_refetch(self, symbol):
+        with self._lock:
+            self.calls += 1
+            self.full_refetches.append(symbol)
+        raise RuntimeError(f"full re-fetch of {symbol} (1d) returned LESS history than the cache holds")
+
+
+def test_repair_names_every_symbol_that_still_refuses(root):
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=78)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = _RefusingRefetchSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    p = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+
+    rep = W.repair(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), source=src)
+
+    assert not rep["ok"] and rep["refetched"] == []
+    assert "LESS history" in rep["fetch_errors"]["SPL"]
+    assert list(rep["still_refused"]) == ["SPL"]
+    assert rep["still_refused"]["SPL"][0]["verdict"] == "drift"
+
+
+def test_the_fmp_source_passes_the_tail_keep_only_for_the_named_symbols(tmp_path):
+    from ba2_common.core import native_cache
+    from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
+
+    class StubProvider:
+        api_key = "test-key"
+
+        def __init__(self):
+            self.refetches = []
+            self.kept_tails = {"SATS": {"count": 4}}
+
+        def force_full_refetch(self, symbol, interval, **kw):
+            self.refetches.append((symbol, interval, kw))
+
+    stub = StubProvider()
+    src = FMPWarmupSource(native_cache.CACHE_FOLDER, provider=stub, keep_newer_cached_tail=["sats"])
+    src.force_full_refetch("sats")
+    src.force_full_refetch("aapl")
+    assert stub.refetches == [("SATS", "1d", {"keep_newer_cached_tail": True}), ("AAPL", "1d", {})]
+    assert src.kept_tails == {"SATS": {"count": 4}}
+    assert FMPWarmupSource(native_cache.CACHE_FOLDER, provider=StubProvider()).keep_newer_cached_tail         == frozenset()
+
+
+def test_repair_refuses_a_plan_whose_source_certification_failed(root):
+    """Like build: a failed certification is fatal, nothing is fetched."""
+    _write(root, "AAPL", _unadjust(CERT["AAPL"], date(2020, 8, 31), 4.0))
+    src = FakeSource(root)
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    calls = src.calls
+    rep = W.repair(p, source=src)
+    assert not rep["ok"] and rep["fatal_preflight_errors"] and "AAPL" in rep["fatal_preflight_errors"][0]
+    assert src.calls == calls and src.fetches == [] and src.full_refetches == []
+
+
+def test_repair_reports_the_kept_tails(root):
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=79)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = FakeSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    src.kept_tails = {"SPL": {"count": 2, "first": "2025-06-27", "last": "2025-06-30",
+                              "vendor_last": "2025-06-26"}}
+    p = W.plan(PROFILE, ("SPL",), START, END, cache_root=root, source=src)
+    rep = W.repair(p, source=src)
+    assert rep["kept_tails"] == src.kept_tails

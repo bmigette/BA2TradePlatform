@@ -9,6 +9,8 @@ tags, and pct_equity sizing.
 from datetime import date, timedelta
 import pytest
 
+pytestmark = pytest.mark.usefixtures("_mock_expert_is_resolvable")
+
 from ba2_trade_platform.core.TradeActions import create_action
 from ba2_trade_platform.core.option_types import OptionContract, OptionPosition
 from ba2_trade_platform.core.types import (

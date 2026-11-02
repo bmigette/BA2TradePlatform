@@ -128,6 +128,44 @@ def test_screener_capband_matrix_forwards_zero_caps(captured, monkeypatch):
     assert _flag_value(cmd, "--profit-share-cap-pct") == "0.0"
 
 
+def test_screener_capband_matrix_forwards_early_stop_only_when_given(captured, monkeypatch):
+    """Early-stop flags reach the launcher when given, and the command is unchanged when not."""
+    monkeypatch.setattr(sys, "argv", [
+        "run_screener_capband_matrix.py", "--bands", "large", "--strategies", "S1",
+        "--early-stop", "5", "--early-stop-min-rel", "0.01",
+    ])
+    assert run_screener_capband_matrix.main() == 0
+    cmd = captured[0]
+    assert _flag_value(cmd, "--early-stop") == "5"
+    assert _flag_value(cmd, "--early-stop-min-rel") == "0.01"
+
+    captured.clear()
+    monkeypatch.setattr(sys, "argv", [
+        "run_screener_capband_matrix.py", "--bands", "large", "--strategies", "S1"])
+    assert run_screener_capband_matrix.main() == 0
+    assert "--early-stop" not in captured[0]
+    assert "--early-stop-min-rel" not in captured[0]
+
+
+def test_screener_capband_matrix_forwards_rm_toggle_policy_only_when_given(captured, monkeypatch):
+    """--rm-toggle-policy (atr_grid_2027 design §3.2 item 5): forwarded to the launcher only
+    when given, exactly like --early-stop above -- every existing matrix command is unchanged."""
+    monkeypatch.setattr(sys, "argv", [
+        "run_screener_capband_matrix.py", "--bands", "large", "--strategies", "S1",
+        "--rm-toggle-policy", "atr-searched",
+    ])
+    assert run_screener_capband_matrix.main() == 0
+    assert captured, "the driver launched no optimize job"
+    cmd = captured[0]
+    assert _flag_value(cmd, "--rm-toggle-policy") == "atr-searched"
+
+    captured.clear()
+    monkeypatch.setattr(sys, "argv", [
+        "run_screener_capband_matrix.py", "--bands", "large", "--strategies", "S1"])
+    assert run_screener_capband_matrix.main() == 0
+    assert "--rm-toggle-policy" not in captured[0]
+
+
 def test_every_driver_help_promise_that_zero_disables_is_now_true():
     """All three advertise "Pass 0 to disable"; none may reintroduce the truthiness guard."""
     import inspect

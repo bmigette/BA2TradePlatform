@@ -37,15 +37,18 @@ def test_put_call_parity_in_test():
 
 def test_put_call_parity_zero_rate_arbitrary_dte():
     """At r=0, parity collapses to C - P == S - K exactly, for ANY dte/iv."""
-    call = bs_price(142.0, 150.0, 47, 0.35, OptionRight.CALL)
-    put = bs_price(142.0, 150.0, 47, 0.35, OptionRight.PUT)
+    call = bs_price(142.0, 150.0, 47, 0.35, OptionRight.CALL, r=0.0)
+    put = bs_price(142.0, 150.0, 47, 0.35, OptionRight.PUT, r=0.0)
     assert call - put == pytest.approx(142.0 - 150.0, abs=1e-6)
 
 
-def test_r_defaults_to_zero():
-    explicit = bs_price(100.0, 95.0, 30, 0.25, OptionRight.CALL, r=0.0)
-    default = bs_price(100.0, 95.0, 30, 0.25, OptionRight.CALL)
-    assert explicit == pytest.approx(default, abs=1e-9)
+def test_r_is_a_required_keyword_with_no_default():
+    """The rate is a pricing input the caller states (the run's as-of rate), never a
+    silent 0.0."""
+    with pytest.raises(TypeError):
+        bs_price(100.0, 95.0, 30, 0.25, OptionRight.CALL)
+    with pytest.raises(TypeError):
+        bs_price(100.0, 95.0, 30, 0.25, OptionRight.CALL, 0.05)      # positional refused
 
 
 # ---------------------------------------------------------------------------
@@ -53,11 +56,11 @@ def test_r_defaults_to_zero():
 # ---------------------------------------------------------------------------
 
 def test_dte_zero_returns_none():
-    assert bs_price(100.0, 100.0, 0, 0.2, OptionRight.CALL) is None
+    assert bs_price(100.0, 100.0, 0, 0.2, OptionRight.CALL, r=0.0) is None
 
 
 def test_dte_negative_returns_none():
-    assert bs_price(100.0, 100.0, -5, 0.2, OptionRight.CALL) is None
+    assert bs_price(100.0, 100.0, -5, 0.2, OptionRight.CALL, r=0.0) is None
 
 
 # ---------------------------------------------------------------------------
@@ -69,51 +72,50 @@ def test_missing_required_field_returns_none(field):
     kwargs = dict(spot=100.0, strike=100.0, dte_days=30, iv=0.2)
     kwargs[field] = None
     assert bs_price(kwargs["spot"], kwargs["strike"], kwargs["dte_days"], kwargs["iv"],
-                     OptionRight.CALL) is None
+                     OptionRight.CALL, r=0.0) is None
 
 
 def test_missing_iv_is_not_priced_as_zero():
     """A caller must never see a real number back when iv is absent — mutation (c)."""
-    with_iv = bs_price(100.0, 100.0, 30, 0.2, OptionRight.CALL)
-    without_iv = bs_price(100.0, 100.0, 30, None, OptionRight.CALL)
+    with_iv = bs_price(100.0, 100.0, 30, 0.2, OptionRight.CALL, r=0.0)
+    without_iv = bs_price(100.0, 100.0, 30, None, OptionRight.CALL, r=0.0)
     assert with_iv is not None
     assert without_iv is None
 
 
 @pytest.mark.parametrize("bad", [0.0, -0.2])
 def test_non_positive_iv_returns_none(bad):
-    assert bs_price(100.0, 100.0, 30, bad, OptionRight.CALL) is None
+    assert bs_price(100.0, 100.0, 30, bad, OptionRight.CALL, r=0.0) is None
 
 
 @pytest.mark.parametrize("bad", [0.0, -10.0])
 def test_non_positive_spot_or_strike_returns_none(bad):
-    assert bs_price(bad, 100.0, 30, 0.2, OptionRight.CALL) is None
-    assert bs_price(100.0, bad, 30, 0.2, OptionRight.CALL) is None
+    assert bs_price(bad, 100.0, 30, 0.2, OptionRight.CALL, r=0.0) is None
+    assert bs_price(100.0, bad, 30, 0.2, OptionRight.CALL, r=0.0) is None
 
 
 def test_nan_inputs_return_none():
-    assert bs_price(float("nan"), 100.0, 30, 0.2, OptionRight.CALL) is None
-    assert bs_price(100.0, 100.0, 30, float("nan"), OptionRight.CALL) is None
+    assert bs_price(float("nan"), 100.0, 30, 0.2, OptionRight.CALL, r=0.0) is None
+    assert bs_price(100.0, 100.0, 30, float("nan"), OptionRight.CALL, r=0.0) is None
 
 
 def test_inf_inputs_return_none():
-    assert bs_price(float("inf"), 100.0, 30, 0.2, OptionRight.CALL) is None
-    assert bs_price(100.0, 100.0, float("inf"), 0.2, OptionRight.CALL) is None
+    assert bs_price(float("inf"), 100.0, 30, 0.2, OptionRight.CALL, r=0.0) is None
+    assert bs_price(100.0, 100.0, float("inf"), 0.2, OptionRight.CALL, r=0.0) is None
 
 
-def test_non_finite_rate_falls_back_to_zero_not_none():
-    """r is not a 'requires' input — a bad rate degrades to 0.0 rather than voiding the price."""
-    price = bs_price(100.0, 100.0, 30, 0.2, OptionRight.CALL, r=float("nan"))
-    assert price is not None
-    zero_rate = bs_price(100.0, 100.0, 30, 0.2, OptionRight.CALL, r=0.0)
-    assert price == pytest.approx(zero_rate, abs=1e-9)
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), None, "x"])
+def test_a_bad_rate_raises_rather_than_pricing_at_zero(bad):
+    """It used to be priced at r=0.0; a wrong rate is a caller bug, not a degenerate bar."""
+    with pytest.raises(ValueError, match="risk-free rate"):
+        bs_price(100.0, 100.0, 30, 0.2, OptionRight.CALL, r=bad)
 
 
 def test_invalid_right_returns_none():
     # OptionRight is a str Enum (its own value IS the "call"/"put" string, so those are
     # legitimately accepted elsewhere in the codebase) — an unrelated string/None is not.
-    assert bs_price(100.0, 100.0, 30, 0.2, "bogus") is None
-    assert bs_price(100.0, 100.0, 30, 0.2, None) is None
+    assert bs_price(100.0, 100.0, 30, 0.2, "bogus", r=0.0) is None
+    assert bs_price(100.0, 100.0, 30, 0.2, None, r=0.0) is None
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +124,6 @@ def test_invalid_right_returns_none():
 # ---------------------------------------------------------------------------
 
 def test_deep_itm_call_worth_more_than_far_otm_call():
-    itm = bs_price(150.0, 100.0, 60, 0.3, OptionRight.CALL)
-    otm = bs_price(80.0, 100.0, 60, 0.3, OptionRight.CALL)
+    itm = bs_price(150.0, 100.0, 60, 0.3, OptionRight.CALL, r=0.0)
+    otm = bs_price(80.0, 100.0, 60, 0.3, OptionRight.CALL, r=0.0)
     assert itm > otm > 0

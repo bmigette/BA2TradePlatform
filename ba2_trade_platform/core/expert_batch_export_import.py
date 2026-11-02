@@ -30,7 +30,6 @@ Import semantics, chosen 2026-09-17:
 """
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ba2_common.core.rules_export_import import RulesExporter, RulesImporter
@@ -42,13 +41,9 @@ from .models import ExpertInstance, Ruleset
 from .utils import get_expert_instance_from_id
 from ..logger import logger
 
-EXPORT_TYPE = "expert_batch"
-EXPORT_VERSION = "1.0"
-
-# The two slots an expert can point a ruleset at, and the payload key naming each one.
-_RULESET_SLOTS = (
-    ("enter_market_ruleset_id", "enter_market_ruleset_name"),
-    ("open_positions_ruleset_id", "open_positions_ruleset_name"),
+from ba2_common.export.expert_batch import (  # noqa: E402
+    EXPORT_TYPE, EXPORT_VERSION, RULESET_SLOTS as _RULESET_SLOTS,
+    build_batch_envelope, build_expert_batch_entry,
 )
 
 
@@ -65,30 +60,14 @@ def build_batch_export(instance_ids: List[int]) -> Dict[str, Any]:
             raise ValueError(f"Expert instance {instance_id} not found") from e
         experts.append(_export_one(instance))
 
-    return {
-        "export_version": EXPORT_VERSION,
-        "export_type": EXPORT_TYPE,
-        "export_timestamp": datetime.now().isoformat(),
-        "experts": experts,
-    }
+    return build_batch_envelope(experts)
 
 
 def _export_one(instance: ExpertInstance) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {
-        "expert_type": instance.expert,
-        "general": {
-            "alias": instance.alias or "",
-            "user_description": instance.user_description,
-            "enabled": instance.enabled,
-            "virtual_equity_pct": instance.virtual_equity_pct,
-            "priority": getattr(instance, "priority", 1),
-            "account_id": instance.account_id,
-        },
-    }
-
     # Ruleset NAMES name the slots; the rule CONTENT travels in one `rulesets` block, in the
     # RulesExporter shape so RulesImporter can consume it without a second serialiser.
     ruleset_ids: List[int] = []
+    ruleset_names: Dict[str, Optional[str]] = {}
     for id_attr, name_key in _RULESET_SLOTS:
         ruleset_id = getattr(instance, id_attr, None)
         name = None
@@ -104,18 +83,29 @@ def _export_one(instance: ExpertInstance) -> Dict[str, Any]:
                 name = ruleset.name
                 if ruleset_id not in ruleset_ids:
                     ruleset_ids.append(ruleset_id)
-        entry[name_key] = name
-    entry["rulesets"] = (RulesExporter.export_multiple_rulesets(ruleset_ids)
-                         if ruleset_ids else None)
+        ruleset_names[name_key] = name
+    # Built BEFORE the expert is instantiated, as it always was, so the error order is unchanged.
+    rulesets_export = (RulesExporter.export_multiple_rulesets(ruleset_ids)
+                       if ruleset_ids else None)
 
     expert = get_expert_instance_from_id(instance.id)
     if expert is None:
         raise ValueError(f"Expert instance {instance.id} ({instance.alias}) could not be built; "
                          f"its settings cannot be exported")
-    entry["expert_settings"] = dict(expert.settings)
-    entry["symbol_settings"] = (expert._get_enabled_instruments_config()
-                                if hasattr(expert, "_get_enabled_instruments_config") else {})
-    return entry
+    return build_expert_batch_entry(
+        expert_type=instance.expert,
+        alias=instance.alias,
+        user_description=instance.user_description,
+        enabled=instance.enabled,
+        virtual_equity_pct=instance.virtual_equity_pct,
+        priority=getattr(instance, "priority", 1),
+        account_id=instance.account_id,
+        ruleset_names=ruleset_names,
+        rulesets_export=rulesets_export,
+        expert_settings=dict(expert.settings),
+        symbol_settings=(expert._get_enabled_instruments_config()
+                         if hasattr(expert, "_get_enabled_instruments_config") else {}),
+    )
 
 
 # ─── import plan ────────────────────────────────────────────────────────────

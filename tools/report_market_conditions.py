@@ -200,10 +200,13 @@ def persisted_runs(con, opt_id: int) -> List[Dict[str, Any]]:
     rows = con.execute(
         "SELECT id, name, initial_capital, final_equity, total_return, annualized_return, "
         "       max_drawdown, calmar_ratio, total_trades, win_rate, ga_fitness, "
-        "       results, trades, equity_curve, drawdown_curve, start_date, end_date "
+        "       results, trades, equity_curve, drawdown_curve, start_date, end_date, labels "
         "FROM backtests WHERE optimization_id = ? ORDER BY id", (opt_id,)).fetchall()
     out = []
     for r in rows:
+        # walk-forward out-of-sample rows share the optimization_id but are not its own runs
+        if r[1].startswith("WF") and "-OOS-R" in r[1] or "\"OOS\"" in (r[17] or ""):
+            continue
         out.append({
             "id": r[0], "name": r[1], "initial_capital": r[2], "final_equity": r[3],
             "total_return": r[4], "annualized_return": r[5], "max_drawdown": r[6],

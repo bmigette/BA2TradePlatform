@@ -1,0 +1,330 @@
+{
+  "observed_at_utc": "2026-09-22T11:57:10.584697+00:00",
+  "api_requested": true,
+  "instances": {
+    "prod8081": {
+      "accounts": [
+        {
+          "account_id": 1,
+          "paper": false,
+          "options_feed": "indicative",
+          "stock_feed": "delayed_sip",
+          "requests": {
+            "underlying_quote": {
+              "status": 200
+            },
+            "contracts": {
+              "status": 200
+            },
+            "snapshots_indicative": {
+              "status": 200,
+              "contracts": {
+                "SPY261016C00767000": {
+                  "snapshot_fields": [
+                    "dailyBar",
+                    "greeks",
+                    "impliedVolatility",
+                    "latestQuote",
+                    "latestTrade",
+                    "minuteBar",
+                    "prevDailyBar"
+                  ],
+                  "greek_fields": [
+                    "delta",
+                    "gamma",
+                    "rho",
+                    "theta",
+                    "vega"
+                  ],
+                  "quote_fields": [
+                    "ap",
+                    "as",
+                    "ax",
+                    "bp",
+                    "bs",
+                    "bx",
+                    "c",
+                    "t"
+                  ],
+                  "trade_fields": [
+                    "c",
+                    "p",
+                    "s",
+                    "t",
+                    "x"
+                  ],
+                  "quote_timestamp": "2026-09-21T19:59:59.455969557Z",
+                  "trade_timestamp": "2026-09-21T20:05:06.575501754Z",
+                  "implied_volatility": 0.1307,
+                  "daily_bar": {
+                    "t": "2026-09-21T04:00:00Z",
+                    "v": 1845,
+                    "vw": 12.710271,
+                    "n": 458
+                  },
+                  "previous_daily_bar": {
+                    "t": "2026-09-18T04:00:00Z",
+                    "v": 655,
+                    "vw": 7.749221,
+                    "n": 145
+                  },
+                  "installed_sdk_keeps_daily_bar": false,
+                  "installed_sdk_keeps_previous_daily_bar": false
+                },
+                "SPY261016C00766000": {
+                  "snapshot_fields": [
+                    "dailyBar",
+                    "greeks",
+                    "impliedVolatility",
+                    "latestQuote",
+                    "latestTrade",
+                    "minuteBar",
+                    "prevDailyBar"
+                  ],
+                  "greek_fields": [
+                    "delta",
+                    "gamma",
+                    "rho",
+                    "theta",
+                    "vega"
+                  ],
+                  "quote_fields": [
+                    "ap",
+                    "as",
+                    "ax",
+                    "bp",
+                    "bs",
+                    "bx",
+                    "c",
+                    "t"
+                  ],
+                  "trade_fields": [
+                    "c",
+                    "p",
+                    "s",
+                    "t",
+                    "x"
+                  ],
+                  "quote_timestamp": "2026-09-21T19:59:59.579853422Z",
+                  "trade_timestamp": "2026-09-21T19:51:15.190796451Z",
+                  "implied_volatility": 0.1304,
+                  "daily_bar": {
+                    "t": "2026-09-21T04:00:00Z",
+                    "v": 971,
+                    "vw": 14.454027,
+                    "n": 514
+                  },
+                  "previous_daily_bar": {
+                    "t": "2026-09-18T04:00:00Z",
+                    "v": 968,
+                    "vw": 8.15624,
+                    "n": 176
+                  },
+                  "installed_sdk_keeps_daily_bar": false,
+                  "installed_sdk_keeps_previous_daily_bar": false
+                }
+              }
+            },
+            "snapshots_opra": {
+              "status": 403
+            },
+            "historical_daily_bars": {
+              "status": 403
+            }
+          },
+          "contracts": [
+            {
+              "symbol": "SPY261016C00766000",
+              "expiration_date": "2026-10-16",
+              "strike_price": "766",
+              "type": "call",
+              "style": "american",
+              "size": "100",
+              "tradable": true,
+              "open_interest": "6281",
+              "open_interest_date": "2026-09-18",
+              "close_price": "16.1",
+              "close_price_date": "2026-09-21"
+            },
+            {
+              "symbol": "SPY261016C00767000",
+              "expiration_date": "2026-10-16",
+              "strike_price": "767",
+              "type": "call",
+              "style": "american",
+              "size": "100",
+              "tradable": true,
+              "open_interest": "7810",
+              "open_interest_date": "2026-09-18",
+              "close_price": "14.86",
+              "close_price_date": "2026-09-21"
+            }
+          ]
+        }
+      ],
+      "iv_history_rows": 0
+    },
+    "options8082": {
+      "accounts": [
+        {
+          "account_id": 1,
+          "paper": true,
+          "options_feed": "indicative",
+          "stock_feed": "delayed_sip",
+          "requests": {
+            "underlying_quote": {
+              "status": 200
+            },
+            "contracts": {
+              "status": 200
+            },
+            "snapshots_indicative": {
+              "status": 200,
+              "contracts": {
+                "SPY261016C00767000": {
+                  "snapshot_fields": [
+                    "dailyBar",
+                    "greeks",
+                    "impliedVolatility",
+                    "latestQuote",
+                    "latestTrade",
+                    "minuteBar",
+                    "prevDailyBar"
+                  ],
+                  "greek_fields": [
+                    "delta",
+                    "gamma",
+                    "rho",
+                    "theta",
+                    "vega"
+                  ],
+                  "quote_fields": [
+                    "ap",
+                    "as",
+                    "ax",
+                    "bp",
+                    "bs",
+                    "bx",
+                    "c",
+                    "t"
+                  ],
+                  "trade_fields": [
+                    "c",
+                    "p",
+                    "s",
+                    "t",
+                    "x"
+                  ],
+                  "quote_timestamp": "2026-09-21T19:59:59.455969557Z",
+                  "trade_timestamp": "2026-09-21T20:05:06.575501754Z",
+                  "implied_volatility": 0.1307,
+                  "daily_bar": {
+                    "t": "2026-09-21T04:00:00Z",
+                    "v": 1845,
+                    "vw": 12.710271,
+                    "n": 458
+                  },
+                  "previous_daily_bar": {
+                    "t": "2026-09-18T04:00:00Z",
+                    "v": 655,
+                    "vw": 7.749221,
+                    "n": 145
+                  },
+                  "installed_sdk_keeps_daily_bar": false,
+                  "installed_sdk_keeps_previous_daily_bar": false
+                },
+                "SPY261016C00766000": {
+                  "snapshot_fields": [
+                    "dailyBar",
+                    "greeks",
+                    "impliedVolatility",
+                    "latestQuote",
+                    "latestTrade",
+                    "minuteBar",
+                    "prevDailyBar"
+                  ],
+                  "greek_fields": [
+                    "delta",
+                    "gamma",
+                    "rho",
+                    "theta",
+                    "vega"
+                  ],
+                  "quote_fields": [
+                    "ap",
+                    "as",
+                    "ax",
+                    "bp",
+                    "bs",
+                    "bx",
+                    "c",
+                    "t"
+                  ],
+                  "trade_fields": [
+                    "c",
+                    "p",
+                    "s",
+                    "t",
+                    "x"
+                  ],
+                  "quote_timestamp": "2026-09-21T19:59:59.579853422Z",
+                  "trade_timestamp": "2026-09-21T19:51:15.190796451Z",
+                  "implied_volatility": 0.1304,
+                  "daily_bar": {
+                    "t": "2026-09-21T04:00:00Z",
+                    "v": 971,
+                    "vw": 14.454027,
+                    "n": 514
+                  },
+                  "previous_daily_bar": {
+                    "t": "2026-09-18T04:00:00Z",
+                    "v": 968,
+                    "vw": 8.15624,
+                    "n": 176
+                  },
+                  "installed_sdk_keeps_daily_bar": false,
+                  "installed_sdk_keeps_previous_daily_bar": false
+                }
+              }
+            },
+            "snapshots_opra": {
+              "status": 403
+            },
+            "historical_daily_bars": {
+              "status": 403
+            }
+          },
+          "contracts": [
+            {
+              "symbol": "SPY261016C00766000",
+              "expiration_date": "2026-10-16",
+              "strike_price": "766",
+              "type": "call",
+              "style": "american",
+              "size": "100",
+              "tradable": true,
+              "open_interest": "6281",
+              "open_interest_date": "2026-09-18",
+              "close_price": "16.1",
+              "close_price_date": "2026-09-21"
+            },
+            {
+              "symbol": "SPY261016C00767000",
+              "expiration_date": "2026-10-16",
+              "strike_price": "767",
+              "type": "call",
+              "style": "american",
+              "size": "100",
+              "tradable": true,
+              "open_interest": "7810",
+              "open_interest_date": "2026-09-18",
+              "close_price": "14.86",
+              "close_price_date": "2026-09-21"
+            }
+          ]
+        }
+      ],
+      "iv_history_rows": 0
+    }
+  }
+}

@@ -428,8 +428,11 @@ def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/sync-cache")
-def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
-    """Push the master's cache (diff, as one tar stream) to a remote worker."""
+def sync_worker_cache(worker_id: int, ohlcv_history_source: str, db: Session = Depends(get_db)):
+    """Push the master's cache (diff, as one tar stream) to a remote worker.
+
+    ``ohlcv_history_source`` (query parameter, required) names the OHLCV history to replicate;
+    the other source's history folder is neither copied nor pruned, so there is no default."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
@@ -437,7 +440,8 @@ def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
         return {"status": "skipped", "message": "Local worker shares the master cache"}
     from app.services import worker_client
     try:
-        res = worker_client.push_cache(_worker_dict(worker))
+        res = worker_client.push_cache(
+            _worker_dict(worker), history_source=ohlcv_history_source)
         return {"status": "ok", **res}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"cache push failed: {e}")
@@ -452,6 +456,13 @@ def update_worker_code(worker_id: int, db: Session = Depends(get_db)):
     if worker.is_local:
         return {"status": "skipped", "message": "Local worker updates with the master"}
     from app.services import worker_client, self_update
-    master_version = self_update.get_version_info().get("app_version")
-    ok = worker_client.ensure_synced(_worker_dict(worker), master_version, max_wait=180.0)
+    try:
+        master_info = self_update.master_sync_policy()
+    except self_update.PackageGatingError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    master_version = master_info.get("app_version")
+    ok = worker_client.ensure_synced(
+        _worker_dict(worker), master_version, max_wait=180.0,
+        required_packages=master_info.get("required_package_versions"),
+        master_packages=master_info.get("package_versions"))
     return {"status": "ok" if ok else "failed", "synced": ok, "masterVersion": master_version}

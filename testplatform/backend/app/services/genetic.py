@@ -53,6 +53,86 @@ FITNESS_EVALUATION_FAILED = -1.0e9
 LATTICE_ANCHORS = ("zero", "min")
 
 
+#: optimization_config key for the early-stopping MINIMUM RELATIVE IMPROVEMENT (see
+#: ``early_stop_counts``). Optional; absent (or None) keeps the legacy rule exactly.
+EARLY_STOP_MIN_REL_KEY = "earlyStoppingMinRelativeImprovement"
+
+
+def validate_early_stop_min_rel(value: Any) -> Optional[float]:
+    """``value`` as a float in ``(0, 1)``, or None when it is None. Anything else RAISES.
+
+    Refused, never clamped: a bool (``True`` is an int in Python and would read as 1.0), a
+    non-number, NaN (every comparison against it is False, so NO generation could ever count and
+    the search would stop after exactly ``patience`` generations whatever it found), a negative
+    value (it would count a generation that got WORSE), anything >= 1 (a 100% gain per counted
+    generation is not a stopping rule, it is a typo for a percentage) -- and 0, which behaves
+    exactly like the legacy rule but would give the job a new name/fingerprint: a legacy-equivalent
+    run under a different identity. Omit the key (the flag) for the legacy rule.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be a number in (0, 1), got {value!r}")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{EARLY_STOP_MIN_REL_KEY} must be a number in (0, 1), got {value!r}") from None
+    if v == 0.0:
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY}=0 is the legacy rule under a new job identity; "
+                         f"omit it (the flag) for the legacy rule, got {value!r}")
+    if not math.isfinite(v) or v < 0.0 or v >= 1.0:
+        raise ValueError(f"{EARLY_STOP_MIN_REL_KEY} must be finite and in (0, 1) "
+                         f"(a FRACTION: 0.01 means 1%), got {value!r}")
+    return v
+
+
+def _fmt_fit(value: Optional[float]) -> str:
+    """A fitness for the early-stopping log lines (``n/a`` before any generation counted)."""
+    return "n/a" if value is None else f"{value:.4f}"
+
+
+def early_stop_threshold(baseline: float, min_rel: Optional[float]) -> float:
+    """The fitness a generation must reach to COUNT as an improvement over ``baseline``.
+
+    ``baseline + min_rel * |baseline|`` -- i.e. ``baseline * (1 + min_rel)`` for a positive
+    baseline, and a move of ``min_rel`` of the MAGNITUDE towards (and past) zero for a negative
+    one (-10 with 1% needs -9.9). ``min_rel`` None gives ``baseline`` itself. See
+    ``early_stop_counts`` for how it is compared.
+    """
+    if not min_rel:
+        return baseline
+    return baseline + min_rel * abs(baseline)
+
+
+def early_stop_counts(best_fit: float, baseline: Optional[float], min_rel: Optional[float]) -> bool:
+    """Does a generation whose best is ``best_fit`` RESET the early-stopping patience?
+
+    ``baseline`` is the best fitness at the LAST COUNTED improvement (None before the first
+    generation, which always counts).
+
+    ``min_rel`` None -- the legacy rule, unchanged: any STRICT improvement counts.
+
+    ``min_rel`` set -- the improvement must ALSO reach ``early_stop_threshold(baseline, min_rel)``:
+      * positive baseline: ``best_fit >= baseline * (1 + min_rel)``;
+      * negative baseline: ``best_fit >= baseline + min_rel * |baseline|`` (1% of -10 is -9.9) --
+        a relative gain measured on the magnitude, so "less bad by 1%" counts, and the fitness
+        sentinels (-1e9 for a failed/zero-trade trial) are left behind by ANY real score;
+      * zero baseline: the relative scale is undefined (1% of 0 is 0), so any STRICT improvement
+        counts -- the strict ``>`` is kept in every case, which is also what stops an equal
+        fitness from ever counting when the threshold collapses onto the baseline.
+
+    The baseline is NOT the running best: a non-qualifying gain (23.83 -> 23.95 at 1%) still
+    becomes the best individual, but the bar to reset patience stays 24.07, so a run cannot creep
+    forward forever on sub-threshold gains -- which is the whole point of the rule.
+    """
+    if baseline is None:
+        return True
+    if not best_fit > baseline:
+        return False
+    return min_rel is None or best_fit >= early_stop_threshold(baseline, min_rel)
+
+
 def _on_zero_lattice(x: float, step: float) -> bool:
     """Is ``x`` a multiple of ``step`` (to float noise)?"""
     r = x / step
@@ -225,6 +305,7 @@ class GeneticOptimizer:
         elitism_percent: float = 10.0,
         parallel_individuals: int = 1,
         lattice_anchor: str = "zero",
+        early_stopping_min_rel: Optional[float] = None,
     ):
         """
         Initialize GeneticOptimizer.
@@ -239,6 +320,10 @@ class GeneticOptimizer:
             elitism_percent: Percentage of best individuals to preserve unchanged (default 10%)
             lattice_anchor: where numeric genes' step lattice is counted from -- "zero"
                 (legacy default) or "min"; see LATTICE_ANCHORS
+            early_stopping_min_rel: minimum RELATIVE improvement (a fraction in (0, 1), 0.01 =
+                1%) a generation's best must make over the best at the last counted
+                improvement to reset the patience counter; see ``early_stop_counts``. None
+                (default) is the legacy rule: any strict improvement resets.
         """
         if not DEAP_AVAILABLE:
             raise RuntimeError("DEAP library not available. Install with: pip install deap")
@@ -246,6 +331,11 @@ class GeneticOptimizer:
             raise ValueError(
                 f"lattice_anchor must be one of {LATTICE_ANCHORS}, got {lattice_anchor!r}")
         self.lattice_anchor = lattice_anchor
+        self.early_stopping_min_rel = validate_early_stop_min_rel(early_stopping_min_rel)
+        # The best fitness at the LAST COUNTED improvement -- the bar early_stop_counts measures
+        # against. Only read when early_stopping_min_rel is set; restored on resume by
+        # resume_from_checkpoint (derived from history, like the patience counter).
+        self._es_baseline = None
 
         self.param_ranges = param_ranges or self.DEFAULT_PARAM_RANGES
         self.population_size = population_size
@@ -281,6 +371,8 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+        # Last evaluated generation (genes + fitnesses); see optimize(). None until one ran.
+        self.last_evaluated_population = None
         self._resumed_no_improvement = 0
 
         # Write a partial checkpoint every N completed trials within a generation. Bounds what a
@@ -398,6 +490,35 @@ class GeneticOptimizer:
             individual.append(value)
         return creator.Individual(individual)
 
+    def _initial_population(self, n: int) -> List:
+        """Generation 0: ``n`` random individuals, with every STRATIFIED choice gene balanced.
+
+        A choice gene declared ``"stratify": True`` (the decision-time gene) gets each of its ``k``
+        values at least ``n // k`` times in generation 0 (82 individuals, 7 values: 11 each, the
+        remaining 5 keep their free random draw), instead of whatever the uniform draw gives (a
+        value can start with 4 or 20). Done by overwriting that gene in a random subset of
+        ``k * (n // k)`` individuals, so the other genes stay iid. Fresh generation 0 ONLY: a
+        resumed checkpoint or a warm-start population goes through ``rebuild_population``
+        untouched (a warm start seeds elites from a prior run and must keep them as they are).
+        Without a stratified gene NO extra random draw is made, so every existing job's
+        generation 0 is bit-identical to before.
+        """
+        population = [self._create_individual() for _ in range(n)]
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = n // k
+            if quota == 0:
+                logger.warning(f"choice gene {param_name!r}: population {n} < {k} choices, "
+                               f"generation 0 is not stratified")
+                continue
+            positions = list(range(n))
+            self._rng.shuffle(positions)
+            for slot, pos in enumerate(positions[:k * quota]):
+                population[pos][i] = slot % k
+        return population
+
     def _mutate_individual(self, individual: List, indpb: float = 0.2) -> Tuple[List]:
         """
         Mutate an individual with probability indpb for each gene.
@@ -411,7 +532,16 @@ class GeneticOptimizer:
         """
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
             if self._rng.random() < indpb:
-                if config['type'] == 'choice':
+                if config['type'] == 'choice' and config.get('stratify'):
+                    # A STRATIFIED choice gene (the decision-time gene) is a SPARSE set whose
+                    # neighbouring indices are not neighbours in meaning (10:00 -> 12:00 ->
+                    # 15:30), so a Gaussian index nudge would mean something different at every
+                    # index and could never leave 09:35 for 15:30 in one step. Uniform re-draw
+                    # among the OTHER values. Every other choice gene keeps the nudge below.
+                    n = len(config['choices'])
+                    new = self._rng.randrange(n - 1)
+                    individual[i] = new + 1 if new >= individual[i] else new
+                elif config['type'] == 'choice':
                     # Categorical: nudge the int index, clamped to 0..len-1.
                     n = len(config['choices'])
                     sigma = max(1.0, (n - 1) / 6)
@@ -453,8 +583,16 @@ class GeneticOptimizer:
             value = individual[i]
             if config['type'] == 'choice':
                 # Map the evolved int index back to the categorical VALUE (e.g. the
-                # target_price_type string). Clamp defensively to a valid index.
-                idx = int(np.clip(round(value), 0, len(config['choices']) - 1))
+                # target_price_type string). An index outside the declared list is REFUSED, not
+                # clamped: the operators never produce one, so it means the chromosome came from a
+                # job with a DIFFERENT list (a stale checkpoint / seed) and clamping would silently
+                # evaluate another value than the one the genome stands for.
+                idx = int(round(value))
+                if not 0 <= idx < len(config['choices']):
+                    raise ValueError(
+                        f"choice gene {param_name!r}: index {value!r} is outside its "
+                        f"{len(config['choices'])} declared choices {config['choices']!r} "
+                        f"(a chromosome from a job with a different list?)")
                 value = config['choices'][idx]
             else:
                 # Snap to the step lattice (int or float; see LATTICE_ANCHORS).
@@ -492,7 +630,47 @@ class GeneticOptimizer:
 
         return params
 
-    def encode_params(self, params: Dict) -> List:
+    def seeded_population(self, encoded: List, target_size: int) -> List:
+        """A warm-start generation 0: the ``encoded`` seeds plus random padding up to
+        ``target_size``, with every STRATIFIED choice gene balanced over the WHOLE generation.
+
+        ``encoded`` come from ``encode_params(..., allow_missing_stratified=True)``: a seed whose
+        source job had no such gene carries ``None`` there. Such a seed (and every padding
+        individual) is a FREE slot for that gene; the free slots are filled so each value reaches
+        at least ``target_size // k`` across the generation, counting the seeds that already carry
+        an explicit value. Remaining free slots keep a uniform random value. One INFO line says
+        how many seeds were completed. Without a stratified gene this is exactly
+        ``encoded`` + ``toolbox.individual()`` padding (no extra random draw).
+        """
+        population = [creator.Individual(list(e)) for e in encoded[:target_size]]
+        n_seeds = len(population)
+        while len(population) < target_size:
+            population.append(self._create_individual())
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = target_size // k
+            fixed = [ind[i] for ind in population[:n_seeds] if ind[i] is not None]
+            free = [j for j, ind in enumerate(population) if j >= n_seeds or ind[i] is None]
+            missing_seeds = sum(1 for ind in population[:n_seeds] if ind[i] is None)
+            # Water-filling: every free slot goes to the CURRENTLY least-used value (ties drawn
+            # at random), so each value reaches ``quota`` whenever the seeds leave room for it and
+            # the shortfall is spread evenly when they do not.
+            counts = [sum(1 for x in fixed if x == v) for v in range(k)]
+            self._rng.shuffle(free)
+            for slot in free:
+                low = min(counts)
+                v = self._rng.choice([c for c in range(k) if counts[c] == low])
+                population[slot][i] = v
+                counts[v] += 1
+            if missing_seeds:
+                logger.info(f"warm start: {missing_seeds} of {n_seeds} seed(s) carried no "
+                            f"{param_name!r}; completed so generation 0 is spread over its "
+                            f"{k} values (>= {quota} each where seeds allow)")
+        return population
+
+    def encode_params(self, params: Dict, allow_missing_stratified: bool = False) -> List:
         """
         Encode parameter dictionary to individual (chromosome).
 
@@ -533,9 +711,26 @@ class GeneticOptimizer:
                 # param space) falls back to index 0 rather than raising.
                 choices = config['choices']
                 value = expanded_params[param_name]
-                value = choices.index(value) if value in choices else 0
+                if value in choices:
+                    value = choices.index(value)
+                elif config.get('stratify'):
+                    # The decision-time gene: a seed from a job with another time list must not
+                    # silently become "the first time" (every other choice gene keeps the
+                    # historical index-0 fallback above).
+                    raise ValueError(
+                        f"choice gene {param_name!r}: value {value!r} is not in this job's "
+                        f"declared choices {choices!r}")
+                else:
+                    value = 0
             else:
-                value = expanded_params.get(param_name, config['min'])
+                if (config['type'] == 'choice' and config.get('stratify')
+                        and param_name not in expanded_params):
+                    if not allow_missing_stratified:
+                        raise ValueError(f"choice gene {param_name!r} is missing from the params "
+                                         f"being encoded (a source job without it?)")
+                    value = None            # completed by seeded_population
+                else:
+                    value = expanded_params.get(param_name, config['min'])
             individual.append(value)
         return creator.Individual(individual)
 
@@ -553,7 +748,20 @@ class GeneticOptimizer:
         # Restore the patience clock too. Without this every resume restarted it at 0
         # while best_fitness was restored, so a frequently-restarted search could never
         # early-stop. Derived from history -- see no_improvement_from_history.
-        self._resumed_no_improvement = self.no_improvement_from_history(self.history)
+        #
+        # Under a minimum-improvement rule the BASELINE (the best at the last counted
+        # improvement) is restored the same way and for the same reasons: derived from history
+        # under THIS run's rule, so it always matches the generation the checkpoint is at. It is
+        # NOT best_fitness -- after a sub-threshold gain the two differ, and resuming against the
+        # running best would silently raise the bar the interrupted run was measuring against.
+        min_rel = getattr(self, 'early_stopping_min_rel', None)
+        self._resumed_no_improvement, self._es_baseline = self.patience_state_from_history(
+            self.history, min_rel)
+        if min_rel is not None:
+            logger.warning(
+                f"Resumed early-stopping clock: patience {self._resumed_no_improvement}/"
+                f"{self.early_stopping_generations} (best {_fmt_fit(self._es_baseline)}, needs >= "
+                f"{_fmt_fit(None if self._es_baseline is None else early_stop_threshold(self._es_baseline, min_rel))})")
         self.best_fitness = checkpoint.get('best_fitness')
         self.best_individual = checkpoint.get('best_individual')
 
@@ -640,8 +848,40 @@ class GeneticOptimizer:
         return population
 
     @staticmethod
-    def no_improvement_from_history(history: list) -> int:
-        """Consecutive generations at the end of ``history`` that did not beat the ALL-TIME best.
+    def patience_state_from_history(history: list, min_rel: Optional[float] = None
+                                    ) -> Tuple[int, Optional[float]]:
+        """``(no_improvement_count, baseline)`` at the end of ``history`` under the stopping rule
+        ``min_rel`` -- the exact state the live loop in ``optimize()`` holds after processing the
+        last entry, because both apply ``early_stop_counts`` to the same generation bests.
+
+        ``baseline`` is the best fitness at the last COUNTED improvement (None when no entry is
+        readable). With ``min_rel`` None it is simply the running maximum, and the count is
+        exactly ``no_improvement_from_history`` (which is defined through this). See that
+        method for why the clock is derived rather than stored.
+        """
+        baseline = None
+        last_counted = -1
+        for i, entry in enumerate(history or []):
+            try:
+                fitness = entry["best_fitness"]
+            except (KeyError, TypeError):
+                continue          # a malformed entry must not silently zero the streak
+            if fitness is None:
+                continue
+            if early_stop_counts(fitness, baseline, min_rel):
+                baseline, last_counted = fitness, i
+        if last_counted < 0:
+            return 0, None
+        return max(0, len(history) - 1 - last_counted), baseline
+
+    @staticmethod
+    def no_improvement_from_history(history: list, min_rel: Optional[float] = None) -> int:
+        """Consecutive generations at the end of ``history`` that did not COUNT as an improvement.
+
+        Under the legacy rule (``min_rel`` None) that means "did not beat the all-time best".
+        Under a minimum-improvement rule it means "did not reach ``early_stop_threshold`` over the
+        best at the last counted improvement" (``early_stop_counts``): a generation may set a new
+        all-time best and still extend the streak.
 
         DERIVED, never stored-and-trusted, and that is deliberate. The counter itself is a local
         of ``optimize()`` zeroed on entry, so every resume used to restart the patience clock at 0
@@ -657,23 +897,11 @@ class GeneticOptimizer:
         key existed, resume with the correct streak rather than a zero.
 
         NOTE ``history[i]['best_fitness']`` is the GENERATION best, not the running best, so the
-        running maximum is reconstructed here rather than assuming the series is monotonic --
-        elitism usually makes it so, but nothing in this loop guarantees it.
+        running maximum (legacy) / the counted baseline (under ``min_rel``) is reconstructed here
+        rather than assuming the series is monotonic -- elitism usually makes it so, but nothing
+        in this loop guarantees it.
         """
-        running = None
-        last_improved = -1
-        for i, entry in enumerate(history or []):
-            try:
-                fitness = entry["best_fitness"]
-            except (KeyError, TypeError):
-                continue          # a malformed entry must not silently zero the streak
-            if fitness is None:
-                continue
-            if running is None or fitness > running:
-                running, last_improved = fitness, i
-        if last_improved < 0:
-            return 0
-        return max(0, len(history) - 1 - last_improved)
+        return GeneticOptimizer.patience_state_from_history(history, min_rel)[0]
 
     def get_checkpoint_data(self, generation: int, population: list) -> Dict:
         """
@@ -686,7 +914,9 @@ class GeneticOptimizer:
         Returns:
             Checkpoint data dict
         """
-        return {
+        min_rel = getattr(self, 'early_stopping_min_rel', None)
+        no_improvement, baseline = self.patience_state_from_history(self.history, min_rel)
+        data = {
             'generation': generation,
             'population': [list(ind) for ind in population],
             # Fitness per individual, index-aligned with 'population'. None where the individual
@@ -702,7 +932,7 @@ class GeneticOptimizer:
             # Derived from history at write time, so it can never disagree with it. Resume
             # re-derives rather than trusting this; it is here so a monitor can READ the
             # patience clock, which was previously invisible outside the running process.
-            'no_improvement_count': self.no_improvement_from_history(self.history),
+            'no_improvement_count': no_improvement,
             'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
             # The GA's OWN generator (self._rng) -- the only one whose position decides the rest
@@ -711,6 +941,47 @@ class GeneticOptimizer:
             # the same offspring the uninterrupted run would have produced.
             'ga_random_state': _py_state_to_jsonable(self._rng.getstate()),
         }
+        if min_rel is not None:
+            # The minimum-improvement rule's state, published for monitors exactly like
+            # no_improvement_count (and, like it, re-derived rather than trusted on resume).
+            # Written ONLY under the rule, so a legacy run's checkpoint keeps its exact shape.
+            data['early_stop_min_rel'] = min_rel
+            data['early_stop_baseline'] = baseline
+            data['early_stop_needs'] = (None if baseline is None
+                                        else early_stop_threshold(baseline, min_rel))
+        return data
+
+    def _reproduce(self, population: list, gen: int) -> None:
+        """Elitism + selection + crossover + mutation: turn the evaluated ``population`` of
+        generation ``gen`` into the next generation's (in place)."""
+        # ELITISM: Preserve the best individuals unchanged
+        n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
+        elites = tools.selBest(population, n_elite)
+        # Clone elites to preserve them unchanged
+        elites = [self.toolbox.clone(ind) for ind in elites]
+
+        logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
+
+        # Selection and reproduction for the remaining slots
+        n_offspring = len(population) - n_elite
+        offspring = self.toolbox.select(population, n_offspring)
+        offspring = list(map(self.toolbox.clone, offspring))
+
+        # Crossover
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if self._rng.random() < self.crossover_prob:
+                self.toolbox.mate(child1, child2)
+                del child1.fitness.values
+                del child2.fitness.values
+
+        # Mutation
+        for mutant in offspring:
+            if self._rng.random() < self.mutation_prob:
+                self.toolbox.mutate(mutant)
+                del mutant.fitness.values
+
+        # Combine elites (unchanged) with new offspring
+        population[:] = elites + offspring
 
     def optimize(
         self,
@@ -749,7 +1020,7 @@ class GeneticOptimizer:
                 f"Restored population of {len(population)} individuals "
                 f"({n_valid} already evaluated, {len(population) - n_valid} to run)")
         else:
-            population = self.toolbox.population(n=self.population_size)
+            population = self._initial_population(self.population_size)
 
         # Evaluate fitness function wrapper
         def evaluate(individual):
@@ -758,6 +1029,11 @@ class GeneticOptimizer:
                 fitness = fitness_function(params)
                 return (fitness,)
             except Exception as e:
+                from app.services.job_fatal import job_fatal
+                if job_fatal(e):
+                    # A data / config / code defect (or a look-ahead guard) hit THIS trial and would hit
+                    # every other: the job stops here, it does not score the genome at the sentinel.
+                    raise
                 logger.warning(f"Fitness evaluation failed: {e}")
                 return (FITNESS_EVALUATION_FAILED,)
 
@@ -775,6 +1051,36 @@ class GeneticOptimizer:
 
         # Restore best fitness history from resumed state
         if self.history:
+            best_fitness_history = [h['best_fitness'] for h in self.history]
+
+        # RESUME FROM AN END-OF-GENERATION CHECKPOINT. The checkpoint of generation k is written
+        # after k is evaluated and recorded in ``history`` but BEFORE the best/patience update and
+        # BEFORE reproduction. Starting the loop at k + 1 with that fully evaluated population
+        # used to evaluate nothing, re-record k's best as a phantom generation k + 1 and burn a
+        # patience unit (P5). Finish what the interrupted run was about to do instead: apply the
+        # best update, take the stop decision, then breed. The patience counter / baseline were
+        # already derived from ``history`` (which includes k), so they are not touched here. A
+        # PARTIAL checkpoint has no history entry for its generation, so it is not this case.
+        last_done = self.history[-1]['generation'] if self.history else None
+        if (initial_population and start_generation > 0 and last_done == start_generation - 1
+                and all(ind.fitness.valid for ind in population)):
+            best_ind = tools.selBest(population, 1)[0]
+            best_fit = best_ind.fitness.values[0]
+            if self.best_fitness is None or best_fit > self.best_fitness:
+                self.best_fitness = best_fit
+                self.best_individual = list(best_ind)
+            if no_improvement_count >= self.early_stopping_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}, whose patience "
+                    f"{no_improvement_count}/{self.early_stopping_generations} had already "
+                    f"stopped the run: nothing left to run (best={self.best_fitness:.4f})")
+                start_generation = self.n_generations
+            elif start_generation < self.n_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}: patience {no_improvement_count}/"
+                    f"{self.early_stopping_generations}; breeding generation {start_generation} "
+                    f"(no phantom re-record of generation {last_done})")
+                self._reproduce(population, last_done)
             best_fitness_history = [h['best_fitness'] for h in self.history]
 
         # Evolution loop
@@ -846,6 +1152,15 @@ class GeneticOptimizer:
                 'stats': record
             })
 
+            # The last EVALUATED population, for chain seeding (walk-forward). Taken here, right
+            # after evaluation: the loop below evolves one more generation whose offspring were
+            # never scored, so the population at loop exit is NOT a result.
+            self.last_evaluated_population = {
+                'generation': gen,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
+
             # Call callback if provided
             if callback:
                 callback(gen, best_fit, best_params)
@@ -855,51 +1170,74 @@ class GeneticOptimizer:
                 checkpoint_callback(gen, population)
 
             # Update best overall and track early stopping
-            if self.best_fitness is None or best_fit > self.best_fitness:
-                self.best_fitness = best_fit
-                self.best_individual = list(best_ind)
-                no_improvement_count = 0
+            min_rel = getattr(self, 'early_stopping_min_rel', None)
+            if min_rel is None:
+                # LEGACY RULE, unchanged: any strict gain over the running best resets patience.
+                if self.best_fitness is None or best_fit > self.best_fitness:
+                    self.best_fitness = best_fit
+                    self.best_individual = list(best_ind)
+                    no_improvement_count = 0
+                    counted = True
+                else:
+                    no_improvement_count += 1
+                    counted = False
+                bar, bar_op = self.best_fitness, ">"
             else:
-                no_improvement_count += 1
+                # MINIMUM-IMPROVEMENT RULE. The best individual still follows ANY strict gain
+                # (it is the search's answer); only the patience reset needs the gain to clear
+                # min_rel over the best at the last COUNTED improvement (see early_stop_counts).
+                if self.best_fitness is None or best_fit > self.best_fitness:
+                    self.best_fitness = best_fit
+                    self.best_individual = list(best_ind)
+                counted = early_stop_counts(best_fit, self._es_baseline, min_rel)
+                if counted:
+                    self._es_baseline = best_fit
+                    no_improvement_count = 0
+                else:
+                    no_improvement_count += 1
+                bar, bar_op = early_stop_threshold(self._es_baseline, min_rel), ">="
+            # Read by monitors: one line per generation, whatever the rule. WARNING, not info():
+            # a strategy optimization installs a global logging.disable(INFO) for its whole run
+            # (strategy_optimization_handler), so an info() line here would never be emitted.
+            logger.warning(
+                f"Gen {gen}: {'improvement counted' if counted else 'no counted improvement'} "
+                f"(gen best {_fmt_fit(best_fit)}) -- patience {no_improvement_count}/"
+                f"{self.early_stopping_generations} (best "
+                f"{_fmt_fit(self.best_fitness if min_rel is None else self._es_baseline)}, "
+                f"needs {bar_op} {_fmt_fit(bar)}"
+                + ("" if min_rel is None or self.best_fitness == self._es_baseline
+                   else f", running best {_fmt_fit(self.best_fitness)}")
+                + (")" if min_rel is None else f", min_rel {min_rel:g})"))
 
             # Early stopping: stop if overall best hasn't improved for N generations
             if no_improvement_count >= self.early_stopping_generations:
-                logger.info(
-                    f"Early stopping at generation {gen} — no improvement for "
-                    f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
-                )
+                # WARNING in both branches: the handler's logging.disable(INFO) would swallow an
+                # info() line, and the stop is exactly what a monitor needs to see. Level only.
+                if min_rel is None:
+                    logger.warning(
+                        f"Early stopping at generation {gen} — no improvement for "
+                        f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
+                    )
+                else:
+                    logger.warning(
+                        f"Early stopping at generation {gen} — no improvement of at least "
+                        f"{min_rel:.2%} over {self._es_baseline:.4f} for "
+                        f"{no_improvement_count} generations (best={self.best_fitness:.4f})"
+                    )
                 break
 
             best_fitness_history.append(best_fit)
 
-            # ELITISM: Preserve the best individuals unchanged
-            n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
-            elites = tools.selBest(population, n_elite)
-            # Clone elites to preserve them unchanged
-            elites = [self.toolbox.clone(ind) for ind in elites]
+            self._reproduce(population, gen)
 
-            logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
-
-            # Selection and reproduction for the remaining slots
-            n_offspring = len(population) - n_elite
-            offspring = self.toolbox.select(population, n_offspring)
-            offspring = list(map(self.toolbox.clone, offspring))
-
-            # Crossover
-            for child1, child2 in zip(offspring[::2], offspring[1::2]):
-                if self._rng.random() < self.crossover_prob:
-                    self.toolbox.mate(child1, child2)
-                    del child1.fitness.values
-                    del child2.fitness.values
-
-            # Mutation
-            for mutant in offspring:
-                if self._rng.random() < self.mutation_prob:
-                    self.toolbox.mutate(mutant)
-                    del mutant.fitness.values
-
-            # Combine elites (unchanged) with new offspring
-            population[:] = elites + offspring
+        if self.last_evaluated_population is None and initial_population and not                 [1 for ind in population if not ind.fitness.valid]:
+            # A resume that starts at (or past) the last generation runs no generation, but the
+            # restored population IS fully evaluated: it is the final population.
+            self.last_evaluated_population = {
+                'generation': start_generation - 1,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
 
         # Final best
         best_params = self.decode_individual(self.best_individual)
@@ -911,7 +1249,9 @@ class GeneticOptimizer:
             'best_params': best_params,
             'best_fitness': self.best_fitness,
             'generations_run': len(self.history),
-            'history': self.history
+            'history': self.history,
+            # None when no generation ran (a resume past the last generation).
+            'final_population': self.last_evaluated_population,
         }
 
     def get_progress(self) -> Dict:

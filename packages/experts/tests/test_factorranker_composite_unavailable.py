@@ -318,7 +318,7 @@ def test_the_export_reports_confidence_as_unavailable_not_zero(monkeypatch):
                    "enabled_instruments": {"AAPL": {"enabled": True}},
                    "factor_weight_momentum": 0.0, "factor_weight_value": 1.0,
                    "factor_weight_quality": 0.0, "factor_weight_pead": 0.0,
-                   "top_n": 1, "weighting": "equal", "max_weight_per_name": 1.0,
+                   "top_n": 1, "weighting": "equal", "max_virtual_equity_per_instrument_percent": 100.0,
                    "gross_exposure": 1.0, "winsorize_pct": 0.0,
                    "pead_drift_window_days": 60},
         providers_resolver=lambda cat, name, **kw: {"ohlcv": _FakeOHLCV()}.get(cat))
@@ -351,7 +351,7 @@ def test_the_export_draws_no_badge_for_a_basket_expert(monkeypatch):
                    "enabled_instruments": {"AAPL": {"enabled": True}},
                    "factor_weight_momentum": 0.0, "factor_weight_value": 1.0,
                    "factor_weight_quality": 0.0, "factor_weight_pead": 0.0,
-                   "top_n": 1, "weighting": "equal", "max_weight_per_name": 1.0,
+                   "top_n": 1, "weighting": "equal", "max_virtual_equity_per_instrument_percent": 100.0,
                    "gross_exposure": 1.0, "winsorize_pct": 0.0,
                    "pead_drift_window_days": 60},
         providers_resolver=lambda cat, name, **kw: {"ohlcv": _FakeOHLCV()}.get(cat))

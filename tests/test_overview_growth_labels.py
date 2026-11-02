@@ -164,21 +164,19 @@ def test_neither_label_chart_builds_its_own_unnormalised_symbol_map():
 
 
 def test_both_multi_select_label_charts_are_wired_to_the_store():
-    """Guards the wiring the plan called eyeball-only.
+    """Guards the wiring: a refactor that drops the persist call still renders a
+    perfectly good chart -- it just silently stops remembering.
 
-    A refactor that drops the write() call still renders a perfectly good chart --
-    it just silently stops remembering. Both charts must resolve their default
-    through the store and write back on rebuild, and neither may keep the old
-    hard-coded ``[l for l in ... if l != 'auto_added']`` default.
+    Persistence moved from app.storage.user to the DB (per account, see
+    ui/utils/overview_label_scope.py); the legacy keys are still passed so the
+    old per-browser value is migrated once. Neither chart may keep the old
+    hard-coded ``auto_added`` default literal.
     """
     src = OVERVIEW_PY.read_text(encoding='utf-8')
-    for key in (GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY):
-        const = ('GROWTH_LABELS_STORAGE_KEY' if key == GROWTH_LABELS_STORAGE_KEY
-                 else 'MONTHLY_PROFIT_LABELS_STORAGE_KEY')
-        assert f'read_growth_labels({const})' in src, f'{const} default not restored'
-        assert f'write_growth_labels(visible, {const})' in src, f'{const} never persisted'
-    assert src.count('resolve_growth_labels(') == 2
-    # The single-select "positions within a label" chart keeps its own default and
-    # is not part of this task, so only the two MULTI-selects lose the old literal.
+    flat = ' '.join(src.split())
+    for chart, const in (('CHART_GROWTH', 'GROWTH_LABELS_STORAGE_KEY'),
+                         ('CHART_MONTHLY', 'MONTHLY_PROFIT_LABELS_STORAGE_KEY')):
+        assert f'self._stored_selection( {chart}, {const}' in flat, f'{const} default not restored'
+        assert f'self._persist_selection({chart}, visible)' in src, f'{chart} never persisted'
     assert "[l for l in labels if l != 'auto_added']" not in src
     assert "[l for l in all_labels if l != 'auto_added']" not in src

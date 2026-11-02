@@ -176,7 +176,7 @@ These are enforced project idioms from `CLAUDE.md` — follow them exactly:
 ## Security Considerations
 
 - **This software trades real money.** It is alpha/experimental; always test against paper-trading accounts first. Never bypass risk limits, position-sizing rules, or approval flows.
-- **Secrets**: API keys (OpenAI, Finnhub, Alpha Vantage, Alpaca, FMP, ...) are entered on each app's web UI Settings page and stored in that app's DB (`AppSetting` table); some test-platform scripts also read them from environment variables or a local, untracked `.env`. Never hardcode keys, never log them, never commit `.env` or `creds.env`.
+- **Secrets**: API keys (OpenAI, Finnhub, Alpha Vantage, Alpaca, FMP, ...) are entered on each app's web UI Settings page and stored in that app's DB (`AppSetting` table); some test-platform scripts also read them from environment variables or a local, untracked `.env`. The live app never loads `.env`; its path overrides are the environment variables `BA2_HOME`, `DB_FILE`, `LOG_FOLDER` and `CACHE_FOLDER`. Never hardcode keys, never log them, never commit `.env` or `creds.env`.
 - **No silent fallbacks for money-related values** (see conventions) — fail loud instead of trading on fabricated data.
 - The Docker image runs as a non-root user (`trader`); keep it that way.
 - The NiceGUI `STORAGE_SECRET` in `config.py` is a placeholder default for session storage — override it for any real deployment.

@@ -167,6 +167,7 @@ from ba2_common.core.option_lifecycle import (
     SETTING_BREAKER_TRIPPED,
     UNDEFINED_RISK_STRATEGIES,
     OptionStructure,
+    netted_put_assignment_cost,
     put_assignment_cost,
     structure_metrics,
 )
@@ -245,8 +246,9 @@ class CandidateStructure:
     trade, it is a spec nobody measured.
 
     ``short_put_assignment`` is the total cash this structure would owe if every short
-    put in it were assigned: ``strike x 100 x qty`` per short put leg, with no credit
-    and no long wing netted off (see ``put_assignment_cost``). It is REQUIRED and not
+    put in it were assigned: ``strike x 100 x qty`` per short put leg, no credit netted
+    off, and a long put of the same expiry netting it down to the wing width (see
+    ``netted_put_assignment_cost``). It is REQUIRED and not
     defaulted, for the same reason ``max_loss`` and ``notional`` are: "the caller did
     not state an assignment obligation" and "this structure has none" are different
     facts, and a default would quietly make every un-updated call site look
@@ -384,11 +386,10 @@ def _premium_outlay(structure: OptionStructure) -> Tuple[Optional[float], str]:
 def _short_put_assignment(structure: OptionStructure) -> Tuple[Optional[float], str]:
     """(cash owed if every held short PUT is assigned, "") or (None, why unknown).
 
-    Only SHORT PUTS. A short CALL delivers shares and takes cash IN, and a LONG put is
-    our right rather than our obligation — neither can have shares put to us. A long
-    put wing is deliberately NOT netted against the short it protects: the short can be
-    assigned tonight while the long is not exercised until expiry, which is exactly why
-    a put vertical's delivery bill is the full short strike and not the wing width.
+    Only SHORT PUTS owe. A short CALL delivers shares and takes cash IN. A LONG put of
+    the same expiry covers a short down to the wing width (``netted_put_assignment_cost``,
+    operator decision 2026-10-15, superseding the full-strike rule): a put vertical's or
+    a condor's delivery bill is its width, which is what the backtest settles it at.
 
     The multiplier is the structure's own (``strike x contracts x multiplier``), not a
     hardcoded 100, because it is the field that says how many shares a contract
@@ -396,15 +397,19 @@ def _short_put_assignment(structure: OptionStructure) -> Tuple[Optional[float], 
     pre-existing and out of scope here, but it means a non-100 multiplier makes the two
     numbers disagree by design rather than by accident.
     """
-    total = 0.0
+    groups: dict = {}
     for leg in structure.held_legs:          # contract-symbol ordered, so stable
-        if not leg.is_short:
-            continue
         if leg.option_type is None:
-            return None, (f"no option type for short {leg.contract_symbol} — whether it "
-                          f"is a put that can be assigned to us is unknown, and unknown "
-                          f"must not resolve to 'not a put'")
+            if leg.is_short:
+                return None, (f"no option type for short {leg.contract_symbol} — whether it "
+                              f"is a put that can be assigned to us is unknown, and unknown "
+                              f"must not resolve to 'not a put'")
+            continue                         # an untyped LONG covers nothing: overstates only
         if leg.option_type != OptionRight.PUT:
+            continue
+        if not leg.is_short:
+            if leg.expiry is not None and leg.strike is not None:
+                groups.setdefault(leg.expiry, ([], []))[1].append((leg.strike, leg.net_qty))
             continue
         cost = put_assignment_cost(leg.strike, abs(leg.net_qty), structure.multiplier)
         if cost is None:
@@ -412,6 +417,15 @@ def _short_put_assignment(structure: OptionStructure) -> Tuple[Optional[float], 
                           f"({leg.strike!r}), contract count ({leg.net_qty!r}) or "
                           f"contract multiplier ({structure.multiplier!r}) — the cash it "
                           f"would take to accept delivery is unmeasurable")
+        key = leg.expiry if leg.expiry is not None else ("unmatched", leg.contract_symbol)
+        groups.setdefault(key, ([], []))[0].append((leg.strike, abs(leg.net_qty)))
+    total = 0.0
+    for key in sorted(groups, key=str):
+        shorts, longs = groups[key]
+        cost = netted_put_assignment_cost(shorts, longs, structure.multiplier)
+        if cost is None:
+            return None, (f"short puts expiring {key!r} cannot be priced for delivery net "
+                          f"of their long wings — the cash it would take is unmeasurable")
         total += cost
     return total, ""
 

@@ -3,6 +3,8 @@
 // Mirrors the trade-platform schedule controls. The daily engine's _schedule_allows_entry
 // honours `days` on every clock and `times` only on an intraday clock.
 
+import { DEFAULT_DECISION_TIME } from '../lib/decisionTime';
+
 export interface Schedule { days: Record<string, boolean>; times: string[]; }
 
 const DAYS: { key: string; label: string }[] = [
@@ -14,7 +16,7 @@ const DAYS: { key: string; label: string }[] = [
 
 const DEFAULT_SCHEDULE: Schedule = {
   days: { monday: true, tuesday: true, wednesday: true, thursday: true, friday: true, saturday: false, sunday: false },
-  times: ['09:30'],
+  times: [DEFAULT_DECISION_TIME],
 };
 
 export function ScheduleEditor({ value, onChange }:
@@ -27,7 +29,7 @@ export function ScheduleEditor({ value, onChange }:
 
   const setDay = (k: string, on: boolean) => onChange({ ...sched, days: { ...days, [k]: on } });
   const setTime = (i: number, t: string) => onChange({ ...sched, times: times.map((x, j) => (j === i ? t : x)) });
-  const addTime = () => onChange({ ...sched, times: [...times, '09:30'] });
+  const addTime = () => onChange({ ...sched, times: [...times, DEFAULT_DECISION_TIME] });
   const rmTime = (i: number) => onChange({ ...sched, times: times.filter((_, j) => j !== i) });
 
   return (

@@ -6,14 +6,19 @@ from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
 import re
 import time
 import threading
 import functools
 
+from ...core.fmp_live_price import fetch_fmp_last_prices, FMPPriceError
+from ba2_providers.fmp_common import FMPHermeticViolation, redact
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
+from ...core.pending_cancel import (
+    mark_pending_cancel, get_pending_cancel_since, PENDING_CANCEL_SINCE_KEY)
 from ...core.types import (
     OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus,
     # Aliased: the module-level `AssetClass` imported above from alpaca.trading.enums is
@@ -25,8 +30,7 @@ from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, MarketHours, FractionalPreview,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
     MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
-    FRACTIONAL_OUTCOME_WHOLE, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_FLOORED,
-    FRACTIONAL_OUTCOME_SKIPPED, FRACTIONAL_OUTCOME_REJECTED,
+    FRACTIONAL_OUTCOME_WHOLE, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_REJECTED,
 )
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
@@ -108,70 +112,33 @@ def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
 def plan_fractional_submission(symbol: str, quantity: float, order_type_value: str,
                                use_complex_order: bool = False,
                                fractionable: Optional[bool] = None) -> FractionalPreview:
-    """Alpaca's fractional-quantity rule, as a pure function. THE single definition.
+    """Preview broker constraints without changing the caller's share quantity.
 
-    Both callers share it on purpose: `_submit_order_impl` (which then performs the
-    logging and the DB write) and `AlpacaAccount.preview_fractional_submission` (which
-    hands the answer to the allocation dry run). Because it is the same function, the
-    dry run cannot promise 2.5 shares and then have the submission cancel the row.
+    Alpaca supports fractional market, limit, stop and stop-limit orders with DAY
+    duration: https://docs.alpaca.markets/us/docs/fractional-trading.
+    OCO/BRACKET/OTO eligibility is a separate broker restriction, not permission to
+    floor the quantity. The exact request is submitted, and any broker rejection is
+    recorded as an error by the normal submission path. Never silently under-cover a
+    stop, cancel a sub-share exit, or leave a fractional close remainder behind.
 
-    ALPACA-INTERNAL. Nothing outside this module calls it.
-
-    The rule, in precedence order -- the same order the submission path applies it:
-
-    1. A whole quantity is nothing to do.
-    2. Every NON plain-market request refuses a fraction outright: limit, stop,
-       stop-limit, and a MARKET order routed through the wash-trade escape, which goes
-       to Alpaca re-classed as BRACKET/OTO. Those are FLOORED before the request is even
-       built -- nothing fractional is ever put on the wire, and flooring under-fills
-       rather than overspending the target. A floor of 0 is a SKIP: nothing is sent,
-       nothing was rejected, and nothing is wrong with the account.
-    3. On a plain market order the fraction stands, and Alpaca then requires DAY -- see
-       requires_day_tif. If the broker does not make this SYMBOL fractionable
-       (`Asset.fractionable`, alpaca/trading/models.py:65) the fraction reaches the wire
-       and is REFUSED; the dry run says so instead of letting an ERROR row explain it
-       afterwards.
-
-    Every quantity here is a QUANTITY IN SHARES. No branch produces a dollar-value order.
-
-    Args:
-        symbol: the instrument, for the human-readable strings.
-        quantity: the quantity as sized (may be fractional).
-        order_type_value: the CORE OrderType value, lower-cased ("market", "buy_limit"...).
-        use_complex_order: the wash-trade escape, which re-classes the request.
-        fractionable: the broker's per-symbol flag; None means UNKNOWN and is treated as
-            permissive, matching what the submission path did before this function
-            existed. Never coerce an unknown to False.
-
-    Returns:
-        FractionalPreview: what would actually happen, including the exact sentence to
-        log, display and persist.
+    Shared by submission and the allocation preview. Unknown symbol eligibility
+    remains unknown; the broker makes the final acceptance decision.
     """
-    qty = float(quantity or 0.0)
-    if qty == int(qty):
+    qty = float(quantity)
+    if not math.isfinite(qty) or qty <= 0:
+        raise ValueError(f"Invalid share quantity for {symbol}: {quantity!r}")
+    if qty.is_integer():
         return FractionalPreview(symbol=symbol, requested_quantity=qty,
                                  submit_quantity=qty, outcome=FRACTIONAL_OUTCOME_WHOLE,
                                  fractionable=fractionable)
 
-    is_plain_market = (order_type_value == CoreOrderType.MARKET.value.lower()
-                       and not use_complex_order)
-    if not is_plain_market:
-        whole_shares = float(math.floor(qty))
-        as_complex = (" order submitted as a complex (BRACKET/OTO) order"
-                      if use_complex_order else " order")
-        constraint = (f"fractional qty {qty} is not accepted by Alpaca on a "
-                      f"{order_type_value}{as_complex}")
-        if whole_shares <= 0:
-            return FractionalPreview(
-                symbol=symbol, requested_quantity=qty, submit_quantity=None,
-                outcome=FRACTIONAL_OUTCOME_SKIPPED, fractionable=fractionable,
-                constraint=constraint,
-                reason=f"skipped: {constraint}; flooring leaves 0 whole shares")
+    if use_complex_order or order_type_value == CoreOrderType.OCO.value.lower():
+        constraint = "Alpaca restricts fractional complex orders (OCO/BRACKET/OTO)"
         return FractionalPreview(
-            symbol=symbol, requested_quantity=qty, submit_quantity=whole_shares,
-            outcome=FRACTIONAL_OUTCOME_FLOORED, fractionable=fractionable,
-            constraint=constraint,
-            reason=f"{constraint}; floored to {whole_shares} whole shares")
+            symbol=symbol, requested_quantity=qty, submit_quantity=qty,
+            outcome=FRACTIONAL_OUTCOME_REJECTED, requires_day_tif=True,
+            fractionable=fractionable, constraint=constraint,
+            reason=f"{constraint}; preserving qty {qty}, never substituting a smaller order")
 
     if fractionable is False:
         constraint = f"Alpaca does not make {symbol} fractionable"
@@ -183,9 +150,9 @@ def plan_fractional_submission(symbol: str, quantity: float, order_type_value: s
                     f"— size this symbol in whole shares"))
 
     if fractionable is True:
-        reason = f"fractional qty {qty} is accepted on a plain DAY market order"
+        reason = f"fractional qty {qty} is preserved on a DAY {order_type_value} order"
     else:
-        reason = (f"fractional qty {qty} is accepted on a plain DAY market order "
+        reason = (f"fractional qty {qty} is preserved on a DAY {order_type_value} order "
                   f"(Alpaca's fractionable flag for {symbol} is unknown)")
     return FractionalPreview(
         symbol=symbol, requested_quantity=qty, submit_quantity=qty,
@@ -485,16 +452,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             dict: Dictionary with setting names and their types.
         """
         return {
-            "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
-            "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
+            "api_key": {"type": 'str', "required": True, "secret": True, "description": "Alpaca API Key ID"},
+            "api_secret": {"type": 'str', "required": True, "secret": True, "description": "Alpaca API Secret Key"},
             "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"},
             "data_feed": {
                 "type": "str",
                 "required": False,
-                "default": "delayed_sip",
-                "description": "Alpaca market data feed",
-                "valid_values": ["delayed_sip", "sip", "iex", "otc"],
-                "tooltip": "delayed_sip = 15-min delayed (free tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
+                "default": "fmp",
+                "description": "Live stock price source",
+                "valid_values": ["fmp", "delayed_sip", "sip", "iex", "otc"],
+                "tooltip": "fmp = real-time FMP quote (last price; needs the FMP API key; never falls back to Alpaca; no bid/ask). delayed_sip = 15 min late (free Alpaca tier). iex = real-time IEX-only prints, free. sip = real-time consolidated, paid. otc = OTC data.",
             },
             "options_feed": {"type": "str", "required": False, "default": "indicative",
                              "valid_values": ["indicative", "opra"],
@@ -550,8 +517,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Returns:
             str: Formatted comment string
         """
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        return TransactionHelper.tpsl_comment(order_type, account_id, transaction_id, parent_order_id)
+
+    def _generate_replacement_tpsl_comment(self, kind: str, replaced: TradingOrder) -> str:
+        """The TP/SL mark for a price replacement's NEW row, tracing the row it replaces."""
+        return self._generate_tpsl_comment(
+            kind, replaced.account_id, replaced.transaction_id, replaced.depends_on_order,
+        ) + f" (replaces order {replaced.id})"
 
     @staticmethod
     def _sanitize_enum_field(value, enum_class, field_name, nullable=True, default_value=None):
@@ -1086,7 +1059,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
-            quantity=getattr(order, "qty", None),
+            # Alpaca returns qty as a string ("0.4018"); the model field is a float.
+            quantity=self._safe_float(getattr(order, "qty", None)),
             side=side,
             order_type=final_order_type,
             good_for=getattr(order, "time_in_force", None),
@@ -1132,7 +1106,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         )
         
     @alpaca_api_retry
-    def _fetch_raw_alpaca_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False) -> list:
+    def _fetch_raw_alpaca_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False,
+                                 full_history: bool = False) -> list:
         """
         Fetch raw Alpaca order objects from the API.
 
@@ -1143,14 +1118,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             status: Filter by order status. Defaults to ALL.
             fetch_all: If True, fetches ALL orders using date-based pagination.
                        If False, returns first 500 orders.
+            full_history: Opt-in (only with fetch_all) for callers that need the COMPLETE history
+                       (``get_filled_trades``). Alpaca's ``limit`` counts nested legs, so the
+                       legacy stop check ends paging early and the history is truncated; this
+                       mode counts legs, overlaps pages by 1s, keeps the copy of an order with
+                       the most legs, and RAISES on a failed page instead of returning [].
+                       Default False keeps the legacy (cheap, bounded) behaviour used by the
+                       refresh/TP-SL flows.
 
         Returns:
-            list: Raw Alpaca order objects. Empty list if authentication fails or error occurs.
+            list: Raw Alpaca order objects. Empty list if authentication fails or (legacy mode) error occurs.
         """
         if not self._check_authentication():
             return []
 
         try:
+            page = 0
             limit = 500  # Always use 500 as limit per Alpaca's maximum
             all_orders_dict = {}  # Use dict to deduplicate by broker_order_id
 
@@ -1186,6 +1169,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             if order.id not in all_orders_dict:
                                 all_orders_dict[order.id] = order
                                 new_order_count += 1
+                            elif full_history and len(getattr(order, 'legs', None) or []) > len(
+                                    getattr(all_orders_dict[order.id], 'legs', None) or []):
+                                # Overlapping pages: keep the copy that carries more legs.
+                                all_orders_dict[order.id] = order
 
                             # Track the oldest order date in this batch
                             if order.created_at:
@@ -1197,8 +1184,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         f"{new_order_count} new unique orders (total unique: {len(all_orders_dict)})"
                     )
 
+                    if full_history:
+                        # Alpaca's ``limit`` counts nested legs too, so compare the TOTAL
+                        # (orders + legs) against the limit.
+                        def _row_count(orders):
+                            return sum(1 + _row_count(getattr(o, 'legs', None) or []) for o in orders)
+                        page_is_last = _row_count(alpaca_orders) < limit
+                    else:
+                        page_is_last = len(alpaca_orders) < limit
+
                     # If we got fewer than limit, we've reached the end
-                    if len(alpaca_orders) < limit:
+                    if page_is_last:
                         logger.debug(f"Received fewer than {limit} orders, pagination complete")
                         break
 
@@ -1207,13 +1203,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         logger.debug(f"No new unique orders in this batch, pagination complete")
                         break
 
-                    # Set until_date to oldest order's date - 1 day for next iteration
-                    # The 'until' parameter means "fetch orders created BEFORE this date"
-                    # So we go backwards in time to get older orders
+                    # Set until_date for the next iteration ('until' = created BEFORE this
+                    # date, so we walk backwards in time).
                     if oldest_order_date:
-                        # Subtract 1 day to fetch older orders in next iteration
-                        until_date = oldest_order_date - timedelta(days=1)
-                        logger.debug(f"Next pagination until date (going backwards): {until_date}")
+                        if full_history:
+                            # +1s overlap (deduped by id) so a parent/leg pair split at a page
+                            # boundary survives even if Alpaca's 'until' is exclusive.
+                            until_date = oldest_order_date + timedelta(seconds=1)
+                        else:
+                            until_date = oldest_order_date - timedelta(days=1)
                     else:
                         # No date found, can't continue pagination
                         logger.warning("No created_at date found in orders, stopping pagination")
@@ -1243,7 +1241,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return alpaca_orders
 
         except Exception as e:
-            logger.error(f"Error fetching Alpaca orders: {e}", exc_info=True)
+            logger.error(
+                f"Error fetching Alpaca orders (page {page + 1 if fetch_all else 1}, "
+                f"full_history={full_history}): {e}", exc_info=True)
+            if full_history:
+                # Never hand back a silently truncated history; let the retry decorator /
+                # caller see the failure.
+                raise
             return []
 
     def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False):
@@ -1294,33 +1298,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if code == 40310000 and ("insufficient qty" in message or "insufficient quantity" in message):
             return BrokerOrderErrorReason.INSUFFICIENT_QTY
         return BrokerOrderErrorReason.UNKNOWN
-
-    def _record_fractional_adjustment(self, trading_order: TradingOrder,
-                                      quantity: Optional[float], reason: str) -> None:
-        """Persist a submission-time fractional-quantity adjustment onto the order row.
-
-        ``quantity`` is the whole-share quantity actually being sent, or ``None`` when
-        nothing is being sent at all (the SKIP case: flooring left 0 shares). A skip is
-        marked CANCELED — terminal, but deliberately NOT ERROR: no broker rejected
-        anything and the account is healthy, there was simply no whole share left to
-        trade, so it must not show up as a broker failure in the UI or the logs.
-
-        The reason is appended to ``comment`` (same convention as
-        ``_handle_order_submit_error``) so it is legible in the Pending Orders UI and not
-        only in the log.
-        """
-        fresh_order = get_instance(TradingOrder, trading_order.id)
-        if not fresh_order:
-            logger.error(
-                f"Could not find order {trading_order.id} to record fractional adjustment: {reason}")
-            return
-        if quantity is None:
-            fresh_order.status = OrderStatus.CANCELED
-        else:
-            fresh_order.quantity = quantity
-        fresh_order.comment = (
-            f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
-        update_instance(fresh_order)
 
     @staticmethod
     def _order_opens_short(trading_order: TradingOrder, is_closing_order: bool) -> bool:
@@ -1528,47 +1505,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             from ...core.types import OrderType as CoreOrderType
 
             # ---- Fractional quantities -----------------------------------------------
-            # THE RULE LIVES IN ONE PLACE: plan_fractional_submission() at module level,
-            # which is the SAME function the allocation dry run reaches through
-            # preview_fractional_submission(). Everything below is side effects --
-            # logging, and writing the adjustment back onto the row -- and no arithmetic,
-            # precisely so that what the dry run promised and what is submitted cannot
-            # drift apart.
+            # Submission preserves the quantity chosen by the caller for every order
+            # type. Only the broker's DAY duration requirement is applied here.
+            # The allocation preview uses the same plan_fractional_submission helper.
             #
             # `fractionable` is deliberately NOT looked up here. The allocation engine
             # already gated sizing on the broker's per-symbol flag
             # (MarginInfo.fractionable), and an asset round-trip on the hot order path
             # would buy nothing. Passing it as unknown reproduces exactly the behaviour
             # this method had before the rule was extracted.
-            quantity_value = float(trading_order.quantity or 0.0)
+            quantity_value = float(trading_order.quantity)
             fractional = plan_fractional_submission(
                 trading_order.symbol, quantity_value, order_type_value,
                 use_complex_order=use_complex_order)
 
-            if fractional.outcome == FRACTIONAL_OUTCOME_SKIPPED:
+            if fractional.outcome == FRACTIONAL_OUTCOME_REJECTED:
                 logger.warning(
-                    f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
-                    f"{fractional.constraint}, and flooring leaves 0 whole shares — "
-                    f"nothing submitted"
+                    f"Order {trading_order.id} ({trading_order.symbol}): {fractional.reason}"
                 )
-                self._record_fractional_adjustment(
-                    trading_order, None, fractional.reason)
-                return None
-            if fractional.outcome == FRACTIONAL_OUTCOME_FLOORED:
-                whole_shares = fractional.submit_quantity
-                # Name the CONSEQUENCE, not just the arithmetic: a protective leg
-                # floored off a fractional parent covers less than the position, and
-                # this line is the only place that ever gets said.
-                logger.warning(
-                    f"Order {trading_order.id} ({trading_order.symbol}): "
-                    f"{fractional.constraint}; submitting {whole_shares} whole shares "
-                    f"instead of {quantity_value}; {quantity_value - whole_shares:g} "
-                    f"shares of the position are left uncovered"
-                )
-                trading_order.quantity = whole_shares
-                self._record_fractional_adjustment(
-                    trading_order, whole_shares, fractional.reason)
-            elif fractional.requires_day_tif and time_in_force != TimeInForce.DAY:
+            if fractional.requires_day_tif and time_in_force != TimeInForce.DAY:
                 logger.info(
                     f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
                     f"qty={quantity_value}; forcing time_in_force DAY (was "
@@ -1717,10 +1672,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             f"use_complex_order set for order {trading_order.id} but neither "
                             f"tp_price nor sl_price was provided"
                         )
-                    order_request.order_class = (
-                        OrderClass.BRACKET if len(legs) == 2 else OrderClass.OTO)
+                    # Legs FIRST, class LAST. alpaca-py >= 0.44 validates on every assignment
+                    # and refuses a BRACKET/OCO that has no take_profit/stop_loss yet, so
+                    # setting the class first raised before the legs could be attached.
                     for leg_name, leg in legs.items():
                         setattr(order_request, leg_name, leg)
+                    order_request.order_class = (
+                        OrderClass.BRACKET if len(legs) == 2 else OrderClass.OTO)
                     logger.info(
                         f"Order {trading_order.id} ({trading_order.symbol}) submitted as "
                         f"{order_request.order_class.value.upper()} to bypass the wash-trade block "
@@ -1751,6 +1709,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 result_order = self.alpaca_order_to_tradingorder(alpaca_order)
                 if result_order.status:
                     fresh_order.status = result_order.status
+                # Keep the local row's duration aligned with the actual request. This
+                # is metadata only; the share quantity is never changed here.
+                fresh_order.good_for = time_in_force.value
                 
                 # Use thread-safe update function with retry logic
                 update_instance(fresh_order)
@@ -1878,9 +1839,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             TradingOrder: The modified order if successful, None if an error occurs.
         """
         try:
-            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
-            limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
-            stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
+            # Round price fields to Alpaca's grid: an option contract is on the cent grid at every
+            # price (42210000), an equity keeps 4 decimals below $1.
+            if getattr(trading_order, 'asset_class', None) == CoreAssetClass.OPTION:
+                # Same direction rule as submission: an MLEG net (no contract) rounds up.
+                up = (not getattr(trading_order, 'contract_symbol', None)
+                      or trading_order.side == OrderDirection.BUY)
+                limit_price = self._round_option_limit(trading_order.limit_price, up=up) if trading_order.limit_price is not None else None
+                stop_price = self._round_option_limit(trading_order.stop_price, up=up) if trading_order.stop_price is not None else None
+            else:
+                limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
+                stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
             
             # Map good_for to TimeInForce enum if provided
             time_in_force = None
@@ -1895,6 +1864,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     'cls': TimeInForce.CLS,
                 }
                 time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)
+
+            # Alpaca's replace schema types qty as int and documents that fractional
+            # quantities cannot be changed. Omitting qty preserves the broker's exact
+            # fractional quantity. A resize must be implemented as cancel + new order;
+            # it must never be silently rounded here.
+            replacement_quantity = trading_order.quantity
+            if (replacement_quantity is not None
+                    and not float(replacement_quantity).is_integer()):
+                replacement_quantity = None
+                time_in_force = TimeInForce.DAY
             
             # Validate order has ID
             if not trading_order.id:
@@ -1902,7 +1881,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Create ReplaceOrderRequest using order ID (already unique, no need to regenerate)
             replace_request = ReplaceOrderRequest(
-                qty=trading_order.quantity,
+                qty=replacement_quantity,
                 time_in_force=time_in_force,
                 limit_price=limit_price,
                 stop_price=stop_price,
@@ -1994,7 +1973,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if db_order_id:
                 db_order = get_instance(TradingOrder, db_order_id)
                 if db_order:
-                    db_order.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(db_order)   # status + the moment the cancel was SENT
                     update_instance(db_order)
 
             return True
@@ -2753,6 +2732,53 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return raw
         return [raw] if raw else []
 
+    #: Pages of 100 FILL activities read at most when looking for an external close: enough for
+    #: months of this platform's trading, and a hard stop so a lookup can never loop.
+    CLOSING_FILL_MAX_PAGES = 20
+
+    def get_closing_fill(self, symbol: str, side, quantity: float,
+                         since: Optional[datetime]) -> Optional[Tuple[float, datetime]]:
+        """The Alpaca FILL activities on ``side`` that closed ``quantity`` of ``symbol`` after
+        ``since``: ``(quantity-weighted average price, time of the last fill)``, or None.
+
+        Fills are taken oldest first from ``since`` (the transaction's open) until they cover
+        ``quantity``: the first closing fills after the entry are the ones that closed it, and
+        partial fills of one order arrive as separate activities. None when they never cover
+        the quantity, or when the activities cannot be read (logged at ERROR); a partly matched
+        close is not a price."""
+        from ba2_common.core.types import OrderDirection
+        sides = {"sell", "sell_short"} if side == OrderDirection.SELL else {"buy"}
+        params: Dict[str, Any] = {"direction": "asc", "page_size": 100}
+        if since is not None:
+            params["after"] = since.astimezone(timezone.utc).isoformat()
+        qty = value = 0.0
+        last_time = None
+        for _ in range(self.CLOSING_FILL_MAX_PAGES):
+            try:
+                page = self.client.get("/account/activities/FILL", params)
+            except Exception as e:  # noqa: BLE001 -- the REST client raises its own types
+                logger.error(f"[Account {self.id}] Could not read FILL activities for "
+                             f"{symbol}: {e}", exc_info=True)
+                return None
+            page = page if isinstance(page, list) else ([page] if page else [])
+            for act in page:
+                if act.get("symbol") != symbol or act.get("side") not in sides:
+                    continue
+                q = float(act["qty"])
+                take = min(q, quantity - qty)
+                qty += take
+                value += take * float(act["price"])
+                last_time = datetime.fromisoformat(
+                    str(act["transaction_time"]).replace("Z", "+00:00"))
+                if qty >= quantity - 1e-9:
+                    return value / qty, last_time
+            if len(page) < params["page_size"]:
+                return None
+            params["page_token"] = page[-1]["id"]
+        logger.error(f"[Account {self.id}] Closing fill for {symbol} not found within "
+                     f"{self.CLOSING_FILL_MAX_PAGES} pages of FILL activities after {since}")
+        return None
+
     def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
         """Deposits, withdrawals and dividends over a window, from the activities API.
 
@@ -2922,6 +2948,32 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         
         return results
 
+    def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
+        """The cached price read (base class), with ONE cache entry per symbol on the fmp feed: FMP
+        /quote has a last price only, so 'bid'/'mid'/'mark'/... are the same figure and must not each
+        cost an FMP request. 'ask' keeps its own key and is refused by the implementation."""
+        if price_type != 'ask' and (self.settings.get("data_feed") or "fmp").lower() == "fmp":
+            price_type = 'bid'
+        return super().get_instrument_current_price(symbol_or_symbols, price_type=price_type)
+
+    def _fmp_current_price(self, symbol_or_symbols):
+        """FMP last price(s); None for any symbol FMP did not price (never another source)."""
+        single = isinstance(symbol_or_symbols, str)
+        symbols = [symbol_or_symbols] if single else list(symbol_or_symbols)
+        try:
+            prices = fetch_fmp_last_prices(symbols)
+        except FMPHermeticViolation:
+            raise
+        except FMPPriceError as e:
+            logger.error(f"[Account {self.id}] FMP price feed unavailable: {e}")
+            prices = {}
+        except Exception as e:
+            logger.error(f"[Account {self.id}] FMP price feed failed for {symbols}: {redact(e)}")
+            prices = {}
+        if single:
+            return prices.get(symbol_or_symbols)
+        return {s: prices.get(s) for s in symbols}
+
     @alpaca_api_retry
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """
@@ -2942,6 +2994,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 - If symbol_or_symbols is str: Returns Optional[float] (single price or None)
                 - If symbol_or_symbols is List[str]: Returns Dict[str, Optional[float]] (symbol -> price mapping)
         """
+        feed_setting = (self.settings.get("data_feed") or "fmp").lower()
+        feed_names = ("fmp", "delayed_sip", "sip", "iex", "otc")
+        if feed_setting not in feed_names:
+            raise ValueError(
+                f"Unknown Alpaca data_feed {feed_setting!r} (account {self.id}); "
+                f"valid values: {', '.join(feed_names)}")
+
+        if feed_setting == "fmp":
+            # Real-time FMP /quote LAST price. FMP /quote carries no bid/ask. 'bid' is the
+            # interface DEFAULT price_type (every plain get_instrument_current_price(sym) call
+            # arrives as 'bid' and means "the price"), so it cannot be refused: it is the last
+            # price, like mid/avg/mark/trade. An explicit 'ask' is a quote SIDE we do not have:
+            # refused loudly, never answered with a last price or an Alpaca quote.
+            if price_type == "ask":
+                raise ValueError(
+                    f"data_feed 'fmp' cannot serve price_type 'ask': FMP /quote has no ask "
+                    f"(account {self.id}). Use the default/'mid'/'mark' for a last price, or "
+                    f"switch the account's data_feed to an Alpaca feed.")
+            return self._fmp_current_price(symbol_or_symbols)
+
         if not self._check_authentication():
             # Return appropriate type based on input
             if isinstance(symbol_or_symbols, str):
@@ -2963,14 +3035,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             is_single_symbol = isinstance(symbol_or_symbols, str)
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
 
-            feed_setting = (self.settings.get("data_feed") or "delayed_sip").lower()
             feed_map = {
                 "delayed_sip": DataFeed.DELAYED_SIP,
                 "sip": DataFeed.SIP,
                 "iex": DataFeed.IEX,
                 "otc": DataFeed.OTC,
             }
-            feed = feed_map.get(feed_setting, DataFeed.DELAYED_SIP)
+            feed = feed_map[feed_setting]
 
             # Fetch last trade prices — these match what the Alpaca broker displays and are
             # reliable even for thinly traded stocks where bid/ask can be stale.
@@ -3150,7 +3221,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 )
             ).all()
             pending = [
-                (r.id, r.broker_order_id, r.symbol, r.created_at) for r in rows
+                (r.id, r.broker_order_id, r.symbol, dict(r.data) if r.data else None) for r in rows
                 if r.broker_order_id is None or r.broker_order_id not in covered
             ]
             skipped_free = len(rows) - len(pending)
@@ -3170,6 +3241,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         def _oldest_first(row):
             age = self._order_age_hours(row[3])
             return (age is None, -age if age is not None else 0.0)
+
+        # LEGACY ROWS: PENDING_CANCEL with no recorded cancel moment (written before the
+        # stamp existed). Their true start is unknown; created_at is NOT it (it made every
+        # cancelled leg of a long-held position look 24 h old at once). Start the clock NOW:
+        # never reset on this pass, and say so once (the stamp ends the repetition).
+        # A failure on ONE row (corrupt stamp, DB write) must not abort the others: that row
+        # is treated as starting now, so it is never reset on this pass.
+        for idx, (order_id, broker_order_id, symbol, raw_data) in enumerate(pending):
+            try:
+                since = get_pending_cancel_since(raw_data)
+                if since is None:
+                    since = self._stamp_legacy_pending_cancel(order_id, symbol)
+            except Exception as e:
+                logger.error(
+                    f"Order {order_id} ({symbol}): cannot read/record pending_cancel_since "
+                    f"({type(e).__name__}: {e}); treating the cancel as starting now so the "
+                    f"order is not reset on this pass", exc_info=True)
+                since = datetime.now(timezone.utc)
+            pending[idx] = (order_id, broker_order_id, symbol, since)
 
         pending.sort(key=_oldest_first)
         if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
@@ -3258,6 +3348,24 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return resolved_count
 
+    @staticmethod
+    def _stamp_legacy_pending_cancel(order_id: int, symbol) -> datetime:
+        """Record 'now' as the cancel moment of a PENDING_CANCEL row that has none."""
+        now = datetime.now(timezone.utc)
+        fresh = get_instance(TradingOrder, order_id)
+        if fresh is not None and fresh.status == OrderStatus.PENDING_CANCEL:
+            data = dict(fresh.data) if fresh.data else {}
+            if get_pending_cancel_since(data) is None:
+                data[PENDING_CANCEL_SINCE_KEY] = now.isoformat()
+                fresh.data = data
+                update_instance(fresh)
+                logger.warning(
+                    f"Order {order_id} ({symbol}) is PENDING_CANCEL with no pending_cancel_since "
+                    f"(legacy row): its true cancel time is unknown, so the "
+                    f"{_PENDING_CANCEL_MAX_AGE_HOURS}h timeout now starts from this moment "
+                    f"instead of from created_at")
+        return now
+
     def _write_pending_cancel_result(self, order_id: int, new_status, broker_order) -> bool:
         """Persist the broker's answer onto a PENDING_CANCEL order. Returns True if written.
 
@@ -3272,6 +3380,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"not overwriting")
             return False
         fresh.status = new_status
+        if new_status != OrderStatus.PENDING_CANCEL and fresh.data and PENDING_CANCEL_SINCE_KEY in fresh.data:
+            fresh.data = {k: v for k, v in fresh.data.items() if k != PENDING_CANCEL_SINCE_KEY}
         if broker_order is not None:
             if broker_order.filled_qty is not None:
                 fresh.filled_qty = float(broker_order.filled_qty)
@@ -3879,7 +3989,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 depends_order_status_trigger=tp_order.depends_order_status_trigger,
                 expert_recommendation_id=tp_order.expert_recommendation_id,
                 open_type=tp_order.open_type,
-                comment=replacement_order.comment,  # Use new tracking comment from replacement
+                # The TP mark, not the broker mapping's comment (None): a replaced ROOT TP with
+                # no mark reads as a pending close and skips the exit rules.
+                comment=self._generate_replacement_tpsl_comment("TP", tp_order),
                 data=tp_order.data,  # Preserve TP/SL metadata
                 good_for=tp_order.good_for,
                 created_at=datetime.now(timezone.utc)
@@ -3978,6 +4090,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Create NEW database record for the replacement order
             new_tp_order = TradingOrder(
+                # account_id is NOT NULL: without it this insert failed AFTER the broker had
+                # already replaced the stop, leaving the DB on the old, REPLACED row.
+                account_id=sl_order.account_id,
                 transaction_id=sl_order.transaction_id,
                 broker_order_id=replacement_order.broker_order_id,  # NEW broker order ID
                 symbol=sl_order.symbol,
@@ -3988,7 +4103,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stop_price=new_sl_price,
                 limit_price=sl_order.limit_price,
                 status=replacement_order.status,  # Status from broker (typically NEW or ACCEPTED)
-                comment=replacement_order.comment,  # Tracking comment from broker
+                depends_on_order=sl_order.depends_on_order,
+                depends_order_status_trigger=sl_order.depends_order_status_trigger,
+                expert_recommendation_id=sl_order.expert_recommendation_id,
+                open_type=sl_order.open_type,
+                data=sl_order.data,  # Preserve TP/SL metadata (as the TP replacement does)
+                # The SL mark (see _update_broker_tp_order).
+                comment=self._generate_replacement_tpsl_comment("SL", sl_order),
+                created_at=datetime.now(timezone.utc),
             )
             
             # Add NEW order to database
@@ -4036,7 +4158,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Build replace request - use STOP_LIMIT for both TP and SL
             replace_request = ReplaceOrderRequest(
-                qty=existing_tp.quantity,
                 limit_price=new_tp_price,
                 stop_price=new_tp_price  # STOP_LIMIT: trigger and execute at same price
             )
@@ -4109,7 +4230,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Build replace request - use STOP_LIMIT for both TP and SL
             replace_request = ReplaceOrderRequest(
-                qty=existing_sl.quantity,
                 limit_price=new_sl_price,
                 stop_price=new_sl_price  # STOP_LIMIT: trigger and execute at same price
             )
@@ -4187,7 +4307,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Build replace request - STOP_LIMIT with both prices
             replace_request = ReplaceOrderRequest(
-                qty=existing_order.quantity,
                 limit_price=tp_price,  # Take profit execution price
                 stop_price=sl_price    # Stop loss trigger price
             )
@@ -4437,6 +4556,46 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.error(f"No entry order found for transaction {transaction.id}")
                     return False
 
+                # WHICH ORDERS ARE EXIT LEGS -- review finding C1, 2026-09-29. This used to be
+                # "every non-terminal order but the first entry", which swept up whatever ELSE
+                # was working on the transaction: a FactorRanker rebalance's market SELL (trim)
+                # or BUY (add). The filled-entry path then cancelled that order at the broker
+                # (reversing a trim, killing an add), staged the new stop to wait for IT to be
+                # cancelled, and reported success. Only the position's OWN resting protection
+                # (TransactionHelper.is_resting_protection: OCO/OTO, broker legs, TP/SL-marked
+                # rows, never MARKET) is maintained here; every other working order is left
+                # exactly as it is -- it only changes the SIZE the protection must cover.
+                from ba2_common.core.TransactionHelper import TransactionHelper
+                from ba2_common.core.trade_store import orders_where
+                entry_filled = entry_order.status in OrderStatus.get_executed_statuses()
+                # The size the protection must cover once the working orders fill; None while
+                # the entry itself is unfilled (that path sizes on the entry order).
+                post_fill_qty = None
+                if entry_filled:
+                    txn_orders = orders_where(transaction_id=transaction.id)
+                    try:
+                        post_fill_qty = TransactionHelper.post_fill_position_quantity(
+                            transaction_in_session, entry_order.side, txn_orders)
+                    except ValueError as e:
+                        # An executed row with no filled_qty (legacy rows exist). With nothing
+                        # else working, the position is what it has always been sized as here
+                        # -- transaction.quantity -- so keep that, loudly. With an add, trim or
+                        # close in flight there is no way to know what the leg must cover:
+                        # refuse rather than guess.
+                        in_flight = [o for o in txn_orders
+                                     if o.status in (OrderStatus.get_unfilled_statuses()
+                                                     | OrderStatus.get_unsent_statuses())
+                                     and o.id != entry_order.id
+                                     and not TransactionHelper.is_resting_protection(o)]
+                        if in_flight:
+                            logger.error(
+                                f"Refusing TP/SL adjustment for transaction {transaction.id}: {e}, "
+                                f"and order(s) {[o.id for o in in_flight]} are still working")
+                            return False
+                        logger.error(
+                            f"Transaction {transaction.id}: {e}; sizing its exit on "
+                            f"transaction.quantity={transaction_in_session.quantity} as before")
+
                 # 3. Early skip check: if values unchanged and the existing exit orders already
                 # have the right STRUCTURE (OCO vs plain limit vs plain stop) and prices, skip.
                 tp_unchanged = (new_tp_price is None or
@@ -4462,6 +4621,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             ])
                         )
                     ).all()
+                    valid_tpsl_orders = [o for o in valid_tpsl_orders
+                                         if TransactionHelper.is_resting_protection(o)]
 
                     if target_spec is None:
                         if not valid_tpsl_orders:
@@ -4485,6 +4646,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 logger.debug(f"Exit order {order.id} has SL={order.stop_price}, expected ${want_sl:.2f}")
                                 orders_match = False
                                 break
+                            # The right price on the wrong SIZE is not "unchanged": an add or a
+                            # trim moves the position the leg has to cover.
+                            if (post_fill_qty is not None and order.parent_order_id is None
+                                    and (order.quantity is None
+                                         or abs(float(order.quantity) - post_fill_qty) > 1e-9)):
+                                logger.debug(f"Exit order {order.id} covers {order.quantity}, "
+                                             f"position after working orders fill is {post_fill_qty}")
+                                orders_match = False
+                                break
 
                         if orders_match:
                             logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
@@ -4502,14 +4672,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 session.add(transaction_in_session)
                 session.commit()
 
-                # 5. Find existing exit orders (everything non-terminal that isn't the entry)
-                all_orders = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                        TradingOrder.id != entry_order.id
-                    )
-                ).all()
+                # 5. Find the existing exit orders: the position's resting PROTECTION that is
+                # still working (see the C1 note above). Executed rows are excluded too -- a
+                # leg that already fired protects nothing and has nothing left to cancel.
+                all_orders = [
+                    o for o in session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.transaction_id == transaction.id,
+                            TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
+                            TradingOrder.id != entry_order.id
+                        )
+                    ).all()
+                    if o.status not in OrderStatus.get_executed_statuses()
+                    and TransactionHelper.is_resting_protection(o)
+                ]
 
                 # 6. Decide target structure from what's actually set (see _target_exit_spec):
                 # both -> OCO, TP-only -> plain limit, SL-only -> plain stop, neither -> no exit order.
@@ -4532,7 +4708,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
                     result = self._handle_filled_entry_exit(
-                        session, transaction_in_session, entry_order, spec, all_orders
+                        session, transaction_in_session, entry_order, spec, all_orders,
+                        quantity=post_fill_qty,
                     )
 
                 else:
@@ -4733,7 +4910,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     data={
                         "tp_percent_target": self._calculate_tp_percent(entry_order, transaction.take_profit) if transaction.take_profit else 0,
                         "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0,
-                        "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                        "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                     },
                     created_at=datetime.now(timezone.utc)
                 )
@@ -5058,7 +5235,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # Keep one existing DB-only WAITING_TRIGGER order if it already has the
         # target type (update prices in place); cancel everything else.
         keep: TradingOrder | None = None
+        terminal = OrderStatus.get_terminal_statuses()
         for order in all_orders:
+            if (order.parent_order_id == entry_order.id and order.broker_order_id
+                    and order.status not in terminal):
+                # A leg of the entry's OWN complex order (the OTO/bracket of the wash-trade
+                # escape). Cancelling it cancels the unfilled entry at Alpaca: 2026-10-29 RAPP
+                # entry 1438 had filled 34 of 35 shares when its stop leg was cancelled here,
+                # and the order died with the 34 shares untracked. The leg stays; once the
+                # entry fills, TradeManager cancels it and submits the exit staged below.
+                logger.info(f"Keeping leg {order.id} of entry {entry_order.id}'s own complex order "
+                            f"until the entry fills")
+                continue
             if (spec and keep is None
                     and order.order_type == spec[0]
                     and order.status == OrderStatus.WAITING_TRIGGER
@@ -5108,7 +5296,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         transaction: Transaction,
         entry_order: TradingOrder,
         spec: tuple | None,
-        all_orders: list
+        all_orders: list,
+        quantity: float | None = None,
     ) -> bool:
         """Handle TP/SL adjustment when entry is filled - maintain the target exit
         structure at the broker (OCO / plain limit / plain stop / none).
@@ -5119,7 +5308,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         new order in WAITING_TRIGGER state linked to the cancellation of the
         outgoing order — TradeManager will submit it on the next refresh once
         the parent reaches CANCELED.
+
+        ``all_orders`` holds the position's resting PROTECTION only -- never an add, trim or
+        close working on the same transaction (review finding C1): nothing else is cancelled
+        here and nothing is chained on anything else. ``quantity`` is the position once those
+        working orders fill (``TransactionHelper.post_fill_position_quantity``), which is what
+        the replacement covers; ``transaction.quantity`` (gross entry size) only when a caller
+        gives none. Returns False -- never a hollow True -- when the replacement cannot be
+        staged: nothing left to protect, or a protection cancel the broker did not accept.
         """
+        order_quantity = transaction.quantity if quantity is None else quantity
         spec_desc = f"{spec[0].value} TP={spec[1]} SL={spec[2]}" if spec else "none"
         logger.info(f"[Exit] Adjusting broker exit order for filled entry {entry_order.id} "
                     f"(transaction {transaction.id}): target {spec_desc}")
@@ -5154,14 +5352,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         order_type, tp_price, sl_price, label = spec
 
+        if not order_quantity or order_quantity <= 0:
+            # A full exit is working (or done): there is nothing left to protect, and a stop
+            # placed now would reserve the very shares the exit needs.
+            logger.error(
+                f"Not placing a {order_type.value} exit for transaction {transaction.id}: the "
+                f"position is {order_quantity} once its working orders fill -- nothing to protect")
+            return False
+
         # 3. No live broker order — straight path, submit immediately
         if not live_broker_orders:
             if order_type == CoreOrderType.OCO:
-                return self._create_broker_oco_order(session, transaction, entry_order, tp_price, sl_price)
+                return self._create_broker_oco_order(session, transaction, entry_order, tp_price,
+                                                     sl_price, quantity=order_quantity)
             elif tp_price:
-                return self._create_broker_tp_order(session, transaction, entry_order, tp_price)
+                return self._create_broker_tp_order(session, transaction, entry_order, tp_price,
+                                                    quantity=order_quantity)
             else:
-                return self._create_broker_sl_order(session, transaction, entry_order, sl_price)
+                return self._create_broker_sl_order(session, transaction, entry_order, sl_price,
+                                                    quantity=order_quantity)
 
         # 4. Live broker order(s) — chain the new exit order behind the cancellation
         #    of the most recent (highest-id) live order, then cancel all live
@@ -5169,11 +5378,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         #    the new order once that parent reaches CANCELED.
         live_broker_orders.sort(key=lambda o: o.id, reverse=True)
         parent_for_trigger = live_broker_orders[0]
-
-        order_quantity = transaction.quantity
-        if not order_quantity or order_quantity <= 0:
-            logger.error(f"Cannot stage replacement exit order for transaction {transaction.id}: invalid quantity {order_quantity}")
-            return False
 
         waiting_exit = self._build_exit_order(
             transaction, entry_order, spec,
@@ -5190,13 +5394,30 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"reaches CANCELED at broker"
         )
 
-        # Submit cancel to broker for ALL live orders
+        # Submit cancel to broker for ALL live protection legs. A cancel the broker does not
+        # accept is a FAILURE: the staged replacement waits on it and would never go live.
+        failed = []
         for order in live_broker_orders:
             try:
-                self.cancel_order(order.id)
+                ok = self.cancel_order(order.id)
+            except Exception as e:  # noqa: BLE001 -- reported below
+                ok = False
+                logger.error(f"Failed to cancel broker order {order.id}: {e}", exc_info=True)
+            if ok:
                 logger.info(f"Submitted cancel for broker order {order.id} (broker_id={order.broker_order_id})")
-            except Exception as e:
-                logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+            else:
+                failed.append(order.id)
+        if failed:
+            withdrawn = parent_for_trigger.id in failed
+            if withdrawn:
+                waiting_exit.status = OrderStatus.CANCELED
+                session.add(waiting_exit)
+                session.commit()
+            logger.error(
+                f"Exit replacement for transaction {transaction.id} NOT complete: the broker did "
+                f"not accept the cancel of protective order(s) {failed}"
+                + (f"; staged order {waiting_exit.id} withdrawn" if withdrawn else ""))
+            return False
 
         return True
 
@@ -5222,11 +5443,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         return ((tp_price - entry_order.open_price) / entry_order.open_price) * 100
     
-    def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float) -> bool:
+    def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float,
+                                quantity: float | None = None) -> bool:
         """Create new TP order at broker using OCO (both TP+SL) or simple limit order (TP only)"""
         try:
-            # Use transaction.quantity as source of truth (handles partial closes)
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create TP order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
@@ -5346,7 +5569,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_tp.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_tp)
                 session.add(existing_tp)
                 
                 # Create new pending order with correct type
@@ -5363,7 +5586,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_tp.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"TP order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_tp.id})",
-                    data=existing_tp.data.copy() if existing_tp.data else {},
+                    data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_tp)
@@ -5387,7 +5610,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace TP order {existing_tp.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_tp.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_tp)
                     session.add(existing_tp)
                     
                     # Create new pending TP order to replace it
@@ -5404,7 +5627,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_tp.id,  # Depends on old order being cancelled
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"TP order (pending cancel of {existing_tp.id})",
-                        data=existing_tp.data.copy() if existing_tp.data else {},
+                        data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_tp)
@@ -5442,20 +5665,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
 
-    def _tpsl_reference_price(self, entry_order: TradingOrder):
+    def _tpsl_reference_price(self, entry_order: TradingOrder, transaction=None):
         """Best pre-fill anchor the TP/SL were computed against, so a pending OCO can be
         re-based to the entry's ACTUAL fill on trigger.
 
         Prefers the realized fill if present, else the limit price, else the originating
         recommendation's snapshot price (what the rule's order_open_price/current-price
         reference resolved to for a not-yet-filled market order), else the live price.
+        The preference order is the shared ``resolve_tpsl_reference_price`` (the backtest
+        resolves the same anchor through it); only the two lookups are live-specific.
         """
-        if entry_order.open_price:
-            return entry_order.open_price
-        if entry_order.limit_price:
-            return entry_order.limit_price
-        rec_id = getattr(entry_order, "expert_recommendation_id", None)
-        if rec_id:
+        from ba2_common.core.tpsl_fill_rebase import resolve_tpsl_reference_price
+
+        def _rec_price():
+            rec_id = getattr(entry_order, "expert_recommendation_id", None)
+            if not rec_id:
+                return None
             try:
                 from ...core.db import get_instance
                 from ...core.models import ExpertRecommendation
@@ -5464,10 +5689,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     return rec.price_at_date
             except Exception:
                 pass
-        try:
-            return self.get_instrument_current_price(entry_order.symbol)
-        except Exception:
             return None
+
+        def _live_price():
+            try:
+                return self.get_instrument_current_price(entry_order.symbol)
+            except Exception:
+                return None
+
+        from ba2_common.core.tpsl_fill_rebase import read_anchor
+        return resolve_tpsl_reference_price(
+            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price,
+            stamped_stop_anchor=read_anchor(getattr(transaction, "meta_data", None), "stop"))
 
     def _target_exit_spec(self, transaction: Transaction, entry_order: TradingOrder):
         """Decide which exit-order structure a transaction needs at the broker.
@@ -5518,7 +5751,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             data["tp_percent_target"] = self._calculate_tp_percent(entry_order, tp_price)
         if sl_price:
             data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
-        ref_price = self._tpsl_reference_price(entry_order)
+        ref_price = self._tpsl_reference_price(entry_order, transaction)
         if ref_price:
             data["tpsl_reference_price"] = ref_price
         return TradingOrder(
@@ -5539,7 +5772,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             created_at=datetime.now(timezone.utc)
         )
 
-    def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
+    def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float,
+                                 quantity: float | None = None) -> bool:
         """Create new OCO order at broker with both TP and SL."""
         try:
             # Validate TP/SL prices before creating OCO order
@@ -5550,9 +5784,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 logger.error(f"Cannot create broker OCO order for transaction {transaction.id}: invalid stop_loss {sl_price}")
                 return False
             
-            # Use transaction.quantity as source of truth (handles partial closes)
-            # This is the current position size that needs TP/SL protection
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create OCO order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
@@ -5577,7 +5811,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 data={
                     "tp_percent_target": self._calculate_tp_percent(entry_order, tp_price),
                     "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price),
-                    "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                    "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                 },
                 created_at=datetime.now(timezone.utc)
             )
@@ -5605,11 +5839,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error creating broker OCO order: {e}", exc_info=True)
             return False
     
-    def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
+    def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float,
+                                quantity: float | None = None) -> bool:
         """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
         try:
-            # Use transaction.quantity as source of truth (handles partial closes)
-            order_quantity = transaction.quantity
+            # ``quantity``: the post-fill position from _handle_filled_entry_exit; else the
+            # transaction's quantity (the historical source).
+            order_quantity = transaction.quantity if quantity is None else quantity
             if not order_quantity or order_quantity <= 0:
                 logger.error(f"Cannot create SL order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
@@ -5727,7 +5963,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_sl.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_sl)
                 session.add(existing_sl)
                 
                 # Create new pending order with correct type
@@ -5744,7 +5980,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_sl.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"SL order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_sl.id})",
-                    data=existing_sl.data.copy() if existing_sl.data else {},
+                    data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_sl)
@@ -5766,7 +6002,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 if "cannot replace order" in error_msg or "42210000" in error_msg:
                     logger.warning(f"Cannot replace SL order {existing_sl.id} (error: {e}), creating PENDING_CANCEL order")
                     
-                    existing_sl.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_sl)
                     session.add(existing_sl)
                     
                     new_sl = TradingOrder(
@@ -5782,7 +6018,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_sl.id,
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"SL order (pending cancel of {existing_sl.id})",
-                        data=existing_sl.data.copy() if existing_sl.data else {},
+                        data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_sl)
@@ -5828,7 +6064,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 from alpaca.trading.requests import ReplaceOrderRequest
                 
                 replace_request = ReplaceOrderRequest(
-                    qty=existing_oco.quantity,
                     limit_price=new_tp_price,
                     stop_price=new_sl_price
                 )
@@ -5859,7 +6094,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace OCO order {existing_oco.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_oco.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_oco)
                     session.add(existing_oco)
                     
                     # Validate TP/SL prices before creating replacement OCO order
@@ -6071,9 +6306,27 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return []
 
         try:
-            raw_orders = self._fetch_raw_alpaca_orders(status=OrderStatus.CLOSED, fetch_all=True)
+            raw_orders = self._fetch_raw_alpaca_orders(
+                status=OrderStatus.CLOSED, fetch_all=True, full_history=True)
             trades = []
-            for order in raw_orders:
+            seen_ids = set()
+
+            def _walk(orders):
+                # Orders are fetched with nested=True, so a bracket/OCO exit leg
+                # (stop-loss / take-profit) is returned only inside its parent's
+                # ``legs``. Walk them recursively so filled legs are not lost.
+                for o in orders or []:
+                    yield o
+                    yield from _walk(getattr(o, 'legs', None))
+
+            for order in _walk(raw_orders):
+                order_id = getattr(order, 'id', None)
+                if order_id is not None:
+                    key = str(order_id)
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+
                 filled_qty = float(getattr(order, 'filled_qty', 0) or 0)
                 if filled_qty <= 0:
                     continue
@@ -6111,8 +6364,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return trades
 
         except Exception as e:
+            # Raise (not []) so the caller can tell a failed fetch from "no trades"
+            # (the Overview keeps its old rows on a failed fetch).
             logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
-            return []
+            raise
 
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)
@@ -6492,6 +6747,159 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return nearest.implied_volatility
 
     # ======================================================================
+    # IV rank from DERIVED ATM-IV history (BT/live statistic parity)
+    #
+    # ``OptionsAccountInterface._iv_series`` / ``get_iv_rank`` read the ~daily 16:30
+    # ``option_iv_snapshot`` rows (Alpaca snapshot IV, calls+puts nearest strike), a different
+    # statistic from the backtest's and with only days of history. Here the series comes from
+    # ``AtmIvHistoryProvider`` (Alpaca daily option bars inverted with the backtest's own
+    # Black-Scholes and ATM selection). Overridden HERE, not in the shared interface, so no
+    # package changes; see ``modules/dataproviders/options/atm_iv_history.py``.
+    # ======================================================================
+    #: minimum share of the window's sessions that must carry a value before a rank is served
+    IV_RANK_MIN_COVERAGE = 0.80
+
+    def _atm_iv_history(self):
+        p = getattr(self, "_atm_iv_history_provider", None)
+        if p is None:
+            from ..dataproviders.options.atm_iv_history import get_provider_for_credentials
+            from ba2_common.core.ohlcv_history import account_history_source
+            p = get_provider_for_credentials(self.settings["api_key"], self.settings["api_secret"],
+                                             bool(self.settings["paper_account"]),
+                                             history_source=account_history_source(self.settings))
+            self._atm_iv_history_provider = p
+        return p
+
+    def _snapshot_iv_by_session(self, underlying: str, start, end) -> Dict[Any, float]:
+        """The 16:30 snapshot rows as {New York session date: atm_iv} (latest row of a day)."""
+        from ba2_common.core.models import OptionIVSnapshot
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        lo = datetime(start.year, start.month, start.day, tzinfo=timezone.utc) - timedelta(days=1)
+        with get_db() as session:
+            rows = session.exec(
+                select(OptionIVSnapshot).where(
+                    OptionIVSnapshot.account_id == self.id,
+                    OptionIVSnapshot.underlying == underlying,
+                    OptionIVSnapshot.recorded_at >= lo)
+                .order_by(OptionIVSnapshot.recorded_at)).all()
+            pairs = [(r.recorded_at, r.atm_iv) for r in rows]
+        out: Dict[Any, float] = {}
+        for ts, iv in pairs:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            d = ts.astimezone(ny).date()
+            if start <= d <= end:
+                out[d] = iv
+        return out
+
+    def _iv_rank_state(self, underlying: str, lookback_days: Optional[int]) -> Dict[str, Any]:
+        """Series + current for the rank, from the STORE ONLY: this never calls the API. The
+        cache is filled earlier, inside the symbol's analysis task (``atm_iv_task_hook``).
+
+        Keys: ok (series complete), series (values strictly before the last completed session
+        L), current (derived IV of L), n/m (coverage of the series), status, provenance, reason."""
+        import math as _math
+        from ..dataproviders.options.atm_iv_history import STATUS_COMPLETE, merge_snapshots
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
+        state: Dict[str, Any] = {"ok": False, "series": [], "current": None, "n": 0, "m": 0,
+                                 "status": "unavailable", "provenance": {}, "reason": None,
+                                 "L": None, "resolved": 0, "need": 0}
+        try:
+            prov = self._atm_iv_history()
+            L = prov.last_completed_session()
+            res = prov.peek(underlying, L, lookback_days)
+            df = prov.read_store(underlying)
+            # a 'no_spot' row means "could not derive" -- a snapshot MAY fill that date; a bar
+            # tombstone (thin day) is a derived outcome and may not be back-filled
+            stored = ({ts.date() for ts, why in zip(df["session_date"], df["reason"]) if why != "no_spot"}
+                      if len(df) else set())
+            snaps = (self._snapshot_iv_by_session(underlying, res.window_start, L)
+                     if res.window_start is not None else {})
+            merged, provenance = merge_snapshots(res, snaps, stored)
+            series = {d: v for d, v in merged.items() if d < L}
+            tomb = [d for d in res.tombstone_days if d < L and d not in series]
+            m = max(res.expected - 1, 0)
+            resolved = len(series) + len(tomb)
+            state.update(status=res.status, reason=res.reason, series=list(series.values()),
+                         current=res.values.get(L), n=len(series), m=m, resolved=resolved,
+                         need=_math.ceil(self.IV_RANK_MIN_COVERAGE * m),
+                         provenance=provenance, L=L, ok=res.status == STATUS_COMPLETE)
+        except Exception as e:  # noqa: BLE001 -- fail closed, loudly (a gate reading None stays shut)
+            state["reason"] = f"{type(e).__name__}: {e}"
+            logger.warning(f"ATM-IV history unavailable for {underlying}: {state['reason']}")
+        return state
+
+    def _iv_series(self, underlying: str, lookback_days: Optional[int] = None):
+        """Trailing ATM-IV samples strictly before the last completed session: derived rows
+        first, 16:30 snapshots only for dates with no derived row. Empty unless the derived
+        series is complete (a filling series must not look like a short real one)."""
+        st = self._iv_rank_state(underlying, lookback_days)
+        return list(st["series"]) if st["ok"] else []
+
+    def iv_sample_count(self, underlying: str, lookback_days: Optional[int] = None) -> int:
+        """Readiness count from the STORE ONLY (the startup report must not start fills or
+        spend API calls). 0 unless ``get_iv_rank`` could actually serve a rank now (series
+        complete, resolved coverage met, a derived value for the last session), so the report
+        never says ARMED for a gate that cannot fire."""
+        st = self._iv_rank_state(underlying, lookback_days)
+        if not st["ok"] or st["resolved"] < st["need"] or st["current"] is None:
+            return 0
+        return int(st["n"])
+
+    #: symbol -> reason the latest ``get_iv_rank`` returned None (display only; one source with
+    #: the 'IV rank for X unavailable: ...' warning). Class-level dict shared by design: the
+    #: condition reads it right after the call on the same account object.
+    _iv_rank_reasons: Dict[str, str] = {}
+
+    def iv_rank_unavailable_reason(self, underlying: str) -> Optional[str]:
+        return self._iv_rank_reasons.get(underlying)
+
+    def get_iv_rank(self, underlying: str, lookback_days: Optional[int] = None,
+                    min_samples: int = 20, current: Optional[float] = None) -> Optional[float]:
+        """IV percentile of the LAST COMPLETED SESSION's derived ATM IV against the trailing
+        derived series (backtest parity: the BT ranks the as-of bar's IV against the sessions
+        before it). ``current`` may be supplied by a caller that holds one; it is NOT fetched
+        from the live snapshot any more.
+
+        None (gate false, exactly as 'IV rank unavailable') while the series is filling or
+        unavailable, when RESOLVED coverage (values + tombstones) is below 80% of the window's
+        sessions, when the last session has no derived value, or when fewer than ``min_samples``
+        usable values exist (the backtest's rule). Never a partial number. One warning per
+        symbol per day."""
+        import math as _m
+        from datetime import date as _date
+        from ..dataproviders.options.atm_iv_history import _warn_once_per_day
+        st = self._iv_rank_state(underlying, lookback_days)
+        today = _date.today()
+
+        self._iv_rank_reasons.pop(underlying, None)
+
+        def _none(why: str):
+            self._iv_rank_reasons[underlying] = why
+            _warn_once_per_day(f"ivrank:{self.id}:{underlying}",
+                               f"IV rank for {underlying} unavailable: {why}", today)
+            return None
+
+        if not st["ok"]:
+            if st["status"] == "filling":
+                return _none(f"ATM-IV history filling {st['n']}/{st['m']} (filled by the symbol's analysis task)")
+            return _none(f"ATM-IV history {st['status']} ({st['reason']})")
+        # RESOLVED coverage (value or tombstone) gates 'complete'; the sample floor is then the
+        # backtest's own: ``_iv_rank_from_series(min_samples)`` over the usable values.
+        if st["resolved"] < st["need"]:
+            return _none(f"resolved coverage {st['resolved']}/{st['m']} below the required {st['need']}")
+        cur = current if current is not None else st["current"]
+        if cur is None:
+            return _none(f"no derived ATM IV for the last completed session {st['L']}")
+        rank = self._iv_rank_from_series(st["series"], cur, min_samples)
+        if rank is None:
+            return _none(f"fewer than {min_samples} usable samples ({st['n']}/{st['m']}) or an "
+                         f"implausible current value")
+        return rank
+
+    # ======================================================================
     # OptionsAccountInterface — TEMPORARY stubs (replaced in later tasks)
     # ======================================================================
     @staticmethod
@@ -6640,7 +7048,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 req_kwargs["position_intent"] = intent
             if is_market:
                 return MarketOrderRequest(**req_kwargs)
-            return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+            return LimitOrderRequest(
+                limit_price=self._round_option_limit(trading_order.limit_price,
+                                                     up=leg.side == OrderDirection.BUY),
+                **req_kwargs)
 
         # Multi-leg (2-4 legs) -> MLEG
         leg_requests = [
@@ -6661,7 +7072,33 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         )
         if is_market:
             return MarketOrderRequest(**req_kwargs)
-        return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+        # +debit / -credit: conceding (paying more debit or taking less credit) is always UP.
+        return LimitOrderRequest(
+            limit_price=self._round_option_limit(trading_order.limit_price, up=True), **req_kwargs)
+
+    @staticmethod
+    def _round_option_limit(price, up: bool) -> float:
+        """An option limit on the cent grid Alpaca accepts (42210000 rejects 3+ decimals).
+
+        The indicative feed sometimes quotes 3 decimals (16.149), and the builders quote at
+        that touch. Rounding is towards the fill (``up`` for a buy or an MLEG net, down for a
+        single-leg sell) so the order keeps the touch it was quoted at, at most a cent away.
+        Unlike the equity ``_round_price`` there is no sub-penny tier below $1.
+
+        The price is first cut to 8 decimals: limits built by float arithmetic carry binary
+        residue (0.1 + 0.2 = 0.30000000000000004) that a ceiling would otherwise push a whole
+        cent away (0.31). A non-zero limit that would round to 0.00 (a sub-cent premium or
+        credit) is refused: a zero limit is a different order, not a rounding of this one.
+        """
+        if price is None:
+            raise ValueError("Option limit order has no limit price")
+        rounding = ROUND_CEILING if up else ROUND_FLOOR
+        rounded = float(Decimal(repr(round(price, 8))).quantize(Decimal("0.01"), rounding=rounding))
+        if rounded == 0.0 and price != 0.0:
+            raise ValueError(f"Option limit {price} is below one cent; refusing a 0.00 limit")
+        if rounded != price:
+            logger.info(f"Option limit {price} rounded {'up' if up else 'down'} to {rounded}")
+        return rounded
 
     @alpaca_api_retry
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
@@ -6676,6 +7113,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Genuine errors are allowed to propagate.
         """
         req = self._build_option_order_request(trading_order, legs)
+        if getattr(req, "limit_price", None) is not None:
+            trading_order.limit_price = float(req.limit_price)   # record the cent-rounded limit sent
         alpaca_order = self.client.submit_order(req)
         logger.info(
             f"Successfully submitted option order to Alpaca: "

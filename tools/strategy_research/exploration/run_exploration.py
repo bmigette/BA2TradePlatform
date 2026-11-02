@@ -21,11 +21,12 @@ from tools.strategy_research.exploration.market_conditions import refuse_inert_m
 from tools.strategy_research.exploration.profiles import (
     ALL_FAMILIES, EXTENSION_FAMILIES, FAMILIES, budget_text, build_manifest, fingerprint)
 from tools.strategy_research.exploration.runtime import (
-    check_database, database_url, execute_ready, job_lock, preflight,
+    add_source_paths, check_database, database_url, execute_ready, job_lock, preflight,
     resolve_universe, write_json)
 
 
 def parser():
+    add_source_paths()
     ap = argparse.ArgumentParser(description=__doc__)
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Offline manifest only (the default).")
@@ -43,16 +44,24 @@ def parser():
     ap.add_argument("--end", default="2025-12-31")
     ap.add_argument("--search", choices=("grid", "genetic"), default="grid")
     # None = not passed. Genetic mode then sizes each job from its searched genes (population
-    # clamp(4 x genes, 24, 120); 25 generations, 30 above 20 genes; early stop 8); grid mode
-    # writes 24 x 4 as before.
+    # clamp(4 x genes, 24, 120); 25 generations, 30 above 20 genes; early stop 5 at a 1% minimum
+    # gain); grid mode writes 24 x 4 as before.
     ap.add_argument("--population", type=int, default=None,
                     help="GA population. Default: genetic 4 x the job's genes within 24..120; grid 24.")
     ap.add_argument("--generations", type=int, default=None,
                     help="GA generations. Default: genetic 25, or 30 above 20 genes; grid 4.")
     ap.add_argument("--early-stop", type=int, default=None,
-                    help="Genetic only: stop after N generations without improvement. Default 8.")
-    ap.add_argument("--parallel", type=int, default=1, help="Local GA individuals; grid and saved reruns are serial.")
-    ap.add_argument("--workers", default="", help="Comma-separated configured worker names (genetic search only).")
+                    help="Genetic only: stop after N generations without improvement. Default 5.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Genetic only: the minimum RELATIVE gain (a fraction, 0.01 = 1%%) that counts as an "
+                         "improvement for --early-stop; a smaller gain still updates the best. Default 0.01; "
+                         "0 = any strict gain (the legacy rule, key omitted). Must be in [0, 1).")
+    ap.add_argument("--parallel", type=int, default=1,
+                    help="Local trial slots, in grid and genetic mode (1 = the serial in-process loop "
+                         "when no --workers are named). Saved top-result reruns stay local and serial.")
+    ap.add_argument("--workers", default="",
+                    help="Comma-separated configured worker names, in grid and genetic mode; with "
+                         "--parallel 0 every trial runs remotely.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-top", type=int, default=5)
     ap.add_argument("--market-condition-profile", default="none",
@@ -67,17 +76,43 @@ def parser():
     ap.add_argument("--allow-sl-loosen", action="store_true",
                     help="Set allow_ruleset_sl_loosen on every job's experts: ruleset stops may loosen "
                          "down to the trade's max-loss stop (default: tighten only).")
+    ap.add_argument("--decision-times", default=None, metavar="default|fixed|HH:MM,HH:MM,...",
+                    help="The DECISION TIME gene (schedule:time) for --search genetic jobs that "
+                         "search at all. DEFAULT (absent) = ON with the shared "
+                         "DEFAULT_DECISION_TIME_CHOICES; 'fixed' = off; or a comma list. "
+                         "Grid-mode manifests and fixed controls never carry it.")
     ap.add_argument("--spread-bps", type=float, help="Override every family's spread; 0 is preserved.")
     ap.add_argument("--store", help="Override the snapshot's metric-store directory.")
     ap.add_argument("--etf-symbols", nargs="+", help="Fixed ETF research universe; default SPY IEF TLT GLD.")
     data_home = Path(os.environ["BA2_HOME"]).expanduser() if "BA2_HOME" in os.environ else Path.home() / "Documents/ba2"
     ap.add_argument("--db-file", type=Path, default=data_home / "test/dl_forecasting.db")
-    ap.add_argument("--cache-dir", type=Path, default=data_home / "common/cache/FMPOHLCVProvider")
+    from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES
+    ap.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=DEFAULT_BT_HISTORY_SOURCE,
+                    help=f"OHLCV history of every job (default {DEFAULT_BT_HISTORY_SOURCE}): stamped as "
+                         "ohlcv_history_source on each job's optimization_config, part of its fingerprint and "
+                         "name, and it selects the cache folder and the default metric store. alpaca needs a "
+                         "PASS gate certificate on the cache and an explicit --store; fmp keeps the FMP-era snapshot store.")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="The source's provider folder. Default <BA2_HOME>/common/cache/<FMPOHLCVProvider | "
+                         "AlpacaHistoryOHLCVProvider>; a folder of the other source is refused.")
     ap.add_argument("--output-dir", type=Path, help="Default: reports/strategy_research/<campaign hash>/.")
     ap.add_argument("--resume", action="store_true", help="Resume an interrupted job after its previous runner has stopped.")
     ap.add_argument("--job-file", type=Path, help=argparse.SUPPRESS)
     return ap
 
+
+def resolve_cache_dir(args):
+    """``--cache-dir`` (default derived from the source), refused unless it is the source's folder."""
+    add_source_paths()
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    wanted = history_cache_dirname(args.ohlcv_history_source)
+    if args.cache_dir is None:
+        home = Path(os.environ["BA2_HOME"]).expanduser() if "BA2_HOME" in os.environ else Path.home() / "Documents/ba2"
+        return home / "common/cache" / wanted
+    if args.cache_dir.name.casefold() != wanted.casefold():
+        raise ValueError(f"--cache-dir {args.cache_dir} is not the {wanted} folder that --ohlcv-history-source "
+                         f"{args.ohlcv_history_source} reads")
+    return args.cache_dir
 
 def verify_job(job):
     unsigned = {k: v for k, v in job.items() if k != "fingerprint"}
@@ -87,6 +122,7 @@ def verify_job(job):
 
 def run_child(args):
     # Bind the engine to the same central cache checked below, before backend imports.
+    args.cache_dir = resolve_cache_dir(args)
     os.environ["CACHE_FOLDER"] = str(args.cache_dir.resolve().parent)
     path = args.job_file.resolve()
     job = json.loads(path.read_text(encoding="utf-8"))
@@ -114,7 +150,8 @@ def run_jobs(jobs, output, args):
         write_json(job_path, job)
         log_path = output / (job["name"] + ".log")
         command = [sys.executable, str(Path(__file__).resolve()), "--job-file", str(job_path),
-                   "--db-file", str(database), "--cache-dir", str(args.cache_dir.resolve())]
+                   "--db-file", str(database), "--cache-dir", str(args.cache_dir.resolve()),
+                   "--ohlcv-history-source", args.ohlcv_history_source]
         if args.resume:
             command.append("--resume")
         budget = f"\n  {budget_text(job)}" if budget_text(job) else ""
@@ -130,20 +167,29 @@ def run_jobs(jobs, output, args):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        args.cache_dir = resolve_cache_dir(args)
         if args.job_file is not None:
             return run_child(args)
+        from ba2_common.core.schedule_genes import parse_decision_times_arg
+        decision_times = parse_decision_times_arg(args.decision_times, "5min", when_unset="default")
         manifest = build_manifest(
             families=args.families, equity=args.equity,
             equity_cap=None if args.equity_cap == 0 else args.equity_cap,
             start=args.start, end=args.end, search=args.search, population=args.population,
-            generations=args.generations, early_stop=args.early_stop, parallel=args.parallel, seed=args.seed,
+            generations=args.generations, early_stop=args.early_stop,
+            early_stop_min_rel=args.early_stop_min_rel, parallel=args.parallel, seed=args.seed,
             workers=[s.strip() for s in args.workers.split(",") if s.strip()],
             save_top=args.save_top, store=args.store, spread_bps=args.spread_bps, etf_symbols=args.etf_symbols,
             market_condition_profile=args.market_condition_profile,
             market_condition_manifest=args.market_condition_manifest,
             market_condition_mode=args.market_condition_mode,
             market_exit=tuple(s.strip() for s in args.market_exit.split(",") if s.strip()),
-            allow_sl_loosen=args.allow_sl_loosen)
+            allow_sl_loosen=args.allow_sl_loosen,
+            decision_times=decision_times, history_source=args.ohlcv_history_source)
+        print(f"OHLCV history source: {args.ohlcv_history_source} (cache {args.cache_dir})")
+        print("decision times (GA gene schedule:time, genetic jobs that search): "
+              + (",".join(decision_times) if decision_times
+                 else "fixed (per-family schedule time; --decision-times fixed)"))
         if args.variants is not None:
             available = {j["variant"] for j in manifest["jobs"]}
             unknown = set(args.variants) - available

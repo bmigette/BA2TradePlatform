@@ -4,7 +4,8 @@ Deterministic regime composite (memo §3): index trend dominates, plus VIX,
 credit spreads, yield curve, ISM, Sahm, breadth. Output R in [-1, 1] is used
 as an EXPOSURE MULTIPLIER by combine.py (never a point forecast).
 
-All series inputs must be pre-filtered to observation date <= as_of.
+All series inputs must be pre-filtered to what the decision could see: rows FRED first
+published strictly before the decision label (``fred_series.get_series_as_of``).
 """
 from __future__ import annotations
 

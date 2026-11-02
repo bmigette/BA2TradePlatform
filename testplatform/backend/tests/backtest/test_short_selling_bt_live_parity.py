@@ -136,6 +136,31 @@ class _LiveExpert(_SignalStubExpert):
         super().__init__(id, price_source=None, signals={})
 
 
+def _install_live_utils_stub(monkeypatch, expert, account):
+    """Stand in for ``ba2_trade_platform.core.utils`` without importing it.
+
+    The shim is ``from ba2_common.core.utils import *`` plus three live-only factories
+    (``get_expert_instance_from_id``, ``get_account_instance_from_id``,
+    ``get_account_instance_from_transaction``). The stand-in carries the same shared helpers
+    and answers the factories with this test's instances -- exactly what patching them on the
+    real module did, minus the live-registry import the CI job cannot satisfy.
+    """
+    import sys
+    import types
+
+    import ba2_common.core.utils as shared_utils
+    import ba2_trade_platform.core as live_core
+
+    stub = types.ModuleType("ba2_trade_platform.core.utils")
+    stub.__dict__.update({k: v for k, v in vars(shared_utils).items()
+                          if not (k.startswith("__") and k.endswith("__"))})
+    stub.get_expert_instance_from_id = lambda _id, *a, **k: expert
+    stub.get_account_instance_from_id = lambda _id, *a, **k: account
+    stub.get_account_instance_from_transaction = lambda _txn, *a, **k: account
+    monkeypatch.setitem(sys.modules, "ba2_trade_platform.core.utils", stub)
+    monkeypatch.setattr(live_core, "utils", stub, raising=False)
+
+
 @contextmanager
 def _live_world(monkeypatch, run_id, *, enter_id=None, open_id=None, positions=(),
                 settings=None):
@@ -161,9 +186,14 @@ def _live_world(monkeypatch, run_id, *, enter_id=None, open_id=None, positions=(
         expert.save_settings({**SETTINGS, **(settings or {})})
         resolver.register_account(run_id, account)
         resolver.register_expert(run_id, expert)
-        with patch("ba2_trade_platform.core.utils.get_expert_instance_from_id",
-                   return_value=expert), \
-             patch("ba2_trade_platform.modules.accounts.get_account_class",
+        # TradeManager's passes do ``from .utils import get_expert_instance_from_id`` at call
+        # time. The real ba2_trade_platform.core.utils shim imports the live expert registry
+        # (TradingAgents / LLM stack), which the CI backtest job does not install -- patching
+        # an attribute of it would import it. So the passes get a stand-in module instead:
+        # every shared helper the shim re-exports (ba2_common.core.utils, verbatim) plus the
+        # three live instance factories answering with this world's expert and account.
+        _install_live_utils_stub(monkeypatch, expert, account)
+        with patch("ba2_trade_platform.modules.accounts.get_account_class",
                    return_value=(lambda _id: account)), \
              patch.object(TradeManager, "_has_pending_analysis_jobs", return_value=False):
             yield SimpleNamespace(tm=TradeManager(), account=account, expert=expert, id=run_id)

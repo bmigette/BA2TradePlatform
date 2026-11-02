@@ -7,13 +7,33 @@ Calculates indicators from historical price data.
 
 from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime, timedelta
+import re
 import pandas as pd
 from stockstats import wrap
 
 from ba2_common.core.interfaces import MarketIndicatorsInterface
 from ba2_common.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
 from ba2_common.core.provider_utils import validate_date_range, log_provider_call
+from ba2_common.core.ohlcv_history import InsufficientHistory
 from ba2_common.logger import logger
+
+
+_WINDOW_FROM_NAME = re.compile(r"^close_(\d+)_(?:sma|ema)$")
+#: bars each fixed-window indicator needs before its first meaningful value (stockstats defaults)
+_FIXED_WINDOWS = {"rsi": 14, "atr": 14, "mfi": 14, "boll": 20, "boll_ub": 20, "boll_lb": 20, "vwma": 20,
+                  "macd": 26, "macds": 35, "macdh": 35}
+
+
+def required_bars(indicator: str, period: Optional[int] = None) -> int:
+    """Bars needed for ``indicator`` (0 = unknown name: no guard). A caller-declared ``period`` (atr / rsi / mfi: the window it
+    sizes by) raises the need above the stockstats default: ATR(20) needs 20 bars, not 14."""
+    m = _WINDOW_FROM_NAME.match(indicator)
+    if m:
+        return int(m.group(1))
+    need = _FIXED_WINDOWS.get(indicator, 0)
+    if period is not None and indicator in ("atr", "rsi", "mfi"):
+        need = max(need, int(period))
+    return need
 
 
 class PandasIndicatorCalc(MarketIndicatorsInterface):
@@ -77,7 +97,8 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         indicator: str,
         start_date: datetime,
         end_date: datetime,
-        interval: str = "1d"
+        interval: str = "1d",
+        period: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Calculate technical indicator for a date range using stockstats.
@@ -114,6 +135,12 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             interval=interval
         )
         
+        # A series shorter than the indicator's window is NOT computed: stockstats would return a value from the
+        # bars that exist (a 200-period average of 120 bars) and a caller would trade on it. Shared by backtest and live.
+        need = required_bars(indicator, period)
+        if len(data) < need:
+            raise InsufficientHistory(symbol, indicator, len(data), need)
+
         # Check if original data has timezone info
         has_tz = False
         if 'Date' in data.columns:
@@ -239,7 +266,8 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
                 indicator=indicator,
                 start_date=actual_start_date,
                 end_date=end_date,
-                interval=interval
+                interval=interval,
+                period=period
             )
             
             # Convert DataFrame to data points list and extract arrays for structured format

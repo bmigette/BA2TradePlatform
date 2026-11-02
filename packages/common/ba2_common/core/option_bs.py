@@ -49,7 +49,7 @@ from ba2_common.core.types import OptionRight
 
 
 def bs_price(spot: float, strike: float, dte_days: float, iv: float,
-             right: "OptionRight", r: float = 0.0) -> Optional[float]:
+             right: "OptionRight", *, r: float) -> Optional[float]:
     """Black-Scholes MARK-FALLBACK price for one contract, per share — or ``None``.
 
     Requires ``spot``/``strike``/``dte_days``/``iv`` to each be present, finite, and
@@ -59,10 +59,11 @@ def bs_price(spot: float, strike: float, dte_days: float, iv: float,
     a FALLBACK stage, so a bad input here must fall through to the mark chain's next
     stage (intrinsic/entry), never abort the mark or crash the run.
 
-    ``r`` defaults to 0.0. The mark fallback's job is to recover a defensible TIME VALUE
-    from the contract's own last-known IV, not to model a rates curve; a non-finite or
-    absent ``r`` is treated as 0.0 rather than invalidating the whole price (unlike
-    spot/strike/dte/iv, ``r`` is not one of the "requires" inputs the caller must supply).
+    ``r`` is a REQUIRED keyword with no default: the run's risk-free rate for the pricing
+    day (``BacktestAccount._bs_mark_rate``, the same rate the contract's iv was inverted
+    with). It used to default to 0.0 and a non-finite value was silently priced at 0.0; a
+    rate is a pricing input, so a missing or non-finite one is now a caller bug and RAISES
+    ``ValueError`` rather than being substituted.
 
     Delegates the actual pricing to the ONE shared BSM implementation
     (``ba2_common.core.finance_calc.derivatives.black_scholes``) so there is exactly one
@@ -85,10 +86,10 @@ def bs_price(spot: float, strike: float, dte_days: float, iv: float,
     spot, strike, dte_days, iv = checked
     try:
         rate = float(r)
-        if not math.isfinite(rate):
-            rate = 0.0
     except (TypeError, ValueError):
-        rate = 0.0
+        raise ValueError(f"bs_price: risk-free rate r={r!r} is not a number") from None
+    if not math.isfinite(rate):
+        raise ValueError(f"bs_price: risk-free rate r={r!r} is not finite")
     years = dte_days / 365.0
     option_type = "call" if right == OptionRight.CALL else "put"
     try:

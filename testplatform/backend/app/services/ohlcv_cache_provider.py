@@ -92,7 +92,8 @@ class OHLCVCacheMixin:
         """Read a cache file by suffix (Parquet preferred; legacy CSV still supported)."""
         return pd.read_csv(path) if path.suffix == ".csv" else pd.read_parquet(path)
 
-    def _write_cache_df(self, df: pd.DataFrame, symbol: str, interval: str) -> Path:
+    def _write_cache_df(self, df: pd.DataFrame, symbol: str, interval: str,
+                        incoming: Optional[pd.DataFrame] = None) -> Path:
         """Write ``df`` to the canonical native Parquet cache and remove any legacy CSV sibling.
 
         UNIFIED CACHE: delegates to ``native_cache.write_timeseries`` — the SAME atomic
@@ -104,6 +105,13 @@ class OHLCVCacheMixin:
         out = df.copy()
         out["Date"] = pd.to_datetime(out["Date"])
         out["effective_date"] = out["Date"]
+        if not OHLCVCacheMixin._is_daily_interval(interval) and incoming is not None and len(incoming):
+            # CROSS-INTERVAL BASIS: only the rows FETCHED now (head/tail/gap pieces, a cold fill) are judged,
+            # never the file already on disk: a legacy-defective file must stay extendable by a correct tail.
+            # Raises IntradayBasisMismatch; a stale-marked file refuses in write_timeseries.
+            guard = getattr(self, "_guard_intraday_write", None)
+            if guard is not None:
+                guard(incoming, symbol, interval, type(self).__name__)
         native_cache.write_timeseries(type(self).__name__, symbol, interval, out)
         path = self._get_cache_file(symbol, interval)
         legacy = path.with_suffix(".csv")
@@ -178,12 +186,35 @@ class OHLCVCacheMixin:
             new_data = self._get_ohlcv_data_impl(symbol, start_date, end_date, interval)
             if not new_data.empty:
                 new_data['Date'] = pd.to_datetime(new_data['Date']).dt.tz_localize(None)
-                cache_file = self._write_cache_df(new_data, symbol, interval)
+                cache_file = self._write_cache_df(new_data, symbol, interval, incoming=new_data)
                 logger.info(f"Saved {len(new_data)} rows to {cache_file}")
             _report(100.0, f"{symbol}/{interval}: Done - {len(new_data)} rows")
             return new_data
 
         existing = existing.sort_values('Date').reset_index(drop=True)
+
+        # ------------------------------------------------------------------ #
+        # Phase 0 - Verified TAIL top-up (daily-or-longer, real providers)     #
+        # ------------------------------------------------------------------ #
+        # The SAME guarded path as the live refresh (MarketDataProviderInterface.
+        # _verified_tail_topup): the vendor's newest bars are appended only when it still agrees
+        # with the cached tail; a split since the file was fetched REPLACES the history with a
+        # full re-fetch, and anything unexplained refuses (OHLCVTopUpRefused, nothing written).
+        # Done FIRST so a replacement puts every later piece on one basis. APH 2026-09-28.
+        daily = OHLCVCacheMixin._is_daily_interval(interval)
+        tail_verified = False
+        guarded_tail = getattr(self, "_verified_tail_topup", None)
+        if daily and guarded_tail is not None and end_ts > existing['Date'].max():
+            _report(3.0, f"{symbol}/{interval}: Verified tail top-up "
+                         f"{existing['Date'].max().date()} -> {end_date.date()}")
+            frame, action = guarded_tail(existing, symbol, interval, type(self).__name__, end_date,
+                                         raise_fetch_errors=True)
+            if action == "replaced":
+                _report(4.0, f"{symbol}/{interval}: history REPLACED by a full re-fetch (split)")
+            existing = frame.copy()
+            existing['Date'] = pd.to_datetime(existing['Date']).dt.tz_localize(None)
+            existing = existing.sort_values('Date').reset_index(drop=True)
+            tail_verified = True
 
         # ------------------------------------------------------------------ #
         # Phase 1 - Identify internal gaps within the requested range          #
@@ -204,6 +235,7 @@ class OHLCVCacheMixin:
         # Phase 1 - Fetch all gaps concurrently (max 5 workers)               #
         # ------------------------------------------------------------------ #
         gap_pieces: List[pd.DataFrame] = []
+        fetched_now: List[pd.DataFrame] = []     # every piece fetched in THIS call (what the basis guard judges)
         if gaps_to_fill:
             completed_gaps = [0]
             total_gaps = len(gaps_to_fill)
@@ -228,7 +260,12 @@ class OHLCVCacheMixin:
                 for future in as_completed(future_to_gap):
                     data = future.result()
                     if not data.empty:
+                        # Checked HERE, not inside fetch_gap: a basis refusal must reach the
+                        # caller, not be logged as one more failed gap.
+                        if daily:
+                            OHLCVCacheMixin._check_piece_basis(existing, data, symbol, interval, "gap fill")
                         gap_pieces.append(data)
+                        fetched_now.append(data)
                     with gap_lock:
                         completed_gaps[0] += 1
                         pct = 5.0 + (completed_gaps[0] / total_gaps) * 75.0
@@ -258,10 +295,13 @@ class OHLCVCacheMixin:
             )
             if not left.empty:
                 left['Date'] = pd.to_datetime(left['Date']).dt.tz_localize(None)
+                if daily:
+                    OHLCVCacheMixin._check_piece_basis(merged, left, symbol, interval, "head extension")
                 extension_pieces.append(left)
+                fetched_now.append(left)
             _report(90.0, f"{symbol}/{interval}: Left extension done")
 
-        if end_ts > cache_max:
+        if end_ts > cache_max and not tail_verified:
             _report(92.0, f"{symbol}/{interval}: Extending right: "
                           f"{cache_max.date()} -> {end_date.date()}")
             right = self._get_ohlcv_data_impl(
@@ -269,7 +309,10 @@ class OHLCVCacheMixin:
             )
             if not right.empty:
                 right['Date'] = pd.to_datetime(right['Date']).dt.tz_localize(None)
+                if daily:
+                    OHLCVCacheMixin._check_piece_basis(merged, right, symbol, interval, "tail extension")
                 extension_pieces.append(right)
+                fetched_now.append(right)
             _report(98.0, f"{symbol}/{interval}: Right extension done")
 
         final = (
@@ -280,7 +323,9 @@ class OHLCVCacheMixin:
         )
 
         if not final.empty:
-            cache_file = self._write_cache_df(final, symbol, interval)
+            cache_file = self._write_cache_df(
+                final, symbol, interval,
+                incoming=pd.concat(fetched_now, ignore_index=True) if fetched_now else None)
             logger.info(f"Saved {len(final)} rows to {cache_file}")
 
         _report(100.0, f"{symbol}/{interval}: Done - {len(final)} rows total")
@@ -288,6 +333,36 @@ class OHLCVCacheMixin:
         # callers expect the public Date+OHLCV shape, so drop it (mirrors get_ohlcv_data). It was
         # already (re)stamped on write by _write_cache_df.
         return final.drop(columns=["effective_date"], errors="ignore")
+
+
+    @staticmethod
+    def _is_daily_interval(interval: str) -> bool:
+        """Daily-or-longer: the intervals whose cached history spans splits (the verified top-up
+        and the piece check apply to these; intraday caches are unchanged)."""
+        from ba2_common.core.interfaces.MarketDataProviderInterface import _INTRADAY_INTERVALS
+        return interval not in _INTRADAY_INTERVALS
+
+    @staticmethod
+    def _check_piece_basis(cached: pd.DataFrame, piece: pd.DataFrame, symbol: str, interval: str,
+                           what: str) -> None:
+        """A fetched piece merged INTO the cached history (gap fill, head/tail extension) must
+        agree with it on the sessions both hold -- the vendor's basis today may not be the one the
+        file was fetched on (a split since). Refuses (``OHLCVTopUpRefused``, nothing written) on
+        any disagreement, or when the two share no session to compare."""
+        from ba2_common.core.ohlcv_topup_guard import OHLCVTopUpRefused, shared_mismatches
+        if cached is None or cached.empty:
+            return
+        n, bad = shared_mismatches(cached, piece)
+        if n and not bad:
+            return
+        why = ("it disagrees with the cached bars where they meet: " + "; ".join(bad) if bad else
+               "it shares no session with the cached history, so nothing proves it is on the "
+               "same split basis")
+        msg = (f"{symbol} ({interval}): {what} REFUSED, cache left untouched -- {why}. A split "
+               f"since the file was fetched does this; re-fetch the full history "
+               f"(force_full_refetch / tools/warm_market_conditions.py plan --fetch-missing).")
+        logger.error(msg)
+        raise OHLCVTopUpRefused(msg)
 
 
 class OHLCVCacheProviderBase(OHLCVCacheMixin, ABC):

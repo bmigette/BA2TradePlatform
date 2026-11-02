@@ -195,7 +195,7 @@ def build_trial_config(opt_id: int, rank: int, label: str, bt_id: int = None) ->
         # determinism probe rather than the persist path.
         hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
         trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
-                                              option_trade_records=False)  # read-only report
+                                              option_trade_records=False, stored_row=True)  # read-only report
     finally:
         db.close()
     trial_cfg["name"] = f"RERUN-{label}"
@@ -350,9 +350,13 @@ def main() -> int:
     worker = get_worker(args.worker)
     if not args.skip_sync:
         from testplatform.version import TEST_APP_VERSION
-        from app.services import worker_client
+        from app.services import worker_client, self_update
         print(f"syncing {worker['name']} to TEST_APP_VERSION {TEST_APP_VERSION} ...", flush=True)
-        if not worker_client.ensure_synced(worker, TEST_APP_VERSION, log=lambda m: print("   ", m)):
+        _policy = self_update.master_sync_policy()  # refuses loudly if minimums are unreadable
+        if not worker_client.ensure_synced(
+                worker, TEST_APP_VERSION, log=lambda m: print("   ", m),
+                required_packages=_policy["required_package_versions"],
+                master_packages=_policy["package_versions"], drift_seen=set()):
             raise SystemExit(f"worker {worker['name']} could not be synced; refusing to run "
                              f"(its results would come from the OLD ceiling)")
         print("   worker is on the master's version", flush=True)

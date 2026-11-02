@@ -78,7 +78,13 @@ def test_tastytrade_cannot_be_downgraded_or_cross_a_major():
 
 def test_alpaca_py_cannot_be_downgraded_or_cross_a_breaking_minor():
     # alpaca-py is 0.x, where the MINOR is the breaking number.
-    _assert_bounded("alpaca-py", "0.44.0")
+    _assert_bounded("alpaca-py", "0.45.0")
+
+
+def test_ib_async_cannot_be_downgraded_or_cross_a_major():
+    """IBKRAccount (and tests/ibkr_fakes.py) are written against ib_async 2.x's Order/Trade/Ticker
+    shapes. The ceiling is the major: 3.x may move them under a live-money adapter."""
+    _assert_bounded("ib_async", "3.0.0")
 
 
 def _requirement_names():

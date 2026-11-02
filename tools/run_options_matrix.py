@@ -83,7 +83,9 @@ from typing import Optional
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, is_analysis_failure_reason, note_job_exit,
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
@@ -112,6 +114,8 @@ _DISCOVERY_STRATEGIES = [
 _DISCOVERY_EXCLUDED = {"O_SSTG", "O_SSTD"}
 _DISCOVERY_EXPERTS = ["FMPRating", "DeterministicScorer"]
 _NEUTRAL_STRUCTURES = {"O_IC", "O_STRD", "O_STRG"}
+# Option keys whose builders emit NO SPY regime leaves (launcher: outside _PURE_OPTION_STRATEGIES).
+_NO_SPY_GATE = {"O_CC", "O_PP", "O_STK"}
 
 
 def _universe(path=_UNIVERSE_FILE) -> str:
@@ -320,6 +324,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Options store serving the run, forwarded to the launcher per job "
                          "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
                          "2020 start; tastytrade floors at 2022-10-01, alpaca at 2024-01-18).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default=None,
+                    help="OHLCV history of the underlyings, forwarded to the launcher per job only "
+                         "when given (absent: the launcher's own default, fmp for option jobs, and "
+                         "every existing job name/digest is unchanged). Stage 1 ran without it "
+                         "(fmp); its re-runs on the Alpaca cache pass alpaca.")
     ap.add_argument("--option-spread-model", default=SPREAD_MODEL_VERSION, choices=SPREAD_MODELS,
                     help="Option fill spread model, forwarded to the launcher per job (default "
                          f"{SPREAD_MODEL_VERSION}: the decision bar's real quote, else the "
@@ -335,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "existing job names/commands are unchanged; a digest token when on, so "
                          "a sized run never shares a name (checkpoint) with an unsized one. "
                          "tools/stage1_run.sh passes it.")
+    ap.add_argument("--benchmark-regime-gates", action="store_true", default=False,
+                    help="Forward --benchmark-regime-gates to every job: append the SPY trend / "
+                         "vol regime entry gates (two categorical mode genes per member) to each "
+                         "option structure. Option structures only (O_CC/O_PP/O_STK and equity "
+                         "keys are refused). Off by default so existing job names/commands are "
+                         "unchanged; a digest token when on, so a SPY-gated run never shares a "
+                         "name (checkpoint) with an ungated one.")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
@@ -343,6 +359,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops (spec stage 1: 8). "
                          "Omitted -> launcher default.")
+    ap.add_argument("--early-stop-min-rel", type=float, default=None,
+                    help="Minimum RELATIVE improvement (a fraction in (0, 1): 0.01 = 1%%) that "
+                         "resets the --early-stop patience (launcher --early-stop-min-rel). "
+                         "Omitted -> nothing is forwarded and the legacy rule applies (any strict "
+                         "improvement resets), so every existing job name is unchanged. When "
+                         "given it is a discovery-digest token: a job under a different stopping "
+                         "rule gets its own name, and so never skips on or resumes the other's.")
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--seed", type=int, default=42,
@@ -516,6 +539,14 @@ def resolve_args(ap, argv=None):
         ap.error("--market-condition-manifest was given without --market-condition-profile: "
                  "nothing would read that snapshot and the jobs would run UNGATED under the "
                  "ungated job names. Pass --market-condition-profile, or drop the manifest.")
+    if getattr(args, "benchmark_regime_gates", False):
+        # The launcher refuses it per job for any other key; refusing here keeps it off the
+        # job names and out of --dry-run listings too.
+        bad = [k for k in args.strategies.split(",") if not k.startswith("O") or k in _NO_SPY_GATE]
+        if bad:
+            ap.error(f"--benchmark-regime-gates: {bad} emit no SPY regime gates (option "
+                     f"structures only; O_CC/O_PP/O_STK are not gated). Pass --strategies "
+                     f"explicitly (the discovery default list includes O_CC/O_PP)")
     try:
         start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
     except ValueError:
@@ -537,6 +568,12 @@ def resolve_args(ap, argv=None):
             ap.error(f"--{key.replace('_', '-')} must be finite and non-negative")
     if not math.isfinite(args.elitism_percent) or not 0 <= args.elitism_percent <= 100:
         ap.error("--elitism-percent must be in [0, 100]")
+    if args.early_stop_min_rel == 0:
+        ap.error("--early-stop-min-rel 0 is the legacy rule under new job names; omit the flag "
+                 "for the legacy rule")
+    if args.early_stop_min_rel is not None and (not math.isfinite(args.early_stop_min_rel)
+                                               or not 0 < args.early_stop_min_rel < 1):
+        ap.error("--early-stop-min-rel must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
     if args.mutation_prob is not None and (not math.isfinite(args.mutation_prob)
                                           or not 0 <= args.mutation_prob <= 1):
         ap.error("--mutation-prob must be in [0, 1]")
@@ -574,8 +611,12 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     cmd += _market_condition_passthrough(args)
     if neutral_entry_mode != "legacy":
         cmd += ["--neutral-entry-mode", neutral_entry_mode]
+    # --early-stop-min-rel is forwarded only when given (None -> no token), so every command --
+    # and therefore every discovery digest -- made without it is unchanged.
     for field, flag in (("fitness", "--fitness"), ("early_stop", "--early-stop"),
-                        ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap")):
+                        ("early_stop_min_rel", "--early-stop-min-rel"),
+                        ("mutation_prob", "--mutation-prob"), ("equity_cap", "--equity-cap"),
+                        ("ohlcv_history_source", "--ohlcv-history-source")):
         value = getattr(args, field)
         if value is not None:
             cmd += [flag, str(value)]
@@ -591,6 +632,9 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
     # Robustness is DEFAULT-ON in the launcher, so the ON case passes nothing (every existing
     # job name is unchanged) and only the opt-OUT is forwarded -- and it is a digest token, so a
     # raw-ranked run cannot share a name, and therefore a checkpoint, with a robust one.
+    # SPY regime gates: forwarded only when on, so every existing command and digest is unchanged.
+    if getattr(args, "benchmark_regime_gates", False):
+        cmd += ["--benchmark-regime-gates"]
     if not args.robust_fitness:
         cmd += ["--no-robust-fitness"]
     if args.workers:
@@ -649,7 +693,8 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     while i < len(tokens):
         flag = tokens[i]
         if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
-                    "--no-robust-fitness", "--option-size-within-fill-volume"):
+                    "--no-robust-fitness", "--option-size-within-fill-volume",
+                    "--benchmark-regime-gates"):
             config[flag] = True
             i += 1
         else:
@@ -685,9 +730,14 @@ def planned_jobs(args, launcher, experts, strategies, universe):
             yield arm_name, expert, strategy, mode
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main(argv=None) -> int:
     ap = build_parser()
+    add_refused_decision_times_flag(ap)
     args = resolve_args(ap, argv)
+    refuse_decision_times_and_announce(args)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -704,7 +754,10 @@ def main(argv=None) -> int:
               "Stage-1 rankings provide seeds, not a survival gate.")
         print("Risk-policy exclusions: O_SSTG, O_SSTD (2026-08-31; not performance exclusions).")
         print(f"Search budget: population={args.population}, generations={args.generations}, "
-              f"patience={args.early_stop}, seed={args.seed}; "
+              f"patience={args.early_stop}"
+              + (f" (min gain {args.early_stop_min_rel:.2%} per counted generation)"
+                 if args.early_stop_min_rel is not None else "")
+              + f", seed={args.seed}; "
               f"capital={args.initial_capital}, equity_cap={args.equity_cap}")
         if args.population < 200:
             print("PILOT BUDGET: population below the documented 200; precision equivalence is unmeasured.")
@@ -743,6 +796,14 @@ def main(argv=None) -> int:
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
         if rc != 0:
+            _reason = _failure_reason(name, created_after=prior_max_id) if prior_max_id is not None else ""
+            if is_analysis_failure_reason(_reason):
+                # The job was refused for failing analysis passes: FAILED with its reason (the row is
+                # 'failed', so a re-run does not skip it as completed), and the campaign carries on.
+                note_job_exit(_FAILED_JOBS, name, rc, _reason)
+                print(f"[{i}/{len(jobs)}] {name} FAILED (analysis failures): {_reason}; "
+                      f"the campaign continues.", flush=True)
+                continue
             decision = _classify_failure(name, prior_max_id)
             if decision == "skip":
                 # A stall-only job (2026-09-21 review, G2). Its checkpoint was PRESERVED, so a later
@@ -759,8 +820,7 @@ def main(argv=None) -> int:
                 print(f"[{i}/{len(jobs)}] options matrix stopped: {name} failed; remaining jobs "
                       f"were not launched.", flush=True)
             return rc if rc > 0 else 1
-    print("options matrix driver: done.")
-    return 0
+    return finish_matrix(_FAILED_JOBS, "options matrix driver")
 
 
 if __name__ == "__main__":

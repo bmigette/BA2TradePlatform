@@ -150,7 +150,7 @@ def _fmp_like(first_bar, last_bar, freq="D"):
 
 
 @pytest.fixture
-def cache_dir(tmp_path, monkeypatch):
+def cache_dir(tmp_path, monkeypatch, request):
     """Redirect the parquet cache root AND freeze the clock.
 
     The real ~/Documents/.../cache holds 9.8 GB the user depends on -- nothing here
@@ -164,6 +164,14 @@ def cache_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(native_cache, "CACHE_FOLDER", str(d))
     monkeypatch.setattr(native_cache, "_CACHE_ROOT", str(d / "datasets" / "cache"))
     monkeypatch.setattr(mdp_mod, "datetime", _FrozenDatetime)
+    # These tests pin the file-mtime freshness gate. The live in-session rule (a LATEST daily read while a
+    # session is open fetches today's forming bar whatever the mtime says, pinned in
+    # packages/providers/tests/test_ohlcv_no_unfinished_bars.py) depends on the wall clock, so it is switched
+    # off here to keep them deterministic at any hour.
+    from ba2_common.core import ohlcv_final_bars
+    ohlcv_final_bars.set_live_overlay_enabled(False)
+    mdp_mod.MarketDataProviderInterface._UNFINISHED_MEMO.clear()
+    request.addfinalizer(lambda: ohlcv_final_bars.set_live_overlay_enabled(False))
     return str(d)
 
 
@@ -360,7 +368,13 @@ def test_live_daily_still_tops_up_a_stale_cache(cache_dir):
 
 
 def test_live_topup_fetches_only_the_missing_tail(cache_dir):
-    """The top-up range must start at the last cached bar, not at now-15y."""
+    """The top-up range must start at the last cached bars, not at now-15y.
+
+    Since 2026-09-28 (APH) a daily top-up re-asks the vendor for the last TOPUP_OVERLAP_BARS
+    cached bars too, to prove the vendor is still on the cache's split basis before appending
+    (ba2_common.core.ohlcv_topup_guard) -- still an incremental tail, never the whole series."""
+    from ba2_common.core.ohlcv_topup_guard import TOPUP_OVERLAP_BARS
+
     _seed("LIVE", "1d", "2025-06-02", "2026-02-27", age_hours=30 * 24)
     p = _StubProvider(
         rows_for=lambda s, e, i: _frame(pd.date_range(start=s, end=min(e, FROZEN_NOW), freq="D"))
@@ -370,8 +384,9 @@ def test_live_topup_fetches_only_the_missing_tail(cache_dir):
 
     assert len(p.impl_calls) == 1
     call = p.impl_calls[0]
-    assert call["start"].date() == (datetime(2026, 2, 27) + timedelta(days=1)).date(), (
-        f"top-up started at {call['start']} -- it must resume from the last cached bar"
+    first_compared = datetime(2026, 2, 27) - timedelta(days=TOPUP_OVERLAP_BARS - 1)
+    assert call["start"].date() == first_compared.date(), (
+        f"top-up started at {call['start']} -- it must resume from the last cached bars"
     )
     span_days = (call["end"] - call["start"]).days
     assert span_days <= 45, (

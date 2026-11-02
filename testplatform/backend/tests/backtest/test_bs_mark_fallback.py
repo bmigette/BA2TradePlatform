@@ -60,7 +60,9 @@ def _account(tmp_path, tag, ps, chain_underlying, chain, bar_rows, cfg=CFG):
         cache.write_chain_rows(chain_underlying, "2024-03-01", chain)
     if bar_rows:
         cache.write_bar_rows(bar_rows)
-    prov = HistoricalOptionsProvider(cache_db)
+    # The run's rate as production resolves it: the as-of FRED DGS3MO series (real values).
+    from tests.backtest.fixtures.fred_rate import dgs3mo_rate
+    prov = HistoricalOptionsProvider(cache_db, risk_free_rate=dgs3mo_rate("2024-01-02", "2024-12-31"))
     wire_backtest_seams()
     ctx = backtest_trading_db(tag)
     ctx.__enter__()
@@ -190,6 +192,7 @@ def test_bar_wins_over_bs_when_both_available(tmp_path, monkeypatch):
         extra_bar_rows=[_bar(_AMD_CALL_500, "2024-03-07", 3.2, "call", 500.0,
                               underlying="AMD", iv=0.31)],
     )
+    calls.clear()    # the entry fill's open-print screen may have priced through BS; the MARK may not
     try:
         ps.set_clock(datetime(2024, 3, 7))
         assert acct._option_positions_mtm() == pytest.approx(-320.0, abs=1.0)  # bar close, clamped
@@ -208,13 +211,15 @@ def test_bs_used_when_bar_missing_and_iv_fresh(tmp_path):
     BS(spot=452, strike=500, dte, iv=0.30), independently re-derived here via the SAME
     shared black_scholes() the wrapper delegates to (not via option_bs.bs_price itself)."""
     from ba2_common.core.finance_calc.derivatives import black_scholes
-    from app.services.backtest.options_store import default_options_risk_free_rate
+    from tests.backtest.fixtures.fred_rate import dgs3mo_rate
 
     acct, ps, ctx = _naked_short_call_account(tmp_path, "order-bs")
     try:
         ps.set_clock(datetime(2024, 3, 7))
         dte_days = (_EXPIRY - date(2024, 3, 7)).days
-        rate = default_options_risk_free_rate()
+        # The as-of DGS3MO of the CLOCK's day (5.47% on 2024-03-07), not a flat number.
+        rate = dgs3mo_rate("2024-01-02", "2024-12-31").rate_on(date(2024, 3, 7))
+        assert rate == pytest.approx(0.0547)
         expected = black_scholes(452.0, 500.0, dte_days / 365.0, rate, 0.30,
                                   option_type="call")["price"]
         mtm = acct._option_positions_mtm()
@@ -231,7 +236,7 @@ def test_bs_wins_over_intrinsic_entry_liquidation_buyback(tmp_path):
     """The SAME order applies to the margin-liquidation buyback: with the bar missing and
     iv fresh, the forced buyback prices at BS, not at the pre-Task-3 max(intrinsic, entry)."""
     from ba2_common.core.finance_calc.derivatives import black_scholes
-    from app.services.backtest.options_store import default_options_risk_free_rate
+    from tests.backtest.fixtures.fred_rate import dgs3mo_rate
 
     # Push AMD to 520 (deep ITM, intrinsic 20) with NO bar on the blow-up day, so the
     # pre-Task-3 fallback would book max(intrinsic=20, entry=3.0)=20 -- BS must differ.
@@ -241,7 +246,7 @@ def test_bs_wins_over_intrinsic_entry_liquidation_buyback(tmp_path):
         ps.set_clock(datetime(2024, 3, 10))
         lot = _held_lot(acct)
         dte_days = (_EXPIRY - date(2024, 3, 10)).days
-        rate = default_options_risk_free_rate()
+        rate = dgs3mo_rate("2024-01-02", "2024-12-31").rate_on(date(2024, 3, 10))
         expected = black_scholes(520.0, 500.0, dte_days / 365.0, rate, 0.30,
                                   option_type="call")["price"]
         premium = acct._bs_fallback_premium(lot)
@@ -465,6 +470,9 @@ def test_happy_path_never_calls_bs(tmp_path, monkeypatch):
     )
     acct.refresh_orders()
     acct.refresh_transactions()
+    # The ENTRY FILL's open-print screen (``_screen_open_print``) reprices through BS, but only
+    # to judge/replace a print; what is pinned here is that the per-bar MARK makes no BS call.
+    calls.clear()
     try:
         for d in (datetime(2024, 3, 6), datetime(2024, 3, 7), datetime(2024, 3, 8)):
             ps.set_clock(d)

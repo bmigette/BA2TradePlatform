@@ -69,7 +69,9 @@ def _run_build_cache(monkeypatch, tmp_path, feed=_OMIT):
                         _FakeDataClient)
     monkeypatch.setattr("ba2_providers.get_provider", lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(fo, "discover_contracts", lambda *a, **k: [_Contract()])
-    monkeypatch.setattr(fo, "fetch_risk_free_rate_series", lambda *a: {})
+    from ba2_providers.macro.risk_free_rate import explicit_rate
+    monkeypatch.setattr(fo, "fetch_risk_free_rate_series",
+                        lambda *a: explicit_rate(0.045, origin="test stub"))
     monkeypatch.setattr(fo, "fetch_underlying_close_series", lambda *a, **k: {})
     kwargs = {} if feed is _OMIT else {"feed": feed}
     # Dummy explicit creds so _alpaca_keys never touches the environment; the stubbed clients

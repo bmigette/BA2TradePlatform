@@ -95,7 +95,21 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 # benign: refusals whose whole meaning is "this run's numbers would be wrong -- stop". Matched
 # by class NAME across the MRO so this module imports neither definer (one lives in
 # ``split_basis``, the other in the backtest engine). BT/live option parity, plan Part E.
-_NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch"})
+#
+# MacroAvailabilityUnknown (``ba2_providers.macro.fred_series``, 2026-09-26): a macro FRED read
+# whose publication dates cannot be established for the decision (old-format cache, a cache
+# fetched before the decision, a decision before the first vintage). Absorbed, the expert's macro
+# regime would silently fall back to the index trend alone -- in ``observe``/``legacy`` too.
+#
+# OHLCVTopUpRefused (``ba2_common.core.ohlcv_topup_guard``, 2026-09-28): a daily OHLCV top-up that
+# could not be appended without mixing split bases (APH). The cache is on the OLD basis and the
+# market is on the new one, so absorbing it would price the symbol on the stale history.
+# StaleAnchorPrice (``ba2_common.core.knowability``, 2026-10-07): a TP/SL/size builder was handed a
+# price that is not the decision price on an intraday clock. Absorbed it becomes 'quantity 0' or a
+# quietly failed action, i.e. a silently wrong decision.
+_NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch",
+                                 "MacroAvailabilityUnknown", "OHLCVTopUpRefused",
+                                 "StaleAnchorPrice"})
 
 
 def is_never_absorbed(exc: BaseException) -> bool:

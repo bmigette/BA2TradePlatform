@@ -266,6 +266,55 @@ def upside_slope(legs: Sequence[PayoffLeg]) -> float:
     return slope
 
 
+def position_value_at(legs: Sequence[PayoffLeg], spot: float) -> float:
+    """Expiry VALUE in dollars of the legs as a held position at ``spot``, PREMIUMS IGNORED.
+
+    ``payoff_at`` is P&L (value minus what was paid); this is the value alone, i.e. what the
+    position is worth, which is what a mark-to-market clamp bounds. Assumes
+    ``validate_legs(legs) is None``.
+    """
+    total = 0.0
+    for leg in legs:
+        if leg.kind == "call":
+            intrinsic = max(spot - leg.strike, 0.0)
+        elif leg.kind == "put":
+            intrinsic = max(leg.strike - spot, 0.0)
+        elif leg.kind == "stock":
+            intrinsic = spot
+        else:
+            raise ValueError(f"position_value_at: unknown leg kind {leg.kind!r}")
+        total += _sign(leg.side) * intrinsic * leg.ratio * leg.multiplier
+    return total
+
+
+def position_value_bounds(legs: Sequence[PayoffLeg]) -> "tuple[float, float]":
+    """``(lowest, highest)`` value in dollars the legs can be worth as a position at expiry.
+
+    THE ONE DEFINITION of a structure's no-arbitrage value range, for any mark-to-market clamp
+    that must not erase a real loss. It is derived from the legs, not from a per-strategy width
+    table, because a width table is only right for the shapes it was written for: a call
+    butterfly whose UPPER wing is wider than its lower one is worth ``(k2-k1) - (k3-k2)`` above
+    ``k3`` -- NEGATIVE -- so a ``[0, width]`` clamp floors a real liability at zero (measured on
+    the O_BF optimization: 148 group-days in one genome).
+
+    Piecewise-linear with kinks only at strikes, so the extremes over ``[0, K_max]`` are exact;
+    above ``K_max`` the value is linear with slope ``upside_slope``. A positive slope makes the
+    upper bound ``+inf``, a negative one makes the lower bound ``-inf`` -- unbounded is returned
+    as an infinity, never as a finite wrong number, and the caller must not clamp on that side.
+
+    Raises ``ValueError`` for legs ``validate_legs`` refuses (a bound from unusable legs would
+    be a guess).
+    """
+    problem = validate_legs(legs)
+    if problem is not None:
+        raise ValueError(problem)
+    values = [position_value_at(legs, s) for s in critical_points(legs)]
+    slope = upside_slope(legs)
+    lo = -math.inf if slope < -_SLOPE_EPSILON else min(values)
+    hi = math.inf if slope > _SLOPE_EPSILON else max(values)
+    return lo, hi
+
+
 def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
     """The worst-case loss of ONE structure unit at expiry, as POSITIVE dollars.
 
@@ -335,6 +384,50 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
                     f"legs were built before re-quoting"))
 
     return MaxLossResult(MEASURED, amount=-worst)
+
+
+@dataclass(frozen=True)
+class SizingRisk:
+    """What a PREMIUM-SIZED (net-debit) structure puts at risk per contract.
+
+    ``state`` is the ``max_loss`` state. ``risk_per_contract`` is the dollars to size the budget
+    against: the outlay, or the true max loss when that is larger (``None`` when UNBOUNDED --
+    there is no number to size against and the caller must refuse). ``extra_beyond_outlay`` is
+    the part of that risk the entry does NOT pay at the fill (zero for every balanced debit
+    structure): it must be reserved, like any other risk not already spent.
+    """
+
+    state: str
+    risk_per_contract: Optional[float]
+    extra_beyond_outlay: float
+
+
+#: One cent per contract: far below any real difference between a structure's max loss and its
+#: outlay, and above the 4-decimal rounding of a quoted net debit (5e-5 a share = 0.005 dollars)
+#: that separates the two numbers on a structure whose worst loss IS its debit.
+SIZING_RISK_TOLERANCE = 0.01
+
+
+def sizing_risk(legs: Sequence[PayoffLeg], outlay_per_contract: float) -> SizingRisk:
+    """The ONE definition of what a debit-sized structure risks, for live AND backtest.
+
+    A debit structure is conventionally sized by what it costs, which is right only when the
+    debit is the worst case. It is not for a call butterfly whose UPPER wing is wider than its
+    lower: above the top strike it is worth ``(k2-k1) - (k3-k2)`` per share, a liability, so it
+    can lose MORE than it cost. Sizing by the debit under-sizes the risk and reserves nothing
+    against the difference.
+
+    MEASURED and within a cent of the outlay (every balanced structure): the outlay, unchanged,
+    so those size EXACTLY as before. MEASURED and larger: the max loss, and the difference is
+    ``extra_beyond_outlay``. UNBOUNDED: no number (refuse). UNMEASURABLE (a structure that cannot
+    lose at all, or crossed quotes): the outlay -- nothing says it can lose more than it paid.
+    """
+    result = max_loss(legs)
+    if result.state == UNBOUNDED:
+        return SizingRisk(UNBOUNDED, None, 0.0)
+    if result.state == MEASURED and result.amount > outlay_per_contract + SIZING_RISK_TOLERANCE:
+        return SizingRisk(MEASURED, result.amount, result.amount - outlay_per_contract)
+    return SizingRisk(result.state, outlay_per_contract, 0.0)
 
 
 #: Mirror of MIN_MEASURABLE_LOSS. A structure whose best outcome is under a cent is not a

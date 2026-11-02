@@ -14,6 +14,7 @@ from ...core.types import TransactionStatus, OrderStatus, OrderDirection, OrderT
 from ...core.utils import get_account_instance_from_id
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .account_scope import scope_transactions_to_account
+from ..utils.position_prices import broker_position_prices_from
 
 
 # ---------------------------------------------------------------------------
@@ -417,16 +418,10 @@ class _FloatingPLWidgetBase:
             return [PLRow(name=name, pl=None, balance=balance, tradable=tradable,
                           broker_bp=broker_bp) for name in names]
 
-        prices: Dict[str, float] = {}
-        for pos in broker_positions:
-            pos_dict = pos if isinstance(pos, dict) else dict(pos)
-            symbol = pos_dict.get('symbol')
-            current_price = pos_dict.get('current_price')
-            # An unpriced position is left OUT of the map so it surfaces as
-            # unpriced below, rather than being coerced into a zero price.
-            if symbol is None or current_price is None:
-                continue
-            prices[symbol] = float(current_price)
+        # An unpriced position is left OUT of the map so it surfaces as unpriced below,
+        # rather than being coerced into a zero price. Same broker price the Live Trades
+        # rows use (``position_prices``), so the card and the table agree.
+        prices: Dict[str, float] = broker_position_prices_from(broker_positions)
 
         pl_by_name: Dict[str, float] = {name: 0.0 for name in names}
         unpriced_by_name: Dict[str, List[str]] = {name: [] for name in names}
@@ -442,7 +437,7 @@ class _FloatingPLWidgetBase:
                 ).all()
                 if any(getattr(order, 'contract_symbol', None) for order in orders):
                     measured = self._option_transaction_pl(
-                        trans, orders, account, account_id, option_quotes)
+                        trans, orders, account, account_id, option_quotes, prices)
                 else:
                     measured = self._transaction_pl(trans, prices, session)
             except Exception as e:
@@ -467,7 +462,7 @@ class _FloatingPLWidgetBase:
 
     @staticmethod
     def _option_transaction_pl(trans: Transaction, orders, account, account_id,
-                               quotes: Dict) -> Optional[float]:
+                               quotes: Dict, marks: Dict[str, float]) -> Optional[float]:
         """An OPTION transaction's floating P/L, or ``None`` if it holds but is unquoted.
 
         Through ``open_structure_pnl`` -- the Options tab's own rule (option premium, contract
@@ -480,7 +475,10 @@ class _FloatingPLWidgetBase:
         from ...core.option_pnl_display import (
             UNAVAILABLE_FLAT, UNAVAILABLE_NO_FILLS, open_structure_pnl, quote_caching_account,
         )
-        priced = open_structure_pnl(quote_caching_account(account, quotes, account_id),
+        # Each held contract at the BROKER's position price (``marks``) -- what the equity
+        # path and the positions table use -- not at a bid/ask liquidation quote, which on
+        # the indicative feed put the cards $1,400 away from the table.
+        priced = open_structure_pnl(quote_caching_account(account, quotes, account_id, marks),
                                     trans, orders)
         if priced.available:
             return priced.amount

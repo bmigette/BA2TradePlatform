@@ -40,21 +40,43 @@ from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExper
 
 @pytest.fixture(scope="session")
 def test_engine():
-    """Create an in-memory SQLite engine shared across the entire test session.
-
-    ``StaticPool``: ONE connection for every thread. The default pool for ``:memory:`` is
-    ``SingletonThreadPool`` (one connection -- and so one separate, EMPTY in-memory database --
-    per thread), whose ``_cleanup`` can close the main thread's connection when a background
-    thread (the ActivityLogWorker) connects; the next query in the main thread then reopens a
-    fresh empty database and fails with "no such table" (an order-dependent flake).
-    """
+    """Create an in-memory SQLite engine shared across the entire test session."""
+    # SQLite ``:memory:`` is served by SQLAlchemy's SingletonThreadPool: ONE connection (= one private
+    # in-memory database) PER THREAD, and the pool keeps at most ``pool_size`` (default 5) of them,
+    # closing arbitrary ones beyond that. A test run that touches the DB from more than five threads
+    # (worker queues, schedulers, warm workers) can therefore close the MAIN thread's connection; its
+    # next use opens a brand-new EMPTY database and fails with "no such table: expertsetting" /
+    # "no such table: tradingorder" -- sporadic, order-dependent, and never in the test's own code.
+    # A pool this large is never evicted from within a session.
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        pool_size=4096,
     )
     SQLModel.metadata.create_all(engine)
     return engine
+
+
+#: Thread-name fragments of the long-lived managers a test must stop (APScheduler, the trade manager's
+#: refresh, the worker queue, the warm service). A thread of this kind still alive after its test is
+#: REPORTED (a warning naming the test), so the culprit of a cross-test DB / timing interference is
+#: named instead of discovered by bisecting a 30-minute run.
+_MANAGER_THREAD_MARKERS = ("APScheduler", "TradeManager", "WorkerQueue", "worker_queue", "warm",
+                           "JobManager", "account-refresh", "dgs3mo")
+
+
+@pytest.fixture(autouse=True)
+def _report_leaked_manager_threads(request):
+    import threading
+    import warnings
+    before = {t.ident for t in threading.enumerate()}
+    yield
+    leaked = [t.name for t in threading.enumerate()
+              if t.ident not in before and t.is_alive()
+              and any(m.lower() in t.name.lower() for m in _MANAGER_THREAD_MARKERS)]
+    if leaked:
+        warnings.warn(f"{request.node.nodeid} left manager thread(s) running: {sorted(set(leaked))}",
+                      RuntimeWarning, stacklevel=1)
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +124,44 @@ def reset_account_filter_state():
     yield
 
 
+@pytest.fixture(autouse=True)
+def forget_nicegui_test_clients():
+    """Drop the ``nicegui.Client`` objects a test constructed, so they cannot starve other tests.
+
+    NiceGUI answers ``ui.context.client`` outside any ``with`` block by lazily creating a pseudo
+    "script" client -- but ONLY while ``Client.instances`` is empty. A test that builds its own
+    ``Client(page(...), request=None)`` registers it there and (its fixture removes the elements,
+    not the registry entry) leaves it behind, after which every later test that touches
+    ``ui.context.client`` bare -- ``tests/test_batch_import_upload.py`` is one -- dies with "The
+    current slot cannot be determined because the slot stack for this task is empty". It only
+    showed once a client-building test file sorted BEFORE that one in pytest's alphabetical order.
+    The script client NiceGUI itself created is never touched.
+    """
+    import sys
+    client_module = sys.modules.get('nicegui.client')
+    before = set(client_module.Client.instances) if client_module is not None else set()
+    yield
+    client_module = sys.modules.get('nicegui.client')
+    if client_module is None:
+        return
+    core_module = sys.modules.get('nicegui.core')
+    script_client = getattr(core_module, 'script_client', None)
+    for client_id in set(client_module.Client.instances) - before:
+        if client_module.Client.instances[client_id] is not script_client:
+            client_module.Client.instances.pop(client_id, None)
+
+
+@pytest.fixture(autouse=True)
+def close_ibkr_runtimes():
+    """IBKRAccount keeps one connection runtime (a daemon loop thread) per account id in a
+    process-wide registry; account ids restart at 1 in every test. Close whatever a test left."""
+    yield
+    import sys
+    runtime = sys.modules.get("ba2_trade_platform.modules.accounts.ibkr_runtime")
+    if runtime is not None:
+        runtime.shutdown_all_runtimes()
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 seam wiring (done at conftest import time, BEFORE any test module is
 # collected). The shimmed in-tree experts/interfaces now execute the *package*
@@ -136,6 +196,21 @@ def _wire_package_seams_for_tests():
 
 
 _wire_package_seams_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def history_source_seams_unwired():
+    """The per-account history-source seams (wire_all_seams step 4b) resolve an expert's ACCOUNT in the DB; most tests use stub
+    experts / ``MockAccount`` rows that no real resolver can classify. Every test starts with them unwired (the pre-feature
+    behaviour); the tests of the feature wire them explicitly."""
+    from ba2_common.core import TradeRiskManagement as rm_module
+    from ba2_common.core import backtest_context as bc
+    before = (bc.get_live_history_resolver(), rm_module.get_indicator_provider_resolver())
+    bc.set_live_history_resolver(None)
+    rm_module.set_indicator_provider_resolver(None)
+    yield
+    bc.set_live_history_resolver(before[0])
+    rm_module.set_indicator_provider_resolver(before[1])
 
 
 @pytest.fixture(autouse=True)
@@ -479,3 +554,28 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     from ba2_common.core.interfaces.OptionsAccountInterface import (
         OptionsAccountInterface as _OAI)
     monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")
+
+
+@pytest.fixture(autouse=True)
+def _buying_power_failure_memory_starts_empty():
+    """The buying-power read remembers a failed read per ACCOUNT ID for a few seconds
+    (``MarketExpertInterface._BP_FAILED_READS``); fake accounts here reuse small ids, so a failure
+    pinned by one test must never leak into the next."""
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+    MarketExpertInterface._BP_FAILED_READS.clear()
+    yield
+    MarketExpertInterface._BP_FAILED_READS.clear()
+
+
+@pytest.fixture
+def _mock_expert_is_resolvable(monkeypatch):
+    """An option entry now reads its expert's capital (``get_available_equity_balance_detail``)
+    through the instance resolver, so an ``ExpertInstance`` row named ``MockExpert`` must resolve to
+    the ``MockExpert`` double here (the production registry knows only real expert classes)."""
+    import ba2_trade_platform.core.utils as _utils
+    real = _utils.get_expert_class
+    monkeypatch.setattr(_utils, "get_expert_class",
+                        lambda name: MockExpert if name == "MockExpert" else real(name))
+    real_account = _utils.get_account_class
+    monkeypatch.setattr(_utils, "get_account_class",
+                        lambda name: MockAccount if name == "MockAccount" else real_account(name))

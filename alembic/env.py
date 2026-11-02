@@ -39,6 +39,8 @@ sys.path[0:0] = [_p for _p in _PACKAGE_PATHS if _p not in sys.path]
 from sqlmodel import SQLModel
 from ba2_trade_platform.config import DB_FILE as _DEFAULT_DB_FILE
 from ba2_trade_platform.core import models  # Import all models to register them with SQLModel
+# In-tree (live-only) tables that ba2_common.core.models does not declare.
+from ba2_trade_platform.core import allocator_protection_models  # noqa: F401
 
 # Allow targeting a non-default DB (e.g. prod) without editing config.py.
 # Set BA2_DB_FILE to point alembic at any sqlite file. Falls back to the

@@ -14,7 +14,9 @@ PUSH model: the MASTER builds the list of files a worker is missing (``diff_miss
 worker's manifest) and streams them as ONE tar (``iter_tar``); the WORKER extracts that stream
 (``extract_tar``). ``build_manifest`` / ``safe_resolve`` are used on both ends. Dedup is by
 ``(rel_path, size)`` — immutable history means a size match is an identity match, so re-pushes
-only send genuinely new files. ``diff_stale``/``prune_paths`` are the reverse direction: a rel_path
+only send genuinely new files. The exception is the job's OHLCV history folder, which a build
+rewrites in place (the Alpaca history): it is also compared by crc32 (``add_crc32``), so a file
+rewritten at its old size is re-sent instead of silently skipped. ``diff_stale``/``prune_paths`` are the reverse direction: a rel_path
 the worker has that the master's CURRENT manifest no longer lists is a leftover from before a
 rebuild — a partition-globbing reader (e.g. the screener metric_store's ``load_store``) would
 otherwise keep ingesting it alongside the fresh file, silently corrupting that worker's results.
@@ -117,7 +119,8 @@ def _crc32_file(p: Path, chunk: int = 1 << 20) -> int:
     return crc
 
 
-def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
+def build_manifest(root: Optional[str] = None, with_hash: bool = False,
+                   exclude_dirnames: Iterable[str] = ()) -> dict:
     """Enumerate every syncable cache file under *root* (default ``CACHE_FOLDER``).
 
     Returns ``{root, count, total_bytes, files:[{rel_path, size, mtime[, crc32]}]}`` with
@@ -133,8 +136,15 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
     only needs ``(rel_path, size)`` and reading every file is disk-IO-heavy; use it for the
     periodic cache-integrity check, which needs to catch a same-size-different-content drift that
     (rel_path, size) alone can't see (e.g. a rebuild that rewrites a file at its old byte size).
+
+    ``exclude_dirnames`` names TOP-LEVEL cache folders (direct children of *root*) that are left
+    out of the manifest, e.g. the OHLCV history folder of the source a job does NOT run on. Unlike
+    ``_derived`` this is a per-call choice: the folder is not copied, and the push caller drops it
+    from the stale list too (``without_dirs``), so it is neither copied nor pruned. Only a top-level match counts, so a
+    same-named directory deeper in the tree stays ordinary cache content.
     """
     base = cache_root(root)
+    exclude_top = frozenset(exclude_dirnames)
     files: List[dict] = []
     if base.is_dir():
         # os.walk (not rglob) so a skipped directory is PRUNED from the descent: a derived cache
@@ -146,8 +156,10 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
         # and a symlinked-in subtree is symmetric on master and worker so it never reaches
         # diff_stale.
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES]
             rel_dir = Path(dirpath).relative_to(base)
+            at_root = rel_dir == Path(".")
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRNAMES
+                           and not (at_root and d in exclude_top)]
             for fn in filenames:
                 rel = rel_dir / fn
                 if not _is_syncable(rel):
@@ -198,7 +210,9 @@ def safe_resolve(rel_path: str, root: Optional[str] = None) -> Path:
 def diff_missing(local_files: List[dict], remote_manifest: dict) -> List[str]:
     """Return the rel_paths present in *local_files* that the remote is missing or has at a
     different size (immutable history ⇒ size match = identity match). *local_files* and
-    ``remote_manifest['files']`` are manifest entries (``{rel_path, size, ...}``)."""
+    ``remote_manifest['files']`` are manifest entries (``{rel_path, size, ...}``). Folders
+    rebuilt in place are NOT immutable: ``push_cache`` adds ``diff_content_mismatch`` over
+    ``add_crc32`` manifests for them."""
     remote = {f["rel_path"]: f["size"] for f in remote_manifest.get("files", [])}
     return [f["rel_path"] for f in local_files if remote.get(f["rel_path"]) != f["size"]]
 
@@ -228,6 +242,123 @@ def diff_content_mismatch(local_files: List[dict], remote_manifest: dict) -> Lis
         if rh is not None and lh is not None and rh != lh:
             out.append(f["rel_path"])
     return out
+
+
+# --------------------------------------------------------------------------------------------
+# Content check of the folders rebuilt IN PLACE (the OHLCV history)
+# --------------------------------------------------------------------------------------------
+# ``diff_missing`` treats a size match as identity, which holds for append-only vendor history but
+# not for a folder a build REWRITES under the same names: the Alpaca history rebuild of 2026-10-22
+# rewrote _meta/gate_certificate.json and _meta/split_table.json at their old byte sizes, the push
+# skipped both, and every option trial on remote150 was refused (SplitBasisRefused). A rewritten
+# bar file at its old size would have been skipped the same way and SILENTLY. So the push also
+# compares a crc32 per file under those folders. The crc of an unchanged file is not recomputed:
+# a per-host cache at the cache root keys it by (size, mtime), and both ends write files only by
+# replacing them (extract_tar's os.replace, the build's atomic writes), which moves the mtime.
+CRC_CACHE_NAME = ".ba2_crc_cache.json"   # a dot name: never synced, never pruned (_is_syncable)
+
+
+def _load_crc_cache(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        files = raw["files"]
+        if raw.get("version") != 1 or not isinstance(files, dict):
+            raise ValueError(f"unexpected layout (version {raw.get('version')!r})")
+        return files
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        # Only a cache: a bad one costs one full re-hash, never a wrong answer.
+        logger.warning("crc cache %s unreadable (%s); re-hashing", path, e)
+        return {}
+
+
+def _save_crc_cache(path: Path, files: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "files": files}, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("crc cache %s not saved (%s); the next call re-hashes", path, e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def add_crc32(manifest: dict, dirnames: Iterable[str], root: Optional[str] = None) -> dict:
+    """A copy of *manifest* whose entries under the TOP-LEVEL folders *dirnames* carry ``crc32``.
+
+    Other entries are shared, not copied (a worker's manifest is ~1.6M entries). A file that
+    cannot be read raises: an entry without a crc under *dirnames* would read as "nothing to
+    compare" on the other end, which is exactly the silent skip this check exists to end.
+    """
+    base = cache_root(root)
+    prefixes = tuple(d + "/" for d in dirnames)
+    if not prefixes:
+        return manifest
+    cache_path = base / CRC_CACHE_NAME
+    cached = _load_crc_cache(cache_path)
+    kept = {k: v for k, v in cached.items() if not k.startswith(prefixes)}
+    hashed = n_bytes = 0
+    t0 = time.monotonic()
+    files = []
+    for f in manifest["files"]:
+        rel = f["rel_path"]
+        if not rel.startswith(prefixes):
+            files.append(f)
+            continue
+        hit = cached.get(rel)
+        if hit is not None and hit[0] == f["size"] and hit[1] == f["mtime"]:
+            crc = hit[2]
+        else:
+            crc = _crc32_file(safe_resolve(rel, str(base)))
+            hashed += 1
+            n_bytes += f["size"]
+        kept[rel] = [f["size"], f["mtime"], crc]
+        files.append({**f, "crc32": crc})
+    if hashed or len(kept) != len(cached):
+        _save_crc_cache(cache_path, kept)
+    if hashed:
+        logger.info("crc32: hashed %d file(s), %s under %s in %.1fs (the rest from %s)", hashed,
+                    format_bytes(n_bytes), ", ".join(dirnames), time.monotonic() - t0,
+                    CRC_CACHE_NAME)
+    return {**manifest, "files": files}
+
+
+def missing_crc32(local_files: List[dict], remote_manifest: dict,
+                  dirnames: Iterable[str]) -> List[str]:
+    """rel_paths under *dirnames* that both ends hold at the same size but the REMOTE reports no
+    ``crc32`` for: their content cannot be compared (a worker whose code predates the check)."""
+    prefixes = tuple(d + "/" for d in dirnames)
+    remote = {f["rel_path"]: f for f in remote_manifest.get("files", [])}
+    out = []
+    for f in local_files:
+        if not f["rel_path"].startswith(prefixes):
+            continue
+        r = remote.get(f["rel_path"])
+        if r is not None and r["size"] == f["size"] and r.get("crc32") is None:
+            out.append(f["rel_path"])
+    return out
+
+
+def without_dirs(rel_paths: Iterable[str], dirnames: Iterable[str]) -> List[str]:
+    """*rel_paths* minus everything under the top-level folders *dirnames* (the folders a push
+    does not replicate: neither copied nor pruned)."""
+    prefixes = tuple(d + "/" for d in dirnames)
+    return [r for r in rel_paths if not r.replace("\\", "/").startswith(prefixes)]
+
+
+def assert_prunable(rel_paths: Iterable[str], root: Optional[str] = None) -> None:
+    """Refuse (``ValueError``) unless every one of *rel_paths* stays inside the cache root.
+
+    The stale list comes from the REMOTE manifest, i.e. from another machine; the worker's own
+    ``prune_paths`` skips an escaping path, but the master must not even ask for one.
+    """
+    for rel in rel_paths:
+        safe_resolve(rel, root)
 
 
 def iter_tar(rel_paths: Iterable[str], root: Optional[str] = None,

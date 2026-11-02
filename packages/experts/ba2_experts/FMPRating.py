@@ -16,6 +16,7 @@ from ba2_common.core.types import (
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.replay import observe_provider, record_branch_flag, replay_now
 from ba2_common.core.provider_utils import parse_provider_date
+from ba2_common.core.knowability import intraday_decision_clock, published_known
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
@@ -334,6 +335,10 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
             d = _memo_provider_date(r, "publishedDate")
             if d is None or d > ref_date or d < floor:
                 continue
+            # INTRADAY clock: a target published after the decision instant on its own date
+            # (``publishedDate`` carries a UTC timestamp) is not yet public.
+            if intraday_decision_clock() and not published_known(r.get("publishedDate"), ref_date):
+                continue
             if r.get("priceTarget") is not None:
                 n += 1
         return n
@@ -357,6 +362,9 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         for r in grades:
             d = _memo_provider_date(r, "date")
             if d is None or d > ref_date or d < floor:
+                continue
+            # INTRADAY clock: a grade carries only a DATE, so it is public from the next session.
+            if intraday_decision_clock() and not published_known(r.get("date"), ref_date):
                 continue
             company = r.get("gradingCompany")
             if company:
@@ -427,7 +435,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
                             if consensus_data is not None else None)
             if consensus_data is not None and max_age > 0:
                 analyst_grades = self._fetch_analyst_grades(symbol)
-            current_price = providers.price_at_date(symbol, as_of)
+            current_price = self._decision_price(providers, symbol, as_of)
         return {"consensus_data": consensus_data, "upgrade_data": upgrade_data,
                 "current_price": current_price, "symbol": symbol,
                 "analyst_grades": analyst_grades}
@@ -723,6 +731,8 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         for r in price_target_history:
             d = _memo_provider_date(r, "publishedDate")
             if d is None or d > as_of or d < floor:
+                continue
+            if intraday_decision_clock() and not published_known(r.get("publishedDate"), as_of):
                 continue
             pt = r.get("priceTarget")
             if pt is None:

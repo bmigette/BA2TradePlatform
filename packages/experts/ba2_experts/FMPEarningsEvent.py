@@ -155,8 +155,10 @@ near UTC midnight (that's the middle of the US trading day), so this is a real b
 negligible edge, not a practical concern.
 
 THE MOST RECENT PAST EVENT reads the as-of close. An 'amc' print dated as_of-1
-reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- the very
-bar every expert on this platform already prices its decisions at. That is
+reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- a DAILY
+bar of the as-of session (history, not the decision price: on an intraday backtest clock the
+daily history read here ends at the last FINISHED session, so this event's reaction is simply
+absent until the next session). That is
 platform-consistent, not a leak: the as-of close is the decision-time information
 set, and refusing it here would make this expert's history end a day earlier than
 everyone else's for no gain. LIVE CAVEAT: intraday, that as-of "close" is a PARTIAL
@@ -683,8 +685,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                 # 0 is FMP's "no count published", not a real zero-analyst estimate.
                 analyst_count = int(count) if count else None
 
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
 
         # Task 8: the implied-move leg. ONE chain read, only for a symbol that HAS an
         # upcoming event -- see _fetch_implied_leg for the duck-typed seam and every

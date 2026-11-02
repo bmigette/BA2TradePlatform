@@ -380,6 +380,14 @@ class TransactionStatus(str, Enum):
     CLOSED = "CLOSED"
     FAILED = "FAILED"  # Transaction creation succeeded but order submission failed
 
+
+#: The transaction statuses whose position (or pending entry) still HOLDS the expert's capital:
+#: WAITING (entry working), OPENED, and CLOSING -- a resting close has not released the shares or the
+#: option collateral until it fills, so the position is still held and still counts. The ONE definition
+#: the used-balance, the classic per-instrument cap and the option per-underlying cap all read.
+CAPITAL_HOLDING_TRANSACTION_STATUSES = (
+    TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING)
+
 class RiskLevel(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
@@ -617,6 +625,13 @@ class ExpertEventType(str, Enum):
     N_STRUCTURE_STATE = "structure_state"
     N_STRUCTURE_BARS_SINCE_BOS = "structure_bars_since_bos"
     N_STRUCTURE_BARS_SINCE_CHOCH = "structure_bars_since_choch"
+    # BENCHMARK (SPY) REGIME ENTRY GATES (plan docs/plans/2026-10-24-spy-regime-gate.md). Two
+    # CATEGORICAL fields compared with ``==`` against a mode code (``benchmark_regime`` tables);
+    # they read the market-wide regime, not a per-instrument feature row, so they are NOT in
+    # ``market_conditions.PROFILES`` (see ``BENCHMARK_FIELDS``). Enum members cannot be added at
+    # runtime, hence declared here. An unknown regime never passes.
+    N_SPY_TREND_REGIME = "spy_trend_regime"
+    N_SPY_VOL_REGIME = "spy_vol_regime"
 
 
 class ExpertActionType(str, Enum):
@@ -712,6 +727,57 @@ class ActivityLogType(str, Enum):
     TP_SL_ADJUSTED = "tp_sl_adjusted"
     TRADE_ACTION_OPEN = "trade_action_open"
     TRADE_ACTION_NEW = "trade_action_new"
+
+_ACTIVITY_TYPE_LABELS = {
+    ActivityLogType.TRADE_ACTION_OPEN.value: "Trade Action (Open Position)",
+    ActivityLogType.TRADE_ACTION_NEW.value: "Trade Action (New Entry)",
+    ActivityLogType.TP_SL_ADJUSTED.value: "TP/SL Adjusted",
+}
+
+
+def get_activity_type_display_label(activity_type):
+    """User-facing label for an ``ActivityLogType`` (or its value string).
+
+    The single place the Activity Monitor gets its type labels from. Types without an explicit
+    entry keep the generic title-case of their value.
+    """
+    value = activity_type.value if isinstance(activity_type, ActivityLogType) else activity_type
+    try:
+        return _ACTIVITY_TYPE_LABELS[value]
+    except KeyError:
+        return value.replace("_", " ").title()
+
+
+# Pseudo action for ONE merged TP+SL adjust call (no ExpertActionType member exists for it and the
+# enum is stored in the DB, so it is not added there). Accepted only by the trade-action activity log.
+ACTION_ADJUST_TP_SL = "adjust_tp_sl"
+
+_TRADE_ACTION_LABELS = {
+    ExpertActionType.BUY.value: "Buy",
+    ExpertActionType.SELL.value: "Sell",
+    ExpertActionType.CLOSE.value: "Close",
+    ExpertActionType.ADJUST_TAKE_PROFIT.value: "Adjust Take Profit",
+    ExpertActionType.ADJUST_STOP_LOSS.value: "Adjust Stop Loss",
+    ACTION_ADJUST_TP_SL: "Adjust TP/SL",
+}
+
+
+def get_trade_action_display_label(action):
+    """Readable label for an ``ExpertActionType`` (or its value, or ``ACTION_ADJUST_TP_SL``).
+
+    Raises ``ValueError`` for anything that is not a known action: a bad action type is a
+    programming error and must not be logged as garbage text.
+    """
+    value = action.value if isinstance(action, ExpertActionType) else action
+    if isinstance(value, str) and value in _TRADE_ACTION_LABELS:
+        return _TRADE_ACTION_LABELS[value]
+    if isinstance(value, str):
+        try:
+            return ExpertActionType(value).value.replace("_", " ").title()
+        except ValueError:
+            pass
+    raise ValueError(f"Unknown trade action type for activity log: {action!r}")
+
 
 def get_reference_value_options():
     """Return dictionary of reference value options with user-friendly labels."""
@@ -1105,7 +1171,7 @@ class Recommendation:
     """
     signal: OrderRecommendation          # BUY/SELL/HOLD/OVERWEIGHT/UNDERWEIGHT/ERROR
     confidence: float                    # 1-100 scale (platform convention)
-    current_price: float                 # the as_of close, resolved in _gather
+    current_price: Optional[float]       # the DECISION price resolved in _gather; None only on a skip with no price
     details: str = ""
     expected_profit_percent: Optional[float] = None
     target_price: Optional[float] = None   # expert's recommended TP price (None -> backtest derives from expected_profit_percent)

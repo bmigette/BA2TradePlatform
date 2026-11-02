@@ -1,0 +1,38 @@
+{
+  "source": "synthetic input passed through actual adapter and UI/rule methods",
+  "chain_fields": [
+    "ask",
+    "bid",
+    "delta",
+    "expiry",
+    "gamma",
+    "implied_volatility",
+    "last",
+    "open_interest",
+    "option_type",
+    "strike",
+    "symbol",
+    "theta",
+    "underlying",
+    "vega",
+    "volume"
+  ],
+  "quote_fields": [
+    "ask",
+    "bid",
+    "delta",
+    "gamma",
+    "implied_volatility",
+    "last",
+    "symbol",
+    "theta",
+    "timestamp",
+    "vega"
+  ],
+  "chain_volume": null,
+  "enabled_volume_gate_result": "OptionLiquidityDataUnavailable",
+  "equal_iv_samples": 20,
+  "current_iv": 0.3,
+  "ui_percentile": 100.0,
+  "rule_percentile": 0.0
+}

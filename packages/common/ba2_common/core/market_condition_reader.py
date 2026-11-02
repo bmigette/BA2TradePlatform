@@ -34,7 +34,10 @@ whatever the symbol count -- the symbol slices live INSIDE them:
   * ``values``       float64(n, F)  the profile's fields in registry order (a categorical field
                                     holds its integer code; NaN where the field is not valid)
   * ``status``       int8   (n, F)  index into ``market_conditions.STATUSES``
-  * ``reason_codes`` int16  (n, F)  index into the manifest's small reason table
+  * ``reason_codes`` int32  (n, F)  index into the manifest's reason table (int16 until 2026-10-01;
+    a 2,040-symbol snapshot carries >32,768 distinct date-bearing reason strings, so the codes are
+    int32 now. The layout key is unchanged: older int16 derived arrays are still read correctly,
+    the code is only ever an index)
   * ``meta_json``    uint8  (m,)    UTF-8 JSON: layout/manifest/profile/calc version, the field
                                     list, the per-symbol ``[lo, hi)`` slice table and the reason
                                     table.
@@ -109,11 +112,13 @@ from ba2_common.core.market_condition_store import (
 from ba2_common.core.market_conditions import (
     PROFILES,
     STATUS_INSUFFICIENT_HISTORY,
+    STATUS_MISSING_SESSION,
     STATUS_VALID,
     STATUSES,
     WINDOW,
     FeatureRow,
     Observation,
+    calc_version_accepted,
 )
 from ba2_common.core.shared_arrays import (
     DONE_MARKER,
@@ -250,7 +255,7 @@ class MappedMarketConditionReader:
         if self.manifest["profile"] != self.profile:
             raise ManifestError(f"manifest {self.manifest_digest} carries profile "
                                 f"{self.manifest['profile']!r}, not {self.profile!r}")
-        if spec.calc_version != self.calc_version:
+        if not calc_version_accepted(self.profile, self.calc_version):
             raise MarketConditionVersionMismatch(
                 f"manifest {self.manifest_digest} was built at calc version {self.calc_version!r}; "
                 f"profile {self.profile!r} is registered at {spec.calc_version!r}")
@@ -325,8 +330,10 @@ class MappedMarketConditionReader:
         values = np.empty((total, n_f), dtype=np.float64)
         status = np.empty((total, n_f), dtype=np.int8)
         # zeros, not empty: a symbol with no rows leaves its slice untouched, and uninitialised
-        # int16 would index the reason table out of range if anything ever read it.
-        reason_codes = np.zeros((total, n_f), dtype=np.int16)
+        # int32: reasons carry dates ("... sessions ending 2020-01-03", "series starts ..."), so a
+        # wide union has tens of thousands of distinct strings. Zeros, not empty: a symbol with no
+        # rows leaves its slice untouched, and uninitialised codes would index the table out of range.
+        reason_codes = np.zeros((total, n_f), dtype=np.int32)
         reason_table: Dict[str, int] = {}
         slices: Dict[str, List[int]] = {}
         pos = 0
@@ -347,10 +354,10 @@ class MappedMarketConditionReader:
                     code = reason_table.get(reason)
                     if code is None:
                         code = reason_table[reason] = len(reason_table)
-                        if code > 32767:
+                        if code > np.iinfo(np.int32).max:
                             raise ManifestError(
-                                f"manifest {self.manifest_digest} carries more than 32768 distinct "
-                                f"reason strings; the packed reason code is int16")
+                                f"manifest {self.manifest_digest} carries more distinct reason "
+                                f"strings than the packed reason code (int32) can index")
                     reason_codes[pos + i, j] = code
             pos += n
         meta = {
@@ -480,7 +487,7 @@ class MappedMarketConditionReader:
         would serve a memoised row computed under the old calculator without a word -- the exact
         silent-corruption case this reader raises for.
         """
-        if PROFILES[self.profile].calc_version != self.calc_version:
+        if not calc_version_accepted(self.profile, self.calc_version):
             self._check_registry()
 
     # -- retained evidence (capture) ---------------------------------------------------------
@@ -935,10 +942,18 @@ def coverage_detail(mapped: Any, missing: Any) -> str:
 #     the window (APP, ARM, GEV, PLTR, SNDK in the published snapshots). LEGITIMATE for the same
 #     reason: there is no price history to have computed anything from, and the strategy could
 #     not have traded the symbol then either.
-#   * The same status ELSEWHERE -- an interior gap, a trailing run (a delisting, or a source that
-#     stops before the window does), or an entire window with no usable row at all (SPCX, whose
-#     daily cache starts in 2026). None of those is explained by the symbol's listing date, and
-#     each one silently removes real decision dates from the search. A JOB CONFIGURATION ERROR.
+#   * A ROW that says ``missing_session`` (or any other non-``valid`` status) as a TRAILING run
+#     that reaches the LAST session this snapshot has anything recorded for at all (``coverage``'s
+#     own ``last_session``) -- the symmetric case: the company was acquired/delisted (ATVI, DFS,
+#     ANSS, CDAY, FI, ...) or its source simply stops before the window does. LEGITIMATE for the
+#     same reason as a leading run: the symbol never trades again after its last bar (the engine
+#     treats "no more bars" as "no more fills," never an error), so there is nothing a re-fetch or
+#     a fill could supply and no strategy could have traded it either.
+#   * The same status ELSEWHERE -- an interior gap, or an entire window with no usable row at all
+#     (SPCX, whose daily cache starts in 2026). Neither is explained by a listing or delisting
+#     date (an interior gap has valid rows resuming AFTER it, inside this very snapshot, which
+#     proves the source did not simply stop), and each one silently removes real decision dates
+#     from the search. A JOB CONFIGURATION ERROR.
 #
 # The per-symbol ``coverage`` record is what makes the distinction cheap: its ``exceptions``
 # carry ``{kind, field, status, rows, first_session, last_session}`` per (field, status), so a
@@ -985,7 +1000,8 @@ def clear_window_coverage_cache() -> None:
         _window_cache.clear()
 
 
-def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -> List[str]:
+def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any,
+                             intraday: bool = False) -> List[str]:
     """Why this snapshot does not serve the rows a run over ``[start, end]`` will ask for.
 
     Empty list = it does. Each string is one symbol's (or the pin's) fault, phrased for an
@@ -998,6 +1014,14 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
     :func:`missing_coverage`'s answer, and reporting it twice would name the same symbol in two
     different refusals. Memoised by (cache root, profile, digest, universe, window): a batch asks
     the identical question once per job and a GA once per trial.
+
+    ``intraday``: the run is on an INTRADAY clock. Bar D then reads the row of the last FINISHED
+    session P(D), never D's own (not final until the close), so the rows required are
+    P(first bar)..P(last bar): one session BEFORE ``start`` is needed and the run's last session
+    is not. The warmup writes rows for ``[prior(first bar), last bar]``, so a snapshot warmed for
+    exactly ``start..end`` DOES hold P(first bar) and is accepted; one built under an older row
+    rule (rows for ``first..last`` only) lacks it and is refused here instead of silently reading
+    missing_session on the run's first day. The pin's declared window is still compared in BARS.
     """
     if mapped is None:
         return []
@@ -1006,13 +1030,13 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
         return []
     first, last = _as_date(start), _as_date(end)
     key = (str(getattr(mapped, "cache_root", "")), str(getattr(mapped, "profile", "")),
-           _bare(str(getattr(mapped, "manifest_digest", ""))), wanted, first, last)
+           _bare(str(getattr(mapped, "manifest_digest", ""))), wanted, first, last, bool(intraday))
     with _window_cache_lock:
         hit = _window_cache.get(key)
         if hit is not None:
             _window_cache.move_to_end(key)
             return list(hit)
-    problems = tuple(_window_coverage_problems(mapped, wanted, first, last))
+    problems = tuple(_window_coverage_problems(mapped, wanted, first, last, bool(intraday)))
     with _window_cache_lock:
         _window_cache[key] = problems
         _window_cache.move_to_end(key)
@@ -1022,7 +1046,7 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
 
 
 def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
-                              first: date, last: date) -> List[str]:
+                              first: date, last: date, intraday: bool = False) -> List[str]:
     from ba2_common.core.market_calendar import (
         backtest_decision_label, decision_data_session, regular_session_dates,
     )
@@ -1042,6 +1066,11 @@ def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
     # The row each end bar reads, through the ONE decision-session rule (== the bar itself).
     want_first = decision_data_session(backtest_decision_label(bars[0]))
     want_last = decision_data_session(backtest_decision_label(bars[-1]))
+    if intraday:
+        # P(D): the last session finished before bar D (see ``window_coverage_problems``).
+        from ba2_common.core.market_calendar import prior_regular_session
+        want_first = prior_regular_session(bars[0])
+        want_last = bars[-2] if len(bars) > 1 else want_first
     required = regular_session_dates(want_first, want_last)
 
     problems: List[str] = []
@@ -1116,11 +1145,17 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
                      want_first: date, want_last: date) -> List[str]:
     """The symbol's recorded status exceptions that this window cannot explain.
 
-    A run of unusable rows is EXPLAINED when it is the symbol's leading prefix and contiguous:
-    the symbol had not listed yet (or its source history starts later), which no re-download
-    repairs and no strategy could have traded through. Anything else -- an interior gap, a
-    trailing run, a whole window with no usable row -- removes real decision dates from the
-    search for a reason the snapshot does not record.
+    A run of unusable rows is EXPLAINED when EITHER:
+    * it is the symbol's leading prefix and contiguous -- the symbol had not listed yet (or its
+      source history starts later), which no re-download repairs and no strategy could have
+      traded through; or
+    * it is a trailing run, contiguous, and reaches the snapshot's own last recorded session
+      (``coverage``'s ``last_session``) -- the symmetric case: the company was delisted/acquired,
+      or the source simply stops there. Nothing valid follows it in THIS snapshot, which is what
+      tells a genuine delisting apart from an interior gap (where valid rows resume afterward).
+
+    Anything else -- an interior gap, or a whole window with no usable row -- removes real
+    decision dates from the search for a reason the snapshot does not record.
 
     The exceptions are recorded PER FIELD, and a symbol with no source data has the identical
     run on all twelve of them, so identical runs are reported ONCE naming their fields: twelve
@@ -1128,6 +1163,7 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
     """
     from ba2_common.core.market_calendar import regular_session_dates
 
+    cov_last = _opt_date(record.get("last_session"))
     grouped: "OrderedDict[Tuple[Any, ...], List[str]]" = OrderedDict()
     for exc in record.get("exceptions") or ():
         if not isinstance(exc, Mapping) or str(exc.get("kind")) != "status":
@@ -1146,6 +1182,22 @@ def _status_problems(symbol: str, record: Mapping[str, Any],
         leading = exc_first <= want_first
         if leading and contiguous and exc_last < want_last:
             continue                     # the listing date explains it: legitimate pre-listing
+        # The SYMMETRIC rule: a TRAILING run is a delisting (the company stopped trading, or the
+        # source stops before this window does), not a hole, when it is contiguous, does not
+        # also touch the window's start (a leading run is handled above; the "whole" branch below
+        # catches a run that is BOTH), and -- the safety property -- reaches all the way to the
+        # LAST session this snapshot has anything recorded for (``cov_last``, the coverage
+        # record's own ``last_session``, which the record carries regardless of this one field's
+        # status). A run that stops SHORT of ``cov_last`` has valid data resuming after it within
+        # this very snapshot, so it is an interior hole and is never exempted here, however long.
+        # ONLY ``missing_session``: a trailing run of ``invalid_prices`` (or any other status) is a
+        # corrupt-data problem on a symbol that still trades, never a delisting. The run starts
+        # inside the window (``exc_first <= want_last``), so the symbol's last valid bar precedes
+        # the window end.
+        trailing = (status == STATUS_MISSING_SESSION and not leading and contiguous
+                    and cov_last is not None and exc_last == cov_last and exc_first <= want_last)
+        if trailing:
+            continue                     # the delisting date explains it: legitimate post-delisting
         whole = leading and contiguous
         grouped.setdefault((whole, status, exc_first, exc_last, rows), []).append(
             str(exc.get("field") or "?"))

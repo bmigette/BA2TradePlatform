@@ -285,15 +285,15 @@ def test_the_channel_fit_matches_an_independent_ols():
         (closes[-1] - (ra + (CHANNEL_LOOKBACK - 1) * rb - 2.0 * rsd)) / (4.0 * rsd))
 
 
-def test_a_flat_channel_has_zero_dispersion_a_valid_zero_slope_and_unknown_width_and_position():
+def test_a_flat_channel_has_zero_dispersion_a_valid_zero_slope_and_neutral_width_and_position():
     closes = [100.0 + 0.3 * (i % 7) for i in range(WINDOW - CHANNEL_LOOKBACK)] + [111.0] * CHANNEL_LOOKBACK
     o, h, l, c, v = _bars(closes)
     row = _row(o, h, l, c, v)
     assert row["channel_slope_20_atr"] == 0.0
     assert row["channel_slope_20_atr_status"] == STATUS_VALID
-    assert row["channel_width_20_atr"] is None and row["channel_pos_20"] is None
-    assert row["channel_width_20_atr_status"] == STATUS_INVALID_PRICES
-    assert row["channel_pos_20_status"] == STATUS_INVALID_PRICES
+    # calc-2 (operator decision 2026-10-01): zero dispersion is a defined neutral state.
+    assert row["channel_width_20_atr"] == 0.0 and row["channel_width_20_atr_status"] == STATUS_VALID
+    assert row["channel_pos_20"] == 0.5 and row["channel_pos_20_status"] == STATUS_VALID
 
 
 def test_a_close_outside_the_channel_gives_a_position_outside_0_1_and_is_not_clamped():
@@ -458,13 +458,28 @@ def test_a_break_is_not_registered_before_the_swing_it_breaks_is_confirmed():
 # window-level failures
 # --------------------------------------------------------------------------------------------
 
-def test_a_non_positive_atr_makes_every_field_unknown():
+def test_an_all_flat_window_is_defined_neutral_not_invalid():
+    """calc-2: ATR[127] == 0 (every bar O=H=L=C and equal) is a thin-trading market state."""
     o, h, l, c, v = _bars([100.0] * WINDOW, spread=0.0)
     row = _row(o, h, l, c, v)
+    assert row["channel_slope_20_atr"] == 0.0 and row["channel_width_20_atr"] == 0.0
+    assert row["channel_pos_20"] == 0.5
+    assert row["close_vs_prior_high_20_atr"] == 0.0 and row["close_vs_prior_low_20_atr"] == 0.0
+    assert row["structure_state"] == 0.0
     for f in STRUCTURE_FIELDS:
-        assert row[f] is None
-        assert row[f"{f}_status"] == STATUS_INVALID_PRICES
-    assert compute_chart_structure(o, h, l, c, v).dist_support.reason == f"atr<=0 at index {WINDOW - 1}"
+        assert row[f"{f}_status"] != STATUS_INVALID_PRICES
+        v_ = row[f]
+        assert v_ is None or math.isfinite(v_)
+    # no pivot exists in a flat window: levels / bars-since stay "not enough structure"
+    assert row["structure_dist_support_atr_status"] == STATUS_INSUFFICIENT_HISTORY
+
+
+def test_one_bad_bar_in_a_flat_window_is_still_invalid():
+    o, h, l, c, v = _bars([100.0] * WINDOW, spread=0.0)
+    h = h.copy()
+    h[60] = 90.0                           # high < low
+    row = _row(o, h, l, c, v)
+    assert all(row[f"{f}_status"] == STATUS_INVALID_PRICES for f in STRUCTURE_FIELDS)
 
 
 def test_a_short_window_is_insufficient_history_and_a_long_one_is_a_programming_error():
@@ -523,7 +538,7 @@ _TABLE = [
 
 def test_the_profile_registers_the_twelve_fields_of_the_design_table_in_order():
     assert PROFILES["ta-structure-v1"] is TA_STRUCTURE_V1
-    assert TA_STRUCTURE_V1.calc_version == STRUCTURE_CALC_VERSION == "ta-structure-v1/calc-1"
+    assert TA_STRUCTURE_V1.calc_version == STRUCTURE_CALC_VERSION == "ta-structure-v1/calc-2"
     assert tuple(f.name for f in TA_STRUCTURE_V1.fields) == STRUCTURE_FIELDS
     assert [row[0] for row in _TABLE] == list(STRUCTURE_FIELDS)
 
@@ -619,4 +634,4 @@ def test_golden_rows_are_bit_for_bit_stable(key):
     # Pinned HERE, next to the hex: a row whose bits changed is a new calculator, and the two
     # decisions -- re-paste the goldens, bump the calc version -- have to be taken together or
     # a warmed store will serve rows no longer produced by the version it is labelled with.
-    assert row["calc_version"] == "ta-structure-v1/calc-1"
+    assert row["calc_version"] == "ta-structure-v1/calc-2"

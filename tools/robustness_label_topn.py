@@ -178,6 +178,7 @@ def process(name_like: str, dry_run: bool, relabel: bool, limit: Optional[int]) 
     """One pass. Returns how many backtests were labelled."""
     from app.models import SessionLocal, Backtest, StrategyOptimization
     from app.services.backtest.monte_carlo import run_monte_carlo
+    from app.services.distinct_topn import is_oos_row
 
     db = SessionLocal()
     labelled = 0
@@ -192,6 +193,10 @@ def process(name_like: str, dry_run: bool, relabel: bool, limit: Optional[int]) 
                      .order_by(Backtest.id).all())
             for bt in bts:
                 labels = _labels_of(bt)
+                # Walk-forward out-of-sample rows share the optimization_id but are NOT its
+                # in-sample TOP rows: never label them.
+                if is_oos_row(bt.name, labels):
+                    continue
                 if not relabel and (ROBUST in labels or FRAGILE in labels):
                     continue
                 trades = _json_list(bt.trades)

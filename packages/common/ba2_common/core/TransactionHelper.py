@@ -10,6 +10,7 @@ This class handles:
 Separates business logic from data models following clean architecture principles.
 """
 
+import re
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 from sqlmodel import Session, select
@@ -25,6 +26,12 @@ from ba2_common.logger import logger
 #: order is PENDING at OUR end, the gate held it back, and nothing was sent.
 _SUBMISSION_DEAD_STATUSES = frozenset(
     OrderStatus.get_terminal_statuses() | {OrderStatus.WASHTRADE_LOCKED})
+
+#: The comment the live TP/SL writers stamp on a protective order:
+#: ``AlpacaAccount._generate_tpsl_comment`` -> ``<ts>-TP-[``, ``<ts>-SL-[``, ``<ts>-TPSL-[``,
+#: and the OCO leg rows ``<ts>-OCO-TP-[``, ``<ts>-OCO-SL-[``, ``<ts>-OCO-LEG-[``. Anchored on the
+#: timestamp digit so free text that merely mentions "TP" or "SL" never matches.
+_PROTECTIVE_COMMENT_RE = re.compile(r"\d-(?:OCO-(?:TP|SL|LEG)|TPSL|TP|SL)-\[")
 
 if TYPE_CHECKING:
     from ba2_common.core.interfaces.AccountInterface import AccountInterface
@@ -342,6 +349,140 @@ class TransactionHelper:
             not_statuses=OrderStatus.get_terminal_statuses(), session=session)
         return matches[0] if matches else None
     
+    @staticmethod
+    def is_resting_protection(order: TradingOrder) -> bool:
+        """True if ``order`` is the position's own TP/SL protection, never a close of it.
+
+        Meant for the transaction's ROOT rows (``depends_on_order IS NULL``); a dependent row
+        is already set apart by its ``depends_on_order``. Live writes protection at the root in
+        three shapes, and none of them is a close someone submitted:
+
+        * a LEG of a composite order (``parent_order_id`` set): Alpaca's OCO TP/SL legs
+          (the stop leg is typically ``HELD``) and the per-contract legs of a multi-leg option
+          structure. A leg is not an order of its own: its parent carries the status;
+        * a bracket container, ``order_type`` OCO/OTO (``_create_broker_oco_order`` places
+          one with no ``depends_on_order`` once the entry has filled);
+        * a standalone TP or SL placed once the entry has filled
+          (``_create_broker_tp_order`` / ``_create_broker_sl_order``), recognised by the
+          comment its writer stamps: ``<ts>-TP-[`` / ``<ts>-SL-[`` / ``<ts>-TPSL-[``, or an
+          OCO leg's ``<ts>-OCO-TP|SL|LEG-[`` (older leg rows lack ``parent_order_id``).
+
+        Never a MARKET order: see the check below.
+
+        NOT ``data["sl_percent_target"]``: the ENTRY carries that key too (its safeguard
+        stop), and reading the entry as protection would promote a real close to "entry"
+        and let a second close through (measured on prod transaction 238 and 46 dev rows).
+
+        The backtest writes none of these at the root: its TP/SL live on the transaction and
+        a bracket close is synthesised filled with ``depends_on_order`` set.
+        """
+        if order.parent_order_id is not None:
+            return True
+        if order.order_type in (OrderType.OCO, OrderType.OTO):
+            return True
+        # A MARKET order is a close, whatever its comment says. A stop rejected as already
+        # breached is re-sent as MARKET on the SAME row and keeps its ``<ts>-SL-[`` comment
+        # (``AccountInterface._handle_order_submit_error``): that row is a full-size market
+        # sell, and reading it as resting protection would let a second close through.
+        if order.order_type == OrderType.MARKET:
+            return False
+        return bool(order.comment) and _PROTECTIVE_COMMENT_RE.search(order.comment) is not None
+
+    @staticmethod
+    def post_fill_position_quantity(transaction: Transaction, entry_side: OrderDirection,
+                                    orders: List[TradingOrder]) -> float:
+        """The position this transaction will hold once its WORKING non-protection orders fill.
+
+        What a protective exit must cover. ``transaction.quantity`` is not it: that is the sum
+        of the entry-side orders ever sent (``_recalculate_transaction_quantity``), so a trim
+        never lowers it, and an add raises it before the add has filled. This is:
+
+            net filled quantity (every executed order, BUY +, SELL -)
+          + the unfilled remainder of every working order that is NOT resting protection
+            (an add, a trim, a close someone submitted), signed the same way
+
+        expressed in the direction of the position (a long is positive, and so is a short's
+        size). Protection is excluded because it does not move the position until it fires,
+        and a triggered leg is already in the executed sum.
+
+        RAISES ``ValueError`` when an executed order carries no ``filled_qty``: the size is
+        then unmeasurable, and a stop sized on a guess reserves the wrong number of shares.
+
+        ``orders``: the transaction's orders (any status).
+        """
+        executed = OrderStatus.get_executed_statuses()
+        working = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
+                   | {OrderStatus.PARTIALLY_FILLED})
+        net = 0.0
+        for order in orders:
+            sign = 1.0 if order.side == OrderDirection.BUY else -1.0
+            if order.status in executed:
+                if order.filled_qty is None:
+                    raise ValueError(
+                        f"transaction {transaction.id}: order {order.id} is {order.status} with "
+                        f"no filled_qty -- the position size is unmeasurable")
+                net += sign * float(order.filled_qty)
+            if order.status in working and not TransactionHelper.is_resting_protection(order):
+                if order.quantity is None or (order.status == OrderStatus.PARTIALLY_FILLED
+                                              and order.filled_qty is None):
+                    raise ValueError(
+                        f"transaction {transaction.id}: working order {order.id} "
+                        f"({order.status}) has quantity={order.quantity}, "
+                        f"filled_qty={order.filled_qty} -- the position size is unmeasurable")
+                # An order that has not started filling carries no filled_qty: all of it is
+                # still to come.
+                remaining = float(order.quantity)
+                if order.filled_qty is not None:
+                    remaining -= float(order.filled_qty)
+                if remaining > 0:
+                    net += sign * remaining
+        return net if entry_side == OrderDirection.BUY else -net
+
+    @staticmethod
+    def tpsl_comment(kind: str, account_id: Optional[int], transaction_id: Optional[int],
+                     parent_order_id: Optional[int], note: Optional[str] = None) -> str:
+        """The comment every TP/SL writer stamps: ``<ts>-<kind>-[ACC:a/TR:t/PORD:p]``.
+
+        ``kind`` is TP, SL or TPSL (an OCO). The mark is what ``is_resting_protection``
+        recognises on a root row, so a writer that stamps anything else leaves its resting
+        leg looking like a pending close. ``note`` (free text, e.g. what the leg replaces) is
+        appended after the mark.
+        """
+        if kind not in ("TP", "SL", "TPSL"):
+            raise ValueError(f"tpsl_comment kind must be TP, SL or TPSL, got {kind!r}")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        mark = f"{timestamp}-{kind}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
+        return f"{mark} {note}" if note else mark
+
+    @staticmethod
+    def pending_closing_orders(root_orders: List[TradingOrder]) -> List[TradingOrder]:
+        """The transaction's closing orders that are still WORKING, oldest first.
+
+        ``root_orders`` are the transaction's ``depends_on_order IS NULL`` rows. A pending
+        closing order is one that
+          * is not resting protection (``is_resting_protection``): a TP/SL leg, bracket or
+            standalone TP/SL guards the position, it is not a close anyone submitted;
+          * is not the entry, i.e. the oldest remaining root order (ordered by UTC-normalised
+            ``created_at``, then id: naive and aware timestamps both come back from SQLite);
+          * is neither terminal nor FILLED. PARTIALLY_FILLED counts as pending: the rest of
+            the close is still working.
+
+        So: a submitted close / reduce / sell that has not resolved, or the net-only parent
+        of a multi-leg option close. A missing ``created_at`` sorts first (as the entry).
+        """
+        if len(root_orders) <= 1:  # just the entry: the backtest's hot path, per bar
+            return []
+        from ba2_common.core.utils import as_utc_key
+
+        candidates = [o for o in root_orders if not TransactionHelper.is_resting_protection(o)]
+        if len(candidates) <= 1:
+            return []
+        candidates.sort(key=lambda o: (as_utc_key(o.created_at, default=datetime.min), o.id or 0))
+        # get_terminal_statuses() deliberately excludes FILLED (tracked as "executed"); a
+        # FILLED close has resolved and must not read as still pending.
+        resolved = OrderStatus.get_terminal_statuses() | {OrderStatus.FILLED}
+        return [o for o in candidates[1:] if o.status not in resolved]
+
     @staticmethod
     def is_tpsl_order(order: TradingOrder) -> bool:
         """
@@ -805,6 +946,7 @@ class TransactionHelper:
             with Session(get_db().bind) as session:
                 # Get entry order to determine direction
                 entry_order = TransactionHelper.get_entry_order(transaction, session)
+                entry_order_id = entry_order.id if entry_order else None
                 if entry_order:
                     entry_direction = entry_order.side
                 else:
@@ -1008,7 +1150,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="OCO TP/SL (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TPSL", account.id, transaction.id, entry_order_id,
+                                note="OCO TP/SL (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         oco_id = add_instance(oco_order)
@@ -1030,7 +1174,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="Take Profit order (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TP", account.id, transaction.id, entry_order_id,
+                                note="Take Profit order (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         tp_id = add_instance(tp_order)
@@ -1052,7 +1198,9 @@ class TransactionHelper:
                             status=OrderStatus.WAITING_TRIGGER,
                             depends_on_order=close_order_id,
                             depends_order_status_trigger=OrderStatus.FILLED,
-                            comment="Stop Loss order (triggered by close fill)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "SL", account.id, transaction.id, entry_order_id,
+                                note="Stop Loss order (triggered by close fill)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         sl_id = add_instance(sl_order)
@@ -1173,7 +1321,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="OCO TP/SL (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TPSL", account.id, transaction.id, entry_order_id,
+                                note="OCO TP/SL (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         oco_id = add_instance(oco_order)
@@ -1195,7 +1345,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="Take Profit order (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "TP", account.id, transaction.id, entry_order_id,
+                                note="Take Profit order (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         tp_id = add_instance(tp_order)
@@ -1217,7 +1369,9 @@ class TransactionHelper:
                             status=order_status,
                             depends_on_order=trigger_order_id,
                             depends_order_status_trigger=trigger_status,
-                            comment="Stop Loss order (triggered by old TP/SL cancel)",
+                            comment=TransactionHelper.tpsl_comment(
+                                "SL", account.id, transaction.id, entry_order_id,
+                                note="Stop Loss order (triggered by old TP/SL cancel)"),
                             created_at=datetime.now(timezone.utc)
                         )
                         sl_id = add_instance(sl_order)

@@ -34,7 +34,8 @@
 # ThetaData TSLA; the store serialises builders per KEY only, so 24 cold consumers on
 # different keys can OOM the host). From the repo root, same PYTHONPATH/BA2_HOME as below:
 #   /opt/ba2worker/ba2-venvs/test/bin/python tools/build_shared_arrays.py #     --options-store thetadata --universe-file tools/options_universe_top100.txt #     --ohlcv-provider FMPOHLCVProvider --interval 1d --start 2020-01-01 --end 2025-12-31 #     --warmup-days 60 --jobs 4
-# and run it TWICE: the second run must report 0 built / 98 opened before launching.
+# and run it TWICE: the second run must report 0 built / 97 opened before launching (97 since
+# SPCX left the universe on 2026-09-16).
 # BT_MAX_TASKS_PER_CHILD is raised from the handler default of 8: a recycle now costs a
 # re-OPEN of mapped files (ms), not a re-parse, but the projections are still rebuilt.
 set -euo pipefail
@@ -116,6 +117,9 @@ fi
 if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   MC_PYTHON=/opt/ba2worker/ba2-venvs/test/bin/python
   MC_WARM=tools/warm_market_conditions.py
+  # Option jobs are fmp-only (the launcher refuses an option job stated as alpaca), and the warm tool
+  # has no default vendor: state it.
+  MC_HS=fmp
   MC_PLAN="${MC_PLAN:-/home/debian/ba2-grid/market_conditions_plan.json}"
   MC_UNIVERSE="${MC_UNIVERSE:-tools/options_universe_top100.txt}"
   MC_START="${STAGE1_START:-2020-01-01}"
@@ -168,21 +172,21 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
     if [ "$MC_DRY" = "1" ]; then
       echo "stage1_run.sh: market-condition warm step (profile $MC_PROFILE), run ONCE"
       echo "               before the matrix command below:"
-      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN_P"
-      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --print-digest   # -> the $MC_PROFILE digest"
-      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest>"
-      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE"
+      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --ohlcv-history-source $MC_HS --out $MC_PLAN_P"
+      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --ohlcv-history-source $MC_HS --print-digest   # -> the $MC_PROFILE digest"
+      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest> --ohlcv-history-source $MC_HS"
+      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE --ohlcv-history-source $MC_HS"
       MC_DIGEST="${MC_DIGEST:-DIGEST-FROM-BUILD}"
     else
       if [ -z "$MC_DIGEST" ]; then
         "$MC_PYTHON" "$MC_WARM" plan --profile "$MC_PROFILE" \
-          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN_P" || {
+          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --ohlcv-history-source "$MC_HS" --out "$MC_PLAN_P" || {
           echo "stage1_run.sh: market-condition PLAN is actionable for $MC_PROFILE (missing" >&2
           echo "coverage or a failed source preflight) -- resolve it (re-fetch those symbols, or" >&2
           echo "trim the universe) and re-run. Refusing to launch a gated grid on an incomplete" >&2
           echo "snapshot." >&2
           exit 1; }
-        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only \
+        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only --ohlcv-history-source "$MC_HS" \
           --print-digest | tail -n 1)" || {
           echo "stage1_run.sh: market-condition BUILD failed for $MC_PROFILE" >&2; exit 1; }
         if [ -z "$MC_DIGEST" ]; then
@@ -192,10 +196,10 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
       else
         echo "stage1_run.sh: market-condition profile $MC_PROFILE uses the pre-set manifest $MC_DIGEST (plan/build skipped)"
       fi
-      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" || {
+      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" --ohlcv-history-source "$MC_HS" || {
         echo "stage1_run.sh: market-condition VERIFY failed for $MC_DIGEST ($MC_PROFILE)" >&2
         exit 1; }
-      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" \
+      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" --ohlcv-history-source "$MC_HS" \
         --profile "$MC_PROFILE" || {
         echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MC_DIGEST ($MC_PROFILE)" >&2
         exit 1; }
@@ -207,6 +211,20 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   MC_ARGS=(--market-condition-profile "$MARKET_CONDITION_PROFILE" \
            --market-condition-manifest "$MARKET_CONDITION_MANIFEST")
 fi
+
+# RISK-FREE RATE (2026-09-26). Every option backtest inverts its bars and prices its barless
+# marks at the as-of 3-month Treasury (FRED DGS3MO), read CACHE-ONLY from
+# $BA2_HOME/common/cache/fred/DGS3MO.json (CACHE_FOLDER/fred), and REFUSES to start without it.
+# This host needs that file synced (it needs no FRED key). Checked here, before any job, rather
+# than discovered by every trial of job 1. Not a digest input: job names are unchanged.
+RATE_CHECK=(/opt/ba2worker/ba2-venvs/test/bin/python tools/refresh_fred_cache.py   --check-rate-window "${STAGE1_START:-2020-01-01}" "${STAGE1_END:-2025-12-31}")
+case " $* " in
+  *" --dry-run "*) echo "stage1_run.sh: risk-free-rate preflight (cache only): ${RATE_CHECK[*]}" ;;
+  *) "${RATE_CHECK[@]}" || {
+       echo "stage1_run.sh: the FRED DGS3MO cache does not cover the window -- sync" >&2
+       echo "<CACHE_FOLDER>/fred/DGS3MO.json from a host that ran tools/refresh_fred_cache.py." >&2
+       exit 1; } ;;
+esac
 
 # FITNESS (2026-09-17). Unset -> run_options_matrix --profile discovery's own default,
 # ``option_consistent_annual_return``, which is what every -st1 job so far ran under; with it
@@ -289,6 +307,25 @@ if [ -n "$STAGE1_ROBUST" ]; then
   esac
 fi
 
+# MINIMUM-IMPROVEMENT EARLY STOP (2026-09-26). STAGE1_EARLY_STOP_MIN_REL=0.01 forwards
+# --early-stop-min-rel 0.01: a generation resets the patience clock only when its best beats the
+# best at the last COUNTED improvement by at least that fraction (1%); a smaller gain still
+# updates the best genome but counts as no improvement, so a search stops instead of creeping
+# forward on +0.1 gains for 40 generations. Unset (the default) passes NOTHING -- the launch line
+# is byte-identical and every job keeps its name and checkpoint. When set it is a
+# discovery-digest token, so the jobs get NEW names (intended: a different stopping rule never
+# resumes the other rule's checkpoint). Patience itself is still --early-stop 8 below; pass
+# `--early-stop 5` after it on the command line (argparse keeps the last value), e.g. for stage-1
+# jobs 2-16:
+#   STAGE1_EARLY_STOP_MIN_REL=0.01 tools/stage1_run.sh --early-stop 5 --strategies O_LP,...
+# The driver refuses a value that is not a fraction in (0, 1) -- 0 included: it is the legacy
+# rule under new job names, so leave the variable unset for the legacy rule.
+STAGE1_EARLY_STOP_MIN_REL="${STAGE1_EARLY_STOP_MIN_REL:-}"
+MINREL_ARGS=()
+if [ -n "$STAGE1_EARLY_STOP_MIN_REL" ]; then
+  MINREL_ARGS=(--early-stop-min-rel "$STAGE1_EARLY_STOP_MIN_REL")
+fi
+
 # ORDER-TIME SIZING (plan 2026-09-24 Task 11): --option-size-within-fill-volume cuts every OPENING
 # option order to what the backtest fill engine's 10%-of-bar-volume cap can fill (read on the
 # decision bar; a structure by its most constrained leg). Without it an oversized order simply
@@ -310,4 +347,5 @@ exec /opt/ba2worker/ba2-venvs/test/bin/python tools/run_options_matrix.py \
   ${FITNESS_ARGS[@]+"${FITNESS_ARGS[@]}"} \
   ${ROBUST_ARGS[@]+"${ROBUST_ARGS[@]}"} \
   ${MC_ARGS[@]+"${MC_ARGS[@]}"} \
+  ${MINREL_ARGS[@]+"${MINREL_ARGS[@]}"} \
   "$@"

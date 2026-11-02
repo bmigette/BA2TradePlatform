@@ -61,6 +61,8 @@ class ParquetRunInputs:
     store: str
     options_cache_db: str
     parquet_root: Optional[str]
+    #: The explicit constant the run priced with, or None when it read the as-of FRED DGS3MO
+    #: series (then rebuilt from the FRED cache for the run's window, as the run did).
     risk_free_rate: Optional[float]
     execution_interval: str
     warmup_days: int
@@ -68,6 +70,17 @@ class ParquetRunInputs:
     end: datetime
     #: True: the run had a split basis (as-traded spot). False: it predates it.
     as_traded: bool
+    #: How the rate was established, for the popup's note: "recorded" (the run config or
+    #: results state it), "legacy-flat" (the run predates the rate record and the as-of
+    #: series, so it priced at the flat default of that time).
+    rate_origin: str = "recorded"
+    #: A ``fred-dgs3mo`` run's recorded ``RiskFreeRate.identity`` (a digest of every DGS3MO
+    #: print up to its end date). The rebuilt reader must produce the same one, or today's
+    #: FRED cache is not the one the run priced with and its greeks cannot be reproduced.
+    rate_identity: Optional[str] = None
+    #: The OHLCV history the run read (``fmp`` | ``alpaca``): the closes the greeks were inverted
+    #: against, and the split basis they were converted with, come from it.
+    history_source: str = "fmp"
 
     def run_config(self, underlying: str) -> Dict[str, Any]:
         """The run config, narrowed to ONE underlying.
@@ -77,6 +90,7 @@ class ParquetRunInputs:
         ``spot_scope`` string, which only keys caches -- and this overlay is private anyway.
         """
         return {
+            "ohlcv_history_source": self.history_source,
             "options_cache_db": self.options_cache_db,
             "options_store": self.store,
             "options_parquet_root": self.parquet_root,
@@ -101,10 +115,17 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
     """``(inputs, None)`` when the run's parquet reader can be rebuilt, else ``(None, reason)``.
 
     Nothing is defaulted that the run might have set differently: an unrecorded interval,
-    warm-up or window refuses. The risk-free rate is the one input whose absence is the norm
-    (no launcher records it); the run then resolved ``default_options_risk_free_rate()`` in
-    its own process, which is reproduced -- unless THIS process overrides that default through
-    the environment, in which case the run's value cannot be told and it refuses.
+    warm-up or window refuses. The risk-free rate is established in this order:
+
+      1. the run CONFIG's ``options_risk_free_rate`` (an explicit constant);
+      2. the run RESULTS' ``options_risk_free_rate_source`` (every options run since the as-of
+         rate, 2026-09-26): an explicit constant is used as recorded, ``fred-dgs3mo`` is
+         rebuilt from the FRED cache over the run's window, exactly as the run built it;
+      3. neither: the run predates both, and priced at the flat 4.5% every options run used
+         then (``options_store.LEGACY_FLAT_RISK_FREE_RATE``) -- reproduced for display only.
+
+    In cases 2 (fred) and 3, THIS process overriding the rate through the environment would
+    replace the run's rate, so the run's value cannot be told and it refuses.
     """
     from app.services.backtest import options_store as ostore
 
@@ -131,21 +152,40 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
     if start is None or end is None:
         return None, "the saved result carries no start/end date, so the run's window is unknown"
 
+    results = _json_blob(getattr(backtest, "results", None))
+    if not isinstance(results, dict):
+        return None, ("its results are not readable, so whether it priced on the as-traded "
+                      "split basis cannot be told")
+
     rate = provenance.risk_free_rate
+    rate_origin = "recorded"
+    rate_identity = None
     if rate is not None:
         try:
             rate = float(rate)
         except (TypeError, ValueError):
             return None, f"its recorded options_risk_free_rate {rate!r} is not a number"
-    elif os.environ.get(ostore._RATE_ENV):
-        return None, (f"it did not record its risk-free rate, and this process overrides the "
-                      f"default through {ostore._RATE_ENV}, so the rate the run inverted at "
-                      f"cannot be established")
-
-    results = _json_blob(getattr(backtest, "results", None))
-    if not isinstance(results, dict):
-        return None, ("its results are not readable, so whether it priced on the as-traded "
-                      "split basis cannot be told")
+    else:
+        record = results.get("options_risk_free_rate_source")
+        if isinstance(record, dict) and record.get("source") == "explicit":
+            try:
+                rate = float(record["rate"])
+            except (KeyError, TypeError, ValueError):
+                return None, f"its recorded risk-free rate {record!r} carries no usable rate"
+        elif os.environ.get(ostore._RATE_ENV):
+            return None, (f"its risk-free rate is not a recorded constant, and this process "
+                          f"overrides the rate through {ostore._RATE_ENV}, so the rate the run "
+                          f"inverted at cannot be established")
+        elif record is None:
+            rate = ostore.LEGACY_FLAT_RISK_FREE_RATE
+            rate_origin = "legacy-flat"
+        elif not (isinstance(record, dict) and record.get("source") == "fred-dgs3mo"):
+            return None, f"its recorded risk-free rate source {record!r} is not recognised"
+        else:
+            rate_identity = record.get("identity")
+            if not rate_identity:
+                return None, ("its recorded FRED DGS3MO rate carries no identity, so whether "
+                              "today's FRED cache is the one it priced with cannot be told")
     if "option_basis_guard" in results:
         if not isinstance(results["option_basis_guard"], dict):
             return None, ("its results record no split-basis guard for a parquet reader, which "
@@ -154,11 +194,18 @@ def parquet_run_inputs(provenance: Any, backtest: Any) -> Tuple[Optional[Parquet
     else:
         as_traded = False
 
+    from app.services.backtest.history_source import stored_history_source
+
+    try:
+        history_source = stored_history_source(backtest)
+    except ValueError as exc:
+        return None, f"its OHLCV history source cannot be established ({exc})"
     return ParquetRunInputs(
-        store=store, options_cache_db=provenance.db_path or _OPTIONS_RUN_FLAG,
+        history_source=history_source, store=store, options_cache_db=provenance.db_path or _OPTIONS_RUN_FLAG,
         parquet_root=provenance.parquet_root, risk_free_rate=rate,
         execution_interval=str(interval), warmup_days=warmup_days,
-        start=start, end=end, as_traded=as_traded), None
+        start=start, end=end, as_traded=as_traded, rate_origin=rate_origin,
+        rate_identity=rate_identity), None
 
 
 @dataclass
@@ -209,7 +256,10 @@ class ParquetContractReader:
 
     def _build_context(self, underlying: str) -> _UnderlyingContext:
         from ba2_common.core.split_basis import SplitBasisRefused
-        from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+        from ba2_common.core.ohlcv_history import history_registry_key
+        from ba2_providers import get_provider
+
+        from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
 
         from app.services.backtest.options_cache import OptionsCacheMiss
         from app.services.backtest.options_store import build_options_provider, build_options_run
@@ -226,9 +276,11 @@ class ParquetContractReader:
         # In cached_only mode it uses the inner provider for its CLASS NAME (the cache
         # directory) and never calls it; constructing a real one would read the API key and
         # create the cache folder, so an uninitialised instance of the same class stands in.
-        ohlcv = MemoizedOHLCVProvider(FMPOHLCVProvider.__new__(FMPOHLCVProvider), fetch_start,
+        inner = type(get_provider("ohlcv", history_registry_key(inputs.history_source)))
+        ohlcv = MemoizedOHLCVProvider(inner.__new__(inner), fetch_start,
                                       inputs.end, interval=interval, cached_only=True)
         ps = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        ohlcv.bind_price_source(ps)
         try:
             # Exactly the arrays ``preload`` binds (read_window -> _ohlcv_arrays_from_df), for
             # the same [start - warmup, end] window, without its cache flush/publish.
@@ -236,7 +288,7 @@ class ParquetContractReader:
                                                           interval))
         except BacktestCacheMiss:
             raise ContractDetailRefused(
-                f"no cached {interval} FMP bars for {underlying} on this host, and the greeks "
+                f"no cached {interval} {inputs.history_source} bars for {underlying} on this host, and the greeks "
                 f"are inverted against them")
         try:
             if inputs.as_traded:
@@ -250,10 +302,19 @@ class ParquetContractReader:
                 f"host, so its spot cannot be reproduced: {exc}")
         except OptionsCacheMiss as exc:
             raise ContractDetailRefused(f"the run's option store is not on this host: {exc}")
+        except RiskFreeRateUnavailable as exc:
+            raise ContractDetailRefused(
+                f"the run's risk-free rate (FRED DGS3MO) cannot be rebuilt on this host: {exc}")
         except ValueError as exc:
             raise ContractDetailRefused(f"the run's option reader cannot be rebuilt: {exc}")
 
-        overlay = read_only_overlay(provider.root, underlying, provider.risk_free_rate)
+        if (inputs.rate_identity is not None
+                and provider.risk_free_rate_source.identity != inputs.rate_identity):
+            raise ContractDetailRefused(
+                f"the FRED DGS3MO series in this host's cache is not the one the run priced with "
+                f"(recorded {inputs.rate_identity}, cache gives "
+                f"{provider.risk_free_rate_source.identity}), so its greeks cannot be reproduced")
+        overlay = read_only_overlay(provider.root, underlying, provider.risk_free_rate_source)
         if overlay is None:
             raise ContractDetailRefused(
                 f"the {inputs.store} option arrays for {underlying} are not built on this host "
@@ -263,7 +324,7 @@ class ParquetContractReader:
 
     # -- the reader contract ---------------------------------------------------
     def latest_bar_on_or_before(self, occ_symbol: str, on_or_before: str) -> Optional[Dict[str, Any]]:
-        from app.services.backtest.option_basis_guard import BasisGuard, OptionSpotBasisMismatch
+        from app.services.backtest.option_basis_guard import OptionSpotBasisMismatch
         from app.services.backtest.parquet_options_provider import _underlying_of
 
         underlying = _underlying_of(occ_symbol)   # the provider's own routing (get_bar)
@@ -278,9 +339,11 @@ class ParquetContractReader:
         bar_day = u.raw.date_of_ord[u.bar_ord_l[i]]
         spot_source = ctx.provider.spot_source
 
-        # The E4 check on THIS bar's session. A fresh guard each time: a guard samples after
-        # its first evaluable session, and every bar shown here must be checked.
-        guard = BasisGuard(spot_source)
+        # The E4 check on THIS bar's session. A fresh guard each time (a guard samples after
+        # its first evaluable session, and every bar shown here must be checked), wired like
+        # the run's own -- split dates and dividend source included -- so a bar the run passed
+        # is not refused here.
+        guard = ctx.provider.new_basis_guard()
         try:
             guard.check(u, underlying, bar_day)
         except OptionSpotBasisMismatch as exc:
@@ -306,9 +369,13 @@ class ParquetContractReader:
         spot = ("the run's as-traded underlying close" if inputs.as_traded else
                 "the split-ADJUSTED underlying close (this run predates the as-traded split "
                 "basis)")
-        rate = f"r={ctx.provider.risk_free_rate:g}"
-        if inputs.risk_free_rate is None:
-            rate += " (not recorded on the run: the platform default it resolved)"
+        source = ctx.provider.risk_free_rate_source
+        rate = f"r={source.rate_on(bar_day):g}"
+        if inputs.rate_origin == "legacy-flat":
+            rate += (" (not recorded on the run: the flat default every options run priced "
+                     "with before the as-of FRED DGS3MO rate)")
+        elif not source.is_explicit:
+            rate += f" (the as-of FRED DGS3MO rate on {bar_day.isoformat()}, as the run read it)"
         notes = [f"not stored by the {inputs.store} store: derived by the run's own reader, "
                  f"Black-Scholes from this bar's close against {spot}, {rate}, from the current "
                  f"caches"]

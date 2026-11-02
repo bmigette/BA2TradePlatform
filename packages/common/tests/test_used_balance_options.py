@@ -102,18 +102,19 @@ class TestOptionUsedBalance:
             used = expert._calculate_used_balance(account)
             assert used == pytest.approx(980.0)  # 4.90 * 2 * 100, not 4.90 * 2 = 9.80
 
-    def test_short_option_marks_at_ask(self):
+    def test_a_short_option_with_no_strategy_is_unmeasurable_not_priced_as_spent(self):
+        """It used to be marked at the ask and counted as premium + loss (230 here), which treats the
+        collateral of a legacy short as if it were spent. With no strategy and no recorded reserve
+        its collateral is UNKNOWN: the used balance refuses, and says which row."""
         with ts.inmem_trades():
             quote = OptionQuote(symbol="X", bid=2.00, ask=2.30)
             account = _StubAccount(stock_price=563.29, quote=quote)
             expert = _StubExpert(expert_id=1)
-            _option_txn(expert_id=1, open_price=2.10, quantity=1, multiplier=100.0,
-                       side=OrderDirection.SELL)
-
-            used = expert._calculate_used_balance(account)
-            # SELL: profit_loss = (open_price - current) * qty * mult = (2.10-2.30)*1*100 = -20
-            # (losing) -> transaction_used = open_price*qty*mult + loss = 210 + 20 = 230.
-            assert used == pytest.approx(230.0)
+            txn_id = _option_txn(expert_id=1, open_price=2.10, quantity=1, multiplier=100.0,
+                                 side=OrderDirection.SELL)
+            failure = []
+            assert expert._calculate_used_balance(account, failure=failure) is None
+            assert f"transaction {txn_id}" in "; ".join(failure)
 
     def test_falls_back_to_open_price_when_quote_unavailable(self):
         with ts.inmem_trades():

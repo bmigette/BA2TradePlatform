@@ -42,10 +42,11 @@ def test_screen_universe_uses_metric_store_when_store_set(monkeypatch):
         captured["store_path"] = path
         return "FAKE_DF"
 
-    def fake_screen_as_of(df, day, settings):
+    def fake_screen_as_of(df, day, settings, excluded_symbols=None):
         captured["df"] = df
         captured["day"] = day
         captured["settings"] = settings
+        captured["excluded_symbols"] = excluded_symbols
         return ["aapl", "Msft"]  # lower/mixed case -> must be uppercased
 
     # The fake REPLACES sys.modules["...metric_store"], so it must expose everything the code
@@ -77,6 +78,37 @@ def test_screen_universe_uses_metric_store_when_store_set(monkeypatch):
     assert captured["store_path"] == "/tmp/store"
     assert captured["df"] == "FAKE_DF"
     assert captured["day"] == "2024-01-08"  # as_of formatted YYYY-MM-DD
+    assert captured["excluded_symbols"] is None  # not pushed onto this trial -> no-op
+
+
+def test_screen_universe_threads_excluded_symbols_to_the_metric_store(monkeypatch):
+    """goal2027atr split-basis fix: strategy_optimization_handler._build_daily_trial_config
+    pushes ``excluded_symbols`` onto a bypass expert's OWN per-trial settings (this expert does
+    NOT consult ``enabled_instruments`` for its screener-mode universe -- see
+    ``_resolve_universe_source``'s docstring), and ``_screen_universe`` must forward it to
+    ``metric_store.screen_universe_as_of`` so an excluded symbol can never be selected."""
+    captured = {}
+
+    def fake_load_store(path):
+        return "FAKE_DF"
+
+    def fake_screen_as_of(df, day, settings, excluded_symbols=None):
+        captured["excluded_symbols"] = excluded_symbols
+        return ["AAPL", "MSFT"]
+
+    import ba2_providers.screener.metric_store as _real_ms
+    fake_ms = SimpleNamespace(load_store=fake_load_store,
+                              screen_universe_as_of=fake_screen_as_of,
+                              METRIC_STORE_KEYS=_real_ms.METRIC_STORE_KEYS,
+                              normalize_screener_settings=_real_ms.normalize_screener_settings)
+    import ba2_providers.screener as screener_pkg
+    monkeypatch.setattr(screener_pkg, "metric_store", fake_ms, raising=False)
+    monkeypatch.setitem(sys.modules, "ba2_providers.screener.metric_store", fake_ms)
+
+    me = _fake_self({"screener_store": "/tmp/store", "excluded_symbols": ["SMCI", "MARA"]})
+    FactorRanker._screen_universe(me, as_of=AS_OF)
+
+    assert captured["excluded_symbols"] == ["SMCI", "MARA"]
 
 
 def test_screen_universe_falls_back_to_stockscreener_when_store_unset(monkeypatch):

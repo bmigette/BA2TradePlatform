@@ -20,7 +20,8 @@ PHASE-1 strategy keys -- one job per (strategy x expert), so every result is att
 ONE structure (design Section 7):
 
     O_LEAP    LEAPS long -- ONE signal-driven key: a bullish buy_call arm (O_LEAPC) and a
-              bearish buy_put arm (O_LEAPP), delta 0.70-0.90, entry DTE 365-550, sharing one
+              bearish buy_put arm (O_LEAPP), delta 0.70-0.90, entry DTE 270-540 (floor
+              lowered from 365, operator decision 2026-09-30 -- design §1b), sharing one
               exit ruleset. Operator decision 2026-09-02, superseding the two separate keys:
               the two arms are the same structure pointed either way, and the group shape gives
               the GA a per-arm on/off gene so it can drop a direction in a one-sided regime.
@@ -48,8 +49,9 @@ tree actually reaches it over the run window. Without it a LEAPS job over the fu
 universe spends most of its compute on names that never listed a 1-year expiry, and reports
 the resulting nothing as a result. Per-strategy thresholds:
 
-    O_LEAP  / O_PMCC    DTE >= 365     (January-cycle LEAPS: both O_LEAP arms, and the
-                                       PMCC's long leg)
+    O_LEAP  / O_PMCC    DTE >= 270     (January-cycle LEAPS: both O_LEAP arms, and the
+                                       PMCC's long leg; lowered from 365, operator decision
+                                       2026-09-30 -- design §1b)
     O_CBS   / O_PBS     DTE >= 180
     O_ERN               DTE >= 7       (nearly the whole universe)
 
@@ -76,6 +78,7 @@ Environment overrides (so a longer/shorter search does not need a code edit):
     BA2_GRID2_POPULATION, BA2_GRID2_GENERATIONS
 """
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -85,7 +88,9 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
@@ -100,11 +105,14 @@ _DEFAULT_STRATEGIES = ["O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"]
 _MIN_DTE = {
     # Keyed by the LAUNCHABLE key: O_LEAPC/O_LEAPP are the two arms of O_LEAP and are not
     # launchable on their own, so a threshold for them would never be read.
-    "O_LEAP": 365,
+    # Lowered from 365, operator decision 2026-09-30 (design §1b): the entry gene's floor
+    # dropped to 270, so a universe filter still keyed at 365 would drop names the strategy
+    # can now actually trade.
+    "O_LEAP": 270,
     # The PMCC's LONG leg is a LEAPS, so it needs the same January-cycle depth O_LEAP
     # does; its 30-45-DTE overlay is listed on every name and is never the binding
     # constraint.
-    "O_PMCC": 365,
+    "O_PMCC": 270,
     "O_ERN": 7,
     "O_CBS": 180,
     "O_PBS": 180,
@@ -238,6 +246,9 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         # the serving vendor's history floor, and the sqlite/Alpaca store's is 2024-01-18 --
         # so the design's 2023-01 start RAISES before the job runs on the default store.
         "--options-store", args.options_store,
+        # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
+        # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
+        "--ohlcv-history-source", args.ohlcv_history_source,
         "--fitness", args.fitness,
         # Daily cadence: option entries want the day's signal, and O_ERN's entry window is
         # 1-5 days wide, which a weekly scan would miss outright.
@@ -245,6 +256,8 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     ]
     if args.early_stop is not None:
         cmd += ["--early-stop", str(args.early_stop)]
+    # Always forwarded: absent, the launcher falls back to the legacy rule (any strict gain resets).
+    cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
     if args.mutation_prob is not None:
         cmd += ["--mutation-prob", str(args.mutation_prob)]
     # "Pass 0 to disable": a 0 must be FORWARDED, or the launcher re-applies its own default.
@@ -255,6 +268,14 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     if args.workers:
         cmd += ["--workers", args.workers]
     return cmd
+
+
+def _min_rel(text: str) -> float:
+    """``--early-stop-min-rel``: finite and in (0, 1); 0 would be the legacy rule under a new name."""
+    v = float(text)
+    if not math.isfinite(v) or not 0 < v < 1:
+        raise argparse.ArgumentTypeError("must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
+    return v
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -286,6 +307,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--generations", type=int, default=_DEFAULT_GENERATIONS,
                     help=f"GA generations (default {_DEFAULT_GENERATIONS}; "
                          f"$BA2_GRID2_GENERATIONS overrides).")
+    ap.add_argument("--early-stop-min-rel", type=_min_rel, default=0.01,
+                    help="Minimum RELATIVE gain (a fraction in (0, 1): 0.01 = 1%%) for a generation to "
+                         "reset the --early-stop patience (default 0.01, the owner's GA budget rule: "
+                         "patience 5 + 1%%). Always forwarded to the launcher.")
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops. Omitted -> "
                          "launcher default.")
@@ -299,6 +324,9 @@ def build_parser() -> argparse.ArgumentParser:
                          f"uses option_convex and must not be crossed with it).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default="alpaca",
+                    help="OHLCV history of the underlyings (default alpaca, owner 2026-10-22; the as-traded "
+                         "split basis then comes from the verified split table of the alpaca cache).")
     ap.add_argument("--options-store", default="thetadata",
                     help="Options store serving the run (default thetadata -- floor 2018-09-14, "
                          "the only vendor whose history reaches the 2020 start this grid "
@@ -334,8 +362,14 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    add_refused_decision_times_flag(ap)
+    args = ap.parse_args(argv)
+    refuse_decision_times_and_announce(args)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -378,8 +412,8 @@ def main(argv=None) -> int:
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
-    print("options grid 2 driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, name, rc)
+    return finish_matrix(_FAILED_JOBS, "options grid 2 driver")
 
 
 if __name__ == "__main__":

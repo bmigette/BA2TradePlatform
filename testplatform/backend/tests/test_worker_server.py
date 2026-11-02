@@ -533,3 +533,28 @@ def test_actively_polled_job_is_never_swept(monkeypatch):
 
     assert "alive" in ws._JOBS
     assert ctl["cancel"] is False
+
+
+def test_cache_manifest_hash_dirs_adds_crc_only_under_those_folders(client, tmp_path, monkeypatch):
+    dst = tmp_path / "worker_cache"
+    (dst / "AlpacaHistoryOHLCVProvider" / "_meta").mkdir(parents=True)
+    (dst / "AlpacaHistoryOHLCVProvider" / "_meta" / "gate_certificate.json").write_bytes(b"cert")
+    (dst / "options").mkdir()
+    (dst / "options" / "o.sqlite").write_bytes(b"o")
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+
+    r = client.get("/cache/manifest", headers=H, params={"hash_dirs": "AlpacaHistoryOHLCVProvider"})
+    assert r.status_code == 200
+    by = {f["rel_path"]: f for f in r.json()["files"]}
+    assert "crc32" in by["AlpacaHistoryOHLCVProvider/_meta/gate_certificate.json"]
+    assert "crc32" not in by["options/o.sqlite"]
+    # the per-host crc cache is a dot file: never listed, so never synced or pruned
+    assert (dst / cache_sync.CRC_CACHE_NAME).is_file()
+    assert cache_sync.CRC_CACHE_NAME not in {p.split("/")[-1] for p in by}
+
+
+def test_cache_manifest_hash_dirs_rejects_a_path(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    for bad in ("../x", "a/b", "..", r"a\b"):
+        r = client.get("/cache/manifest", headers=H, params={"hash_dirs": bad})
+        assert r.status_code == 400, bad

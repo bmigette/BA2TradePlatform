@@ -135,13 +135,13 @@ Use the existing `tools/warm_market_conditions.py` sequence for each requested p
 # After producing the resolved union file; run from the repository root.
 $research = "reports/strategy_research/goal2020_market_conditions"
 New-Item -ItemType Directory -Force $research | Out-Null
-python tools/warm_market_conditions.py plan --profile ohlcv-v1 `
+python tools/warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp `
   --universe-file "$research/universe.txt" --start 2020-01-01 --end 2025-12-31 `
   --out "$research/ohlcv-v1-plan.json"
-python tools/warm_market_conditions.py build --plan "$research/ohlcv-v1-plan.json" --cache-only
+python tools/warm_market_conditions.py build --plan "$research/ohlcv-v1-plan.json" --cache-only --ohlcv-history-source fmp
 # Repeat plan/build for ta-structure-v1. Retain each returned digest separately.
-python tools/warm_market_conditions.py verify --manifest <digest>
-python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile <profile>
+python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source fmp
+python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile <profile> --ohlcv-history-source fmp
 ```
 
 The placeholders above must be replaced with the actual digest/profile. The union file is created
@@ -173,8 +173,9 @@ combinations by every threshold combination; use separate condition-focused GA j
 
 Record the added gene count and the search budget. The driver sizes each genetic job from its
 final gene count (population clamp(4 x genes, 24, 120); 25 generations, or 30 above 20 genes;
-early stop 8) and prints it; each profile adds its genes per opening rule (15 per rule with both),
-and market exits add up to 9. Pass `--population`/`--generations`/`--early-stop` to override;
+early stop after 5 generations without a gain of at least 1%) and prints it; each profile adds its
+genes per opening rule (15 per rule with both), and market exits add up to 9. Pass
+`--population`/`--generations`/`--early-stop`/`--early-stop-min-rel` to override;
 the option defaults do not establish adequate search depth for this campaign. Explicitly evaluate the frozen all-off control;
 random initialization is not a guarantee that the optimizer visits it.
 

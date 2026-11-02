@@ -90,14 +90,15 @@ def test_every_offered_strategy_states_its_chain_depth():
 
 
 def test_the_chain_depth_thresholds_are_the_designs():
-    """Design section 5: LEAPS keys need DTE >= 365, the backspreads >= 180, O_ERN >= 7.
+    """Design section 5: LEAPS keys need DTE >= 270 (lowered from 365, operator decision
+    2026-09-30 -- design §1b), the backspreads >= 180, O_ERN >= 7.
 
-    O_PMCC joins the 365 group at ``718f7cf4`` (Task 6 un-gated the key): its LONG leg IS a
+    O_PMCC joins the 270 group at ``718f7cf4`` (Task 6 un-gated the key): its LONG leg IS a
     LEAPS, so it needs the same January-cycle chain depth O_LEAP does -- the 30-45-DTE
     overlay is listed on every name and is never the binding constraint.
     """
     d = _driver()
-    assert d._MIN_DTE == {"O_LEAP": 365, "O_PMCC": 365, "O_ERN": 7,
+    assert d._MIN_DTE == {"O_LEAP": 270, "O_PMCC": 270, "O_ERN": 7,
                           "O_CBS": 180, "O_PBS": 180}
 
 
@@ -110,12 +111,12 @@ def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
 def test_the_preflight_runs_once_per_DISTINCT_threshold():
     """Three probes for FIVE keys: the probe walks the whole parquet tree, so running it per
     STRATEGY would pay for the same scan twice. Still three DISTINCT thresholds after
-    ``718f7cf4`` added O_PMCC -- it shares O_LEAP's 365, which is exactly the saving this
-    test exists to state."""
+    ``718f7cf4`` added O_PMCC -- it shares O_LEAP's threshold (270 as of 2026-09-30, was 365),
+    which is exactly the saving this test exists to state."""
     d = _driver()
     groups = d._thresholds(d._DEFAULT_STRATEGIES)
-    assert set(groups) == {365, 180, 7}
-    assert sorted(groups[365]) == ["O_LEAP", "O_PMCC"]
+    assert set(groups) == {270, 180, 7}
+    assert sorted(groups[270]) == ["O_LEAP", "O_PMCC"]
     assert sorted(groups[180]) == ["O_CBS", "O_PBS"]
     assert groups[7] == ["O_ERN"]
 
@@ -212,13 +213,15 @@ def test_the_launched_command_is_exactly_this():
     assert cmd == [
         "/x/ba2-test", "optimize", "--expert", "FMPRating",
         "--universe", "AAPL,MSFT", "--strategy", "O_LEAPC",
-        "--start", "2023-01-01", "--end", "2025-12-31",
+        "--start", "2020-01-01", "--end", "2025-12-31",
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
-        "--options-store", "parquet",
+        "--options-store", "thetadata",
+        "--ohlcv-history-source", "alpaca",
         "--fitness", "option_car",
         "--run-schedule", "daily", "--name", "opt2-FMPRating-O_LEAPC",
         "--parallel", "4",
+        "--early-stop-min-rel", "0.01",
         "--profit-cap-pct", "2000.0", "--profit-share-cap-pct", "25.0",
     ]
 
@@ -254,3 +257,23 @@ def test_the_window_stops_short_of_the_reserved_holdout():
     args = _args(d)
     assert args.end == "2025-12-31"
     m._assert_option_window_excludes_holdout(["O_LEAPC"], args.end)  # must not raise
+
+
+def test_the_history_source_is_always_stated_and_defaults_to_alpaca():
+    """Option jobs default to fmp in the launcher, so the driver must STATE the source; this grid
+    runs on the alpaca history (owner 2026-10-22), and fmp stays one explicit flag away."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "alpaca"
+    cmd = d.build_cmd(_args(d, ohlcv_history_source="fmp"), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "fmp"
+
+
+def test_the_early_stop_min_rel_is_always_forwarded_and_defaults_to_one_percent():
+    """Absent, the launcher applies the legacy rule (any strict gain resets the patience); the
+    owner's GA budget is patience 5 + a 1% minimum relative gain, so the driver always states it."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--early-stop-min-rel") + 1] == "0.01"
+    with pytest.raises(SystemExit):
+        d.build_parser().parse_args(["--early-stop-min-rel", "0"])

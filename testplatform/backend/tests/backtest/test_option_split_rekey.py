@@ -457,15 +457,18 @@ def test_a_rekeyed_short_put_is_assigned_as_qty_x_k_x_100_shares_at_strike_over_
         assert acct._option_positions[ADJ_PUT1025].qty == -4
         _expire(engine, acct, ps)
         close = _expiry_close(acct, ADJ_PUT1025)
-        assert close.open_price == pytest.approx(7.5) and close.quantity == 4
+        # Assigned short put: closes at 0 (the intrinsic 7.5 is the share leg's, at the strike).
+        assert close.open_price == pytest.approx(0.0) and close.quantity == 4
+        assert close.data["exit_record"]["trigger"] == "assigned"
         pos = acct._positions["AAPL"]
         assert pos.qty == pytest.approx(400.0) and pos.avg_price == pytest.approx(102.5)
         assert acct._cash == pytest.approx(cash - 41_000.0)
         (row,) = [t for t in acct.get_round_trip_trades() if t.get("contract_symbol")]
-        # original units: short 1 x P410 @ 15, closed at 30 (= 7.50 x 4) -> -1500
+        # original units: short 1 x P410 @ 15, assigned -> closed at 0 (premium kept, +1500). The
+        # intrinsic (30 = 7.50 x 4) is carried by the share leg at the strike, not by this row.
         assert (row["contract_symbol"], row["size"]) == (PUT410, pytest.approx(1.0))
-        assert row["exit_price"] == pytest.approx(30.0)
-        assert row["pnl"] == pytest.approx(-1500.0)
+        assert row["exit_price"] == pytest.approx(0.0)
+        assert row["pnl"] == pytest.approx(1500.0)
 
 
 # =============================================================================================

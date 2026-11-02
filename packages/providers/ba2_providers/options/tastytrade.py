@@ -262,6 +262,61 @@ def expiry_calendar(start: date, end: date) -> List[date]:
     return out
 
 
+def _third_friday(year: int, month: int) -> date:
+    """The 3rd Friday of ``year``/``month`` -- the standard US equity monthly expiry DAY,
+    before any holiday shift (see ``is_monthly_expiry``)."""
+    first = date(year, month, 1)
+    first_friday = first + timedelta(days=(4 - first.weekday()) % 7)
+    return first_friday + timedelta(days=14)
+
+
+def is_monthly_expiry(expiry: date) -> bool:
+    """True for a standard MONTHLY listed-equity-option expiry: the 3rd Friday of the
+    month, or the Thursday immediately before when that Friday is an NYSE holiday.
+
+    WHY THIS EXISTS (``--monthly-only``, ``tools/warm_options_history.py``). LEAPS only
+    ever list on standard monthly expiries; weeklies dated a year or more out are listed
+    only weeks before they expire, so they carry none of the earlier bars a LEAPS backfill
+    needs -- filtering to monthlies is what keeps a LEAPS-only run from paying for expiries
+    it can never use.
+
+    THE HOLIDAY SHIFT is real and not a rare edge case: 2026-06-19 (Juneteenth, a Friday and
+    that month's 3rd Friday) is an NYSE holiday, so June 2026's monthly options expire
+    2026-06-18 (Thursday) instead. Other Good-Friday-adjacent Aprils hit the same rule.
+    Answered from the offline NYSE calendar (``ba2_common.core.market_calendar``,
+    ``pandas_market_calendars`` data) -- no network call.
+    """
+    from ba2_common.core.market_calendar import is_regular_session
+    third_friday = _third_friday(expiry.year, expiry.month)
+    if expiry == third_friday:
+        return is_regular_session(third_friday)
+    if expiry == third_friday - timedelta(days=1):
+        return not is_regular_session(third_friday)
+    return False
+
+
+def monthly_expiry_calendar(start: date, end: date) -> List[date]:
+    """Every standard MONTHLY expiry in ``[start, end]`` -- see ``is_monthly_expiry``.
+
+    The one-expiry-per-month sibling of ``expiry_calendar``'s every-Friday grid, used by
+    ``--monthly-only`` for a LEAPS-only backfill.
+    """
+    if end < start:
+        raise ValueError(f"reversed window: {start} .. {end}")
+    from ba2_common.core.market_calendar import is_regular_session
+    out: List[date] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        third_friday = _third_friday(year, month)
+        expiry = third_friday if is_regular_session(third_friday) else third_friday - timedelta(days=1)
+        if start <= expiry <= end:
+            out.append(expiry)
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    return out
+
+
 def _strike_increment(price: float) -> float:
     """The OCC strike spacing typical for a price level."""
     if price < 25:

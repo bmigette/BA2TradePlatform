@@ -14,6 +14,19 @@ from ...core.types import OrderStatus
 from ...core.models import AccountDefinition
 from ...core.db import add_instance
 from ...logger import logger
+from ba2_common.core.schedule_genes import SCHEDULE_DAYS, schedule_refusal_message, schedule_weekday_enabled
+
+
+def _render_schedule_refusals(refusals: List[str]) -> None:
+    """A red banner listing every stored schedule the live scheduler REFUSES (unknown day key), so the
+    Scheduled Jobs views never render a refused schedule as if it ran at its defaults. Quasar classes
+    only (no page CSS), built synchronously by the caller."""
+    if not refusals:
+        return
+    with ui.card().classes('w-full mb-2 p-3 bg-red-100'):
+        ui.label('Schedules NOT running (refused by the scheduler)').classes('text-negative text-weight-bold')
+        for line in refusals:
+            ui.label(line).classes('text-negative text-sm')
 from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
@@ -129,13 +142,16 @@ def classic_run_detail_rows(decisions) -> list:
     for position, d in sorted(enumerate(decisions), key=_order):
         before, after = d.get('balance_before'), d.get('balance_after')
         symbol = d.get('symbol', '')
+        is_option = d.get('asset_class') == 'option'
+        row_symbol = (f"{symbol} · {d['option_strategy']}"
+                      if is_option and d.get('option_strategy') else symbol)
         rows.append({
             # UNIQUE per decision, and not the symbol: two recommendations on one ticker
             # (or two option legs) are two decisions, and on a symbol key Quasar renders
             # them as one row -- silently hiding whichever it saw first.
             'key': f"{position}:{symbol}",
             'rank': _rm_num(d.get('rank'), 'd'),
-            'symbol': symbol,
+            'symbol': row_symbol,
             'outcome': d.get('outcome', ''),
             # WHAT THE RANKING DECIDED ON. The score is the sort key the funding order was
             # built from, so a refused symbol's score IS its explanation: it ranked below the
@@ -144,11 +160,14 @@ def classic_run_detail_rows(decisions) -> list:
             'score': _rm_num(d.get('score'), '.3f'),
             'score_inputs': _rm_score_inputs(d),
             # '-' not 0: a refused symbol has no quantity at all.
-            'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+            # Contracts for an option entry, shares otherwise.
+            'quantity': ('-' if d.get('quantity') is None
+                         else f"{d['quantity']:g}{' ct' if is_option else ''}"),
             # The ceilings and the risk budget the quantity was solved from. Recorded on
             # every row; shown on hover rather than as four more columns, because they are
-            # what you ask for AFTER the size surprises you.
-            'qty_detail': _rm_qty_detail(d),
+            # what you ask for AFTER the size surprises you. For an option entry: the
+            # contract's quote and liquidity, and the structure's payoff limits.
+            'qty_detail': _rm_option_detail(d) if is_option else _rm_qty_detail(d),
             # THE SIZE IN MONEY, which is what the per-instrument cap in the context above is
             # denominated in -- so a funded row can be checked against the limit it was
             # measured against without doing the multiplication.
@@ -216,6 +235,45 @@ def _rm_qty_detail(d) -> str:
         # min-stop floor without a stop price ever being written to the order.
         parts.append(f"stop {_rm_num(stop_pct, '.1f')}% away")
     return ' · '.join(parts)
+
+
+def _rm_option_detail(d) -> str:
+    """The chosen contract(s)' quote and liquidity, then the payoff limits, or ''.
+
+    Every number through ``_rm_num``: a JSON-column value that is not a number must not
+    raise inside the dialog and take the whole run down with it.
+    """
+    parts = []
+    for leg in d.get('legs') or []:
+        right = {'call': 'C', 'put': 'P'}.get(str(leg.get('right') or '').lower(), '?')
+        head = f"{right} {_rm_num(leg.get('strike'), 'g')} {leg.get('expiry') or ''}".strip()
+        facts = []
+        if leg.get('bid') is not None or leg.get('ask') is not None:
+            facts.append(f"bid {_rm_num(leg.get('bid'), '.2f')} / ask {_rm_num(leg.get('ask'), '.2f')}")
+        if leg.get('iv') is not None:
+            facts.append(f"IV {_rm_num(leg['iv'] * 100 if isinstance(leg['iv'], (int, float)) else leg['iv'], '.0f')}%")
+        if leg.get('open_interest') is not None:
+            facts.append(f"OI {_rm_num(leg['open_interest'], ',.0f')}")
+        if leg.get('volume') is not None:
+            facts.append(f"vol {_rm_num(leg['volume'], ',.0f')}")
+        parts.append(head + (f": {', '.join(facts)}" if facts else ''))
+    if d.get('max_loss_per_contract') is not None:
+        parts.append(f"max loss ${_rm_num(d['max_loss_per_contract'], ',.2f')}/ct")
+    if d.get('max_profit_per_contract') is not None:
+        parts.append(f"max profit ${_rm_num(d['max_profit_per_contract'], ',.2f')}/ct")
+    if d.get('breakevens'):
+        parts.append('breakeven ' + ', '.join(_rm_num(b, ',.2f') for b in d['breakevens']))
+    return ' · '.join(parts)
+
+
+def classic_run_option_legend(decisions) -> str:
+    """One line explaining option rows, or '' when the run has none."""
+    if not any(d.get('asset_class') == 'option' for d in (decisions or [])):
+        return ''
+    return ('Option rows are entries sized by their own action (strike/DTE/sizing box), not '
+            'by this manager\'s ranking: Qty is contracts, Size the premium paid (debit) or '
+            'received (credit), and Reason the contract chosen. Hover Qty for its quote, '
+            'liquidity and payoff limits.')
 
 
 def _rm_binding_detail(d) -> str:
@@ -1267,6 +1325,9 @@ class JobMonitoringTab:
             legend = classic_run_detail_legend(decisions)
             if legend:
                 ui.label(legend).classes('text-xs text-gray-500 mt-1')
+            option_legend = classic_run_option_legend(decisions)
+            if option_legend:
+                ui.label(option_legend).classes('text-xs text-gray-500 mt-1')
 
             if not rows:
                 ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')
@@ -3428,6 +3489,7 @@ class ScheduledJobsTab:
         
         # Collect schedule data per expert and day
         expert_schedules = {}  # {expert_id: {day_index: {enter_market: [times], open_positions: [times]}}}
+        calendar_refusals: List[str] = []   # stored schedules the live scheduler refuses (unknown day key)
         
         for expert_instance in enabled_experts:
             try:
@@ -3466,22 +3528,30 @@ class ScheduledJobsTab:
                     
                     if not isinstance(schedule_config, dict):
                         continue
-                    
+
+                    refusal = schedule_refusal_message(schedule_config)
+                    if refusal:
+                        # the live scheduler runs NOTHING for this setting: say so, do not draw defaults
+                        calendar_refusals.append(
+                            f"Expert instance {expert_instance.id}, {schedule_key}: {refusal}")
+                        continue
+
                     days = schedule_config.get('days', {})
                     times = schedule_config.get('times', [])
-                    
-                    if not any(days.values()) or not times:
+
+                    # The ONE shared reading of ``days`` (an absent key = Mon-Fri on, Sat/Sun off), so
+                    # this calendar shows what the live scheduler actually fires.
+                    if not any(schedule_weekday_enabled(days, d) for d in SCHEDULE_DAYS) or not times:
                         continue
-                    
+
                     # Map days to indices
                     day_map = {
                         'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
                         'friday': 4, 'saturday': 5, 'sunday': 6
                     }
-                    
-                    for day_name, enabled in days.items():
-                        if enabled and day_name in day_map:
-                            day_idx = day_map[day_name]
+
+                    for day_name, day_idx in day_map.items():
+                        if schedule_weekday_enabled(days, day_name):
                             if day_idx not in expert_schedules[expert_instance.id]['days']:
                                 expert_schedules[expert_instance.id]['days'][day_idx] = {
                                     'enter_market': [],
@@ -3502,6 +3572,8 @@ class ScheduledJobsTab:
         # Sort time slots
         sorted_times = sorted(list(all_times))
         
+        _render_schedule_refusals(calendar_refusals)
+
         # Create grid layout with days as columns and times as rows
         with ui.card().classes('w-full mb-4 p-3'):
             ui.label('Weekly Schedule Overview').classes('text-md font-bold mb-3')
@@ -3682,6 +3754,8 @@ class ScheduledJobsTab:
         if scheduled_data is None:
             scheduled_data, _ = self._get_scheduled_jobs_data()
         
+        _render_schedule_refusals(getattr(self, 'schedule_refusals', []))
+
         with ui.card().classes('w-full'):
             # Header with bulk action button
             with ui.row().classes('w-full justify-between items-center mb-2'):
@@ -3763,6 +3837,7 @@ class ScheduledJobsTab:
             
             # Group by (expert_instance_id, symbol, job_type) to create one line per combination
             jobs_by_combination = {}
+            self.schedule_refusals = []     # shown as a banner above the table (unknown day key)
             
             for expert_instance in expert_instances:
                 if not expert_instance.enabled:
@@ -3812,7 +3887,13 @@ class ScheduledJobsTab:
                         
                         if not isinstance(schedule_config, dict):
                             continue
-                        
+
+                        refusal = schedule_refusal_message(schedule_config)
+                        if refusal:
+                            self.schedule_refusals.append(
+                                f"Expert instance {expert_instance.id}, {schedule_key}: {refusal}")
+                            continue
+
                         times = schedule_config.get('times', [])
 
                         if schedule_config.get('frequency') == 'monthly':
@@ -3828,7 +3909,7 @@ class ScheduledJobsTab:
                             days = schedule_config.get('days', {})
 
                             # Skip if no schedule is defined
-                            if not any(days.values()) or not times:
+                            if not any(schedule_weekday_enabled(days, d) for d in SCHEDULE_DAYS) or not times:
                                 continue
 
                             # Get enabled weekdays with short names
@@ -3837,7 +3918,7 @@ class ScheduledJobsTab:
 
                             enabled_weekdays = []
                             for i, day_name in enumerate(day_names):
-                                if days.get(day_name, False):
+                                if schedule_weekday_enabled(days, day_name):
                                     enabled_weekdays.append(short_weekday_names[i])
                             weekdays_display = ', '.join(enabled_weekdays) if enabled_weekdays else 'None'
                         

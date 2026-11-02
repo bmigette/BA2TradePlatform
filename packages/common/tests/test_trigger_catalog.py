@@ -114,12 +114,12 @@ def test_the_counts_the_design_agreed():
     2026-09-25 option-stage2-build, Task 2), filed under position -- it is a fact about who
     opened the evaluated position."""
     assert category_counts() == {
-        "all": 81,
+        "all": 83,
         "position": 19,
         "signal": 26,
         "targets": 10,
         "options": 13,
-        "market": 19,
+        "market": 21,
         "timing": 12,
     }
 
@@ -336,7 +336,16 @@ def test_an_unreadable_kind_is_refused_rather_than_guessed():
 
 def test_the_categorical_market_field_is_the_only_categorical_trigger():
     categorical = {e.value for e in trigger_catalog() if e.kind == KIND_CATEGORICAL}
-    assert categorical == {"structure_state"}
+    assert categorical == {"structure_state", "spy_trend_regime", "spy_vol_regime"}
+
+
+def test_the_spy_regime_triggers_are_market_categorical_and_need_no_profile():
+    by_value = {e.value: e for e in trigger_catalog()}
+    for value in ("spy_trend_regime", "spy_vol_regime"):
+        entry = by_value[value]
+        assert entry.kind == KIND_CATEGORICAL
+        assert "market" in entry.categories
+        assert not entry.requires_profile
 
 
 def test_a_flag_trigger_and_a_number_trigger_read_as_expected():

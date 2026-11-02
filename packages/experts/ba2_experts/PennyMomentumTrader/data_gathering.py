@@ -135,10 +135,10 @@ class DataGatheringMixin:
 
         api_key = get_app_setting("FMP_API_KEY")
         if not api_key:
-            self.logger.warning("FMP_API_KEY not configured, falling back to account prices")
-            from ba2_common.core.instance_resolver import get_instance_resolver
-            account = get_instance_resolver().get_account_instance(self.instance.account_id)
-            return account.get_instrument_current_price(symbols, price_type="mid")
+            # vendor_live_price = fmp is an explicit choice: no key means no prices (callers
+            # treat None as "unpriced"), never a silent switch to the account's prices.
+            self.logger.error("FMP_API_KEY not configured: vendor_live_price=fmp has no prices to give")
+            return {s: None for s in symbols}
 
         result: Dict[str, Optional[float]] = {s: None for s in symbols}
 

@@ -117,3 +117,15 @@ def test_days_to_expiry_documents_WHICH_LEG_it_reads():
         "name the declared strategy the leg rule applies to"
     assert "unevaluable" in description, \
         "mixed expiries on an UNDECLARED strategy must still be documented as unevaluable"
+
+
+def test_the_spy_regime_events_are_documented_with_their_modes_and_the_unknown_rule():
+    docs = get_event_type_documentation()
+    from ba2_common.core.benchmark_regime import CODES_BY_FIELD
+
+    for field, codes in CODES_BY_FIELD.items():
+        entry = docs[field]
+        assert entry["type"] == "categorical" or entry["type"]
+        text = entry["description"] + entry["example"]
+        assert all(mode in text for mode in codes), (field, [m for m in codes if m not in text])
+        assert "never" in entry["description"].lower() and "unknown" in entry["description"].lower()

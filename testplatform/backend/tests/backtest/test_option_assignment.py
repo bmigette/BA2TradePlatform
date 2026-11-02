@@ -178,9 +178,11 @@ def test_short_call_assignment_round_trip_pnl_sane(engine_short_call):
     opt = [t for t in trips if t["direction"] == "sell" and t["entry_price"] == pytest.approx(4.0, abs=0.5)]
     assert len(opt) == 1
     t = opt[0]
-    # Sold @4.0, settled (bought back) at intrinsic 20 -> loss (4-20)*100 = -1600.
-    assert t["exit_price"] == pytest.approx(20.0, abs=0.5)
-    assert t["pnl"] == pytest.approx(-1600.0, abs=50.0)
+    # Sold @4.0, PHYSICALLY ASSIGNED: the option closes at 0 (premium kept, +400) and the
+    # intrinsic 20 lives in the share leg at the strike -- counting it here too was the
+    # double count (test_assigned_option_row_pnl.py). Same convention as live.
+    assert t["exit_price"] == pytest.approx(0.0, abs=0.5)
+    assert t["pnl"] == pytest.approx(400.0, abs=50.0)
     assert t["pnl"] > -100_000  # sanity: NOT -market*100*qty (would be ~ -519.85*100*qty)
 
 
@@ -269,9 +271,10 @@ def test_strangle_round_trip_per_leg_entry_not_zero(engine_short_strangle):
     assert len(call) == 1
     assert len(put) == 1
 
-    # Call leg: sold @4.0 (premium), settled at intrinsic 20 -> loss ~ (4-20)*100 = -1600.
+    # Call leg: sold @4.0 (premium), assigned -> the option row keeps the premium (+400); the
+    # intrinsic 20 is carried by the share leg at the strike, not by this row.
     assert call[0]["entry_price"] == pytest.approx(4.0, abs=0.5)   # NOT ~0
-    assert call[0]["pnl"] == pytest.approx(-1600.0, abs=100.0)
+    assert call[0]["pnl"] == pytest.approx(400.0, abs=100.0)
     assert call[0]["pnl"] > -100_000                                # NOT -market*100*qty
 
     # Put leg: sold @2.5, expired worthless -> small profit (kept the premium).

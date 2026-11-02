@@ -1049,6 +1049,7 @@ const Backtesting: React.FC = () => {
         execution_interval: executionInterval,
         commission,
         slippage,
+        fill_model: fillModel,  // the server builds the job's account settings from it (no server-side default)
         enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
         // Fitness cap/scale knobs (Task 5/7) — read per-trial by strategy_optimization_handler.
         // Trade-scale is force-off for metrics that don't support it (max_drawdown / CAR).
@@ -1378,9 +1379,12 @@ const Backtesting: React.FC = () => {
     // expert's default (all Mon-Fri).
     const rso = (parsed.execution as Record<string, unknown> | undefined)?.run_schedule_override as
       { days?: Record<string, boolean>; times?: string[] } | undefined;
-    if (rso?.days && !merged.execution_schedule_enter_market && !merged.execution_schedule_open_positions) {
-      merged.execution_schedule_enter_market = { days: rso.days, times: rso.times ?? ['09:30'] };
-      merged.execution_schedule_open_positions = { days: rso.days, times: rso.times ?? ['09:30'] };
+    // No default time: an exported schedule that carries no `times` is not seeded (the expert's
+    // own default stays), rather than being silently pinned to a guessed time of day.
+    if (rso?.days && rso.times?.length && !merged.execution_schedule_enter_market
+        && !merged.execution_schedule_open_positions) {
+      merged.execution_schedule_enter_market = { days: rso.days, times: rso.times };
+      merged.execution_schedule_open_positions = { days: rso.days, times: rso.times };
     }
     if (Object.keys(merged).length) {
       setExpertSettings((prev) => ({ settings: { ...prev.settings, ...merged }, expert_params: prev.expert_params }));
@@ -2732,6 +2736,7 @@ const Backtesting: React.FC = () => {
             execution_interval: executionInterval,
             commission,
             slippage,
+            fill_model: fillModel,  // the server builds the job's account settings from it (no server-side default)
             enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
             ...fitnessKnobs,
           }

@@ -33,7 +33,8 @@ from nicegui import ui
 
 from ...core.db import get_db
 from ...core.option_pnl_display import (
-    UNAVAILABLE_INCOMPLETE, open_structure_pnl, option_closed_pnl, quote_caching_account,
+    UNAVAILABLE_INCOMPLETE, broker_position_marks, open_structure_pnl, option_closed_pnl,
+    quote_caching_account,
     unavailable_pnl,
 )
 from ...core.option_positions import opening_legs
@@ -408,8 +409,12 @@ class OptionTradesTab:
                     if account_inst is not None:
                         # One quote per (account, contract) for the whole refresh, shared by
                         # the pricing seam and the Current column (second review, N5).
+                        marks_key = ('marks', account_id)
+                        if marks_key not in self._quote_snapshot:
+                            self._quote_snapshot[marks_key] = broker_position_marks(account_inst)
                         account_inst = quote_caching_account(
-                            account_inst, self._quote_snapshot, account_id)
+                            account_inst, self._quote_snapshot, account_id,
+                            self._quote_snapshot[marks_key])
                         # The one display rule, shared with the Floating P/L cards.
                         priced = open_structure_pnl(account_inst, txn, orders, leg_set=leg_set)
                         current_pnl = priced

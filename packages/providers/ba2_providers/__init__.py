@@ -46,6 +46,7 @@ from .ohlcv.YFinanceDataProvider import YFinanceDataProvider
 from .ohlcv.AlphaVantageOHLCVProvider import AlphaVantageOHLCVProvider
 from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
 from .ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+from .ohlcv.AlpacaHistoryOHLCVProvider import AlpacaHistoryOHLCVProvider
 from .ohlcv.EODHDOHLCVProvider import EODHDOHLCVProvider
 from .ohlcv.PolygonOHLCVProvider import PolygonOHLCVProvider
 
@@ -74,6 +75,7 @@ OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
     "alphavantage": AlphaVantageOHLCVProvider,
     "alpaca": AlpacaOHLCVProvider,
     "fmp": FMPOHLCVProvider,
+    "alpaca_hist": AlpacaHistoryOHLCVProvider,
     "eodhd": EODHDOHLCVProvider,
     "polygon": PolygonOHLCVProvider,
 }
@@ -236,6 +238,7 @@ __all__ = [
     "AlphaVantageOHLCVProvider",
     "AlpacaOHLCVProvider",
     "FMPOHLCVProvider",
+    "AlpacaHistoryOHLCVProvider",
     "EODHDOHLCVProvider",
     "PolygonOHLCVProvider",
     "AlpacaNewsProvider",
@@ -263,3 +266,5 @@ __all__ = [
     # Helper functions
     "get_provider",
 ]
+
+from .version import PACKAGE_VERSION as __version__  # noqa: F401  (single source: version.py)

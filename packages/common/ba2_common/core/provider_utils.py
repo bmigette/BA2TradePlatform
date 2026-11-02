@@ -11,6 +11,7 @@ import functools
 import inspect
 import time
 
+from ba2_common.core.knowability import filing_visible_from, intraday_decision_clock
 from ba2_common.logger import logger
 
 T = TypeVar("T")
@@ -302,7 +303,16 @@ def insider_effective_date(txn: dict):
     The trade is only PUBLIC once the Form-4 ``filingDate`` is on file; when that
     field is missing/empty we approximate with ``transactionDate`` plus
     ``INSIDER_FILING_LAG_DAYS``.
+
+    INTRADAY backtest clock (``knowability.intraday_decision_clock``): the effective date is the
+    first INSTANT the filing is public -- the ``filingDate`` timestamp when it carries a time
+    (New York wall clock), else the start of the NEXT day -- so a 09:30 decision does not see a
+    Form 4 filed at 16:30 the same day. Live and the daily clock are unchanged.
     """
+    if intraday_decision_clock():
+        v = filing_visible_from(txn.get("filingDate"))
+        if v is not None:
+            return v.replace(tzinfo=timezone.utc)
     eff = parse_provider_date(txn.get("filingDate"))
     if eff is not None:
         return eff
@@ -316,7 +326,17 @@ def statement_effective_date(row: dict):
 
     FMP statement rows carry ``fillingDate`` (FMP's known double-l typo) and
     ``acceptedDate``; the fiscal/value date key is ``date`` (or ``fiscalDateEnding``).
+
+    INTRADAY backtest clock: the first INSTANT the filing is public -- ``acceptedDate`` (SEC
+    acceptance time) when it carries one, else the start of the day AFTER the filing date. A
+    statement accepted at 16:52 on D is not visible at D 09:30 (66% of statements are accepted
+    after 09:30 on their filing day, 51% after 16:00). Live and the daily clock are unchanged.
     """
+    if intraday_decision_clock():
+        for key in ("acceptedDate", "fillingDate", "filingDate"):
+            v = filing_visible_from(row.get(key))
+            if v is not None:
+                return v.replace(tzinfo=timezone.utc)
     for key in ("fillingDate", "filingDate", "acceptedDate"):
         eff = parse_provider_date(row.get(key))
         if eff is not None:

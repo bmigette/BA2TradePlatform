@@ -73,7 +73,7 @@ def test_wizard_module_imports_and_exposes_its_entry_points():
     assert hasattr(wiz, "AllocationWizard")
     assert callable(wiz.open_allocation_wizard)
     assert callable(wiz.render_income_panel)
-    assert callable(wiz.render_outcomes)
+    assert callable(wiz.notify_outcomes)
 
 
 def test_open_allocation_wizard_accepts_the_page_call_signature():
@@ -1100,86 +1100,11 @@ def notifications(monkeypatch):
     return seen
 
 
-def test_the_outcome_table_lists_every_row_with_its_own_status(nicegui_client, notifications):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    with nicegui_client:
-        wiz.render_outcomes(_outcomes(), run_id=21)
-        texts = _rendered_texts(nicegui_client.layout)
-
-    for symbol in ("MSFT", "AAPL", "NVDA", "TSLA", "KO", "SCHD"):
-        assert symbol in texts
-    for status in ("submitted", "partially_filled", "failed", "washtrade_locked", "skipped"):
-        assert status in texts
-    assert any("21" in t for t in texts)
-
-
-def test_the_outcome_table_shows_a_failed_row_next_to_a_submitted_one(nicegui_client,
-                                                                     notifications):
-    """Nothing is rolled back, so the table is not "the run worked" or "the run
-    failed" -- it is per row, with the broker's own words on the failure."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    with nicegui_client:
-        wiz.render_outcomes(_outcomes(), run_id=21)
-        texts = _rendered_texts(nicegui_client.layout)
-
-    assert "insufficient buying power" in texts
-    assert "below the broker's $5 fractional minimum" in texts
-
-
-def test_the_outcome_table_shows_what_filled_when_it_differs_from_what_was_sent(
-        nicegui_client, notifications):
-    """A 4-share order that filled 1.5 is not a 4-share result. Showing only the
-    submitted quantity is the run reporting its intention as its outcome."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    with nicegui_client:
-        wiz.render_outcomes(_outcomes(), run_id=21)
-        filled = _marked_texts(nicegui_client.layout, wiz.MARKER_OUTCOME_FILLED)
-
-    # Row order is outcome order: MSFT, AAPL, NVDA, TSLA, KO, SCHD.
-    assert filled == ["5.0000", "-", "1.5000", "-", "-", "-"]
-
-
-def test_the_outcome_table_says_unknown_rather_than_zero_for_an_unreported_fill(
-        nicegui_client, notifications):
-    """``filled_quantity is None`` means the broker said nothing, which is not the
-    same as "nothing filled" -- an accepted market order before the open looks
-    exactly like this."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core import portfolio_allocation_service as svc
-
-    with nicegui_client:
-        wiz.render_outcomes([svc.RowOutcome(symbol="AAPL", action="new",
-                                            status=svc.OUTCOME_SUBMITTED, quantity=10.0)])
-        filled = _marked_texts(nicegui_client.layout, wiz.MARKER_OUTCOME_FILLED)
-
-    assert filled == ["-"]
-
-
-def test_the_outcome_colour_map_covers_every_outcome_the_service_can_produce():
-    """The colours and the failure count are keyed on the service's own status
-    strings. Duplicating them as literals here is how a renamed constant silently
-    turns a run in which everything failed into a green "submitted"."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core import portfolio_allocation_service as svc
-
-    assert set(wiz.OUTCOME_COLOURS) == {
-        svc.OUTCOME_SUBMITTED, svc.OUTCOME_PARTIAL, svc.OUTCOME_SKIPPED,
-        svc.OUTCOME_FAILED, svc.OUTCOME_WASHTRADE_LOCKED,
-        svc.OUTCOME_UNACTIONABLE,
-    }
-    # ...and it must not be drawn in the grey the run uses for "nothing to do".
-    assert wiz.OUTCOME_COLOURS[svc.OUTCOME_UNACTIONABLE] != \
-        wiz.OUTCOME_COLOURS[svc.OUTCOME_SKIPPED]
-
-
 def test_the_outcome_table_warns_when_a_row_failed(nicegui_client, notifications):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.render_outcomes(_outcomes(), run_id=21)
+        wiz.notify_outcomes(_outcomes())
 
     assert notifications[-1][1] == 'warning'
     assert '1 row(s) failed' in notifications[-1][0]
@@ -1191,7 +1116,7 @@ def test_the_outcome_table_confirms_a_run_in_which_nothing_failed(nicegui_client
     from ba2_trade_platform.core import portfolio_allocation_service as svc
 
     with nicegui_client:
-        wiz.render_outcomes([svc.RowOutcome(symbol="AAPL", action="new",
+        wiz.notify_outcomes([svc.RowOutcome(symbol="AAPL", action="new",
                                             status=svc.OUTCOME_SUBMITTED, quantity=10.0)])
 
     assert notifications[-1][1] == 'positive'
@@ -1205,7 +1130,7 @@ def test_the_outcome_table_says_when_a_symbol_is_wash_trade_locked(nicegui_clien
     from ba2_trade_platform.core import portfolio_allocation_service as svc
 
     with nicegui_client:
-        wiz.render_outcomes([svc.RowOutcome(symbol="KO", action="new",
+        wiz.notify_outcomes([svc.RowOutcome(symbol="KO", action="new",
                                             status=svc.OUTCOME_WASHTRADE_LOCKED,
                                             quantity=3.0)])
 
@@ -1232,28 +1157,11 @@ def test_the_outcome_table_does_not_congratulate_a_run_that_could_not_act(
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.render_outcomes([_unactionable_outcome()], run_id=31)
+        wiz.notify_outcomes([_unactionable_outcome()])
 
     assert notifications[-1][1] == 'warning'
     assert notifications[-1][1] != 'positive'
     assert 'could NOT be acted on' in notifications[-1][0]
-
-
-def test_the_outcome_table_spells_out_why_a_row_could_not_be_acted_on(nicegui_client,
-                                                                     notifications):
-    """The Detail cell has to name the shares and the transaction ids: a status of
-    "unactionable" on its own sends the operator hunting."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core import portfolio_allocation_service as svc
-
-    with nicegui_client:
-        wiz.render_outcomes([_unactionable_outcome()], run_id=31)
-        texts = _rendered_texts(nicegui_client.layout)
-
-    assert svc.OUTCOME_UNACTIONABLE in texts
-    assert any('100 share(s) of AAPL' in t for t in texts)
-    assert any('transaction 41' in t for t in texts)
-    assert not any('nothing to do' in t for t in texts)
 
 
 # ---------------------------------------------------------------------------

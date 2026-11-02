@@ -244,6 +244,35 @@ class TestPopup:
         assert exit_["delta"] is not None
         assert "r=0.045 (not recorded on the run" in exit_["reason"]
 
+    def _fred_run(self, published, tmp_path, monkeypatch, identity=None):
+        from ba2_providers.macro import fred_series
+
+        from tests.backtest.fixtures.fred_rate import dgs3mo_rate, install_dgs3mo
+
+        monkeypatch.setattr(fred_series, "CACHE_FOLDER", str(tmp_path))
+        install_dgs3mo(tmp_path)
+        record = dgs3mo_rate(START - timedelta(days=WARMUP), END).describe()
+        if identity is not None:
+            record["identity"] = identity
+        results = {**AS_TRADED, "options_risk_free_rate_source": record}
+        from app.services.backtest_trade_chart import build_trade_chart_context
+        return build_trade_chart_context(
+            _backtest(_params(published, options_risk_free_rate=None), results=results), 1)
+
+    def test_a_fred_rate_run_is_rebuilt_from_the_same_cached_series(
+            self, published, tmp_path, monkeypatch):
+        exit_ = self._fred_run(published, tmp_path, monkeypatch)["legs"][0]["exitContract"]
+        assert exit_["delta"] is not None
+        assert "as-of FRED DGS3MO rate on" in exit_["reason"]
+        assert "r=0.0" in exit_["reason"]          # DGS3MO was ~5.4% in spring 2024
+
+    def test_a_fred_rate_run_on_a_different_cache_is_refused(
+            self, published, tmp_path, monkeypatch):
+        exit_ = self._fred_run(published, tmp_path, monkeypatch,
+                               identity="fred-dgs3mo:0000000000000000")["legs"][0]["exitContract"]
+        assert exit_["delta"] is None and exit_["quality"] == "unavailable"
+        assert "not the one the run priced with" in exit_["reason"]
+
     def test_a_run_before_the_split_basis_that_was_off_basis_is_withheld(self, published):
         # No option_basis_guard in the results: the run inverted against $55.17 while the
         # chain trades at ~$551. Those greeks were wrong; they are not shown.

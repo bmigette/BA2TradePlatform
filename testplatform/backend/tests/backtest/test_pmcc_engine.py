@@ -278,7 +278,7 @@ def _harness(*, entry_rules, exit_rules, entry_action, account_id):
     cache = OptionsHistoryCache(cache_db)
     cache.write_chain_rows(SYMBOL, START.date().isoformat(), _chain_rows())
     cache.write_bar_rows(_bar_rows())
-    provider = HistoricalOptionsProvider(cache_db)
+    provider = HistoricalOptionsProvider(cache_db, risk_free_rate=0.045)
 
     resolver = wire_backtest_seams()
     ctx = backtest_trading_db(f"pmcc-{account_id}")

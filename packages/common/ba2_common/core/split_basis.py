@@ -37,6 +37,16 @@ marked file is exactly the defect a marker would otherwise hide for ever. A real
 size that close to a split is rare (APP +46%, ARM +48%, NFLX -35% are all far from any
 split); if one ever is, the symbol is refused loudly, never silently priced.
 
+FURTHER OUT (review r7, APH 2026-09-28): APH's cache had every bar from 2026-07-01 divided by 2
+-- the 2:1 split of 2026-09-03 applied 64 days early, which neither the ratio rule nor the 30-day
+window saw. Beyond ``MIXED_BASIS_WINDOW_DAYS`` and up to ``MIXED_BASIS_FAR_WINDOW_DAYS`` from a
+calendar split, a one-day move whose size MATCHES that split's factor (either direction, within
+``MIXED_BASIS_FAR_MATCH`` in log) is ``mixed_basis`` too. Requiring the match keeps real moves
+out: over the 789 local files of the 753 stage-2 and 97 stage-1 names (2026-09-28) the only
+one-day move of a calendar split's size within 365 days of that split is APH's, and layer 1
+refuses exactly that one file; the other split-sized moves (GME/AMC 2021, MARA 2012/2017,
+biotech gaps) are years from a split of that factor.
+
 ``drift``, ``undetectable`` and ``mixed_basis`` all require a FULL re-fetch. For ``drift`` and
 ``undetectable`` the marker the re-fetch writes turns them into ``refetched``, so that repair
 happens once, never on every refresh. ``mixed_basis`` is NOT cleared by a marker: if the vendor
@@ -70,6 +80,8 @@ __all__ = [
     "VERDICT_MIXED_BASIS",
     "MIXED_BASIS_JUMP",
     "MIXED_BASIS_WINDOW_DAYS",
+    "MIXED_BASIS_FAR_WINDOW_DAYS",
+    "MIXED_BASIS_FAR_MATCH",
     "REFETCH_VERDICTS",
     "check_split_basis",
     "needs_full_refetch",
@@ -77,6 +89,22 @@ __all__ = [
     "read_full_fetch_marker",
     "write_full_fetch_marker",
     "SplitBasisRefused",
+    "IntradayBasisError",
+    "IntradayBasisStale",
+    "IntradayBasisMismatch",
+    "IntradayVendorBasisConflict",
+    "OPERATOR_HINT",
+    "intraday_rebase_path",
+    "read_intraday_rebase",
+    "write_intraday_rebase",
+    "clear_intraday_rebase",
+    "list_intraday_states",
+    "intraday_state_summary",
+    "start_intraday_state_reporter",
+    "intraday_stale_marker_path",
+    "read_intraday_stale",
+    "write_intraday_stale",
+    "clear_intraday_stale",
     "SymbolSplitBasis",
     "as_traded_factor",
     "resolve_symbol_split_basis",
@@ -96,6 +124,11 @@ REFETCH_VERDICTS = (VERDICT_DRIFT, VERDICT_UNDETECTABLE, VERDICT_MIXED_BASIS)
 MIXED_BASIS_JUMP = 1.4
 #: How far (calendar days, either side of the ex-date) the scan looks.
 MIXED_BASIS_WINDOW_DAYS = 30
+#: Beyond that and up to this far, only a move MATCHING the split's factor counts (docstring).
+MIXED_BASIS_FAR_WINDOW_DAYS = 365
+#: ... within this, in log (|ln|r|| - ln(factor)): the day's own return rides on the step (APH
+#: x0.4884 for a 2:1 = 2.4% off), ~4% of it is allowed.
+MIXED_BASIS_FAR_MATCH = 0.04
 
 #: Below this factor the ratio rule's "ordinary day" and "unadjusted" bands (ln 1.5 wide each,
 #: see ``market_condition_source._MATCH_TOLERANCE``) overlap, so prices cannot decide.
@@ -257,19 +290,34 @@ def _mixed_basis_check(d: np.ndarray, close: np.ndarray, jump_idx: np.ndarray,
     sd = np.datetime64(sp.date, "D")
     ex_i = int(np.searchsorted(d, sd, side="left"))
     win = np.timedelta64(MIXED_BASIS_WINDOW_DAYS, "D")
-    hits = [int(i) for i in jump_idx
-            if i != ex_i and abs(d[i] - sd) <= win]
+    far = np.timedelta64(MIXED_BASIS_FAR_WINDOW_DAYS, "D")
+    log_f = math.log(max(ratio, 1.0 / ratio))
+    near_hits, far_hits = [], []
+    for i in jump_idx:
+        i = int(i)
+        if i == ex_i:
+            continue
+        gap = abs(d[i] - sd)
+        if gap <= win:
+            near_hits.append(i)
+        elif gap <= far and abs(abs(math.log(close[i] / close[i - 1])) - log_f) <= MIXED_BASIS_FAR_MATCH:
+            far_hits.append(i)
+    hits = sorted(near_hits + far_hits)
     if not hits:
         return None
     moves = ", ".join(f"{d[i].astype(object).isoformat()} x{close[i] / close[i - 1]:.4f}"
                       for i in hits)
+    where = (f"within {MIXED_BASIS_WINDOW_DAYS} days" if not far_hits else
+             f"of the split's own size (x{max(ratio, 1.0 / ratio):g}) within "
+             f"{MIXED_BASIS_FAR_WINDOW_DAYS} days" if not near_hits else
+             f"within {MIXED_BASIS_WINDOW_DAYS} days, or of its size within "
+             f"{MIXED_BASIS_FAR_WINDOW_DAYS} days,")
     return SplitBasisCheck(
         sp.date, ratio, VERDICT_MIXED_BASIS, checked_bar=d[hits[0]].astype(object),
         basis="mixed",
-        reason=(f"one-day close move(s) beyond x{MIXED_BASIS_JUMP} within "
-                f"{MIXED_BASIS_WINDOW_DAYS} days of the {sp.date.isoformat()} split but not on "
-                f"its ex-date bar: {moves}. The file is on a mixed basis (adjusted on the wrong "
-                f"day); only a full re-fetch can repair it"))
+        reason=(f"one-day close move(s) beyond x{MIXED_BASIS_JUMP} {where} of the "
+                f"{sp.date.isoformat()} split but not on its ex-date bar: {moves}. The file is on a "
+                f"mixed basis (adjusted on the wrong day); only a full re-fetch can repair it"))
 
 
 def _marker_date(marker: Optional[dict]) -> Optional[date]:
@@ -317,6 +365,212 @@ def write_full_fetch_marker(parquet_path: str, *, first_bar: Optional[date], las
         json.dump(payload, f, sort_keys=True)
     os.replace(tmp, path)
     return path
+
+
+# ---------------------------------------------------------------------------------------------
+# INTRADAY STALENESS (cross-interval basis, 2026-10-08)
+# ---------------------------------------------------------------------------------------------
+# The daily file of a symbol is REPLACED on a new split basis by ``force_full_refetch`` (the split-aware
+# top-up). The intraday files (``<SYM>_5min.parquet`` ...) of the same symbol are NOT refetched with it
+# (hundreds of vendor calls per file), so they keep the old basis. Measured on the real cache: 7 of 250
+# random symbols had a 5-minute history a constant multiple (0.10 .. 6.25) of the daily one. The state
+# "daily was rewritten, intraday was not" is therefore recorded EXPLICITLY, next to the intraday file, and
+# every reader / writer of that file refuses until the intraday file is replaced on the vendor's current
+# basis (``force_full_refetch`` of the intraday interval clears it).
+
+
+class IntradayBasisError(RuntimeError):
+    """Base of the cross-interval basis refusals (matched by NAME in ``job_fatal``)."""
+
+
+#: Appended to every refusal: these errors surface inside a chart, an indicator, a tool call or a backtest where
+#: nobody knows the cache layout, so each says what the state is and who fixes it.
+OPERATOR_HINT = (" This is a state of the local OHLCV CACHE for this one symbol, not a platform fault; daily bars "
+                 "are unaffected. Operator: `python tools/cache_health_check.py --basis-symbols <SYM>` shows it, "
+                 "`python tools/repair_intraday_basis.py plan --symbols <SYM>` says whether it can be repaired, "
+                 "`python tools/repair_intraday_basis.py markers --list` lists the stale markers.")
+
+
+class IntradayBasisStale(IntradayBasisError):
+    """An intraday cache file is marked stale: the symbol's DAILY history was rewritten on a new split
+    basis after the file was fetched, so its price levels are not those of the daily file. Raised by
+    every read of the file (``get_ohlcv_data``), every write of it and every backtest launch / job
+    start that includes the symbol. Repair: ``force_full_refetch(symbol, <interval>)``, or the rebase
+    tool when the vendor cannot serve the old dates on the daily basis."""
+
+
+class IntradayBasisMismatch(IntradayBasisError):
+    """An intraday cache (or a frame about to be written to it) is on a different price level than
+    the symbol's daily cache: the cross-interval check (``ba2_providers.ohlcv.cross_interval_basis``)
+    classified it ``constant_factor`` / ``factor_changes`` / ``noisy``."""
+
+
+class IntradayVendorBasisConflict(IntradayBasisError):
+    """The VENDOR's intraday history of a symbol disagrees with the VENDOR's own daily history (it serves
+    old dates as-traded on one endpoint and split-adjusted on the other). A refetch cannot repair this, so
+    nothing was written and the existing file was left exactly as it was: this is not a stale file."""
+
+
+def intraday_stale_marker_path(parquet_path: str) -> str:
+    folder, name = os.path.split(parquet_path)
+    stem = name[:-len(".parquet")] if name.endswith(".parquet") else name
+    return os.path.join(folder, MARKER_DIRNAME, stem + ".intraday-stale.json")
+
+
+def read_intraday_stale(parquet_path: Optional[str]) -> Optional[dict]:
+    """The stale marker of an intraday parquet, or None. An UNREADABLE marker file is reported as a
+    stale marker too (``{"reason": "unreadable marker ..."}``): a state we cannot read is not "fresh"."""
+    if not parquet_path:
+        return None
+    path = intraday_stale_marker_path(parquet_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return {"reason": f"unreadable stale marker {path}: not a JSON object"}
+    except (OSError, ValueError) as e:
+        return {"reason": f"unreadable stale marker {path}: {e}"}
+
+
+def write_intraday_stale(parquet_path: str, *, reason: str, now: Optional[datetime] = None) -> str:
+    """Mark an intraday parquet stale. Atomic. Returns the marker path."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    path = intraday_stale_marker_path(parquet_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"marked_at_utc": now.isoformat(), "reason": reason,
+               "file": os.path.basename(parquet_path)}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_intraday_stale(parquet_path: Optional[str]) -> bool:
+    """Remove the stale marker of an intraday parquet. True when one was removed."""
+    if not parquet_path:
+        return False
+    try:
+        os.remove(intraday_stale_marker_path(parquet_path))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def intraday_rebase_path(parquet_path: str) -> str:
+    folder, name = os.path.split(parquet_path)
+    stem = name[:-len(".parquet")] if name.endswith(".parquet") else name
+    return os.path.join(folder, MARKER_DIRNAME, stem + ".intraday-rebase.json")
+
+
+def read_intraday_rebase(parquet_path: Optional[str]) -> Optional[dict]:
+    """The PROVENANCE sidecar of an intraday parquet whose prices were re-based by
+    ``tools/repair_intraday_basis.py`` (or adopted from an earlier ad-hoc rescale), or None. An unreadable
+    sidecar is reported as a rebase too: the file's origin is then unknown, never silently vendor data."""
+    if not parquet_path:
+        return None
+    path = intraday_rebase_path(parquet_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"unreadable": f"{path}: not a JSON object"}
+    except (OSError, ValueError) as e:
+        return {"unreadable": f"{path}: {e}"}
+
+
+def write_intraday_rebase(parquet_path: str, payload: dict) -> str:
+    """Write the provenance sidecar next to the file (inside the cache, so it travels with it). Atomic."""
+    path = intraday_rebase_path(parquet_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, indent=1, default=str)
+    os.replace(tmp, path)
+    return path
+
+
+def clear_intraday_rebase(parquet_path: Optional[str]) -> bool:
+    if not parquet_path:
+        return False
+    try:
+        os.remove(intraday_rebase_path(parquet_path))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def list_intraday_states(provider_folder: str) -> dict:
+    """``{"stale": [{file, marked_at_utc, age_days, reason}], "rebased": [{file, applied_utc, ...}]}`` of one
+    provider folder, read from its ``_split_basis`` directory (names only; no parquet is opened)."""
+    from datetime import datetime as _dt
+    out = {"stale": [], "rebased": []}
+    d = os.path.join(provider_folder, MARKER_DIRNAME)
+    if not os.path.isdir(d):
+        return out
+    now = _dt.now(timezone.utc)
+    for name in sorted(os.listdir(d)):
+        full = os.path.join(d, name)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            data = {"reason": f"unreadable: {e}"}
+        if name.endswith(".intraday-stale.json"):
+            age = None
+            try:
+                age = round((now - _dt.fromisoformat(data["marked_at_utc"])).total_seconds() / 86400.0, 1)
+            except (KeyError, ValueError, TypeError):
+                pass
+            out["stale"].append({"file": name[:-len(".intraday-stale.json")], "age_days": age,
+                                 "marked_at_utc": data.get("marked_at_utc"), "reason": data.get("reason")})
+        elif name.endswith(".intraday-rebase.json"):
+            segs = data.get("segments") or []
+            out["rebased"].append({
+                "file": name[:-len(".intraday-rebase.json")], "applied_utc": data.get("applied_utc"),
+                "source": data.get("source"),
+                "volume_unadjusted": any(sg.get("volume_unadjusted") for sg in segs if isinstance(sg, dict))})
+    return out
+
+
+def intraday_state_summary(provider_folder: str) -> str:
+    """ONE log line for the live app's startup / daily summary: how many intraday files are stale-marked or
+    rebased (names capped), so a refusal in a chart or tool call is not a surprise. Empty folder -> ``ok``."""
+    st = list_intraday_states(provider_folder)
+    if not st["stale"] and not st["rebased"]:
+        return "intraday cache state: no stale-marked and no rebased intraday files"
+    def names(rows):
+        n = [r["file"] for r in rows]
+        return ", ".join(n[:12]) + (f", ... (+{len(n) - 12})" if len(n) > 12 else "")
+    parts = []
+    if st["stale"]:
+        parts.append(f"{len(st['stale'])} STALE-marked (reads/writes refuse: {names(st['stale'])})")
+    if st["rebased"]:
+        parts.append(f"{len(st['rebased'])} rebased (prices re-based by the repair tool: {names(st['rebased'])})")
+    return "intraday cache state: " + "; ".join(parts)
+
+
+def start_intraday_state_reporter(provider_folder: str, log, *, interval_s: float = 86400.0):
+    """LIVE VISIBILITY. Logs ``intraday_state_summary`` once now (startup) and then every ``interval_s`` (default
+    daily) from a daemon thread, so a refusal in a chart, an indicator or a tool call that reads a stale / rebased
+    intraday file is explained by a line in the app log. Returns the stop ``Event`` (set it to end the thread)."""
+    import threading
+    stop = threading.Event()
+
+    def _run():
+        while not stop.is_set():
+            try:
+                log(intraday_state_summary(provider_folder))
+            except Exception as e:  # noqa: BLE001 -- a reporter must never take the app down; say so, once per cycle
+                log(f"intraday cache state summary failed: {type(e).__name__}: {e}")
+            stop.wait(interval_s)
+
+    threading.Thread(target=_run, name="intraday-state-reporter", daemon=True).start()
+    return stop
 
 
 # ---------------------------------------------------------------------------------------------
@@ -464,9 +718,10 @@ def resolve_symbol_split_basis(symbol: str, dates: Any, o: Any, h: Any, l: Any, 
             f"as-traded basis. Repair with tools/warm_market_conditions.py plan --fetch-missing.")
     added = [CalendarSplit(e.event_date, float(e.ratio)) for e in entries
              if e.kind == ovr.KIND_ADD_PRICE_ADJUSTMENT]
-    included = tuple(sorted((s for s in list(good) + added
-                             if first < s.date <= last and float(s.ratio) != 1.0
-                             and s.date not in excluded),
+    # ``excluded`` removes CALENDAR rows only: an added adjustment may sit on the date of a row
+    # it replaces (an excluded vendor ratio re-stated with the measured one).
+    included = tuple(sorted((s for s in [g for g in good if g.date not in excluded] + added
+                             if first < s.date <= last and float(s.ratio) != 1.0),
                             key=lambda s: s.date))
     evidence = (f"bars {first}..{last}; marker={_marker_date(marker)}; "
                 + ", ".join(f"{ch.split_date}:{ch.ratio:g}:{ch.verdict}" for ch in checks))
@@ -484,15 +739,24 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
     calendar dates the entries exclude. REFUSES when any anchor close is missing or off by more
     than ``ANCHOR_TOLERANCE``, when an ``exclude_calendar_event`` names a row the calendar does
     not hold, or when an ``add_price_adjustment`` lands on a date the calendar already lists
-    (the vendor now carries it: counting both would double the factor). Each of those means
+    (the vendor now carries it: counting both would double the factor) -- unless the symbol's
+    entries also exclude that row, which makes the add its measured replacement. Each of those means
     the entry was measured against other data: re-measure it, never guess."""
     from ba2_common.core import split_basis_overrides as ovr
 
     if not entries:
         return set()
+    try:
+        ovr.validate_overrides(entries)
+    except ValueError as e:
+        raise SplitBasisRefused(f"{symbol}: {e}") from e
     close = np.asarray(c, dtype=np.float64)
     cal_dates = {s.date for s in calendar}
-    excluded: set = set()
+    # Exclusions first: an ``add_price_adjustment`` on the date of a row the same symbol's
+    # entries EXCLUDE is a replacement (the vendor's ratio is wrong, the measured one stands),
+    # not a double count.
+    excluded: set = {e.event_date for e in entries if e.kind == ovr.KIND_EXCLUDE_CALENDAR_EVENT
+                     and e.event_date in cal_dates}
     for e in entries:
         for a_day, a_close in e.anchors:
             hit = np.flatnonzero(d == np.datetime64(a_day, "D"))
@@ -526,7 +790,7 @@ def _verify_overrides(symbol: str, d: np.ndarray, c: Any, calendar: Sequence[Cal
                     f"(overrides {ovr.OVERRIDES_VERSION}); the calendar changed since it was "
                     f"measured. Re-measure.")
             excluded.add(e.event_date)
-        elif e.event_date in cal_dates:
+        elif e.event_date in cal_dates and e.event_date not in excluded:
             raise SplitBasisRefused(
                 f"{symbol}: split-basis override add_price_adjustment {e.event_date.isoformat()} "
                 f"x{e.ratio:g} now also appears in the vendor split calendar (overrides "

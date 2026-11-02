@@ -4,7 +4,7 @@ TradingAgents/TradingAgentsUI (the multi-agent LLM framework) stay in the live
 BA2TradePlatform and are intentionally NOT part of this package, so importing
 ba2_experts never pulls langchain.
 """
-__version__ = "0.1.0"
+from .version import PACKAGE_VERSION as __version__  # noqa: F401  (single source: version.py)
 
 from .FinnHubRating import FinnHubRating
 from .FMPRating import FMPRating
@@ -18,6 +18,7 @@ from .FactorRanker import FactorRanker
 from .DeterministicScorer import DeterministicScorer
 from .ETFTrend import ETFTrend
 from .PullbackReversion import PullbackReversion
+from .MLForecast import MLForecast
 
 # PremiumSeller was removed 2026-08-31 (operator decision; option-model plan Task 12):
 # its book rails / breaker / lifecycle logic live on in ba2_common.core.option_book and
@@ -25,7 +26,7 @@ from .PullbackReversion import PullbackReversion
 experts = [FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
            FMPInsiderClusterBuy, FMPEarningsDrift, FMPEarningsEvent, PennyMomentumTrader,
            FactorRanker,
-           DeterministicScorer, ETFTrend, PullbackReversion]
+           DeterministicScorer, ETFTrend, PullbackReversion, MLForecast]
 
 
 def get_expert_class(expert_type):

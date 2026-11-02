@@ -74,6 +74,7 @@ __all__ = [
     "RAW_DIRNAME",
     "SCHEMA_VERSION",
     "MANIFEST_KEYS",
+    "OPTIONAL_MANIFEST_KEYS",
     "ManifestError",
     "ManifestConflictError",
     "ObjectEntry",
@@ -109,6 +110,21 @@ MANIFEST_KEYS = (
     "schema_version", "fields", "objects", "raw_objects", "coverage", "universe_digest",
     "sessions_digest", "window_start", "window_end", "created_at",
 )
+
+#: Keys a manifest MAY carry in addition to ``MANIFEST_KEYS``, never REQUIRED. ``_normalize``
+#: accepts them but does not demand them, so a manifest that never sets one -- every manifest
+#: published before this key existed, and every manifest built with the default (no-fill) policy
+#: after it -- normalizes, hashes and verifies exactly as it did before the key was invented. A
+#: manifest that DOES set one gets a different ``manifest_identity`` than an otherwise-identical
+#: manifest that doesn't, because ``canonical_manifest_json`` simply dumps whatever keys are
+#: present: that is how a filled snapshot gets a different digest from an unfilled one over the
+#: same universe/window without bumping ``SCHEMA_VERSION`` (which would also re-digest every
+#: EXISTING manifest, including every one that never used this feature).
+#:
+#: ``gap_fill_policy`` -- one of ``market_condition_source.GAP_FILL_POLICIES`` (e.g.
+#: ``"previous"``), present only when the manifest's rows were built over a gap-filled source
+#: series. Absent == the historical default (no fill).
+OPTIONAL_MANIFEST_KEYS = ("gap_fill_policy",)
 
 #: How long a reader waits on one notification while another thread indexes a manifest.
 _INDEX_WAIT_S = 1.0
@@ -459,8 +475,12 @@ class MarketConditionStore:
                       objects: Iterable[ObjectEntry], raw_objects: Iterable[RawEntry],
                       coverage: Mapping[str, Any], universe: Iterable[str], sessions: Iterable[date],
                       window_start: date, window_end: date,
-                      created_at: Optional[str] = None) -> Dict[str, Any]:
-        return {
+                      created_at: Optional[str] = None,
+                      gap_fill_policy: Optional[str] = None) -> Dict[str, Any]:
+        """``gap_fill_policy`` (default None = no fill, unchanged byte-for-byte from before this
+        parameter existed) is omitted from the manifest entirely when None, and set to the policy
+        name otherwise -- see :data:`OPTIONAL_MANIFEST_KEYS`."""
+        manifest = {
             "profile": profile.name,
             "source_profile": source_profile,
             "timing_policy": timing_policy,
@@ -477,13 +497,16 @@ class MarketConditionStore:
             "window_end": window_end.isoformat(),
             "created_at": created_at or datetime.now(timezone.utc).isoformat(),
         }
+        if gap_fill_policy is not None:
+            manifest["gap_fill_policy"] = gap_fill_policy
+        return manifest
 
     @staticmethod
     def _normalize(manifest: Mapping[str, Any]) -> Dict[str, Any]:
         missing = [k for k in MANIFEST_KEYS if k not in manifest]
         if missing:
             raise ManifestError(f"manifest lacks keys {missing}")
-        extra = [k for k in manifest if k not in MANIFEST_KEYS]
+        extra = [k for k in manifest if k not in MANIFEST_KEYS and k not in OPTIONAL_MANIFEST_KEYS]
         if extra:
             raise ManifestError(f"manifest carries unknown keys {extra}")
         # Deep copy through JSON (rejects non-JSON values), lists in canonical order.

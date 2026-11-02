@@ -1,0 +1,64 @@
+{
+ "backtest_id": 903,
+ "name": "synthetic-opt-FMPInsiderClusterBuy",
+ "expert": "FMPInsiderClusterBuy",
+ "engine_type": "daily_expert",
+ "settings": {
+  "expert_params": {
+   "atr_multiplier": 3.25,
+   "lookback_days": 45,
+   "max_virtual_equity_per_instrument_percent": 12.5,
+   "min_insiders": 4,
+   "min_stop_loss_pct": 5.5,
+   "risk_per_trade_pct": 1.25,
+   "use_atr_stop": false,
+   "regime_overlay_enabled": false,
+   "allow_automated_trade_opening": true,
+   "enable_buy": true,
+   "allow_automated_trade_modification": true,
+   "enable_sell": false
+  }
+ },
+ "backtest_only": {
+  "hold_assigned_stock": false,
+  "entry_action": null
+ },
+ "execution": {
+  "seed": 2024,
+  "fill_model": "same_bar_close",
+  "warmup_days": 45,
+  "commission": 0.75,
+  "slippage": 3.0,
+  "enable_short": false,
+  "run_schedule_override": {
+   "days": {
+    "friday": false,
+    "monday": false,
+    "saturday": false,
+    "sunday": false,
+    "thursday": false,
+    "tuesday": false,
+    "wednesday": true
+   },
+   "times": [
+    "11:30"
+   ]
+  }
+ },
+ "universe": {
+  "mode": "static",
+  "symbols": [
+   "WMT",
+   "HD",
+   "UNH",
+   "V",
+   "MA",
+   "CVX",
+   "PFE"
+  ]
+ },
+ "execution_interval": "30min",
+ "start_date": "2022-03-01T00:00:00",
+ "end_date": "2024-09-30T00:00:00",
+ "initial_capital": 25000.0
+}

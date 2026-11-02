@@ -115,7 +115,7 @@ def contract_to_metadata_chain_row(c: Any, underlying: str,
                                    as_of_premium: Optional[float] = None, *,
                                    as_of_date: Optional[date] = None,
                                    underlying_close: Optional[float] = None,
-                                   risk_free_rate: float = 0.0) -> Dict[str, Any]:
+                                   risk_free_rate: float) -> Dict[str, Any]:
     """Map an Alpaca OptionContract (metadata) to a HISTORICAL chain row.
 
     Pure (no network). open_interest/volume are ALWAYS None — Alpaca has no as-of OI/volume for
@@ -124,6 +124,9 @@ def contract_to_metadata_chain_row(c: Any, underlying: str,
     IV is derived from the option's own price, not an independently-observed vendor quantity, so
     we don't need Alpaca (or anyone) to hand us historical greeks. Omit either kwarg (as the old
     call sites and most tests do) to get the prior None-filled behaviour unchanged.
+
+    ``risk_free_rate`` is REQUIRED (no default): the build's as-of rate for ``as_of_date``
+    (``fetch_risk_free_rate_series``). It used to default to 0.0.
 
     ``as_of_premium`` (the contract's CLOSE on the chain's as-of date, taken from the daily bar
     we already fetch) is used to fill bid/ask/last so the option ENTRY action — which requires a
@@ -171,12 +174,13 @@ def merge_contracts_by_symbol(*contract_lists: List[Any]) -> List[Any]:
 
 def bar_to_row(occ: str, d: str, bar: Any, underlying: str, opt_type: str, strike: float,
                expiry: str, *, underlying_close: Optional[float] = None,
-               risk_free_rate: float = 0.0) -> Dict[str, Any]:
+               risk_free_rate: float) -> Dict[str, Any]:
     """Map one daily option bar to a row. iv/delta/gamma/theta/vega are computed via
     Black-Scholes inversion of THIS bar's close (see ``option_greeks.py``) when
     ``underlying_close`` is supplied — the POINT-IN-TIME greeks for this specific trading day,
     not a single build-time snapshot. Omit it (as the pre-existing tests do) for the prior
-    None-filled behaviour."""
+    None-filled behaviour. ``risk_free_rate`` is REQUIRED (no default): the build's as-of rate
+    for THIS bar's date; it used to default to 0.0."""
     close = _g(bar, "close")
     greeks_out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
     if close is not None and underlying_close is not None:
@@ -223,54 +227,30 @@ def _options_feed(feed: str) -> Any:
             f"invalid options feed {feed!r}; valid values: {sorted(by_value)}") from None
 
 
-# Default risk-free rate used when FRED is unreachable/unconfigured. Rho (rate sensitivity) is
-# the smallest-impact Greek for short-dated equity options, so a rough constant is a far smaller
-# error source than the close-price-based IV itself — this is a documented fallback, not a
-# silently-wrong default (a warning is logged when it's used).
-_FALLBACK_RISK_FREE_RATE = 0.045
+def fetch_risk_free_rate_series(start: date, end: date):
+    """The build's risk-free rate: the as-of 3-month Treasury (FRED DGS3MO) over [start, end],
+    as the shared ``RiskFreeRate`` the option BACKTEST reads (``ba2_providers.macro.
+    risk_free_rate``), so the greeks baked into this store and the Black-Scholes marks a
+    backtest prices off them use the same series.
 
+    REFUSES, never falls back. It used to return {} when the FRED key was unset or the request
+    failed, and the build then inverted every bar at a flat 4.5% -- with nothing but a warning
+    to say so. Now:
 
-def fetch_risk_free_rate_series(start: date, end: date) -> Dict[str, float]:
-    """Daily risk-free rate (3-month Treasury, FRED series DGS3MO) as {date_iso: rate_decimal}
-    over [start, end], forward-filled across weekends/holidays (FRED only publishes business
-    days). One HTTP call for the whole build (shared across every underlying/contract) — this is
-    the SAME external input `FREDMacroProvider` already exposes elsewhere in the codebase, called
-    directly here (env var key, not the DB-backed AppSetting) so this script stays a
-    self-contained CLI like its Alpaca creds handling.
+      * no FRED key (``ba2_common.core.fred_api_key``: env ``FRED_API_KEY``, else the AppSetting
+        ``fred_api_key``) raises ``FredApiKeyMissing``;
+      * a failed fetch raises (``fred_series.refresh_series``);
+      * a series that does not cover the window raises ``RiskFreeRateUnavailable``.
 
-    Falls back to `_FALLBACK_RISK_FREE_RATE` (with a logged warning) when FRED_API_KEY is unset
-    or the request fails — rho is a minor Greek, so this does not block the build."""
-    import os
-    import requests
-    api_key = os.environ.get("FRED_API_KEY")
-    if not api_key:
-        logger.warning(
-            "FRED_API_KEY not set; using a flat %.2f%% risk-free rate for option greeks "
-            "(rho is a minor Greek, this does not materially affect delta/gamma/theta/vega).",
-            _FALLBACK_RISK_FREE_RATE * 100)
-        return {}
-    try:
-        resp = requests.get(
-            "https://api.stlouisfed.org/fred/series/observations",
-            params={"series_id": "DGS3MO", "api_key": api_key, "file_type": "json",
-                    "observation_start": start.isoformat(), "observation_end": end.isoformat(),
-                    "sort_order": "asc", "limit": 10000},
-            timeout=30)
-        resp.raise_for_status()
-        obs = resp.json().get("observations", [])
-    except Exception as e:  # noqa: BLE001 — never block the build on a macro-data hiccup
-        logger.warning(f"FRED risk-free-rate fetch failed ({e}); using flat "
-                       f"{_FALLBACK_RISK_FREE_RATE * 100:.2f}% fallback.")
-        return {}
-    series: Dict[str, float] = {}
-    last: Optional[float] = None
-    for o in obs:
-        v = o.get("value")
-        if v and v != ".":
-            last = float(v) / 100.0
-        if last is not None:
-            series[o["date"]] = last
-    return series
+    The series is refreshed into the shared FRED disk cache (``<CACHE_FOLDER>/fred/DGS3MO.json``)
+    and read back from there -- the same file a backtest reads."""
+    from ba2_common.core.fred_api_key import require_fred_api_key
+    from ba2_providers.macro import fred_series
+    from ba2_providers.macro.risk_free_rate import SERIES_ID, fred_dgs3mo_rate
+
+    key = require_fred_api_key("the options cache build's risk-free rate (FRED DGS3MO)")
+    fred_series.refresh_series(SERIES_ID, key)
+    return fred_dgs3mo_rate(start, end)
 
 
 def fetch_underlying_close_series(ohlcv_provider: Any, underlying: str,
@@ -460,8 +440,9 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     start_iso = start.isoformat()
     end_iso = end.isoformat()
 
-    # Risk-free rate: ONE FRED call for the whole build (read-only dict, safe to share across
-    # threads). Underlying close series is fetched PER-UNDERLYING inside _process (below) since
+    # Risk-free rate: ONE FRED refresh for the whole build (a read-only RiskFreeRate, safe to
+    # share across threads; its per-day memo only ever gains identical entries). REFUSES the
+    # build up front when the key is missing, the fetch fails or the series is short. Underlying close series is fetched PER-UNDERLYING inside _process (below) since
     # it needs a per-thread OHLCV provider instance, mirroring the per-thread Alpaca clients.
     risk_free_series = fetch_risk_free_rate_series(start, end)
 
@@ -489,8 +470,7 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
         return _tl.tc, _tl.dc, _tl.ohlcv
 
     def _rate_at(d: date) -> float:
-        r = _nearest_on_or_before(risk_free_series, d)
-        return r if r is not None else _FALLBACK_RISK_FREE_RATE
+        return risk_free_series.rate_on(d)   # as-of DGS3MO; raises rather than falls back
 
     def _process(u: str) -> None:
         try:

@@ -547,14 +547,14 @@ def test_a_non_finite_multiplier_is_rejected_because_or_1_cannot_catch_it():
              profit_cap_pct=100.0)
 
 
-def test_a_missing_multiplier_still_defaults_to_the_one_that_is_a_no_op():
-    """``None`` is legitimate -- equities, per-FILL fallback rows and trade blobs persisted
-    before the round-trip recorder published the column all lack it. It must become 1.0 (an
-    exact no-op), NOT raise: only a value that is not a number at all is rejected."""
+def test_a_missing_multiplier_defaults_to_one_for_equities_and_is_refused_for_options():
+    """``None`` is legitimate for equities and per-FILL fallback rows (no contract): it becomes
+    1.0, an exact no-op. An OPTION leg has no safe default -- 1.0 would read a 100x contract as
+    one share and cap a structure's max loss 100x too small -- so it is refused."""
     leg = _opt(1, "AAPL231215C00180000", "buy", 2.00, 7.00, 2, 1_000.0, 1.0)
     leg["multiplier"] = None
-    r = _run(100_000.0, 101_000.0, [leg])
-    assert r["trades"][0]["multiplier"] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="trade.multiplier"):
+        _run(100_000.0, 101_000.0, [leg])
 
     # And an equity row (multiplier 1) is unchanged by the coercion.
     r_eq = _run(100_000.0, 101_000.0,

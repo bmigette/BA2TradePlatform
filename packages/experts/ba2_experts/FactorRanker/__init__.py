@@ -18,13 +18,15 @@ from ba2_common.core.interfaces.ExpertDataExportInterface import (
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
-from ba2_providers.StockScreener import StockScreener
+from ba2_common.core.knowability import scan_cutoff_date
+from ba2_providers.StockScreener import ScreenerDataError, StockScreener
+from ba2_providers.screener.metric_store import MetricStoreStaleError
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
 from ba2_common.logger import get_expert_logger
 
 from ba2_experts.FactorRanker import data
-from ba2_experts.FactorRanker.construction import long_only_top_n
+from ba2_experts.FactorRanker.construction import WEIGHTINGS, long_only_top_n
 from ba2_experts.FactorRanker.factors import (
     DEF_MIN_MEASURED_FACTORS, composite_detail, cross_sectional_stats,
     cross_sectional_zscore, describe_composite_availability, earnings_surprise,
@@ -66,6 +68,50 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return False
 
 
+def _refuse_legacy_max_weight_per_name(raw_settings: Dict[str, Any]) -> None:
+    """Raise LOUDLY if the retired ``max_weight_per_name`` setting (fraction 0-1,
+    FactorRanker-only) is present anywhere in ``raw_settings`` -- an old stored DB row, an
+    old GA genome or an old deploy payload. It was unified into the platform-wide
+    ``max_virtual_equity_per_instrument_percent`` (percent, shared with every other
+    expert) on 2026-09-29; silently ignoring a leftover value would run the book at the
+    OTHER setting's cap instead of the one the operator/GA actually chose, with no sign
+    anything changed. Shared by the live settings-resolution path (``self.settings``) and
+    the backtest path (``context.settings``) -- one function, two callers.
+    """
+    legacy = raw_settings.get("max_weight_per_name")
+    if legacy is None:
+        return
+    try:
+        as_percent = f"{float(legacy) * 100.0:g}"
+    except (TypeError, ValueError):
+        as_percent = "<unreadable>"
+    raise ValueError(
+        f"FactorRanker: setting 'max_weight_per_name' ({legacy!r}) is retired -- the "
+        f"per-name cap is now the platform-wide 'max_virtual_equity_per_instrument_percent' "
+        f"(a PERCENT, not a fraction). Set max_virtual_equity_per_instrument_percent="
+        f"{as_percent} instead (the old value x 100) and remove max_weight_per_name."
+    )
+
+
+def _validate_instrument_cap_percent(cap_percent: Any) -> float:
+    """``max_virtual_equity_per_instrument_percent`` (percent) -> validated per-name
+    weight fraction in (0, 1]. Raises ValueError naming the setting for a missing value or
+    anything outside (0, 100] -- no clamping, no fallback (CLAUDE.md: no defaults that hide
+    missing config)."""
+    if cap_percent is None:
+        raise ValueError(
+            "FactorRanker: max_virtual_equity_per_instrument_percent is required "
+            "(no stored value and no interface default resolved)"
+        )
+    value = float(cap_percent)
+    if not (0 < value <= 100):
+        raise ValueError(
+            f"FactorRanker: max_virtual_equity_per_instrument_percent must be in "
+            f"(0, 100], got {cap_percent!r}"
+        )
+    return value / 100.0
+
+
 class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     """Configurable cross-sectional multi-factor equity ranker."""
 
@@ -96,8 +142,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     # row per factor (momentum/value/quality/pead) -- see
     # _build_export_metrics below. factor_weight_*/winsorize_pct/
     # pead_drift_window_days directly shape those. Excludes: top_n/weighting/
-    # max_weight_per_name/gross_exposure (portfolio CONSTRUCTION across a
-    # book, never reflected in a single-symbol composite/factor display);
+    # max_virtual_equity_per_instrument_percent/gross_exposure (portfolio CONSTRUCTION
+    # across a book, never reflected in a single-symbol composite/factor display);
     # universe_source/min_price/min_dollar_volume/screener_store (universe
     # RESOLUTION, moot here since export_symbol_data pins the universe to
     # exactly the requested symbol regardless of these).
@@ -175,12 +221,18 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             },
             "weighting": {
                 "type": "str", "required": False, "default": "equal",
-                "choices": ["equal", "score"],
-                "description": "Position weighting: equal (1/N) or score-proportional.",
-            },
-            "max_weight_per_name": {
-                "type": "float", "required": False, "default": 0.10,
-                "description": "Maximum portfolio weight per holding (0-1).",
+                "choices": list(WEIGHTINGS),
+                # valid_values is what the settings UI renders as a dropdown; choices alone
+                # rendered a free-text box.
+                "valid_values": list(WEIGHTINGS),
+                "description": "Position weighting: equal (1/N), score-proportional, or by rank.",
+                "tooltip": "equal (default): every held name gets the same weight. score: "
+                           "proportional to the composite factor score. rank: linear in rank -- "
+                           "of N names the best gets N parts, the next N-1, ... the last 1. In "
+                           "every mode no name exceeds max_virtual_equity_per_instrument_percent "
+                           "(the platform-wide per-instrument cap, shared with every other "
+                           "expert); weight a capped name cannot take goes to the others, and to "
+                           "cash once all are capped.",
             },
             "gross_exposure": {
                 "type": "float", "required": False, "default": 1.0,
@@ -388,7 +440,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         Default (``screener_store`` unset): runs the configured ``StockScreener``,
         reading the expert's ``screener_*`` settings (part of the base interface) and
         returning the matched symbols (uppercased). Failures degrade to an empty
-        universe rather than raising, so one bad screen doesn't crash the rebalance.
+        universe rather than raising, so one bad screen doesn't crash the rebalance --
+        EXCEPT a LIVE (as_of None) ``ScreenerDataError`` (FMP data could not be fetched),
+        which propagates so the analysis fails with the reason.
 
         ``as_of`` is threaded into both paths so the BACKTEST screens the point-in-time
         universe for that date (the store resolves to the latest scan date <= as_of;
@@ -410,14 +464,33 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             try:
                 from ba2_providers.screener import metric_store as ms  # local import (opt-in)
                 df = ms.load_store(store)
-                day = (as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-                syms = ms.screen_universe_as_of(df, day, self._metric_store_settings())
+                # the scan VISIBLE at the decision (an intraday backtest clock: every session dated
+                # <= the scan finished at it; live / daily clock: the as_of date, unchanged)
+                day = scan_cutoff_date(as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+                # PER-RUN exclusion (not a persisted expert setting -- pushed onto this trial's
+                # settings dict by strategy_optimization_handler._build_daily_trial_config from
+                # the launcher's --exclude-symbols / optimization_config.backtest.
+                # excluded_instruments). This expert's screener-mode universe resolves straight
+                # off the metric store, never off enabled_instruments, so the launcher-level
+                # exclusion cannot reach it any other way. Absent/empty -> no-op (unchanged).
+                # NOTE on CLAUDE.md's "no .get() defaults" rule: that rule targets REQUIRED
+                # config, where a silent default would mask a missing value that should have
+                # been supplied. "excluded_symbols" is optional BY DESIGN -- it is never a
+                # declared setting (see get_settings_definitions), it does not exist for a live
+                # ExpertInstance at all, and its absence is the correct, intended state for every
+                # run except a backtest launched with --exclude-symbols. `.get()` here reads "not
+                # applicable to this run", not "value forgotten".
+                excluded_symbols = self.settings.get("excluded_symbols")
+                syms = ms.screen_universe_as_of(df, day, self._metric_store_settings(),
+                                                excluded_symbols)
                 syms = [s.upper() for s in syms]
                 self.logger.info(
                     f"FactorRanker: metric_store returned {len(syms)} candidates "
                     f"(store={store}, as_of={day})"
                 )
                 return syms
+            except MetricStoreStaleError:
+                raise  # a window past the store's end must fail loudly, never fall back silently
             except Exception as e:
                 self.logger.warning(
                     f"FactorRanker: metric_store universe resolution failed ({e}); "
@@ -443,6 +516,11 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             raise
         except Exception as e:
             self.logger.error(f"FactorRanker: screener universe resolution failed: {e}", exc_info=True)
+            if as_of is None and isinstance(e, ScreenerDataError):
+                # LIVE ONLY: a data-fetch failure is not "the filters matched nothing". Let the
+                # analysis fail visibly with the reason instead of a silent empty universe.
+                # Backtests (as_of set) keep the degrade-to-empty behaviour byte-for-byte.
+                raise
             return []
 
     def _resolve_universe_source(self) -> str:
@@ -562,14 +640,19 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     # all four data fetchers; _process is pure (composite_score/rank/construction).
     # ------------------------------------------------------------------
     _FACTOR_SETTING_KEYS = (
-        "winsorize_pct", "top_n", "weighting", "max_weight_per_name",
+        "winsorize_pct", "top_n", "weighting", "max_virtual_equity_per_instrument_percent",
         "gross_exposure", "pead_drift_window_days",
     )
 
     def _resolve_factor_settings(self) -> Dict[str, Any]:
         """Resolve the construction settings _process consumes into a plain dict,
         plus the per-factor weights under ``_factor_weights`` (so _process never
-        reads self for config — matches the optimizer-override flow)."""
+        reads self for config — matches the optimizer-override flow).
+
+        Refuses loudly first if the retired ``max_weight_per_name`` is still stored on
+        this instance (checked against the RAW settings, since it is no longer in
+        ``_FACTOR_SETTING_KEYS`` and would otherwise be silently dropped)."""
+        _refuse_legacy_max_weight_per_name(self.settings)
         settings = self._resolve_settings(self._FACTOR_SETTING_KEYS)
         settings["_factor_weights"] = self._factor_weights()
         return settings
@@ -615,7 +698,10 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             import pandas as pd
             from ba2_providers.screener import metric_store as ms
             df = ms.load_store(store)
-            rows = ms.metrics_as_of(df, as_of.strftime("%Y-%m-%d"), ["momentum_12_1", "close"])
+            rows = ms.metrics_as_of(df, scan_cutoff_date(as_of).strftime("%Y-%m-%d"),
+                                  ["momentum_12_1", "close"])
+        except MetricStoreStaleError:
+            raise  # stale store: fail loudly (the OHLCV fallback would hide it)
         except Exception:  # noqa: BLE001 — any store issue -> safe OHLCV fallback
             return None, None
         if not rows or not all(s in rows for s in universe):
@@ -652,7 +738,7 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         # Thread it into every OHLCV-using fetcher so the daily closes are sliced from
         # memory instead of re-reading + re-parsing the parquet on every analysis bar.
         # On the LIVE path ``providers.ohlcv()`` is the plain FMP provider, so behaviour
-        # is unchanged; the fetchers fall back to ``FMPOHLCVProvider()`` if it is None.
+        # is unchanged; the fetchers fall back to the live registry provider if it is None (refused with an as_of).
         ohlcv_provider = providers.ohlcv()
 
         universe = self._resolve_universe(as_of)
@@ -725,7 +811,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             ranked, comp,
             top_n=int(settings["top_n"]),
             weighting=settings["weighting"],
-            max_weight_per_name=float(settings["max_weight_per_name"]),
+            max_weight_per_name=_validate_instrument_cap_percent(
+                settings["max_virtual_equity_per_instrument_percent"]),
             gross_exposure=gross_exposure,
         )
         book = self._build_book(
@@ -749,8 +836,16 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         optimizer's ``model:factor_weight_*`` genes are honoured (the GA overrides arrive via
         ``context.settings``, not on ``self``), falling back to this expert's interface default
         for any weight the engine did not pass. Without this every bar raised
-        ``KeyError('_factor_weights')`` and the bypass expert silently traded nothing."""
+        ``KeyError('_factor_weights')`` and the bypass expert silently traded nothing.
+
+        Refuses loudly first if the retired ``max_weight_per_name`` rides along on
+        ``context.settings`` (an old genome or deploy payload decoded verbatim) — the SAME
+        refusal the live path raises, so a re-run of a pre-2026-09-29 genome fails instead of
+        silently sizing against the wrong cap. ``max_virtual_equity_per_instrument_percent``
+        gets the same live-path fallback as the factor weights: the GA's ``model:*`` gene wins
+        when present, else this expert's declared interface default."""
         settings = dict(context.settings)
+        _refuse_legacy_max_weight_per_name(settings)
         settings.setdefault("_factor_weights", {
             name: float(
                 settings.get(f"factor_weight_{name}",
@@ -758,6 +853,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 or 0.0)
             for name in _FACTOR_PIPELINE
         })
+        settings.setdefault(
+            "max_virtual_equity_per_instrument_percent",
+            self.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent"))
         self._gather_settings = settings
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, settings, as_of)

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, List
 from sqlmodel import select
 
 
-from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
+from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, ExpertSetting, EventAction, Ruleset
 from ...logger import logger
 from ...core.db import (get_db, get_all_instances, delete_instance, add_instance,
                         update_instance, get_instance, ruleset_event_actions,
@@ -16,6 +16,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_for_display
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -47,6 +48,38 @@ from ba2_common.core.trigger_catalog import (
 )
 from functools import partial
 from ..components.refresh_button import refresh_button
+from ..utils import phone_sections as _phone_sections
+from ..utils.secret_mask import SECRET_INPUT_CLASS, is_secret_setting
+from ..utils.phone_sections import (expert_card_template,
+                                    check_card_covers_table, phone_css, DIALOG_CLASS, TABS_CLASS,
+                                    FOOT_CLASS, LIST_CLASS, LIST_TOP_CLASS)
+from ..utils.responsive import PhoneTableRegistry, install_phone_listener, phone_grid_prop
+
+
+#: Keep browsers and password managers from autofilling/saving a credential field: an autofill
+#: into an empty secret input would be written by Save.
+SECRET_INPUT_PROPS = 'autocomplete=new-password data-1p-ignore data-lpignore=true data-bwignore'
+
+
+def _secret_input(label, value=''):
+    """A credential input: hidden by default, eye icon to reveal (never pre-revealed).
+
+    ``password=True`` only changes how the browser DRAWS the field; ``.value`` is the real
+    text, so what the form records and what Save compares/writes is unchanged.
+    """
+    return ui.input(label=label, value=value, password=True,
+                    password_toggle_button=True).classes(SECRET_INPUT_CLASS).props(SECRET_INPUT_PROPS)
+
+
+def phone_section(title, **kwargs):
+    """A section that folds on a phone (see utils/phone_sections.py), built with THIS module's
+    ``ui`` -- looked up at call time, so a test that swaps ``ui`` swaps it for the sections too."""
+    return _phone_sections.phone_section(title, ui=ui, **kwargs)
+
+
+def dialog_tab(name, icon):
+    return _phone_sections.dialog_tab(name, icon, ui=ui)
+
 
 
 class TriggerTypePicker:
@@ -277,6 +310,60 @@ OPERATOR_REFUSED_NOTE = '⚠ The engine refuses {operator} on this trigger; allo
 
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
+from ...core.app_settings import APP_SETTINGS_DEFINITIONS
+from ..utils.setting_display import (
+    NumericSettingNotSavable, SettingHasNoDisplayValue, ShownValues, display_text,
+    has_stored_value, numeric_setting_for_save, resolve_setting_for_display,
+    select_value_for_display, unpicked_selects, unpicked_selects_message, unset_bool_message,
+    unset_bool_settings,
+)
+
+#: The instrument-selection select's value for "no stored method". FactorRanker reads an unset
+#: method as "defer to universe_source" while an explicit 'static' forces a static universe, so
+#: the dialog must be able to SHOW unset and leave it unset.
+INSTRUMENT_METHOD_UNSET = '__unset__'
+
+
+def _null_setting_keys(setting_model, lookup_field: str, owner_id) -> set:
+    """Keys whose row EXISTS but holds no value (every value column NULL / empty / "None").
+
+    The settings loader reads such a bool row as False and a str/float row as None; the dialog
+    treats all of them as unset, so a no-edit save leaves the row exactly as it is.
+    """
+    with get_db() as session:
+        rows = session.exec(select(setting_model).filter_by(**{lookup_field: owner_id})).all()
+    return {r.key for r in rows
+            if r.value_float is None and r.value_str in (None, "None") and r.value_json in (None, {}, "")}
+
+
+def _show_select_error(key: str, inp, error) -> None:
+    """Put ``error`` ON the dropdown (Quasar error state), log it and tell the operator. The
+    error clears once a value is picked; the save refuses until then (unpicked_selects)."""
+    if not error:
+        return
+    safe = str(error).replace('"', "'")
+    inp.props(f'error error-message="{safe}"')
+    inp.on_value_change(lambda e: inp.props(remove='error'))
+    logger.error(f"Setting '{key}': {error}")
+    ui.notify(f"Setting '{key}': {error}", type='negative', timeout=0, close_button=True)
+
+
+def selectable_account_providers():
+    """The account providers the dialog may offer, and why each other one is not.
+
+    An ABSTRACT provider class (IBKRAccount today lacks 10 methods) can never be built: saving
+    it created the AccountDefinition row and then died in ``provider_cls.__new__``, leaving an
+    orphan row on every retry. Returns ``(names, {name: reason})``.
+    """
+    import inspect
+    names, unavailable = [], {}
+    for name, cls in providers.items():
+        missing = sorted(getattr(cls, '__abstractmethods__', ()) or ())
+        if inspect.isabstract(cls):
+            unavailable[name] = (f"{name} is not implemented yet (missing: {', '.join(missing)})")
+        else:
+            names.append(name)
+    return names, unavailable
 
 
 def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
@@ -287,8 +374,46 @@ def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
     """
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import margin_factor_error
     if "margin_factor" in dynamic_settings:
-        return margin_factor_error(dynamic_settings["margin_factor"])
+        problem = margin_factor_error(dynamic_settings["margin_factor"])
+        if problem:
+            return problem
+    if "ohlcv_history_source" in dynamic_settings:
+        # unknown value, or alpaca on an account without Alpaca keys: named, nothing saved
+        from ba2_trade_platform.core.account_history import validate_account_history_source
+        try:
+            validate_account_history_source(dynamic_settings)
+        except ValueError as e:                      # UnknownHistorySource and HistorySourceNeedsAlpacaKeys
+            return f"Not saved: {e}"
     return None
+
+
+def _strike_param_text(value: Any) -> str:
+    """The Strike Param box's text: what the save path parses back.
+
+    ``str()`` showed a float's binary noise (0.35000000000000003) and a per-leg dict in
+    Python's single-quoted repr, which the save's ``json.loads`` then refused.
+    """
+    import json as _json
+    if value is None or value == '':
+        return ''
+    if isinstance(value, dict):
+        return _json.dumps({k: (float(f"{v:.10g}") if isinstance(v, float) else v)
+                            for k, v in value.items()})
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    return str(value)
+
+
+def _builtin_default(key: str) -> Any:
+    """The DECLARED default of a MarketExpertInterface builtin setting -- the one source.
+
+    The expert dialog's constructor used literals that had drifted from the declaration
+    (smart RM max iterations 10 vs 20, model 'nagaai/gpt5' vs the declared model). Explicit
+    access: a builtin with no declared default is a KeyError here, not a guess.
+    """
+    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+    MarketExpertInterface._ensure_builtin_settings()
+    return MarketExpertInterface._builtin_settings[key]["default"]
 
 
 def _render_reset_default_button(inp, default_value, meta):
@@ -733,40 +858,70 @@ class AppSettingsTab:
         self.account_refresh_interval_input = None
         self.render()
 
+    #: Every app setting the tab edits: key -> input attribute.
+    _APP_CONTROLS = {
+        'openai_api_key': 'openai_input', 'openai_admin_api_key': 'openai_admin_input',
+        'naga_ai_api_key': 'naga_ai_input', 'naga_ai_admin_api_key': 'naga_ai_admin_input',
+        'anthropic_api_key': 'anthropic_input', 'anthropic_admin_api_key': 'anthropic_admin_input',
+        'google_api_key': 'google_input', 'openrouter_api_key': 'openrouter_input',
+        'xai_api_key': 'xai_input', 'xai_admin_api_key': 'xai_admin_input',
+        'xai_team_id': 'xai_team_id_input', 'moonshot_api_key': 'moonshot_input',
+        'deepseek_api_key': 'deepseek_input', 'aws_access_key_id': 'aws_access_key_input',
+        'aws_secret_access_key': 'aws_secret_key_input', 'aws_bedrock_region': 'aws_region_input',
+        'finnhub_api_key': 'finnhub_input', 'fred_api_key': 'fred_input',
+        'alpha_vantage_api_key': 'alpha_vantage_input', 'FMP_API_KEY': 'fmp_input',
+        'alpaca_api_key': 'alpaca_key_input', 'alpaca_api_secret': 'alpaca_secret_input',
+        'worker_count': 'worker_count_input',
+        'account_refresh_interval': 'account_refresh_interval_input',
+        'scheduled_session_guard_enabled': 'session_guard_input',
+    }
+
+    def _shown_value(self, key: str):
+        """The stored value, else the DECLARED default, else empty ('' for text, None for a
+        number). An unparsable stored number is shown empty, loudly."""
+        meta = APP_SETTINGS_DEFINITIONS[key]
+        stored = getattr(self, '_stored', {})
+        if has_stored_value(stored, key):
+            raw = stored[key]
+            if meta['type'] == 'bool':
+                from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                try:
+                    return coerce_bool(raw)
+                except ValueError:
+                    logger.error(f"App setting '{key}' holds an unreadable boolean {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable boolean ({raw!r}); it is "
+                              f"shown at its declared default", type='negative', timeout=0,
+                              close_button=True)
+                    return meta['default']
+            if meta['type'] == 'int':
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    logger.error(f"App setting '{key}' holds an unreadable number {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable number ({raw!r}); it is "
+                              f"shown empty -- a save with it empty writes the declared default",
+                              type='negative', timeout=0, close_button=True)
+                    return None
+            return raw
+        if 'default' in meta:
+            return meta['default']
+        return '' if meta['type'] == 'str' else None
+
     def render(self):
-        session = get_db()
+        # Every value comes from the stored row, else the DECLARED default
+        # (core.app_settings.APP_SETTINGS_DEFINITIONS -- the default the runtime readers use
+        # too), else empty. No literals here: they were second copies of the runtime's own.
+        with get_db() as session:
+            self._stored = {row.key: row.value_str
+                            for row in session.exec(select(AppSetting)).all()}
         
         # LLM Provider API Keys
-        openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-        openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
-        naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
-        naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
-        anthropic = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_api_key')).first()
-        anthropic_admin = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_admin_api_key')).first()
-        google = session.exec(select(AppSetting).where(AppSetting.key == 'google_api_key')).first()
-        openrouter = session.exec(select(AppSetting).where(AppSetting.key == 'openrouter_api_key')).first()
-        xai = session.exec(select(AppSetting).where(AppSetting.key == 'xai_api_key')).first()
-        xai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'xai_admin_api_key')).first()
-        xai_team_id = session.exec(select(AppSetting).where(AppSetting.key == 'xai_team_id')).first()
-        moonshot = session.exec(select(AppSetting).where(AppSetting.key == 'moonshot_api_key')).first()
-        deepseek = session.exec(select(AppSetting).where(AppSetting.key == 'deepseek_api_key')).first()
-        aws_access_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_access_key_id')).first()
-        aws_secret_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_secret_access_key')).first()
-        aws_region = session.exec(select(AppSetting).where(AppSetting.key == 'aws_bedrock_region')).first()
         
         # Data Provider API Keys
-        finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
-        fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
-        alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
-        fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
         
         # Broker API Keys
-        alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
-        alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
         
         # System Settings
-        worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
-        account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
         # =================================================================
         # LLM Provider API Keys Section
@@ -777,68 +932,68 @@ class AppSettingsTab:
             
             with ui.expansion('OpenAI', icon='smart_toy').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
-                    self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.openai_input = _secret_input(label='OpenAI API Key', value=self._shown_value('openai_api_key')).classes('w-full')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.openai_admin_input = _secret_input(label='OpenAI Admin API Key (for usage data)', value=self._shown_value('openai_admin_api_key')).classes('flex-1')
                         ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('NagaAI', icon='waves').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.naga_ai_input = ui.input(label='NagaAI API Key', value=naga_ai.value_str if naga_ai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.naga_ai_input = _secret_input(label='NagaAI API Key', value=self._shown_value('naga_ai_api_key')).classes('flex-1')
                         ui.link('Get NagaAI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.naga_ai_admin_input = ui.input(label='NagaAI Admin API Key (for usage data)', value=naga_ai_admin.value_str if naga_ai_admin else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.naga_ai_admin_input = _secret_input(label='NagaAI Admin API Key (for usage data)', value=self._shown_value('naga_ai_admin_api_key')).classes('w-full')
             
             with ui.expansion('Anthropic (Claude)', icon='psychology').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.anthropic_input = ui.input(label='Anthropic API Key', value=anthropic.value_str if anthropic else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.anthropic_input = _secret_input(label='Anthropic API Key', value=self._shown_value('anthropic_api_key')).classes('flex-1')
                         ui.link('Get Anthropic Key', 'https://console.anthropic.com/settings/keys', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.anthropic_admin_input = ui.input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=anthropic_admin.value_str if anthropic_admin else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.anthropic_admin_input = _secret_input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=self._shown_value('anthropic_admin_api_key')).classes('w-full')
             
             with ui.expansion('Google (Gemini)', icon='auto_awesome').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.google_input = ui.input(label='Google API Key', value=google.value_str if google else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.google_input = _secret_input(label='Google API Key', value=self._shown_value('google_api_key')).classes('flex-1')
                         ui.link('Get Google Key', 'https://aistudio.google.com/app/apikey', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('OpenRouter', icon='route').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.openrouter_input = ui.input(label='OpenRouter API Key', value=openrouter.value_str if openrouter else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.openrouter_input = _secret_input(label='OpenRouter API Key', value=self._shown_value('openrouter_api_key')).classes('flex-1')
                         ui.link('Get OpenRouter Key', 'https://openrouter.ai/keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('xAI (Grok)', icon='bolt').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_input = ui.input(label='xAI API Key', value=xai.value_str if xai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_input = _secret_input(label='xAI API Key', value=self._shown_value('xai_api_key')).classes('flex-1')
                         ui.link('Get xAI Key', 'https://console.x.ai/', new_tab=True).classes('text-sm text-blue-600 underline')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.xai_admin_input = ui.input(label='xAI Admin API Key (for billing/usage data)', value=xai_admin.value_str if xai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.xai_admin_input = _secret_input(label='xAI Admin API Key (for billing/usage data)', value=self._shown_value('xai_admin_api_key')).classes('flex-1')
                         ui.link('Management API Docs', 'https://docs.x.ai/docs/key-information/using-management-api', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=xai_team_id.value_str if xai_team_id else '').classes('w-full')
+                    self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=self._shown_value('xai_team_id')).classes('w-full')
                     ui.label('Find your Team ID in the xAI console URL or account settings').classes('text-xs text-gray-500')
             
             with ui.expansion('Moonshot (Kimi)', icon='nightlight').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.moonshot_input = ui.input(label='Moonshot API Key', value=moonshot.value_str if moonshot else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.moonshot_input = _secret_input(label='Moonshot API Key', value=self._shown_value('moonshot_api_key')).classes('flex-1')
                         ui.link('Get Moonshot Key', 'https://platform.moonshot.ai/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('DeepSeek', icon='explore').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.deepseek_input = ui.input(label='DeepSeek API Key', value=deepseek.value_str if deepseek else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.deepseek_input = _secret_input(label='DeepSeek API Key', value=self._shown_value('deepseek_api_key')).classes('flex-1')
                         ui.link('Get DeepSeek Key', 'https://platform.deepseek.com/api_keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('AWS Bedrock', icon='cloud').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
                     ui.label('AWS credentials for Amazon Bedrock models (Claude, etc.)').classes('text-sm text-gray-500')
                     with ui.row().classes('w-full items-center gap-2'):
-                        self.aws_access_key_input = ui.input(label='AWS Access Key ID', value=aws_access_key.value_str if aws_access_key else '', password=True, password_toggle_button=True).classes('flex-1')
+                        self.aws_access_key_input = _secret_input(label='AWS Access Key ID', value=self._shown_value('aws_access_key_id')).classes('flex-1')
                         ui.link('Get AWS Keys', 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html', new_tab=True).classes('text-sm text-blue-600 underline')
-                    self.aws_secret_key_input = ui.input(label='AWS Secret Access Key', value=aws_secret_key.value_str if aws_secret_key else '', password=True, password_toggle_button=True).classes('w-full')
-                    self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=aws_region.value_str if aws_region else 'us-east-1').classes('w-full')
+                    self.aws_secret_key_input = _secret_input(label='AWS Secret Access Key', value=self._shown_value('aws_secret_access_key')).classes('w-full')
+                    self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=self._shown_value('aws_bedrock_region')).classes('w-full')
         
         # =================================================================
         # Data Provider API Keys Section
@@ -847,11 +1002,11 @@ class AppSettingsTab:
             ui.label('📊 Data Provider API Keys').classes('text-xl font-bold mb-2')
             ui.label('Configure API keys for market data providers').classes('text-sm text-gray-500 mb-4')
             
-            self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '', password=True, password_toggle_button=True).classes('w-full')
-            self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '', password=True, password_toggle_button=True).classes('w-full')
-            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '', password=True, password_toggle_button=True).classes('w-full')
+            self.finnhub_input = _secret_input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key')).classes('w-full')
+            self.fred_input = _secret_input(label='FRED API Key', value=self._shown_value('fred_api_key')).classes('w-full')
+            self.alpha_vantage_input = _secret_input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key')).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
-                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=fmp.value_str if fmp else '', password=True, password_toggle_button=True).classes('flex-1')
+                self.fmp_input = _secret_input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY')).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
         
         # =================================================================
@@ -862,9 +1017,9 @@ class AppSettingsTab:
             ui.label('Configure API keys for trading brokers').classes('text-sm text-gray-500 mb-4')
             
             with ui.row().classes('w-full items-center gap-2'):
-                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=alpaca_key.value_str if alpaca_key else '', password=True, password_toggle_button=True).classes('flex-1')
+                self.alpaca_key_input = _secret_input(label='Alpaca API Key', value=self._shown_value('alpaca_api_key')).classes('flex-1')
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
-            self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=alpaca_secret.value_str if alpaca_secret else '', password=True, password_toggle_button=True).classes('w-full')
+            self.alpaca_secret_input = _secret_input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret')).classes('w-full')
         
         # =================================================================
         # System Settings Section
@@ -875,19 +1030,32 @@ class AppSettingsTab:
             
             self.worker_count_input = ui.number(
                 label='Worker Count', 
-                value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
+                value=self._shown_value('worker_count'),
                 min=1,
                 max=20,
                 step=1
             ).classes('w-full')
             self.account_refresh_interval_input = ui.number(
                 label='Account Refresh Interval (minutes)', 
-                value=int(account_refresh_interval.value_str) if account_refresh_interval and account_refresh_interval.value_str else 5,
+                value=self._shown_value('account_refresh_interval'),
                 min=1,
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
+            self.session_guard_input = ui.switch(
+                'Session guard: skip scheduled passes outside the regular market session',
+                value=self._shown_value('scheduled_session_guard_enabled'))
+            ui.label('ON (default): an entry / open-positions pass that fires on a holiday, a '
+                     'weekend, after an early close or outside 09:30-16:00 New York is skipped '
+                     'and logged. Turn OFF only if the guard misbehaves; takes effect on the next '
+                     'fire.').classes('text-xs text-gray-500')
         
+        # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded, and a control
+        # that still shows it is not written (stored value or declared default alike).
+        self._app_shown_values = ShownValues()
+        for key, attr in self._APP_CONTROLS.items():
+            self._app_shown_values.record(key, getattr(self, attr).value)
+
         ui.button('Save All Settings', on_click=self.save_settings, icon='save').classes('mt-4').props('color=primary')
 
     def _save_app_setting(self, session, key: str, value: str):
@@ -902,174 +1070,60 @@ class AppSettingsTab:
 
     def save_settings(self):
         try:
+            # Validate BEFORE any write.
+            admin_key = (self.openai_admin_input.value or '').strip()
+            if admin_key and not admin_key.startswith("sk-admin"):
+                ui.notify('Invalid admin key format. Admin keys should start with "sk-admin".', type='negative')
+                return
+            # A NO-EDIT SAVE IS A NO-OP: a control still showing what it was filled with (its
+            # stored value or declared default) is not written. A cleared number saves the
+            # declared default; an unparsable one is refused by name. Empty text stays allowed.
+            tracker = getattr(self, '_app_shown_values', None)
+            to_write = {}
+            try:
+                for key, attr in self._APP_CONTROLS.items():
+                    raw = getattr(self, attr).value
+                    if tracker is not None and tracker.unedited(key, raw):
+                        continue
+                    if APP_SETTINGS_DEFINITIONS[key]['type'] == 'int':
+                        to_write[key] = str(numeric_setting_for_save(
+                            APP_SETTINGS_DEFINITIONS, key, raw, int))
+                    elif APP_SETTINGS_DEFINITIONS[key]['type'] == 'bool':
+                        to_write[key] = 'true' if raw else 'false'
+                    else:
+                        to_write[key] = '' if raw is None else raw
+            except NumericSettingNotSavable as e:
+                ui.notify(f'Not saved: {e}', type='negative')
+                logger.warning(f'Refused to save app settings: {e}')
+                return
+
             session = get_db()
-            # OpenAI Regular Key
-            openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-            if openai:
-                openai.value_str = self.openai_input.value
-                update_instance(openai, session)
-            else:
-                openai = AppSetting(key='openai_api_key', value_str=self.openai_input.value)
-                add_instance(openai, session)
-
-            # OpenAI Admin Key
-            if self.openai_admin_input.value.strip():
-                # Validate admin key format
-                if not self.openai_admin_input.value.strip().startswith("sk-admin"):
-                    ui.notify('Invalid admin key format. Admin keys should start with "sk-admin".', type='negative')
-                    return
-            
-            openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
-            if openai_admin:
-                openai_admin.value_str = self.openai_admin_input.value
-                update_instance(openai_admin, session)
-            else:
-                openai_admin = AppSetting(key='openai_admin_api_key', value_str=self.openai_admin_input.value)
-                add_instance(openai_admin, session)
-
-            # Naga AI Regular Key
-            naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
-            if naga_ai:
-                naga_ai.value_str = self.naga_ai_input.value
-                update_instance(naga_ai, session)
-            else:
-                naga_ai = AppSetting(key='naga_ai_api_key', value_str=self.naga_ai_input.value)
-                add_instance(naga_ai, session)
-
-            # Naga AI Admin Key
-            naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
-            if naga_ai_admin:
-                naga_ai_admin.value_str = self.naga_ai_admin_input.value
-                update_instance(naga_ai_admin, session)
-            else:
-                naga_ai_admin = AppSetting(key='naga_ai_admin_api_key', value_str=self.naga_ai_admin_input.value)
-                add_instance(naga_ai_admin, session)
-
-            # Anthropic API Key
-            self._save_app_setting(session, 'anthropic_api_key', self.anthropic_input.value)
-            self._save_app_setting(session, 'anthropic_admin_api_key', self.anthropic_admin_input.value)
-            
-            # Google API Key
-            self._save_app_setting(session, 'google_api_key', self.google_input.value)
-            
-            # OpenRouter API Key
-            self._save_app_setting(session, 'openrouter_api_key', self.openrouter_input.value)
-            
-            # xAI API Key
-            self._save_app_setting(session, 'xai_api_key', self.xai_input.value)
-            
-            # xAI Admin API Key
-            self._save_app_setting(session, 'xai_admin_api_key', self.xai_admin_input.value)
-            
-            # xAI Team ID
-            self._save_app_setting(session, 'xai_team_id', self.xai_team_id_input.value)
-            
-            # Moonshot API Key
-            self._save_app_setting(session, 'moonshot_api_key', self.moonshot_input.value)
-            
-            # DeepSeek API Key
-            self._save_app_setting(session, 'deepseek_api_key', self.deepseek_input.value)
-            
-            # AWS Bedrock Credentials
-            self._save_app_setting(session, 'aws_access_key_id', self.aws_access_key_input.value)
-            self._save_app_setting(session, 'aws_secret_access_key', self.aws_secret_key_input.value)
-            self._save_app_setting(session, 'aws_bedrock_region', self.aws_region_input.value)
-
-            # Finnhub
-            finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
-            if finnhub:
-                finnhub.value_str = self.finnhub_input.value
-                update_instance(finnhub, session)
-            else:
-                finnhub = AppSetting(key='finnhub_api_key', value_str=self.finnhub_input.value)
-                add_instance(finnhub, session)
-
-            # FRED
-            fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
-            if fred:
-                fred.value_str = self.fred_input.value
-                update_instance(fred, session)
-            else:
-                fred = AppSetting(key='fred_api_key', value_str=self.fred_input.value)
-                add_instance(fred, session)
-
-            # Alpha Vantage
-            alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
-            if alpha_vantage:
-                alpha_vantage.value_str = self.alpha_vantage_input.value
-                update_instance(alpha_vantage, session)
-            else:
-                alpha_vantage = AppSetting(key='alpha_vantage_api_key', value_str=self.alpha_vantage_input.value)
-                add_instance(alpha_vantage, session)
-            
-            # FMP (Financial Modeling Prep)
-            fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
-            if fmp:
-                fmp.value_str = self.fmp_input.value
-                update_instance(fmp, session)
-            else:
-                fmp = AppSetting(key='FMP_API_KEY', value_str=self.fmp_input.value)
-                add_instance(fmp, session)
-            
-            # Alpaca API Key
-            alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
-            if alpaca_key:
-                alpaca_key.value_str = self.alpaca_key_input.value
-                update_instance(alpaca_key, session)
-            else:
-                alpaca_key = AppSetting(key='alpaca_api_key', value_str=self.alpaca_key_input.value)
-                add_instance(alpaca_key, session)
-            
-            # Alpaca API Secret
-            alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
-            if alpaca_secret:
-                alpaca_secret.value_str = self.alpaca_secret_input.value
-                update_instance(alpaca_secret, session)
-            else:
-                alpaca_secret = AppSetting(key='alpaca_api_secret', value_str=self.alpaca_secret_input.value)
-                add_instance(alpaca_secret, session)
-            
-            # Worker Count
-            worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
-            if worker_count:
-                worker_count.value_str = str(int(self.worker_count_input.value))
-                update_instance(worker_count, session)
-            else:
-                worker_count = AppSetting(key='worker_count', value_str=str(int(self.worker_count_input.value)))
-                add_instance(worker_count, session)
-            
-            # Account Refresh Interval
-            account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
-            if account_refresh_interval:
-                account_refresh_interval.value_str = str(int(self.account_refresh_interval_input.value))
-                update_instance(account_refresh_interval, session)
-            else:
-                account_refresh_interval = AppSetting(key='account_refresh_interval', value_str=str(int(self.account_refresh_interval_input.value)))
-                add_instance(account_refresh_interval, session)
-            
+            for key, value in to_write.items():
+                self._save_app_setting(session, key, value)
             session.commit()
-            
+            logger.debug(f'Saved app settings: {sorted(to_write)}')
+
             # Clear the ModelBillingUsage cache so new API keys take effect
             try:
                 from ...core.ModelBillingUsage import ModelBillingUsage
                 ModelBillingUsage.clear_cache()
             except Exception as e:
                 logger.warning(f"Could not clear ModelBillingUsage cache: {e}")
-            
+
             # Clear the ModelFactory cache so new API keys take effect
             try:
                 from ...core.ModelFactory import ModelFactory
                 ModelFactory.clear_cache()
             except Exception as e:
                 logger.warning(f"Could not clear ModelFactory cache: {e}")
-            
+
             ui.notify('Settings saved successfully', type='positive')
-            
+
             # Notify user that worker count changes require restart
             ui.notify('Worker count changes will take effect after restart', type='info')
             # Notify user that account refresh interval changes require restart
             ui.notify('Account refresh interval changes will take effect after restart', type='info')
-            
+
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}", exc_info=True)
             ui.notify('Error saving settings', type='negative')
@@ -1109,63 +1163,101 @@ class AccountDefinitionsTab:
         """
         
         try:
-            
             provider = self.type_select.value
             provider_cls = providers.get(provider, None)
             dynamic_settings = {}
             if hasattr(self, 'settings_inputs') and self.settings_inputs:
                 for key, inp in self.settings_inputs.items():
                     dynamic_settings[key] = inp.value
-            # Refused HERE, before a single setting is written: save_account writes the
-            # settings one by one and only then validates, so a value that got past this
-            # point would already be stored. ``ui.number`` hands back None when the field
-            # is cleared, and margin_factor_error(None) is an error message -- so a
-            # cleared factor is refused with a clear message rather than stored as None.
-            # That is intended: the 1.8 default applies only where the key was NEVER
-            # saved, and a stored None is not that.
-            problem = account_settings_error(dynamic_settings)
+            raw_values = dict(dynamic_settings)   # what the controls show, before conversion
+
+            # EVERYTHING is validated HERE, before a single write. The old order committed the
+            # AccountDefinition row (new: add_instance; edit: update_instance) and only then
+            # met the failures -- an abstract provider (IBKRAccount lacks 10 methods) died in
+            # provider_cls.__new__ after add_instance, leaving an orphan row on every retry.
+            #
+            # ``ui.number`` hands back None when the field is cleared, and
+            # margin_factor_error(None) is an error message -- so a cleared factor is refused
+            # with a clear message rather than stored as None. That is intended: the 1.8
+            # default applies only where the key was NEVER saved, and a stored None is not that.
+            _, unavailable = selectable_account_providers()
+            load_error = getattr(self, '_account_settings_load_error', None)
+            if provider in unavailable:
+                problem = f"Not saved: {unavailable[provider]}."
+            elif load_error:
+                problem = (f"Not saved: the settings of this account could not be loaded "
+                           f"({load_error}), so the form shows defaults, not its real settings. "
+                           f"Close the dialog and reopen it; see the log.")
+            else:
+                problem = account_settings_error(dynamic_settings)
+            if not problem and provider_cls:
+                account_defs = provider_cls.get_merged_settings_definitions()
+                unset = unset_bool_settings(dynamic_settings, account_defs)
+                unpicked = unpicked_selects(getattr(self, '_select_checks', None) or {})
+                if unset:
+                    problem = unset_bool_message(unset)
+                elif unpicked:
+                    problem = unpicked_selects_message(unpicked)
+                else:
+                    # Numeric fields resolved before any write, exactly as the expert dialog
+                    # does: a cleared field saves the DECLARED default, an unparsable one (or
+                    # an empty one with no default) is refused by name. Runs after
+                    # account_settings_error, so a cleared margin_factor is still refused.
+                    try:
+                        for key, raw in list(dynamic_settings.items()):
+                            kind = account_defs.get(key, {}).get("type")
+                            if kind in ("int", "float"):
+                                dynamic_settings[key] = numeric_setting_for_save(
+                                    account_defs, key, raw, int if kind == "int" else float)
+                    except NumericSettingNotSavable as e:
+                        problem = f"Not saved: {e}"
             if problem:
                 ui.notify(problem, type='negative')
                 logger.warning(f"Refused to save account settings: {problem}")
                 return
-            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings_keys: {list(dynamic_settings.keys())}')
+
+            # A NO-EDIT SAVE IS A NO-OP: an unedited field is not written -- a missing row
+            # stays missing, and a stored value (a credential, a native-JSON bool) keeps its
+            # exact bytes rather than being rewritten through the shared writer.
+            # (Empty str settings, credentials included, stay ALLOWED: user decision 2026-09-26.)
+            shown = getattr(self, '_account_shown_values', None)
+            to_write = {key: value for key, value in dynamic_settings.items()
+                        if not (shown and shown.unedited(key, raw_values[key]))}
+            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, keys to write: {list(to_write)}')
+
             if account:
+                # SETTINGS FIRST, then the definition row: a settings failure leaves the
+                # name/provider/description of the account exactly as they were.
+                if provider_cls and to_write:
+                    try:
+                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
+                        temp_acc_iface.id = account.id
+                        for key, value in to_write.items():
+                            temp_acc_iface.save_setting(key, value)
+                        logger.info(f"Saved {len(to_write)} settings for account {account.id}")
+                    except Exception as settings_error:
+                        logger.error(f"Failed to save settings for account {account.id}: {settings_error}", exc_info=True)
+                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
+                        return
                 account.provider = provider
                 account.name = self.name_input.value
                 account.description = self.desc_input.value
                 update_instance(account)
                 logger.info(f"Updated account: {account.name}")
-                
-                # Save dynamic settings FIRST, then validate
-                if provider_cls and dynamic_settings:
+
+                # Now try to validate credentials
+                if provider_cls and to_write:
                     try:
-                        # Save settings first
-                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
-                        temp_acc_iface.id = account.id
-                        
-                        # Save each setting individually using save_setting method
-                        for key, value in dynamic_settings.items():
-                            temp_acc_iface.save_setting(key, value)
-                            
-                        logger.info(f"Saved {len(dynamic_settings)} settings for account {account.id}")
-                        
-                        # Now try to validate credentials
-                        try:
-                            acc_iface = get_account_instance_from_id(account.id, use_cache=False)  # Force new instance to test fresh credentials
-                            if acc_iface:
-                                logger.info(f"Successfully validated credentials for account {account.id}")
-                            else:
-                                logger.warning(f"Account {account.id} updated but could not validate credentials")
-                                ui.notify(f"Account updated but could not validate credentials", type="warning")
-                        except Exception as auth_error:
-                            logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
-                            ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
-                            # Account is still updated, just with authentication issues
-                            
-                    except Exception as settings_error:
-                        logger.error(f"Failed to save settings for account {account.id}: {settings_error}", exc_info=True)
-                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
-                        return
+                        acc_iface = get_account_instance_from_id(account.id, use_cache=False)  # Force new instance to test fresh credentials
+                        if acc_iface:
+                            logger.info(f"Successfully validated credentials for account {account.id}")
+                        else:
+                            logger.warning(f"Account {account.id} updated but could not validate credentials")
+                            ui.notify(f"Account updated but could not validate credentials", type="warning")
+                    except Exception as auth_error:
+                        logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
+                        ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
+                        # Account is still updated, just with authentication issues
             else:
                 new_account = AccountDefinition(
                     provider=provider,
@@ -1174,40 +1266,49 @@ class AccountDefinitionsTab:
                 )
                 new_account_id = add_instance(new_account)
                 logger.info(f"Created new account: {self.name_input.value} with id {new_account_id}")
-                
+
                 # Save dynamic settings FIRST before creating AccountInterface
                 # This ensures credentials are in database before AccountInterface tries to use them
-                if provider_cls and dynamic_settings:
+                if provider_cls and to_write:
                     try:
                         # Create a temporary AccountInterface instance just for saving settings
-                        # Use a special flag to prevent immediate client initialization
                         temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
                         temp_acc_iface.id = new_account_id
-                        
-                        # Save each setting individually using save_setting method
-                        for key, value in dynamic_settings.items():
+                        for key, value in to_write.items():
                             temp_acc_iface.save_setting(key, value)
-                            
-                        logger.info(f"Saved {len(dynamic_settings)} settings for new account {new_account_id}")
-                        
-                        # Now try to create the full AccountInterface to validate credentials
-                        try:
-                            acc_iface = provider_cls(new_account_id)
-                            logger.info(f"Successfully validated credentials for account {new_account_id}")
-                        except Exception as auth_error:
-                            logger.warning(f"Account {new_account_id} created but authentication failed: {auth_error}")
-                            ui.notify(f"Account created but authentication failed: {str(auth_error)}", type="warning")
-                            # Account is still created, just with authentication issues
-                            
+                        logger.info(f"Saved {len(to_write)} settings for new account {new_account_id}")
                     except Exception as settings_error:
-                        logger.error(f"Failed to save settings for new account {new_account_id}: {settings_error}", exc_info=True)
+                        # Undo the half-created account (its row and whatever settings were
+                        # written), so a retry does not leave an orphan behind.
+                        logger.error(f"Failed to save settings for new account {new_account_id}: {settings_error}; "
+                                     f"removing the half-created account", exc_info=True)
+                        self._remove_half_created_account(new_account_id)
                         ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
                         return
+
+                    # Now try to create the full AccountInterface to validate credentials
+                    try:
+                        acc_iface = provider_cls(new_account_id)
+                        logger.info(f"Successfully validated credentials for account {new_account_id}")
+                    except Exception as auth_error:
+                        logger.warning(f"Account {new_account_id} created but authentication failed: {auth_error}")
+                        ui.notify(f"Account created but authentication failed: {str(auth_error)}", type="warning")
+                        # Account is still created, just with authentication issues
             self.dialog.close()
             self._update_table_rows()
         except Exception as e:
             logger.error(f"Error saving account: {str(e)}", exc_info=True)
             ui.notify("Error saving account", type="error")
+
+    def _remove_half_created_account(self, account_id: int) -> None:
+        """Delete a just-created AccountDefinition and any settings rows written for it."""
+        with get_db() as session:
+            for setting in session.exec(
+                    select(AccountSetting).where(AccountSetting.account_id == account_id)).all():
+                delete_instance(setting, session)
+        created = get_instance(AccountDefinition, account_id)
+        if created is not None:
+            delete_instance(created)
 
     def delete_account(self, account: AccountDefinition) -> None:
         try:
@@ -1240,7 +1341,12 @@ class AccountDefinitionsTab:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
         with self.dialog:
             self.dialog.clear()
-            provider_names = list(providers.keys())
+            # An abstract provider (IBKRAccount today) can never be built: it is not offered
+            # for a NEW account, and the reason is shown. An existing account keeps its
+            # provider listed so the dialog still opens -- save_account refuses it by name.
+            provider_names, unavailable = selectable_account_providers()
+            if account is not None and account.provider not in provider_names:
+                provider_names = provider_names + [account.provider]
             # WIDE AND COMPACT on purpose. Quasar caps a non-maximized dialog's card at
             # 560px, and one stacked, full-height field per setting made a dozen settings
             # a scrolling column. Dense outlined fields in a two-column grid fit the whole
@@ -1254,6 +1360,8 @@ class AccountDefinitionsTab:
                     self.name_input = ui.input(label='Account Name').props('dense outlined').classes('w-full')
                     self.desc_input = ui.input(label='Description').props('dense outlined').classes('w-full')
                 self.type_select.value = account.provider if account else provider_names[0]
+                for reason in unavailable.values():
+                    ui.label(f'Not offered: {reason}.').classes('text-caption text-grey-7')
                 self.name_input.value = account.name if account else ''
                 self.desc_input.value = account.description if account else ''
                 ui.separator().classes('my-1')
@@ -1312,8 +1420,10 @@ class AccountDefinitionsTab:
             return settings
             
         except Exception as e:
+            # RAISED, not `return {}`: an empty dict renders every field at its DEFAULT, and
+            # Save would then write those defaults over the account's real settings.
             logger.error(f"Error loading settings from database for account {account_id}: {e}", exc_info=True)
-            return {}
+            raise
 
     def _render_dynamic_settings(self, provider, account=None):
         # Render provider-specific fields dynamically inside the container
@@ -1322,10 +1432,22 @@ class AccountDefinitionsTab:
             return
         settings_def = provider_config.get_merged_settings_definitions()
         
-        # Get settings directly from database without creating AccountInterface
+        # Get settings directly from database without creating AccountInterface.
+        # A read failure leaves the form on DEFAULTS, which Save would write over the real
+        # settings: it is shown, and save_account refuses while it stands.
+        self._account_settings_load_error = None
+        self._account_shown_values = ShownValues()
+        self._select_checks = {}
         settings_values = {}
         if account:
-            settings_values = self._get_account_settings_from_db(account.id)
+            try:
+                settings_values = self._get_account_settings_from_db(account.id)
+            except Exception as e:
+                self._account_settings_load_error = f'{type(e).__name__}: {e}'
+                ui.notify(f'Could not load the settings of account {account.id} '
+                          f'({self._account_settings_load_error}). The form shows DEFAULTS, not '
+                          f'its real settings, and Save is refused for this dialog.',
+                          type='negative', timeout=0, close_button=True)
 
         self.settings_inputs = {}
 
@@ -1342,7 +1464,10 @@ class AccountDefinitionsTab:
             if settings_def and len(settings_def.keys()) > 0:
                 for key, meta in settings_def.items():
                     label = meta.get("description", key)
-                    value = settings_values.get(key, None) if settings_values else None
+                    # Stored value, else the DECLARED default (None when there is none);
+                    # bools are resolved in their own branch below.
+                    value = (None if meta["type"] == "bool"
+                             else resolve_setting_for_display(settings_def, settings_values, key))
                     tooltip_text = meta.get("tooltip")
                     valid_values = meta.get("valid_values")
 
@@ -1350,32 +1475,69 @@ class AccountDefinitionsTab:
                     # floating label) grows, the help icon trails it.
                     with ui.row().classes('w-full items-center gap-1 no-wrap min-h-10'):
                         if meta["type"] == "str" and valid_values:
+                            # Never the first option as a silent fallback: an invalid stored
+                            # value (or none, with no default) is shown EMPTY with an error,
+                            # and save_account refuses until one is picked.
+                            select_value, select_error = select_value_for_display(valid_values, value)
                             inp = ui.select(
                                 label=label,
                                 options=list(valid_values),
-                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                value=select_value
                             ).props('dense outlined').classes('flex-grow')
+                            _show_select_error(key, inp, select_error)
+                            self._select_checks[key] = (inp, list(valid_values))
                         elif meta["type"] == "str":
-                            inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
+                            if is_secret_setting(key, meta):
+                                inp = _secret_input(label, value or "").props('dense outlined').classes('flex-grow')
+                            else:
+                                inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         elif meta["type"] == "bool":
-                            # Proper boolean conversion - handle string "false"/"true" and boolean values
-                            bool_value = False
-                            if value is not None:
-                                if isinstance(value, bool):
-                                    bool_value = value
-                                elif isinstance(value, str):
-                                    bool_value = value.lower() in ('true', '1', 'yes')
+                            # Stored value (through coerce_bool), else the DECLARED default --
+                            # an unset bool used to show False whatever the definition said.
+                            # A bool with neither (AlpacaAccount.paper_account on a new
+                            # account) is shown INDETERMINATE: ticking False for it would be a
+                            # silent guess at paper-vs-live, and save_account refuses a bool
+                            # still left unset, naming it.
+                            # A stored spelling coerce_bool cannot read is shown the same way
+                            # (and logged) rather than taking the whole dialog down.
+                            try:
+                                if key in settings_values and settings_values[key] is None:
+                                    # A row whose value columns are NULL: the runtime reads it
+                                    # as False (the settings loader cannot coerce it), so the
+                                    # form shows False -- not the declared default.
+                                    bool_value = False
                                 else:
-                                    bool_value = bool(value)
+                                    bool_value = resolve_setting_for_display(settings_def, settings_values, key)
+                            except SettingHasNoDisplayValue:
+                                bool_value = None
+                            except ValueError as e:
+                                logger.error(f"Account setting '{key}' holds an unreadable "
+                                             f"boolean ({e}); shown unset -- set it explicitly")
+                                ui.notify(f"Account setting '{key}' holds an unreadable value "
+                                          f"({e}); it is shown unset -- set it explicitly",
+                                          type='negative', timeout=0, close_button=True)
+                                bool_value = None
                             inp = ui.checkbox(text=label, value=bool_value).props('dense').classes('flex-grow')
                         elif meta["type"] == "float":
-                            float_value = value if value is not None else meta.get("default", "")
-                            inp = ui.number(label=label, value=float_value).props('dense outlined').classes('flex-grow')
+                            inp = ui.number(label=label, value=value).props('dense outlined').classes('flex-grow')
+                        elif meta["type"] == "int":
+                            # `value or ""` blanked a stored 0 (IBKR client_id 0 is a real id);
+                            # only a value that is truly absent shows empty, and the save
+                            # refuses an empty int with no declared default by name.
+                            inp = ui.input(label=label, value="" if value is None
+                                           else display_text(settings_def, key, value)
+                                           ).props('dense outlined').classes('flex-grow')
+                        elif is_secret_setting(key, meta):
+                            inp = _secret_input(label, value or "").props('dense outlined').classes('flex-grow')
                         else:
                             inp = ui.input(label=label, value=value or "").props('dense outlined').classes('flex-grow')
                         _help(tooltip_text)
 
                     self.settings_inputs[key] = inp
+                    if account:
+                        # EDIT: an unedited field is never written back (stored value or
+                        # declared default alike) -- a no-edit save is byte-for-byte a no-op.
+                        self._account_shown_values.record(key, inp.value)
             else:
                 ui.label("No provider-specific settings available.").classes('col-span-2 text-sm text-gray-500')
 
@@ -1501,8 +1663,9 @@ class ExpertSettingsTab:
     with appropriate setting_type parameters to ensure proper data type handling.
     """
     
-    def __init__(self):
+    def __init__(self, phone_tables=None):
         logger.debug('Initializing ExpertSettingsTab')
+        self._phone_tables = phone_tables
         self.dialog = ui.dialog()
         # Disallow closing dialog by clicking outside - user must explicitly click Cancel or Save
         self.dialog.props('no-backdrop-dismiss')
@@ -1533,11 +1696,20 @@ class ExpertSettingsTab:
                 rows=self._get_all_expert_instances(),
                 row_key='id',
                 selection='multiple'
-            ).classes('w-full')
+            ).classes('w-full ' + LIST_CLASS)
             self.experts_table.selected = []
+            # PHONE: one card per expert (q-table grid mode, same rows, same selection and the
+            # same edit/duplicate/del events as the desktop cells). The registry re-pins it when
+            # the viewport crosses the breakpoint.
+            check_card_covers_table([c['name'] for c in self.experts_table.columns])
+            self.experts_table.props(phone_grid_prop())
+            self.experts_table.add_slot('item', expert_card_template())
+            phone_tables = getattr(self, '_phone_tables', None)
+            if phone_tables is not None:
+                phone_tables.register(self.experts_table)
 
             with self.experts_table.add_slot('top-left'):
-                with ui.row().classes('items-center gap-4'):
+                with ui.row().classes('items-center gap-4 ' + LIST_TOP_CLASS):
                     ui.button('Export Selected', icon='download',
                               on_click=self._export_selected_experts) \
                         .props('flat') \
@@ -1895,6 +2067,13 @@ class ExpertSettingsTab:
         
         # Initialize import attributes
         self._imported_expert_settings = None
+        self._general_settings_load_error = None   # set by _load_general_settings on failure
+        self._instrument_selection_load_error = None   # set when editing, on a failed read
+        self._instrument_method_unset = False           # editing an expert with no stored method
+        self._instrument_method_loaded = False          # the stored method was read (an edit)
+        self._stored_instrument_method = None
+        self._shown_values = ShownValues()          # controls filled from a declared default
+        self._save_button = None
         self._imported_symbol_settings = None
         self._imported_enter_market_ruleset_name = None
         self._imported_open_positions_ruleset_name = None
@@ -1904,7 +2083,7 @@ class ExpertSettingsTab:
         with self.dialog:
             self.dialog.clear()
             
-            with ui.card().classes('w-full').style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
+            with ui.card().classes('w-full ' + DIALOG_CLASS).style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
                 ui.label('Add Expert' if not is_edit else 'Edit Expert').classes('text-h6')
                 
                 # Tabs for different settings sections
@@ -1918,20 +2097,20 @@ class ExpertSettingsTab:
                     except Exception:
                         pass
 
-                with ui.tabs() as settings_tabs:
-                    ui.tab('General Settings', icon='schedule')
-                    ui.tab('Instruments', icon='trending_up')
-                    ui.tab('Expert Settings', icon='settings')
-                    ui.tab('Import/Export', icon='download')
+                with ui.tabs().classes(TABS_CLASS) as settings_tabs:
+                    dialog_tab('General Settings', 'schedule')
+                    dialog_tab('Instruments', 'trending_up')
+                    dialog_tab('Expert Settings', 'settings')
+                    dialog_tab('Import/Export', 'download')
                     if expert_actions:
-                        ui.tab('Actions', icon='play_circle')
+                        dialog_tab('Actions', 'play_circle')
                 
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # General Settings tab
                     with ui.tab_panel('General Settings'):
                         # Basic expert information
                         with ui.column().classes('w-full gap-2'):
-                            with ui.row().classes('w-full gap-4'):
+                            with ui.row().classes('w-full gap-4 bm-stack'):
                                 expert_types = self._get_available_expert_types()
                                 initial_expert = expert_instance.expert if is_edit else (expert_types[0] if expert_types else None)
                                 self.expert_select = ui.select(
@@ -1965,7 +2144,7 @@ class ExpertSettingsTab:
                                     value='100.0'
                                 ).props('dense').classes('w-32')
 
-                            with ui.row().classes('w-full gap-4'):
+                            with ui.row().classes('w-full gap-4 bm-stack'):
                                 accounts = self._get_available_accounts()
                                 initial_account = None
                                 if is_edit:
@@ -1980,368 +2159,387 @@ class ExpertSettingsTab:
                                     value=initial_account
                                 ).classes('flex-1').props('dense')
 
-                        ui.separator().classes('my-2')
-                        ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
+                        ui.separator().classes('my-2 bm-sec-sep')
+                        ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4 bm-sec-title')
                         
                         # Schedule settings - hidden for live experts
                         with ui.column().classes('w-full') as self.execution_schedule_section:
-                            ui.label('Execution Schedules:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2')
+                            with phone_section('Execution Schedules', open_=True):
+                                ui.label('Execution Schedules:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            # Enter Market Analysis Schedule
-                            with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
-                                with ui.card().classes('w-full'):
-                                    ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
+                                # Enter Market Analysis Schedule
+                                with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
+                                    with ui.card().classes('w-full bm-flat'):
+                                        ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
 
-                                    self._build_schedule_frequency_controls('enter_market')
+                                        self._build_schedule_frequency_controls('enter_market')
 
-                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
-                                        ui.label('Time basis:').classes('text-body2')
-                                        self.enter_market_time_basis = ui.toggle(
-                                            ['Local time', 'Market time (NYSE)'], value='Local time',
-                                            on_change=lambda e: self._refresh_time_basis_hint('enter_market'),
-                                        ).props('no-caps dense')
-                                    self.enter_market_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
+                                        with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                            ui.label('Time basis:').classes('text-body2')
+                                            self.enter_market_time_basis = ui.toggle(
+                                                ['Local time', 'Market time (NYSE)'], value='Local time',
+                                                on_change=lambda e: self._refresh_time_basis_hint('enter_market'),
+                                            ).props('no-caps dense')
+                                        self.enter_market_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
 
-                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                    try:
-                                        self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                                        ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                        try:
+                                            self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                                            if self.enter_market_times_container is None:
+                                                logger.error("ui.column() returned None for enter_market_times_container")
+                                                self.enter_market_times_container = ui.column()  # Try again without classes
+                                        except Exception as e:
+                                            logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
+                                            self.enter_market_times_container = None
+
+                                        self.enter_market_execution_times = []
+
+                                        # Verify container was created successfully
                                         if self.enter_market_times_container is None:
-                                            logger.error("ui.column() returned None for enter_market_times_container")
-                                            self.enter_market_times_container = ui.column()  # Try again without classes
-                                    except Exception as e:
-                                        logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
-                                        self.enter_market_times_container = None
+                                            logger.error("Failed to create enter_market_times_container, skipping time input setup")
+                                        else:
+                                            # Add initial time input
+                                            self._add_time_input_enter_market('09:30')
 
-                                    self.enter_market_execution_times = []
+                                        # Only create the add time button if we have a valid container
+                                        if self.enter_market_times_container is not None:
+                                            with ui.row().classes('w-full gap-2 mb-4'):
+                                                ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
 
-                                    # Verify container was created successfully
-                                    if self.enter_market_times_container is None:
-                                        logger.error("Failed to create enter_market_times_container, skipping time input setup")
-                                    else:
-                                        # Add initial time input
-                                        self._add_time_input_enter_market('09:30')
+                                # Open Positions Analysis Schedule
+                                # Captured so it can be hidden for experts that rebalance in one batch
+                                # run (schedules_open_positions=False), via _update_open_positions_schedule_visibility.
+                                with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4') as self.open_positions_schedule_expansion:
+                                    with ui.card().classes('w-full bm-flat'):
+                                        ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
 
-                                    # Only create the add time button if we have a valid container
-                                    if self.enter_market_times_container is not None:
-                                        with ui.row().classes('w-full gap-2 mb-4'):
-                                            ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
+                                        self._build_schedule_frequency_controls('open_positions')
 
-                            # Open Positions Analysis Schedule
-                            # Captured so it can be hidden for experts that rebalance in one batch
-                            # run (schedules_open_positions=False), via _update_open_positions_schedule_visibility.
-                            with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4') as self.open_positions_schedule_expansion:
-                                with ui.card().classes('w-full'):
-                                    ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
+                                        with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                            ui.label('Time basis:').classes('text-body2')
+                                            self.open_positions_time_basis = ui.toggle(
+                                                ['Local time', 'Market time (NYSE)'], value='Local time',
+                                                on_change=lambda e: self._refresh_time_basis_hint('open_positions'),
+                                            ).props('no-caps dense')
+                                        self.open_positions_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
 
-                                    self._build_schedule_frequency_controls('open_positions')
+                                        ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                        try:
+                                            self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                            if self.open_positions_times_container is None:
+                                                logger.error("ui.column() returned None for open_positions_times_container")
+                                                self.open_positions_times_container = ui.column()  # Try again without classes
+                                        except Exception as e:
+                                            logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
+                                            self.open_positions_times_container = None
 
-                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
-                                        ui.label('Time basis:').classes('text-body2')
-                                        self.open_positions_time_basis = ui.toggle(
-                                            ['Local time', 'Market time (NYSE)'], value='Local time',
-                                            on_change=lambda e: self._refresh_time_basis_hint('open_positions'),
-                                        ).props('no-caps dense')
-                                    self.open_positions_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
+                                        self.open_positions_execution_times = []
 
-                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                    try:
-                                        self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                        # Verify container was created successfully
                                         if self.open_positions_times_container is None:
-                                            logger.error("ui.column() returned None for open_positions_times_container")
-                                            self.open_positions_times_container = ui.column()  # Try again without classes
-                                    except Exception as e:
-                                        logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
-                                        self.open_positions_times_container = None
+                                            logger.error("Failed to create open_positions_times_container, skipping time input setup")
+                                        else:
+                                            # Add initial time inputs (more frequent for position monitoring)
+                                            for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
+                                                self._add_time_input_open_positions(time)
 
-                                    self.open_positions_execution_times = []
-
-                                    # Verify container was created successfully
-                                    if self.open_positions_times_container is None:
-                                        logger.error("Failed to create open_positions_times_container, skipping time input setup")
-                                    else:
-                                        # Add initial time inputs (more frequent for position monitoring)
-                                        for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
-                                            self._add_time_input_open_positions(time)
-
-                                    # Only create the add time button if we have a valid container
-                                    if self.open_positions_times_container is not None:
-                                        with ui.row().classes('w-full gap-2 mb-4'):
-                                            ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
+                                        # Only create the add time button if we have a valid container
+                                        if self.open_positions_times_container is not None:
+                                            with ui.row().classes('w-full gap-2 mb-4'):
+                                                ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
                         
-                        ui.separator().classes('my-4')
+                        ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Trading direction settings
-                        ui.label('Trading Permissions:').classes('text-subtitle2 mb-2')
-                        ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2')
+                        with phone_section('Trading Permissions'):
+                            ui.label('Trading Permissions:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.row().classes('w-full gap-4'):
-                            self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
-                            self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
-                        ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
-                                 'position needs the permission that opened it: a sell closing a long '
-                                 'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
-                        ui.label('An order opposite to an open position only reduces or closes it; '
-                                 'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
+                            with ui.row().classes('w-full gap-4'):
+                                # Initial values are the DECLARED defaults (a new expert shows and
+                                # saves exactly those); editing overwrites them in _load_general_settings.
+                                self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=_builtin_default('enable_buy'))
+                                self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=_builtin_default('enable_sell'))
+                            ui.label('BUY opens longs; SELL opens shorts (a sell from flat). Closing a '
+                                     'position needs the permission that opened it: a sell closing a long '
+                                     'needs BUY, a buy covering a short needs SELL.').classes('text-body2 text-grey-7 ml-6')
+                            ui.label('An order opposite to an open position only reduces or closes it; '
+                                     'a new position in the other direction opens only from flat').classes('text-body2 text-grey-7 ml-6')
                         
-                        ui.separator().classes('my-4')
+                        ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Automatic trading settings
-                        ui.label('Automatic Trading:').classes('text-subtitle2 mb-2')
-                        ui.label('Configure automatic trading permissions for this expert:').classes('text-body2 mb-2')
+                        with phone_section('Automatic Trading'):
+                            ui.label('Automatic Trading:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Configure automatic trading permissions for this expert:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.column().classes('w-full gap-2'):
-                            self.allow_automated_trade_opening_checkbox = ui.checkbox(
-                                'Allow automated trade opening', 
-                                value=False
-                            )
-                            ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
+                            with ui.column().classes('w-full gap-2'):
+                                self.allow_automated_trade_opening_checkbox = ui.checkbox(
+                                    'Allow automated trade opening', 
+                                    value=_builtin_default('allow_automated_trade_opening')
+                                )
+                                ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
                             
-                            self.allow_automated_trade_modification_checkbox = ui.checkbox(
-                                'Allow automated trade modification/closing', 
-                                value=False
-                            )
-                            ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
+                                self.allow_automated_trade_modification_checkbox = ui.checkbox(
+                                    'Allow automated trade modification/closing', 
+                                    value=_builtin_default('allow_automated_trade_modification')
+                                )
+                                ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                         
                         # Position sizing section - always visible for all experts
                         with ui.column().classes('w-full'):
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
-                            ui.label('Position Sizing:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure position sizing parameters for this expert:').classes('text-body2 mb-2')
+                            with phone_section('Position Sizing'):
+                                ui.label('Position Sizing:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure position sizing parameters for this expert:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            with ui.column().classes('w-full gap-2'):
-                                # Max Virtual Equity Per Instrument
-                                with ui.row().classes('items-center gap-2'):
-                                    ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
-                                    self.max_virtual_equity_per_instrument_input = ui.input(
-                                        value='10.0',
-                                        placeholder='10.0'
-                                    ).classes('w-20')
-                                    ui.label('%').classes('text-sm')
-                                ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
-
-                                # Min Available Balance Percentage
-                                with ui.row().classes('items-center gap-2 mt-2'):
-                                    ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
-                                    self.min_available_balance_pct_input = ui.input(
-                                        value='10.0',
-                                        placeholder='10.0'
-                                    ).classes('w-20')
-                                    ui.label('%').classes('text-sm')
-                                ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
-
-                                # Risk-based (ATR) sizing builtins - visible/editable for every expert.
-                                # Pull defaults/descriptions/valid_values from the builtin definitions.
-                                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                                MarketExpertInterface._ensure_builtin_settings()
-
-                                sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
-                                sizing_mode_default = sizing_mode_def.get('default', 'notional')
-                                sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
-
-                                risk_per_trade_pct_def = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {})
-                                risk_per_trade_pct_default = risk_per_trade_pct_def.get('default', 1.0)
-
-                                atr_multiplier_def = MarketExpertInterface._builtin_settings.get('atr_multiplier', {})
-                                atr_multiplier_default = atr_multiplier_def.get('default', 2.0)
-
-                                atr_period_def = MarketExpertInterface._builtin_settings.get('atr_period', {})
-                                atr_period_default = atr_period_def.get('default', 14)
-
-                                min_stop_loss_pct_def = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {})
-                                min_stop_loss_pct_default = min_stop_loss_pct_def.get('default', 7.0)
-
-                                # Sizing mode select - always shown
-                                with ui.row().classes('items-center gap-2 mt-2'):
-                                    ui.label('Sizing mode:').classes('text-sm font-medium')
-                                    self.sizing_mode_select = ui.select(
-                                        options={v: v for v in sizing_mode_values},
-                                        value=sizing_mode_default,
-                                        on_change=lambda e: self.risk_atr_settings_container.set_visibility(e.value == 'risk_atr')
-                                    ).classes('w-40')
-                                ui.label(sizing_mode_def.get('description', 'How position size is computed')).classes('text-body2 text-grey-7 ml-2')
-
-                                # risk_atr knobs - only visible when sizing_mode == risk_atr
-                                with ui.column().classes('w-full gap-2') as self.risk_atr_settings_container:
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('Risk per trade (%):').classes('text-sm font-medium')
-                                        self.risk_per_trade_pct_input = ui.input(
-                                            value=str(risk_per_trade_pct_default),
-                                            placeholder=str(risk_per_trade_pct_default)
+                                with ui.column().classes('w-full gap-2'):
+                                    # Max Virtual Equity Per Instrument
+                                    with ui.row().classes('items-center gap-2'):
+                                        ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
+                                        self.max_virtual_equity_per_instrument_input = ui.input(
+                                            value=str(_builtin_default('max_virtual_equity_per_instrument_percent')),
+                                            placeholder=str(_builtin_default('max_virtual_equity_per_instrument_percent'))
                                         ).classes('w-20')
                                         ui.label('%').classes('text-sm')
+                                    ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
 
+                                    # Min Available Balance Percentage
                                     with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('ATR multiplier:').classes('text-sm font-medium')
-                                        self.atr_multiplier_input = ui.input(
-                                            value=str(atr_multiplier_default),
-                                            placeholder=str(atr_multiplier_default)
-                                        ).classes('w-20')
-
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('ATR period (bars):').classes('text-sm font-medium')
-                                        self.atr_period_input = ui.input(
-                                            value=str(atr_period_default),
-                                            placeholder=str(atr_period_default)
-                                        ).classes('w-20')
-
-                                    with ui.row().classes('items-center gap-2 mt-2'):
-                                        ui.label('Min stop loss (%):').classes('text-sm font-medium')
-                                        self.min_stop_loss_pct_input = ui.input(
-                                            value=str(min_stop_loss_pct_default),
-                                            placeholder=str(min_stop_loss_pct_default)
+                                        ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
+                                        self.min_available_balance_pct_input = ui.input(
+                                            value=str(_builtin_default('min_available_balance_pct')),
+                                            placeholder=str(_builtin_default('min_available_balance_pct'))
                                         ).classes('w-20')
                                         ui.label('%').classes('text-sm')
+                                    ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
-                                    ui.label('Risk-based sizing: quantity = (equity × risk_per_trade_pct%) ÷ stop-distance-per-share. risk_per_trade_pct is the $ budget (max % of EQUITY to lose per trade). The stop distance is |entry − stop| when an SL is known, else atr_multiplier × ATR. min_stop_loss_pct floors the stop distance (as % of price) so a tiny ATR can\'t oversize the lot. Only used when sizing_mode = risk_atr.').classes('text-body2 text-grey-7 ml-2')
+                                    # Fractional shares (builtin, default off)
+                                    self.allow_fractional_shares_checkbox = ui.checkbox(
+                                        'Allow fractional shares',
+                                        value=_builtin_default('allow_fractional_shares')
+                                    ).classes('mt-2')
+                                    ui.label('Size in fractional shares for symbols the broker marks fractionable. '
+                                             'Ignored (with a log warning) whenever the expert arms protective '
+                                             'orders, because brokers do not accept a fractional OCO/TP/SL: the '
+                                             'classic risk manager always attaches a stop, so it always sizes '
+                                             'whole shares; FactorRanker applies it only when risk per trade is 0 '
+                                             '(its resting stop off).').classes('text-body2 text-grey-7 ml-2')
 
-                                # Set initial visibility based on the default; load handler updates it when editing.
-                                self.risk_atr_settings_container.set_visibility(sizing_mode_default == 'risk_atr')
+                                    # Risk-based (ATR) sizing builtins - visible/editable for every expert.
+                                    # Pull defaults/descriptions/valid_values from the builtin definitions.
+                                    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                                    MarketExpertInterface._ensure_builtin_settings()
+
+                                    sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
+                                    sizing_mode_default = _builtin_default('sizing_mode')
+                                    sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
+
+                                    risk_per_trade_pct_default = _builtin_default('risk_per_trade_pct')
+
+                                    atr_multiplier_default = _builtin_default('atr_multiplier')
+
+                                    atr_period_default = _builtin_default('atr_period')
+
+                                    min_stop_loss_pct_default = _builtin_default('min_stop_loss_pct')
+
+                                    # Sizing mode select - always shown
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('Sizing mode:').classes('text-sm font-medium')
+                                        self.sizing_mode_select = ui.select(
+                                            options={v: v for v in sizing_mode_values},
+                                            value=sizing_mode_default,
+                                            on_change=lambda e: self.risk_atr_settings_container.set_visibility(e.value == 'risk_atr')
+                                        ).classes('w-40')
+                                    ui.label(sizing_mode_def.get('description', 'How position size is computed')).classes('text-body2 text-grey-7 ml-2')
+
+                                    # risk_atr knobs - only visible when sizing_mode == risk_atr
+                                    with ui.column().classes('w-full gap-2') as self.risk_atr_settings_container:
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('Risk per trade (%):').classes('text-sm font-medium')
+                                            self.risk_per_trade_pct_input = ui.input(
+                                                value=str(risk_per_trade_pct_default),
+                                                placeholder=str(risk_per_trade_pct_default)
+                                            ).classes('w-20')
+                                            ui.label('%').classes('text-sm')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('ATR multiplier:').classes('text-sm font-medium')
+                                            self.atr_multiplier_input = ui.input(
+                                                value=str(atr_multiplier_default),
+                                                placeholder=str(atr_multiplier_default)
+                                            ).classes('w-20')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('ATR period (bars):').classes('text-sm font-medium')
+                                            self.atr_period_input = ui.input(
+                                                value=str(atr_period_default),
+                                                placeholder=str(atr_period_default)
+                                            ).classes('w-20')
+
+                                        with ui.row().classes('items-center gap-2 mt-2'):
+                                            ui.label('Min stop loss (%):').classes('text-sm font-medium')
+                                            self.min_stop_loss_pct_input = ui.input(
+                                                value=str(min_stop_loss_pct_default),
+                                                placeholder=str(min_stop_loss_pct_default)
+                                            ).classes('w-20')
+                                            ui.label('%').classes('text-sm')
+
+                                        ui.label('Risk-based sizing: quantity = (equity × risk_per_trade_pct%) ÷ stop-distance-per-share. risk_per_trade_pct is the $ budget (max % of EQUITY to lose per trade). The stop distance is |entry − stop| when an SL is known, else atr_multiplier × ATR. min_stop_loss_pct floors the stop distance (as % of price) so a tiny ATR can\'t oversize the lot. Only used when sizing_mode = risk_atr.').classes('text-body2 text-grey-7 ml-2')
+
+                                    # Set initial visibility based on the default; load handler updates it when editing.
+                                    self.risk_atr_settings_container.set_visibility(sizing_mode_default == 'risk_atr')
 
                         # Risk manager section - hidden for experts that manage their own risk
                         with ui.column().classes('w-full') as self.risk_manager_section:
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
                             # AI Model Settings
-                            ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
+                            with phone_section('AI Model Settings'):
+                                ui.label('AI Model Settings:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            # Get model options from builtin settings definitions for defaults/descriptions
-                            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                            MarketExpertInterface._ensure_builtin_settings()
+                                # Get model options from builtin settings definitions for defaults/descriptions
+                                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                                MarketExpertInterface._ensure_builtin_settings()
 
-                            risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
-                            risk_manager_model_default = risk_manager_model_def.get('default', 'nagaai/gpt5')
-                            risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
+                                risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
+                                risk_manager_model_default = _builtin_default('risk_manager_model')
+                                risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
 
-                            dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
-                            dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
-                            dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
+                                dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
+                                dynamic_model_default = _builtin_default('dynamic_instrument_selection_model')
+                                dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
 
-                            # Import the ModelSelectorInput component and labels
-                            from ..components.ModelSelector import ModelSelectorInput
-                            from ...core.models_registry import LABEL_WEBSEARCH
+                                # Import the ModelSelectorInput component and labels
+                                from ..components.ModelSelector import ModelSelectorInput
+                                from ...core.models_registry import LABEL_WEBSEARCH
 
-                            with ui.column().classes('w-full gap-2'):
-                                # Risk Manager Model - using ModelSelectorInput
-                                self.risk_manager_model_input = ModelSelectorInput(
-                                    label='Risk Manager Model',
-                                    value=risk_manager_model_default,
-                                    default_provider='nagaai',
-                                    help_text=risk_manager_model_help
-                                )
-                                self.risk_manager_model_input.render()
+                                with ui.column().classes('w-full gap-2'):
+                                    # Risk Manager Model - using ModelSelectorInput
+                                    self.risk_manager_model_input = ModelSelectorInput(
+                                        label='Risk Manager Model',
+                                        value=risk_manager_model_default,
+                                        default_provider='nagaai',
+                                        help_text=risk_manager_model_help
+                                    )
+                                    self.risk_manager_model_input.render()
 
-                                # Dynamic Instrument Selection Model - REQUIRES web search capability
-                                self.dynamic_instrument_selection_model_input = ModelSelectorInput(
-                                    label='Dynamic Instrument Selection Model',
-                                    value=dynamic_model_default,
-                                    default_provider='nagaai',
-                                    help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
-                                    required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
-                                )
-                                self.dynamic_instrument_selection_model_input.render()
+                                    # Dynamic Instrument Selection Model - REQUIRES web search capability
+                                    self.dynamic_instrument_selection_model_input = ModelSelectorInput(
+                                        label='Dynamic Instrument Selection Model',
+                                        value=dynamic_model_default,
+                                        default_provider='nagaai',
+                                        help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
+                                        required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
+                                    )
+                                    self.dynamic_instrument_selection_model_input.render()
 
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
 
                             # Risk Manager Mode
-                            ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2')
-                            ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2')
+                            with phone_section('Risk Manager Mode'):
+                                ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2 bm-sec-title')
+                                ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2 bm-sec-intro')
 
-                            with ui.column().classes('w-full gap-2'):
-                                self.risk_manager_mode_select = ui.select(
-                                    options={
-                                        'classic': 'Classic (Rules)',
-                                        'smart': 'Smart (Agentic)'
-                                    },
-                                    label='Risk Management Mode',
-                                    value='classic'
-                                ).classes('w-full')
-                                ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
+                                with ui.column().classes('w-full gap-2'):
+                                    # Options = the DECLARED modes (a hand list lacked classic_options,
+                                    # which then showed blank and silent).
+                                    _rm_labels = {'classic': 'Classic (Rules)', 'smart': 'Smart (Agentic)'}
+                                    self.risk_manager_mode_select = ui.select(
+                                        options={mode: _rm_labels.get(mode, mode.replace('_', ' ').title())
+                                                 for mode in MarketExpertInterface._builtin_settings[
+                                                     'risk_manager_mode']['valid_values']},
+                                        label='Risk Management Mode',
+                                        value=_builtin_default('risk_manager_mode')
+                                    ).classes('w-full')
+                                    ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager User Instructions
-                                ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_user_instructions_input = ui.textarea(
-                                    label='Instructions for Smart Risk Manager',
-                                    value='Maximize short term profit with medium risk taking',
-                                    placeholder='Enter your risk management strategy instructions...'
-                                ).props('stack-label rows=3').classes('w-full')
-                                ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager User Instructions
+                                    ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_user_instructions_input = ui.textarea(
+                                        label='Instructions for Smart Risk Manager',
+                                        value=_builtin_default('smart_risk_manager_user_instructions'),
+                                        placeholder='Enter your risk management strategy instructions...'
+                                    ).props('stack-label rows=3').classes('w-full')
+                                    ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager Max Iterations
-                                ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_max_iterations_input = ui.number(
-                                    label='Maximum Iterations',
-                                    value=10,
-                                    min=1,
-                                    max=50,
-                                    step=1
-                                ).classes('w-full')
-                                ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager Max Iterations
+                                    ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_max_iterations_input = ui.number(
+                                        label='Maximum Iterations',
+                                        value=_builtin_default('smart_risk_manager_max_iterations'),
+                                        min=1,
+                                        max=50,
+                                        step=1
+                                    ).classes('w-full')
+                                    ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
 
-                                # Smart Risk Manager Analysis Window (hours)
-                                ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
-                                self.smart_risk_manager_analysis_window_hours_input = ui.number(
-                                    label='Analysis Discovery Window (hours)',
-                                    value=24,
-                                    min=1,
-                                    max=168,
-                                    step=1
-                                ).classes('w-full')
-                                ui.label('How far back the risk manager looks for analyses when deciding which symbols are tradable to OPEN. Lower it for a more frequent/intraday trader. The agent can still pull older analyses for context. (Screener experts keep a 24h execution floor.)').classes('text-body2 text-grey-7 ml-2')
+                                    # Smart Risk Manager Analysis Window (hours)
+                                    ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
+                                    self.smart_risk_manager_analysis_window_hours_input = ui.number(
+                                        label='Analysis Discovery Window (hours)',
+                                        value=_builtin_default('smart_risk_manager_analysis_window_hours'),
+                                        min=1,
+                                        max=168,
+                                        step=1
+                                    ).classes('w-full')
+                                    ui.label('How far back the risk manager looks for analyses when deciding which symbols are tradable to OPEN. Lower it for a more frequent/intraday trader. The agent can still pull older analyses for context. (Screener experts keep a 24h execution floor.)').classes('text-body2 text-grey-7 ml-2')
 
-                            ui.separator().classes('my-4')
+                            ui.separator().classes('my-4 bm-sec-sep')
                         
                         # Ruleset assignment settings
-                        ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
-                        ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2')
+                        with phone_section('Automation Rulesets'):
+                            ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2 bm-sec-title')
+                            ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2 bm-sec-intro')
                         
-                        with ui.column().classes('w-full gap-2'):
-                            # Enter Market Ruleset
-                            enter_market_rulesets_list, self.enter_market_ruleset_map = self._get_rulesets_list_by_use_case('enter_market')
-                            self.enter_market_ruleset_select = ui.select(
-                                options=enter_market_rulesets_list,
-                                label='Enter Market Ruleset',
-                                with_input=True,
-                                clearable=True
-                            ).classes('w-full')
-                            ui.label('Ruleset to evaluate when creating new positions from expert recommendations').classes('text-body2 text-grey-7 ml-2')
+                            with ui.column().classes('w-full gap-2'):
+                                # Enter Market Ruleset
+                                enter_market_rulesets_list, self.enter_market_ruleset_map = self._get_rulesets_list_by_use_case('enter_market')
+                                self.enter_market_ruleset_select = ui.select(
+                                    options=enter_market_rulesets_list,
+                                    label='Enter Market Ruleset',
+                                    with_input=True,
+                                    clearable=True
+                                ).classes('w-full')
+                                ui.label('Ruleset to evaluate when creating new positions from expert recommendations').classes('text-body2 text-grey-7 ml-2')
                             
-                            # Open Positions Ruleset
-                            open_positions_rulesets_list, self.open_positions_ruleset_map = self._get_rulesets_list_by_use_case('open_positions')
-                            self.open_positions_ruleset_select = ui.select(
-                                options=open_positions_rulesets_list,
-                                label='Open Positions Ruleset',
-                                with_input=True,
-                                clearable=True
-                            ).classes('w-full')
-                            ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
+                                # Open Positions Ruleset
+                                open_positions_rulesets_list, self.open_positions_ruleset_map = self._get_rulesets_list_by_use_case('open_positions')
+                                self.open_positions_ruleset_select = ui.select(
+                                    options=open_positions_rulesets_list,
+                                    label='Open Positions Ruleset',
+                                    with_input=True,
+                                    clearable=True
+                                ).classes('w-full')
+                                ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
 
-                            # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
-                            # it is the data supply for the enter-market ruleset's market gates --
-                            # the two are one strategy and saving them apart is what
-                            # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
-                            # (MarketExpertInterface), and this dialog's Expert Settings tab
-                            # renders only expert-SPECIFIC definitions, so it needs its own widget.
-                            # MULTI-select: the setting is a comma list and a strategy may gate on
-                            # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
-                            # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
-                            self.market_condition_profile_select = ui.select(
-                                options=self._market_condition_profile_options(),
-                                label='Market-Condition Profile(s)',
-                                value=[],
-                                multiple=True,
-                                clearable=True,
-                            ).classes('w-full').props('use-chips')
-                            # A NEW instance has no stored value to read, so the widget IS the
-                            # operator's input and is saveable from the start. The edit branch
-                            # below clears this if it cannot read what is stored.
-                            self._market_condition_profile_loaded = True
-                            ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
-                                     'Empty serves no market-condition data: a ruleset with a market '
-                                     'gate then cannot enter, and saving that combination is refused.'
-                                     ).classes('text-body2 text-grey-7 ml-2')
+                                # MARKET-CONDITION PROFILE. Rendered HERE, with the rulesets, because
+                                # it is the data supply for the enter-market ruleset's market gates --
+                                # the two are one strategy and saving them apart is what
+                                # _refuse_unserved_market_gates below refuses. It is a BUILTIN setting
+                                # (MarketExpertInterface), and this dialog's Expert Settings tab
+                                # renders only expert-SPECIFIC definitions, so it needs its own widget.
+                                # MULTI-select: the setting is a comma list and a strategy may gate on
+                                # fields from several profiles at once (e.g. ohlcv-v1 + ta-structure-v1).
+                                # Nothing selected = MARKET_CONDITION_PROFILE_OFF (no data served).
+                                self.market_condition_profile_select = ui.select(
+                                    options=self._market_condition_profile_options(),
+                                    label='Market-Condition Profile(s)',
+                                    value=[],
+                                    multiple=True,
+                                    clearable=True,
+                                ).classes('w-full').props('use-chips')
+                                # A NEW instance has no stored value to read, so the widget IS the
+                                # operator's input and is saveable from the start. The edit branch
+                                # below clears this if it cannot read what is stored.
+                                self._market_condition_profile_loaded = True
+                                ui.label('Market-condition profile(s) the enter-market ruleset may gate on. '
+                                         'Empty serves no market-condition data: a ruleset with a market '
+                                         'gate then cannot enter, and saving that combination is refused.'
+                                         ).classes('text-body2 text-grey-7 ml-2')
 
                     # Instruments tab
                     with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
@@ -2393,15 +2591,7 @@ class ExpertSettingsTab:
                     if account_instance:
                         self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
 
-                    try:
-                        from ...core.utils import get_expert_instance_from_id
-                        expert = get_expert_instance_from_id(expert_instance.id)
-                        if expert:
-                            instrument_method = expert.settings.get('instrument_selection_method', 'static')
-                            self.instrument_selection_method_select.value = instrument_method
-                    except Exception as e:
-                        logger.debug(f'Could not load instrument selection method: {e}')
-                        self.instrument_selection_method_select.value = 'static'
+                    self._load_instrument_selection_method(expert_instance)
 
                     # THE PROFILE IS READ IN ITS OWN TRY, and failing to read it is recorded.
                     # Sharing the handler above meant a failure left the select on its
@@ -2418,6 +2608,8 @@ class ExpertSettingsTab:
                         self._fill_market_condition_profile(
                             expert.settings.get(MARKET_CONDITION_PROFILE_SETTING))
                         self._market_condition_profile_loaded = True
+                        self._shown_values_tracker().record(
+                            MARKET_CONDITION_PROFILE_SETTING, self._market_condition_profile_value())
                     except Exception as e:
                         logger.error(
                             f'Could not read {MARKET_CONDITION_PROFILE_SETTING} for expert '
@@ -2443,9 +2635,10 @@ class ExpertSettingsTab:
                     self._load_general_settings(expert_instance)
 
                 # Save button
-                with ui.row().classes('w-full justify-end mt-4'):
+                with ui.row().classes('w-full justify-end mt-4 ' + FOOT_CLASS):
                     ui.button('Cancel', on_click=self.dialog.close).props('flat')
-                    ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+                    self._save_button = ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+                    self._refresh_save_button()
         
         self.dialog.open()
     
@@ -2618,6 +2811,13 @@ class ExpertSettingsTab:
         ).props('no-caps').classes('mb-2')
         setattr(self, f'{kind}_frequency', freq)
 
+        # Refusal banner: shown by ``_show_schedule_refusal`` when the STORED schedule is one the live
+        # scheduler refuses (an unknown day key). Built here, synchronously, from Quasar's own classes
+        # (no page CSS to lose to an await); hidden until a loader finds a refused schedule.
+        refusal_label = ui.label('').classes('text-negative text-weight-bold mb-2 w-full')
+        refusal_label.set_visibility(False)
+        setattr(self, f'{kind}_schedule_refusal_label', refusal_label)
+
         # Weekly: day checkboxes (unchanged behaviour/output)
         weekly_container = ui.column().classes('w-full')
         setattr(self, f'{kind}_weekly_container', weekly_container)
@@ -2651,6 +2851,19 @@ class ExpertSettingsTab:
         setattr(self, f'{kind}_weekday_select', weekday_select)
 
         self._apply_schedule_frequency_visibility(kind)
+
+    def _show_schedule_refusal(self, kind: str, schedule_config):
+        """Show (or hide) the "schedule refused" banner for the stored schedule of ``kind``. The
+        checkboxes below render the typo'd day at its default and the next Save would silently rewrite
+        the seven clean keys, so the operator must be told the LIVE scheduler is not running this
+        setting. Same sentence the scheduler logs (``schedule_refusal_message``)."""
+        label = getattr(self, f'{kind}_schedule_refusal_label', None)
+        if label is None:
+            return
+        refusal = schedule_refusal_message(schedule_config)
+        if refusal:
+            label.set_text(f"{refusal}. No job runs for this setting until it is saved with valid days.")
+        label.set_visibility(bool(refusal))
 
     def _apply_schedule_frequency_visibility(self, kind: str):
         """Show the weekly day checkboxes or the monthly Nth-weekday controls."""
@@ -2687,8 +2900,9 @@ class ExpertSettingsTab:
         hint = getattr(self, f'{kind}_local_hint', None)
         if toggle is None or hint is None:
             return
+        warnings = self._session_time_warnings(kind, toggle.value == 'Market time (NYSE)')
         if toggle.value != 'Market time (NYSE)':
-            hint.text = ''
+            hint.text = ' | '.join(warnings)
             return
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2700,7 +2914,22 @@ class ExpertSettingsTab:
             hours, minutes = map(int, time_str.split(':'))
             ny_dt = datetime.now(ny).replace(hour=hours, minute=minutes, second=0, microsecond=0)
             parts.append(f"{time_str} NYSE -> {ny_dt.astimezone(local_tz).strftime('%H:%M')} local")
-        hint.text = ('This machine\'s local time: ' + ', '.join(parts)) if parts else ''
+        hint.text = ' | '.join(([('This machine\'s local time: ' + ', '.join(parts))] if parts else [])
+                               + warnings)
+
+    def _session_time_warnings(self, kind: str, market_basis: bool) -> list:
+        """The live session guard's consequences for the times being edited: a pass outside the
+        regular session is SKIPPED by JobManager, and one too close to the close cannot finish.
+        A warning only (``schedule_genes.schedule_time_warnings``)."""
+        from datetime import datetime
+        from ba2_common.core.schedule_genes import schedule_time_warnings
+        try:
+            times = self._collect_execution_times(getattr(self, f'{kind}_execution_times', []))
+            return schedule_time_warnings(times, 'market' if market_basis else 'local',
+                                          datetime.now().astimezone().tzinfo)
+        except Exception as e:  # noqa: BLE001 -- a hint must never break the form
+            logger.warning(f"could not compute schedule time warnings: {e}")
+            return []
 
     def _update_open_positions_schedule_visibility(self):
         """Hide the open-positions schedule editor for experts that handle exits
@@ -2816,9 +3045,9 @@ class ExpertSettingsTab:
         # Load days
         days = schedule_config.get('days', {})
         for day, checkbox in self.schedule_days.items():
-            # Default weekdays to True, weekends to False if not specified
-            default_value = day not in ['saturday', 'sunday']
-            checkbox.value = days.get(day, default_value)
+            # An absent day: weekdays True, weekends False -- the ONE shared rule the live scheduler
+            # and the backtest read too (schedule_genes.schedule_weekday_enabled).
+            checkbox.value = schedule_weekday_for_display(days, day)
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
@@ -2836,12 +3065,19 @@ class ExpertSettingsTab:
             self._add_time_input('09:30')
     
     def _load_general_settings(self, expert_instance):
-        """Load general settings (schedule and trading permissions) for an existing expert."""
+        """Load general settings (schedule and trading permissions) for an existing expert.
+
+        A failure here leaves the form on its NEW-EXPERT defaults; saving that would write
+        them over the real settings. So a failure is recorded in
+        ``_general_settings_load_error`` (which ``_save_expert`` refuses on), logged with the
+        traceback, and shown to the operator as a persistent error.
+        """
+        self._general_settings_load_error = None
         try:
             from ...core.utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
             if not expert:
-                return
+                raise ValueError(f'no live expert instance for id {expert_instance.id}')
             
             # Check if we have imported settings to use instead
             settings_source = self._imported_expert_settings if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings else expert.settings
@@ -2879,143 +3115,103 @@ class ExpertSettingsTab:
                 if open_positions_schedule:
                     self._load_open_positions_schedule_config(open_positions_schedule)
             
-            # Load trading permissions - convert to booleans if they're strings
-            enable_buy = settings_source.get('enable_buy', True)  # Default to True
-            enable_sell = settings_source.get('enable_sell', False)  # Default to False
-            
-            # Handle legacy automatic_trading setting by splitting it into new settings
-            legacy_automatic_trading = settings_source.get('automatic_trading', None)
-            allow_automated_trade_opening = settings_source.get('allow_automated_trade_opening', False)
-            allow_automated_trade_modification = settings_source.get('allow_automated_trade_modification', False)
-            
-            # If legacy setting exists and new settings don't, migrate the legacy setting
-            if legacy_automatic_trading is not None and 'allow_automated_trade_opening' not in settings_source and 'allow_automated_trade_modification' not in settings_source:
-                if isinstance(legacy_automatic_trading, str):
-                    legacy_value = legacy_automatic_trading.lower() == 'true'
-                else:
-                    legacy_value = bool(legacy_automatic_trading)
-                allow_automated_trade_opening = legacy_value
-                allow_automated_trade_modification = legacy_value
-            
-            # Convert string values to booleans if needed
-            if isinstance(enable_buy, str):
-                enable_buy = enable_buy.lower() == 'true'
-            if isinstance(enable_sell, str):
-                enable_sell = enable_sell.lower() == 'true'
-            if isinstance(allow_automated_trade_opening, str):
-                allow_automated_trade_opening = allow_automated_trade_opening.lower() == 'true'
-            if isinstance(allow_automated_trade_modification, str):
-                allow_automated_trade_modification = allow_automated_trade_modification.lower() == 'true'
-            
-            if hasattr(self, 'enable_buy_checkbox'):
-                self.enable_buy_checkbox.value = enable_buy
-            if hasattr(self, 'enable_sell_checkbox'):
-                self.enable_sell_checkbox.value = enable_sell
-            if hasattr(self, 'allow_automated_trade_opening_checkbox'):
-                self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
-            if hasattr(self, 'allow_automated_trade_modification_checkbox'):
-                self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
-            
-            # Load risk management settings.
-            # NOTE: settings_source contains every definition key (pre-filled with
-            # None when no DB row exists), so .get(key, default) returns None rather
-            # than the default. Treat a stored None as "use the interface default".
-            max_virtual_equity_per_instrument = settings_source.get('max_virtual_equity_per_instrument_percent')
-            if max_virtual_equity_per_instrument is None:
-                max_virtual_equity_per_instrument = 10.0
-            if isinstance(max_virtual_equity_per_instrument, str):
-                max_virtual_equity_per_instrument = float(max_virtual_equity_per_instrument)
+            # EVERY displayed value is resolved against the DECLARED default
+            # (get_merged_settings_definitions, builtins included) -- never a literal here.
+            # settings_source holds every definition key, pre-filled with None when no row
+            # exists, so `.get(key, <literal>)` returned None: the checkboxes held None and
+            # Save died in coerce_bool(None) (bug report 2026-09-22). See setting_display.
+            definitions = type(expert).get_merged_settings_definitions()
 
-            if hasattr(self, 'max_virtual_equity_per_instrument_input'):
-                self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
+            def shown(key):
+                return resolve_setting_for_display(definitions, settings_source, key)
 
-            min_available_balance_pct = settings_source.get('min_available_balance_pct')
-            if min_available_balance_pct is None:
-                min_available_balance_pct = 10.0
-            if isinstance(min_available_balance_pct, str):
-                min_available_balance_pct = float(min_available_balance_pct)
+            # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded (stored value or
+            # declared default alike), and the save writes only the controls that changed -- a
+            # missing row stays missing, a NULL row NULL, a native-JSON bool keeps its bytes.
+            tracker = self._shown_values_tracker()
 
-            if hasattr(self, 'min_available_balance_pct_input'):
-                self.min_available_balance_pct_input.value = str(min_available_balance_pct)
+            def show(key, attr, value):
+                if hasattr(self, attr):
+                    control = getattr(self, attr)
+                    control.value = value
+                    tracker.record(key, control.value)
 
-            # Load risk_atr (risk-based) sizing builtins. As above, a stored None
-            # means "use the interface default" (settings_source pre-fills None).
-            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-            MarketExpertInterface._ensure_builtin_settings()
+            # Schedules: recorded the same way.
+            if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
+                tracker.record('execution_schedule_enter_market', self._get_enter_market_schedule_config())
+            if hasattr(self, 'open_positions_schedule_days') and hasattr(self, 'open_positions_execution_times'):
+                tracker.record('execution_schedule_open_positions', self._get_open_positions_schedule_config())
 
-            sizing_mode = settings_source.get('sizing_mode')
-            if sizing_mode is None:
-                sizing_mode = MarketExpertInterface._builtin_settings.get('sizing_mode', {}).get('default', 'notional')
-            if hasattr(self, 'sizing_mode_select'):
-                self.sizing_mode_select.value = sizing_mode
+            # Load trading permissions
+            enable_buy = shown('enable_buy')
+            enable_sell = shown('enable_sell')
+            allow_automated_trade_opening = shown('allow_automated_trade_opening')
+            allow_automated_trade_modification = shown('allow_automated_trade_modification')
 
-            risk_per_trade_pct = settings_source.get('risk_per_trade_pct')
-            if risk_per_trade_pct is None:
-                risk_per_trade_pct = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {}).get('default', 1.0)
-            if hasattr(self, 'risk_per_trade_pct_input'):
-                self.risk_per_trade_pct_input.value = str(risk_per_trade_pct)
+            # The undeclared legacy `automatic_trading` key is deliberately IGNORED. A migration
+            # of it into the two new permissions existed here but could never fire (its
+            # `key not in settings_source` test is always false -- every defined key is
+            # pre-filled); making it reachable would have switched automated trading ON, on a
+            # no-edit save, for any expert with an old automatic_trading=true row, while only
+            # the new keys gate trading (review 2026-09-22). The dialog shows the new keys from
+            # their stored value or declared default, nothing else.
 
-            atr_multiplier = settings_source.get('atr_multiplier')
-            if atr_multiplier is None:
-                atr_multiplier = MarketExpertInterface._builtin_settings.get('atr_multiplier', {}).get('default', 2.0)
-            if hasattr(self, 'atr_multiplier_input'):
-                self.atr_multiplier_input.value = str(atr_multiplier)
+            for key, attr in self._BUILTIN_BOOL_CONTROLS.items():
+                show(key, attr, shown(key))
 
-            atr_period = settings_source.get('atr_period')
-            if atr_period is None:
-                atr_period = MarketExpertInterface._builtin_settings.get('atr_period', {}).get('default', 14)
-            if hasattr(self, 'atr_period_input'):
-                self.atr_period_input.value = str(atr_period)
+            # Position sizing (text inputs show str()).
+            for key, attr in (
+                ('max_virtual_equity_per_instrument_percent', 'max_virtual_equity_per_instrument_input'),
+                ('min_available_balance_pct', 'min_available_balance_pct_input'),
+                ('risk_per_trade_pct', 'risk_per_trade_pct_input'),
+                ('atr_multiplier', 'atr_multiplier_input'),
+                ('atr_period', 'atr_period_input'),
+                ('min_stop_loss_pct', 'min_stop_loss_pct_input'),
+            ):
+                show(key, attr, display_text(definitions, key, shown(key)))
 
-            min_stop_loss_pct = settings_source.get('min_stop_loss_pct')
-            if min_stop_loss_pct is None:
-                min_stop_loss_pct = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {}).get('default', 7.0)
-            if hasattr(self, 'min_stop_loss_pct_input'):
-                self.min_stop_loss_pct_input.value = str(min_stop_loss_pct)
+            self._select_checks_general = {}
+
+            def show_select(key, attr):
+                # A select: an invalid stored value is ONE field in error (shown empty, save
+                # refused until picked), not a load error for the whole tab -- and never a
+                # silent fallback to the first option.
+                if hasattr(self, attr):
+                    valid = definitions[key]['valid_values']
+                    value, error = select_value_for_display(valid, shown(key))
+                    show(key, attr, value)
+                    _show_select_error(key, getattr(self, attr), error)
+                    self._select_checks_general[key] = (getattr(self, attr), list(valid))
+
+            show_select('sizing_mode', 'sizing_mode_select')
+            sizing_mode = getattr(getattr(self, 'sizing_mode_select', None), 'value', None)
 
             # Set risk_atr container visibility from the loaded sizing_mode so an
             # expert already in risk_atr shows the knobs when the dialog opens.
             if hasattr(self, 'risk_atr_settings_container'):
                 self.risk_atr_settings_container.set_visibility(sizing_mode == 'risk_atr')
 
-            # Load AI model settings
-            risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
-            if hasattr(self, 'risk_manager_model_input'):
-                self.risk_manager_model_input.value = risk_manager_model
-            
-            dynamic_instrument_selection_model = settings_source.get('dynamic_instrument_selection_model', 'nagaai/gpt5')
-            if hasattr(self, 'dynamic_instrument_selection_model_input'):
-                self.dynamic_instrument_selection_model_input.value = dynamic_instrument_selection_model
-            
-            # Load AI instrument prompt (for dynamic instrument selection)
+            # AI model settings, risk manager mode, smart risk manager
+            for key, attr in (
+                ('risk_manager_model', 'risk_manager_model_input'),
+                ('dynamic_instrument_selection_model', 'dynamic_instrument_selection_model_input'),
+                ('smart_risk_manager_user_instructions', 'smart_risk_manager_user_instructions_input'),
+            ):
+                show(key, attr, shown(key))
+            show_select('risk_manager_mode', 'risk_manager_mode_select')
+            for key, attr in (
+                ('smart_risk_manager_max_iterations', 'smart_risk_manager_max_iterations_input'),
+                ('smart_risk_manager_analysis_window_hours', 'smart_risk_manager_analysis_window_hours_input'),
+            ):
+                show(key, attr, int(shown(key)))
+
+            # AI instrument prompt: an undeclared key, shown only when stored (the textarea
+            # otherwise holds the generated default prompt); recorded either way.
             ai_instrument_prompt = settings_source.get('ai_instrument_prompt')
             if ai_instrument_prompt and hasattr(self, 'ai_prompt_textarea'):
                 self.ai_prompt_textarea.value = ai_instrument_prompt
-            
-            # Load risk manager mode
-            risk_manager_mode = settings_source.get('risk_manager_mode', 'classic')
-            if hasattr(self, 'risk_manager_mode_select'):
-                self.risk_manager_mode_select.value = risk_manager_mode
-            
-            # Load smart risk manager user instructions
-            smart_risk_manager_user_instructions = settings_source.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
-            if hasattr(self, 'smart_risk_manager_user_instructions_input'):
-                self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
-            
-            # Load smart risk manager max iterations
-            smart_risk_manager_max_iterations = settings_source.get('smart_risk_manager_max_iterations', 10)
-            if hasattr(self, 'smart_risk_manager_max_iterations_input'):
-                # Handle None value gracefully (can happen if setting exists but value is None)
-                if smart_risk_manager_max_iterations is None:
-                    smart_risk_manager_max_iterations = 10
-                self.smart_risk_manager_max_iterations_input.value = int(smart_risk_manager_max_iterations)
-
-            # Load smart risk manager analysis window (hours)
-            smart_risk_manager_analysis_window_hours = settings_source.get('smart_risk_manager_analysis_window_hours', 24)
-            if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
-                if smart_risk_manager_analysis_window_hours is None:
-                    smart_risk_manager_analysis_window_hours = 24
-                self.smart_risk_manager_analysis_window_hours_input.value = int(smart_risk_manager_analysis_window_hours)
+            if hasattr(self, 'ai_prompt_textarea'):
+                tracker.record('ai_instrument_prompt', self.ai_prompt_textarea.value)
 
             # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -3049,7 +3245,13 @@ class ExpertSettingsTab:
             logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, auto_open={allow_automated_trade_opening}, auto_modify={allow_automated_trade_modification}, enter_market_ruleset_id={expert_instance.enter_market_ruleset_id}, open_positions_ruleset_id={expert_instance.open_positions_ruleset_id}')
             
         except Exception as e:
-            logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
+            self._general_settings_load_error = f'{type(e).__name__}: {e}'
+            logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}. '
+                         f'Saving this dialog is refused.', exc_info=True)
+            ui.notify(f'Could not load the settings of expert {expert_instance.id} '
+                      f'({self._general_settings_load_error}). The form shows DEFAULTS, not its '
+                      f'real settings, and Save is disabled for this dialog.',
+                      type='negative', timeout=0, close_button=True)
 
     def _add_time_input_enter_market(self, initial_time=''):
         """Add a new time input field to the enter market execution times container."""
@@ -3077,6 +3279,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('enter_market')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3129,6 +3332,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('open_positions')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3185,12 +3389,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'enter_market_schedule_days'):
                 for day, checkbox in self.enter_market_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set enter market day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('enter_market')
+        self._show_schedule_refusal('enter_market', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'enter_market_time_basis'):
@@ -3249,12 +3453,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'open_positions_schedule_days'):
                 for day, checkbox in self.open_positions_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set open positions day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('open_positions')
+        self._show_schedule_refusal('open_positions', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'open_positions_time_basis'):
@@ -3348,23 +3552,58 @@ class ExpertSettingsTab:
             expert_properties = expert_class.get_expert_properties()
             required_method = expert_properties.get('required_instrument_selection_method')
 
-            if required_method:
-                # Expert requires a specific method — force it and disable dropdown
-                self.instrument_selection_method_select.options = [required_method]
-                self.instrument_selection_method_select.value = required_method
-                self.instrument_selection_method_select.props('disable')
+            select_el = self.instrument_selection_method_select
+            editing = getattr(self, '_instrument_method_loaded', False)
+            stored = getattr(self, '_stored_instrument_method', None)
+            self._select_checks_instrument = {}
+            if required_method and editing and stored != required_method:
+                # EDIT of an expert whose stored method differs from the one its type requires
+                # (missing, NULL, or e.g. a Senate 'static' promised to stay static until an
+                # operator switches it). Forcing it silently would change job ROUTING on a
+                # no-edit save -- an unset method is dormant in JobManager and would be
+                # ACTIVATED. Shown in error, naming both; the save is refused until picked.
+                select_el.options = [required_method]
+                select_el.value = None
+                select_el.props(remove='disable')
+                stored_text = 'no stored method' if stored is None else f'the stored method {stored!r}'
+                _show_select_error('instrument_selection_method', select_el, (
+                    f"{stored_text} differs from {required_method!r}, which {expert_type} "
+                    f"requires -- pick {required_method!r} to switch it (this changes how its "
+                    f"analysis jobs are routed)"))
+                self._select_checks_instrument['instrument_selection_method'] = (
+                    select_el, [required_method])
+            elif required_method:
+                # A NEW expert (or an edit already on it): force it and disable the dropdown.
+                select_el.options = [required_method]
+                select_el.value = required_method
+                select_el.props('disable')
                 logger.debug(f'Instrument selection forced to "{required_method}" for {expert_type}')
             else:
-                # Build available options (no "expert" — only via required_instrument_selection_method)
-                options = ["static", "dynamic", "screener"]
+                # Build available options (no "expert" — only via required_instrument_selection_method);
+                # plus UNSET while the edited expert has no stored method.
+                options = self._instrument_method_options(["static", "dynamic", "screener"])
 
                 current_value = self.instrument_selection_method_select.value
                 self.instrument_selection_method_select.options = options
                 self.instrument_selection_method_select.props(remove='disable')
 
-                # Reset value if current value is no longer valid
+                # A value this expert does not offer: on an EDIT it is the stored method, so it
+                # is shown in ERROR and the save refused until one is picked (it used to be
+                # reset to 'static' silently); on a new expert nothing is stored -- the form
+                # goes back to the declared default.
                 if current_value not in options:
-                    self.instrument_selection_method_select.value = "static"
+                    if editing:
+                        self.instrument_selection_method_select.value = None
+                        _show_select_error('instrument_selection_method',
+                                           self.instrument_selection_method_select, (
+                            f"the stored method {current_value!r} is not offered for "
+                            f"{expert_type} ({', '.join(o for o in options if o != INSTRUMENT_METHOD_UNSET)})"
+                            f" -- pick one"))
+                        self._select_checks_instrument['instrument_selection_method'] = (
+                            self.instrument_selection_method_select, list(options))
+                    else:
+                        self.instrument_selection_method_select.value = _builtin_default(
+                            'instrument_selection_method')
 
                 logger.debug(f'Updated instrument selection options for {expert_type}: {options}')
 
@@ -3396,7 +3635,7 @@ class ExpertSettingsTab:
         self.instruments_content_container.clear()
         
         # Get current selection method
-        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        selection_method = self._effective_instrument_method()
         
         # Get expert properties to check capabilities
         expert_type = getattr(self.expert_select, 'value', None) if hasattr(self, 'expert_select') else None
@@ -3450,10 +3689,8 @@ class ExpertSettingsTab:
                         if expert:
                             model_for_prompt = expert.settings.get('dynamic_instrument_selection_model')
                     if not model_for_prompt:
-                        # Use default from MarketExpertInterface
-                        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                        MarketExpertInterface._ensure_builtin_settings()
-                        model_for_prompt = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+                        # The DECLARED default (no second copy of it here).
+                        model_for_prompt = _builtin_default('dynamic_instrument_selection_model')
                     
                     ai_selector = AIInstrumentSelector(model_string=model_for_prompt)
                     default_prompt = ai_selector.get_default_prompt()
@@ -3508,6 +3745,9 @@ class ExpertSettingsTab:
             expert = get_expert_instance_from_id(expert_instance.id)
             if expert:
                 current_settings = expert.settings
+        tracker = self._shown_values_tracker()
+        tracker.forget(getattr(self, 'screener_settings_inputs', None) or ())
+        self._select_checks_screener = {}
 
         self.screener_settings_inputs = {}
 
@@ -3537,7 +3777,7 @@ class ExpertSettingsTab:
                     tooltip_text = meta.get("tooltip")
 
                     # 3-column grid: label / input / reset-default button
-                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                    setting_container = ui.element('div').classes('w-full mb-2 bm-setgrid').style(
                         'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
@@ -3552,31 +3792,34 @@ class ExpertSettingsTab:
 
                         # Input field based on type
                         if meta["type"] == "str" and valid_values:
-                            value = current_value if current_value is not None else default_value or ""
+                            # No silent first-option fallback (see the expert-specific form).
+                            select_value, select_error = select_value_for_display(
+                                valid_values, resolve_setting_for_display(builtin, current_settings, key))
                             inp = ui.select(
                                 options=valid_values,
                                 label='',
-                                value=value if value in valid_values else valid_values[0]
+                                value=select_value
                             ).classes('w-full').props('dense')
-                        elif meta["type"] == "int":
-                            if current_value is not None and current_value != "":
-                                try:
-                                    value = int(current_value)
-                                except (ValueError, TypeError):
-                                    value = default_value or 0
-                            else:
-                                value = default_value or 0
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
-                        elif meta["type"] == "float":
-                            value = current_value if current_value is not None else default_value or 0.0
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                            _show_select_error(key, inp, select_error)
+                            self._select_checks_screener[key] = (inp, list(valid_values))
+                        elif meta["type"] in ("int", "float"):
+                            # As the expert-specific form: stored, else DECLARED default, else
+                            # empty (refused by name on save) -- never an invented 0.
+                            value = resolve_setting_for_display(builtin, current_settings, key)
+                            inp = ui.input(label='', value="" if value is None
+                                           else display_text(builtin, key, value)).classes('w-full').props('dense')
                         else:
                             value = current_value if current_value is not None else default_value or ""
-                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                            if is_secret_setting(key, meta):
+                                inp = _secret_input('', str(value)).classes('w-full').props('dense')
+                            else:
+                                inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
 
                         _render_reset_default_button(inp, default_value, meta)
 
                     self.screener_settings_inputs[key] = inp
+                    if expert_instance:
+                        tracker.record(key, inp.value)
 
                 # Test Screener button + progress bar
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -3667,6 +3910,8 @@ class ExpertSettingsTab:
                 stat_items.append(f'RVOL: -{dropped_rvol}')
                 dropped_float = stats.get('dropped_float', 0)
                 stat_items.append(f'Float: -{dropped_float}')
+                dropped_vol_min = stats.get('dropped_volume_min', 0)
+                stat_items.append(f'Vol min: -{dropped_vol_min}')
                 dropped_vol = stats.get('dropped_volume_max', 0)
                 stat_items.append(f'Vol max: -{dropped_vol}')
                 dropped_drop = stats.get('dropped_price_drop', 0)
@@ -3760,10 +4005,8 @@ class ExpertSettingsTab:
                     if expert:
                         model_string = expert.settings.get('dynamic_instrument_selection_model')
                 if not model_string:
-                    # Use default from MarketExpertInterface
-                    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                    MarketExpertInterface._ensure_builtin_settings()
-                    model_string = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+                    # The DECLARED default (no second copy of it here).
+                    model_string = _builtin_default('dynamic_instrument_selection_model')
             
             # Initialize with the selected model (model_string is now guaranteed to exist)
             ai_selector = AIInstrumentSelector(model_string=model_string)
@@ -3814,7 +4057,17 @@ class ExpertSettingsTab:
             ui.notify(f'Error testing AI selection: {str(e)}', type='negative')
     
     def _render_expert_settings(self, expert_instance=None):
-        """Render expert-specific settings based on the selected expert type."""
+        """Render expert-specific settings based on the selected expert type.
+
+        A field (or the whole form) that cannot be read is shown as such and recorded in
+        ``_expert_settings_load_error``, which ``_save_expert`` refuses on: a truncated or
+        defaulted form must never be saved over the expert's real settings.
+        """
+        self._expert_settings_load_error = None
+        tracker = self._shown_values_tracker()
+        tracker.forget(getattr(self, '_expert_form_keys', ()))
+        self._expert_form_keys = set()
+        self._select_checks_expert = {}
         self.expert_settings_container.clear()
         
         expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
@@ -3853,7 +4106,7 @@ class ExpertSettingsTab:
                     ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
                     # 3-column grid: 55% label / 38% input / 7% reset-default button
-                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                    setting_container = ui.element('div').classes('w-full mb-2 bm-setgrid').style(
                         'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
@@ -3902,15 +4155,22 @@ class ExpertSettingsTab:
                                         new_value_mode='add-unique'  # Allow adding new custom values
                                     ).classes('w-full').props('use-input')  # Enable search
                                 else:
-                                    # Regular select - restricted to list
-                                    # Add search capability if there are many options (>10)
+                                    # Regular select - restricted to list. Never the first
+                                    # option as a silent fallback: invalid / no value -> EMPTY
+                                    # with an error, and the save refuses until one is picked.
+                                    select_value, select_error = select_value_for_display(
+                                        valid_values, resolve_setting_for_display(settings_def, current_settings, key))
                                     inp = ui.select(
                                         options=valid_values,
                                         label=display_label,
-                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                        value=select_value
                                     ).classes('w-full')
                                     if len(valid_values) > 10:
                                         inp.props('use-input')  # Enable search for long lists
+                                    _show_select_error(key, inp, select_error)
+                                    self._select_checks_expert[key] = (inp, list(valid_values))
+                            elif is_secret_setting(key, meta):
+                                inp = _secret_input(display_label, value).classes('w-full')
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
                         elif meta["type"] == "list":
@@ -3931,21 +4191,32 @@ class ExpertSettingsTab:
                                 import json
                                 inp = ui.input(label=display_label, value=json.dumps(value)).classes('w-full')
                         elif meta["type"] == "bool":
-                            value = current_value if current_value is not None else default_value or False
-                            inp = ui.checkbox(text=display_label, value=bool(value))
-                        elif meta["type"] == "int":
-                            # Handle empty strings and None values for integer fields
-                            if current_value is not None and current_value != "":
-                                try:
-                                    value = int(current_value)
-                                except (ValueError, TypeError):
-                                    value = default_value or 0
-                            else:
-                                value = default_value or 0
-                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
-                        elif meta["type"] == "float":
-                            value = current_value if current_value is not None else default_value or 0.0
-                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
+                            # Stored value (read through coerce_bool -- bool("false") is True),
+                            # else the declared default. A bool with neither raises: a
+                            # checkbox cannot show "unset", and False would be a silent guess.
+                            try:
+                                value = resolve_setting_for_display(settings_def, current_settings, key)
+                            except ValueError as e:
+                                # Unreadable stored value, or no default to show: this ONE
+                                # field is shown indeterminate with the error beside it; the
+                                # rest of the form still renders. Save is refused (flag).
+                                logger.error(f"Expert setting '{key}' cannot be shown: {e}")
+                                self._expert_settings_load_error = f"'{key}': {e}"
+                                value = None
+                                ui.notify(f"Expert setting '{key}' cannot be shown ({e}); it is "
+                                          f"left unset and Save is refused for this dialog.",
+                                          type='negative', timeout=0, close_button=True)
+                            inp = ui.checkbox(text=display_label, value=value)
+                        elif meta["type"] in ("int", "float"):
+                            # Stored value, else the DECLARED default; neither -> an EMPTY field,
+                            # which the save refuses by name. The old `default_value or 0`
+                            # showed an invented 0 that a no-edit save then wrote, and an
+                            # unparsable stored int was silently replaced by the default; it
+                            # is now shown as stored, and the save refuses it by name.
+                            value = resolve_setting_for_display(settings_def, current_settings, key)
+                            inp = ui.input(label=display_label,
+                                           value="" if value is None
+                                           else display_text(settings_def, key, value)).classes('w-full')
                         else:
                             value = current_value if current_value is not None else default_value or ""
                             if valid_values:
@@ -3964,14 +4235,19 @@ class ExpertSettingsTab:
                                         new_value_mode='add-unique'
                                     ).classes('w-full').props('use-input')  # Enable search
                                 else:
-                                    # Regular select - restricted to list
+                                    # Regular select - restricted to list (no silent first-option
+                                    # fallback; see the str branch above).
+                                    select_value, select_error = select_value_for_display(
+                                        valid_values, resolve_setting_for_display(settings_def, current_settings, key))
                                     inp = ui.select(
                                         options=valid_values,
                                         label=display_label,
-                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                        value=select_value
                                     ).classes('w-full')
                                     if len(valid_values) > 10:
                                         inp.props('use-input')  # Enable search for long lists
+                                    _show_select_error(key, inp, select_error)
+                                    self._select_checks_expert[key] = (inp, list(valid_values))
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
@@ -3989,12 +4265,23 @@ class ExpertSettingsTab:
                     setting_container.move(self.expert_settings_container)
                     
                     self.expert_settings_inputs[key] = inp
+                    if expert_instance:
+                        # EDIT: an unedited field is never written back (a no-edit save is
+                        # byte-for-byte a no-op).
+                        self._expert_form_keys.add(key)
+                        tracker.record(key, inp.value)
             else:
                 ui.label("No expert-specific settings available.").move(self.expert_settings_container)
                 
         except Exception as e:
+            # The form is TRUNCATED at the failing field; saving it would write whatever
+            # rendered and silently skip the rest. Recorded so _save_expert refuses.
+            self._expert_settings_load_error = f'{type(e).__name__}: {e}'
             logger.error(f'Error rendering expert settings: {e}', exc_info=True)
-            ui.label(f"Error loading settings: {e}").move(self.expert_settings_container)
+            ui.label(f"Error loading settings: {e}. Save is refused for this dialog.") \
+                .classes('text-negative').move(self.expert_settings_container)
+        # The expert type may have changed: Save follows the form's CURRENT load state.
+        self._refresh_save_button()
     
     def _on_expert_type_change(self, event, expert_instance):
         """Handle expert type change."""
@@ -4584,8 +4871,220 @@ class ExpertSettingsTab:
         from ...core.ExpertPriority import validate_expert_priority
         return validate_expert_priority(self.priority_input.value)
 
+    # ------------------------------------------------------------ a no-edit save is a no-op
+    def _shown_values_tracker(self) -> ShownValues:
+        tracker = getattr(self, '_shown_values', None)
+        if tracker is None:
+            tracker = self._shown_values = ShownValues()
+        return tracker
+
+    def _save_unless_unedited(self, expert, key, control_value, value, setting_type) -> bool:
+        """Write ``key`` -- unless its control still shows what it was filled with (stored value
+        or declared default, see ShownValues): a no-edit save is byte-for-byte a no-op.
+        Returns whether it wrote."""
+        if self._shown_values_tracker().unedited(key, control_value):
+            logger.debug(f'Not writing {key}: not edited')
+            return False
+        expert.save_setting(key, value, setting_type=setting_type)
+        return True
+
+    def _dialog_load_error(self):
+        """Why this dialog's form does not hold the expert's real settings; None when it does."""
+        return (getattr(self, '_general_settings_load_error', None)
+                or getattr(self, '_expert_settings_load_error', None)
+                or getattr(self, '_instrument_selection_load_error', None))
+
+    def _refresh_save_button(self):
+        """Enable/disable Save from the CURRENT load state. Re-run whenever a part of the form is
+        re-rendered (an expert-type change re-renders the expert-specific form), not decided
+        once when the dialog opens."""
+        self._save_button_disabled = bool(self._dialog_load_error())
+        button = getattr(self, '_save_button', None)
+        if button is None:
+            return
+        if self._save_button_disabled:
+            button.disable()
+        else:
+            button.enable()
+
+    # ------------------------------------------------------------ instrument selection method
+    def _instrument_method_options(self, methods: list):
+        """The select's options: ``methods``, plus the UNSET entry while this expert has no
+        stored method (then a dict value -> label, as the select accepts)."""
+        if not getattr(self, '_instrument_method_unset', False):
+            return list(methods)
+        default = _builtin_default('instrument_selection_method')
+        options = {INSTRUMENT_METHOD_UNSET: f"(unset -- the declared default '{default}' applies)"}
+        options.update({m: m for m in methods})
+        return options
+
+    def _effective_instrument_method(self) -> str:
+        """The method the instruments tab renders and saves by: the select's value, or the
+        DECLARED default while it shows unset (which is what the runtime applies)."""
+        value = getattr(getattr(self, 'instrument_selection_method_select', None), 'value', None)
+        if value in (None, '', INSTRUMENT_METHOD_UNSET):
+            return _builtin_default('instrument_selection_method')
+        return value
+
+    def _load_instrument_selection_method(self, expert_instance):
+        """Fill the method select for an EDIT.
+
+        No stored method (no row, or a NULL row) is shown as UNSET and saved as nothing: an
+        explicit 'static' would force FactorRanker's static universe where unset defers to its
+        universe_source. A failed read used to set 'static' at DEBUG level, and the save wrote
+        it back -- a no-edit save switched a screener expert to static. It is now recorded,
+        shown, Save is disabled and _save_expert refuses.
+        """
+        key = 'instrument_selection_method'
+        self._instrument_selection_load_error = None
+        self._instrument_method_unset = False
+        self._instrument_method_loaded = False
+        self._stored_instrument_method = None
+        select_el = self.instrument_selection_method_select
+        try:
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if expert is None:
+                raise ValueError(f'no live expert instance for id {expert_instance.id}')
+            shown = resolve_setting_for_display(
+                type(expert).get_merged_settings_definitions(), expert.settings, key)
+            if (not has_stored_value(expert.settings, key)
+                    or key in _null_setting_keys(ExpertSetting, 'instance_id', expert_instance.id)):
+                self._instrument_method_unset = True
+                select_el.options = self._instrument_method_options(
+                    [o for o in (select_el.options or []) if o != INSTRUMENT_METHOD_UNSET])
+                shown = INSTRUMENT_METHOD_UNSET
+            else:
+                self._stored_instrument_method = shown
+            select_el.value = shown
+            self._shown_values_tracker().record(key, select_el.value)
+            self._instrument_method_loaded = True
+        except Exception as e:
+            self._instrument_selection_load_error = f'{type(e).__name__}: {e}'
+            logger.error(f'Could not load instrument_selection_method for expert '
+                         f'{expert_instance.id}: {e}. Saving this dialog is refused.',
+                         exc_info=True)
+            ui.notify(f'Could not load the instrument selection method of expert '
+                      f'{expert_instance.id} ({self._instrument_selection_load_error}). '
+                      f'Save is disabled for this dialog.',
+                      type='negative', timeout=0, close_button=True)
+
+    def _unpicked_selects(self) -> list:
+        """Dropdowns (general tab, expert-specific form, screener form when the method is
+        screener) that do not hold one of their options -- refused by name."""
+        checks = dict(getattr(self, '_select_checks_general', None) or {})
+        checks.update(getattr(self, '_select_checks_expert', None) or {})
+        checks.update(getattr(self, '_select_checks_instrument', None) or {})
+        if self._effective_instrument_method() == 'screener':
+            checks.update(getattr(self, '_select_checks_screener', None) or {})
+        return unpicked_selects(checks)
+
+    #: The builtin permission checkboxes and the setting each one writes.
+    _BUILTIN_BOOL_CONTROLS = {
+        'enable_buy': 'enable_buy_checkbox',
+        'enable_sell': 'enable_sell_checkbox',
+        'allow_automated_trade_opening': 'allow_automated_trade_opening_checkbox',
+        'allow_automated_trade_modification': 'allow_automated_trade_modification_checkbox',
+        'allow_fractional_shares': 'allow_fractional_shares_checkbox',
+    }
+
+    def _unset_bool_controls(self) -> list:
+        """Bool settings whose control holds None -- a save must refuse them by name.
+
+        The loader resolves every checkbox from its declared default, so this should never
+        fire; it is here so that if something regresses the operator is told WHICH setting,
+        before anything is written, instead of a coerce_bool stack trace halfway through the
+        save. Never coerced to False: that would be a silent guess at a trading permission.
+        """
+        values = {key: getattr(self, attr).value
+                  for key, attr in self._BUILTIN_BOOL_CONTROLS.items() if hasattr(self, attr)}
+        definitions = {key: {'type': 'bool'} for key in values}
+        expert_inputs = getattr(self, 'expert_settings_inputs', None) or {}
+        if expert_inputs:
+            expert_class = self._get_expert_class(self.expert_select.value)
+            if expert_class:
+                expert_defs = expert_class.get_settings_definitions()
+                for key, inp in expert_inputs.items():
+                    if expert_defs.get(key, {}).get('type') == 'bool':
+                        values[key] = inp.value
+                        definitions[key] = expert_defs[key]
+        return unset_bool_settings(values, definitions)
+
+    #: The builtin numeric fields: setting -> (widget attribute, int|float).
+    _BUILTIN_NUMERIC_CONTROLS = {
+        'max_virtual_equity_per_instrument_percent': ('max_virtual_equity_per_instrument_input', float),
+        'min_available_balance_pct': ('min_available_balance_pct_input', float),
+        'risk_per_trade_pct': ('risk_per_trade_pct_input', float),
+        'atr_multiplier': ('atr_multiplier_input', float),
+        'atr_period': ('atr_period_input', int),
+        'min_stop_loss_pct': ('min_stop_loss_pct_input', float),
+        'smart_risk_manager_max_iterations': ('smart_risk_manager_max_iterations_input', int),
+        'smart_risk_manager_analysis_window_hours': ('smart_risk_manager_analysis_window_hours_input', int),
+    }
+
+    def _numeric_settings_to_save(self) -> dict:
+        """Every numeric field this dialog saves, resolved: setting key -> int/float.
+
+        A cleared field saves the DECLARED default (never a literal in this file -- the old
+        `or 10.0` / `else 10` / `else 0` fallbacks had drifted from the declarations and
+        swallowed parse errors). Raises NumericSettingNotSavable, naming the setting, for an
+        unparsable value or an empty field with no declared default.
+        """
+        expert_class = self._get_expert_class(self.expert_select.value)
+        if not expert_class:
+            return {}
+        definitions = expert_class.get_merged_settings_definitions()
+        fields = {}   # key -> (raw value, kind)
+        for key, (attr, kind) in self._BUILTIN_NUMERIC_CONTROLS.items():
+            if hasattr(self, attr):
+                fields[key] = (getattr(self, attr).value, kind)
+        expert_defs = expert_class.get_settings_definitions()
+        for key, inp in (getattr(self, 'expert_settings_inputs', None) or {}).items():
+            meta = expert_defs.get(key, {})
+            if (key != 'instrument_selection_method' and meta.get('ui_editor_type') != 'ModelSelector'
+                    and meta.get('type') in ('int', 'float')):
+                fields[key] = (inp.value, int if meta['type'] == 'int' else float)
+        if self._effective_instrument_method() == 'screener':
+            for key, inp in (getattr(self, 'screener_settings_inputs', None) or {}).items():
+                kind = definitions.get(key, {}).get('type')
+                if kind in ('int', 'float'):
+                    fields[key] = (inp.value, int if kind == 'int' else float)
+        return {key: numeric_setting_for_save(definitions, key, raw, kind)
+                for key, (raw, kind) in fields.items()}
+
     def _save_expert(self, expert_instance=None):
         """Save the expert instance."""
+        # A dialog whose stored settings could not be loaded is showing new-expert defaults;
+        # saving it would write those over the real settings. Refused, before any write.
+        load_error = (getattr(self, '_general_settings_load_error', None)
+                      or getattr(self, '_expert_settings_load_error', None)
+                      or getattr(self, '_instrument_selection_load_error', None))
+        if load_error:
+            message = (f"Not saved: this expert's settings could not be loaded ({load_error}), "
+                       f"so the form shows defaults, not its real settings. Close the dialog "
+                       f"and reopen it; see the log.")
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=15000)
+            return
+        try:
+            self._numeric_settings_to_save()
+        except NumericSettingNotSavable as e:
+            message = f'Not saved: {e}'
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
+        unset = self._unset_bool_controls()
+        if unset:
+            message = unset_bool_message(unset)
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
+        unpicked = self._unpicked_selects()
+        if unpicked:
+            message = unpicked_selects_message(unpicked)
+            logger.error(f'Refused to save expert: {message}')
+            ui.notify(message, type='negative', timeout=10000)
+            return
         try:
             is_edit = expert_instance is not None
             
@@ -4697,7 +5196,7 @@ class ExpertSettingsTab:
             self._save_expert_settings(expert_id)
             
             # Check if instruments are properly configured based on selection method
-            selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+            selection_method = self._effective_instrument_method()
             has_instruments = False
             
             if selection_method == 'static':
@@ -4773,98 +5272,61 @@ class ExpertSettingsTab:
         # Save general settings (schedules and trading permissions)
         if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
             schedule_config = self._get_enter_market_schedule_config()
-            expert.save_setting('execution_schedule_enter_market', schedule_config, setting_type="json")
+            self._save_unless_unedited(expert, 'execution_schedule_enter_market', schedule_config,
+                                               schedule_config, "json")
             logger.debug(f'Saved execution_schedule_enter_market: {schedule_config}')
         
         if hasattr(self, 'open_positions_schedule_days') and hasattr(self, 'open_positions_execution_times'):
             schedule_config_open = self._get_open_positions_schedule_config()
-            expert.save_setting('execution_schedule_open_positions', schedule_config_open, setting_type="json")
+            self._save_unless_unedited(expert, 'execution_schedule_open_positions', schedule_config_open,
+                                               schedule_config_open, "json")
             logger.debug(f'Saved execution_schedule_open_positions: {schedule_config_open}')
         
         if (hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and 
             hasattr(self, 'allow_automated_trade_opening_checkbox') and hasattr(self, 'allow_automated_trade_modification_checkbox')):
-            expert.save_setting('enable_buy', self.enable_buy_checkbox.value, setting_type="bool")
-            expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
-            expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
-            expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
+            for key, attr in self._BUILTIN_BOOL_CONTROLS.items():
+                if not hasattr(self, attr):
+                    continue
+                value = getattr(self, attr).value
+                self._save_unless_unedited(expert, key, value, value, "bool")
             logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
-        # Save risk management settings
-        if hasattr(self, 'max_virtual_equity_per_instrument_input'):
-            max_equity_value = float(self.max_virtual_equity_per_instrument_input.value or 10.0)
-            expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
-            logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
-        
-        if hasattr(self, 'min_available_balance_pct_input'):
-            min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
-            expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
-            logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
+        # Numeric fields: resolved by _numeric_settings_to_save (a cleared field saves the
+        # DECLARED default; unparsable or default-less refuses). _save_expert already ran it
+        # before any write, so it cannot raise here for a dialog that got this far.
+        numeric = self._numeric_settings_to_save()
+        for key, (attr, kind) in self._BUILTIN_NUMERIC_CONTROLS.items():
+            if key in numeric and self._save_unless_unedited(
+                    expert, key, getattr(self, attr).value, numeric[key], kind.__name__):
+                logger.debug(f'Saved {key}={numeric[key]}')
 
-        # Save risk_atr (risk-based) sizing builtins
+        # Save risk_atr (risk-based) sizing mode; an empty select saves the declared default.
         if hasattr(self, 'sizing_mode_select'):
-            sizing_mode_value = str(self.sizing_mode_select.value or 'notional')
-            expert.save_setting('sizing_mode', sizing_mode_value, setting_type="str")
+            shown_value = sizing_mode_value = self.sizing_mode_select.value
+            if sizing_mode_value in (None, ''):
+                sizing_mode_value = _builtin_default('sizing_mode')
+            self._save_unless_unedited(expert, 'sizing_mode', shown_value, str(sizing_mode_value), "str")
             logger.debug(f'Saved risk management: sizing_mode={sizing_mode_value}')
-
-        if hasattr(self, 'risk_per_trade_pct_input'):
-            risk_per_trade_pct_value = float(self.risk_per_trade_pct_input.value or 1.0)
-            expert.save_setting('risk_per_trade_pct', risk_per_trade_pct_value, setting_type="float")
-            logger.debug(f'Saved risk management: risk_per_trade_pct={risk_per_trade_pct_value}%')
-
-        if hasattr(self, 'atr_multiplier_input'):
-            atr_multiplier_value = float(self.atr_multiplier_input.value or 2.0)
-            expert.save_setting('atr_multiplier', atr_multiplier_value, setting_type="float")
-            logger.debug(f'Saved risk management: atr_multiplier={atr_multiplier_value}')
-
-        if hasattr(self, 'atr_period_input'):
-            atr_period_value = int(float(self.atr_period_input.value or 14))
-            expert.save_setting('atr_period', atr_period_value, setting_type="int")
-            logger.debug(f'Saved risk management: atr_period={atr_period_value}')
-
-        if hasattr(self, 'min_stop_loss_pct_input'):
-            min_stop_loss_pct_value = float(self.min_stop_loss_pct_input.value or 7.0)
-            expert.save_setting('min_stop_loss_pct', min_stop_loss_pct_value, setting_type="float")
-            logger.debug(f'Saved risk management: min_stop_loss_pct={min_stop_loss_pct_value}%')
 
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
-            expert.save_setting('risk_manager_model', self.risk_manager_model_input.value, setting_type="str")
+            self._save_unless_unedited(expert, 'risk_manager_model', self.risk_manager_model_input.value, self.risk_manager_model_input.value, "str")
             logger.debug(f'Saved AI model setting: risk_manager_model={self.risk_manager_model_input.value}')
         
         if hasattr(self, 'dynamic_instrument_selection_model_input'):
-            expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_input.value, setting_type="str")
+            self._save_unless_unedited(expert, 'dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_input.value, self.dynamic_instrument_selection_model_input.value, "str")
             logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_input.value}')
         
         # Save risk manager mode
         if hasattr(self, 'risk_manager_mode_select'):
-            expert.save_setting('risk_manager_mode', self.risk_manager_mode_select.value, setting_type="str")
+            self._save_unless_unedited(expert, 'risk_manager_mode', self.risk_manager_mode_select.value, self.risk_manager_mode_select.value, "str")
             logger.debug(f'Saved risk manager mode: risk_manager_mode={self.risk_manager_mode_select.value}')
         
         # Save smart risk manager user instructions
         if hasattr(self, 'smart_risk_manager_user_instructions_input'):
-            expert.save_setting('smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, setting_type="str")
+            self._save_unless_unedited(expert, 'smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, self.smart_risk_manager_user_instructions_input.value, "str")
             logger.debug(f'Saved smart risk manager user instructions: {self.smart_risk_manager_user_instructions_input.value}')
         
-        # Save smart risk manager max iterations
-        if hasattr(self, 'smart_risk_manager_max_iterations_input'):
-            try:
-                value = self.smart_risk_manager_max_iterations_input.value
-                max_iterations = int(value) if value is not None else 10
-            except (ValueError, TypeError):
-                max_iterations = 10  # Default value
-            expert.save_setting('smart_risk_manager_max_iterations', max_iterations, setting_type="int")
-            logger.debug(f'Saved smart risk manager max iterations: {max_iterations}')
-
-        # Save smart risk manager analysis window (hours)
-        if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
-            try:
-                value = self.smart_risk_manager_analysis_window_hours_input.value
-                analysis_window_hours = int(value) if value is not None else 24
-            except (ValueError, TypeError):
-                analysis_window_hours = 24  # Default value
-            expert.save_setting('smart_risk_manager_analysis_window_hours', analysis_window_hours, setting_type="int")
-            logger.debug(f'Saved smart risk manager analysis window: {analysis_window_hours}h')
-
         # Save the market-condition profile (a BUILTIN setting with its own widget next to the
         # ruleset assignment; _refuse_unserved_market_gates has already checked this value
         # against the ruleset's leaves, so nothing unserved reaches the DB).
@@ -4874,13 +5336,21 @@ class ExpertSettingsTab:
         # because of an unrelated read failure. Never write a default you did not read.
         if self._market_condition_profile_savable():
             profile_value = self._market_condition_profile_value()
-            expert.save_setting(MARKET_CONDITION_PROFILE_SETTING, profile_value, setting_type="str")
+            self._save_unless_unedited(expert, MARKET_CONDITION_PROFILE_SETTING, profile_value, profile_value, "str")
             logger.debug(f'Saved {MARKET_CONDITION_PROFILE_SETTING}: {profile_value!r}')
 
-        # Save instrument selection method (moved to main panel)
+        # Save instrument selection method (moved to main panel). UNSET (no stored method on
+        # an edited expert, left alone) writes NOTHING: an explicit 'static' would force
+        # FactorRanker's static universe where unset defers to universe_source.
         if hasattr(self, 'instrument_selection_method_select'):
-            expert.save_setting('instrument_selection_method', self.instrument_selection_method_select.value, setting_type="str")
-            logger.debug(f'Saved instrument_selection_method: {self.instrument_selection_method_select.value}')
+            method = self.instrument_selection_method_select.value
+            if method == INSTRUMENT_METHOD_UNSET:
+                logger.debug('instrument_selection_method left unset')
+            elif self._shown_values_tracker().unedited('instrument_selection_method', method):
+                logger.debug('instrument_selection_method not edited')
+            else:
+                expert.save_setting('instrument_selection_method', method, setting_type="str")
+                logger.debug(f'Saved instrument_selection_method: {method}')
         
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:
@@ -4892,6 +5362,8 @@ class ExpertSettingsTab:
                     continue
                     
                 meta = settings_def.get(key, {})
+                if self._shown_values_tracker().unedited(key, inp.value):
+                    continue   # filled from its declared default, not edited: no-op
                 
                 # Handle ModelSelector special case (ModelSelectorInput has .value property)
                 if meta.get("ui_editor_type") == "ModelSelector":
@@ -4899,20 +5371,9 @@ class ExpertSettingsTab:
                     expert.save_setting(key, inp.value or "", setting_type="str")
                 elif meta.get("type") == "bool":
                     expert.save_setting(key, inp.value, setting_type="bool")
-                elif meta.get("type") == "int":
-                    # Handle empty strings and ensure proper type
-                    try:
-                        int_value = int(inp.value) if inp.value and inp.value.strip() != "" else 0
-                    except (ValueError, TypeError):
-                        int_value = 0
-                    expert.save_setting(key, int_value, setting_type="int")
-                elif meta.get("type") == "float":
-                    # Handle empty strings and ensure proper type
-                    try:
-                        float_value = float(inp.value) if inp.value and inp.value.strip() != "" else 0.0
-                    except (ValueError, TypeError):
-                        float_value = 0.0
-                    expert.save_setting(key, float_value, setting_type="float")
+                elif meta.get("type") in ("int", "float"):
+                    # Resolved (and validated) by _numeric_settings_to_save.
+                    expert.save_setting(key, numeric[key], setting_type=meta["type"])
                 elif meta.get("type") == "list":
                     # Handle list types - save as JSON
                     expert.save_setting(key, inp.value, setting_type="json")
@@ -4937,13 +5398,13 @@ class ExpertSettingsTab:
             return
             
         expert = expert_class(expert_id)
-        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        selection_method = self._effective_instrument_method()
         
         if selection_method == 'dynamic':
             # Save AI prompt for dynamic selection
             if hasattr(self, 'ai_prompt_textarea'):
                 ai_prompt = self.ai_prompt_textarea.value
-                expert.save_setting('ai_instrument_prompt', ai_prompt, setting_type="str")
+                self._save_unless_unedited(expert, 'ai_instrument_prompt', ai_prompt, ai_prompt, "str")
                 logger.debug(f'Saved AI instrument prompt for expert {expert_id}')
             
             # For dynamic selection, we don't save static instrument configuration
@@ -4963,20 +5424,15 @@ class ExpertSettingsTab:
                 MarketExpertInterface._ensure_builtin_settings()
                 builtin = MarketExpertInterface._builtin_settings
 
+                # Numeric screener fields were resolved and validated by
+                # _numeric_settings_to_save before _save_expert wrote anything.
+                numeric = self._numeric_settings_to_save()
                 for key, inp in self.screener_settings_inputs.items():
                     meta = builtin.get(key, {})
-                    if meta.get("type") == "int":
-                        try:
-                            value = int(inp.value) if inp.value and str(inp.value).strip() != "" else 0
-                        except (ValueError, TypeError):
-                            value = 0
-                        expert.save_setting(key, value, setting_type="int")
-                    elif meta.get("type") == "float":
-                        try:
-                            value = float(inp.value) if inp.value and str(inp.value).strip() != "" else 0.0
-                        except (ValueError, TypeError):
-                            value = 0.0
-                        expert.save_setting(key, value, setting_type="float")
+                    if self._shown_values_tracker().unedited(key, inp.value):
+                        continue   # filled from its declared default, not edited: no-op
+                    if meta.get("type") in ("int", "float"):
+                        expert.save_setting(key, numeric[key], setting_type=meta["type"])
                     else:
                         expert.save_setting(key, inp.value or "", setting_type="str")
                 logger.debug(f'Saved screener settings for expert {expert_id}')
@@ -4997,6 +5453,10 @@ class ExpertSettingsTab:
                     'weight': inst['weight']
                 }
             
+            if not instrument_configs and not has_stored_value(expert.settings, 'enabled_instruments'):
+                # Nothing selected and nothing stored: writing {} would be a no-edit change.
+                logger.debug(f'No instruments selected and none stored for expert {expert_id}')
+                return
             expert.set_enabled_instruments(instrument_configs)
             logger.debug(f'Saved instrument configuration for expert {expert_id}: {len(instrument_configs)} instruments')
     
@@ -5892,7 +6352,7 @@ class TradeSettingsTab:
                                     ).classes('w-40').props('dense')
                                     strike_param_input = ui.input(
                                         label='Strike Param',
-                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        value=_strike_param_text(action_config.get('strike_param')) if action_config else '',
                                         placeholder='0.30 or {"long":0.45,"short":0.25}'
                                     ).classes('w-44').props('dense')
                                 else:
@@ -5901,7 +6361,7 @@ class TradeSettingsTab:
                                     # exactly how "30-delta" became "0.30 % OTM".
                                     strike_param_input = ui.input(
                                         label='Strike % OTM',
-                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        value=_strike_param_text(action_config.get('strike_param')) if action_config else '',
                                         placeholder='5.0 (this structure selects by % OTM)'
                                     ).classes('w-44').props('dense')
                                 dte_min_input = ui.number(
@@ -8211,6 +8671,14 @@ def content() -> None:
     render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "Settings")
     logger.debug('Initializing settings page')
 
+    # PHONE LAYER, installed FIRST: NiceGUI drops ui.add_css / ui.add_head_html made after a
+    # page's first await (this function has none; tests/test_settings_phone_css_before_await.py
+    # pins it). The registry flips the expert list between table and cards on a breakpoint
+    # crossing.
+    ui.add_css(phone_css())
+    phone_tables = PhoneTableRegistry()
+    install_phone_listener(phone_tables, ui.add_head_html, ui.on)
+
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('global', 'Global Settings'),
@@ -8234,7 +8702,7 @@ def content() -> None:
         with ui.tab_panel(tab_objects['account']):
             AccountDefinitionsTab()
         with ui.tab_panel(tab_objects['expert']):
-            ExpertSettingsTab()
+            ExpertSettingsTab(phone_tables)
         with ui.tab_panel(tab_objects['trade']):
             TradeSettingsTab()
         with ui.tab_panel(tab_objects['instruments']):

@@ -1,0 +1,25 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.0, pluggy-1.6.0
+rootdir: C:\Users\basti\Documents\dev\BA2TradePlatform
+configfile: pytest.ini
+plugins: anyio-4.14.0, langsmith-0.8.16, cov-7.1.0
+collected 182 items
+
+tests\test_alpaca_options.py ......................                      [ 12%]
+tests\test_live_option_details.py ........                               [ 16%]
+tests\test_option_selector.py .............                              [ 23%]
+tests\test_option_structure_chart.py ...................                 [ 34%]
+tests\test_option_tab_loader.py .......................                  [ 46%]
+tests\test_iv_rank_wiring.py ........................................... [ 70%]
+......                                                                   [ 73%]
+tests\test_iv_rank_recorder.py ......................................... [ 96%]
+......                                                                   [ 99%]
+test_files\options_data_audit_20260922_offline.py .                      [100%]
+
+============================== warnings summary ===============================
+..\..\..\ba2-venvs\trade\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users\basti\ba2-venvs\trade\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 182 passed, 1 warning in 24.00s =======================

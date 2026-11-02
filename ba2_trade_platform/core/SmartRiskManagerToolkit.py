@@ -1889,7 +1889,15 @@ class SmartRiskManagerToolkit:
         # from, the available balance that caps it, and the capital mapping that explains
         # both come from this single record. Two calls (get_virtual_balance here,
         # get_available_balance further down) re-ran the whole pass and could disagree.
-        balances = self.expert._available_balance_breakdown()
+        from ba2_common.core.interfaces.MarketExpertInterface import CAPITAL_REPAIR_HINT
+        capital_failure: List[str] = []
+        balances = self.expert._available_balance_breakdown(failure=capital_failure)
+        if balances is None and capital_failure:
+            # An option row of this expert cannot be valued (unknown is never zero): refuse the
+            # sizing and NAME the row, so it can be repaired. A stock-only expert never gets here.
+            return {"quantity": 0,
+                    "reason": (f"cannot size {symbol}: " + "; ".join(capital_failure) + ". "
+                               + CAPITAL_REPAIR_HINT)}
         # WHAT CAPITAL THIS IS SIZING AGAINST: raw account equity x the effective margin
         # factor -- the mapping every live sizing decision has to be readable against
         # (the same line the classic RM logs, from the same function). INFO only when
@@ -1937,7 +1945,10 @@ class SmartRiskManagerToolkit:
             if not sl_price and use_atr_stop:
                 try:
                     from .seam_helpers import get_default_indicator_provider
-                    indicator_provider = get_default_indicator_provider()
+                    from .account_history import indicator_provider_for_expert
+                    # ATR follows the expert's account history source: an alpaca account reads Alpaca history,
+                    # an fmp account keeps the default (yfinance) stack as before.
+                    indicator_provider = indicator_provider_for_expert(self.expert.id) or get_default_indicator_provider()
                 except Exception as e:
                     logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
             atr = None if (sl_price or not use_atr_stop) else get_latest_atr(symbol, indicator_provider, period=atr_period)

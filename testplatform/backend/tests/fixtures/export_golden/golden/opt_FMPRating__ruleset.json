@@ -1,0 +1,633 @@
+{
+ "backtest_id": 901,
+ "name": "synthetic-opt-FMPRating",
+ "entry_rules": [
+  {
+   "continueProcessing": false,
+   "id": "buy-1",
+   "name": "enter-buy-1",
+   "conditions": {
+    "id": "grp-syn-fr-a",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "confidence",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 62.0,
+      "valueMin": 50.0,
+      "value_min": 50.0,
+      "valueMax": 80.0,
+      "value_max": 80.0,
+      "valueStep": 5.0,
+      "value_step": 5.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c2",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c3",
+      "field": "highrisk",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "buy",
+     "action_type": "buy"
+    }
+   ],
+   "continue_processing": false
+  },
+  {
+   "continueProcessing": false,
+   "id": "buy-2",
+   "name": "enter-buy-2",
+   "conditions": {
+    "id": "grp-syn-fr-b",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "percent_to_current_target",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">",
+      "op": ">",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 62.0,
+      "valueMin": 55.0,
+      "value_min": 55.0,
+      "valueMax": 70.0,
+      "value_max": 70.0,
+      "valueStep": 2.5,
+      "value_step": 2.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c2",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "buy",
+     "action_type": "buy"
+    }
+   ],
+   "continue_processing": false
+  },
+  {
+   "continueProcessing": false,
+   "id": "buy-3",
+   "name": "enter-buy-3",
+   "conditions": {
+    "id": "grp-syn-fr-c",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "buy-3-flat",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c0",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "expected_profit_target_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 62.0,
+      "valueMin": 40.0,
+      "value_min": 40.0,
+      "valueMax": 90.0,
+      "value_max": 90.0,
+      "valueStep": 10.0,
+      "value_step": 10.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c3",
+      "field": "confidence",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<",
+      "op": "<",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 7.5,
+      "valueMin": 5.0,
+      "value_min": 5.0,
+      "valueMax": 10.0,
+      "value_max": 10.0,
+      "valueStep": 0.5,
+      "value_step": 0.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "buy",
+     "action_type": "buy"
+    }
+   ],
+   "continue_processing": false
+  }
+ ],
+ "exit_rules": [
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x10",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "rating_downgraded",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c2",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 3.3000000000000003,
+      "valueMin": 1.0,
+      "value_min": 1.0,
+      "valueMax": 5.0,
+      "value_max": 5.0,
+      "valueStep": 0.5,
+      "value_step": 0.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x11",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<=",
+      "op": "<=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": -9.0,
+      "valueMin": -15.0,
+      "value_min": -15.0,
+      "valueMax": -5.0,
+      "value_max": -5.0,
+      "valueStep": 1.0,
+      "value_step": 1.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x12",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "days_opened",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 25.0,
+      "valueMin": 10.0,
+      "value_min": 10.0,
+      "valueMax": 40.0,
+      "value_max": 40.0,
+      "valueStep": 5.0,
+      "value_step": 5.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c2",
+      "field": "days_opened",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<",
+      "op": "<",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 55.0,
+      "valueMin": 40.0,
+      "value_min": 40.0,
+      "valueMax": 100.0,
+      "value_max": 100.0,
+      "valueStep": 10.0,
+      "value_step": 10.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "adjust_take_profit",
+     "referenceValue": "expert_target_price",
+     "actionValue": -3.5,
+     "value": -3.5,
+     "actionValueOptimize": true,
+     "actionValueMin": -6.0,
+     "actionValueMax": -1.0,
+     "actionValueStep": 0.5,
+     "action_type": "adjust_take_profit",
+     "reference_value": "expert_target_price",
+     "action_value": -3.5,
+     "action_value_optimize": true,
+     "action_value_min": -6.0,
+     "action_value_max": -1.0,
+     "action_value_step": 0.5
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x13",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "days_opened",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 70.0,
+      "valueMin": 50.0,
+      "value_min": 50.0,
+      "valueMax": 110.0,
+      "value_max": 110.0,
+      "valueStep": 10.0,
+      "value_step": 10.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c2",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<",
+      "op": "<",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 2.0,
+      "valueMin": 0.0,
+      "value_min": 0.0,
+      "valueMax": 6.0,
+      "value_max": 6.0,
+      "valueStep": 1.0,
+      "value_step": 1.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "adjust_take_profit",
+     "referenceValue": "order_open_price",
+     "actionValue": 1.5,
+     "value": 1.5,
+     "actionValueOptimize": true,
+     "actionValueMin": 0.0,
+     "actionValueMax": 4.0,
+     "actionValueStep": 0.5,
+     "action_type": "adjust_take_profit",
+     "reference_value": "order_open_price",
+     "action_value": 1.5,
+     "action_value_optimize": true,
+     "action_value_min": 0.0,
+     "action_value_max": 4.0,
+     "action_value_step": 0.5
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x14",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "current_rating_neutral",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c2",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": -2.0,
+      "valueMin": -8.0,
+      "value_min": -8.0,
+      "valueMax": 0.0,
+      "value_max": 0.0,
+      "valueStep": 1.0,
+      "value_step": 1.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  },
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x15",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c1",
+      "field": "new_target_higher",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c2",
+      "field": "profit_loss_percent",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": ">=",
+      "op": ">=",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 6.0,
+      "valueMin": 3.0,
+      "value_min": 3.0,
+      "valueMax": 9.0,
+      "value_max": 9.0,
+      "valueStep": 1.5,
+      "value_step": 1.5,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     },
+     {
+      "id": "c3",
+      "field": "instrument_account_share",
+      "fieldType": "numeric",
+      "field_type": "numeric",
+      "comparison": "<",
+      "op": "<",
+      "optimizeEnabled": true,
+      "optimize": true,
+      "value": 8.0,
+      "valueMin": 4.0,
+      "value_min": 4.0,
+      "valueMax": 16.0,
+      "value_max": 16.0,
+      "valueStep": 2.0,
+      "value_step": 2.0,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "increase_instrument_share",
+     "action_type": "increase_instrument_share"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  }
+ ],
+ "optimized_genes": {
+  "cond:c1:enabled": 1,
+  "cond:c1:value": 62.0,
+  "cond:c2:enabled": 1,
+  "cond:c2:value": 3.3000000000000003,
+  "cond:c3:enabled": 1,
+  "cond:c3:value": 7.5,
+  "cond:c4:enabled": 0,
+  "cond:c4:value": 44.0,
+  "exit:syn-x10:enabled": 1,
+  "exit:syn-x11:enabled": 1,
+  "exit:syn-x12:action_value": -3.5,
+  "exit:syn-x12:enabled": 1,
+  "exit:syn-x13:action_value": 1.5,
+  "exit:syn-x13:enabled": 1,
+  "exit:syn-x14:enabled": 1,
+  "exit:syn-x15:enabled": 1,
+  "exit:syn-x16:action_value": 6.0,
+  "exit:syn-x16:enabled": 0,
+  "exit:syn-x17:enabled": 0
+ }
+}

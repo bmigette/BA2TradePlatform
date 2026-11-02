@@ -74,15 +74,22 @@ class QuoteCachingAccount(OptionsAccountInterface):
     #: wrapper -- returning None for `get_option_positions` and silently skipping the real
     #: account. Forwarding has to happen at lookup time.
     _LOCAL = frozenset({
-        'get_option_quote', '_account', '_cache', '_account_id', '_LOCAL',
+        'get_option_quote', '_account', '_cache', '_account_id', '_marks', '_LOCAL',
         '__class__', '__dict__', '__getattribute__', '__setattr__', '__init__',
         '__abstractmethods__', '__weakref__', '__module__', '__doc__',
     })
 
-    def __init__(self, account: Any, cache: Dict[Any, Any], account_id: Any = None):
+    def __init__(self, account: Any, cache: Dict[Any, Any], account_id: Any = None,
+                 marks: Optional[Dict[str, float]] = None):
         self._account = account
         self._cache = cache
         self._account_id = account_id
+        # BROKER POSITION MARKS, contract -> the broker's own current price for the position.
+        # ``None`` keeps the bid/ask quote path (the rules engine's). A dict -- even an empty
+        # one -- switches this wrapper to DISPLAY pricing: a held contract is read at the
+        # broker's mark and a contract the broker does not list is UNKNOWN, never a quote
+        # fallback.
+        self._marks = marks
 
     def __getattribute__(self, name: str) -> Any:
         if name in QuoteCachingAccount._LOCAL:
@@ -90,6 +97,15 @@ class QuoteCachingAccount(OptionsAccountInterface):
         return getattr(object.__getattribute__(self, '_account'), name)
 
     def get_option_quote(self, contract_symbol: str) -> Any:
+        marks = object.__getattribute__(self, '_marks')
+        if marks is not None:
+            mark = marks.get(contract_symbol)
+            if mark is None:
+                return None
+            from ba2_common.core.option_types import OptionQuote
+            # bid == ask == last == the mark: the seam marks longs at the bid and shorts at
+            # the ask, so every leg prices at the broker's own number.
+            return OptionQuote(symbol=contract_symbol, bid=mark, ask=mark, last=mark)
         cache = object.__getattribute__(self, '_cache')
         key = (object.__getattribute__(self, '_account_id'), contract_symbol)
         if key not in cache:
@@ -106,11 +122,40 @@ class QuoteCachingAccount(OptionsAccountInterface):
 QuoteCachingAccount.__abstractmethods__ = frozenset()
 
 
-def quote_caching_account(account: Any, cache: Dict[Any, Any], account_id: Any = None) -> Any:
-    """``account`` wrapped for per-refresh quote reuse (already-wrapped accounts pass through)."""
+def quote_caching_account(account: Any, cache: Dict[Any, Any], account_id: Any = None,
+                          marks: Optional[Dict[str, float]] = None) -> Any:
+    """``account`` wrapped for per-refresh quote reuse (already-wrapped accounts pass through).
+
+    ``marks`` (see :func:`broker_position_marks`) prices every held contract at the broker's
+    own position price, as the equity cards do, instead of at the bid/ask quote.
+    """
     if isinstance(account, QuoteCachingAccount):
         return account
-    return QuoteCachingAccount(account, cache, account_id)
+    return QuoteCachingAccount(account, cache, account_id, marks)
+
+
+def broker_position_marks(account: Any) -> Dict[str, float]:
+    """``{contract_symbol: broker current_price}`` for every position the broker reports.
+
+    A failed fetch (``None``) or an unpriced position yields NO entry, so its contracts price
+    as unknown on the card -- never as a quote the broker did not mark. Equity positions are
+    in the map too; they are keyed by their own symbol and nothing looks them up here.
+    """
+    try:
+        positions = account.get_positions()
+    except Exception as exc:  # noqa: BLE001 -- an unreadable book is UNKNOWN, not flat
+        logger.error(f"Option P&L marks: get_positions() raised ({exc}); legs price as unknown")
+        return {}
+    if positions is None:
+        logger.error("Option P&L marks: get_positions() failed; legs price as unknown")
+        return {}
+    marks: Dict[str, float] = {}
+    for pos in positions:
+        pos_dict = pos if isinstance(pos, dict) else dict(pos)
+        symbol, price = pos_dict.get('symbol'), pos_dict.get('current_price')
+        if symbol is not None and price is not None:
+            marks[symbol] = float(price)
+    return marks
 
 
 def unavailable_pnl(reason: str) -> OptionPnlDisplay:

@@ -279,9 +279,20 @@ def _to_contract(r: dict, greeks_row: Optional[dict], volume: int) -> OptionCont
         volume=volume, greeks_source=greeks_source)
 
 class HistoricalOptionsProvider:
-    def __init__(self, cache_db: str):
+    def __init__(self, cache_db: str, *, risk_free_rate: Any = None):
+        """``risk_free_rate`` -- the run's ``RiskFreeRate`` (or an explicit number). This store's
+        greeks are baked in at build time, so the reader itself never uses it; it is HELD here
+        for ``BacktestAccount._bs_mark_rate``, which marks a barless held lot with Black-Scholes
+        and must use the run's rate (``options_store.build_options_provider`` passes it). ``None``
+        (fixture readers) means the run has no rate: a Black-Scholes mark then refuses loudly
+        rather than picking one."""
         self.cache = OptionsHistoryCache(cache_db)
         self.db_path = self.cache.db_path
+        self.risk_free_rate_source = None
+        if risk_free_rate is not None:
+            from ba2_providers.macro.risk_free_rate import as_risk_free_rate
+            self.risk_free_rate_source = as_risk_free_rate(
+                risk_free_rate, origin="HistoricalOptionsProvider(risk_free_rate=...)")
         #: Per-run (the provider is built once per run): see ``ChainStaleness``.
         self._staleness = ChainStaleness()
 
@@ -386,6 +397,17 @@ class HistoricalOptionsProvider:
         # the two stores disagree about the same trade's entry delta. A snapshot is dated at
         # the CLOSE, so the entry day's own snapshot has already absorbed the session,
         # including the move that flagged this trade for refinement in the first place.
+        row = self._entry_chain_row(underlying, occ_symbol, when)
+        return None if row is None else row.get("delta")
+
+    def iv_at_entry(self, underlying: str, occ_symbol: str, when: Any) -> Optional[float]:
+        """The contract's implied vol AS OF ``when`` (same strictly-prior snapshot as
+        ``delta_at_entry``): the input the multi-leg intraday refinement re-prices with
+        Black-Scholes. None when there is no prior snapshot or no usable iv -- never 0.0."""
+        row = self._entry_chain_row(underlying, occ_symbol, when)
+        return None if row is None else row.get("iv")
+
+    def _entry_chain_row(self, underlying: str, occ_symbol: str, when: Any):
         d = when.date() if hasattr(when, "date") and not isinstance(when, date) else when
         if not isinstance(d, date):
             try:
@@ -401,7 +423,7 @@ class HistoricalOptionsProvider:
             return None
         for row in hist.by_asof.get(snapshot, []):
             if row.get("occ_symbol") == occ_symbol:
-                return row.get("delta")
+                return row
         return None
 
     def get_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:

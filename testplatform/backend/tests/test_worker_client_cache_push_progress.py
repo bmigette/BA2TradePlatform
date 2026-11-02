@@ -103,6 +103,11 @@ def _fake_transport(monkeypatch, remote, local):
                         lambda **kw: _FakeClient(calls, remote, **kw))
     monkeypatch.setattr(worker_client.cache_sync, "build_manifest",
                         lambda *a, **k: local)
+    # no files on disk behind the fake manifest: the history folder's crc is a fixed 0 here
+    monkeypatch.setattr(worker_client.cache_sync, "add_crc32",
+                        lambda m, dirs, root=None: {**m, "files": [
+                            {**f, "crc32": 0} if f["rel_path"].startswith(tuple(d + "/" for d in dirs))
+                            else f for f in m["files"]]})
     return calls
 
 
@@ -117,7 +122,7 @@ def test_push_cache_never_prunes_on_an_empty_local_manifest(monkeypatch):
     monkeypatch.setattr(worker_client.logger, "warning", lambda m, *a, **k: warned.append(m))
     logged = []
 
-    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=logged.append)
+    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, history_source="fmp", log=logged.append)
 
     assert res["pruned"] == 0
     assert not any(url.endswith("/cache/prune") for _m, url in calls), calls
@@ -129,13 +134,15 @@ def test_push_cache_never_prunes_on_an_empty_local_manifest(monkeypatch):
 
 def test_push_cache_still_prunes_stale_files_on_a_non_empty_manifest(monkeypatch):
     """The guard is about the EMPTY case only — a real manifest still prunes leftovers."""
-    local = {"root": "/cache", "count": 1, "total_bytes": 10,
-             "files": [{"rel_path": "a.parquet", "size": 10}]}
+    local = {"root": "/cache", "count": 2, "total_bytes": 20,
+             "files": [{"rel_path": "a.parquet", "size": 10},
+                       {"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10}]}
     remote = {"files": [{"rel_path": "a.parquet", "size": 10},          # in sync -> no push
+                        {"rel_path": "FMPOHLCVProvider/AAPL_1d.parquet", "size": 10, "crc32": 0},
                         {"rel_path": "old-fragment.parquet", "size": 4}]}  # stale -> prune
     calls = _fake_transport(monkeypatch, remote, local)
 
-    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, log=lambda _m: None)
+    res = worker_client.push_cache({"name": "w1", "url": "http://w1"}, history_source="fmp", log=lambda _m: None)
 
     assert res["pruned"] == 1
     assert ("POST", "http://w1/cache/prune") in calls, calls

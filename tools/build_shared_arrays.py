@@ -394,6 +394,7 @@ def build_ohlcv(provider_class_name: str, symbols: List[str], interval: str, sta
         ohlcv = MemoizedOHLCVProvider(inner, fetch_start, end, interval=interval,
                                       cached_only=True)
         src = AsOfPriceSource(ohlcv_provider=ohlcv, interval=interval)
+        ohlcv.bind_price_source(src)   # preload only; bound anyway so no later read can bypass the rule
         # This process's own bar cache would serve a second preload from memory and report every
         # symbol "opened" without touching the derived store at all.
         clear_worker_bar_cache()

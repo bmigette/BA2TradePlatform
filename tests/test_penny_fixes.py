@@ -1028,14 +1028,15 @@ class TestLivePriceSource:
         method_source = source[idx:next_def]
         assert "_get_live_prices" in method_source
 
-    def test_fmp_quotes_fallback_on_missing_key(self):
-        """If FMP_API_KEY not set, should fall back to account prices."""
+    def test_fmp_quotes_no_account_fallback_on_missing_key(self):
+        """If FMP_API_KEY is not set: no prices, never account prices (no silent fallback)."""
         source = _read_source("__init__.py")
         idx = source.index("def _get_fmp_quotes(")
         next_def = source.index("\n    def ", idx + 1)
         method_source = source[idx:next_def]
         assert "FMP_API_KEY" in method_source
-        assert "falling back to account" in method_source
+        assert "falling back to account" not in method_source
+        assert "get_instrument_current_price" not in method_source.split("result:")[0]
 
 
 # ===========================================================================
@@ -1085,11 +1086,11 @@ class TestAlpacaDataFeedSetting:
         source = self._read_alpaca()
         assert '"data_feed"' in source
 
-    def test_default_is_delayed_sip(self):
+    def test_default_is_fmp(self):
         source = self._read_alpaca()
         idx = source.index('"data_feed"')
         block = source[idx:idx + 400]
-        assert '"default": "delayed_sip"' in block
+        assert '"default": "fmp"' in block
 
     def test_valid_values_include_sip(self):
         source = self._read_alpaca()

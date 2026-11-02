@@ -40,6 +40,7 @@ _BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 from app.services.prewarm_fetchers import EXPERT_NAMES, SENATE_SCALPER_BOUNDS  # noqa: E402
+from ba2_providers.screener import universe_superset as _us  # noqa: E402
 
 
 def _parse_symbols_arg(raw: str) -> list:
@@ -56,7 +57,7 @@ def _parse_symbols_arg(raw: str) -> list:
     a comma or a space, so accepting both separators cannot be ambiguous.
     """
     if raw.startswith("@"):
-        with open(raw[1:], encoding="utf-8") as f:
+        with open(_caller_path(raw[1:]), encoding="utf-8") as f:       # relative to where the user ran, not backend/
             raw = f.read()
     return [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
 
@@ -267,16 +268,40 @@ def _cmd_prewarm(args) -> int:
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
     )
     from app.services.prewarm_fetchers import (
-        PrewarmConfigError, PrewarmFetchers, prewarm_fred, resolve_keys, run_prewarm,
+        PrewarmConfigError, PrewarmFetchers, prewarm_fractionable, prewarm_fred, resolve_keys,
+        run_prewarm,
     )
 
     # ONE key resolver, shared with the API handler (env first, then the app-settings DB).
     keys = resolve_keys()
 
-    symbols = _parse_symbols_arg(args.symbols)
+    symbols = _parse_symbols_arg(args.symbols) if args.symbols else []
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
-    if not symbols:
-        sys.exit("ba2-test prewarm: --symbols is empty.")
+    if not symbols and not args.screener_panel:
+        sys.exit("ba2-test prewarm: --symbols is empty (or pass --screener-panel --screener-store ...).")
+
+    # SCREENER PANEL (criteria live-daily-v2): every input of the screener simulation (the vendor's share table and
+    # per-symbol share history, the market-cap / float caches, the daily panel itself) for the universe of
+    # --screener-store.  Resumable; an up-to-date panel is a no-op.  Needed by every classic `optimize --screener`
+    # job: a job whose panel is missing, stale for its window, or built under another definition REFUSES to launch.
+    if args.screener_panel:
+        from app.services.prewarm_fetchers import prewarm_screener_panel
+        if not args.screener_store:
+            sys.exit("ba2-test prewarm --screener-panel: --screener-store is required (it defines the universe)")
+        if not args.ohlcv_history_source:
+            sys.exit("ba2-test prewarm --screener-panel: --ohlcv-history-source {fmp,alpaca} is required "
+                     "(the panel is built from one OHLCV history and records it)")
+        try:
+            panel_summary = prewarm_screener_panel(
+                args.screener_store, args.start, args.end, fmp_key=keys["fmp"], workers=args.workers,
+                force=args.force_panel, log=lambda msg: print(msg, flush=True),
+                history_source=args.ohlcv_history_source)
+        except PrewarmConfigError as e:
+            print(f"!! ba2-test prewarm --screener-panel aborted: {e}")
+            return 1
+        print(f">> screener panel summary: {panel_summary}", flush=True)
+        if not symbols:
+            return 0
 
     # end_date bounds only the in-Python filtering (the per-symbol histories are full
     # fetches), but thread it through for correctness. Default = now. Use a tz-aware
@@ -343,8 +368,8 @@ def _cmd_prewarm(args) -> int:
         def _grid_values(param: Dict[str, Any]) -> List[int]:
             return list(range(int(param["min"]), int(param["max"]) + 1, int(param["step"])))
 
-        horizon_values = _grid_values(_senate_opt["expert_params"]["skill_horizon_days"])
-        lookback_values = _grid_values(_senate_opt["expert_params"]["skill_lookback_months"])
+        horizon_values = _grid_values(_EXPERT_OPT["FMPSenateTraderWeight"]["expert_params"]["skill_horizon_days"])
+        lookback_values = _grid_values(_EXPERT_OPT["FMPSenateTraderWeight"]["expert_params"]["skill_lookback_months"])
 
         # Real trading days, not a synthetic weekday calendar: reuse the fullest already-warmed
         # price history above (any gaps in a thin/delisted symbol would silently under-cover).
@@ -445,6 +470,15 @@ def _cmd_prewarm(args) -> int:
                                     log=lambda msg: print(msg, flush=True))
         print(f">> FRED macro series: {fred_summary}", flush=True)
 
+    # Fractional-share eligibility, for experts that opt in to allow_fractional_shares. ONE
+    # bulk broker call for the whole universe, skipped while the file is fresh, and never
+    # fatal: without it every symbol sizes in whole shares, the pre-feature behaviour. Run
+    # for every expert list rather than gated on one, because the classic risk manager
+    # sizes for all of them.
+    fractionable_summary = prewarm_fractionable(args.fractionable_max_age_hours,
+                                                log=lambda msg: print(msg, flush=True))
+    print(f">> fractionable map: {fractionable_summary}", flush=True)
+
     try:
         summary = run_prewarm(fetchers, experts, symbols, args.workers, end=end_date)
     except PrewarmConfigError as e:
@@ -493,6 +527,14 @@ def _cmd_prewarm(args) -> int:
     return 0
 
 
+def _read_symbols_file(path: str) -> list:
+    """One symbol per line (blank lines / ``#`` comments ignored); upper-cased, order kept.  A relative ``path`` is resolved against the
+    directory the user ran from (``_caller_path``): the command chdirs into backend/ first."""
+    with open(_caller_path(path), encoding="utf-8") as f:
+        out = [ln.split("#")[0].strip().upper() for ln in f]
+    return [x for x in out if x]
+
+
 def _cmd_build_screener_metrics(args) -> int:
     """Build/extend the screener METRIC store (parquet) from the as-of OHLCV cache.
 
@@ -527,7 +569,8 @@ def _cmd_build_screener_metrics(args) -> int:
         if _sym and _cap > 0 and _px > 0:
             _shares_by_sym[_sym] = _cap / _px
 
-    prov = get_provider("ohlcv", "fmp")
+    from ba2_common.core.ohlcv_history import history_registry_key
+    prov = get_provider("ohlcv", history_registry_key(args.ohlcv_history_source))
 
     def _ohlcv(sym, end):
         # The as-of OHLCV cache returns a DataFrame with a `Date` COLUMN + int index, rows not
@@ -569,11 +612,22 @@ def _cmd_build_screener_metrics(args) -> int:
     summary = ms.build_store(
         args.store, api_key, args.start, args.end,
         market_cap_min=args.market_cap_min, price_min=args.price_min, volume_min=args.volume_min,
-        ohlcv_get=_ohlcv, mcap_get=_mcap, float_get=_float, shares_get=_shares,
+        ohlcv_get=_ohlcv, ohlcv_history_source=args.ohlcv_history_source, mcap_get=_mcap, float_get=_float, shares_get=_shares,
         cadence_days=args.cadence_days, drop_days=args.drop_days,
         max_lookback=getattr(args, "max_lookback", 30) or 30,
-        max_workers=getattr(args, "workers", 8) or 8)
+        max_workers=getattr(args, "workers", 8) or 8,
+        allow_stale_symbols=_parse_symbols_arg(getattr(args, "allow_stale_symbols", None) or ""),
+        universe_symbols=(_read_symbols_file(args.symbols_file)
+                          if getattr(args, "symbols_file", None) else None),
+        universe_symbols_path=(_caller_path(args.symbols_file) if getattr(args, "symbols_file", None) else None))
     print(f"build-screener-metrics: {summary}")
+    if getattr(args, "daily_panel", False):
+        # the store's universe is now known: produce the simulation data for it (same function as prewarm)
+        from app.services.prewarm_fetchers import prewarm_screener_panel
+        ps = prewarm_screener_panel(args.store, args.start, args.end, fmp_key=api_key, workers=args.workers or 4,
+                                    log=lambda msg: print(msg, flush=True),
+                                    history_source=args.ohlcv_history_source)
+        print(f"build-screener-metrics: daily panel {ps}")
     return 0
 
 
@@ -581,7 +635,7 @@ def _cmd_recompute_screener_drops(args) -> int:
     """CACHE-ONLY rebuild of ONLY the price-drop columns of an existing screener store — no FMP.
 
     Reads each store symbol's DAILY OHLCV straight from the native parquet cache
-    (CACHE_FOLDER/FMPOHLCVProvider/<SYM>_1d.parquet) — NEVER calls the network — recomputes the
+    (CACHE_FOLDER/<the store's history folder>/<SYM>_1d.parquet) — NEVER calls the network — recomputes the
     legacy ``price_drop_pct`` (window --drop-days) AND the per-window ``price_drop_pct_2..max``
     columns, and writes them back in place (other metrics untouched). Use it to (1) fix a store
     built with a degenerate window (the old drop_days=1 -> all-zero bug) and (2) add the
@@ -595,7 +649,9 @@ def _cmd_recompute_screener_drops(args) -> int:
     store = args.store or _cfg.SCREENER_STORE_DIR
     if not os.path.isdir(store):
         sys.exit(f"recompute-screener-drops: store not found: {store}")
-    ohlcv_dir = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
+    # the store's OWN history (its build_manifest.json stamp; unstamped = fmp): never the other one's bars
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    ohlcv_dir = os.path.join(_cfg.CACHE_FOLDER, history_cache_dirname(ms.store_history_source(store)))
 
     def _ohlcv_cached(sym):
         # Direct parquet read = guaranteed offline (bypasses the provider's fetch-on-miss). Same
@@ -1016,7 +1072,8 @@ def _daily_manage_schedule() -> dict:
     days_opened rules each trading day even when ENTRY is weekly. (Weekends are off — no session.)"""
     wk = ("monday", "tuesday", "wednesday", "thursday", "friday")
     days = {d: (d in wk) for d in (*wk, "saturday", "sunday")}
-    return {"days": days, "times": ["09:30"]}
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    return {"days": days, "times": [DEFAULT_DECISION_TIME]}
 
 
 #: Two toggles that NEVER took effect in any run to date, pinned OFF so they still don't.
@@ -1039,6 +1096,162 @@ def _daily_manage_schedule() -> dict:
 #: is the control.
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
+#: Mirrors strategy_param_space.ALLOWED_RM_TOGGLES_UNPINNED. See _pinned_rm_toggles.
+_ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
+
+#: --rm-toggle-policy values (see _cmd_optimize / _cmd_optimize_batch). "pinned" (default) is
+#: today's behaviour, byte-identical. "atr-searched" is the 2027 ATR grid's run-level policy
+#: (docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2): it unpins ONLY use_atr_stop,
+#: persisted on the run (backtest_block['rm_toggles_unpinned']) so every path that rebuilds a
+#: trial from the stored config -- GA trials, top-N persist, re-runs, robustness variants,
+#: tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same policy.
+_RM_TOGGLE_POLICIES = ("pinned", "atr-searched")
+
+
+def _rm_toggles_unpinned_for_policy(policy: str) -> list:
+    """The ``rm_toggles_unpinned`` list a ``--rm-toggle-policy`` value resolves to."""
+    if policy == "pinned":
+        return []
+    if policy == "atr-searched":
+        return ["use_atr_stop"]
+    raise ValueError(f"unknown --rm-toggle-policy {policy!r}; choices are {_RM_TOGGLE_POLICIES}")
+
+
+def _pinned_rm_toggles(rm_toggles_unpinned: "list | None" = None) -> dict:
+    """``_INERT_RM_TOGGLES`` minus the keys a run policy unpinned. Mirrors
+    strategy_param_space.pinned_rm_toggles -- see that function for the full rationale. Refuses
+    (raises) any key outside ``_ALLOWED_RM_TOGGLES_UNPINNED``."""
+    unpinned = list(rm_toggles_unpinned or [])
+    bad = [k for k in unpinned if k not in _ALLOWED_RM_TOGGLES_UNPINNED]
+    if bad:
+        raise ValueError(
+            f"rm_toggles_unpinned may only unpin {sorted(_ALLOWED_RM_TOGGLES_UNPINNED)}; "
+            f"refusing to unpin {bad}")
+    return {k: v for k, v in _INERT_RM_TOGGLES.items() if k not in unpinned}
+
+
+def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None:
+    """An ``atr-searched`` run must be named so it can never be confused with -- or accidentally
+    resume the checkpoint of -- a pinned run of the same expert/strategy. ``pinned`` (the
+    default) is unrestricted."""
+    if policy != "atr-searched":
+        return
+    if not name or "-atr27" not in name:
+        sys.exit(
+            f"ba2-test: --rm-toggle-policy atr-searched requires --name (or --name-prefix) to "
+            f"contain '-atr27' (got {name!r}) -- this policy changes what the run scores, and a "
+            f"job name that could collide with a pinned run's name risks resuming its checkpoint "
+            f"into the wrong search or skipping a policy run as 'already completed'.")
+
+
+#: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
+DECISION_TIMES_NAME_TOKEN = "timegene"
+#: ``--decision-times split`` (goal2027 2.4): the ENTRY time and the MANAGE time are searched as two genes.
+#: A different gene space is a different job, so it carries its own name token.
+DECISION_TIMES_SPLIT = "split"
+DECISION_TIMES_SPLIT_NAME_TOKEN = "timesplit"
+
+
+def _decision_times_is_split(raw) -> bool:
+    """True for ``--decision-times split`` (the default seven values, as TWO genes)."""
+    return raw is not None and str(raw).strip() == DECISION_TIMES_SPLIT
+
+
+def _resolve_decision_times(raw, command: str, *, interval: str, name: "str | None",
+                            bypass_jobs, option_jobs) -> "list | None":
+    """``--decision-times 09:35,09:40,...|default|split|fixed`` -> the validated, sorted list, or None
+    (flag absent or ``fixed``: no gene, the single shared default time). ``default`` is the shared
+    ``DEFAULT_DECISION_TIME_CHOICES``; ``split`` is the same seven values searched as TWO genes
+    (``schedule:entry_time`` + ``schedule:manage_time``, goal2027 2.4) and requires ``timesplit`` in the
+    name instead of ``timegene``.
+
+    Everything refused HERE, before a row is written, so a bad flag costs nothing:
+      * a daily-clock job (``--interval 1d``): a decision time means nothing with one bar a day;
+      * an option job (daily clock, the option code paths must stay untouched);
+      * a bypass expert (FactorRanker): it gets no schedule genes, the gene would be dead;
+      * a value that is not HH:MM on the bar grid, strictly inside the session's first and last
+        bar (``ba2_common.core.schedule_genes.validate_decision_times``);
+      * a job name without ``timegene`` in it: the flag changes what the run scores, and a name
+        that could equal a plain run's name risks skipping as 'already completed' or resuming
+        that run's checkpoint (the gene space also differs, so the checkpoint FINGERPRINT would
+        refuse the resume, but the name guard stops the skip-by-name first).
+    """
+    if raw is None or str(raw).strip() == "fixed":
+        return None   # plain optimize / explicit `fixed`: the single shared DEFAULT_DECISION_TIME
+    from ba2_common.core.schedule_genes import parse_decision_times_arg
+
+    if bypass_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is not supported for a bypass expert "
+                 f"({sorted(bypass_jobs)}): its schedule genes are not searched, the gene would "
+                 f"be dead")
+    if option_jobs:
+        sys.exit(f"ba2-test {command}: --decision-times is refused for option jobs "
+                 f"({sorted(option_jobs)}): option backtests run on a DAILY clock, one bar per "
+                 f"session, so there is no decision time to search")
+    split = _decision_times_is_split(raw)
+    try:
+        times = parse_decision_times_arg("default" if split else raw, interval)
+    except ValueError as e:
+        sys.exit(f"ba2-test {command}: --decision-times: {e}")
+    token = DECISION_TIMES_SPLIT_NAME_TOKEN if split else DECISION_TIMES_NAME_TOKEN
+    if not name or token not in name:
+        sys.exit(f"ba2-test {command}: --decision-times {'split ' if split else ''}requires --name (or "
+                 f"--name-prefix) to contain {token!r} (got {name!r}) -- the run's identity "
+                 f"must differ from a plain run of the same expert/strategy")
+    return times
+
+
+def _refuse_reused_timegene_name(name: str, times: "list | None", command: str, *,
+                                 split: bool = False) -> None:
+    """Refuse (exit) a run whose NAME is already a COMPLETED optimization carrying a DIFFERENT
+    decision-time list: the name is the job's identity (skip-by-name, checkpoint key), so reusing
+    it for another list would either skip the new run as 'done' or compare unlike results under
+    one name. The matrix drivers cannot hit this (the list is in their name digest); a hand-run
+    ``optimize --name ...-timegene...`` can."""
+    if not times:
+        return
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed")
+                .all())
+        stored = []
+        for r in rows:
+            params = (r.optimization_config or {}).get("expert_params") or {}
+            if split:
+                # a split job is the SAME job only when it also searched the split pair over this list
+                ent = (params.get("schedule:entry_time") or {}).get("choices")
+                man = (params.get("schedule:manage_time") or {}).get("choices")
+                stored.append((r.id, ent if ent == man else (ent, man)))
+            else:
+                if "schedule:entry_time" in params or "schedule:manage_time" in params:
+                    stored.append((r.id, "split entry/manage genes"))
+                    continue
+                spec = params.get("schedule:time") or {}
+                stored.append((r.id, spec.get("choices")))
+    finally:
+        db.close()
+    other = [(i, c) for i, c in stored if c != list(times)]
+    if other:
+        sys.exit(f"ba2-test {command}: name {name!r} is already a COMPLETED optimization "
+                 f"#{other[0][0]} with decision times {other[0][1]!r}, not {list(times)!r}. Use a "
+                 f"different --name: the name is the job's identity (skip-by-name, checkpoint).")
+
+
+def _decision_time_gene(times: "list | None", *, split: bool = False) -> dict:
+    """The ``expert_params`` entries (pre-namespaced) that declare the decision-time gene(s); {} when
+    no ``--decision-times`` was given, so every other job's gene space is untouched. ``split``
+    (goal2027 2.4) declares ``schedule:entry_time`` and ``schedule:manage_time`` instead of the single
+    ``schedule:time`` (never both)."""
+    if not times:
+        return {}
+    if split:
+        return {"schedule:entry_time": {"optimize": True, "choices": list(times)},
+                "schedule:manage_time": {"optimize": True, "choices": list(times)}}
+    return {"schedule:time": {"optimize": True, "choices": list(times)}}
+
 
 def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     """The spec's ``option_fixed_settings`` when ``strategy_kind`` is an option job, else {}.
@@ -1054,20 +1267,35 @@ def _option_fixed_settings_for(spec: dict, strategy_kind: "str | None") -> dict:
     return {}
 
 
+#: Settings a STRATEGY pins for every job that runs it (and the RM genes that would then be dead). SQM's entry stop is
+#: a ruleset stop; at entry the RM's safeguard stop is attached instead whenever it is TIGHTER
+#: (``position_sizing.reconcile_protective_stop``; ``allow_ruleset_sl_loosen`` does not apply there). With
+#: ``use_atr_stop`` off the safeguard distance is ``max(risk_per_trade_pct, min_stop_loss_pct)`` -- 3% to 15% across the
+#: RM genes -- so the searched -14..-6% stop would be dead whenever that distance is smaller. Pinning the floor at
+#: 15% (above the loosest stop gene, 14%) is enough: ``risk_per_trade_pct`` only ever sets that STOP distance (never the
+#: position size: notional sizes by the per-instrument cap, risk_atr by ``atr_risk_budget_pct``), its gene tops out at
+#: 10 < 15, and ATR (``min(risk, atr * mult)``) can only shorten the candidate before the floor, so the safeguard
+#: distance is exactly 15% for every genome in every sizing mode (regime scaling only widens it). ``risk_per_trade_pct``
+#: therefore stays a gene. Only ``min_stop_loss_pct`` is dropped from the SQM gene space (``_rm_opt_for``). The pin
+#: reaches live through the export.
+_STRATEGY_FIXED_SETTINGS = {"SQM": {"min_stop_loss_pct": 15.0}}
+
+
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None, *,
-                         strategy_kind: "str | None" = None) -> dict:
+                         strategy_kind: "str | None" = None,
+                         rm_toggles_unpinned: "list | None" = None,
+                         sizing_mode_searched: bool = False) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
     expert that reads its universe from a setting, not from enabled_instruments; no current
     spec names one since PremiumSeller's removal, 2026-08-31).
 
     ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
-    be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
-    the GA has never searched (it is pinned risk_atr for the classic experts), and it is
-    deliberately compared as two separate runs rather than made a gene — under notional the five
-    ATR genes face no selection pressure and drift random, so a crossover that flips the mode
-    would judge it with unselected parameters and bias the comparison toward whichever mode
-    happens to dominate the population.
+    be run once per sizing mode without editing _EXPERT_OPT. (``--search-sizing-mode`` now offers the
+    gene alternative, goal2027 item 2.1: under notional only ``atr_risk_budget_pct`` is dead; the stop
+    genes act in both modes since ``_ensure_safeguard_stop`` runs in notional too. Decode drops the
+    budget, so a crossover that flips the mode no longer scores it with an unselected budget. The older
+    "five ATR genes are inert under notional" argument for two matrices predates that.)
 
     ``risk_manager_mode`` (review finding M5, 2026-09-01) is plumbed here and NOWHERE ELSE:
     a spec that names one has it written onto the run's expert settings, from which
@@ -1081,16 +1309,32 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     same settings dict it always did, byte for byte, so every existing job is unchanged.
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
 
+    ``rm_toggles_unpinned`` (the --rm-toggle-policy run policy) relaxes ``_INERT_RM_TOGGLES`` for
+    exactly the keys it names -- see ``_pinned_rm_toggles``. ``None``/``[]`` (every call site
+    before this policy existed, and every ``pinned``-policy run) pins both toggles off exactly as
+    before.
+
     ``option_fixed_settings`` (optional spec key) is layered over ``fixed_settings`` only when
     ``strategy_kind`` is an option strategy (see ``_option_fixed_settings_for``). It lets ONE expert spec
     serve both the equity grids and the option grids with a setting the option grids need
     (DeterministicScorer's ``macro_short_side``) without moving any equity job. No kind given
     (bypass experts, ad-hoc callers) = not an option job = the plain ``fixed_settings``.
+
+    ``sizing_mode_searched`` (``--search-sizing-mode``, goal2027 item 2.1): the spec's pinned ``sizing_mode``
+    is REMOVED, so the ``model:sizing_mode`` gene is the only source (no pin to disagree with it, none
+    persisted into ``expertFixedSettings``). Under notional only ``atr_risk_budget_pct`` is dead -- the
+    stop-distance genes still act through ``_ensure_safeguard_stop`` -- see
+    docs/plans/2026-10-25-goal2027-sizing-gene-plan.md; decode neutralises it
+    (``strategy_param_space.neutralise_sizing_genes``).
     """
     settings = dict(spec["fixed_settings"])
+    if sizing_mode_searched:
+        settings.pop("sizing_mode", None)
     settings.update(_option_fixed_settings_for(spec, strategy_kind))
-    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
-    settings.update(_INERT_RM_TOGGLES)
+    settings.update(_STRATEGY_FIXED_SETTINGS.get(strategy_kind, {}))
+    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY -- unless a run policy unpinned one.
+    # See _INERT_RM_TOGGLES / _pinned_rm_toggles.
+    settings.update(_pinned_rm_toggles(rm_toggles_unpinned))
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
@@ -1114,6 +1358,76 @@ def _apply_options_seam(spec: dict, backtest_block: dict) -> None:
     if spec.get("options"):
         from app.services.backtest.daily_backtest_handler import default_options_cache_db
         backtest_block["options_cache_db"] = default_options_cache_db()
+
+
+#: ``--ohlcv-history-source`` help, shared by every subcommand that creates a job.
+_HISTORY_SOURCE_HELP = (
+    "OHLCV history the job reads and is STAMPED with (ohlcv_history_source on the run config, in the "
+    "checkpoint fingerprint, and in a matrix driver's job name): fmp = CACHE_FOLDER/FMPOHLCVProvider, "
+    "alpaca = CACHE_FOLDER/AlpacaHistoryOHLCVProvider (raw SIP bars + the verified split table). "
+    "Default: alpaca for EQUITY jobs; fmp for OPTION jobs (an option expert or an option strategy) "
+    "(unchanged); an option job MAY be stated as alpaca: ThetaData strikes are as-traded and the "
+    "split basis then comes from the verified split table of the alpaca cache (a missing symbol or "
+    "an uncertified cache refuses, naming it).")
+
+
+def _add_history_source_arg(parser) -> None:
+    """``--ohlcv-history-source {fmp,alpaca}`` (None = not stated; ``_resolve_history_source`` decides)."""
+    from ba2_common.core.ohlcv_history import HISTORY_SOURCES
+    parser.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=None,
+                        help=_HISTORY_SOURCE_HELP)
+
+
+def _is_option_job(spec: dict, strategy_kind: "str | None") -> bool:
+    """An OPTION job: an options expert, or an option strategy / strategy group (the same test
+    ``_resolve_decision_times`` is given)."""
+    return bool(spec.get("options")) or bool(strategy_kind) and (
+        strategy_kind in _OPTION_STRATEGY_KEYS or strategy_kind in _OPTION_GROUPS_ALL)
+
+
+def _resolve_history_source(args, command: str, spec: dict, strategy_kind: "str | None") -> str:
+    """The OHLCV history source this job runs on.
+
+    Stated -> as stated (an unknown name never gets here: argparse ``choices``). Not stated ->
+    ``DEFAULT_BT_HISTORY_SOURCE`` for an equity job and ``fmp`` for an option job, so the option
+    grids behave exactly as before. An option job STATED as anything but fmp refuses here, before
+    the job row, the strategy or any trial exists (``OptionHistorySourceUnsupported``)."""
+    from app.services.backtest.history_source import OptionHistorySourceUnsupported, new_job_history_source
+    try:
+        return new_job_history_source(getattr(args, "ohlcv_history_source", None),
+                                      uses_options=_is_option_job(spec, strategy_kind), where=command)
+    except OptionHistorySourceUnsupported as e:
+        sys.exit(f"ba2-test {command}: REFUSED: {e}")
+
+
+def _refuse_reused_history_source_name(name: str, source: str, command: str) -> None:
+    """Refuse (exit) a run whose NAME is already a COMPLETED optimization stamped with a DIFFERENT
+    history source: the name is the job's identity (skip-by-name, checkpoint key), so reusing it
+    would skip the new run as 'done' or compare results of two histories under one name. A stored
+    optimization without the stamp ran on the legacy source (fmp). Matrix drivers put the source in
+    the name (``matrix_flags.with_history_source_name``) and cannot hit this."""
+    from ba2_common.core.ohlcv_history import LEGACY_HISTORY_SOURCE
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services.backtest.history_source import find_history_stamp
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed")
+                .all())
+        clashes = []
+        for r in rows:
+            stored = find_history_stamp(r.optimization_config or {})
+            stored = LEGACY_HISTORY_SOURCE if stored is None else stored
+            if stored != source:
+                clashes.append((r.id, stored))
+    finally:
+        db.close()
+    if clashes:
+        sys.exit(f"ba2-test {command}: REFUSED: --name {name!r} is already a completed optimization "
+                 f"{clashes} (id, history source) but this run is on {source!r}. Use a name that "
+                 f"differs (the matrix drivers add the source to the name); one name must not stand "
+                 f"for two price histories.")
 
 
 def _apply_options_store(args, backtest_block: dict) -> None:
@@ -1142,15 +1456,21 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 # ``option_consistent_annual_return`` disqualifies a config below a hard trades/year floor
 # (``strategy_fitness._CAR_HARD_MIN_TRADES_PER_YEAR`` = 12) and ramps credit up to
 # ``_CAR_MIN_TRADES_PER_YEAR`` = 30. Those two numbers are a SCREENER expert's cadence. A
-# structure that is OPENED at 365-550 DTE and exited at a 90-240 DTE floor lives 125-460
-# CALENDAR DAYS by construction (365-240 at the fastest, 550-90 at the slowest), so over the
-# grid's 1,095-day window ONE underlying supports between 1,095/460 = 2.4 and 1,095/125 = 8.8
-# sequential structures -- 0.8 to 2.9 per underlying per YEAR. Clearing a 12/yr floor
-# therefore needs between 4 and 15 underlyings occupied CONTINUOUSLY, and design §1 measured
-# that only 8 of 14 sampled January expiries carry any 1-year+ bars at all: the eligible slice
-# of the universe is a fraction of it. On the default floor the metric would disqualify the
-# long-dated arms for having the holding period the design chose for them, and the grid would
-# report that as "LEAPS do not work".
+# structure that is OPENED at 270-540 DTE (floor lowered from 365, operator decision
+# 2026-09-30 -- design §1b) and exited at a 90-240 DTE floor lives 30-450 CALENDAR DAYS by
+# construction (270-240 at the fastest, 540-90 at the slowest), so over the grid's 1,095-day
+# window ONE underlying supports between 1,095/450 = 2.4 and 1,095/30 = 36.5 sequential
+# structures -- 0.8 to 12.2 per underlying per YEAR. Clearing a 12/yr floor therefore needs
+# between (rounding up) 1 and 15 underlyings occupied CONTINUOUSLY, and design §1b measured
+# that lowering the floor to 270 roughly doubles day-level availability versus the pre-2026-
+# 09-30 365 floor -- the eligible slice of the universe is still a fraction of it at the SLOW
+# end of this range, which is what the floor below still exists to cover. (The FAST end can
+# now clear the platform default alone; the exemption is unconditional per strategy KEY, not
+# per decoded window, so it still applies to every O_LEAP/O_PMCC genome, slow or fast --
+# a floor of 3/8 stays comfortably below both ends of the new range, so it is still correct,
+# just less tightly binding at the fast end than it was pre-2026-09-30.) On the default floor
+# the metric would disqualify the long-dated arms for having the holding period the design
+# chose for them, and the grid would report that as "LEAPS do not work".
 #
 # THESE TWO NUMBERS ARE AUTHORED FROM THAT ARITHMETIC, NOT MEASURED -- there is no grid-2 run
 # to measure against yet, the same footing as the ARC bands above. 3/yr hard keeps a genuinely
@@ -1370,6 +1690,35 @@ _EXPERT_OPT = {
         # run_options_matrix folds this dict into the discovery job name.
         "option_fixed_settings": {"macro_short_side": "mirror"},
     },
+    # MLForecast (ml_forecast design 2026-10-25 §2): maps a PRECOMPUTED forecast-store row to a signal, so a trial
+    # only re-maps rows (no model inference in the GA). `model_key` picks among the BUILT stores by alias
+    # (<card_id>[+covariates], resolved from each store's meta.json). Ranges MEASURED on the 2025 NDX100 stores
+    # (pilot 2026-10-26), see the pilot report.
+    "MLForecast": {
+        "expert_params": {
+            # LOG-space TimesFM cards: the price-space cards abort on a collapse extrapolated through 0 (TTD 2026-08).
+            "model_key": {"optimize": True, "type": "choice", "choices": ["timesfm3-log-ctx512", "timesfm3-log-ctx2048"]},
+            "horizon": {"optimize": True, "type": "choice", "choices": [5, 10, 20]},
+            # MEASURED 2025 NDX100, timesfm3-log-ctx512: |q50| p90 = 2.0 / 3.4 / 5.9 % (h5/h10/h20), p99 4.7-15.4 %;
+            # the lift sits in the tail (h10 q50 >= 5 %: +2.08 % mean 10-session return vs +0.67 % for all rows), so
+            # the range reaches 8 %.
+            "min_edge_pct": {"optimize": True, "min": 0.5, "max": 8.0, "step": 0.5, "type": "float"},
+            # MEASURED: P(up) from the deciles showed NO lift at any threshold (h10 P>=65: +0.58 % vs +0.67 % all),
+            # so the gate must be able to (almost) vanish: 51 keeps MappingGenes' min_prob > 50.
+            "min_prob": {"optimize": True, "min": 51.0, "max": 75.0, "step": 4.0, "type": "float"},
+            # MEASURED q10-q90 width in ATR14: median 3.9 / 5.6 / 7.8 (h5/h10/h20), p90 4.8 / 7.0 / 10.2. The design's
+            # 1-6 range would have shut nearly every h20 row and most h5 rows.
+            "max_uncertainty": {"optimize": True, "min": 3.0, "max": 12.0, "step": 1.0, "type": "float"},
+            "tp_quantile": {"optimize": True, "min": 60.0, "max": 90.0, "step": 10.0, "type": "float"},
+            "sl_quantile": {"optimize": True, "min": 10.0, "max": 40.0, "step": 10.0, "type": "float"},
+            "exit_flip_prob": {"optimize": True, "min": 55.0, "max": 70.0, "step": 5.0, "type": "float"},
+            # NO rank_top_n gene here: the ranking mode (strategy MLR) adds it for MLR jobs only
+            # (_apply_ml_rank_top_n, --ml-rank-top-n), so MLH / MLF / S1 keep their gene space and trial sequence.
+        },
+        # S1 runs long-only (shorts need the engine's enable_short), so a SELL entry gene would only spend
+        # population on a knob that cannot act; a bearish forecast still exits a held long via the flip.
+        "fixed_settings": {"enable_sell": False},
+    },
     # NOTE: FinnHubRating is intentionally NOT optimized — it is REDUNDANT with FMPRating (both
     # are analyst-consensus rating experts on the same large-cap universe).
     # FMPSenateTraderWeight — congressional (senate) disclosed-trade signal. Sparse per symbol,
@@ -1443,9 +1792,27 @@ _EXPERT_OPT = {
             "factor_weight_quality": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "factor_weight_pead": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             "top_n": {"optimize": True, "min": 10, "max": 40, "step": 5, "type": "int"},
-            "max_weight_per_name": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
+            # UNIFIED WITH THE PLATFORM-WIDE PER-INSTRUMENT CAP (2026-09-29): FactorRanker's own
+            # max_weight_per_name (fraction 0-1) is retired in favour of every other expert's
+            # max_virtual_equity_per_instrument_percent (percent), which the account-level
+            # position-size check now also enforces for FactorRanker (previously a no-op for it —
+            # see AccountInterface._validate_position_size_limits). Same range as the old gene
+            # (0.05-0.20), expressed as a percent (5.0-20.0) with the platform's usual 5-point step.
+            "max_virtual_equity_per_instrument_percent": {
+                "optimize": True, "min": 5.0, "max": 20.0, "step": 5.0, "type": "float"},
+            # CATEGORICAL (2026-09-28): how the top_n picks share the book. The choices are the
+            # expert's own declared values, in its order (FactorRanker.get_settings_definitions()
+            # ["weighting"]["valid_values"]; a test pins the two lists equal). "rank" is linear in
+            # rank (of N picks the best gets N parts ... the last 1), "score" is proportional to
+            # the composite score, "equal" is 1/N; every mode stays capped by
+            # max_virtual_equity_per_instrument_percent. Lands on the expert setting of the same
+            # name (model:weighting -> expert_overrides -> the trial's expert settings -> the
+            # deploy's expert_params), which is why it is no longer pinned in fixed_settings below:
+            # one source.
+            "weighting": {"optimize": True, "type": "choice",
+                          "choices": ["equal", "score", "rank"]},
         },
-        "fixed_settings": {"universe_source": "static", "weighting": "equal"},
+        "fixed_settings": {"universe_source": "static"},
         "bypass": True,
     },
     # PremiumSeller's grid entry was REMOVED 2026-08-31 (operator decision; option-model plan
@@ -1510,6 +1877,32 @@ _RM_OPT = {
     **_REGIME_OPT,
 }
 
+#: The ATR-searched policy's variant of _RM_OPT (docs/strategy_research/atr_grid/
+#: atr_grid_2027_design.md §3.2/§9, D4). ONLY used when --rm-toggle-policy atr-searched (via
+#: _rm_opt_for's atr_searched=True) -- the pinned policy's _RM_OPT is untouched.
+#:
+#: use_atr_stop: optimize True, searched 0/1 -- it is a real gene here, not dropped, because its
+#: declared default is True (see _INERT_RM_TOGGLES).
+#: atr_multiplier: floor widened 3.0->1.5. The 3.0 floor was raised 2026-07-01 from whipsaw
+#: evidence gathered while use_atr_stop was silently dead (the "1"-string defect, fixed later by
+#: coerce_bool), so it has no basis under a run where the toggle genuinely acts.
+#: The three regime_*_scale genes are DROPPED (D3): the overlay stays pinned off under this
+#: policy too, so they would be pure dead weight -- unlike the pinned policy, which keeps them
+#: in the space to preserve the historical genome shape.
+_RM_OPT_ATR_SEARCHED = {
+    "risk_per_trade_pct": _RM_OPT["risk_per_trade_pct"],
+    "atr_risk_budget_pct": _RM_OPT["atr_risk_budget_pct"],
+    "atr_multiplier": {"optimize": True, "min": 1.5, "max": 6.0, "step": 0.5, "type": "float"},
+    "atr_period": _RM_OPT["atr_period"],
+    "min_stop_loss_pct": _RM_OPT["min_stop_loss_pct"],
+    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    "max_virtual_equity_per_instrument_percent":
+        _RM_OPT["max_virtual_equity_per_instrument_percent"],
+    # PINNED OFF, not searched -- D3: the overlay is a separate experiment. Kept as a (non-gene)
+    # entry for documentation; optimize=False means _collect_expert never emits it.
+    "regime_overlay_enabled": _REGIME_OPT["regime_overlay_enabled"],
+}
+
 #: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.
 #:
 #: A cash-secured put at spot $100 reserves strike*100 = $10,000, exactly 50% of the grid's $20k
@@ -1533,14 +1926,20 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     ``fixed_settings``. None means "unknown" and callers must treat it as the permissive case --
     never guess ``notional`` from absence, because that would silently drop a live gene.
     """
+    if _SEARCH_SIZING_MODE:
+        return None     # searched: unknown per genome -- keep atr_risk_budget_pct in the space
     mode = getattr(args, "sizing_mode", None)
     if mode:
         return mode
     return ((spec or {}).get("fixed_settings") or {}).get("sizing_mode")
 
 
-def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
+def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bool = False) -> dict:
     """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
+
+    ``atr_searched`` (--rm-toggle-policy atr-searched) swaps the base block for
+    ``_RM_OPT_ATR_SEARCHED`` -- use_atr_stop searched, wider atr_multiplier floor, the 3
+    regime_*_scale genes dropped (D3/D4). False (default) is today's ``_RM_OPT``, unchanged.
 
     EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
     point of the function. ``O_STK`` is ``_build_strategy_stock`` -> ``_build_strategy_S2``, i.e.
@@ -1556,8 +1955,9 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
     Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
     for that reason.
     """
-    block = ({**_RM_OPT, **_OPTION_RM_OVERRIDE}
-             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(_RM_OPT))
+    base = _RM_OPT_ATR_SEARCHED if atr_searched else _RM_OPT
+    block = ({**base, **_OPTION_RM_OVERRIDE}
+             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(base))
     # atr_risk_budget_pct IS THE SIZING BUDGET, and only ``_risk_atr_quantity`` reads it -- which
     # runs solely under ``sizing_mode == 'risk_atr'``. In a notional run it is therefore a DEAD
     # gene: two genomes differing only in it score identically, so the GA spends population slots,
@@ -1568,10 +1968,16 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
     # one set the stop distance, which applies in BOTH modes -- so this gating only becomes
     # correct alongside that fix, and would have silently changed notional results before it.
     #
+    # Under ``--search-sizing-mode`` the mode is NOT known here (``_effective_sizing_mode`` returns None),
+    # so the gene stays in the space and is instead decoded away per genome:
+    # ``strategy_param_space.neutralise_sizing_genes`` drops it from a notional genome (decode + memo key).
+    #
     # Dropped ONLY when the mode is positively known to be notional. Unknown stays permissive:
     # inferring notional from absence would delete a live gene from a risk_atr run.
     if sizing_mode == "notional":
         block.pop("atr_risk_budget_pct", None)
+    for pinned in _STRATEGY_FIXED_SETTINGS.get(kind, {}):
+        block.pop(pinned, None)         # pinned by the strategy (see _STRATEGY_FIXED_SETTINGS): no gene
     return block
 
 
@@ -1585,8 +1991,13 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
 # were quick same-day stop-outs vs 3.1% for large). Exposed as its own (narrower) gene set so the
 # GA can actually tune it, instead of the full _RM_OPT block (whose other keys — ATR/min-stop/
 # max-virtual-equity — have no bypass-path reader).
+# Max 10.0 -> 5.0 (2026-09-29, operator): the stop caps one symbol's loss at risk_per_trade_pct %
+# of the expert's equity. With 10-35 names each position is only ~3-10% of equity, so above ~5%
+# the budget exceeds the position and the stop sits 90%+ below entry or is not placed at all
+# (measured on dev: 38/39 FactorRanker positions). A name whose position cannot lose the budget
+# carrying no stop is accepted by design.
 _BYPASS_RM_OPT = {
-    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 5.0, "step": 0.5, "type": "float"},
 }
 
 # Per-weekday entry-scan ON/OFF toggle genes (schedule:<day>): merged into expert_params
@@ -1602,31 +2013,24 @@ _SCHEDULE_DAY_OPT = {
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 }
 
+#: D8 (atr_grid_2027_design.md §3.2/§9): the ATR-searched policy searches weekday entry-scan
+#: cadence only -- the 2 weekend genes are noise on a daily clock (reference-ga-schedule-genes,
+#: every backtest bar is a weekday). Dropping them from the merged expert_params (not just from
+#: the search) means decode_params never sees a schedule:saturday/schedule:sunday key, so both
+#: default to False via its existing ``schedule_by_day.get(day, False)`` repair -- no change
+#: needed there. The pinned policy keeps _SCHEDULE_DAY_OPT (all 7 days) untouched.
+_WEEKDAY_SCHEDULE_DAY_OPT = {
+    day: spec for day, spec in _SCHEDULE_DAY_OPT.items() if day not in ("saturday", "sunday")
+}
+
 # Screener-settings genes (only added to the search when --screener is passed). The STATIC cap
 # range is kept small — its loosest bound sizes the metric store's shortlist superset — while the
 # dynamic ranges (RVOL / price-drop / max_stocks) may be wide. These are merged into expert_params
 # pre-namespaced with `screener:` so collect_param_space / decode_params route them to the screener
 # namespace (see _collect_screener / decode_params in strategy_param_space.py).
-_SCREENER_OPT = {
-    "screener_market_cap_min": {"min": 2e9, "max": 1e10, "step": 1e9, "type": "float", "optimize": True},
-    # Floor lowered 1.0->0.0 (2026-07-19): FactorRanker's own docs say this gate is
-    # penny-momentum-oriented and should be 0 for factor strategies, but the floor never let the
-    # GA reach 0. Measured against the live metric_store at the GA's winning mid/small-band gene
-    # combos: 0-5 candidates/week (mid), 0 candidates on 4/5 sampled dates (small) — this gate was
-    # the primary cause of small-band FactorRanker trade starvation, not a lack of factor edge.
-    # screener_price_drop_pct already floors at 0 for every expert; this brings rvol_min in line.
-    "screener_relative_volume_min": {"min": 0.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
-    "screener_price_drop_pct": {"min": 0.0, "max": 25.0, "step": 1.0, "type": "float", "optimize": True},
-    # Lookback window Y (trading days) for the price-drop gate: selects the precomputed
-    # price_drop_pct_<Y> column in a multi-window store (build with --max-lookback >= this max).
-    # Decodes to a bare `price_drop_days` screener override. Cap 30 matches the default max_lookback.
-    "screener_price_drop_days": {"min": 2, "max": 30, "step": 1, "type": "int", "optimize": True},
-    "screener_max_stocks": {"min": 10, "max": 50, "step": 10, "type": "int", "optimize": True},
-    # Weinstein stage-2 gate (price above a rising 30-week SMA = confirmed uptrend). Optimized
-    # as a 0/1 toggle: the GA decides whether requiring Stage-2 helps. (A richer "which stage(s)"
-    # categorical would need a multi-stage screener setting; stage2-only is the current knob.)
-    "screener_weinstein_stage2_only": {"min": 0, "max": 1, "step": 1, "type": "int", "optimize": True},
-}
+# CANONICAL definition: ba2_providers.screener.universe_superset (the drivers cannot import this
+# module, and the static-universe derivation reads the SAME ranges). Aliased, not copied.
+_SCREENER_OPT = _us.SCREENER_OPT
 
 # Per-cap-band jobs (small/mid/large): run the SAME screener gene set on a DISJOINT cap universe per
 # band, so 5min stays feasible (each band's screened union is far smaller than the whole store) and
@@ -1634,11 +2038,47 @@ _SCREENER_OPT = {
 # market_cap_max change per band; every other gene (RVOL / price-drop / max_stocks / weinstein) is
 # unchanged. Selected via --screener-cap-band. Bands (current-cap $): small $50M-$2B, mid $2B-$10B,
 # large >=$10B. The cap-min gene optimizes the floor WITHIN the band; market_cap_max pins the ceiling.
-_SCREENER_CAP_BANDS = {
-    "small": {"min": 5e7,  "max": 2e9,  "step": 1e8,  "cap_max": 2e9},
-    "mid":   {"min": 2e9,  "max": 1e10, "step": 1e9,  "cap_max": 1e10},
-    "large": {"min": 1e10, "max": 2e11, "step": 1e10, "cap_max": None},
+_SCREENER_CAP_BANDS = _us.SCREENER_CAP_BANDS
+
+#: ``--screen-preset`` (goal2027 item 2.8): a FIXED screen -- every selection key pinned in the job's
+#: ``screener_opt.base_settings``, NO screener genes -- instead of the searched cap bands. ``xl`` is the exploration
+#: ``new_idea_baseline`` screen (liquid large caps, 50 names), the design doc's ```xl-screen block (a test pins the
+#: two equal). UNPREFIXED metric-store names, the vocabulary of ``base_settings``; the deploy export carries them and
+#: ``live_settings_from_universe`` maps them to the live ``screener_<key>`` settings.
+#: ``dollar_volume_min`` is 0, NOT the exploration's 10e6: live has no dollar-volume stage and the live-simulation
+#: gate REFUSES a positive value (``live_sim.check_settings``), so a floor here could never be deployed faithfully.
+_SCREEN_PRESETS = {
+    "xl": {"market_cap_min": 1e10, "market_cap_max": 0, "price_min": 10, "volume_min": 500000,
+           "dollar_volume_min": 0, "float_min": 10000000, "relative_volume_min": 0, "price_drop_pct": 0,
+           "price_drop_days": 5, "weinstein_stage2_only": False, "max_stocks": 50},
 }
+
+
+def _screener_launch_inputs(args):
+    """``(base_settings, scr_opt, cap_band)`` of the screener launch request. Without ``--screen-preset`` exactly
+    what the launch always used (the base JSON, the searched gene set, the cap band). With it: the preset's fixed
+    keys, NO genes, no cap band. Refuses (exit) the preset together with a searched cap band or a base JSON (they would
+    state the same keys twice), without ``--screener``, and a preset the live simulation could not serve."""
+    preset = getattr(args, "screen_preset", None)
+    if not preset:
+        return (json.load(open(args.screener_base_json)) if args.screener_base_json else {},
+                _SCREENER_OPT, getattr(args, "screener_cap_band", None))
+    if preset not in _SCREEN_PRESETS:
+        sys.exit(f"optimize: unknown --screen-preset {preset!r}; have {sorted(_SCREEN_PRESETS)}")
+    if not getattr(args, "screener", False):
+        sys.exit("optimize: --screen-preset needs --screener (it pins the screener's keys)")
+    if getattr(args, "screener_cap_band", None):
+        sys.exit(f"optimize: --screen-preset {preset} and --screener-cap-band {args.screener_cap_band} are mutually "
+                 f"exclusive (a fixed screen has no cap-band gene range; choose one)")
+    if getattr(args, "screener_base_json", None):
+        sys.exit("optimize: --screen-preset and --screener-base-json are mutually exclusive (the preset states "
+                 "every key itself)")
+    from ba2_providers.screener import live_sim as _ls
+    try:
+        _ls.check_settings(dict(_SCREEN_PRESETS[preset]), _ls.POST_FIX)
+    except _ls.SimulationRefusal as _e:
+        sys.exit(f"optimize: --screen-preset {preset} cannot be simulated: {_e}")
+    return dict(_SCREEN_PRESETS[preset]), {}, None
 
 
 def _strategy_from_parts(name: str, buy_tree=None, exit_conditions=None, entry_actions=None):
@@ -1830,7 +2270,7 @@ def _build_strategy_S3(name: str):
                                 exit_conditions=exit_conditions)
 
 
-def _build_strategy_S5(name: str):
+def _build_strategy_S5(name: str, *, time_exit: bool = False):
     """S5 — S2/S3 HYBRID: signal exits + trailing ladder. Data-driven design from the -goal grids:
     the best S2 config (186% archived S2-large winner) entered on nearly every signal (all gates
     off) and managed purely by exits — but capped every winner at a FIXED +32% TP while its trades
@@ -1895,11 +2335,22 @@ def _build_strategy_S5(name: str):
              {"id": "xcap", "field": "profit_loss_percent", "op": ">", "value": 60,
               "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5}]}},
     ]
+    order = ["exit_bearish", "exit_downgrade", "exit_cap", "trail_t3", "trail_t2", "trail_t1",
+             "exit_belock", "exit_stoploss"]
+    if time_exit:
+        # ``--search-exploration-ranges`` (goal2027 2.9), FMPEarningsDrift only: the exploration families
+        # tested a 60/90/120-day timeout against the unlimited-hold control, and S5 had no time exit at all.
+        # Toggleable (off = unlimited hold, the control); a close, so it goes with the closes, before the
+        # always-matching floor stop. Same ids as S2/S3/S6 (cond:xt:value, exit:exit_time:enabled).
+        exit_conditions.append(
+            {"id": "exit_time", "action_type": "close", "toggle_optimize": True,
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "xt", "field": "days_opened", "op": ">", "value": 90,
+                  "optimize": True, "value_min": 30, "value_max": 150, "value_step": 30}]}})
+        order.insert(order.index("exit_cap") + 1, "exit_time")
     # FIRST-MATCH order: signal closes + wide cap first, trailing tiers DEEPEST-first,
     # break-even lock, always-matching floor stop LAST (see _first_match_order).
-    exit_conditions = _first_match_order(exit_conditions, [
-        "exit_bearish", "exit_downgrade", "exit_cap", "trail_t3", "trail_t2", "trail_t1",
-        "exit_belock", "exit_stoploss"])
+    exit_conditions = _first_match_order(exit_conditions, order)
     return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
                                 exit_conditions=exit_conditions)
 
@@ -2027,6 +2478,259 @@ def _build_strategy_S7(name: str):
     ]
     return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
                                 exit_conditions=exit_conditions)
+
+
+#: Strategies only the named expert can use (goal2027 item 2.8). ``SQM`` is the exploration "quality_momentum"
+#: recipe, written for the DeterministicScorer score; another expert would run it on a signal it was not made for.
+_EXPERT_ONLY_STRATEGIES = {"SQM": "DeterministicScorer", "MLH": "MLForecast", "MLF": "MLForecast",
+                           "MLR": "MLForecast"}
+
+
+def _refuse_ds_only_strategy(command: str, kind: str, expert: str) -> None:
+    """Refuse an expert-restricted strategy (``_EXPERT_ONLY_STRATEGIES``) on any other expert."""
+    owner = _EXPERT_ONLY_STRATEGIES.get(kind)
+    if owner is not None and expert != owner:
+        sys.exit(f"{command}: strategy {kind} is for {owner} only (got expert {expert!r})")
+
+
+def _build_strategy_SQM(name: str):
+    """SQM -- QUALITY-MOMENTUM, the exploration phase-1 winner's ruleset (goal2027 item 2.8). DeterministicScorer only.
+
+    One entry, three fixed exits and nothing else: buy when bullish and flat with a one-day cooldown, a fixed
+    stop and a fixed target at the fill, and a time exit. Exactly the exploration ``quality_momentum`` rules
+    (tools/strategy_research/exploration/profiles.py: ``new_idea_baseline`` + ``time_exit``); the three numbers
+    are genes whose DEFAULT is the recipe (stop -12%, target +20%, 30 days).
+
+    Gene names follow the S1-S7 shape: ``entry:buy:a1:action_value`` (target) and ``entry:buy:a2:action_value`` (stop), the
+    same roles and indices as S6, plus ``cond:xt:value`` (time exit days). No on/off toggle: the recipe is "buy with a stop, a target
+    and a time exit", and a toggled-off bracket would be a different strategy. First match wins, and there is
+    one exit rule, so nothing shadows it."""
+    buy_entry_conditions = {
+        "id": "root", "type": "AND", "conditions": [
+            {"id": "gate_days_since_close", "field": "days_since_last_close", "op": ">", "value": 1},
+        ],
+    }
+    # Order as in S6: a1 = take-profit, a2 = stop (a0 is the buy).
+    entry_actions = [
+        {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
+         "action_value": 20.0, "action_value_optimize": True,
+         "action_value_min": 10.0, "action_value_max": 30.0, "action_value_step": 5.0},
+        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -12.0, "action_value_optimize": True,
+         "action_value_min": -14.0, "action_value_max": -6.0, "action_value_step": 2.0},
+    ]
+    exit_conditions = [
+        {"id": "exit_time", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xp", "field": "has_position"},
+             {"id": "xt", "field": "days_opened", "op": ">", "value": 30,
+              "optimize": True, "value_min": 20, "value_max": 120, "value_step": 10}]}},
+    ]
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions, entry_actions=entry_actions)
+
+
+def _build_strategy_MLH(name: str, forecast_tp: bool = False):
+    """MLH -- ML-forecast HOLD (custom-ML fair test, 2026-10-27). Buy when the expert is bullish and flat; NO take-profit
+    and no strategy stop (the RM max-risk safeguard stop is always placed on entry); close once the position is
+    ``days_opened`` calendar days old (gene 0-6: 0 = the first daily check after the fill, about one session held;
+    2 about 3 sessions; 4 about 5) or, toggleable, when the expert turns bearish on the held position.
+
+    Why: under S1 the GA found a +2% take-profit (the platform's minimum TP) against a -10% stop on every trade, which
+    pays on liquid mega-caps whatever stock the model picks (the cross-symbol shuffle earned as much out of sample).
+    Here a trade's outcome is the return over the holding time, which is what the models forecast.
+
+    ``forecast_tp`` (strategy MLF): plus a take-profit AT the forecast's own target (``expert_target_price``, offset 0,
+    not a gene) -- the forecast's exit level, still floored by the platform's minimum TP distance."""
+    buy = {"id": "root", "type": "AND", "conditions": [
+        {"id": "mlh_bull", "field": "bullish"},
+        {"id": "mlh_flat", "field": "has_no_position"},
+    ]}
+    exits = [
+        {"id": "mlh_exit_time", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "mlh_hold", "field": "has_position"},
+             {"id": "mlh_days", "field": "days_opened", "op": ">=", "value": 2,
+              "optimize": True, "value_min": 0, "value_max": 6, "value_step": 1}]}},
+        {"id": "mlh_exit_signal", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "mlh_bear", "field": "bearish"}]}},
+    ]
+    entry_actions = None
+    if forecast_tp:
+        entry_actions = [{"id": "mlf_tp", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
+                          "action_value": 0.0}]
+    return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits, entry_actions=entry_actions)
+
+
+def _build_strategy_MLF(name: str):
+    """MLF -- MLH plus a take-profit at the forecast's own target (see _build_strategy_MLH)."""
+    return _build_strategy_MLH(name, forecast_tp=True)
+
+
+def _build_strategy_MLR(name: str):
+    """MLR -- ML-forecast ROTATION (ML exploration v2, selection track). MLForecast only, with ``rank_top_n`` > 0
+    (``--ml-rank-top-n``): the expert answers BUY only for the N most bullish symbols of the store at the decision
+    date, and SELL for a held long that dropped out of them.
+
+    Entry: bullish and flat. Exits: the bearish signal (= left the top N, or a flip) is ALWAYS on -- it is the
+    rotation itself, not a gene; plus a time exit, ``days_opened >= rebalance`` calendar days (gene 5..20 step 5,
+    toggleable), the rebalance cadence. No take-profit and no strategy stop (fixed brackets are banned in v2; the RM
+    safeguard stop is placed on entry). Position count is bounded by N through the ranking, not by the strategy.
+
+    Needs ``--ml-rank-top-n`` (the gene) and gets the job's symbols as the fixed ``rank_universe`` setting
+    (``_apply_ml_rank_universe``): the ranked set is the traded set."""
+    buy = {"id": "root", "type": "AND", "conditions": [
+        {"id": "mlr_bull", "field": "bullish"},
+        {"id": "mlr_flat", "field": "has_no_position"},
+    ]}
+    exits = [
+        {"id": "mlr_exit_signal", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [{"id": "mlr_bear", "field": "bearish"}]}},
+        {"id": "mlr_exit_time", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "mlr_hold", "field": "has_position"},
+             {"id": "mlr_days", "field": "days_opened", "op": ">=", "value": 10,
+              "optimize": True, "value_min": 5, "value_max": 20, "value_step": 5}]}},
+    ]
+    return _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits)
+
+
+def ml_hold_days_range(horizon: int) -> tuple:
+    """``(min, centre, max)`` of MLH's ``days_opened`` gene matched to a forecast horizon of ``horizon`` sessions
+    (``--ml-hold-from-horizon``): d = round(H x 7/5) - 1 calendar days (H sessions are about 7H/5 calendar days; the
+    position is closed at the first daily check at or after d days, i.e. about H sessions after the entry fill), and
+    the gene is {d-1, d, d+1} clipped at 0. H x 7/5 never lands on .5, so Python's rounding is unambiguous."""
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
+        raise ValueError(f"horizon must be an int >= 1, got {horizon!r}")
+    d = round(horizon * 7 / 5) - 1
+    return max(0, d - 1), d, d + 1
+
+
+def _ml_store_horizon(keys, command: str, flag: str) -> int:
+    """The one horizon shared by every store of ``keys`` (aliases or keys); refuses a multi-horizon store, a mix, or an
+    unreadable store."""
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    horizons = {}
+    try:
+        for k in keys:
+            hs = list(_store.read_meta(_resolve(k))["horizons"])
+            if len(hs) != 1:
+                sys.exit(f"{command}: {flag}: store {k!r} has horizons {hs}; it needs single-horizon stores")
+            horizons[k] = int(hs[0])
+    except (ValueError, _store.ForecastStoreError) as e:
+        sys.exit(f"{command}: {flag}: cannot read a store's meta: {e}")
+    if len(set(horizons.values())) != 1:
+        sys.exit(f"{command}: {flag}: the --ml-model-keys stores do not share one horizon: {horizons}")
+    return next(iter(horizons.values()))
+
+
+def _ml_hold_from_horizon_range(enabled, raw_keys, expert: str, strategy: str, command: str):
+    """``--ml-hold-from-horizon``: the ``(min, centre, max)`` of the MLH/MLF ``days_opened`` gene, or None when the flag
+    is off. Refused for any other expert or strategy, without ``--ml-model-keys``, and for stores that do not share one
+    single horizon."""
+    if not enabled:
+        return None
+    if expert != "MLForecast" or strategy not in ("MLH", "MLF"):
+        sys.exit(f"{command}: --ml-hold-from-horizon only applies to MLForecast with strategy MLH or MLF, "
+                 f"not {expert!r} / {strategy!r}")
+    if not raw_keys:
+        sys.exit(f"{command}: --ml-hold-from-horizon needs --ml-model-keys (the horizon is the stores')")
+    keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    h = _ml_store_horizon(keys, command, "--ml-hold-from-horizon")
+    lo, centre, hi = ml_hold_days_range(h)
+    print(f"{command}: --ml-hold-from-horizon: horizon {h} -> MLH days_opened gene {lo}..{hi} (centre {centre})")
+    return lo, centre, hi
+
+
+def _apply_ml_hold_range(strat, hold_range):
+    """Set the MLH ``days_opened`` gene (rule node ``mlh_days``) to ``hold_range`` = (min, centre, max), step 1.
+    ``hold_range`` None returns ``strat`` untouched. Both spellings of each key (camel and snake) are written, as the
+    rule model stores both."""
+    if hold_range is None:
+        return strat
+    import copy
+    lo, centre, hi = hold_range
+    found = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+        elif isinstance(node, dict):
+            if node.get("id") == "mlh_days":
+                node.update({"value": float(centre), "valueMin": float(lo), "value_min": float(lo),
+                             "valueMax": float(hi), "value_max": float(hi), "valueStep": 1.0, "value_step": 1.0})
+                found.append(node)
+            for v in node.values():
+                walk(v)
+
+    strat.exit_rules = copy.deepcopy(strat.exit_rules)
+    walk(strat.exit_rules)
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one 'mlh_days' gene in the strategy, found {len(found)}")
+    return strat
+
+
+def _apply_ml_rank_top_n(spec: dict, raw, expert: str, strategy: str, command: str) -> dict:
+    """``--ml-rank-top-n 3,5``: ADD MLForecast's ``rank_top_n`` gene as a choice of these N (distinct ints >= 1) to a copy
+    of the spec. MLR only (the ranking mode is the rotation strategy's), and MLR REQUIRES it: without it MLR would be a
+    rotation strategy with ranking off. Any other strategy without the flag gets ``spec`` untouched, so MLH / MLF / S1
+    keep the gene space they always had."""
+    is_mlr = expert == "MLForecast" and strategy == "MLR"
+    if not raw:
+        if is_mlr:
+            sys.exit(f"{command}: strategy MLR needs --ml-rank-top-n N[,N] (without it the ranking is off and MLR is "
+                     f"not a rotation)")
+        return spec
+    if not is_mlr:
+        sys.exit(f"{command}: --ml-rank-top-n only applies to MLForecast with strategy MLR, not {expert!r} / {strategy!r}")
+    try:
+        ns = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        sys.exit(f"{command}: --ml-rank-top-n needs comma-separated integers, got {raw!r}")
+    if not ns or len(set(ns)) != len(ns) or min(ns) < 1:
+        sys.exit(f"{command}: --ml-rank-top-n needs distinct integers >= 1, got {raw!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    out["expert_params"]["rank_top_n"] = {"optimize": True, "type": "choice", "choices": ns}
+    print(f"{command}: --ml-rank-top-n: MLForecast rank_top_n gene choices = {ns}")
+    return out
+
+
+def _apply_ml_rank_universe(command: str, backtest_block: dict, strategy: str, model_keys=()) -> None:
+    """MLR: record the run's own symbols as the expert's FIXED ``rank_universe`` setting (comma-separated, sorted, so it
+    travels as an ordinary string setting and enters the run identity: the checkpoint fingerprint and the stored
+    config). Call AFTER every step that can rewrite ``enabled_instruments``. The ranked set is exactly the traded set,
+    never the store's directory contents. A per-trial candidate universe (``--screener``) would make it disagree with
+    the traded set, so MLR refuses a screener. Other strategies: untouched.
+
+    PREFLIGHT: for every ``model_keys`` choice (the ``model_key`` gene's aliases / keys) every universe symbol must have
+    a file in that store, or the job is refused here, naming the missing symbols: the expert aborts a run on the first
+    missing file, so without this a gene value on an incomplete store would only fail mid-GA, on whichever worker drew it."""
+    if strategy != "MLR":
+        return
+    if backtest_block.get("screener_opt"):
+        sys.exit(f"{command}: strategy MLR ranks the job's fixed symbol list; it cannot run with a screener")
+    universe = sorted({str(x).strip().upper() for x in backtest_block["enabled_instruments"] if str(x).strip()})
+    if not universe:
+        sys.exit(f"{command}: strategy MLR needs a non-empty universe to rank")
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    problems = []
+    for name in model_keys:
+        try:
+            missing = _store.missing_symbol_files(_resolve(name), universe)
+        except ValueError as e:
+            sys.exit(f"{command}: strategy MLR: cannot check store {name!r} for the universe: {e}")
+        if missing:
+            problems.append(f"{name!r}: {len(missing)} of {len(universe)} symbols have no file ({', '.join(missing[:15])}"
+                            f"{' ...' if len(missing) > 15 else ''})")
+    if problems:
+        sys.exit(f"{command}: strategy MLR ranks the whole universe, so every model_key store must hold every symbol; "
+                 f"incomplete: " + "; ".join(problems))
+    (expert,) = [e for e in backtest_block["experts"] if e["class"] == "MLForecast"]
+    expert["settings"]["rank_universe"] = ",".join(universe)
 
 
 def _build_strategy_minimal(name: str):
@@ -2548,15 +3252,22 @@ _OPTION_STRATS = {
         "option_strike_param": 0.80, "option_strike_delta": 0.80,
         "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
         "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
-        # ENTRY DTE 365-550 (design §2). ``_apply_option_dte`` decodes the gene as the window
-        # CENTRE and keeps a half-width taken from the AUTHORED window, so the authored
-        # 380..470 fixes hw = (470-380)//2 = 45 and the searched centres 410..500 step 15
-        # (7 levels) decode to [365,455] .. [455,545] -- every window inside the design band,
-        # and 90 days wide so a January-cycle LEAPS expiry can actually fall in it (§1: LEAPS
-        # live on the January cycles, so a narrow window is usually empty).
+        # ENTRY DTE 270-540 (design §2/§1b; floor LOWERED from 365 to 270, operator decision
+        # 2026-09-30 -- §1b measured that a 365-550 floor holds an entry-able January-cycle
+        # LEAPS contract only ~half of each year, and a single genome's 90-day window only
+        # 25-50% of days; a 270 floor roughly doubles availability).
+        # ``_apply_option_dte`` decodes the gene as the window CENTRE and keeps a half-width
+        # taken from the AUTHORED window, so the authored 380..470 fixes hw = (470-380)//2 = 45
+        # (unchanged, and still inside the new band) and the searched centres 315..495 step 15
+        # (13 levels) decode to [270,360] .. [450,540] -- every window inside the new design
+        # band, and 90 days wide so a January-cycle LEAPS expiry can actually fall in it (§1:
+        # LEAPS live on the January cycles, so a narrow window is usually empty). 315/495 are
+        # both on the 15-day lattice from 0 (315 = 21*15, 495 = 33*15), so the ``"min"`` lattice
+        # anchor grid 2 already runs under (``_lattice_anchor_for``) decodes them EXACTLY, with
+        # no rounding slack at either end.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         "option_sizing": 5.0},
     "O_LEAPP": {  # LEAPS long PUT arm of O_LEAP -- the bearish twin; same genes, kind=put.
         # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE), like O_LP. The delta band is
@@ -2565,9 +3276,11 @@ _OPTION_STRATS = {
         "option_strike_param": 0.80, "option_strike_delta": 0.80,
         "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
         "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
+        # Same 270-540 entry band as O_LEAPC (see its comment) -- floor lowered from 365,
+        # operator decision 2026-09-30.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         "option_sizing": 5.0},
     "O_PMCC": {  # poor man's covered call -- LEAPS + a rolling short-call overlay (debit)
         # TWO LEGS ON TWO EXPIRIES, and the ONLY key in any grid that is. The LEAPS is the
@@ -2587,13 +3300,14 @@ _OPTION_STRATS = {
         "option_strike_delta_long": 0.80,
         "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.75,
         "option_strike_delta_long_max": 0.85, "option_strike_delta_long_step": 0.05,
-        # LEAPS ENTRY DTE >= 365, decoded exactly as O_LEAPC's: authored 380..470 fixes the
-        # half-width at 45, and centres 410..500 step 15 (7 levels) decode to [365,455] ..
-        # [455,545]. 90 days wide because §1 measured LEAPS living on the JANUARY cycles --
-        # a narrow window is usually empty.
+        # LEAPS ENTRY DTE >= 270 (floor lowered from 365, operator decision 2026-09-30 -- see
+        # O_LEAPC's comment for the §1b measurement), decoded exactly as O_LEAPC's: authored
+        # 380..470 fixes the half-width at 45, and centres 315..495 step 15 (13 levels) decode
+        # to [270,360] .. [450,540]. 90 days wide because §1 measured LEAPS living on the
+        # JANUARY cycles -- a narrow window is usually empty.
         "option_dte_min": 380, "option_dte_max": 470,
-        "option_dte_optimize": True, "option_dte_min_range": 410,
-        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_dte_optimize": True, "option_dte_min_range": 315,
+        "option_dte_max_range": 495, "option_dte_step": 15,
         # THE OVERLAY'S OWN WINDOW: design §2's "DTE 30-45", FIXED and deliberately not a
         # gene. The design states it as one narrow band rather than a range, and at pop 40 /
         # gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still a
@@ -2681,7 +3395,9 @@ _OPTION_STRATS = {
     # CONVEX-HARVEST GRID (design 2026-08-31, docs/superpowers/specs/
     # 2026-08-31-convex-harvest-grid-design.md §2) -- plan Task 13. A SEPARATE grid from GRID 2
     # above: its own fitness (``option_convex``, ``_CONVEX_FITNESS`` below), its own universe
-    # threshold (DTE >= 270 vs 365/180/7), its own matrix script
+    # threshold (DTE >= 270 vs 270/180/7 -- grid 2's LEAPS/PMCC floor was ALSO lowered to 270
+    # on 2026-09-30, so the two grids now share this number by coincidence, not construction),
+    # its own matrix script
     # (``tools/run_convex_matrix.py``). Sharing this table with grid 2 is fine -- the ROW is
     # just a gene table -- but every DERIVED set below is checked member-by-member so O_CONVEX
     # never inherits a grid-2-only behaviour (the trade floor) or drifts into grid 2's fitness
@@ -2757,9 +3473,13 @@ def _lattice_anchor_for(kind: str, override: "str | None") -> str:
     other key is ``"zero"``, the legacy lattice (``genetic.LATTICE_ANCHORS``):
 
     * GRID 2 NEEDS it. Its DTE genes are the ones whose ``min`` is not a multiple of the step:
-      O_LEAPC/O_LEAPP/O_PMCC 410..500 step 15 decoded 410 to 405 on the zero lattice -- an entry
-      window starting at 360, under design §2's 365 floor -- and O_ERN 14..23 step 3 decoded 23 to
-      24, a dte_max of 31 against the designed 7-30 band. On the min lattice they decode to the
+      O_LEAPC/O_LEAPP/O_PMCC's ORIGINAL 410..500 step 15 decoded 410 to 405 on the zero lattice --
+      an entry window starting at 360, under design §2's original 365 floor -- and O_ERN 14..23
+      step 3 decoded 23 to 24, a dte_max of 31 against the designed 7-30 band. The LEAPS floor
+      was lowered to 270 on 2026-09-30 and the new bound, 315..495 step 15, happens to land
+      exactly on the zero lattice (315 = 21*15, 495 = 33*15) -- so "min" now decodes it
+      bit-identically to "zero" -- but the key still needs "min" for O_ERN's still-misaligned
+      band, so the policy stays per-KIND, not per-gene. On the min lattice they decode to the
       levels their row comments state.
     * EVERYTHING ELSE KEEPS zero, because it was measured to matter (2026-09-25): the stage-1
       discovery grid (``cond:xlk:value`` 3..20 step 2) and the equity S1-S7 grids carry genes that
@@ -2786,6 +3506,36 @@ def _apply_lattice_anchor(cfg: dict, kind: str, override: "str | None") -> dict:
     anchor = _lattice_anchor_for(kind, override)
     if anchor != "zero":
         cfg["latticeAnchor"] = anchor
+    return cfg
+
+def _early_stop_min_rel_arg(value: str) -> float:
+    """argparse ``type`` for ``--early-stop-min-rel``: a FRACTION in (0, 1) (0.01 = 1%).
+
+    Refuses 0 (the legacy rule under a new job identity -- omit the flag instead), NaN/inf,
+    negatives and anything >= 1 at parse time -- the backend refuses them too
+    (genetic.validate_early_stop_min_rel), but a job that fails after its row is written wastes a
+    grid slot and leaves a failed row behind."""
+    import math
+    try:
+        v = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if v == 0.0:
+        raise argparse.ArgumentTypeError(
+            "0 is the legacy rule under a new job identity; omit --early-stop-min-rel for the "
+            "legacy rule")
+    if not math.isfinite(v) or v < 0.0 or v >= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"must be finite and in (0, 1) -- a FRACTION, 0.01 means 1% -- got {value!r}")
+    return v
+
+
+def _apply_early_stop_min_rel(cfg: dict, value: "float | None") -> dict:
+    """Write ``earlyStoppingMinRelativeImprovement`` onto a GA config ONLY when given, so every
+    job that does not opt in persists a byte-identical ``optimization_config`` (and keeps its
+    checkpoint fingerprint). Absent = the legacy rule: any strict improvement resets patience."""
+    if value is not None:
+        cfg["earlyStoppingMinRelativeImprovement"] = float(value)
     return cfg
 
 #: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
@@ -4139,6 +4889,52 @@ _OPTION_DTE_EXIT_BANDS = {
     "O_CONVEX": (60, 30, 120, 15),   # 7
 }
 
+
+def _assert_entry_dte_clears_exit_floor(kind: str, member_keys) -> None:
+    """The roll/exit DTE floor (``_OPTION_DTE_EXIT_BANDS``) must never be reachable AT ENTRY.
+
+    Both genes are searched INDEPENDENTLY -- the entry window centre and the exit floor
+    threshold share no code path -- so nothing stops the GA from pairing the LOWEST entry
+    window a genome can decode with the HIGHEST exit-floor threshold. If that pairing ever let
+    ``entry_dte <= exit_floor``, the position would roll/exit the same day (or before) it
+    opened: a silent no-op trade that still consumes a fitness evaluation and looks like a
+    structure that "trades but never holds".
+
+    Checked the same way ``_assert_option_expiry_clears_event_window`` checks O_ERN's
+    event/expiry ordering: derive the WORST CASE from the tables rather than restate a number
+    that could drift from them. The lowest DTE any genome can decode to at entry is
+    ``option_dte_min_range - hw`` (``_apply_option_dte``'s own arithmetic, hw fixed by the
+    authored window); that must exceed the exit floor's own ceiling (the gene's ``max``, the
+    largest threshold the GA can pick), for every member the group key builds an exit ruleset
+    for (O_LEAP has two: O_LEAPC and O_LEAPP, sharing one exit ruleset -- see
+    ``_OPTION_GROUPS_ALL``).
+
+    2026-09-30: the entry floor was lowered 365 -> 270 (operator decision). At the extremes
+    this leaves a 30-day margin (270 entry floor vs 240 exit-floor ceiling) -- positive, so
+    still structurally impossible, but far thinner than the previous 125-day margin (365 vs
+    240). Pinned here so a FUTURE change to either band cannot silently close that margin.
+    """
+    dte_hi = _OPTION_DTE_EXIT_BANDS[kind][2]
+    for member in member_keys:
+        cfg = _OPTION_STRATS[member]
+        base_min, base_max = int(cfg["option_dte_min"]), int(cfg["option_dte_max"])
+        hw = max(int((base_max - base_min) // 2) if base_max > base_min else 0, 7)
+        lowest_entry_dte = max(0, int(cfg["option_dte_min_range"]) - hw)
+        if lowest_entry_dte <= dte_hi:
+            raise RuntimeError(
+                f"{kind}/{member}: the entry option_dte gene can decode to dte_min="
+                f"{lowest_entry_dte} (option_dte_min_range={cfg['option_dte_min_range']} minus "
+                f"the half-width {hw}), which is NOT strictly greater than the exit/roll DTE "
+                f"floor's own ceiling {dte_hi} (_OPTION_DTE_EXIT_BANDS[{kind!r}][2]). Such a "
+                f"genome would exit the same day (or before) it entered -- a silent no-op "
+                f"trade. Raise option_dte_min_range, widen the authored window, or lower the "
+                f"exit floor's ceiling.")
+
+
+_assert_entry_dte_clears_exit_floor("O_LEAP", _LEAP_MEMBER_KEYS)
+_assert_entry_dte_clears_exit_floor("O_PMCC", ["O_PMCC"])
+
+
 # TAKE PROFIT AS A MULTIPLE OF THE PREMIUM PAID (``profit_multiple_of_premium``, plan Task 4).
 # Design §2 gives the backspreads "take-profit multiple 2x-6x | to expiry" -- the "| to
 # expiry" arm IS the rule's own ``toggle_optimize`` gene switched off, not a sentinel value.
@@ -4971,6 +5767,29 @@ def _market_condition_setting_profiles() -> tuple:
     return parse_profile_setting(_market_condition_setting_value())
 
 
+#: ``--benchmark-regime-gates``: append the two SPY regime leaves (spy-trend, spy-vol) to every
+#: pure option structure's initial-entry tree. OFF by default = today's rules, genes, stored
+#: config and job identity byte for byte. Module-level for the same reason as
+#: ``_MARKET_CONDITION_PROFILES``: the builders run far from the parsed args.
+_BENCHMARK_REGIME_GATES: bool = False
+
+
+def _resolve_benchmark_regime_gates(raw, command: str) -> bool:
+    """Parse ``--benchmark-regime-gates``; sets the module global and returns it."""
+    global _BENCHMARK_REGIME_GATES
+    _BENCHMARK_REGIME_GATES = bool(raw)
+    return _BENCHMARK_REGIME_GATES
+
+
+def _benchmark_regime_gates(m: str) -> list:
+    """The SPY regime entry leaves for rule prefix ``m`` ([] unless the flag is on)."""
+    if not _BENCHMARK_REGIME_GATES:
+        return []
+    from ba2_common.core.market_condition_templates import benchmark_regime_leaves
+
+    return benchmark_regime_leaves(m)
+
+
 def _market_condition_gates(m: str) -> list:
     """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
 
@@ -5052,11 +5871,13 @@ def _rename_market_condition_gates(strategy, frm: str, to: str):
     Design section 5: the wheel gets wheel-specific ids even though its entry is the CSP's, so a
     later composed strategy can demand one regime for the wheel and another for a bare CSP.
     """
-    if not _MARKET_CONDITION_PROFILES:
+    if not _MARKET_CONDITION_PROFILES and not _BENCHMARK_REGIME_GATES:
         return strategy
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
     fields = {f.name for prof in PROFILES.values() for f in prof.fields}
+    # the SPY regime leaves are re-prefixed too (``<frm>-spy-trend`` -> ``<to>-spy-trend``)
+    bench = {spec.name: spec.short for spec in BENCHMARK_FIELDS.values()}
     old, new = f"{frm}-market-", f"{to}-market-"
 
     def walk(node):
@@ -5071,6 +5892,9 @@ def _rename_market_condition_gates(strategy, frm: str, to: str):
         # ``<member>-market-something`` must keep its id, or a gene key would move under it.
         if isinstance(cid, str) and cid.startswith(old) and node.get("field") in fields:
             node["id"] = new + cid[len(old):]
+        elif (isinstance(cid, str) and node.get("field") in bench
+              and cid == f"{frm}-{bench[node['field']]}"):
+            node["id"] = f"{to}-{bench[node['field']]}"
         for v in node.values():
             walk(v)
 
@@ -5238,11 +6062,244 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
     return facts
 
 
+#: The classic equity strategy keys (design 2026-09-15 Task 11, lifted 2026-09-29 for the
+#: risk-ATR "goal2027atr" grid ONLY -- an explicit operator call, not an implementation side
+#: effect: "do not change strategy s1 s7" held until this grid). Their builders append the
+#: market-condition ENTRY leaves through ``_append_equity_market_condition_gates`` and (behind
+#: ``--market-exit``) the EXIT/STOP/TP rules through ``_append_equity_market_exit_rules`` -- both
+#: called once, generically, from ``_build_strategy``'s dispatch, unlike the option builders
+#: (which call ``_append_market_condition_gates``/``_option_entry_rule`` themselves).
+_EQUITY_MARKET_CONDITION_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+
 #: The strategy keys whose builders actually EMIT market-condition leaves: every pure-option
-#: structure (through ``_option_entry_rule``) plus the two equity-entry option overlays
-#: (through ``_append_market_condition_gates``). Design 2026-09-15 "Deferred": the equity grid
-#: S1-S7 is NOT in this delivery, and O_STK has no entry gate of its own to hang leaves on.
-_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+#: structure (through ``_option_entry_rule``), the two equity-entry option overlays (through
+#: ``_append_market_condition_gates``), and (since the 2026-09-29 deferral lift) the classic
+#: equity strategies S1-S7. O_STK has no entry gate of its own to hang leaves on, so it stays out.
+_MARKET_CONDITION_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"} | _EQUITY_MARKET_CONDITION_STRATEGIES
+
+#: ``--market-condition-mode``: the default arm actually searches the market genes; ``all-off``
+#: is the matched control (design section 6) -- every market gene frozen off, byte-identical to
+#: profile ``none`` for both the entry gates and (see ``--market-exit``) the exit rules.
+_MARKET_CONDITION_MODE_SEARCHED = "searched"
+_MARKET_CONDITION_MODE_ALL_OFF = "all-off"
+_MARKET_CONDITION_MODE: str = _MARKET_CONDITION_MODE_SEARCHED
+
+#: ``--market-exit``: the selected MARKET_EXIT_KINDS (empty = no market exit/stop/tp rules).
+#: Equity-only (S1-S7) in this delivery -- no option kind gets market exits here.
+_MARKET_EXIT_KINDS_SELECTED: "tuple[str, ...]" = ()
+
+#: ``--search-sl-loosen``: searches ``allow_ruleset_sl_loosen`` (MarketExpertInterface, default
+#: False) as ONE model:* gene. NOT a market-condition gene (design D6) -- it must be searched in
+#: BOTH the treatment and the all-off control arm, so it is resolved and merged independently of
+#: ``_MARKET_CONDITION_MODE``.
+_SEARCH_SL_LOOSEN: bool = False
+_SL_LOOSEN_SETTING = "allow_ruleset_sl_loosen"
+
+#: ``--search-sizing-mode`` (goal2027 item 2.1): searches ``sizing_mode`` as ONE ``model:sizing_mode`` choice gene
+#: over ("risk_atr", "notional"). Mutually exclusive with an explicit ``--sizing-mode`` (the pin). Decode-time
+#: neutralisation of the genes that are dead under notional lives in
+#: ``strategy_param_space.neutralise_sizing_genes``.
+_SEARCH_SIZING_MODE: bool = False
+
+#: ``--search-market-profile`` (goal2027 item 2.2): replaces the ``market:enabled`` master gene by ONE
+#: ``market:profile`` choice gene over (off, ohlcv-v1, ta-structure-v1, both). The builders stamp the
+#: ``market_profile_gene`` rule marker when it is on; the decode-time rules live in
+#: ``strategy_param_space.decode_params`` / ``neutralise_market_profile_genes``.
+_SEARCH_MARKET_PROFILE: bool = False
+
+#: ``--search-ds-factor-weights`` (goal2027 item 2.8, name token ``dsfw``): the DeterministicScorer sub-weights
+#: (``tw_*``, ``fw_*``), the momentum lookback and the analyst-target window / minimum as GA genes, plus a wider
+#: ``w_analyst`` ceiling. DS jobs only. The decode-time rules live in
+#: ``strategy_param_space.neutralise_ds_factor_genes``.
+_SEARCH_DS_FACTOR_WEIGHTS: bool = False
+_DS_FACTOR_EXPERT = "DeterministicScorer"
+
+#: ``--search-exploration-ranges`` (goal2027 item 2.9, name token ``explr``): closes the gaps the audit of the
+#: exploration phase-1 families found between what they varied by hand and what the goal2027 cells search (design
+#: doc 2.9). Today that is the TIME-EXIT lattice of the cells below (every exploration timeout and its control must
+#: be reachable) and, for FMPEarningsDrift S5, a toggleable time exit that strategy lacks. Everything else the
+#: families varied is already covered or lives under ``--search-ds-factor-weights``.
+_SEARCH_EXPLORATION_RANGES: bool = False
+#: expert -> the strategies on which the flag CHANGES something (every other pair is REFUSED: it would be a no-op with a
+#: changed identity). Exactly the ``_EXPLORATION_TIME_EXIT_RANGE`` pairs plus EarningsDrift S5 (the added time exit);
+#: the audited cells that were already covered (FMPRating S1, EarningsDrift S1/S3, DS S6) are not listed. A test pins
+#: that the table equals the set of pairs whose built gene space actually differs.
+_EXPLORATION_RANGE_PAIRS = {
+    "FMPRating": ("S2",),
+    "FMPEarningsDrift": ("S2", "S5"),
+    "FMPInsiderClusterBuy": ("S1",),
+    "DeterministicScorer": ("S1", "S2", "SQM"),
+}
+#: (expert, strategy) -> (min, max, step) of the ``days_opened`` time-exit threshold under the flag. The default
+#: value of the template must sit on the new lattice (pinned by test).
+_EXPLORATION_TIME_EXIT_RANGE = {
+    ("FMPInsiderClusterBuy", "S1"): (30, 210, 30),      # mid_insider: 60/90/120 + the 210-day control (was max 200)
+    ("DeterministicScorer", "S1"): (15, 180, 5),        # mid_ds 15/20/25/30 (was 30..200 step 30)
+    ("DeterministicScorer", "S2"): (15, 120, 5),        # (was 20..120 step 20)
+    ("FMPRating", "S2"): (20, 120, 10),                 # small_rating 60/90/120 (was step 20: no 90)
+    ("FMPEarningsDrift", "S2"): (20, 120, 10),          # small_earnings 60/90/120 (was step 20: no 90)
+    ("DeterministicScorer", "SQM"): (15, 120, 5),       # analyst_targets hold 15/30/60 (was 20..120 step 10: no 15)
+}
+_MARKET_PROFILE_GENE_PROFILES = ("ohlcv-v1", "ta-structure-v1")
+
+
+def _resolve_exclude_symbols_arg(spec) -> list:
+    """Parse ``--exclude-symbols``: a comma list, or ``@path`` to a file.
+
+    The file form is ONE SYMBOL PER LINE (not comma-separated): blank lines and lines starting
+    with ``#`` (comments) are skipped -- matches
+    ``docs/strategy_research/atr_grid/excluded_symbols.txt``. Returns the symbols
+    UPPERCASED, first-occurrence order, de-duplicated. ``None``/empty -> ``[]`` (no-op).
+    """
+    if not spec:
+        return []
+    spec = spec.strip()
+    if spec.startswith("@"):
+        path = spec[1:]
+        with open(path, encoding="utf-8") as f:
+            raw = [line.strip() for line in f]
+        raw = [line for line in raw if line and not line.startswith("#")]
+    else:
+        raw = [s.strip() for s in spec.split(",") if s.strip()]
+    seen: set = set()
+    out: list = []
+    for s in raw:
+        su = s.upper()
+        if su not in seen:
+            seen.add(su)
+            out.append(su)
+    return out
+
+
+def _coverage_report(symbols, interval: str, start: str, end: str, history_source: str):
+    """Per-symbol-day intraday coverage of these symbols (``ba2_providers.screener.intraday_coverage``) in the cache of
+    ``history_source`` (REQUIRED: the job's own history), None on a daily clock."""
+    from app.services.backtest import screener_launch as _sl
+    return _sl.coverage_report(symbols, interval, start, end, history_source)
+
+
+def _coverage_preflight(command: str, symbols, args, history_source: str) -> None:
+    """LAUNCH REFUSAL (every intraday ``optimize``): more than the stated share of symbol-days without an intraday bar.  The report
+    is printed either way (the screener gate only COUNTS candidates it cannot price).  The check is the function the web API
+    shares (``screener_launch.intraday_coverage_preflight``)."""
+    from app.services.backtest import screener_launch as _sl
+    try:
+        _sl.intraday_coverage_preflight(symbols, args.interval, args.start, args.end, history_source, command=command)
+    except _sl.ScreenerLaunchRefused as e:
+        sys.exit(f"{command}: " + e.body)
+
+
+def _apply_exclude_symbols(command: str, backtest_block: dict, exclude_symbols: list) -> None:
+    """Remove ``exclude_symbols`` from ``backtest_block['enabled_instruments']`` and persist the
+    FULL requested list on ``backtest_block['excluded_instruments']``.
+
+    Called AFTER every block that can rewrite ``enabled_instruments`` (--screener,
+    --screener-gate-store) and BEFORE ``_apply_market_conditions`` (whose coverage check reads
+    ``enabled_instruments`` and must see the REDUCED universe, or it would validate coverage for
+    symbols this run can never trade).
+
+    Persisting the full requested list (not just the subset that was present) is what lets a
+    re-run reproduce the exclusion even if the resolved universe differs slightly next time
+    (a different screener band snapshot, a cache refresh, ...). ``_build_daily_trial_config``
+    reads ``excluded_instruments`` back off the run config and carries it into
+    ``screener_runtime['excluded_symbols']`` (the classic per-bar screener gate,
+    ``daily_engine._screened_symbols_for_bar``) AND into a bypass expert's OWN per-trial settings
+    (FactorRanker's ``_screen_universe`` resolves its screener-mode universe straight from the
+    metric store, NOT from ``enabled_instruments`` -- see FactorRanker._resolve_universe_source's
+    docstring -- so removing symbols from ``enabled_instruments`` alone does not reach it).
+
+    No-op (byte-identical) when ``exclude_symbols`` is empty. Refuses an empty resulting universe
+    loudly: a run with nothing left to trade is a launch-time configuration error (CLAUDE.md "no
+    silent failure"), not a 0-trade result to discover after hours of compute.
+    """
+    if not exclude_symbols:
+        return
+    universe = list(backtest_block.get("enabled_instruments") or [])
+    # Uppercased defensively (not just relying on the caller having already normalized it via
+    # _resolve_exclude_symbols_arg): both the membership test AND the reported names are on the
+    # canonical uppercase form, so a mixed-case universe entry (e.g. a screener union that has
+    # not itself been normalized) is matched, and the report always names the symbol the same
+    # way regardless of how it happened to be cased in this run's universe.
+    excluded_set = {str(s).upper() for s in exclude_symbols}
+    removed = sorted({s.upper() for s in universe if s.upper() in excluded_set})
+    kept = [s for s in universe if s.upper() not in excluded_set]
+    if not kept:
+        sys.exit(f"{command}: --exclude-symbols removed the ENTIRE universe "
+                 f"({len(universe)} symbols: {sorted(universe)}) -- refusing an empty universe.")
+    backtest_block["enabled_instruments"] = kept
+    # Persisted verbatim (not just `removed`) — see docstring.
+    backtest_block["excluded_instruments"] = list(exclude_symbols)
+    print(f"{command}: excluded {len(removed)} of {len(exclude_symbols)} symbols "
+          f"({len(kept)} in this universe): "
+          f"{', '.join(removed) if removed else '(none of the given symbols were in this universe)'}")
+
+
+def _refuse_intraday_basis_mismatch(command: str, backtest_block: dict) -> None:
+    """EARLY REFUSAL (master side) of a job whose universe holds a symbol whose intraday cache is on a
+    different price level than its daily cache (``intraday_basis_preflight``; the same check re-runs at job
+    start on every worker, where it is job-fatal). Applies to an intraday-clock job and to an options job
+    (whose drawdown refinement reads 5-minute bars); a daily-clock equity job reads no intraday bar and is
+    untouched. Called AFTER the final universe is known (--screener, --exclude-symbols).
+
+    Prints the verdict counts and every symbol that could NOT be judged, is on REBASED prices, or (options job)
+    has no intraday bars to refine on. A mismatched symbol on the REVIEWED exclusion list
+    (``ba2_providers/ohlcv/intraday_basis_exclusions.json``; ``reviewed_by`` starting with "pending" is not in
+    force) is REMOVED from the universe with a printed line and recorded on the run
+    (``excluded_instruments`` + ``intraday_basis_exclusions``); any other mismatched symbol REFUSES the launch
+    with (symbol, factor, class). There is no flag that skips the check."""
+    from app.services.backtest import intraday_basis_preflight as pf
+    from ba2_common.core.split_basis import IntradayBasisError
+    from ba2_providers.ohlcv import intraday_exclusions as _ix
+    interval = pf.interval_to_check(backtest_block)
+    if interval is None:
+        return
+    import os as _os
+    from ba2_providers.ohlcv import cross_interval_basis as _cib
+    n = len(backtest_block["enabled_instruments"])
+    print(f"{command}: intraday/daily basis preflight over {n} symbols ({interval}) ...", flush=True)
+    workers = max(1, min(8, (_os.cpu_count() or 2) - 1))
+    lo, hi = _cib.judged_window(backtest_block["start_date"], backtest_block["end_date"], int(backtest_block["warmup_days"]))
+    first = pf.scan(backtest_block["enabled_instruments"], interval, lo, hi, workers=workers,
+                    job_kind=pf.job_kind_of(backtest_block))
+    force = _ix.in_force(_ix.load_exclusions())
+    bad = {r.symbol for r in first.mismatched} | {s for s, _ in first.stale}
+    listed = sorted(s for s in bad if s in force)
+    if listed:
+        applied = [{"symbol": s, "reason": force[s]["reason"], "added": force[s]["added"],
+                    "reviewed_by": force[s]["reviewed_by"], "interval": interval} for s in listed]
+        print(f"{command}: EXCLUDING {len(listed)} symbols on the reviewed intraday-basis exclusion list from the universe: "
+              + "; ".join(f"{e['symbol']} ({e['reason'][:70]}, {e['added']}, reviewed by {e['reviewed_by']})" for e in applied),
+              flush=True)
+        _apply_exclude_symbols(command, backtest_block,
+                               list(backtest_block.get("excluded_instruments") or []) + [s for s in listed])
+        backtest_block["intraday_basis_exclusions"] = applied
+    unneeded = sorted(s for s in force if s in {x.upper() for x in backtest_block["enabled_instruments"]} and s not in bad)
+    if unneeded:
+        print(f"{command}: NOTE exclusion-list entries no longer needed (the symbol passes the check now): "
+              f"{', '.join(unneeded)} -- ask for the entries to be removed", flush=True)
+    try:
+        rep = pf.require_for_config(backtest_block, workers=workers)
+    except IntradayBasisError as e:
+        sys.exit(f"{command}: REFUSED -- {e}")
+    print(f"{command}: intraday basis preflight OK: "
+          + ", ".join(f"{k}={v}" for k, v in sorted(rep.counts.items())), flush=True)
+    if rep.unjudged:
+        print(f"{command}: WARNING {len(rep.unjudged)} symbol(s) could not be judged (not refused, NOT ok): "
+              + ", ".join(f"{r.symbol}[{r.klass}]" for r in rep.unjudged[:40])
+              + (" ..." if len(rep.unjudged) > 40 else ""), flush=True)
+    if rep.rebased:
+        print(f"{command}: {len(rep.rebased)} universe symbol(s) run on REBASED intraday prices (provenance in "
+              f"_split_basis/*.intraday-rebase.json; recorded in the job result); volume NOT adjusted for: "
+              f"{', '.join(r['symbol'] for r in rep.rebased if r.get('volume_unadjusted')) or 'none'}", flush=True)
+    if rep.bursts:
+        print(f"{command}: {len(rep.bursts)} judged-ok symbol(s) carry >= 3 sessions more than 10% off the daily close "
+              f"inside this window (short bursts, not refused, recorded in the result): "
+              + ", ".join(f"{s}({k})" for s, k in rep.bursts[:25]) + (" ..." if len(rep.bursts) > 25 else ""), flush=True)
+    if rep.option_uncovered:
+        sess = sum(r.daily_sessions if r.klass == "no_intraday" else r.no_intraday_sessions for r in rep.option_uncovered)
+        print(f"{command}: WARNING OPTIONS job: {len(rep.option_uncovered)} underlying(s) have no / too thin {interval} bars, so the "
+              f"intraday drawdown refinement SKIPS them ({sess} daily sessions without an intraday bar; recorded in the "
+              f"result): " + ", ".join(f"{r.symbol}[{r.klass}]" for r in rep.option_uncovered[:30]), flush=True)
 
 
 def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
@@ -5286,12 +6343,18 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     if _MARKET_CONDITION_PROFILES and kind and kind not in _MARKET_CONDITION_STRATEGIES:
         # A strategy whose builders emit NO market leaves would be labelled gated, would demand
         # snapshot coverage of its own universe, and would search exactly zero market genes --
-        # so `optimize-batch --strategies S1,O_LC --market-condition-profile ...` produced an S1
-        # job that failed coverage against the OPTION universe while claiming to be gated.
-        sys.exit(f"{command}: --market-condition-profile is options-only in this delivery, and "
-                 f"{kind!r} emits no market-condition gates (gated keys: "
-                 f"{sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or run the option "
-                 f"keys in a job of their own.")
+        # so `optimize-batch --strategies S1,O_STK --market-condition-profile ...` produced an
+        # O_STK job that failed coverage against the gated universe while claiming to be gated.
+        sys.exit(f"{command}: --market-condition-profile: {kind!r} emits no market-condition "
+                 f"gates (gated keys: {sorted(_MARKET_CONDITION_STRATEGIES)}). Drop the flag, or "
+                 f"run the gated keys in a job of their own.")
+    if _MARKET_EXIT_KINDS_SELECTED and kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # --market-exit is attached ONLY by the equity dispatch in _build_strategy (design section
+        # 5.2 scopes it to S1-S7); an option kind would otherwise silently build WITHOUT the
+        # requested exit rules while the command line claims they are on.
+        sys.exit(f"{command}: --market-exit is equity-only (S1-S7) in this delivery, and "
+                 f"{kind!r} is not one of them ({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). "
+                 f"Drop the flag, or run the equity keys in a job of their own.")
     if not _MARKET_CONDITION_PROFILES:
         if _MARKET_CONDITION_MANIFESTS:
             # Ignoring it would run an UNGATED grid from a command line that says otherwise, and
@@ -5397,6 +6460,645 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     print(f"{command}: market-condition {shown}; {len(genes)} added genes; population and "
           f"generations are NOT scaled by the profile(s)")
     return recorded
+
+
+def _data_rebase_from_optimize_args(tokens) -> dict:
+    """The DATA choices an ``optimize`` command line states, for ``_rebase_run_data``.
+
+    goal2027 two-phase walk-forward (docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md): a fold
+    trained in phase A is tested in phase B on the data of the command that runs the test. Returns
+    ``static_universe`` (the ``--universe`` list of a non-screener job, else None), ``screener_store``
+    (``--screener-store`` of a screener job, else None), ``manifests`` (``{profile: digest}`` from
+    ``--market-condition-manifest``, both spellings, else None) and ``exclude_symbols`` (the current
+    ``--exclude-symbols``; ``[]`` when the command excludes nothing). Pure: no launcher global is set.
+    """
+    tokens = list(tokens)
+
+    def value(flag):
+        return tokens[tokens.index(flag) + 1] if flag in tokens and tokens.index(flag) + 1 < len(tokens) else None
+
+    screener = "--screener" in tokens
+    universe = value("--universe")
+    profiles = [p.strip() for p in str(value("--market-condition-profile") or "").split(",")
+                if p.strip() and p.strip() != "none"]
+    raw = [t.strip() for t in str(value("--market-condition-manifest") or "").split(",") if t.strip()]
+    manifests = None
+    if raw:
+        if any("=" in t for t in raw):
+            if not all("=" in t for t in raw):
+                raise ValueError(f"--market-condition-manifest {raw!r} mixes bare digests with profile=digest pairs")
+            manifests = {t.partition("=")[0].strip(): t.partition("=")[2].strip() for t in raw}
+        elif len(raw) != len(profiles):
+            raise ValueError(f"{len(raw)} --market-condition-manifest digest(s) for profile(s) {profiles!r}")
+        else:
+            manifests = dict(zip(profiles, raw))
+    return {"static_universe": (None if screener or not universe
+                                else [s.strip().upper() for s in universe.split(",") if s.strip()]),
+            "screener_store": value("--screener-store") if screener else None,
+            "manifests": manifests,
+            "exclude_symbols": _resolve_exclude_symbols_arg(value("--exclude-symbols"))}
+
+
+def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forward test") -> dict:
+    """A COPY of a stored run block whose DATA choices are the current command's (``spec`` from
+    ``_data_rebase_from_optimize_args``); the genome, the expert settings, the gene lists and every
+    other key stay the stored run's. Applied by ``_persist_top_backtests(data_rebase=)`` AFTER the window
+    override, so the manifest checks run on the TEST window.
+
+    * universe: a static run takes the current ``--universe``; a screener run keeps its stored superset
+      (the train job's, as every out-of-sample re-run does) and reads the current ``--screener-store``;
+    * exclusions: the stored list PLUS the current one, removed from the universe (an exclusion is
+      never lifted by a rebase);
+    * market-condition manifests: the current digest per profile, validated for coverage and window
+      like a launch. The profile SET must be the train job's (it is part of the gene space).
+
+    Every mismatch is a ``ValueError``: a test on data the command did not state is not a test of it.
+    """
+    import copy as _copy
+    block = _copy.deepcopy(backtest_block)
+    screener = bool(block.get("screener_opt"))
+    if screener and spec.get("static_universe") is not None:
+        raise ValueError(f"{command}: the run is a screener run; a static --universe cannot replace its universe")
+    if not screener and spec.get("screener_store"):
+        raise ValueError(f"{command}: --screener-store given for a static-universe (non-screener) run")
+    if screener:
+        if spec.get("screener_store"):
+            block["screener_opt"]["store"] = spec["screener_store"]
+        universe = list(block.get("enabled_instruments") or [])
+    else:
+        if not spec.get("static_universe"):
+            raise ValueError(f"{command}: a static-universe run needs the current --universe to be tested on")
+        universe = list(spec["static_universe"])
+    # UNION with the stored list, never a replacement: the per-bar screener gate and FactorRanker read
+    # ``excluded_instruments`` directly, so dropping a stored exclusion could readmit a symbol.
+    excluded = list(block.get("excluded_instruments") or [])
+    excluded += [s for s in (spec.get("exclude_symbols") or []) if s.upper() not in {e.upper() for e in excluded}]
+    ex = {s.upper() for s in excluded}
+    kept = [s for s in universe if s.upper() not in ex]
+    if not kept:
+        raise ValueError(f"{command}: the current exclusions remove the entire universe ({len(universe)} symbols)")
+    block["enabled_instruments"] = kept
+    block["excluded_instruments"] = excluded
+
+    stored = dict(block.get("market_condition_manifests") or {})
+    current = dict(spec.get("manifests") or {})
+    if stored or current:
+        if not stored:
+            raise ValueError(f"{command}: manifest(s) {current!r} given for a run trained without market conditions")
+        if not current:
+            raise ValueError(f"{command}: the run was trained with market-condition manifests {stored!r}; the test "
+                             f"command states none (pass --market-condition-manifest for the new data)")
+        if set(current) != set(stored):
+            raise ValueError(f"{command}: profile(s) {sorted(current)} differ from the train job's {sorted(stored)}")
+        from types import SimpleNamespace
+
+        from app.services.backtest import seam_wiring as _sw
+        facts_by_profile = {}
+        for profile, digest in current.items():
+            facts = dict(_market_condition_manifest_facts(digest, profile))
+            reader = facts.pop("reader")
+            check = {"enabled_instruments": kept, "start_date": str(block["start_date"]),
+                     "end_date": str(block["end_date"]), "_ga_trial": True}
+            _sw.check_market_condition_coverage(check, SimpleNamespace(mapped_reader=reader))
+            _sw.check_market_condition_window(check, SimpleNamespace(mapped_reader=reader))
+            facts_by_profile[profile] = facts
+        block["market_condition_manifests"] = current
+        if isinstance(block.get("market_condition"), dict):
+            block["market_condition"]["manifests"] = dict(current)
+            block["market_condition"]["facts"] = facts_by_profile
+    return block
+
+
+def _apply_benchmark_regime(command: str, backtest_block: dict, strat, kind: str = "") -> dict:
+    """Record the SPY regime gate on a run's backtest block, or do nothing.
+
+    NOTHING is written (and ``{}`` returned) with the flag off: the stored config, its digest and
+    the checkpoint identity of every existing run stay unchanged. With it on:
+
+    * REFUSED for a key whose builders emit no SPY leaves (anything outside
+      ``_PURE_OPTION_STRATEGIES`` and the equity S1-S7, goal2027 2.3), and for a job whose built
+      strategy carries none (a bypass expert's minimal strategy): the job would be labelled gated
+      and search no such gene;
+    * REQUIRES the job's resolved ``ohlcv_history_source``: the SPY series the regime is computed
+      from is the job's own history, so it is stamped here and printed.
+    """
+    if not _BENCHMARK_REGIME_GATES:
+        return {}
+    gated_keys = _PURE_OPTION_STRATEGIES | _EQUITY_MARKET_CONDITION_STRATEGIES
+    if kind and kind not in gated_keys:
+        sys.exit(f"{command}: --benchmark-regime-gates: {kind!r} emits no SPY regime gates "
+                 f"(gated keys: {sorted(gated_keys)}). Drop the flag, or run the "
+                 f"gated keys in a job of their own.")
+    source = backtest_block.get("ohlcv_history_source")
+    if not source:
+        sys.exit(f"{command}: --benchmark-regime-gates needs the job's resolved "
+                 f"ohlcv_history_source (the SPY series is read from it); none on the run config")
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS
+
+    from app.services.strategy_param_space import collect_param_space
+
+    bench = set(BENCHMARK_FIELDS)
+
+    def _has_gate(node) -> bool:
+        if isinstance(node, list):
+            return any(_has_gate(n) for n in node)
+        if isinstance(node, dict):
+            return node.get("field") in bench or any(_has_gate(v) for v in node.values())
+        return False
+
+    if not _has_gate(getattr(strat, "entry_rules", None) or []):
+        sys.exit(f"{command}: --benchmark-regime-gates: the built strategy carries no SPY regime "
+                 f"gate (a bypass expert builds no entry rules); drop the flag for this job")
+    genes = sorted(g for g in collect_param_space(strat) if "-spy-" in g)
+    recorded = {"symbol": "SPY", "history_source": source, "trend": "sma200+sma50slope10",
+                "vol": "rv20-rank504", "genes": genes, "gene_count": len(genes)}
+    backtest_block["benchmark_regime_gates"] = True
+    backtest_block["benchmark_regime"] = recorded
+    print(f"{command}: benchmark regime gates on (SPY, {source}); {len(genes)} added genes; "
+          f"population and generations are NOT scaled")
+    return recorded
+
+
+def _resolve_market_condition_mode(raw, command: str) -> str:
+    """Parse ``--market-condition-mode``; sets and returns the module global.
+
+    ``searched`` (default) is today's behaviour: the entry gates and (with ``--market-exit``) the
+    exit rules are GA genes. ``all-off`` is the matched control (design section 6): every market
+    gene is frozen off -- ``_append_equity_market_condition_gates``/``_append_equity_market_exit_
+    rules`` skip the strategy entirely, so the built tree is byte-identical to profile ``none``,
+    while ``_apply_market_conditions`` still pins/validates the SAME manifest and writes the SAME
+    ``market_condition_profile`` expert setting, so the control pays the same data-supply cost."""
+    global _MARKET_CONDITION_MODE
+    mode = raw or _MARKET_CONDITION_MODE_SEARCHED
+    if mode not in (_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF):
+        sys.exit(f"{command}: --market-condition-mode must be "
+                 f"{_MARKET_CONDITION_MODE_SEARCHED!r} or {_MARKET_CONDITION_MODE_ALL_OFF!r}, "
+                 f"got {mode!r}")
+    _MARKET_CONDITION_MODE = mode
+    return _MARKET_CONDITION_MODE
+
+
+def _resolve_market_exit_kinds(raw, command: str) -> tuple:
+    """Parse ``--market-exit``; sets and returns the module global (``()`` = no market exits).
+
+    Mirrors ``tools/strategy_research/exploration/market_conditions.py:exit_selection``: distinct
+    kinds from ``MARKET_EXIT_KINDS``, requires a profile (the rules read market conditions) and
+    requires the ``searched`` arm (the all-off control cannot carry searched exit genes -- design
+    section 6, "identical except every market gene frozen off")."""
+    global _MARKET_EXIT_KINDS_SELECTED
+    from ba2_common.core.market_condition_templates import MARKET_EXIT_KINDS
+
+    tokens = tuple(t.strip() for t in str(raw or "").split(",") if t.strip())
+    if not tokens:
+        _MARKET_EXIT_KINDS_SELECTED = ()
+        return _MARKET_EXIT_KINDS_SELECTED
+    unknown = [t for t in tokens if t not in MARKET_EXIT_KINDS]
+    if unknown or len(set(tokens)) != len(tokens):
+        sys.exit(f"{command}: --market-exit takes distinct kinds from "
+                 f"{','.join(MARKET_EXIT_KINDS)}; got {list(tokens)!r}")
+    if not _MARKET_CONDITION_PROFILES:
+        sys.exit(f"{command}: --market-exit requires --market-condition-profile (the rules read "
+                 f"market conditions)")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --market-exit adds searched genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry them")
+    _MARKET_EXIT_KINDS_SELECTED = tuple(k for k in MARKET_EXIT_KINDS if k in tokens)
+    return _MARKET_EXIT_KINDS_SELECTED
+
+
+def _resolve_search_sl_loosen(raw, command: str) -> bool:
+    """Parse ``--search-sl-loosen``; sets and returns the module global."""
+    global _SEARCH_SL_LOOSEN
+    _SEARCH_SL_LOOSEN = bool(raw)
+    return _SEARCH_SL_LOOSEN
+
+
+def _sl_loosen_gene_space() -> dict:
+    """The ONE ``allow_ruleset_sl_loosen`` expert gene (``model:`` once collected) ``--search-sl-loosen`` adds ({} when off).
+
+    Int 0/1 like every other RM toggle gene (``use_atr_stop``, ``screener_weinstein_stage2_only``)
+    -- ``_build_daily_trial_config`` merges it straight onto the expert's per-trial settings
+    (``overrides``, no whitelist in that path: every ``model:*`` key flows through unconditionally)
+    and ``ruleset_sl_loosen_allowed``/``coerce_bool`` read it back as a real bool regardless of
+    whether it lands as an int or (an older row's) the JSON string ``"1"``. NOT gated by
+    ``_MARKET_CONDITION_MODE`` -- design D6 requires it searched in BOTH arms, or the comparison
+    would measure two things at once."""
+    if not _SEARCH_SL_LOOSEN:
+        return {}
+    # Keyed by the PLAIN setting name, like every other expert gene (``risk_per_trade_pct``,
+    # ``use_atr_stop``): ``collect_param_space`` adds the ``model:`` namespace itself, and
+    # ``decode_params`` strips exactly one. Keying it ``model:allow_ruleset_sl_loosen`` here made
+    # the gene ``model:model:...`` and the trial setting ``model:allow_ruleset_sl_loosen`` -- a name
+    # nothing reads -- so the gene was INERT in every goal2027atr job before 2026-10-02.
+    return {_SL_LOOSEN_SETTING: {
+        "optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"}}
+
+
+def _resolve_search_sizing_mode(raw, explicit_mode, command: str) -> bool:
+    """Parse ``--search-sizing-mode``; sets and returns the module global. Refuses (exit) together with an
+    explicit ``--sizing-mode``: one says "pin the mode", the other "search it".
+
+    Always ASSIGNS the global (False included) on purpose: the launcher is reused within one process
+    (tests, optimize-batch, in-process drivers), and a value left over from a previous command would
+    silently add the gene to, or drop the pin from, an unrelated run. Every command entry resets it."""
+    global _SEARCH_SIZING_MODE
+    if raw and explicit_mode:
+        sys.exit(f"{command}: --search-sizing-mode and --sizing-mode {explicit_mode} are mutually exclusive "
+                 f"(search the mode, or pin it; not both)")
+    _SEARCH_SIZING_MODE = bool(raw)
+    return _SEARCH_SIZING_MODE
+
+
+def _resolve_search_market_profile(raw, command: str) -> bool:
+    """Parse ``--search-market-profile``; sets and returns the module global. MUST run after the profile, manifest
+    and mode resolvers. Refuses (exit) unless BOTH profiles are selected with BOTH manifests pinned and the
+    ``searched`` arm: the gene chooses between the profiles, so a missing profile (or an unpinned manifest) would be a
+    choice value that could never be evaluated honestly.
+
+    Always ASSIGNS the global (False included): the launcher is reused within one process, and a value left over
+    from a previous command would silently change an unrelated run's gene space."""
+    global _SEARCH_MARKET_PROFILE
+    _SEARCH_MARKET_PROFILE = False
+    if not raw:
+        return False
+    need = _MARKET_PROFILE_GENE_PROFILES
+    if tuple(sorted(_MARKET_CONDITION_PROFILES)) != tuple(sorted(need)):
+        sys.exit(f"{command}: --search-market-profile needs --market-condition-profile {','.join(need)} "
+                 f"(both profiles); got {list(_MARKET_CONDITION_PROFILES)!r}")
+    unpinned = [p for p in need if not _MARKET_CONDITION_MANIFESTS.get(p)]
+    if unpinned:
+        sys.exit(f"{command}: --search-market-profile needs a --market-condition-manifest for BOTH profiles; "
+                 f"no manifest pinned for {unpinned!r}")
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        sys.exit(f"{command}: --search-market-profile searches the market genes; --market-condition-mode "
+                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry it")
+    _SEARCH_MARKET_PROFILE = True
+    return True
+
+
+def _refuse_market_profile_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic equity S1-S7 experts only (the strategies that carry the market master gene);
+    a bypass expert (FactorRanker) and the option strategies would search it dead -- refused, not inert."""
+    if not _SEARCH_MARKET_PROFILE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is a bypass expert that carries no market "
+                 f"genes; the gene would be searched but dead")
+    if kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --search-market-profile: {kind!r} is not an equity S1-S7 strategy "
+                 f"({sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}); the gene is for those only")
+
+
+def _resolve_search_ds_factor_weights(raw, command: str, expert: "str | None" = None) -> bool:
+    """Parse ``--search-ds-factor-weights``; sets and returns the module global. Refuses (exit) for any expert
+    but DeterministicScorer: the genes would be searched but never read.
+
+    Always ASSIGNS the global (False included): the launcher is reused within one process, and a value left over
+    from a previous command would silently change an unrelated run's gene space."""
+    global _SEARCH_DS_FACTOR_WEIGHTS
+    _SEARCH_DS_FACTOR_WEIGHTS = False
+    if not raw:
+        return False
+    if expert is not None and expert != _DS_FACTOR_EXPERT:
+        sys.exit(f"{command}: --search-ds-factor-weights is for {_DS_FACTOR_EXPERT} jobs only; {expert!r} never "
+                 f"reads the tw_*/fw_*/mom_lookback_days settings, so the genes would be searched but dead")
+    _SEARCH_DS_FACTOR_WEIGHTS = True
+    return True
+
+
+def _resolve_search_exploration_ranges(raw, command: str, expert: "str | None" = None) -> bool:
+    """Parse ``--search-exploration-ranges``; sets and returns the module global. Refuses (exit) for an expert with
+    no audited dimension. Always ASSIGNS the global (False included), like the other opt-in gene resolvers."""
+    global _SEARCH_EXPLORATION_RANGES
+    _SEARCH_EXPLORATION_RANGES = False
+    if not raw:
+        return False
+    if expert is not None and expert not in _EXPLORATION_RANGE_PAIRS:
+        sys.exit(f"{command}: --search-exploration-ranges: {expert!r} has no exploration dimension to widen "
+                 f"(defined for {sorted(_EXPLORATION_RANGE_PAIRS)}); the flag would change nothing")
+    _SEARCH_EXPLORATION_RANGES = True
+    return True
+
+
+def _apply_ml_model_keys(spec: dict, raw, expert: str, command: str) -> dict:
+    """``--ml-model-keys a,b``: replace MLForecast's ``model_key`` gene choices with these store aliases/keys for this
+    job only (e.g. a single-store GA, or a control store: naive / placebo). Flag-off returns ``spec`` untouched. Any
+    other expert is refused (the flag would change nothing). The aliases are NOT checked against the cache here: an
+    unknown one fails the first trial loudly (MLForecast.resolve_model_key)."""
+    if not raw:
+        return spec
+    if expert != "MLForecast":
+        sys.exit(f"{command}: --ml-model-keys only applies to MLForecast, not {expert!r}")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not keys or len(set(keys)) != len(keys):
+        sys.exit(f"{command}: --ml-model-keys needs distinct, non-empty store aliases, got {raw!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    out["expert_params"]["model_key"] = {"optimize": True, "type": "choice", "choices": keys}
+    print(f"{command}: --ml-model-keys: MLForecast model_key gene choices = {keys}")
+    # Single-horizon stores (the custom models predict one horizon each) trade THEIR horizon: the horizon gene is
+    # pinned to 0 ("the store's horizon"). A mix of single- and multi-horizon stores has no common horizon gene.
+    from ba2_common.core.ml_forecast import store as _store
+    from ba2_experts.MLForecast import resolve_model_key as _resolve
+    try:
+        single = [len(_store.read_meta(_resolve(k))["horizons"]) == 1 for k in keys]
+    except (ValueError, _store.ForecastStoreError) as e:
+        sys.exit(f"{command}: --ml-model-keys: cannot read a store's meta: {e}")
+    if all(single):
+        out["expert_params"]["horizon"] = {"optimize": True, "type": "choice", "choices": [0]}
+        print(f"{command}: --ml-model-keys: single-horizon stores -> horizon gene pinned to 0 (the store's horizon)")
+    elif any(single):
+        sys.exit(f"{command}: --ml-model-keys mixes single-horizon and multi-horizon stores; run them as separate GAs")
+    return out
+
+
+def _refuse_exploration_ranges_unsupported(command: str, expert: str, kind: str) -> None:
+    """The flag is defined per (expert, strategy); any other pair would be given a name token and a changed identity
+    for a gene space that is the same, so it is refused instead of silently inert."""
+    if _SEARCH_EXPLORATION_RANGES and kind not in _EXPLORATION_RANGE_PAIRS.get(expert, ()):
+        pairs = {e: list(k) for e, k in _EXPLORATION_RANGE_PAIRS.items()}
+        sys.exit(f"{command}: --search-exploration-ranges would not change {expert} {kind} (defined for "
+                 f"{pairs}); drop the flag for this job")
+
+
+def _apply_exploration_time_exit_range(strat, kind: str, expert: str):
+    """Widen the strategy's ONE ``days_opened`` threshold to the exploration lattice (a no-op for an unlisted pair)."""
+    rng = _EXPLORATION_TIME_EXIT_RANGE.get((expert, kind))
+    if rng is None or strat is None:
+        return strat
+    lo, hi, st = rng
+    leaves = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("field") == "days_opened" and node.get("optimize"):
+                leaves.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(strat.exit_rules)
+    if len(leaves) != 1:
+        raise ValueError(f"{expert} {kind}: expected one optimised days_opened threshold, found {len(leaves)}")
+    leaf = leaves[0]
+    if not (lo <= float(leaf["value"]) <= hi and (float(leaf["value"]) - lo) % st == 0):
+        raise ValueError(f"{expert} {kind}: template time exit {leaf['value']} is off the exploration lattice "
+                         f"{lo}..{hi} step {st}")
+    for key, camel, val in (("value_min", "valueMin", lo), ("value_max", "valueMax", hi),
+                            ("value_step", "valueStep", st)):
+        leaf[key] = leaf[camel] = val
+    return strat
+
+
+def _ds_factor_gene_space() -> dict:
+    """The DeterministicScorer factor genes ``--search-ds-factor-weights`` adds ({} when off; merged LAST, so every
+    existing gene keeps its position). ``w_analyst`` is the one EXISTING gene it widens (0.4 -> 0.8): the dict
+    update keeps its position. The ``mom_lookback_days`` choice ORDER is a persisted contract (the GA stores the
+    index). Zero-sum combinations are canonicalised at decode time (``neutralise_ds_factor_genes``)."""
+    if not _SEARCH_DS_FACTOR_WEIGHTS:
+        return {}
+    w = lambda: {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.1, "type": "float"}   # noqa: E731
+    return {
+        "w_analyst": {"optimize": True, "min": 0.0, "max": 0.8, "step": 0.1, "type": "float"},
+        "tw_mom": w(), "tw_d200": w(), "tw_rsi": w(), "tw_don": w(),
+        "fw_quality": w(), "fw_piotroski": w(), "fw_value": w(), "fw_growth": w(),
+        "mom_lookback_days": {"optimize": True, "type": "choice", "choices": [63, 126, 252]},
+        # analyst_targets recipe (exploration): targets leg only (aw_targets 1, aw_grades 0), 30/60/90-day target
+        # window, 3/5 minimum targets. The legs are normalised by DS; both 0 switches the section off at decode.
+        "aw_targets": w(), "aw_grades": w(),
+        "analyst_target_window_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
+        "analyst_min_targets": {"optimize": True, "min": 3, "max": 5, "step": 2, "type": "int"},
+    }
+
+
+def _sizing_mode_gene_space() -> dict:
+    """The ONE ``sizing_mode`` choice gene (``model:sizing_mode`` once collected) ``--search-sizing-mode`` adds
+    ({} when off). The choice ORDER is a persisted contract (the GA stores the index)."""
+    if not _SEARCH_SIZING_MODE:
+        return {}
+    return {"sizing_mode": {"optimize": True, "type": "choice", "choices": ["risk_atr", "notional"]}}
+
+
+def _refuse_sizing_gene_unsupported(command: str, kind: str, bypass: bool) -> None:
+    """The gene is for the classic S1-S7 experts only: a bypass expert (FactorRanker) never reads
+    ``sizing_mode`` and an option strategy sizes by its own structure rules, so the gene would be searched but
+    dead -- refused rather than silently inert (same convention as ``_refuse_sl_loosen_on_bypass``)."""
+    if not _SEARCH_SIZING_MODE:
+        return
+    if bypass:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is a bypass expert that never reads "
+                 f"sizing_mode; the gene would be searched but dead")
+    if kind in _OPTION_STRATEGY_KEYS:
+        sys.exit(f"{command}: --search-sizing-mode: {kind!r} is an option strategy; the gene is for the "
+                 f"classic equity strategies S1-S7 only")
+
+
+def _refuse_sl_loosen_on_bypass(command: str, kind: str, bypass: bool) -> None:
+    """``allow_ruleset_sl_loosen`` only affects the classic ruleset stop-loss policy
+    (``TradeActions.ruleset_stop_policy``); a bypass expert (FactorRanker) has no ruleset SL to
+    loosen, so the gene would be searched but dead -- refused rather than silently inert."""
+    if _SEARCH_SL_LOOSEN and bypass:
+        sys.exit(f"{command}: --search-sl-loosen: {kind!r} is a bypass expert with no classic "
+                 f"ruleset stop-loss to loosen; the gene would be searched but dead")
+
+
+def _equity_strategy_direction(strategy, kind: str) -> str:
+    """The ONE direction every position this equity strategy's entry rules open.
+
+    Derived from the built Strategy's OWN entry actions (mirrors ``tools/strategy_research/
+    exploration/market_conditions.py:job_direction``) rather than assumed long: S1-S7 are
+    long-only TODAY (every entry action is ``buy`` -- shorts, where enabled at all, are mirrored
+    onto the buy gates by a run-level engine flag, never a strategy-level sell entry), but a
+    strategy that ever grows a sell-side entry must not silently be gated with the wrong-side
+    market exit templates."""
+    opens = {str(a.get("action_type") or a.get("action") or "")
+             for rule in (getattr(strategy, "entry_rules", None) or [])
+             for a in (rule.get("actions") or []) if isinstance(a, dict)} & {"buy", "sell"}
+    if opens == {"buy", "sell"}:
+        raise ValueError(f"{kind}: entry rules both buy and sell; market exits need a single "
+                         f"position direction")
+    if not opens:
+        raise ValueError(f"{kind}: no buy/sell entry action; the position direction is unknown")
+    return "long" if opens == {"buy"} else "short"
+
+
+def _append_equity_market_condition_gates(strategy, kind: str):
+    """Append the market-condition ENTRY leaves to EVERY initial-entry AND tree of an equity
+    strategy (S1-S7), never to an exit/open-position rule (design section 5.1).
+
+    S1 has THREE entry rules, one per conviction tier (``_build_strategy_S1``), and design D5
+    requires them to SHARE one gate set (15 genes total, not 45). Sharing works for free: the SAME
+    leaf ids (``_market_condition_gates`` is deterministic in ``kind``) are appended,
+    independently copied, to every entry rule's tree here -- ``strategy_param_space`` keys
+    condition genes by leaf id ACROSS THE WHOLE STRATEGY (``decode_params``'s ``cond_by_id``) and
+    ``_apply_to_tree`` applies one decoded value/mode to every node carrying that id, exactly the
+    mechanism the option builders already use for ``shared-gate_confidence``/``shared-rel_volume``
+    across members. Every other S1-S7 builder has exactly one entry rule with a condition tree, so
+    this collapses to the ordinary single-tree case there.
+
+    Skipped entirely under the ``all-off`` control mode: the built tree must stay byte-identical
+    to profile ``none`` (design section 6).
+    """
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        return strategy
+    gates = _market_condition_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the "
+                         f"market-condition gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+        # OPT-IN MARKER for the master gene (``market:enabled``, atr_grid_2027 addendum) --
+        # RULE-level, not leaf-level: ``ConditionLeaf.to_canonical_dict`` is a fixed whitelist
+        # and does not re-emit unrecognised extras, so a marker stamped on a LEAF is silently
+        # dropped by the very ``normalize_trade_rules`` call below. ``TradeRule.to_canonical_
+        # dict`` DOES preserve unrecognised extras (``extra='allow'`` + ``__pydantic_extra__``
+        # merged back in), so the rule itself is the only place this survives a normalize pass
+        # -- and, by the same mechanism, every later JSON round trip (the Strategy row, a
+        # re-run, an export). This is what scopes ``market:enabled`` to exactly the equity
+        # S1-S7 goal2027atr jobs this function builds for: option strategies get their market
+        # leaves from ``_market_condition_gates``/``_append_market_condition_gates`` too, but
+        # never through THIS function, so they never carry the marker and never collect the
+        # master gene (``strategy_param_space._strategy_opts_into_market_master_gene``).
+        rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2: market:profile replaces market:enabled
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _append_equity_benchmark_regime_gates(strategy, kind: str):
+    """Append the SPY regime ENTRY leaves (``<kind>-spy-trend``, ``<kind>-spy-vol``) LAST to every
+    initial-entry AND tree of an equity strategy (S1-S7), never to an exit rule (goal2027 design 2.3).
+
+    The same leaves the option builders append (``benchmark_regime_leaves``), with the same sharing
+    as ``_append_equity_market_condition_gates``: S1's three conviction tiers get the SAME ids, so one
+    pair of mode genes drives all three. Appended after the market-condition leaves, so every existing
+    leaf keeps its index. Independent of the market profile: the SPY fields are a separate registry
+    (``BENCHMARK_FIELDS``), so ``market:profile`` / ``market:enabled`` never switch them; each has its
+    own ``off`` mode. A no-op with ``--benchmark-regime-gates`` off: every existing command is byte
+    for byte unchanged."""
+    gates = _benchmark_regime_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the SPY regime gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _equity_market_exit_terminal_catch_all(rule) -> bool:
+    """True for a TERMINAL CATCH-ALL exit rule: it matches every held position and stops
+    processing (ported from ``tools/strategy_research/exploration/market_conditions.py:
+    terminal_catch_all`` -- same algorithm, kept local so the launcher does not import from
+    ``tools/``). S2/S3/S5/S7/S1/S4's always-on floor stop (bare ``has_position``, first-match) is
+    exactly this shape."""
+    if rule.get("continue_processing") or rule.get("continueProcessing"):
+        return False
+
+    def matches_all(node):
+        if not node:
+            return True
+        if "conditions" in node:
+            group = node.get("operator") or node.get("type") or "AND"
+            return group in ("AND", "OR") and all(matches_all(c) for c in node["conditions"])
+        return (node.get("field") == "has_position"
+                and (node.get("op") or node.get("comparison")) == "is_true")
+
+    return matches_all(rule.get("conditions"))
+
+
+def _equity_market_exit_adjusts_stop_loss(rule) -> bool:
+    return any((a.get("action_type") or a.get("action")) == "adjust_stop_loss"
+              for a in (rule.get("actions") or []) if isinstance(a, dict))
+
+
+def _insert_equity_market_exit_rules(exit_rules, new_rules) -> tuple:
+    """Insert ``new_rules`` into an equity strategy's exit list AFTER the existing exits but
+    BEFORE the first TERMINAL CATCH-ALL rule (mirrors ``exploration/market_conditions.py:
+    attach_exits``): a catch-all placed first (S1-S3/S5/S7's floor stop) would otherwise shadow
+    every rule appended strictly at the end, under the engine's first-match semantics. The market
+    rules keep ``continue_processing`` on their adjust actions, so the catch-all still runs right
+    after them -- except the STOP rule is DROPPED when the catch-all itself adjusts the stop-loss
+    (S6 has no catch-all at all, so nothing is omitted there): the engine keeps only the LAST
+    stop-loss action of a pass, and the always-matching catch-all would win that race every time,
+    making a market stop ahead of it a searched-but-dead gene. Returns ``(rules, omitted)``.
+    """
+    rules = list(exit_rules or [])
+    at = next((i for i, r in enumerate(rules) if _equity_market_exit_terminal_catch_all(r)),
+             len(rules))
+    omitted: dict = {}
+    kept = list(new_rules)
+    if at < len(rules) and _equity_market_exit_adjusts_stop_loss(rules[at]):
+        stop_ids = [r["id"] for r in kept if "-mkt-stop" in r["id"]]
+        if stop_ids:
+            omitted["stop"] = (f"catch-all exit rule {rules[at].get('id')!r} adjusts the "
+                               f"stop-loss after it on every bar, and a pass keeps only its "
+                               f"last stop-loss action")
+            kept = [r for r in kept if r["id"] not in stop_ids]
+    if kept:
+        rules[at:at] = kept
+    return rules, omitted
+
+
+def _append_equity_market_exit_rules(strategy, kind: str):
+    """Append the ``--market-exit`` rules (``[]`` when unselected) to an equity strategy's exit
+    list, off by default behind their own rule-level toggle genes (design section 5.2).
+
+    Skipped under the ``all-off`` control mode -- ``_resolve_market_exit_kinds`` already refuses
+    that combination at parse time (``--market-exit`` requires the ``searched`` arm), so
+    ``_MARKET_EXIT_KINDS_SELECTED`` is guaranteed empty whenever the mode is ``all-off``; the
+    guard here is defensive, not load-bearing.
+    """
+    if not _MARKET_EXIT_KINDS_SELECTED:
+        return strategy
+    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        raise ValueError(f"{kind}: market exit rules requested with a non-searched "
+                         f"market-condition mode {_MARKET_CONDITION_MODE!r}")
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
+    from ba2_common.core.market_condition_templates import market_exit_rules
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    direction = _equity_strategy_direction(strategy, kind)
+    profiles = _market_condition_setting_profiles()
+    prefix = kind.lower()
+    rules = market_exit_rules(prefix, profiles, direction, _MARKET_EXIT_KINDS_SELECTED)
+    if not rules:
+        raise ValueError(f"{kind}: --market-exit {','.join(_MARKET_EXIT_KINDS_SELECTED)} "
+                         f"produced no rule for the selected profile(s) {','.join(profiles)}")
+    # OPT-IN MARKER for the master gene -- see the matching comment in
+    # _append_equity_market_condition_gates. Rule-level (these rules have no mode-gened leaves
+    # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
+    for rule in rules:
+        rule["market_master_gene"] = True
+        if _SEARCH_MARKET_PROFILE:
+            rule["market_profile_gene"] = True   # goal2027 2.2
+    merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
+    strategy.exit_rules = normalize_trade_rules(merged)
+    assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
+    if omitted:
+        print(f"{kind}: market-exit omitted {sorted(omitted)}: {omitted}")
+    return strategy
 
 
 def _option_signal_gate(m: str, member: str) -> dict:
@@ -5514,6 +7216,9 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             # profile `none` emits a byte-identical rule and an older gene key still names the
             # same gate. Design section 6: the initial-entry tree only -- never an exit rule.
             *_market_condition_gates(m),
+            # SPY REGIME gates (--benchmark-regime-gates; [] by default), after the market
+            # gates: appending keeps every existing leaf at its current index.
+            *_benchmark_regime_gates(m),
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
@@ -6783,6 +8488,10 @@ _STRATEGY_BUILDERS = {
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
+    "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
+    "MLH": _build_strategy_MLH, # (name) — MLForecast only: hold for a fixed time, no TP (custom-ML fair test)
+    "MLF": _build_strategy_MLF, # (name) — MLForecast only: MLH + take-profit at the forecast's own target
+    "MLR": _build_strategy_MLR, # (name) — MLForecast only: rotation over the top-N ranked symbols (selection track)
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
@@ -6846,12 +8555,33 @@ _STRATEGY_POP_FACTOR = {"S1": 1.5}
 # the ceiling, it just must not exceed it.
 _EXPERT_CONFIDENCE_CEILING = {
     "DeterministicScorer": 50.0,   # measured max |final| 0.562 -> 56.2; 50 leaves headroom
+    # MLForecast confidence = the probability used, in %: decile models clamp P(up) to [5, 95] (mapping.P_TAIL_CLAMP).
+    "MLForecast": 95.0,
 }
+
+
+#: DeterministicScorer's ceiling under ``--search-ds-factor-weights``. The 50.0 above was MEASURED under the default
+#: section weights (analyst <= 0.4 and a blended technical section), where the sections rarely agree. The dsfw gene
+#: space reaches combinations the measurement never saw (w_analyst up to 0.8, a targets-only analyst leg, a single
+#: technical component), so the measurement no longer bounds it. What does: confidence = 100 * |final|,
+#: final = tanh(raw / k_compress) * m with m <= 1 and raw a weighted AVERAGE of section scores in [-1, 1], hence
+#: |raw| <= 1 and |final| <= tanh(1 / k_compress). With ``DEF_K_COMPRESS`` = 0.6 (not a gene) that is
+#: tanh(1.667) = 0.9311 -> 93.1, floored to 93.0. This is the supremum, not an observed maximum (not measured on
+#: cached data); a gate between the observed maximum and 93 may be hard to pass, but none is arithmetically
+#: impossible, which is all the clamp exists to guarantee. A test recomputes the number from combine.py.
+_DS_FACTOR_CONFIDENCE_CEILING = 93.0
+
+
+def _confidence_ceiling_for(expert: str):
+    """The confidence ceiling of ``expert`` for the job being built (flag-off: ``_EXPERT_CONFIDENCE_CEILING``)."""
+    if _SEARCH_DS_FACTOR_WEIGHTS and expert == _DS_FACTOR_EXPERT:
+        return _DS_FACTOR_CONFIDENCE_CEILING
+    return _EXPERT_CONFIDENCE_CEILING.get(expert)
 
 
 def _clamp_confidence_genes(strat, expert: str):
     """Cap every `confidence` condition's value/range at the expert's reachable ceiling."""
-    ceiling = _EXPERT_CONFIDENCE_CEILING.get(expert)
+    ceiling = _confidence_ceiling_for(expert)
     if ceiling is None or strat is None:
         return strat
 
@@ -6894,7 +8624,22 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         builder = _STRATEGY_BUILDERS.get(kind)
         if builder is None:
             sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
-        strat = builder(name)
+        if kind == "S5" and _SEARCH_EXPLORATION_RANGES and expert == "FMPEarningsDrift":
+            strat = builder(name, time_exit=True)       # goal2027 2.9: S5 gains a toggleable time exit
+        else:
+            strat = builder(name)
+    if _SEARCH_EXPLORATION_RANGES:
+        strat = _apply_exploration_time_exit_range(strat, kind, expert)
+    if kind in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        # Equity market-condition gates/exits (design 2026-09-15 Task 11, lifted 2026-09-29):
+        # a no-op with the profile off / no --market-exit, so every existing S1-S7 command stays
+        # byte-identical. The option builders attach their own leaves internally (_option_entry_
+        # rule, _append_market_condition_gates called from the O_CC/O_PP/O_WHEEL builders); S1-S7
+        # attach here, once, generically, since every one of them returns a plain Strategy with no
+        # further per-kind splicing to interact with.
+        strat = _append_equity_market_condition_gates(strat, kind)
+        strat = _append_equity_benchmark_regime_gates(strat, kind)   # goal2027 2.3; no-op flag off
+        strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
     return _clamp_confidence_genes(strat, expert)
@@ -6975,6 +8720,27 @@ def _resolve_style_args(args, spec: dict, command: str) -> "dict | None":
         return _load_style_spec(path, name)
     except ValueError as e:
         sys.exit(f"{command}: {e}")
+def _resolve_chain_seed_source(db, name: str, warm_start_from) -> int:
+    """``--chain-seed-from NAME`` -> the id of the ONE completed optimization of that name.
+
+    Walk-forward chain seeding (docs/plans/2026-10-25-goal2027-walk-forward-plan.md): the handler
+    reads that row's stored final population. Refused here, before any row is created, when the
+    name is unknown, ambiguous or not completed, or when --warm-start-from is also given.
+    """
+    from app.models.strategy_optimization import StrategyOptimization
+    if warm_start_from is not None:
+        sys.exit("optimize: --chain-seed-from and --warm-start-from are mutually exclusive")
+    rows = db.query(StrategyOptimization.id, StrategyOptimization.status).filter(
+        StrategyOptimization.name == name).order_by(StrategyOptimization.id).all()
+    if not rows:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: no optimization has that name")
+    if len(rows) > 1:
+        sys.exit(f"optimize: --chain-seed-from {name!r}: {len(rows)} optimizations share that name "
+                 f"({', '.join(f'id={i} {st}' for i, st in rows)}); delete the unwanted rows")
+    if rows[0][1] != "completed":
+        sys.exit(f"optimize: --chain-seed-from {name!r}: optimization {rows[0][0]} is "
+                 f"{rows[0][1]!r}, not completed")
+    return int(rows[0][0])
 
 
 def _cmd_optimize(args) -> int:
@@ -6991,7 +8757,18 @@ def _cmd_optimize(args) -> int:
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
+    _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
+    _resolve_search_sizing_mode(getattr(args, "search_sizing_mode", False),
+                                getattr(args, "sizing_mode", None), "optimize")
+    _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
+    _resolve_search_ds_factor_weights(getattr(args, "search_ds_factor_weights", False), "optimize", args.expert)
+    _resolve_search_exploration_ranges(getattr(args, "search_exploration_ranges", False), "optimize", args.expert)
+    if getattr(args, "screen_preset", None):
+        _screener_launch_inputs(args)       # refuse a bad preset combination up front (before any DB work)
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -7005,11 +8782,31 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
+    spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
+    spec = _apply_ml_rank_top_n(spec, getattr(args, "ml_rank_top_n", None), expert, args.strategy, "optimize")
+    ml_hold_range = _ml_hold_from_horizon_range(getattr(args, "ml_hold_from_horizon", False),
+                                                getattr(args, "ml_model_keys", None), expert, args.strategy, "optimize")
     # BEFORE the fitness checks and the build: both read the style's members.
     global _STYLE_ACTIVE
     _STYLE_ACTIVE = _resolve_style_args(args, spec, "optimize")
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
+    # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
+    # today; "atr-searched" unpins use_atr_stop for this run only, persisted on the run config
+    # so every path that rebuilds a trial from it sees the same policy. Resolved and validated
+    # BEFORE anything is built: a refusal here must cost nothing.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name)
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
+    # --decision-times: the decision-time gene. Validated (and every refusal taken) before
+    # anything is built; None leaves the run byte-identical to one without the flag.
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize", interval=getattr(args, "interval", None),
+        name=args.name,
+        bypass_jobs=([expert] if spec.get("bypass") else []),
+        option_jobs=([f"{expert}/{args.strategy}"]
+                     if (spec.get("options") or args.strategy in _OPTION_STRATEGY_KEYS
+                         or args.strategy in _OPTION_GROUPS_ALL) else []))
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -7028,13 +8825,18 @@ def _cmd_optimize(args) -> int:
         days = {d: (d in sched_days) for d in
                 ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")}
         # `times` pins the ANALYSIS to the scheduled time-of-day so on a 5min fill clock the
-        # expert analyses ONCE/day (at market open) instead of every intraday bar. FMP bars are
-        # stamped in market-local 09:30-15:55, so "09:30" is the first regular-session bar.
-        run_sched = {"days": days, "times": ["09:30"]}
+        # expert analyses ONCE/day instead of every intraday bar. FMP bars are stamped in
+        # market-local 09:30-15:55 at the START of the bar and the decision price is the close of
+        # the latest bar that has ENDED, so the time is DEFAULT_DECISION_TIME (>= first bar + one
+        # bar), not the session's first bar: a decision there sees only the PRIOR close.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+        run_sched = {"days": days, "times": [DEFAULT_DECISION_TIME]}
     # Open-positions MANAGEMENT runs DAILY (mirrors live, which schedules open_positions far more
     # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
     # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
     manage_sched = _daily_manage_schedule()
+    # The OHLCV history source, resolved (and an option job on alpaca refused) before anything is built.
+    history_source = _resolve_history_source(args, "optimize", spec, args.strategy)
 
     init_db()
 
@@ -7068,6 +8870,9 @@ def _cmd_optimize(args) -> int:
     # because the accident this prevents is silent and costs hours of cluster time
     # while the inconvenience it causes is one flag.
     _opt_name = args.name or f"opt-{expert}"
+    _refuse_reused_timegene_name(_opt_name, decision_times, "optimize",
+                                 split=_decision_times_is_split(getattr(args, "decision_times", None)))
+    _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
     if not getattr(args, "rerun", False):
         _db = SessionLocal()
         try:
@@ -7087,6 +8892,11 @@ def _cmd_optimize(args) -> int:
     db = SessionLocal()
     try:
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize", args.strategy, bypass)
+        _refuse_sizing_gene_unsupported("optimize", args.strategy, bypass)
+        _refuse_market_profile_gene_unsupported("optimize", args.strategy, bypass)
+        _refuse_ds_only_strategy("optimize", args.strategy, expert)
+        _refuse_exploration_ranges_unsupported("optimize", expert, args.strategy)
         _sname = args.name or f"opt-{expert}-{args.strategy}"
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
@@ -7101,6 +8911,7 @@ def _cmd_optimize(args) -> int:
                 raise
             # The builder's message names the style and the member (also a PEP-678 note).
             sys.exit(f"optimize: {_refusal_text(e)}")
+        strat = _apply_ml_hold_range(strat, ml_hold_range)
         # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
         # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
         # affect it, then thread it into the run config below so the handler's _build_experts (and
@@ -7113,7 +8924,9 @@ def _cmd_optimize(args) -> int:
             "enabled_instruments": universe,
             "experts": [{"class": expert, "settings": _expert_run_settings(
                 spec, universe, _sizing_overrides(args),
-                strategy_kind=None if bypass else args.strategy)}],
+                strategy_kind=None if bypass else args.strategy,
+                rm_toggles_unpinned=rm_toggles_unpinned,
+                sizing_mode_searched=_SEARCH_SIZING_MODE)}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -7146,6 +8959,8 @@ def _cmd_optimize(args) -> int:
             "run_schedule_override": run_sched,
             "manage_schedule_override": manage_sched,
             "execution_interval": args.interval,
+            # Which OHLCV history every trial of this job reads (also in the checkpoint fingerprint).
+            "ohlcv_history_source": history_source,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -7160,6 +8975,28 @@ def _cmd_optimize(args) -> int:
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
+        # Persisted with the run (never an env var) so every consumer of this stored config --
+        # GA trials via _build_daily_trial_config, top-N persist, re-runs, robustness variants,
+        # tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same
+        # policy. Absent (pinned policy) keeps this block byte-identical to before the policy
+        # existed; only written when non-empty.
+        if rm_toggles_unpinned:
+            backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
+        # --fr-top-n-below-pool / --no-fr-top-n-below-pool (operator decision 2026-09-29,
+        # DEFAULT ON as of the same day -- see the flag's own help). ONLY ever written for a
+        # BYPASS expert (FactorRanker) job -- "Non-FactorRanker jobs never get the key" (operator
+        # decision): a classic expert's backtest_block never carries this key, whatever the CLI
+        # flag says, since the repair is meaningless (and a no-op) outside FactorRanker's
+        # top_n/screener_max_stocks settings. Persisted with the run (never an env var) so every
+        # consumer of this stored config -- GA trials via _build_daily_trial_config, top-N
+        # persist, re-runs, robustness variants, the export/deploy payload -- sees the same
+        # repair (or its absence). --no-fr-top-n-below-pool (or a non-bypass expert) leaves the
+        # key ABSENT, not False: _build_daily_trial_config and derive_export_payload both read a
+        # missing key as off, so a re-run of any FactorRanker row from BEFORE this default
+        # existed (goal2020, goal2027atr -atr27-fr/-fr2/-fr3, ...) still decodes byte-identically
+        # -- only a NEW run's config is affected by this default.
+        if bypass and getattr(args, "fr_top_n_below_pool", True):
+            backtest_block["fr_top_n_below_pool"] = True
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
         # WHICH store the run reads, resolved and recorded here rather than left to whatever
@@ -7185,87 +9022,54 @@ def _cmd_optimize(args) -> int:
         # param-space router sends them to the screener namespace). The run-level universe becomes
         # the metric store's FULL symbol union so the engine has OHLCV for any per-day pick.
         screener_genes: dict = {}
+        _uncached_exclusions: list = []   # --screener-exclude-uncached: merged into --exclude-symbols below
         if getattr(args, "screener", False):
             if not args.screener_store:
                 sys.exit("optimize: --screener requires --screener-store")
-            base = json.load(open(args.screener_base_json)) if args.screener_base_json else {}
-            # Cap-band job: override the market-cap gene RANGE for the band and pin market_cap_max in
-            # the base settings, so each band optimizes a DISJOINT, smaller cap universe (5min-feasible).
-            # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
-            _scr_opt = _SCREENER_OPT
-            _cap_band = getattr(args, "screener_cap_band", None)
-            if _cap_band:
-                _b = _SCREENER_CAP_BANDS[_cap_band]
-                _scr_opt = dict(_SCREENER_OPT)
-                _scr_opt["screener_market_cap_min"] = {"min": _b["min"], "max": _b["max"],
-                                                       "step": _b["step"], "type": "float", "optimize": True}
-                base = dict(base)
-                if _b.get("cap_max") is not None:
-                    base["market_cap_max"] = _b["cap_max"]
-            backtest_block["screener_opt"] = {
-                "store": args.screener_store,
-                "base_settings": base,
-                "cadence_days": int(args.screener_cadence_days),  # default 7 = weekly
-                # BYPASS experts (e.g. FactorRanker) ignore the classic entry-gate path, so the
-                # CLASSIC `screener_runtime` gate (which gates entries to the per-day screened
-                # universe) has no effect on them. Instead they read `universe_source` /
-                # `screener_store` / `screener_*` straight off their OWN expert settings to build
-                # their DYNAMIC universe from the fast metric_store. This flag tells
-                # `_build_daily_trial_config` to push the store + decoded screener genes onto the
-                # bypass expert's per-trial settings each generation. For NON-bypass experts the
-                # flag is False and only the classic `screener_runtime` path applies (unchanged).
-                "apply_to_expert_settings": bool(spec.get("bypass")),
-            }
-            from ba2_providers.screener import metric_store as _ms
-            _store_df = _ms.load_store(args.screener_store)
-            if _store_df.empty:
-                sys.exit(f"optimize: --screener-store {args.screener_store!r} has no symbols")
-            # Preload only the symbols ANY individual could screen in — the union under the LOOSEST
-            # end of every screener gene (most-admitting thresholds + max_stocks at its ceiling).
-            # This is the correct superset for the whole population (tighter individuals select a
-            # subset) and is far smaller than the raw store union (e.g. ~26-150 vs 868), so the
-            # OHLCV preload doesn't load/hold ~800 never-selected symbols. The per-bar
-            # screener_runtime gate still applies each individual's actual thresholds.
-            _loosest = dict(base)   # base carries market_cap_max for a cap-band job
-            _loosest.update({
-                "market_cap_min": _scr_opt["screener_market_cap_min"]["min"],
-                "relative_volume_min": _scr_opt["screener_relative_volume_min"]["min"],
-                "price_drop_pct": _scr_opt["screener_price_drop_pct"]["min"],
-                "weinstein_stage2_only": 0,
-                "max_stocks": _scr_opt["screener_max_stocks"]["max"],
-            })
-            enabled = _ms.screened_symbol_union(_store_df, args.start, args.end, _loosest)
-            if not enabled:
-                sys.exit(f"optimize: --screener-store {args.screener_store!r} selected zero symbols "
-                         f"for {args.start}..{args.end} under the loosest gene settings")
-            # Drop screened symbols with NO cached OHLCV for the run interval. The backtest is
-            # hermetic (never fetches mid-run), so preloading a symbol without bars hard-fails the
-            # whole run. The metric store (built from DAILY) legitimately contains names with no
-            # INTRADAY series — preferred shares / baby bonds (e.g. AQNB, DUKB, ELC) and a few thin
-            # tickers. The screener can still rank them; we just can't fill what has no bars. Match
-            # the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet (with the
-            # provider's symbol sanitisation: '-' -> '_'/'.').
-            import os as _os
-            from ba2_common.config import CACHE_FOLDER as _CF
-            _cdir = _os.path.join(_CF, "FMPOHLCVProvider")
-            _iv = args.interval
-            def _has_bars(sym: str) -> bool:
-                for cand in (sym, sym.replace("-", "_"), sym.replace("-", ".")):
-                    if _os.path.exists(_os.path.join(_cdir, f"{cand}_{_iv}.parquet")):
-                        return True
-                return False
-            _before = len(enabled)
-            enabled = [s for s in enabled if _has_bars(s)]
-            _dropped = _before - len(enabled)
-            if _dropped:
-                print(f"optimize: dropped {_dropped}/{_before} screened symbols with no cached "
-                      f"{_iv} OHLCV (e.g. preferred/baby-bond tickers) -> {len(enabled)} tradeable.")
-            if not enabled:
-                sys.exit(f"optimize: 0 of the screened union has cached {_iv} OHLCV — fetch it first "
-                         f"(ba2-test fetch-cache --timeframes {_iv} ...) or pick a different interval.")
-            backtest_block["enabled_instruments"] = enabled
-            universe = enabled  # for the progress line / submit description below
-            screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
+            # The launch preparation is ONE function shared with the web API
+            # (app.services.backtest.screener_launch): base settings, the daily-panel gate (classic jobs; the bypass
+            # expert FactorRanker keeps the weekly store gate), the superset static universe, the hermetic cache
+            # check.  Every refusal is a ScreenerLaunchRefused whose CLI text is the historical one.
+            from app.services.backtest import screener_launch as _sl
+            _sbase, _sopt, _scap = _screener_launch_inputs(args)
+            _sreq = _sl.ScreenerLaunchRequest(
+                store=args.screener_store, start=args.start, end=args.end, interval=args.interval,
+                base_settings=_sbase,
+                scr_opt=_sopt, cadence_days=int(args.screener_cadence_days),   # default 7 = weekly
+                history_source=history_source,
+                bypass=bool(spec.get("bypass")), surface=_sl.CLI,
+                cap_band=_scap,
+                panel=(os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None) else None),
+                exclude_uncached=bool(getattr(args, "screener_exclude_uncached", False)))
+            try:
+                _prep = _sl.prepare_screener_launch(_sreq)
+                if getattr(args, "print_universe", False):
+                    # DRY RUN for preflights (grid scripts): the job's static universe through the SAME function the
+                    # launch uses, and the symbols a launch would refuse on; nothing is submitted.
+                    _uncached, enabled = _prep.uncached, _prep.enabled
+                    _cov = _coverage_report([x for x in enabled if x not in set(_uncached)], args.interval, args.start, args.end,
+                                            history_source)
+                    from ba2_providers.screener import intraday_coverage as _icm
+                    _cov_probs = _icm.problems(_cov) if _cov else []
+                    print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
+                                                          "intraday_missing_coverage_share": (_cov["missing_coverage_share"] if _cov else None),
+                                                          "intraday_no_file": (_cov["no_intraday_file"] if _cov else None),
+                                                          "uncached": _uncached, "interval": args.interval,
+                                                          "rule": _us.RULE_ID,
+                                                          "criteria_version": _prep.criteria_version}),
+                          flush=True)
+                    sys.exit(0 if (not _uncached or getattr(args, "screener_exclude_uncached", False)) and not _cov_probs else 3)
+                _launch = _sl.apply_uncached_policy(_prep)
+            except _sl.ScreenerLaunchRefused as _e:
+                sys.exit(_e.text)
+            backtest_block["screener_opt"] = _launch.screener_opt
+            if getattr(args, "screen_preset", None):
+                backtest_block["screener_opt"]["screen_preset"] = args.screen_preset     # provenance on the run
+            backtest_block["enabled_instruments"] = _launch.enabled_instruments
+            backtest_block["screener_universe_rule"] = _launch.universe_rule
+            _uncached_exclusions = list(_launch.uncached_exclusions)
+            universe = _launch.enabled_instruments  # for the progress line / submit description below
+            screener_genes = dict(_launch.genes)
 
         # GATE-ONLY screener (--screener-gate-store): attach the metric store PURELY as a
         # per-bar entry gate (the options grid's max-stock-price cap) — the run universe stays
@@ -7275,7 +9079,8 @@ def _cmd_optimize(args) -> int:
         if _gate_opt:
             backtest_block["screener_opt"] = _gate_opt
             from ba2_providers.screener import metric_store as _gate_ms
-            _gate_df = _gate_ms.load_store(_gate_opt["store"])
+            from app.services.backtest.history_source import load_job_store as _load_job_store_g
+            _gate_df = _load_job_store_g(_gate_opt["store"], {"ohlcv_history_source": history_source})
             if _gate_df.empty:
                 sys.exit(f"optimize: --screener-gate-store {_gate_opt['store']!r} has no symbols")
             # Coverage guard: a symbol with no store row can NEVER pass the per-bar gate, so a
@@ -7299,6 +9104,24 @@ def _cmd_optimize(args) -> int:
         # enter ruleset with the option action (no equity leg). Equity strategies leave it unset.
         if strat_entry_action:
             backtest_block["entry_action"] = strat_entry_action
+        # --exclude-symbols: AFTER the screener/gate-only blocks (which can still rewrite
+        # enabled_instruments) and BEFORE _apply_market_conditions (whose coverage check reads
+        # enabled_instruments and must be checked against the REDUCED universe, same ordering
+        # reason as that check documents below).
+        _exclude_symbols = _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None))
+        _exclude_symbols = _exclude_symbols + [s for s in _uncached_exclusions if s.upper() not in _exclude_symbols]
+        _apply_exclude_symbols("optimize", backtest_block, _exclude_symbols)
+        if _exclude_symbols:
+            universe = list(backtest_block["enabled_instruments"])
+        # Cross-interval basis: refuse a universe with a symbol whose 5-minute cache is on another price
+        # level than its daily cache (decision price from one, history from the other).
+        _refuse_intraday_basis_mismatch("optimize", backtest_block)
+        universe = list(backtest_block["enabled_instruments"])      # the reviewed exclusion list may have removed some
+        _apply_ml_rank_universe("optimize", backtest_block, args.strategy,   # AFTER the last universe rewrite
+                                spec["expert_params"]["model_key"]["choices"] if args.strategy == "MLR" else ())
+        # the FINAL universe's intraday coverage (threshold + report); the price-basis cross-check is the shared function of
+        # fix/ohlcv-cross-interval-basis, not duplicated here
+        _coverage_preflight("optimize", list(backtest_block["enabled_instruments"]), args, history_source)
         # Market-condition gates: record the profile + the pinned manifest on the run config
         # (persisted, so every _build_daily_trial_config consumer of this run -- trials, re-runs,
         # robustness variants, top-N persist, tools/backtest_parity.py -- carries the digest), and
@@ -7309,9 +9132,16 @@ def _cmd_optimize(args) -> int:
         # Checked before that rewrite, a run whose real universe the snapshot does not cover would
         # pass -- exactly the silent miss this check exists to prevent.
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
+        _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
-        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}
+        # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
+        # 2 weekend genes); the pinned policy keeps all 7.
+        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
+                     else _SCHEDULE_DAY_OPT)
+        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
+        schedule_genes.update(_decision_time_gene(          # after the days: no index shift
+            decision_times, split=_decision_times_is_split(getattr(args, "decision_times", None))))
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -7322,15 +9152,25 @@ def _cmd_optimize(args) -> int:
             # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
             # their own portfolio so they carry only the narrow _BYPASS_RM_OPT block — unless the
             # spec opts out via no_bypass_rm — not the full _RM_OPT). Screener genes (screener:*
-            # namespace) are merged in ONLY when --screener is set.
+            # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
+            # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"], **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args)),
-                                    **screener_genes, **schedule_genes}),
+                              else {**spec["expert_params"],
+                                    **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
+                                                 atr_searched=(rm_toggle_policy == "atr-searched")),
+                                    **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
+                                    **_sizing_mode_gene_space(), **_ds_factor_gene_space()}),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
+        _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
         if getattr(args, "warm_start_from", None) is not None:
             cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
+        if getattr(args, "chain_seed_from", None):
+            cfg["chainSeedFromOptimizationId"] = _resolve_chain_seed_source(
+                db, args.chain_seed_from, getattr(args, "warm_start_from", None))
+        if getattr(args, "persist_final_population", False) or getattr(args, "chain_seed_from", None):
+            cfg["requireFinalPopulation"] = True
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -7426,8 +9266,17 @@ def _cmd_optimize_batch(args) -> int:
     _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None),
                                        "optimize-batch")
+    _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False),
+                                    "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
+    _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
+    _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
+    _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
+    _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
+    _resolve_search_market_profile(False, "optimize-batch")      # likewise
+    _resolve_search_ds_factor_weights(False, "optimize-batch")   # likewise
+    _resolve_search_exploration_ranges(False, "optimize-batch")  # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -7444,6 +9293,12 @@ def _cmd_optimize_batch(args) -> int:
     if _STYLE_KEY in strategies:
         sys.exit(f"optimize-batch: {_STYLE_KEY} is spec-driven (--style-config/--style) and "
                  f"runs through `optimize`, one style per command; the stage-2 driver loops it")
+    # --rm-toggle-policy (see _cmd_optimize). Resolved ONCE for the whole batch: every job in a
+    # batch run shares one policy, and the name guard checks the prefix every job name is built
+    # from.
+    rm_toggle_policy = getattr(args, "rm_toggle_policy", "pinned") or "pinned"
+    _refuse_atr_policy_without_job_name(rm_toggle_policy, args.name_prefix or "phase1")
+    rm_toggles_unpinned = _rm_toggles_unpinned_for_policy(rm_toggle_policy)
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -7452,17 +9307,36 @@ def _cmd_optimize_batch(args) -> int:
             jobs.append((e, "FACTOR"))
         else:
             jobs.extend((e, k) for k in strategies)
+    # --decision-times (see _cmd_optimize): one list for the whole batch, refused up front if ANY
+    # job of the batch cannot carry the gene (a partial application would score some jobs on a
+    # time search and others not, under one flag).
+    decision_times = _resolve_decision_times(
+        getattr(args, "decision_times", None), "optimize-batch",
+        interval=getattr(args, "interval", None),
+        name=args.name_prefix or "phase1",
+        bypass_jobs=[e for e, _k in jobs if _EXPERT_OPT[e].get("bypass")],
+        option_jobs=[f"{e}/{k}" for e, k in jobs
+                     if (_EXPERT_OPT[e].get("options") or k in _OPTION_STRATEGY_KEYS
+                         or k in _OPTION_GROUPS_ALL)])
     run_sched = None
     if args.run_schedule == "weekly":
         # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
         # signal that decays fast can scan more than once/week without going fully daily.
         sched_days = {d.strip().lower() for d in args.run_schedule_day.split(",") if d.strip()}
-        # `times` pins ANALYSIS to market open so a 5min fill clock analyses once/day, not per bar.
+        # `times` pins ANALYSIS to one bar so a 5min fill clock analyses once/day, not per bar;
+        # the shared default decision time (>= first bar + one bar), see _cmd_optimize.
+        from ba2_common.core.knowability import DEFAULT_DECISION_TIME
         run_sched = {"days": {d: (d in sched_days) for d in
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
-                     "times": ["09:30"]}
+                     "times": [DEFAULT_DECISION_TIME]}
+    if any(_k == "MLR" for _e, _k in jobs):
+        sys.exit("optimize-batch: strategy MLR needs --ml-rank-top-n and the job's rank_universe; run it with `optimize`")
     _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
+    # every job's history source resolved up front: an option job stated as alpaca refuses the whole
+    # batch BEFORE the first job is enqueued, not midway
+    for _e, _k in jobs:
+        _resolve_history_source(args, "optimize-batch", _EXPERT_OPT[_e], _k)
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
@@ -7473,6 +9347,7 @@ def _cmd_optimize_batch(args) -> int:
     for n, (expert, strat_kind) in enumerate(jobs, 1):
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
+        _refuse_sl_loosen_on_bypass("optimize-batch", strat_kind, bypass)
         prefix = args.name_prefix or "phase1"
         # Per-job resolution: pure-option kinds AND options experts (spec key `options` — a
         # bypass one's strat_kind is "FACTOR" and carries no option-kind default) default to
@@ -7482,6 +9357,8 @@ def _cmd_optimize_batch(args) -> int:
                                    "consistent_annual_return" if spec.get("options") else "calmar_ratio")
         _refuse_convex_fitness_mismatch("optimize-batch", strat_kind, fitness)
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
+        history_source = _resolve_history_source(args, "optimize-batch", spec, strat_kind)
+        _refuse_reused_history_source_name(name, history_source, "optimize-batch")
         db = SessionLocal()
         try:
             neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
@@ -7497,7 +9374,9 @@ def _cmd_optimize_batch(args) -> int:
                 "enabled_instruments": universe,
                 "experts": [{"class": expert, "settings": _expert_run_settings(
                     spec, universe, _sizing_overrides(args),
-                    strategy_kind=None if bypass else strat_kind)}],
+                    strategy_kind=None if bypass else strat_kind,
+                    rm_toggles_unpinned=rm_toggles_unpinned,
+                    sizing_mode_searched=_SEARCH_SIZING_MODE)}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -7524,6 +9403,8 @@ def _cmd_optimize_batch(args) -> int:
                 "run_schedule_override": run_sched,
                 "manage_schedule_override": _daily_manage_schedule(),
                 "execution_interval": args.interval,
+                # Which OHLCV history every trial of this job reads (see _cmd_optimize).
+                "ohlcv_history_source": history_source,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -7538,6 +9419,15 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
+            # Persisted with the run (see _cmd_optimize). Absent (pinned policy) keeps this
+            # block byte-identical to before the policy existed.
+            if rm_toggles_unpinned:
+                backtest_block["rm_toggles_unpinned"] = rm_toggles_unpinned
+            # --fr-top-n-below-pool / --no-fr-top-n-below-pool: see _cmd_optimize. DEFAULT ON,
+            # written ONLY for this job's bypass expert (FactorRanker) -- never for a classic
+            # expert's job in the same batch.
+            if bypass and getattr(args, "fr_top_n_below_pool", True):
+                backtest_block["fr_top_n_below_pool"] = True
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
             # The store decision, resolved once and recorded on the block. THIS driver is the one
@@ -7554,9 +9444,18 @@ def _cmd_optimize_batch(args) -> int:
             # seeds the enter ruleset with the option action (forwarded by _build_daily_trial_config).
             if strat_entry_action:
                 backtest_block["entry_action"] = strat_entry_action
+            # --exclude-symbols (see _cmd_optimize for the full rationale/ordering note). The
+            # outer `universe` var is SHARED across every job of this batch loop, so it is left
+            # untouched here -- only this job's own backtest_block is reduced.
+            _apply_exclude_symbols(
+                "optimize-batch", backtest_block,
+                _resolve_exclude_symbols_arg(getattr(args, "exclude_symbols", None)))
+            _refuse_intraday_basis_mismatch("optimize-batch", backtest_block)
+            _coverage_preflight("optimize-batch", list(backtest_block["enabled_instruments"]), args, history_source)
             # Market-condition gates (no-op with the profile off) — see _cmd_optimize for why this
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
+            _apply_benchmark_regime("optimize-batch", backtest_block, strat, strat_kind)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,
@@ -7572,11 +9471,21 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args)),
-                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
+                                  else {**spec["expert_params"],
+                                        **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
+                                                     atr_searched=(rm_toggle_policy == "atr-searched")),
+                                        **{f"schedule:{k}": v for k, v in
+                                           (_WEEKDAY_SCHEDULE_DAY_OPT
+                                            if rm_toggle_policy == "atr-searched"
+                                            else _SCHEDULE_DAY_OPT).items()},
+                                        **_decision_time_gene(
+                                            decision_times,
+                                            split=_decision_times_is_split(getattr(args, "decision_times", None))),
+                                        **_sl_loosen_gene_space()}),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))
+            _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
@@ -7850,7 +9759,9 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                             name_prefix: str = "TOP",
                             extra_labels: Optional[List[str]] = None,
                             use_remote_workers: bool = True,
-                            persisted_ids: Optional[List[tuple]] = None) -> int:
+                            persisted_ids: Optional[List[tuple]] = None,
+                            window: Optional[tuple] = None,
+                            data_rebase: Optional[dict] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
@@ -7865,7 +9776,18 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
       * ``extra_labels`` -- appended to the optimization's own labels on every persisted row;
       * ``use_remote_workers=False`` -- re-run on the local pool only, even when the
         optimization used remote workers;
-      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row.
+      * ``persisted_ids`` -- a list this appends ``(rank, backtest_id)`` to per persisted row;
+      * ``window`` -- ``(start, end)`` ISO dates that REPLACE the optimization's own run window
+        for every re-run (walk-forward out-of-sample tests, tools/run_walk_forward.py). Nothing
+        else about the trial changes (same ``decode_params`` + ``_build_daily_trial_config``,
+        the screener hoisted state is derived from the overridden window). The GA-fitness
+        fidelity gate is skipped: it compares against a score earned on a DIFFERENT window.
+        NOT an optimize path -- ``_assert_option_window_excludes_holdout`` guards only the
+        optimize CLI handlers and is deliberately not consulted here (a re-run is a single
+        measurement, not a search).
+      * ``data_rebase`` -- the current command's data choices (``_data_rebase_from_optimize_args``),
+        applied by ``_rebase_run_data`` after ``window``: a phase-A train job tested in phase B on the
+        new data (goal2027 two-phase walk-forward). None keeps the stored data.
 
     The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
     INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
@@ -7897,6 +9819,10 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         strat = db.query(Strategy).filter_by(id=opt.strategy_id).first()
         cfg = opt.optimization_config or {}
         bt_block = dict(cfg["backtest"])
+        if window is not None:
+            bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
+        if data_rebase is not None:
+            bt_block = _rebase_run_data(bt_block, data_rebase)
         # Apply the SAME screener hoisted state the GA scored each individual with, so the persisted
         # top-N are the actual optimized SCREENER runs (universe_source=screener + the per-individual
         # screener genes) — not static-universe runs. Without this the persisted top-N silently
@@ -8025,7 +9951,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 # scores disagree, the row is not the strategy that earned its rank -- and a row
                 # that reads as finished, with plausible numbers, is exactly what somebody
                 # deploys. Say so on the row and in the log rather than persisting it silently.
-                _div = rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit)
+                _div = (None if window is not None
+                        else rerun_fitness_divergence(trial_cfg.get("ga_fitness"), _rerun_fit))
                 if _div is not None:
                     _pct = "n/a" if _div["pct"] is None else f"{_div['pct']:+.1f}%"
                     print(f"    !! {name_prefix}{rank} RE-RUN DIVERGED from its GA score: "
@@ -8062,10 +9989,15 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
                           if use_remote_workers else [])
         if remote_workers:
-            from app.services.self_update import get_version_info
+            from app.services.self_update import master_sync_policy
             from app.services.worker_client import ensure_synced
-            master_version = get_version_info().get("app_version")
-            remote_workers = [w for w in remote_workers if ensure_synced(w, master_version, log=print)]
+            _master_info = master_sync_policy()  # raises PackageGatingError: refuse, never gate silently off
+            master_version = _master_info.get("app_version")
+            _drift_seen: set = set()
+            remote_workers = [w for w in remote_workers if ensure_synced(
+                w, master_version, log=print,
+                required_packages=_master_info.get("required_package_versions"),
+                master_packages=_master_info.get("package_versions"), drift_seen=_drift_seen)]
 
         if not specs:
             return persisted
@@ -8286,7 +10218,8 @@ def _cmd_sync_cache(args) -> int:
     """Push the master's cache (diff, one tar stream) to a configured remote worker."""
     from app.services import worker_client
     worker = _resolve_worker_names([args.worker])[0]
-    res = worker_client.push_cache(worker, log=print)
+    res = worker_client.push_cache(
+        worker, history_source=args.ohlcv_history_source, log=print)
     print(json.dumps(res, indent=2, default=str))
     return 0
 
@@ -8305,6 +10238,164 @@ def _cmd_worker(args) -> int:
     n_workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
     run_worker_server(host=args.host, port=args.port, password=password, n_workers=n_workers)
     return 0
+
+
+def _cmd_ml_search(args) -> int:
+    """Stage-A custom ML model search on the MAG7 point-in-time panels (task type ``ml_model_search``; design
+    docs/plans/2026-10-27-custom-ml-models-design.md). Trains on the 2025 folds only; writes trials.jsonl,
+    predictions/ and result.json under --out."""
+    from datetime import date as _date
+    from pathlib import Path
+    from ba2_common import config as _bc
+    from app.services.ml_search import ensure_panels, handle_ml_model_search
+    panels = ensure_panels(Path(args.panel_dir), _date.fromisoformat(args.panel_start),
+                           _date.fromisoformat(args.panel_end), _bc.CACHE_FOLDER)
+    res = handle_ml_model_search("cli-ml-search", {
+        "panels": panels, "out_dir": args.out, "population": args.population, "generations": args.generations,
+        "early_stop": args.early_stop, "early_stop_min_rel": args.early_stop_min_rel, "seed": args.seed,
+        "parallel": args.parallel, "top_n": args.top_n,
+        "darts_archs": [a.strip() for a in args.darts_archs.split(",") if a.strip()]})
+    print(f"ml-search: {res['n_trials']} trials ({res['n_refused']} refused), {res['generations_run']} generations")
+    for r in res["top"]:
+        print(f"  {r['fitness']:+.4f}  excess {r['excess']:+.4f} naive {r['naive_excess']:+.4f} "
+              f"cal {r['calibration']:.3f}  {r['label']}")
+    return 0
+
+
+def _ml_grid_report_only(directory: str) -> int:
+    """``ba2-test ml-grid --report-only DIR``: rebuild report.md and dashboard.html from DIR/results.jsonl (the gate
+    included) without running anything."""
+    from pathlib import Path as _Path
+    from app.services import ml_grid_report
+    d = _Path(directory)
+    if not (d / "results.jsonl").exists():
+        print(f"ml-grid --report-only: {d / 'results.jsonl'} not found")
+        return 2
+    st = ml_grid_report.build_outputs(d, report=True)
+    g = st["gate"]
+    # No same-quote nesting inside an f-string: that is Python 3.12+ and the masters run 3.11.
+    per_track = ", ".join(f"{t} {len(g['by_track'][t])}" for t in ("selection", "timing"))
+    print(f"ml-grid --report-only: {st['n_rows']} rows, {st['n_errors']} unresolved errors, "
+          f"{len(g['survivors'])} survivors ({per_track})")
+    print(f"  report:    {d / ml_grid_report.REPORT_NAME}")
+    print(f"  dashboard: {d / ml_grid_report.DASHBOARD_NAME}")
+    return 0
+
+
+#: The default groups of ``ba2-test ml-features`` - every registered group of ``ml_features.GROUPS`` (a test pins that).
+ML_FEATURES_DEFAULT_GROUPS = "t,mtf,m,x,mac,f,ag,at,i,s"
+
+
+def _ml_features_sector_overrides(items, no_sector: bool, symbols) -> dict:
+    """The ``{symbol: sector}`` overrides of ``ml-features``: ``--sector-override SYM=Sector`` (repeatable), or ``--no-sector``
+    (every symbol is an index / ETF); the two cannot be combined and an item without ``=`` is refused."""
+    from app.services import ml_features as _mf
+    items = list(items or [])
+    if no_sector and items:
+        raise SystemExit("ba2-test ml-features: --no-sector declares every symbol sectorless; it cannot be combined with "
+                         "--sector-override")
+    overrides = {}
+    for item in items:
+        sym, sep, sector = item.partition("=")
+        if not sep or not sym.strip() or not sector.strip():
+            raise SystemExit(f"ba2-test ml-features: --sector-override must be SYM=Sector, got {item!r}")
+        overrides[sym.strip().upper()] = sector.strip()
+    if no_sector:
+        overrides = {s: _mf.NO_SECTOR for s in symbols}
+    return overrides
+
+
+def _ml_grid_eval_settings(args):
+    """``{"eval_start": ..., "eval_end": ...}`` (only the given ones) from ``--eval-start`` / ``--eval-end``, None when
+    neither is given. Dates must be ISO ``YYYY-MM-DD``, inside (DATA_START, EVAL_END] -- the evaluation starts after the
+    history does and never past the last day of the data -- and the start before the end."""
+    from datetime import date as _date
+    from app.services import ml_grid_bounds as _g
+    raw = {"eval_start": getattr(args, "eval_start", None), "eval_end": getattr(args, "eval_end", None)}
+    given, parsed = {}, {}
+    for key, text in raw.items():
+        if text is None:
+            continue
+        flag = "--" + key.replace("_", "-")
+        try:
+            parsed[key] = _date.fromisoformat(text)
+        except ValueError:
+            raise SystemExit(f"ml-grid: {flag} must be a date YYYY-MM-DD, got {text!r}")
+        if not _g.DATA_START < parsed[key] <= _g.EVAL_END:
+            raise SystemExit(f"ml-grid: {flag} {text} is outside the allowed range: after {_g.DATA_START} (the data "
+                             f"start) and up to {_g.EVAL_END}")
+        given[key] = text
+    start, end = parsed.get("eval_start", _g.EVAL_START), parsed.get("eval_end", _g.EVAL_END)
+    if given and not start < end:
+        raise SystemExit(f"ml-grid: --eval-start ({start}) must be before --eval-end ({end})")
+    return given or None
+
+
+def _cmd_ml_grid(args) -> int:
+    """Stage-1 grid of the ML exploration v2 (task type ``ml_grid``, app/services/ml_grid.py): every cell of --config x
+    its seeds as out-of-sample walk-forward signals, scored per track with shuffle controls. Resumes: finished
+    (cell_key, seed) rows of --out/results.jsonl are skipped."""
+    if getattr(args, "report_only", None):                       # before the grid runner is imported
+        return _ml_grid_report_only(args.report_only)
+    from app.services.ml_grid import factor_effects, handle_ml_grid, read_results
+    if args.config is None or args.out is None or args.cpu_slots is None:
+        raise SystemExit("ml-grid: --config, --out and --cpu-slots are required unless --report-only DIR is given")
+    payload = {"config_path": args.config, "cells": None, "out_dir": args.out, "cpu_slots": args.cpu_slots,
+               "gpu_slots": args.gpu_slots, "limit_cells": args.limit_cells, "cache_root": args.cache_root,
+               "settings": _ml_grid_eval_settings(args), "cores": args.cores if args.cores is not None else (os.cpu_count() or 1),
+               "rerun_mismatched": args.rerun_mismatched,
+               "retry_timeouts": args.retry_timeouts}
+    try:
+        res = handle_ml_grid("cli-ml-grid", payload)
+    except KeyboardInterrupt:
+        print("ml-grid: interrupted (Ctrl-C). The rows already written are kept; run the same command to resume.")
+        return 130
+    if res["cancelled"]:
+        print("ml-grid: cancelled; run the same command to resume.")
+    print(f"ml-grid: {res['done']} rows written, {res['errors']} errors, {res['skipped_existing']} already finished "
+          f"-> {res['out_dir']}")
+    rows = read_results(f"{args.out}/results.jsonl")
+    for track in ("selection", "timing"):
+        if any(r.get("track") == track for r in rows):
+            fx = factor_effects(rows, track)
+            print(f"  top cells ({track}, mean - std of the primary over seeds; {len(fx['excluded'])} excluded for "
+                  f"coverage / near-constant models; deterministic families ran once, their std of 0 is built in):")
+            for _, c in fx["cells"].head(5).iterrows():
+                print(f"    {c['score']:+.4f}  mean {c['mean']:+.4f} std {c['std']:.4f}  {c['cell_key']} "
+                      f"{c['target']} h{c['horizon']} {c['family']} {c['train_months']} {c['groups']}")
+    return 1 if res["errors"] else 0
+
+
+def _cmd_ml_features(args) -> int:
+    """Build (or find up to date) the point-in-time DAILY feature store (ML exploration v2, app/services/ml_features.py):
+    features.parquet + meta + coverage report under --out. With --membership-top-n the X ranks and the breadth use the
+    per-session universe of the metric store (survivor-only, 2020+); without it the symbols file IS the universe (NDQ30)."""
+    from datetime import date as _date
+    from ba2_common import config as _bc
+    from app.services import ml_features as _mf
+    from app.services import ml_panel as _mp
+    from app.services import ml_universe as _mu
+    import pandas as _pd
+
+    symbols = _parse_symbols_arg("@" + args.symbols_file)
+    first, last = _date.fromisoformat(args.start), _date.fromisoformat(args.end)
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    overrides = _ml_features_sector_overrides(args.sector_override, args.no_sector, symbols)
+    membership = None
+    if args.membership_top_n:
+        sessions = _pd.DatetimeIndex(_pd.to_datetime(_mp.regular_sessions(first, last)["session"]))
+        membership = _mu.membership_from_universe(sessions, args.membership_top_n, args.purpose,
+                                                   store_dir=_mu.store_dir_for(_bc.CACHE_FOLDER))
+    res = _mf.ensure_feature_store(args.out, symbols, first, last, groups, membership, cache_root=_bc.CACHE_FOLDER,
+                                   chunk_size=args.chunk_size, sector_overrides=overrides, min_share=args.min_share,
+                                   force=args.force, holdout=args.holdout)
+    print(f"ml-features: {res['status']} -> {res['out_dir']} ({len(res['symbols'])} symbols"
+          + (f", {res['rows']} rows in {res['seconds']}s" if res["status"] == "built" else "") + ")")
+    for sym, reason in res["refused"].items():
+        print(f"  refused {sym}: {reason}")
+    for sym, reason in res["transient"].items():
+        print(f"  transient (may clear after a cache refresh; informational) {sym}: {reason}")
+    return 1 if res["refused"] else 0                       # a permanently refused symbol is not silently dropped
 
 
 def _add_robust_fitness_args(p) -> None:
@@ -8366,6 +10457,42 @@ def _add_market_condition_args(p) -> None:
                         "each worker would compute the indicators from whatever cache it "
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
+    p.add_argument("--benchmark-regime-gates", action="store_true", default=False,
+                   help="OPT-IN, option structures (O_*, groups, O_WHEEL) and the equity S1-S7 "
+                        "(goal2027; refused for any other key). Append two SPY-regime entry gates "
+                        "to every member's / equity entry rule's "
+                        "INITIAL-ENTRY tree: <member>-spy-trend (off/up/pullback/bear_rally/down/"
+                        "above_200/below_200) and <member>-spy-vol (off/calm/normal/stressed/"
+                        "not_stressed/not_calm), one categorical mode gene each (2 added genes "
+                        "per member; population/generations are NOT scaled). The SPY series is "
+                        "the job's own ohlcv history source. Folds into the job identity in "
+                        "tools/run_options_matrix.py. Absent = today's rules and genes.")
+    p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
+                   help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
+                        "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."
+                        "MARKET_EXIT_KINDS) to the strategy's exit list, AFTER its existing "
+                        "exits (but before a terminal catch-all floor stop, which would "
+                        "otherwise shadow them). Each rule is off by default behind its own "
+                        "rule-level toggle gene. Requires --market-condition-profile and "
+                        "--market-condition-mode searched (the default).")
+    p.add_argument("--market-condition-mode", default=_MARKET_CONDITION_MODE_SEARCHED,
+                   choices=(_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF),
+                   help="'searched' (default): the market entry gates and any --market-exit "
+                        "rules are GA genes. 'all-off': the matched CONTROL arm for a "
+                        "--market-condition-profile run -- every market gene is frozen off (no "
+                        "leaf/rule is appended at all), byte-identical to profile 'none' for "
+                        "both the entry gates and the exits, while the run still pins/validates "
+                        "the same manifest and writes the same market_condition_profile expert "
+                        "setting, so the control pays the same data-supply cost as the "
+                        "treatment. Run the SAME seed/population/generations as the matched "
+                        "'searched' job to isolate what the market conditions add.")
+    p.add_argument("--search-sl-loosen", action="store_true", default=False,
+                   help="Search allow_ruleset_sl_loosen (MarketExpertInterface, default False) "
+                        "as ONE model:* gene (int 0/1, decoded through coerce_bool to a real "
+                        "bool by every reader). NOT a market-condition gene (design D6) -- it is "
+                        "added in BOTH the searched and all-off arms, so the market-condition "
+                        "comparison isolates one variable. Refused on a bypass expert "
+                        "(FactorRanker): it has no classic ruleset stop-loss to loosen.")
 
 
 def main(argv: "list | None" = None) -> int:
@@ -8419,7 +10546,21 @@ def main(argv: "list | None" = None) -> int:
     pw = sub.add_parser("prewarm",
                         help="Pre-build the per-symbol FMP history disk cache for the grid experts "
                              "(ratings/earnings/insider) before the GA pool spawns.")
-    pw.add_argument("--symbols", required=True, help="Comma-separated symbols, or @file.")
+    pw.add_argument("--symbols", default=None,
+                    help="Comma-separated symbols, or @file. Optional with --screener-panel.")
+    pw.add_argument("--screener-panel", action="store_true",
+                    help="Also build / refresh the SCREENER SIMULATION data (criteria live-daily-v2) for the universe "
+                         "of --screener-store: the vendor's share table (1 call) and per-symbol share history, the "
+                         "market-cap / float caches, and the daily criteria panel under <cache>/screener/daily_panel "
+                         "(~0.8 GB; remote workers receive it with `cache push`). Uses --start/--end as the job "
+                         "window (the panel always covers 2019-03-01..today). Resumable.")
+    pw.add_argument("--screener-store", default=None,
+                    help="Metric-store directory whose symbols are the screener universe (with --screener-panel).")
+    pw.add_argument("--ohlcv-history-source", choices=["fmp", "alpaca"], default=None,
+                    help="OHLCV history the --screener-panel is built from (REQUIRED with --screener-panel, no default): "
+                         "a derived store names its history and a job refuses a panel built from the other one.")
+    pw.add_argument("--force-panel", action="store_true",
+                    help="Re-fetch the vendor share table and rebuild the panel even if they look fresh.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
                     help="Comma-separated experts to pre-warm. Supported (from the shared "
                          f"fetcher table): {', '.join(EXPERT_NAMES)}. Default: the 3 core "
@@ -8432,6 +10573,10 @@ def main(argv: "list | None" = None) -> int:
                          "compute trader-skill scores for every trading day in [start, end] instead "
                          "of leaving them to lazy per-trial computation (see _do_senate_scores). "
                          "Ignored by the other experts.")
+    pw.add_argument("--fractionable-max-age-hours", type=float, default=24.0,
+                    help="Refresh the on-disk fractional-share eligibility map (one bulk Alpaca "
+                         "/v2/assets call) only when it is older than this (default 24h, the live "
+                         "account's cache TTL). Read by experts with allow_fractional_shares on.")
     pw.add_argument("--fred-max-age-hours", type=float, default=24.0,
                     help="Refresh a FRED macro series only when its cache file is older than "
                          "this (default 24h, matching the API handler). Only consumed when "
@@ -8440,6 +10585,9 @@ def main(argv: "list | None" = None) -> int:
     bm = sub.add_parser("build-screener-metrics", help="Build/extend the screener METRIC store (parquet).")
     bm.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
                     help=f"Path to the parquet metric-store dir (default {_DEFAULT_SCREENER_STORE_DIR}).")
+    bm.add_argument("--ohlcv-history-source", required=True, choices=["fmp", "alpaca"],
+                    help="OHLCV history the store (and its --daily-panel) is built from. REQUIRED, no default: the "
+                         "store records it in build_manifest.json and a job refuses a store built from the other one.")
     bm.add_argument("--start", required=True)
     bm.add_argument("--end", required=True)
     bm.add_argument("--market-cap-min", type=float, required=True, help="LOOSEST cap bound (shortlist superset).")
@@ -8460,6 +10608,20 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--workers", type=int, default=8,
                     help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
                          "float fetches are disk-cached, so re-builds are fast regardless.")
+    bm.add_argument("--daily-panel", action="store_true",
+                    help="After the store is built, also produce the screener-simulation data for its universe "
+                         "(vendor share table + history, daily criteria panel): same as "
+                         "`ba2-test prewarm --screener-panel --screener-store <store>`.")
+    bm.add_argument("--symbols-file", default=None, metavar="PATH",
+                    help="Build EXACTLY the symbols in this file (one per line): no market-cap/price/"
+                         "volume floors, no live-screener universe. Static metadata comes from one "
+                         "screener call restricted to the list; the file path + sha256 are recorded "
+                         "in build_manifest.json so the build is reproducible.")
+    bm.add_argument("--allow-stale-symbols", default=None, metavar="SYM[,SYM...]|@FILE",
+                    help="EXPLICIT opt-in for symbols whose cached last OHLCV bar is >10 days before "
+                         "--end (the build otherwise REFUSES, listing them). Only for genuinely "
+                         "delisted names; they are recorded in <store>/build_manifest.json and "
+                         "their rows still stop 7 days after the last bar.")
 
     rs = sub.add_parser("recompute-screener-drops",
                         help="CACHE-ONLY rebuild of an existing store's price-drop columns (no FMP).")
@@ -8634,6 +10796,14 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
     op.add_argument("--early-stop", type=int, default=4)
+    op.add_argument("--early-stop-min-rel", type=_early_stop_min_rel_arg, default=None,
+                    help="Minimum RELATIVE improvement (a fraction: 0.01 = 1%%) a generation's "
+                         "best must make over the best at the last counted improvement to reset "
+                         "the --early-stop patience; a smaller gain still updates the best "
+                         "individual but counts as no improvement. Negative bests use the "
+                         "magnitude (-10 needs -9.9 at 0.01); a zero best needs any strict gain. "
+                         "Omitted: the legacy rule, any strict improvement resets (the stored "
+                         "optimization_config is then unchanged).")
     op.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     op.add_argument("--elitism-percent", type=float, default=10.0,
@@ -8660,6 +10830,19 @@ def main(argv: "list | None" = None) -> int:
                          "from the same starting point). Use to keep evolving a converged/"
                          "plateaued run instead of re-searching from scratch. Default: off "
                          "(fresh random population).")
+    op.add_argument("--chain-seed-from", default=None, metavar="JOB_NAME",
+                    help="Walk-forward CHAIN SEEDING: seed this job's STARTING population from the "
+                         "stored FINAL population (last evaluated generation) of the completed "
+                         "optimization of this exact name. Unlike --warm-start-from it refuses "
+                         "(fails the job) on a gene-space mismatch, a source without a stored "
+                         "final population, or a source whose window ends after this job's "
+                         "(look-ahead); a short population is padded randomly (count logged and "
+                         "recorded as optimization_config.seededFrom). Mutually exclusive with "
+                         "--warm-start-from.")
+    op.add_argument("--persist-final-population", action="store_true",
+                    help="Fail the job at completion unless its final evaluated population was "
+                         "stored (strategy_optimization_populations). Implied by --chain-seed-from; "
+                         "the walk-forward engine passes it to fold 1, which seeds fold 2.")
     op.add_argument("--initial-capital", type=float, default=10000.0)
     op.add_argument("--equity-cap", type=float, default=None,
                     help="Optional FIXED equity the risk manager sizes against, in dollars "
@@ -8760,6 +10943,7 @@ def main(argv: "list | None" = None) -> int:
                          "which do not enter through the option rule. Not for a real grid: the "
                          "entry then fires on every evaluated symbol.")
     op.add_argument("--fill-model", default="next_bar_open")
+    _add_history_source_arg(op)
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
@@ -8771,7 +10955,36 @@ def main(argv: "list | None" = None) -> int:
                          "via the schedule:<day> GA genes; this flag has no effect on the day "
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
+    op.add_argument("--decision-times", default=None, metavar="default|split|fixed|HH:MM,HH:MM,...",
+                    help="Search the DECISION TIME as a GA gene (schedule:time): a choice among "
+                         "exactly these exchange-local times, applied to BOTH the entry and the "
+                         "open-positions schedule. Each must be on the --interval bar grid, "
+                         "after the session's first bar and before its last (e.g. "
+                         "09:35,09:40,09:45,10:00,15:30); >= 2 values; 'default' = the shared "
+                         "DEFAULT_DECISION_TIME_CHOICES. Without the flag (or with 'fixed') a "
+                         "plain optimize decides at the single shared DEFAULT_DECISION_TIME "
+                         "(only the grid DRIVERS default the gene ON). Refused for daily-clock, "
+                         "option and bypass (FactorRanker) jobs. REQUIRES --name to contain "
+                         "'timegene'. 'split' (goal2027 2.4) searches the ENTRY time "
+                         "(schedule:entry_time) and the MANAGE time (schedule:manage_time) as two "
+                         "genes over the default seven values instead of one shared gene; REQUIRES "
+                         "--name to contain 'timesplit'. When both fire in the same minute, manage "
+                         "runs before entry. Sessions that lack a scheduled time (15:30 on a 13:00 half "
+                         "day) get no decision; they are counted and logged.")
     op.add_argument("--name", default=None)
+    op.add_argument("--ml-model-keys", default=None, metavar="ALIAS,ALIAS",
+                    help="MLForecast only: the forecast stores (aliases or 16-hex keys) the model_key gene chooses "
+                         "among for this job, replacing _EXPERT_OPT's list (e.g. one store, or a naive/placebo "
+                         "control store). Omit: the spec's list.")
+    op.add_argument("--ml-rank-top-n", default=None, metavar="N,N",
+                    help="MLForecast with strategy MLR only, and REQUIRED there (without it the command exits: MLR "
+                         "without a ranking is no rotation): the rank_top_n gene chooses among these N (distinct "
+                         "integers >= 1): BUY only the N most bullish symbols of the store at the decision date, "
+                         "SELL a held long that drops out of them. Any other expert / strategy refuses the flag.")
+    op.add_argument("--ml-hold-from-horizon", action="store_true",
+                    help="MLForecast with strategy MLH or MLF only (needs --ml-model-keys): the days_opened gene "
+                         "becomes {d-1, d, d+1} clipped at 0 with d = round(H x 7/5) - 1, H = the (single, shared) "
+                         "horizon of the --ml-model-keys stores, instead of the 0..6 range.")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "
@@ -8783,15 +10996,61 @@ def main(argv: "list | None" = None) -> int:
                     help="Override the expert spec's pinned sizing_mode for this run. Omit to "
                          "keep the spec default (risk_atr for the classic experts). Exists so "
                          "notional vs risk_atr can be compared as TWO separate optimizations "
-                         "instead of one gene: under notional the five ATR genes "
+                         "instead of one gene: under notional only atr_risk_budget_pct (the "
+                         "risk_atr size budget) is inert; the safeguard-stop genes "
                          "(risk_per_trade_pct, atr_multiplier, atr_period, min_stop_loss_pct, "
-                         "use_atr_stop) are inert and drift random, so a crossover that flipped "
-                         "the mode would score it with unselected parameters and bias the "
-                         "comparison toward whichever mode dominates the population. No effect "
+                         "use_atr_stop) act in both modes. To search the mode as ONE gene instead, "
+                         "use --search-sizing-mode (exclusive with this flag). No effect "
                          "on bypass experts (FactorRanker) — they skip "
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
+    op.add_argument("--search-sizing-mode", action="store_true", default=False,
+                    help="Search sizing_mode (risk_atr | notional) as ONE model:sizing_mode choice gene "
+                         "instead of pinning it (goal2027 item 2.1). Mutually exclusive with "
+                         "--sizing-mode. Genes with no effect under notional (atr_risk_budget_pct, the "
+                         "risk_atr size budget) decode to one canonical value (absent) so the trial memo "
+                         "dedups them; the stop-distance genes and "
+                         "max_virtual_equity_per_instrument_percent stay searched in both modes. "
+                         "Classic S1-S7 only: refused for bypass experts (FactorRanker) and option "
+                         "strategies. Name the job distinctly ('sizegene'): its gene space differs from a "
+                         "pinned run's.")
+    op.add_argument("--search-market-profile", action="store_true", default=False,
+                    help="Search the market-condition PROFILE as ONE market:profile choice gene (off | ohlcv-v1 | "
+                         "ta-structure-v1 | both) instead of the on/off market:enabled master gene (goal2027 "
+                         "item 2.2). Requires --market-condition-profile ohlcv-v1,ta-structure-v1 with BOTH "
+                         "manifests pinned (--market-condition-manifest ohlcv-v1=D1,ta-structure-v1=D2) and the "
+                         "'searched' arm. The leaf genes and the --market-exit rules of a profile that is not "
+                         "selected decode to off (a profile you did not pick cannot drive an exit); 'off' is "
+                         "exactly market:enabled=0. Equity S1-S7 only: refused for bypass experts and option "
+                         "strategies. Name the job distinctly ('mktprof').")
+    op.add_argument("--search-ds-factor-weights", action="store_true", default=False,
+                    help="DeterministicScorer jobs only (goal2027 item 2.8): search the technical sub-weights "
+                         "(tw_mom/tw_d200/tw_rsi/tw_don), the fundamental sub-weights (fw_quality/fw_piotroski/"
+                         "fw_value/fw_growth; each 0..1 step 0.1), mom_lookback_days (63|126|252), "
+                         "analyst_target_window_days (30..90) and analyst_min_targets (3|5), and widen w_analyst "
+                         "to 0.8. DS normalises weights, so only ratios matter; a section whose sub-weights are all "
+                         "zero is switched OFF (section weight 0), never scored as a silent 0. Refused for any "
+                         "other expert. Name the job distinctly ('dsfw'): its gene space differs.")
+    op.add_argument("--search-exploration-ranges", action="store_true", default=False,
+                    help="goal2027 item 2.9: close the gaps between the exploration phase-1 families and the "
+                         "searched genes (design doc 2.9 holds the audit). The time-exit threshold of "
+                         "FMPInsiderClusterBuy S1 (up to 210), DeterministicScorer S1/S2/SQM (from 15, step 5), "
+                         "FMPRating S2 and FMPEarningsDrift S2 (step 10) gets a lattice holding every exploration "
+                         "timeout and its control, and FMPEarningsDrift S5 gains a toggleable time exit (off = "
+                         "unlimited hold). Refused for an expert/strategy pair it would not change. Name the job "
+                         "distinctly ('explr'): its gene space differs.")
+    op.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
+                         "for this run, exactly as every run on record -- byte-identical to "
+                         "before this flag existed. 'atr-searched': unpins ONLY use_atr_stop for "
+                         "this run (D3: regime_overlay_enabled can never be unpinned), searched "
+                         "0/1 with a widened atr_multiplier floor, the 3 regime_*_scale genes "
+                         "dropped, and weekday-only schedule genes (see "
+                         "docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2). "
+                         "Persisted on the run (optimization_config.backtest.rm_toggles_unpinned), "
+                         "never an env var, so re-runs/top-N/robustness variants of THIS run stay "
+                         "under the same policy. Requires --name to contain '-atr27'.")
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
                          "Requires --screener-store; the run universe becomes the store's full "
@@ -8808,6 +11067,27 @@ def main(argv: "list | None" = None) -> int:
                          "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
                          "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
                          "genes unchanged. Run one job per band.")
+    op.add_argument("--screen-preset", choices=sorted(_SCREEN_PRESETS), default=None,
+                    help="--screener with a FIXED screen instead of the searched genes: pins every selection key of "
+                         "the named preset ('xl' = liquid large caps, cap >= $10B, price >= $10, volume >= 500k, 50 "
+                         "names; goal2027 design 2.8) in the run's screener base settings, with no screener genes. "
+                         "Recorded on the run (screener_opt.screen_preset), carried into the deploy export so live "
+                         "gets the same keys. Mutually exclusive with --screener-cap-band and --screener-base-json; "
+                         "needs --screener. Name the job with the preset ('xl').")
+    op.add_argument("--screener-panel", default=None,
+                    help="Directory of the DAILY screener-criteria panel (default <cache>/screener/daily_panel). "
+                         "Classic --screener jobs are gated by it (criteria live-daily-v2); build it with "
+                         "`ba2-test prewarm --screener-panel` or `build-screener-metrics --daily-panel`.")
+    op.add_argument("--print-universe", action="store_true",
+                    help="--screener dry run: print the job's static universe size and the symbols without cached "
+                         "bars (JSON line 'PRINT-UNIVERSE {...}') through the launch's own function, then exit "
+                         "(0 = launchable, 3 = would refuse on uncached symbols). For grid preflights.")
+    op.add_argument("--screener-exclude-uncached", action="store_true",
+                    help="--screener: a static-universe symbol with no cached OHLCV (execution interval or "
+                         "daily) REFUSES the launch by default. With this flag such names are instead "
+                         "EXCLUDED from the screen, listed in the output and recorded on the run as "
+                         "backtest.excluded_instruments (so the per-decision gate never selects them and "
+                         "a re-run reproduces the exclusion).")
     op.add_argument("--screener-gate-store", default=None,
                     help="GATE-ONLY screener mode: path to the parquet metric store used PURELY "
                          "as a per-bar entry gate — the run universe stays the static "
@@ -8820,6 +11100,48 @@ def main(argv: "list | None" = None) -> int:
                          "Point-in-time: a name above the cap is only excluded while above it. "
                          "0 disables the price filter. Per-strategy overrides live in "
                          "_OPTION_STRATS[].screener_gate_base.")
+    op.add_argument("--fr-top-n-below-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="Constraint for a bypass expert's (FactorRanker) genome (operator "
+                         "decision 2026-09-29, DEFAULT ON as of 2026-09-29 -- a later operator "
+                         "decision than the flag's own introduction): when a trial's decoded "
+                         "top_n >= screener_max_stocks, long_only_top_n's ranked[:top_n] slice "
+                         "discards nothing -- every screened name is held and the factor "
+                         "weights (momentum/value/quality/pead) have NO effect on selection "
+                         "(the 'ranking inert' trap; see "
+                         "FactorRanker.validate_deployed_settings). This repairs such a trial's "
+                         "top_n to the next 5-step below the pool (max(5, screener_max_stocks - "
+                         "5)) instead of scoring the inert genome. Applies ONLY to a bypass "
+                         "expert (FactorRanker) job -- never written for any other expert, "
+                         "whatever this flag says. Pass --no-fr-top-n-below-pool to opt OUT and "
+                         "reproduce a FactorRanker run exactly as it behaved before this "
+                         "default flipped (e.g. to re-run/compare against an old goal2027atr "
+                         "-atr27-fr/-fr2/-fr3 row under the OLD, un-repaired behaviour -- though "
+                         "note those rows already predate this flag and decode unchanged "
+                         "regardless, since a STORED config with no fr_top_n_below_pool key is "
+                         "always read as off; --no-fr-top-n-below-pool only affects a NEW run's "
+                         "config). Persisted on the run "
+                         "(optimization_config.backtest.fr_top_n_below_pool), never an env var, "
+                         "so every path that rebuilds a trial from this run's stored config -- "
+                         "GA trials, top-N persist, re-runs, robustness variants, the export/"
+                         "deploy payload -- sees the same repair (or its absence). A run "
+                         "launched before this flag existed, or any run whose stored config "
+                         "carries no fr_top_n_below_pool key, is unaffected: KEY ABSENT ALWAYS "
+                         "MEANS OFF, independent of this CLI default.")
+    op.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
+                    help="Remove these symbols from the run's tradable universe -- AFTER "
+                         "--screener rewrites it to the band's screened union and BEFORE the "
+                         "market-condition coverage check, so a symbol with defective source "
+                         "data (e.g. FMP mixed-basis split history) can never enter this run, "
+                         "however it is screened. A comma list, or '@path' to a file (one "
+                         "symbol per line, blank lines and '#' comments skipped -- see "
+                         "docs/strategy_research/atr_grid/excluded_symbols.txt). "
+                         "Persisted on the run (optimization_config.backtest.excluded_instruments) "
+                         "so re-runs/top-N/robustness variants apply the same exclusion, "
+                         "including a screener-driven bypass expert's OWN per-day screen (which "
+                         "does not otherwise consult enabled_instruments). An excluded symbol "
+                         "absent from this run's universe is fine; an exclusion that empties the "
+                         "universe is refused. Absent -> byte-identical to before this flag "
+                         "existed.")
     op.add_argument("--submit", action="store_true",
                     help="Enqueue on the running serve queue (live in the UI Running-jobs strip) "
                          "instead of running in-process. Submit jobs one at a time to avoid "
@@ -8841,6 +11163,12 @@ def main(argv: "list | None" = None) -> int:
                          "UNBOUNDED-risk and refuse, operator decision 2026-08-31). Each is "
                          "dispatched through _build_strategy. Bypass experts (FactorRanker) ignore this.")
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
+    ob.add_argument("--exclude-symbols", default=None, metavar="SYM,SYM,...|@file",
+                    help="Remove these symbols from --universe for every job (see `ba2-test "
+                         "optimize --help` for the exact semantics/format; same flag, same "
+                         "_apply_exclude_symbols behaviour). Persisted per-job on "
+                         "optimization_config.backtest.excluded_instruments. Absent -> "
+                         "byte-identical to before this flag existed.")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
     ob.add_argument("--gates-off", action="store_true",
@@ -8866,6 +11194,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
     ob.add_argument("--early-stop", type=int, default=4)
+    ob.add_argument("--early-stop-min-rel", type=_early_stop_min_rel_arg, default=None,
+                    help="See optimize --early-stop-min-rel (omitted: legacy rule).")
     ob.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     ob.add_argument("--elitism-percent", type=float, default=10.0,
@@ -8873,6 +11203,14 @@ def main(argv: "list | None" = None) -> int:
                          "(engine default: 10.0). See optimize --elitism-percent.")
     ob.add_argument("--lattice-anchor", choices=["zero", "min"], default=None,
                     help="See optimize --lattice-anchor (per-strategy default).")
+    ob.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
+                    help="See optimize --rm-toggle-policy. Applies to every job in this batch; "
+                         "--name-prefix must contain '-atr27' under 'atr-searched'.")
+    ob.add_argument("--fr-top-n-below-pool", action=argparse.BooleanOptionalAction, default=True,
+                    help="See `optimize --fr-top-n-below-pool` -- DEFAULT ON, written only onto a "
+                         "bypass expert's (FactorRanker) job in this batch (never a classic "
+                         "expert's, whatever this flag says). Pass --no-fr-top-n-below-pool to "
+                         "opt out.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
@@ -8912,6 +11250,7 @@ def main(argv: "list | None" = None) -> int:
                          "trials out to remote workers, and no environment travels with a "
                          "trial -- state the store here.")
     ob.add_argument("--fill-model", default="next_bar_open")
+    _add_history_source_arg(ob)
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
@@ -8919,6 +11258,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
                          "NOTE: for a non-bypass expert this only seeds the static fallback — every "
                          "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
+    ob.add_argument("--decision-times", default=None, metavar="HH:MM,HH:MM,...|default|split",
+                    help="Search the DECISION TIME as a GA gene for every job of the batch "
+                         "(see `optimize --decision-times`). REQUIRES --name-prefix to contain "
+                         "'timegene' ('split': 'timesplit'); refused if any job is an option or bypass job.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",
@@ -8936,9 +11279,76 @@ def main(argv: "list | None" = None) -> int:
     wk.add_argument("--workers", type=int, default=None,
                     help="Trial process slots / capacity (default: CPU count - 1).")
 
+    # ml-search: stage-A custom ML model search (GPU, local only).
+    ms = sub.add_parser("ml-search", help="Stage-A custom ML model search (MAG7 H1/M15 panels, 2025 folds).")
+    ms.add_argument("--out", required=True, help="Output directory (trials.jsonl, predictions/, result.json).")
+    ms.add_argument("--panel-dir", required=True, help="Directory of the MAG7 panels (built when missing/stale).")
+    ms.add_argument("--panel-start", default="2023-01-03", help="Panel first day (warm-up before 2024-01).")
+    ms.add_argument("--panel-end", default="2026-10-12", help="Panel last day (the cache end).")
+    ms.add_argument("--population", type=int, default=24)
+    ms.add_argument("--generations", type=int, default=30)
+    ms.add_argument("--early-stop", type=int, default=5)
+    ms.add_argument("--early-stop-min-rel", type=float, default=0.01)
+    ms.add_argument("--seed", type=int, default=42)
+    ms.add_argument("--parallel", type=int, default=3, help="Trial processes sharing the GPU.")
+    ms.add_argument("--top-n", type=int, default=10)
+    ms.add_argument("--darts-archs", default="tft,nhits",
+                    help="Darts architectures the forward-return genes may pick (tft is 20-55 min per trial).")
+
+    # ml-grid: ML exploration v2 stage-1 grid (cells x seeds, out-of-sample walk-forward signals).
+    mg = sub.add_parser("ml-grid", help="Stage-1 grid of the ML exploration v2 (cells x seeds, signal-level scoring).")
+    mg.add_argument("--config", default=None, help="JSON file: a list of cells (or {\"cells\": [...]}). Required unless --report-only.")
+    mg.add_argument("--out", default=None, help="Output directory (results.jsonl, predictions/, errors.jsonl, report.md, dashboard.html). Required unless --report-only.")
+    mg.add_argument("--cpu-slots", type=int, default=None, help="Worker processes for the tabular families. Required unless --report-only.")
+    mg.add_argument("--report-only", default=None, metavar="DIR",
+                    help="Rebuild report.md and dashboard.html (gate included) from DIR/results.jsonl and exit; runs nothing.")
+    mg.add_argument("--gpu-slots", type=int, default=3,
+                    help="Worker processes of the GPU pool (tsai-* / darts-* families), separate from --cpu-slots (default 3).")
+    mg.add_argument("--limit-cells", type=int, default=None, help="Run only the first N cells of the config.")
+    mg.add_argument("--cache-root", default=None, help="Cache folder holding AlpacaHistoryOHLCVProvider (default: the platform cache).")
+    mg.add_argument("--rerun-mismatched", action="store_true",
+                    help="Rows in --out/results.jsonl made under other settings or data are moved to results.stale.jsonl "
+                         "and recomputed (default: refuse).")
+    from app.services import ml_grid_bounds as _bounds                      # stdlib-only: the help must not load the runner
+    mg.add_argument("--eval-start", default=None, metavar="YYYY-MM-DD",
+                    help=f"First day of the out-of-sample evaluation (default {_bounds.EVAL_START}); after the data start "
+                         f"({_bounds.DATA_START}) and before --eval-end.")
+    mg.add_argument("--eval-end", default=None, metavar="YYYY-MM-DD",
+                    help=f"Last day of the evaluation (default and latest {_bounds.EVAL_END}).")
+    mg.add_argument("--retry-timeouts", action="store_true",
+                    help="Run again the (cell, seed) tasks that timed out in an earlier run (default: skip them).")
+    mg.add_argument("--cores", type=int, default=None,
+                    help="Logical cores to share between all workers of BOTH pools (cpu and gpu slots): n_jobs per "
+                         "fit = cores // total workers (default: all).")
+
+    # ml-features: the point-in-time daily feature store of the ML exploration v2.
+    mf = sub.add_parser("ml-features", help="Build the point-in-time daily feature store (ML exploration v2).")
+    mf.add_argument("--symbols-file", required=True, help="Symbols to build rows for (one per line / whitespace).")
+    mf.add_argument("--start", required=True, help="First day (YYYY-MM-DD).")
+    mf.add_argument("--end", required=True, help="Last day (YYYY-MM-DD).")
+    mf.add_argument("--groups", default=ML_FEATURES_DEFAULT_GROUPS, help="Comma list of feature groups.")
+    mf.add_argument("--out", required=True, help="Store directory (features.parquet, meta, coverage report).")
+    mf.add_argument("--membership-top-n", type=int, default=None,
+                    help="Use the metric store's per-session top-N universe for X ranks and breadth (2020+, survivors only).")
+    mf.add_argument("--purpose", default="dev", choices=("dev", "holdout"), help="Membership split (default dev).")
+    mf.add_argument("--chunk-size", type=int, default=25, help="Symbols per build chunk.")
+    mf.add_argument("--no-sector", action="store_true", help="The symbols are indices / ETFs: they have no sector.")
+    mf.add_argument("--sector-override", action="append", metavar="SYM=Sector",
+                    help="Sector for a symbol the metric store has none for (repeatable).")
+    mf.add_argument("--min-share", type=float, default=0.7,
+                    help="Coverage share under which a (group, year) is masked when the store is loaded (default 0.7).")
+    mf.add_argument("--force", action="store_true", help="Rebuild even when the inputs are unchanged.")
+    mf.add_argument("--holdout", action="store_true",
+                    help="Build the HOLDOUT store: allow locked holdout symbols (refused otherwise) and record "
+                         "purpose=holdout in the meta. The stage-1 grid refuses such a store.")
+
     # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
     sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")
     sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
+    sc.add_argument("--ohlcv-history-source", required=True, choices=("fmp", "alpaca"),
+                    help="Which OHLCV history to replicate. Required: only that history's folder "
+                         "is pushed; the other source's history folder is neither copied nor "
+                         "pruned.")
 
     # Split out the backtest passthrough before full parsing.
     if argv and argv[0] == "backtest":
@@ -8960,6 +11370,9 @@ def main(argv: "list | None" = None) -> int:
         "optimize": lambda: _cmd_optimize(args),
         "optimize-batch": lambda: _cmd_optimize_batch(args),
         "worker": lambda: _cmd_worker(args),
+        "ml-search": lambda: _cmd_ml_search(args),
+        "ml-grid": lambda: _cmd_ml_grid(args),
+        "ml-features": lambda: _cmd_ml_features(args),
         "sync-cache": lambda: _cmd_sync_cache(args),
     }[args.cmd]()
 

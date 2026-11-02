@@ -96,15 +96,23 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 from ..components.refresh_button import refresh_button
+from ..utils.responsive import (
+    ACTIONS_CLASS, BAR_TRACK_CLASS, GENERIC_PHONE_CSS, TIER_DETAIL, TIER_HEAD,
+    TIER_PRIMARY, TIER_WIDE, WRAP_ROW_CLASS, CardColumn, PhoneTableRegistry,
+    check_card_columns, install_phone_listener, phone_grid_prop, phone_media,
+)
 import asyncio
 import threading
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from nicegui import ui
 from sqlmodel import select
 
 from ...config import get_app_setting
+from ...core import allocator_csv
+from ...core import allocator_exclusion as exclusion_store
+from ...core import allocator_protection_service as protect_svc
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.instrument_enrichment import enrich_instruments
@@ -168,7 +176,7 @@ from ..utils.portfolio_allocation_view import (
     important_color_style,
     SUBMIT_FAILED_FMT, format_pnl_caption_parts, missing_quote_symbols,
     picker_options, pnl_classes,
-    pnl_color, pnl_div_classes, pnl_div_color, pnl_div_delta_color, submit_result_cell,
+    pnl_color, pnl_div_classes, pnl_div_color, pnl_div_delta_color,
     submit_summary_line,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
@@ -179,8 +187,13 @@ from ..utils.portfolio_allocation_view import (
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
 )
+from ..utils import allocator_protection_view as protect_view
+from ..utils.allocator_protection_view import label_badge_segments, label_extras_text
+from ..utils.portfolio_allocation_view import effective_symbol_weights
+from .allocator_protection_dialog import open_protection_dialog
 from .portfolio_allocation_wizard import (
-    open_allocation_wizard, open_invest_scope, render_income_panel, render_outcomes,
+    notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
+    phone_card_css as wizard_phone_card_css,
 )
 
 #: The toolbar's main button. It was called ``Allocate``, and that name outlived
@@ -275,12 +288,19 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                for row in get_managed_labels(account_id)]
     symbols_by_label = get_symbols_by_label([m.label for m in managed])
     symbols = collect_managed_symbols(symbols_by_label)
+    # THE OPERATOR'S EXCLUSIONS (manual disable). An excluded symbol is still priced and drawn
+    # (quantity, value and P&L are information) but it is OUTSIDE the managed money: its value is
+    # not in any label, nor in the investable base below.
+    exclusions = exclusion_store.get_exclusions(account_id)
+    enabled_symbols = exclusion_store.split_included(symbols, exclusions)
 
     account = get_account_instance_from_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
 
     positions = positions_by_symbol(account.get_positions())
+
+    protection = _load_protection_payload(account, account_id, positions)
 
     prices: Dict[str, Optional[float]] = {}
     if symbols:
@@ -359,7 +379,7 @@ def _load_view_payload(account_id: int, valuation_mode: str,
             # ``build_base_snapshot`` uses: buying power plus the DISTINCT managed
             # value under the active mode. Anything else and the page's percentages
             # would divide by a different base from the plan's.
-            base_notional = compute_base_notional(buying_power, positions, symbols,
+            base_notional = compute_base_notional(buying_power, positions, enabled_symbols,
                                                   valuation_mode=valuation_mode)
     except Exception as e:
         # The label table is this page's job; buying power is a bonus on top of it.
@@ -443,7 +463,9 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                                    # dividend-adjusted number.
                                    dividends_by_symbol=cash_dividends_by_symbol(
                                        account.get_dividends()),
-                                   unallocated_pct=unallocated_pct),
+                                   unallocated_pct=unallocated_pct,
+                                   excluded=exclusions,
+                                   freed_labels=exclusion_store.labels_with_weight_changes(account_id)),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
         'base_notional': base_notional,
@@ -464,7 +486,33 @@ def _load_view_payload(account_id: int, valuation_mode: str,
         #: ``{symbol: SymbolMarketStats}`` for the ⓘ tooltip. Absent until the
         #: background refresh has reached that symbol.
         'symbol_stats': stats,
+        #: The allocator TP/SL layer: ``{'supported': bool, 'items': {symbol: (protection,
+        #: slices)}}``. ``supported`` False on every broker that cannot do it, and then the
+        #: page draws nothing of it.
+        'protection': protection,
+        #: ``{SYMBOL: AllocatorExclusion}`` -- the symbols the operator switched off.
+        'exclusions': exclusions,
+        'account_id': account_id,
     }
+
+
+def _load_protection_payload(account, account_id: int, positions) -> Dict[str, Any]:
+    """The TP/SL layer's share of one render. Blocking (a broker read on a supporting account).
+
+    ``supported`` is tested with ``is True``: a MagicMock account is truthy on any attribute.
+    DISPLAY ONLY (review F8): no reconcile and no order is placed or cancelled on page load -- that
+    work scales with the number of protected symbols and must not run on every render. The
+    reconcile runs in the TradeManager account refresh and in the explicit 'Check TP/SL orders now'
+    action; the page draws what those last stored.
+    """
+    if getattr(account, 'supports_allocator_protection', False) is not True:
+        return {'supported': False, 'items': {}, 'quantities': {}}
+    items = {p.symbol: (p, protect_svc.get_slices(p.id))
+             for p in protect_svc.list_protections(account_id)}
+    # The broker's held quantity per symbol (read ONCE for the page), so a protection on a
+    # symbol that is in no managed label is still judged against its real position.
+    quantities = {sym: float(state.quantity) for sym, state in positions.items()}
+    return {'supported': True, 'items': items, 'quantities': quantities}
 
 
 def refresh_symbol_facts(account, account_id: int, symbols):
@@ -551,46 +599,58 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
         raise RuntimeError(f"Account {account_id} could not be instantiated")
     managed = get_managed_labels(account_id)
     symbols_by_label = get_symbols_by_label([row.label for row in managed])
-    symbols = collect_managed_symbols(symbols_by_label)
+    all_symbols = collect_managed_symbols(symbols_by_label)
+    # THE OPERATOR'S EXCLUSIONS. An excluded symbol never reaches the engine: it is not in a
+    # label's symbols, not in ``current`` and not in the base -- it is an unmanaged holding as far
+    # as the plan is concerned (and ``run_allocation`` strips it again at the boundary that writes).
+    excluded = exclusion_store.excluded_symbols(account_id)
+    symbols = exclusion_store.split_included(all_symbols, excluded)
 
     # THE BOOK FIRST: the solve path resolves an unsaved share the same way the
     # page displays it -- saved wins, else the symbol's ACTUAL share of its label
     # -- and that needs the positions and their prices, so they are read before
-    # the labels rather than after.
-    current = svc.build_position_states(account, symbols)
+    # the labels rather than after. Read for EVERY managed symbol (the default share of an
+    # excluded one is part of the label's stored total) and then narrowed to the enabled ones.
+    current_all = svc.build_position_states(account, all_symbols)
+    current = {sym: state for sym, state in current_all.items() if sym not in excluded}
 
     labels = []
     for row in managed:
-        members = symbols_by_label.get(row.label, [])
+        members_all = symbols_by_label.get(row.label, [])
+        members = exclusion_store.split_included(members_all, excluded)
         saved = {symbol: float(stored.weight_pct)
                  for symbol, stored in get_symbol_rows(account_id, row.label).items()
-                 if symbol in members}
+                 if symbol in members_all}
         # THE SAME resolver the page's table is built from, so the number on
         # screen and the number the plan solves against cannot be two different
         # defaults. ``fair_share`` is the last resort and only reachable for an
         # UNMEASURABLE symbol -- see below.
         resolved = resolve_symbol_weights(
-            members, saved=saved,
-            values={s: current_value(current.get(s), valuation_mode) for s in members},
-            unmeasurable=[s for s in members
-                          if _is_unmeasurable_holding(current.get(s), valuation_mode)])
+            members_all, saved=saved,
+            values={s: current_value(current_all.get(s), valuation_mode) for s in members_all},
+            unmeasurable=[s for s in members_all
+                          if _is_unmeasurable_holding(current_all.get(s), valuation_mode)])
         # ``SymbolTarget.weight_pct`` is a float and the engine reads 0 as "hold
         # none of this", so an UNKNOWN share may not travel as 0 -- that would sell
         # the position out. It falls back to the historical fair share instead,
         # which is what this path did for every unsaved symbol until now; and the
         # only way to reach it is a held symbol with no price, which
         # ``held_no_price_block`` already refuses to SUBMIT against.
-        fair_share = get_symbol_weights(account_id, row.label, members)
+        fair_share = get_symbol_weights(account_id, row.label, members_all)
         # NULL stays None all the way to the dialog: "there is no last" is what
         # disables the Load-last button, and it is a different fact from 0.0.
         previous_weights = get_previous_symbol_weights(account_id, row.label, members)
+        # The STORED share of every symbol (excluded ones included); the enabled ones are then
+        # SCALED over the excluded ones' (``effective_symbol_weights``), so the label's target
+        # money applies to the enabled symbols only -- and a share a TP/SL fill freed stays freed.
+        stored_shares = {s: (float(fair_share.get(s, 0.0)) if resolved[s].weight_pct is None
+                             else float(resolved[s].weight_pct)) for s in members_all}
+        solved_shares = effective_symbol_weights(stored_shares, excluded)
         labels.append(LabelTarget(
             label=row.label, target_pct=float(row.target_pct or 0.0),
             symbols=[SymbolTarget(
                 symbol=s,
-                weight_pct=(float(fair_share.get(s, 0.0))
-                            if resolved[s].weight_pct is None
-                            else float(resolved[s].weight_pct)),
+                weight_pct=solved_shares[s],
                 previous_weight_pct=previous_weights.get(s)) for s in members],
             comment=row.comment,
             previous_target_pct=row.previous_target_pct))
@@ -600,6 +660,33 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     config = get_allocation_config(account_id)
     return (base, labels, bool(config.allow_fractional),
             float(config.unallocated_pct or 0.0))
+
+
+def labels_for_persist(account_id: int, labels):
+    """The labels to hand ``save_allocation_targets``: for a label that holds an EXCLUDED symbol the
+    solved shares are SCALED (the excluded share spread over the rest) and persisting those would
+    rewrite the stored shares -- re-including the symbol would then total over 100%. So such a
+    label is written with its STORED shares only (read back from the DB); a symbol with no stored
+    row is left unstored rather than persisted at a scaled number. Other labels pass through.
+    Pure over the store reads; one call per run.
+    """
+    from dataclasses import replace
+    excluded = exclusion_store.excluded_symbols(account_id)
+    if not excluded or not labels:
+        return labels
+    from ...core.utils import get_symbols_by_label
+    members_all = get_symbols_by_label([lt.label for lt in labels])
+    out = []
+    for lt in labels:
+        if not any(sym in excluded for sym in members_all.get(lt.label, [])):
+            out.append(lt)
+            continue
+        stored = get_symbol_rows(account_id, lt.label)
+        out.append(replace(lt, symbols=[
+            SymbolTarget(symbol=st.symbol, weight_pct=float(stored[st.symbol].weight_pct),
+                         previous_weight_pct=st.previous_weight_pct)
+            for st in lt.symbols if st.symbol in stored]))
+    return out
 
 
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
@@ -667,6 +754,9 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     plan = svc.precheck_plan(account, plan,
                              available_buying_power=base.available_buying_power,
                              margin=margin, on_progress=on_progress)
+    # ALLOCATOR TP/SL: a symbol held after a protective fill is shown SKIPPED (the run itself
+    # enforces it again at the boundary that writes).
+    plan = svc.mark_excluded_rows_skipped(account, plan)
     return base, plan, current, svc.fetch_market_hours(account)
 
 
@@ -992,7 +1082,7 @@ COLOR_DEBOUNCE_MS = 400
 #: ``truncate`` is not decoration: a flex item's default ``min-width:auto`` lets it
 #: grow past its own ``w-*`` to fit its content, and only a non-visible overflow
 #: pins it. Without it the width class is advisory.
-DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate '
+DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate pf-b-delta '
 #: Wide enough for the dividend clause: "P&L -50.20 (-4.27%, w/ div: +1.20%)"
 #: is ~35 characters, and a truncated P&L would hide the half of the sentence
 #: that was added because the other half misreads a distribution-paying holding.
@@ -1001,7 +1091,7 @@ SYMBOL_DELTA_CELL_CLASSES = 'w-44 shrink-0 truncate '
 RESERVE_DELTA_CELL_CLASSES = 'w-52 shrink-0 truncate '
 #: The label header's bar. It GROWS -- the tracks stay equal because everything to
 #: their right is pinned above, not because the bar itself is nailed down.
-LABEL_BAR_CLASSES = 'flex-1 min-w-[120px]'
+LABEL_BAR_CLASSES = 'flex-1 min-w-[120px] pf-b-bar'
 
 
 def _render_mini_bar(*, fill_marker: str, notch_marker: str,
@@ -1014,7 +1104,7 @@ def _render_mini_bar(*, fill_marker: str, notch_marker: str,
     divs carry no content at all: the geometry IS the information, which is why
     they are marked rather than found by text.
     """
-    with ui.element('div').classes(classes).style(BAR_TRACK_STYLE):
+    with ui.element('div').classes(f'{classes} {BAR_TRACK_CLASS}').style(BAR_TRACK_STYLE):
         fill = ui.element('div').mark(fill_marker)
         notch = ui.element('div').mark(notch_marker)
     return {'fill': fill, 'notch': notch}
@@ -1043,7 +1133,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
                     unallocated_pct: float = 0.0,
                     symbol_facts: Optional[Dict[str, Any]] = None,
-                    symbol_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    symbol_stats: Optional[Dict[str, Any]] = None,
+                    protection: Optional[Dict[str, Any]] = None,
+                    exclusions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -1062,6 +1154,10 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         # {symbol: SymbolMarketStats} for the ⓘ tooltip; absent until the
         # background refresh has reached that symbol.
         'symbol_stats': symbol_stats or {},
+        # The allocator TP/SL layer (see ``_load_protection_payload``).
+        'protection': protection or {'supported': False, 'items': {}, 'quantities': {}},
+        # {SYMBOL: AllocatorExclusion}: the operator's manual disables.
+        'exclusions': {(k or '').strip().upper(): v for k, v in (exclusions or {}).items()},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -1107,7 +1203,16 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     that same figure minus the held shares. Computing it anywhere else would be a
     second writer for a number this one already has to derive.
     """
-    delta = symbol_delta(weight_pct=row.get('weight_pct'),
+    if row.get('excluded'):
+        # OUTSIDE the managed money: nothing to move, so no change to print.
+        for key in ('share_delta', 'value_delta', 'qty_delta'):
+            row[key] = ''
+        for key in ('share_delta_color', 'value_delta_color', 'qty_delta_color'):
+            row[key] = delta_color(None)
+        row['target_quantity'] = None
+        return
+    effective = row.get('eff_weight_pct')
+    delta = symbol_delta(weight_pct=(row.get('weight_pct') if effective is None else effective),
                          pct_of_label=row.get('pct_of_label'),
                          target_value=row.get('target_value'),
                          current_value=row.get('current_value'),
@@ -1144,14 +1249,21 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
         return
     view = live['view_by_label'].get(label)
     weights = live['weights'].get(label) or {}
+    # The stored shares are what the boxes hold; the SOLVED shares are the enabled symbols' ones
+    # scaled over the excluded symbols' (see ``effective_symbol_weights``).
+    effective = effective_symbol_weights(weights, live['exclusions'])
     values = symbol_target_values(
-        weights, label_target_pct=(float(view.target_pct or 0.0) if view else 0.0),
+        effective, label_target_pct=(float(view.target_pct or 0.0) if view else 0.0),
         base_notional=live['base_notional'], unallocated_pct=live['unallocated_pct'])
     for row in table.rows:
         symbol = row['symbol']
         if symbol not in weights:
             continue
         row['weight_pct'] = round(float(weights[symbol]), 2)
+        scaled = effective.get(symbol)
+        row['eff_weight_pct'] = (None if (scaled is None or abs(scaled - weights[symbol]) < 0.005)
+                                 else scaled)
+        row['eff_weight'] = protect_view.effective_weight_text(weights[symbol], row['eff_weight_pct'])
         value = values.get(symbol)
         row['target_value'] = None if value is None else round(value, 2)
         # The live deltas, recomputed from the SAME two numbers the cells above were
@@ -2286,16 +2398,16 @@ def _render_color_choices(account_id: int, label: str, current, on_saved, *,
     keeps the stacked form, where it hangs under an icon and has no siblings to
     line up with.
     """
-    container = (ui.row().classes('items-center gap-3 no-wrap') if inline
+    container = (ui.row().classes(f'items-center gap-3 no-wrap {WRAP_ROW_CLASS}') if inline
                  else ui.column().classes('gap-2 p-2'))
     with container:
         if not inline:
             ui.label('Label colour').classes('text-xs text-secondary-custom')
-        with ui.row().classes('items-center gap-2 no-wrap'):
+        with ui.row().classes(f'items-center gap-2 no-wrap {WRAP_ROW_CLASS}'):
             for name, hex_value in LABEL_COLOR_PALETTE:
                 # ``hx=hex_value`` on the handler: without the default-argument
                 # capture every chip would save the last colour in the tuple.
-                ui.element('div').mark(MARKER_COLOR_SWATCH).style(
+                ui.element('div').classes('pf-swatch').mark(MARKER_COLOR_SWATCH).style(
                     COLOR_SWATCH_STYLE + f'background:{resolve_label_icon_color(hex_value)};'
                 ).tooltip(name).on(
                     'click.stop',
@@ -2356,6 +2468,69 @@ async def _persist_managed_labels(account_id: int, current: List[str],
     _confirm_unmanage(to_remove, counts, _write, restore)
 
 
+def _export_allocation_csv(account_id: int) -> None:
+    """Download the account's labels, symbols and percentages as CSV."""
+    try:
+        text = allocator_csv.export_allocation_csv(account_id)
+    except Exception as e:
+        logger.error(f"Allocator CSV export for account {account_id} failed: {e}", exc_info=True)
+        ui.notify(f'Export failed: {e}', type='negative')
+        return
+    ui.download(text.encode('utf-8'), filename=f'allocator_account_{account_id}.csv')
+
+
+def _open_import_dialog(account_id: int, refresh) -> None:
+    """Pick a CSV, confirm, and REPLACE the account's labels, symbols and percentages."""
+    state: Dict[str, Any] = {'text': None}
+    with ui.dialog() as dialog, ui.card().classes('min-w-[420px]'):
+        ui.label('Import allocator CSV').classes('text-h6')
+        ui.label('Replaces the managed labels of this account, their symbols and percentages '
+                 'with the file. Labels and symbols not in the file are removed (instrument '
+                 'labels are shared with other accounts). This cannot be undone.'
+                 ).classes('text-sm')
+        status = ui.label('').classes('text-sm')
+
+        async def _on_upload(e) -> None:
+            raw = await e.file.read()
+            try:
+                text = raw.decode('utf-8-sig')
+                parsed = allocator_csv.parse_allocation_csv(text)
+            except Exception as ex:
+                state['text'] = None
+                status.set_text(f'Rejected: {ex}')
+                status.classes(replace='text-sm text-negative')
+                return
+            state['text'] = text
+            n_sym = sum(len(x['symbols']) for x in parsed)
+            status.set_text(f'{len(parsed)} label(s), {n_sym} symbol(s) ready to import.')
+            status.classes(replace='text-sm')
+
+        (ui.upload(label='CSV file', on_upload=_on_upload, auto_upload=True)
+            .props('accept=.csv flat bordered').classes('w-full'))
+
+        async def _go() -> None:
+            if state['text'] is None:
+                ui.notify('Choose a valid CSV first', type='warning')
+                return
+            try:
+                summary = allocator_csv.import_allocation_csv(account_id, state['text'])
+            except Exception as ex:
+                logger.error(f"Allocator CSV import for account {account_id} failed: {ex}",
+                             exc_info=True)
+                ui.notify(f'Import failed: {ex}', type='negative')
+                return
+            dialog.close()
+            ui.notify(f"Imported {summary['labels']} label(s); "
+                      f"{summary['symbols_added']} symbol(s) labelled, "
+                      f"{summary['symbols_removed']} unlabelled", type='positive')
+            await refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Replace', on_click=_go).props('color=negative')
+    dialog.open()
+
+
 def _open_label_picker(account_id: int, refresh) -> None:
     """Pick which labels this account manages. Additions persist on change."""
     try:
@@ -2405,7 +2580,7 @@ def _open_label_picker(account_id: int, refresh) -> None:
                      'it no longer has to be found in here.'
                      ).classes('text-xs text-secondary-custom')
         for label in current:
-            with ui.row().classes('w-full items-center gap-3 no-wrap'):
+            with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}'):
                 # ``lbl=label`` on BOTH the swatch and the handler: without the
                 # default-argument capture every row would recolour the last label.
                 #
@@ -2599,6 +2774,687 @@ def _symbol_fact_fields(facts) -> Dict[str, Any]:
     }
 
 
+#: The ⓘ button and the two broker-fact chips of a symbol row, as one Vue fragment.
+#: Shared by the desktop table's ``info`` cell and the phone card's header, so a
+#: change to the chips reaches both. Reads ``props.row`` only.
+SYMBOL_CHIPS_TEMPLATE = r'''
+            <div class="row items-center no-wrap justify-center pf-icons" style="gap:4px">
+                <q-btn dense flat round size="sm" icon="info" color="grey-5"
+                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                        <!-- Income and total return, from the cached provider stats.
+                             Exactly one of these three lines is ever non-empty: the
+                             figures, "not fetched yet", or the fetch error. -->
+                        <div v-if="props.row.stat_line" class="text-weight-medium"
+                             style="margin-top:4px">{{ props.row.stat_line }}</div>
+                        <div v-if="props.row.stat_pending" style="opacity:0.7">
+                            {{ props.row.stat_pending }}</div>
+                        <div v-if="props.row.stat_error" style="opacity:0.7">
+                            {{ props.row.stat_error }}</div>
+                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
+                    </q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frac_badge"
+                      class="text-caption text-weight-bold"
+                      style="width:0.9rem;text-align:center"
+                      :style="props.row.frac_strike
+                              ? 'color:#94a3b8;text-decoration:line-through'
+                              : 'color:#4ade80'">
+                    {{ props.row.frac_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.frac_tip }}
+                    </q-tooltip>
+                </span>
+                <span v-if="props.row.lev_badge"
+                      class="text-caption"
+                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
+                             border-radius:4px;padding:0 4px;line-height:1.25;
+                             font-variant-numeric:tabular-nums;white-space:nowrap">
+                    {{ props.row.lev_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.lev_tip }}
+                    </q-tooltip>
+                </span>
+                <!-- THE TP/SL SHIELD and the EXCLUDE EYE: icons only, the same size as the (i). The colour
+                     and the tooltip carry the whole status; there is no text and no column of their own. -->
+                <q-btn v-if="props.row.prot_on" dense flat round size="sm" icon="shield" aria-label="TP/SL protection"
+                       class="pf-prot-icon" :style="{ color: props.row.prot_hex }"
+                       @click="() => $parent.$emit('protectClick', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem;white-space:pre-line">{{ props.row.prot_tip }}</q-tooltip>
+                </q-btn>
+                <q-btn dense flat round size="sm" :icon="props.row.excl_icon" class="pf-excl-icon"
+                       :aria-label="props.row.excluded ? 'Include in allocation' : 'Exclude from allocation'"
+                       :style="{ color: props.row.excl_hex }"
+                       @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
+                </q-btn>
+            </div>
+'''
+
+
+MARKER_PROTECT_ALERT = 'pf-protect-alert'
+PROTECT_CHECK_LABEL = 'Check and repair TP/SL'
+PROTECT_CHECK_CONFIRM = (
+    'This reads every protective order at the broker and can ACT on what it finds:\n'
+    '- cancel and re-place (resize) orders whose size no longer matches the position,\n'
+    '- place protection for shares nobody covers (growth),\n'
+    '- renew orders close to their expiry, and record fills.\n'
+    'It never re-places an order you cancelled on the broker\'s site. Continue?')
+MARKER_PROTECT_CHECK = 'pf-protect-check'
+MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
+MARKER_LABEL_EXTRAS = 'pf-label-extras'
+MARKER_LABEL_SEGMENTS = 'pf-label-segments'
+MARKER_SEGMENT_PREFIX = 'pf-label-seg-'
+
+#: WHAT EACH SYMBOL-TABLE COLUMN BECOMES ON A PHONE (``<= 639px``), in reading order.
+#:
+#: Sixteen columns cannot share 390px, and scrolling them sideways leaves the symbol
+#: and the money it is held at in different screens. On a phone the SAME ``ui.table``
+#: switches to Quasar's card mode (``grid``): one card per row, drawn from the SAME
+#: row dicts the table is -- so every figure, every inline write path
+#: (``weightChange``, ``commentChange``, ``symbolInfo``) and the selection that
+#: Compare / Remove read are shared, not re-implemented.
+#:   * header: the multi-label flag, the SYMBOL, the ⓘ and the broker chips;
+#:   * the Share-of-label % box first (it is the thing this page exists to edit), on
+#:     its own full-width line with a numeric keyboard;
+#:   * always visible, captioned, two to a line: current value, qty, target value,
+#:     target qty, Last %;
+#:   * P&L and the comment on their own lines;
+#:   * folded behind "Details": the two percentages-of-label/total, cost basis, price
+#:     and market value.
+#: ``check_card_columns`` pins that this accounts for exactly the table's columns.
+SYMBOL_CARD = (
+    CardColumn('flag', '', TIER_HEAD),
+    CardColumn('symbol', 'Symbol', TIER_HEAD),
+    CardColumn('info', '', TIER_HEAD),
+    CardColumn('weight_pct', 'Share of label %', TIER_WIDE),
+    CardColumn('current_value', 'Current value', TIER_PRIMARY),
+    CardColumn('quantity', 'Qty', TIER_PRIMARY),
+    CardColumn('target_value', 'Target value', TIER_PRIMARY),
+    CardColumn('target_quantity', 'Target qty', TIER_PRIMARY),
+    CardColumn('previous_weight_pct', 'Last %', TIER_PRIMARY),
+    CardColumn('pct_of_total', '% of total', TIER_PRIMARY),
+    CardColumn('pnl', 'P&L', TIER_WIDE),
+    CardColumn('comment', 'Comment', TIER_WIDE),
+    CardColumn('pct_of_label_target', '% of label tgt', TIER_DETAIL),
+    CardColumn('cost_basis', 'Cost basis', TIER_DETAIL),
+    CardColumn('price', 'Price', TIER_DETAIL),
+    CardColumn('market_value', 'Market value', TIER_DETAIL),
+)
+
+#: The weight box, as a Vue fragment, for the card. Same ``:key`` (a refused edit puts
+#: the typed text back), same debounce, same emit as the desktop cell. ``inputmode``
+#: asks a phone for the DECIMAL keypad: ``type="number"`` alone gives iOS a keypad
+#: with no decimal point on some versions.
+CARD_WEIGHT_INPUT_TEMPLATE = r"""
+    <q-input :key="props.row.weight_key" :model-value="props.row.weight_pct"
+             type="number" step="any" inputmode="decimal" dense outlined
+             label="Share of label %" input-class="text-right" class="full-width"
+             debounce="__DEBOUNCE__"
+             @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
+        <template v-slot:hint>
+            <div class="text-right"
+                 :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+            <div v-if="props.row.eff_weight" class="text-right text-caption"
+                 style="color:#94a3b8">{{ props.row.eff_weight }}</div>
+        </template>
+    </q-input>
+"""
+
+CARD_COMMENT_INPUT_TEMPLATE = r"""
+    <q-input :model-value="props.row.comment" dense outlined label="Comment"
+             class="full-width" debounce="__DEBOUNCE__"
+             @update:model-value="(val) => $parent.$emit('commentChange', props.row.symbol, val)" />
+"""
+
+#: A change's colour as an INLINE style (a Vue expression over a Quasar colour name).
+#: Not ``text-negative``: Quasar's class is a dark red (#C10015) that is close to
+#: unreadable on this dark card, and the stylesheet's own ``span {{ color: white }}`` beats
+#: an inherited class colour on any inner element -- an inline style needs neither fight.
+_TONE = ("{{ color: ({{ positive: '#4ade80', negative: '#f87171' }})[{v}] || '#94a3b8' }}")
+
+
+def card_tone_style(color_field: str) -> str:
+    """The ``:style`` expression for a field coloured by a Quasar colour name. Pure."""
+    return _TONE.format(v=f'props.row.{color_field}')
+
+
+#: P&L as its own tile. The money figure is the value (16px, coloured); the rest of the
+#: sentence -- "(+1.68%, w/ div: +12.05%)" -- is a second, smaller line, so it can never
+#: wrap in the middle of a token and run into the figure. ``pnl_head`` carries
+#: "<money> (<pct>, w/ div: " and ``pnl_div`` / ``pnl_tail`` the rest (see the row
+#: builder); the split here is on the first " (" and touches no data.
+CARD_PNL_TEMPLATE = (
+    r"""
+    <div class="pf-tile-v" :style="__PNL__">{{
+        ((h) => { const i = h.indexOf(' ('); return i < 0 ? h : h.slice(0, i); })(props.row.pnl_head || '')
+    }}</div>
+    <div class="pf-tile-sub pf-pnl-rest"><span :style="__PNL__">{{
+        ((h) => { const i = h.indexOf(' ('); return i < 0 ? '' : h.slice(i + 1); })(props.row.pnl_head || '')
+    }}</span><span v-if="props.row.pnl_div" :style="__DIV__">{{
+        props.row.pnl_div }}</span><span :style="__PNL__">{{
+        props.row.pnl_tail }}</span></div>
+"""
+    .replace('__PNL__', card_tone_style('pnl_color'))
+    .replace('__DIV__', card_tone_style('pnl_div_color')))
+
+#: A coloured arrow for a change: down for a negative one. The sign stays in the text.
+_ARROW = "String({v}).charAt(0) === '-' ? '\u25BC' : '\u25B2'"
+
+
+def _sub_template(delta_field: str, color_field: str) -> str:
+    return (
+        '<div v-if="props.row.' + delta_field + '" class="pf-tile-sub">'
+        '<span :style="' + card_tone_style(color_field) + '">{{ '
+        + _ARROW.format(v='props.row.' + delta_field) + ' }} {{ props.row.'
+        + delta_field + ' }}</span> <span class="pf-sub-k">to target</span></div>')
+
+
+#: A tile's SUB-LINE for the two figures that carry a live change: the change sits INSIDE
+#: its tile, with an arrow and the words "to target", and says which figure it belongs to
+#: by being under it -- never a lone red number between two rows.
+CARD_SUB_TEMPLATES = {
+    'target_value': _sub_template('value_delta', 'value_delta_color'),
+    'target_quantity': _sub_template('qty_delta', 'qty_delta_color'),
+}
+
+
+def card_tile_html(caption: str, value_html: str, *, sub_html: str = '',
+                   wide: bool = False, field: str = '') -> str:
+    """One TILE of the symbol card: a small muted caption on top, the value below, and
+    an optional sub-line (a change, a second sentence). Pure.
+
+    Every read-only figure on the card is one of these, so the grid is regular by
+    construction: same caption size, same value size, same padding, equal heights.
+    """
+    extra = ' pf-tile--wide' if wide else ''
+    data = f' data-field="{field}"' if field else ''
+    return (f'<div class="pf-tile{extra}"{data}><div class="pf-tile-k">{caption}</div>'
+            f'<div class="pf-tile-v">{value_html}</div>{sub_html}</div>')
+
+
+def _card_tile(column: CardColumn) -> str:
+    return card_tile_html(column.caption, '{{ props.row.' + column.name + ' }}',
+                          sub_html=CARD_SUB_TEMPLATES.get(column.name, ''),
+                          field=column.name)
+
+
+def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
+    """The Vue ``item`` slot of the symbol table's card mode. Pure.
+
+    Built FROM the spec: head columns into the header, ``wide`` columns one per line
+    in spec order, ``primary`` runs into captioned two-column grids, ``detail`` into
+    one fold at the end. ``props.selected`` is the row's tick box (Compare / Remove
+    read the table's selection), and a card tap is not needed -- the fold is a
+    Quasar expansion item.
+    """
+    wide = {
+        'weight_pct': ('<div class="pf-field">'
+                       + CARD_WEIGHT_INPUT_TEMPLATE.replace('__DEBOUNCE__',
+                                                            str(TARGET_DEBOUNCE_MS))
+                       + '</div>'),
+        'comment': ('<div class="pf-field">'
+                    + CARD_COMMENT_INPUT_TEMPLATE.replace('__DEBOUNCE__',
+                                                          str(COMMENT_DEBOUNCE_MS))
+                    + '</div>'),
+        'pnl': ('<div class="pf-tiles"><div class="pf-tile pf-tile--wide" data-field="pnl">'
+                '<div class="pf-tile-k">P&amp;L</div>' + CARD_PNL_TEMPLATE + '</div></div>'),
+    }
+    parts: List[str] = []
+    grid: List[str] = []
+    details: List[str] = []
+
+    def flush() -> None:
+        if grid:
+            parts.append('<div class="pf-tiles">' + ''.join(grid) + '</div>')
+            grid.clear()
+
+    for column in card_columns:
+        if column.tier == TIER_HEAD:
+            continue
+        if column.tier == TIER_PRIMARY:
+            grid.append(_card_tile(column))
+        elif column.tier == TIER_DETAIL:
+            details.append(_card_tile(column))
+        else:
+            flush()
+            parts.append(wide[column.name])
+    flush()
+    if details:
+        parts.append('<q-expansion-item dense dense-toggle label="Details" '
+                     'class="pf-fold" header-class="pf-sym-more"><div class="pf-tiles">'
+                     + ''.join(details) + '</div></q-expansion-item>')
+    return (
+        '<div class="col-12" style="width:100%">'
+        '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected, '
+        '\'pf-sym-card--excl\': props.row.excluded}">'
+        '<div class="pf-sym-head">'
+        '<q-checkbox v-model="props.selected" />'
+        '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
+        'style="color:#f6ad55;font-weight:600">{{ props.row.flag }}</span>'
+        '<span class="pf-sym-name">{{ props.row.symbol }}</span>'
+        + SYMBOL_CHIPS_TEMPLATE +
+        '</div>' + ''.join(parts) + '</div></div>')
+
+
+#: The label header's cells, tagged so the phone layout can address them. The tag
+#: is on the ELEMENT; the repaints that ``classes(replace=...)`` keep it by
+#: prefixing it (see ``DELTA_CELL_CLASSES``).
+BAR_CELL_PREFIX = 'pf-b-'
+BAR_ROW_CLASS = 'pf-bar-row'
+
+LABEL_BAR_PHONE_CSS = phone_media(r"""
+    /* THE LABEL HEADER, on a phone. Eleven cells on one no-wrap line become three:
+       identity (tag, badges, name, count, edit, info), the money and the bar, then
+       the sentences that explain them. Widths the desktop pins per cell would each
+       be a whole line here, so they go. */
+    .pf-bar-row.pf-bar-row { flex-wrap: wrap !important; row-gap: 4px;
+        align-items: center; }
+    /* THE LABEL IS A CARD TOO: its own background, a 1px line, a 12px gap to the next. */
+    .q-expansion-item:has(.pf-bar-row) { border: 1px solid rgba(255,255,255,0.16);
+        border-radius: 12px; background: #232a3d !important; margin-bottom: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+    /* a divider between the identity line and the figures under it */
+    .pf-bar-row.pf-bar-row::before { content: ""; order: 9; flex: 0 0 100%;
+        height: 1px; background: rgba(255,255,255,0.22); margin: 2px 0 4px; }
+    .pf-bar-row.pf-bar-row > * { width: auto !important; min-width: 0 !important;
+        max-width: 100% !important; }
+    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
+        padding: 8px; box-sizing: content-box; font-size: 24px; }
+    /* ONE CARD, not a box in a box: the expansion's header row and its container each
+       painted their own translucent panel and padding inside the card above. */
+    .q-expansion-item:has(.pf-bar-row) > .q-expansion-item__container {
+        background: transparent !important; }
+    .q-expansion-item:has(.pf-bar-row) .q-item { background: transparent !important;
+        padding: 8px 6px 8px 10px !important; }
+    /* LINE 1: the FULL label name, bold, wrapping allowed (never an ellipsis).
+       LINE 2: colour tag, badges, symbol count, edit, info -- 40px tap targets. */
+    .pf-bar-row.pf-bar-row > .pf-b-name { order: 1; flex: 1 1 100% !important;
+        font-size: 1.1rem; font-weight: 700 !important; line-height: 1.25;
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: clip !important; overflow-wrap: anywhere; }
+    .pf-bar-row > .pf-b-icon { order: 2; }
+    .pf-bar-row > .pf-b-zero { order: 2; }
+    .pf-bar-row > .pf-b-warn { order: 2; }
+    .pf-bar-row > .pf-b-count { order: 3; }
+    .pf-bar-row > .pf-b-edit { order: 4; margin-left: auto; }
+    .pf-bar-row > .pf-b-info { order: 5; }
+    .pf-bar-row.pf-bar-row > .pf-b-value { order: 10; flex: 1 1 auto !important;
+        text-align: left; font-size: 1rem; font-weight: 600; }
+    .pf-bar-row > .pf-b-pct { order: 11; font-size: 0.95rem; }
+    .pf-bar-row.pf-bar-row > .pf-b-bar { order: 12; flex: 1 1 100% !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-target, .pf-bar-row.pf-bar-row > .pf-b-delta,
+    .pf-bar-row.pf-bar-row > .pf-b-last, .pf-bar-row.pf-bar-row > .pf-b-pnl,
+    .pf-bar-row.pf-bar-row > .pf-b-pnl > * {
+        white-space: normal !important; overflow: visible !important;
+        text-overflow: clip !important; font-size: 0.875rem !important;
+        text-align: left; }
+    .pf-bar-row.pf-bar-row > .pf-b-target { order: 13; flex: 1 1 100% !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-delta { order: 14; flex: 1 1 auto !important; }
+    .pf-bar-row.pf-bar-row > .pf-b-last { order: 15; }
+    .pf-bar-row.pf-bar-row > .pf-b-pnl { order: 16; flex: 1 1 100% !important;
+        flex-wrap: wrap !important; }
+""")
+
+#: The symbol card's own look (card mode is only ever on at phone width, so this is
+#: not media-gated -- a desktop never renders these classes).
+SYMBOL_CARD_CSS = r"""
+    /* THE SYMBOL CARD: a distinct card (its own background, a 1px line, a 12px gap to the
+       next one), a header row, a strict two-column grid of equal TILES, two outlined
+       inputs of one height, and a full-width Details fold. One value size (16px) and one
+       caption size (11px) throughout. */
+    .pf-sym-card { border: 1px solid rgba(255,255,255,0.16); border-radius: 12px;
+        padding: 10px 12px 12px; margin: 0 0 12px; width: 100%;
+        background: #232a3d; box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+    .pf-sym-card--sel { border-color: #00d4aa; }
+    .pf-sym-head { display: flex; align-items: center; gap: 8px; padding-bottom: 8px;
+        margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.10); }
+    .pf-sym-name { font-size: 1.2rem; font-weight: 700; line-height: 1.1; }
+    .pf-sym-head > .row { margin-left: auto; flex-wrap: nowrap !important;
+        justify-content: flex-end !important; gap: 2px !important; }
+    .pf-sym-head .q-btn { min-width: 32px; min-height: 32px; }
+    .pf-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px; margin: 10px 0; }
+    .pf-tile { display: flex; flex-direction: column; min-width: 0; min-height: 4rem;
+        padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,0.04); }
+    .pf-tile--wide { grid-column: 1 / -1; min-height: 0; }
+    .pf-tile-k { font-size: 11px; line-height: 1.2; letter-spacing: 0.05em;
+        text-transform: uppercase; color: #94a3b8; }
+    .pf-tile-v { font-size: 16px; line-height: 1.3; margin-top: 3px; font-weight: 600;
+        font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .pf-tile-sub { font-size: 12px; line-height: 1.3; margin-top: 2px;
+        font-variant-numeric: tabular-nums; }
+    .pf-sub-k { color: #94a3b8; }
+    .pf-pnl-rest { word-break: keep-all; }
+    .pf-sym-card .text-negative { color: #f87171 !important; }
+    .pf-sym-card .text-positive { color: #4ade80 !important; }
+    .pf-field { margin: 10px 0; }
+    .pf-sym-card .q-field__control { min-height: 44px; height: 44px; }
+    .pf-sym-card .q-field--outlined .q-field__control:before { border-color: rgba(255,255,255,0.35); }
+    .pf-sym-card .q-field__native, .pf-sym-card .q-field__input { min-height: 44px; font-size: 16px; }
+    .pf-fold { margin-top: 10px; border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 8px; background: rgba(255,255,255,0.03); }
+    .pf-sym-more { min-height: 44px; color: #cbd5e1; font-size: 0.95rem; }
+    .pf-fold .pf-tiles { margin: 0; padding: 0 8px 10px; }
+    .q-table__grid-content { padding: 0 !important; }
+"""
+
+PROTECT_CSS = r"""
+    /* THE TP/SL SHIELD AND THE EXCLUDE EYE sit in the symbol cell's icon group, the size of the (i). */
+    .pf-icons .q-btn { min-width: 0; }
+    /* the take-profit rows' fields may shrink so price + share + delete stay on one desktop line */
+    .pf-tp-row .q-field { min-width: 0; }
+    /* THE LABEL HEADER'S COUNT PILL: total | profitable | losing | excluded, touching segments. */
+    .pf-seg { border-radius: 10px; overflow: hidden; gap: 1px !important; }
+    .pf-seg .pf-seg-part { border-radius: 0; padding: 2px 7px; font-weight: 700; }
+    /* AN EXCLUDED ROW is greyed (it is outside the managed money); its icon group stays readable. */
+    .pf-row-excluded td { opacity: 0.55; }
+    .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
+    .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+"""
+
+PROTECT_PHONE_CSS = phone_media("""
+    /* THE TP/SL DIALOG on a phone: each take-profit row is a full-width price over a share box
+       and the delete button, never three fields squeezed into 340px. */
+    .pf-tp-row.pf-tp-row { flex-wrap: wrap !important; row-gap: 4px; }
+    .pf-tp-row.pf-tp-row > .flex-grow { flex: 1 1 100% !important; }
+    .pf-tp-row.pf-tp-row > .w-32 { flex: 1 1 auto !important; width: auto !important; }
+    .pf-prot-dialog .q-field__control { min-height: 44px; }
+    /* the symbol head's icon buttons keep a thumb-sized target (beats .pf-icons .q-btn {min-width:0}) */
+    .pf-sym-head .pf-icons .q-btn { min-width: 40px; min-height: 40px; }
+    .pf-bar-row > .pf-b-excl { order: 3; }
+""")
+
+PHONE_SWATCH_CSS = phone_media("""
+    .pf-swatch { width: 36px !important; height: 36px !important; }
+""")
+
+
+#: THE PAGE'S STYLESHEET IS SERVED AS A FILE, not only injected with ``ui.add_css``.
+#: On the operator's iPhone the symbol cards arrived with NONE of their rules (no
+#: border, no grid, caption and value run together: "Current value390.94") while the
+#: global ``styles.css`` -- linked from the head -- applied. ``ui.add_css`` is JavaScript
+#: (``addStyle(...)``) run in the page; a plain ``<link>`` is the mechanism that has
+#: demonstrably worked on that phone, and it is cacheable. The file is generated from
+#: ``page_phone_css()`` (a test pins the two equal) and the URL carries a content hash
+#: so a changed sheet is never served stale.
+PAGE_CSS_FILENAME = 'portfolio_allocation.css'
+
+
+def page_css_path():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1] / 'static' / PAGE_CSS_FILENAME
+
+
+def page_css_link_html() -> str:
+    """The ``<link>`` that loads the page stylesheet, versioned by content. Pure."""
+    import hashlib
+    digest = hashlib.md5(page_phone_css().encode('utf-8')).hexdigest()[:10]
+    return f'<link rel="stylesheet" href="/static/{PAGE_CSS_FILENAME}?v={digest}">'
+
+
+def write_page_css() -> None:
+    """Regenerate ``static/portfolio_allocation.css`` from ``page_phone_css()``.
+    Run ``python -c "from ba2_trade_platform.ui.pages.portfolio_allocation import
+    write_page_css; write_page_css()"`` after changing any phone CSS."""
+    page_css_path().write_text(page_phone_css(), encoding='utf-8', newline='\n')
+
+
+def page_phone_css() -> str:
+    """Every stylesheet rule this page's phone layout needs, in one string. Pure.
+
+    Added by ``content()`` with the page's other ``ui.add_css``; the wizard's dialog
+    is built later and relies on it being there already.
+    """
+    return '\n'.join((GENERIC_PHONE_CSS, LABEL_BAR_PHONE_CSS, SYMBOL_CARD_CSS,
+                      PROTECT_CSS, PROTECT_PHONE_CSS,
+                      PHONE_SWATCH_CSS, wizard_phone_card_css()))
+
+
+_PHONE_REGISTRIES: Dict[Any, PhoneTableRegistry] = {}
+
+
+def _forget_phone_registry(client) -> None:
+    """``client.on_delete`` handler. NiceGUI hands it the CLIENT, so a ``cid=`` default
+    argument would be silently overwritten with it and the pop would never match."""
+    _PHONE_REGISTRIES.pop(client.id, None)
+
+
+def _phone_tables() -> PhoneTableRegistry:
+    """This client's registry of card-mode tables. One per browser tab: the breakpoint
+    event is scoped to the client that emitted it, and a table must be re-pinned by
+    ITS OWN tab's viewport. Weakly-held tables, so a refresh frees the old ones;
+    the registries themselves are dropped with the client."""
+    client = ui.context.client
+    registry = _PHONE_REGISTRIES.get(client.id)
+    if registry is None:
+        registry = _PHONE_REGISTRIES[client.id] = PhoneTableRegistry()
+        client.on_delete(_forget_phone_registry)
+    return registry
+
+
+def symbol_table_columns() -> List[Dict[str, Any]]:
+    """The symbol table's column definitions. ONE list, read by the table and by
+    the phone card spec check (``SYMBOL_CARD``)."""
+    # The LABELS column is gone. Every row inside a label's own section repeated the
+    # same value, and the section header already says which label this is; the one
+    # case where the value differs -- a symbol carrying two managed labels -- is
+    # named by the ⚠ cell's tooltip, which is why ``labels`` stays in the row DATA.
+    # The table is built here and nowhere else (no cross-label or "all symbols" view
+    # reuses it), so there is nothing to make the column conditional for.
+    columns = [
+        {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
+        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+        # The ⓘ, beside the symbol it describes rather than at the far end of
+        # eleven columns. ``field`` is required by Quasar and is never printed --
+        # the slot below draws a button over it.
+        {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
+        {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
+        # THE HELD SHARES, beside the held money they are the other half of. This
+        # column already existed, out past ``Target value`` and wearing the buy/sell
+        # change as its caption -- which reads as a target column, and had the
+        # operator asking for the current quantity to be "added". It was never
+        # added: it moved, and the change moved with the TARGET quantity below,
+        # which is the figure it is a change to.
+        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
+        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
+        # hold (2026-09-05). The old denominator was the label's own held total, so
+        # the column summed to exactly 100% on every label whatever its funding --
+        # a label holding twice its target read as perfectly balanced. Over 100%
+        # here now means over-subscribed and under means under-invested, which is
+        # what the reader is looking for. The header names the denominator: an
+        # unqualified "% of label" is what made the old figure misread.
+        {'name': 'pct_of_label_target', 'label': '% of label tgt',
+         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
+        {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
+        # "Share of label %", not "Target %": the label header above prints a target
+        # too, and that one is a share of the PORTFOLIO. Two different quantities
+        # under one word is what made "target 0.0%" over a column of 20s look wrong.
+        # NARROWED. The cell holds a number box, not prose, and at its natural width the
+        # header text was setting the column -- pushing the money columns, which the eye
+        # actually compares down the page, off to the right.
+        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct',
+         'sortable': True, 'align': 'right', 'style': 'width: 108px',
+         'headerStyle': 'width: 108px; white-space: normal'},
+        # "Last %", immediately after the box it is the history OF. Its denominator
+        # is the same one -- a share of THIS label -- so it needs no clause of its
+        # own; a blank cell means the symbol has never been allocated.
+        {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
+        {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
+        # The shares that money buys, and under it the change from what is held --
+        # the pair the order is actually placed from. Both are written by
+        # ``_write_row_deltas``, so a share edit moves the two together or neither.
+        {'name': 'target_quantity', 'label': 'Target qty', 'field': 'target_quantity', 'sortable': True, 'align': 'right'},
+        {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
+        {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
+        {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
+        # Unrealised P&L, money and percent in one pre-formatted string. It is a
+        # STRING and not two numeric columns because half its values are not
+        # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
+        # those as 0.00 is the failure mode this platform has actually paid for.
+        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
+        {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
+    ]
+    return columns
+
+
+check_card_columns(SYMBOL_CARD, [c['name'] for c in symbol_table_columns()])
+
+
+async def apply_exclusion_change(account_id: int, symbol: str, currently_excluded: bool,
+                                 note: Optional[str], refresh) -> bool:
+    """Write the exclude / include decision, tell the operator, redraw. Returns whether it was
+    written (a failure is shown and logged, never swallowed)."""
+    symbol = symbol.strip().upper()
+    try:
+        if currently_excluded:
+            await asyncio.to_thread(exclusion_store.include_symbol, account_id, symbol)
+        else:
+            await asyncio.to_thread(exclusion_store.exclude_symbol, account_id, symbol, note=note)
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'Toggling exclusion of {symbol} failed: {e}', exc_info=True)
+        ui.notify(f'Could not change {symbol}: {e}', type='negative')
+        return False
+    ui.notify(f"{symbol} {'included in' if currently_excluded else 'excluded from'} allocation",
+              type='positive')
+    await refresh()
+    return True
+
+
+def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, Any], refresh) -> None:
+    """Exclude / include ONE symbol for allocation. Always confirmed: it changes what the next run trades.
+
+    Excluding does not touch protective TP/SL orders (they stay exactly as they are); including is
+    explicit."""
+    symbol = symbol.strip().upper()
+    currently = symbol in exclusions
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-[520px]'):
+        if currently:
+            ui.label(f'Include {symbol} in allocation again?').classes('text-h6')
+            ui.label('It counts in its labels again: rebalancing may buy or sell it and its share '
+                     'is part of the label maths.').classes('text-xs text-secondary-custom')
+            note = None
+            over = labels_over_allocated_by_include(account_id, symbol)
+            if over:
+                ui.label("WARNING: including it again puts "
+                         + "; ".join(f"{lb} at {total:g}%" for lb, total in over)
+                         + " of its stored shares, over 100%. Nothing is blocked: the engine scales the "
+                           "shares down, but check the label's shares.").classes('text-sm') \
+                    .style('color:#f87171')
+        else:
+            ui.label(f'Exclude {symbol} from allocation?').classes('text-h6')
+            ui.label('The allocator will not buy or sell it, its value is outside the label and the '
+                     'investable base, and its share is ignored (the other symbols are scaled over '
+                     'the enabled ones). It stays visible in its label. Protective TP/SL orders stay '
+                     'exactly as they are.').classes('text-xs text-secondary-custom')
+            note = ui.input('Note (optional)', placeholder='e.g. bought manually').props('dense outlined') \
+                .classes('w-full')
+            emptied = labels_left_without_symbols(account_id, symbol)
+            if emptied:
+                ui.label(f"WARNING: {', '.join(emptied)} would have no enabled symbol left while it has a "
+                         f"non-zero target. The allocator refuses such a label and that blocks the WHOLE "
+                         f"rebalance until you set its target to 0 or include a symbol."
+                         ).classes('text-sm').style('color:#f87171')
+
+        async def _go() -> None:
+            done = await apply_exclusion_change(
+                account_id, symbol, currently,
+                (note.value or None) if note is not None else None, refresh)
+            if done:
+                dialog.close()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-2 pf-actions'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Include again' if currently else 'Exclude', on_click=_go) \
+                .props('color=primary').mark(MARKER_EXCLUDE_TOGGLE)
+    dialog.open()
+
+
+def check_protection_now(account_id: int):
+    """The explicit 'Check TP/SL orders now' action. Blocking (broker reads).
+
+    Runs the same reconcile the account refresh runs (fills, lost orders, resizes) and the GTC
+    renewal; the page never does this on load. Returns the ``ReconcileReport``.
+    """
+    from ...core.utils import get_account_instance_from_id
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    report = protect_svc.reconcile_account(account)
+    protect_svc.renew_expiring(account)
+    return report
+
+
+async def _check_protection_clicked(account_id) -> None:
+    if account_id is None:
+        ui.notify('No account selected', type='warning')
+        return
+    try:
+        report = await asyncio.to_thread(check_protection_now, int(account_id))
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'TP/SL check failed for account {account_id}: {e}', exc_info=True)
+        ui.notify(f'TP/SL check failed: {e}', type='negative')
+        return
+    ui.notify(f'TP/SL checked: {report.checked} order(s) read, {len(report.new_fills)} fill(s), '
+              f'{len(report.alarms)} alarm(s). Press Refresh to redraw.', type='info')
+
+
+def labels_left_without_symbols(account_id: int, symbol: str) -> List[str]:
+    """Managed labels with a NON-ZERO target that would have NO enabled symbol left if ``symbol``
+    were excluded. The engine refuses a funded label with no symbols (ERROR_LABEL_NO_SYMBOLS) and
+    that blocks the WHOLE rebalance, so the exclude dialog warns first.
+    """
+    from ...core.utils import get_symbols_by_label
+    symbol = symbol.strip().upper()
+    managed = [m for m in get_managed_labels(account_id) if float(m.target_pct or 0.0) > 0.0]
+    members = get_symbols_by_label([m.label for m in managed])
+    excluded = exclusion_store.excluded_symbols(account_id)
+    out = []
+    for m in managed:
+        syms = [x.strip().upper() for x in members.get(m.label, [])]
+        if symbol in syms and not [x for x in syms if x != symbol and x not in excluded]:
+            out.append(m.label)
+    return out
+
+
+def labels_over_allocated_by_include(account_id: int, symbol: str) -> List[Tuple[str, float]]:
+    """``[(label, stored total %)]`` for the managed labels holding ``symbol`` whose STORED shares, with
+    this symbol's included, sum to more than 100%. A warning only (the operator's call, 2026-10-05):
+    re-including is never blocked. Pure over the store reads."""
+    from ...core.utils import get_symbols_by_label
+    symbol = symbol.strip().upper()
+    managed = get_managed_labels(account_id)
+    members = get_symbols_by_label([m.label for m in managed])
+    out = []
+    for m in managed:
+        syms = [x.strip().upper() for x in members.get(m.label, [])]
+        if symbol not in syms:
+            continue
+        rows = get_symbol_rows(account_id, m.label)
+        total = sum(float(rows[s].weight_pct) for s in syms if s in rows)
+        if total > 100.0 + 0.005:
+            out.append((m.label, round(total, 2)))
+    return out
+
+
+def _protection_fields(protection: Dict[str, Any], symbol: str, quantity: float) -> Dict[str, Any]:
+    """The row fields of the Set TP/SL control for one symbol. Pure over its arguments."""
+    if not protection['supported']:
+        return protect_view.row_fields(False, None)
+    entry = protection['items'].get(symbol)
+    if entry is None:
+        status = protect_svc.status_for(None, quantity)
+        note = None
+        alert = (None, None)
+    else:
+        status = protect_svc.status_for(entry[0], quantity, entry[1])
+        note = entry[0].last_fill_note
+        alert = (entry[0].alert_code, entry[0].alert_message)
+    return protect_view.row_fields(True, status, note, alert[0], alert[1])
+
+
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     """One managed label's target box, comment box, symbol table and controls.
 
@@ -2614,16 +3470,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     live['weights'][view.label] = {r.symbol: float(r.weight_pct)
                                    for r in view.rows if r.weight_pct is not None}
 
-    with ui.row().classes('w-full items-center gap-2'):
+    with ui.row().classes(f'w-full items-center gap-2 {ACTIONS_CLASS}'):
         # THE label target, on the page at last. It used to be reachable only from
         # inside the Allocate wizard, which is why every label on an untouched
         # account sat at 0 while the table below printed a share of nothing.
         target_input = ui.number(
             label='Portfolio target %', value=view.target_pct, min=0, max=100,
-            step=0.01, suffix='%',
+            suffix='%',
             on_change=lambda e, lbl=view.label: _save_label_target(
                 account_id, live, lbl, e.value)
-        ).props(f'dense outlined debounce={TARGET_DEBOUNCE_MS}').classes('w-44')
+        ).props(f'dense outlined step=any debounce={TARGET_DEBOUNCE_MS}').classes('w-44')
         live['label_inputs'][view.label] = target_input
         ui.input('Label comment', value=view.comment or '',
                  on_change=lambda e, lbl=view.label: _save_label_comment(account_id, lbl, e.value)
@@ -2655,6 +3511,12 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # is never mistaken for "fractionable" at a glance.
         **_symbol_fact_fields(live['symbol_facts'].get(r.symbol)),
         **_symbol_stat_fields(live['symbol_stats'].get(r.symbol)),
+        **_protection_fields(live['protection'], r.symbol, r.quantity),
+        # The operator's manual disable: badge, toggle, tooltip. An excluded row is greyed.
+        **protect_view.exclusion_fields(live['exclusions'].get(r.symbol)),
+        # The share an ENABLED row is really solved with when its label has an excluded symbol.
+        'eff_weight_pct': r.effective_weight_pct,
+        'eff_weight': protect_view.effective_weight_text(r.weight_pct, r.effective_weight_pct),
         'current_value': round(r.current_value, 2),
         # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
         # what the "% of label tgt" COLUMN prints -- the label's target money, so an
@@ -2715,68 +3577,17 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     for row in rows:
         _write_row_deltas(row)
 
-    # The LABELS column is gone. Every row inside a label's own section repeated the
-    # same value, and the section header already says which label this is; the one
-    # case where the value differs -- a symbol carrying two managed labels -- is
-    # named by the ⚠ cell's tooltip, which is why ``labels`` stays in the row DATA.
-    # The table is built here and nowhere else (no cross-label or "all symbols" view
-    # reuses it), so there is nothing to make the column conditional for.
-    columns = [
-        {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
-        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-        # The ⓘ, beside the symbol it describes rather than at the far end of
-        # eleven columns. ``field`` is required by Quasar and is never printed --
-        # the slot below draws a button over it.
-        {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
-        {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
-        # THE HELD SHARES, beside the held money they are the other half of. This
-        # column already existed, out past ``Target value`` and wearing the buy/sell
-        # change as its caption -- which reads as a target column, and had the
-        # operator asking for the current quantity to be "added". It was never
-        # added: it moved, and the change moved with the TARGET quantity below,
-        # which is the figure it is a change to.
-        {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
-        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
-        # hold (2026-09-05). The old denominator was the label's own held total, so
-        # the column summed to exactly 100% on every label whatever its funding --
-        # a label holding twice its target read as perfectly balanced. Over 100%
-        # here now means over-subscribed and under means under-invested, which is
-        # what the reader is looking for. The header names the denominator: an
-        # unqualified "% of label" is what made the old figure misread.
-        {'name': 'pct_of_label_target', 'label': '% of label tgt',
-         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
-        {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
-        # "Share of label %", not "Target %": the label header above prints a target
-        # too, and that one is a share of the PORTFOLIO. Two different quantities
-        # under one word is what made "target 0.0%" over a column of 20s look wrong.
-        # NARROWED. The cell holds a number box, not prose, and at its natural width the
-        # header text was setting the column -- pushing the money columns, which the eye
-        # actually compares down the page, off to the right.
-        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct',
-         'sortable': True, 'align': 'right', 'style': 'width: 108px',
-         'headerStyle': 'width: 108px; white-space: normal'},
-        # "Last %", immediately after the box it is the history OF. Its denominator
-        # is the same one -- a share of THIS label -- so it needs no clause of its
-        # own; a blank cell means the symbol has never been allocated.
-        {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
-        {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
-        # The shares that money buys, and under it the change from what is held --
-        # the pair the order is actually placed from. Both are written by
-        # ``_write_row_deltas``, so a share edit moves the two together or neither.
-        {'name': 'target_quantity', 'label': 'Target qty', 'field': 'target_quantity', 'sortable': True, 'align': 'right'},
-        {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
-        {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
-        {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
-        # Unrealised P&L, money and percent in one pre-formatted string. It is a
-        # STRING and not two numeric columns because half its values are not
-        # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
-        # those as 0.00 is the failure mode this platform has actually paid for.
-        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
-        {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
-    ]
+    columns = symbol_table_columns()
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
+    # PHONE: the same table in Quasar's card mode (``grid``), one card per row. The
+    # ``:grid`` expression reads the viewport once on render; the registry re-pins it
+    # when the viewport crosses the breakpoint (a rotated phone). See
+    # ``ui/utils/responsive.py`` and ``SYMBOL_CARD``.
+    table.props(phone_grid_prop())
+    table.add_slot('item', symbol_card_template())
+    _phone_tables().register(table)
     live['tables'][view.label] = table
     # WHAT AN UNSET SHARE IS SHOWING. The default used to be the fair share, which
     # would have BOUGHT a newly added symbol; it is the symbol's actual share now,
@@ -2788,8 +3599,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # pool, this one is its symbols' shares of the label. The caption on each says
     # which, because two bars two inches apart on two denominators is exactly the
     # collision this page has been unpicking.
-    with ui.row().classes('w-full items-center gap-3 no-wrap').style(TABULAR_NUMS) \
-            .mark(MARKER_SYMBOL_BAR_ROW):
+    with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}') \
+            .style(TABULAR_NUMS).mark(MARKER_SYMBOL_BAR_ROW):
         ui.label(SYMBOL_TOTAL_BAR_CAPTION).classes('w-40 text-xs text-secondary-custom')
         symbol_bar_widgets = _render_mini_bar(
             fill_marker=MARKER_SYMBOL_BAR_FILL, notch_marker=MARKER_SYMBOL_BAR_NOTCH)
@@ -2819,49 +3630,20 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # non-empty (see ``_symbol_fact_fields``): an absent broker answer draws nothing.
     table.add_slot('body-cell-info', r'''
         <q-td :props="props">
-            <div class="row items-center no-wrap justify-center" style="gap:6px">
-                <q-btn dense flat round size="sm" icon="info" color="grey-5"
-                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
-                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
-                        <!-- Income and total return, from the cached provider stats.
-                             Exactly one of these three lines is ever non-empty: the
-                             figures, "not fetched yet", or the fetch error. -->
-                        <div v-if="props.row.stat_line" class="text-weight-medium"
-                             style="margin-top:4px">{{ props.row.stat_line }}</div>
-                        <div v-if="props.row.stat_pending" style="opacity:0.7">
-                            {{ props.row.stat_pending }}</div>
-                        <div v-if="props.row.stat_error" style="opacity:0.7">
-                            {{ props.row.stat_error }}</div>
-                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
-                    </q-tooltip>
-                </q-btn>
-                <span v-if="props.row.frac_badge"
-                      class="text-caption text-weight-bold"
-                      style="width:0.9rem;text-align:center"
-                      :style="props.row.frac_strike
-                              ? 'color:#94a3b8;text-decoration:line-through'
-                              : 'color:#4ade80'">
-                    {{ props.row.frac_badge }}
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        {{ props.row.frac_tip }}
-                    </q-tooltip>
-                </span>
-                <span v-if="props.row.lev_badge"
-                      class="text-caption"
-                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
-                             border-radius:4px;padding:0 4px;line-height:1.25;
-                             font-variant-numeric:tabular-nums;white-space:nowrap">
-                    {{ props.row.lev_badge }}
-                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                        {{ props.row.lev_tip }}
-                    </q-tooltip>
-                </span>
-            </div>
+            ''' + SYMBOL_CHIPS_TEMPLATE + r'''
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
+    # THE TP/SL SHIELD AND THE EXCLUDE EYE live in the ``info`` cell beside the (i) (``SYMBOL_CHIPS_TEMPLATE``):
+    # icons only, so they cost no column. Like ``symbolInfo`` the row's own symbol travels with the click.
+    table.on('excludeToggle',
+             lambda e: _open_exclusion_dialog(account_id, str(emitted_value(e)),
+                                              live['exclusions'], refresh))
+    # An excluded row is greyed (Quasar's ``table-row-class-fn``); its toggle stays readable.
+    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : \'\'"')
+    if live['protection']['supported']:
+        table.on('protectClick',
+                 lambda e: open_protection_dialog(account_id, str(emitted_value(e)), refresh))
     # THE DELTA IS THE INPUT'S ``hint``, not a sibling div. A sibling right-aligns to
     # the CELL's edge while the input's number right-aligns to the INPUT's content box,
     # and the two are not the same edge -- the delta hung a dozen pixels past the box it
@@ -2878,13 +3660,15 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     table.add_slot('body-cell-weight_pct', r'''
         <q-td :props="props">
             <q-input :key="props.row.weight_key" :model-value="props.value"
-                     type="number" dense borderless input-class="text-right"
+                     type="number" step="any" inputmode="decimal" dense borderless input-class="text-right"
                      class="full-width"
                      debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
                      @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
                 <template v-slot:hint>
                     <div class="text-right"
                          :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+                    <div v-if="props.row.eff_weight" class="text-right text-caption"
+                         style="color:#94a3b8">{{ props.row.eff_weight }}</div>
                 </template>
             </q-input>
         </q-td>
@@ -2974,7 +3758,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # None of them is DISABLED when it has nothing to do. The wizard greyed them
     # out; this page reports the no-op in words instead, which is the convention
     # Fill 100% set and which costs no per-keystroke sweep over every row.
-    with ui.row().classes('w-full items-center gap-2 mt-2'):
+    with ui.row().classes(f'w-full items-center gap-2 mt-2 {ACTIONS_CLASS}'):
         ui.button('Fill 100%', icon='functions',
                   on_click=lambda lbl=view.label: _fill_label_to_100(
                       account_id, live, lbl)
@@ -3053,11 +3837,11 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
     """
     with ui.column().classes('stat-card p-3 w-full').mark(MARKER_RESERVE_CARD):
         ui.label('Unallocated reserve').classes('text-xs text-secondary-custom')
-        with ui.row().classes('items-center gap-3 no-wrap'):
+        with ui.row().classes(f'items-center gap-3 no-wrap {WRAP_ROW_CLASS}'):
             slider = ui.slider(min=0, max=100, step=1,
                                value=live['unallocated_pct']).classes('w-40')
-            number = ui.number(value=live['unallocated_pct'], min=0, max=100, step=0.01,
-                               suffix='%').props('dense outlined').classes('w-28') \
+            number = ui.number(value=live['unallocated_pct'], min=0, max=100,
+                               suffix='%').props('dense outlined step=any').classes('w-28') \
                 .style(TABULAR_NUMS)
         live['reserve_slider'] = slider
         live['reserve_number'] = number
@@ -3096,7 +3880,7 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         # which -- so it does.
         live['reserve_row'] = ui.label('').style(TABULAR_NUMS)
         ui.label(ALLOCATION_BAR_LEGEND).classes('text-xs text-secondary-custom')
-        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+        with ui.row().classes(f'w-full items-center gap-3 no-wrap {WRAP_ROW_CLASS}') \
                 .style(TABULAR_NUMS).mark(MARKER_RESERVE_BAR_ROW):
             reserve_bar_widgets = _render_mini_bar(
                 fill_marker=MARKER_RESERVE_BAR_FILL,
@@ -3148,7 +3932,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
     live['bars'][view.label] = widgets
 
     with expansion.add_slot('header'):
-        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+        with ui.row().classes(f'w-full items-center gap-3 no-wrap {BAR_ROW_CLASS}') \
                 .style(TABULAR_NUMS).mark(MARKER_BAR_ROW):
             # THE tag icon, drawn UNCOLOURED. ``_apply_bars`` paints it from
             # ``bar.color``, in the same loop and from the same value as the fill
@@ -3169,7 +3953,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # both resolve to the same neutral grey and only the second is
             # something the user can put right.
             with ui.icon('label').mark(MARKER_LABEL_ICON) \
-                    .classes('cursor-pointer') as icon:
+                    .classes('cursor-pointer pf-b-icon') as icon:
                 ui.tooltip(describe_label_color(view.color))
                 with ui.menu().props('auto-close'):
                     _render_color_choices(
@@ -3185,7 +3969,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # the page as it loaded; ``_apply_bars`` also hides it when every
             # symbol has a share, because a badge reading 0 is noise.
             zero_badge = ui.badge('').props('color=orange') \
-                .classes('shrink-0').mark(MARKER_LABEL_ZERO_BADGE)
+                .classes('shrink-0 pf-b-zero').mark(MARKER_LABEL_ZERO_BADGE)
             with zero_badge:
                 widgets['zero_tooltip'] = ui.tooltip('')
             widgets['zero_badge'] = zero_badge
@@ -3197,11 +3981,11 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # (WARNING_SYMBOL_UNDER_FMT) -- the tooltip says which, using the
             # engine's own wording so the two can never disagree.
             weight_warning = ui.icon('warning').props('color=orange size=xs') \
-                .classes('shrink-0 cursor-help').mark(MARKER_LABEL_WEIGHT_WARNING)
+                .classes('shrink-0 cursor-help pf-b-warn').mark(MARKER_LABEL_WEIGHT_WARNING)
             with weight_warning:
                 widgets['weight_warning_tooltip'] = ui.tooltip('')
             widgets['weight_warning'] = weight_warning
-            ui.label(view.label).classes('w-48 truncate font-medium')
+            ui.label(view.label).classes('w-48 truncate font-medium pf-b-name')
             # HOW MANY SYMBOLS THE LABEL HOLDS, beside the name it is a size of.
             # Static: membership is changed by adding or removing symbols, and both
             # paths reload the page -- unlike the orange badge above, which counts
@@ -3211,13 +3995,38 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # because an orange 0 beside a healthy label is noise; this one is not a
             # warning, and "this label has nothing in it" is the single state of the
             # count most worth seeing without opening the fold.
-            count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
-                .classes('shrink-0').mark(MARKER_LABEL_COUNT_BADGE)
-            with count_badge:
-                ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
-                    count=len(view.rows), label=view.label))
+            # ONE segmented pill of symbol counts: grey = total, green = profitable, red = losing, orange =
+            # excluded (zero segments are omitted except the total). Replaces the grey count badge and the
+            # '+$X excluded' text. Static, like the count it replaces: membership changes reload the page.
+            segments = label_badge_segments(view.rows, view.excluded_value)
+            legend = '\n'.join(seg['tooltip'] for seg in segments[1:])
+            # THE PILL SITS IN A FIXED-WIDTH SLOT (room for all four segments): its own width depends on how
+            # many segments the label has, and everything to its right (value, bar) would otherwise start at
+            # a different x on every row.
+            with ui.row().classes('items-center no-wrap shrink-0 pf-b-count').style('min-width:7.5rem'):
+                with ui.row().classes('items-center no-wrap gap-0 pf-seg').mark(MARKER_LABEL_SEGMENTS):
+                    count_badge = ui.badge(str(len(view.rows))).props('color=grey-7') \
+                        .classes('pf-seg-part').mark(MARKER_LABEL_COUNT_BADGE)
+                    with count_badge:
+                        ui.tooltip(SYMBOL_COUNT_BADGE_TOOLTIP_FMT.format(
+                            count=len(view.rows), label=view.label)
+                            + ('\n' + legend if legend else '')
+                            + (f"\n{segments[0]['unmeasured']} with no measurable P&L"
+                               if segments[0].get('unmeasured') else '')).style('white-space:pre-line')
+                    for seg in segments[1:]:
+                        part = ui.badge(str(seg['count'])).props(f"color={seg['color']}") \
+                            .classes('pf-seg-part').mark(MARKER_SEGMENT_PREFIX + seg['key'])
+                        with part:
+                            ui.tooltip(seg['tooltip'])
             widgets['count_badge'] = count_badge
-            widgets['value'] = ui.label('').classes('w-28 text-right')
+            # 'freed Y% from TP/SL fills' (a share a protective fill released and left unallocated).
+            extras = label_extras_text(view.excluded_value, view.excluded_count, view.freed_pct)
+            if extras:
+                excl_label = ui.label(extras).classes('text-xs shrink-0 pf-b-excl').style('color:#fbbf24') \
+                    .mark(MARKER_LABEL_EXTRAS)
+                with excl_label:
+                    ui.tooltip('A share a TP/SL fill released stays unallocated until you reassign it.')
+            widgets['value'] = ui.label('').classes('w-28 text-right pf-b-value')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
             # IT GROWS, and every track still comes out the same length, because
@@ -3231,7 +4040,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets.update(_render_mini_bar(
                 fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
                 classes=LABEL_BAR_CLASSES))
-            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right pf-b-pct')
             # WIDE ENOUGH FOR THE MONEY, NOWRAP, and LEFT-aligned. The cell carries
             # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
             # (2026-09-05) -- ~33 characters, which wrapped at the old w-36 and made
@@ -3240,7 +4049,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # between the bar and its own label. The bar absorbs whatever is left,
             # which is what keeps a wide screen from opening a hole in the row.
             widgets['target'] = ui.label('').classes(
-                'w-72 shrink-0 truncate text-left')
+                'w-72 shrink-0 truncate text-left pf-b-target')
             # THE number that says what to do. It replaced the bare status word --
             # "over" beside a bar already sitting past its notch said nothing the
             # geometry had not -- and it keeps that word's COLOUR, so the row still
@@ -3251,12 +4060,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # basis (it is a stored target), so unlike the wizard's "% of base"
             # wording it needs no restating -- see ``LAST_TARGET_FMT``.
             widgets['last'] = ui.label('') \
-                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
+                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom pf-b-last') \
                 .mark(MARKER_LABEL_LAST)
             # TWO spans in ONE fixed-width cell. ``gap-0`` because the split is
             # invisible: the halves must read as the one sentence they were before,
             # and the engine guarantees head + dividend + tail is that sentence.
-            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline') \
+            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline pf-b-pnl') \
                     .mark(MARKER_LABEL_PNL_CELL):
                 widgets['pnl'] = ui.label('').classes('truncate') \
                     .mark(MARKER_LABEL_PNL)
@@ -3264,7 +4073,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                     .mark(MARKER_LABEL_PNL_DIV)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
-            ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
+            ui.icon('edit').classes('cursor-pointer text-secondary-custom pf-b-edit') \
                 .on('click.stop',
                     lambda _e=None, lbl=view.label: _focus_label_target(live, lbl)) \
                 .tooltip('Edit this label’s portfolio target')
@@ -3272,7 +4081,7 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # created ONCE and re-texted on every redraw: calling ``.tooltip()``
             # again would add a second tooltip element, and by the tenth keystroke
             # there would be ten of them stacked on one icon.
-            with ui.icon('info_outline').classes('text-secondary-custom') as info:
+            with ui.icon('info_outline').classes('text-secondary-custom pf-b-info') as info:
                 # ``LABEL_TOOLTIP_STYLE`` is the expert cards' own
                 # ``DETAIL_TOOLTIP_STYLE`` plus a legible size: "The info text is too
                 # small", and a tooltip is HTML, so without the max-width the
@@ -3306,12 +4115,48 @@ def _render_sim_banner(payload: Dict[str, Any]) -> None:
             real=f"${float(real):,.2f}" if real is not None else SIM_BANNER_NO_REAL))
 
 
+def _render_protection_banner(payload: Dict[str, Any]) -> None:
+    """The red TP/SL ALERT banner above the label list.
+
+    An unprotected, partly protected or unverifiable position must be impossible to miss, and
+    it must not depend on which label the symbol sits in or whether that label is expanded.
+    Drawn from the SAME statuses the rows use. Nothing is drawn on a broker without the
+    feature, or when there is nothing to say.
+    """
+    protection = payload.get('protection') or {}
+    if not protection.get('supported'):
+        return
+    quantities = protection.get('quantities') or {}
+    entries = [(p, protect_svc.status_for(p, quantities.get(p.symbol, 0.0), slices))
+               for p, slices in protection['items'].values()]
+    alerts = protect_view.banner_lines(entries)
+    def _ask_check() -> None:
+        with ui.dialog() as sure, ui.card():
+            ui.label(PROTECT_CHECK_CONFIRM).classes('text-body2').style('white-space:pre-line')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=sure.close).props('flat')
+
+                async def _yes() -> None:
+                    sure.close()
+                    await _check_protection_clicked(payload.get('account_id'))
+                ui.button('Check and repair', on_click=_yes).props('color=primary')
+        sure.open()
+    ui.button(PROTECT_CHECK_LABEL, icon='fact_check', on_click=_ask_check
+              ).props('outline dense').classes('self-start').mark(MARKER_PROTECT_CHECK)
+    if alerts:
+        with ui.element('div').classes('alert-banner danger w-full p-3').mark(MARKER_PROTECT_ALERT):
+            ui.label(f'TP/SL ALERT: {len(alerts)} position(s) are not fully protected').classes('text-weight-bold')
+            for line in alerts:
+                ui.label(line).classes('text-sm')
+
+
 def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
     # because the order was whatever ``sort_order`` happened to be.
     # BEFORE the empty-label early return: an account with no labels can still be
     # simulating, and the warning must not depend on there being a table under it.
     _render_sim_banner(payload)
+    _render_protection_banner(payload)
 
     views = sort_label_views(payload['views'])
     if not views:
@@ -3326,7 +4171,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                            available_buying_power=buying_power,
                            unallocated_pct=payload['unallocated_pct'],
                            symbol_facts=payload.get('symbol_facts') or {},
-                           symbol_stats=payload.get('symbol_stats') or {})
+                           symbol_stats=payload.get('symbol_stats') or {},
+                           protection=payload.get('protection'),
+                           exclusions=payload.get('exclusions'))
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -3567,7 +4414,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         if mode != ALLOCATION_MODE_INVEST_LABEL:
             set_allocation_config(account_id, unallocated_pct=float(unallocated_pct))
         return save_allocation_targets(
-            account_id, labels,
+            account_id, labels_for_persist(account_id, labels),
             save_label_targets=(mode != ALLOCATION_MODE_INVEST_LABEL))
 
     async def _save_choices(mode: str, labels, allow_fractional: bool,
@@ -3681,8 +4528,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             while painted < len(landed):
                 outcome = landed[painted]
                 painted += 1
-                text, classes = submit_result_cell(outcome)
-                wizard.set_row_result(outcome.symbol, text, classes)
+                # Text, icon and (for a failure) the marking of the whole row.
+                wizard.set_row_outcome(outcome)
 
         # Only when there is somewhere to paint. A caller without a wizard -- the
         # invest-scope path, and every test that drives _do_submit directly -- has no
@@ -3697,7 +4544,12 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             logger.error(f"Allocation submission failed: {e}", exc_info=True)
             ui.notify(f'Submission failed: {e}', type='negative')
             if wizard is not None:
-                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e))
+                # Paint what the worker had already recorded FIRST: a row that landed in
+                # the last 200 ms before the exception has a real outcome, and marking
+                # it "unknown - check the broker" before painting it would leave the
+                # amber mark winning over a FAILED the details view then contradicts.
+                _paint()
+                wizard.finish_submit(SUBMIT_FAILED_FMT.format(error=e), interrupted=True)
             return
         finally:
             # One last pass BEFORE the timer stops, or the rows that landed in the
@@ -3726,11 +4578,14 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                         f"row(s) on account {account_id}: {', '.join(symbols)}")
             ui.timer(0.1, _run_dry_run, once=True)
 
+        # NO second dialog: the dry-run table is the result. The summary line, the
+        # Retry button (only when something failed) and the per-row icons are all in it.
         if wizard is not None:
             wizard.finish_submit(submit_summary_line(result['outcomes'],
-                                                     run_id=result['run_id']))
-        render_outcomes(result['outcomes'], run_id=result['run_id'],
-                        on_retry=_on_retry)
+                                                     run_id=result['run_id']),
+                                 run_id=result['run_id'], outcomes=result['outcomes'],
+                                 on_retry=_on_retry)
+        notify_outcomes(result['outcomes'])
         note = working_orders_notice(settled=result['settled'],
                                      working_order_ids=result['working_order_ids'],
                                      refresh_failed=result['refresh_failed'])
@@ -3772,6 +4627,69 @@ async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
                                 invest_amount=amount)
 
 
+def _install_page_styles() -> None:
+    """Every stylesheet this page needs, installed BEFORE ``content()``'s first await.
+
+    NiceGUI sends the page HTML once the page builder yields; until the websocket
+    connects, ``ui.add_css`` / ``ui.add_head_html`` only append to the client's head
+    buffer, which has already been rendered -- so anything added in that window is
+    silently dropped (the phone cards and this toolbar rendered unstyled on prod,
+    2026-10-03). Called first thing in ``content()``, before ``_load_gate``'s await,
+    these land in the initial HTML.
+    """
+    # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
+    # there. A Quasar field and a Quasar button are different components with
+    # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
+    # leave the select a few pixels taller than the buttons, which is exactly the
+    # misalignment that keeps being reported. `items-center` then centres two boxes
+    # of different heights -- correctly, and still looking wrong.
+    #
+    # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
+    # elsewhere on the page sit in forms where their natural height is right.
+    # `!important` throughout, and that is not laziness. Quasar sets these heights
+    # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
+    # anything scoped to this toolbar by one class -- so the winner is decided by
+    # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
+    # attempt at this had no effect whatsoever for that reason.
+    #
+    # The field's own top padding is what makes the box taller than a button even
+    # once the control is pinned, so it is zeroed here too.
+    ui.add_css(f'''
+        .{TOOLBAR_CLASS} .q-field__control {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field__marginal {{
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+        .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
+            padding-top: 0 !important; padding-bottom: 0 !important; }}
+        .{TOOLBAR_CLASS} .q-btn {{
+            min-height: {TOOLBAR_CONTROL_PX}px !important;
+            height: {TOOLBAR_CONTROL_PX}px !important; }}
+
+        /* The Review button's own bar: WHITE on the button's green.
+           Not `color=white track-color=green-8`, which is what it was: Quasar's
+           palette props resolve to its theme colours and land a dark green track
+           under a white sweep on a mid-green button -- three greens, and the bar
+           reads as a shadow. The moving part and the track are addressed directly
+           so the contrast is a decision rather than whatever the palette gives.
+           `__model` covers BOTH renderings: determinate uses one, indeterminate
+           two, and both carry that class. */
+        .{TOOLBAR_CLASS} .q-linear-progress__model {{
+            background: #ffffff !important; opacity: 1 !important; }}
+        .{TOOLBAR_CLASS} .q-linear-progress__track {{
+            background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
+    ''')
+    # THE PHONE LAYER for this page's own widgets (label headers, symbol cards, the
+    # dry-run dialog's card rows, dialogs) -- see ``page_phone_css``. Then the
+    # breakpoint listener: it re-pins every symbol table's card mode when the
+    # viewport crosses 639px, because the ``:grid`` expression is read once.
+    ui.add_head_html(page_css_link_html())
+    ui.add_css(page_phone_css())
+    install_phone_listener(_phone_tables(), ui.add_head_html, ui.on)
+
+
 async def content() -> None:
     """Entry point for the /portfolioallocation route."""
     account_id = get_selected_account_id()
@@ -3781,6 +4699,9 @@ async def content() -> None:
         with ui.row().classes('w-full items-center justify-between'):
             ui.label('📊 Portfolio Allocation').classes('text-h6')
             ui.label('Manually traded accounts only').classes('text-xs text-secondary-custom')
+
+        # Styles FIRST: anything added to the head after the await below is dropped.
+        _install_page_styles()
 
         # Both loaders touch the DB. Unguarded, a DB error here escapes the route
         # handler and NiceGUI answers 500 with nothing on the page to explain it.
@@ -3796,52 +4717,25 @@ async def content() -> None:
             _render_gate_blocked(gate)
             return
 
-        # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
-        # there. A Quasar field and a Quasar button are different components with
-        # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
-        # leave the select a few pixels taller than the buttons, which is exactly the
-        # misalignment that keeps being reported. `items-center` then centres two boxes
-        # of different heights -- correctly, and still looking wrong.
-        #
-        # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
-        # elsewhere on the page sit in forms where their natural height is right.
-        # `!important` throughout, and that is not laziness. Quasar sets these heights
-        # from `.q-field--outlined .q-field__control`, which has the SAME specificity as
-        # anything scoped to this toolbar by one class -- so the winner is decided by
-        # stylesheet ORDER, and Quasar's loads after NiceGUI's add_css. The first
-        # attempt at this had no effect whatsoever for that reason.
-        #
-        # The field's own top padding is what makes the box taller than a button even
-        # once the control is pinned, so it is zeroed here too.
-        ui.add_css(f'''
-            .{TOOLBAR_CLASS} .q-field__control {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field__marginal {{
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-            .{TOOLBAR_CLASS} .q-field--outlined .q-field__control {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-field__native, .{TOOLBAR_CLASS} .q-field__input {{
-                padding-top: 0 !important; padding-bottom: 0 !important; }}
-            .{TOOLBAR_CLASS} .q-btn {{
-                min-height: {TOOLBAR_CONTROL_PX}px !important;
-                height: {TOOLBAR_CONTROL_PX}px !important; }}
-
-            /* The Review button's own bar: WHITE on the button's green.
-               Not `color=white track-color=green-8`, which is what it was: Quasar's
-               palette props resolve to its theme colours and land a dark green track
-               under a white sweep on a mid-green button -- three greens, and the bar
-               reads as a shadow. The moving part and the track are addressed directly
-               so the contrast is a decision rather than whatever the palette gives.
-               `__model` covers BOTH renderings: determinate uses one, indeterminate
-               two, and both carry that class. */
-            .{TOOLBAR_CLASS} .q-linear-progress__model {{
-                background: #ffffff !important; opacity: 1 !important; }}
-            .{TOOLBAR_CLASS} .q-linear-progress__track {{
-                background: rgba(255, 255, 255, 0.35) !important; opacity: 1 !important; }}
-        ''')
-        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
+        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
         body = ui.column().classes('w-full gap-3')
+        # THE INCOME PANEL'S OWN HOME, cleared and refilled by ``_refresh``. It used to
+        # be drawn into whatever slot happened to be running ``_refresh``: the Refresh
+        # button's row, a timer's parent, and -- after a Submit, whose ``_do_submit``
+        # runs in the Submit button's slot -- the dry-run DIALOG's footer. Every refresh
+        # also appended another copy, because nothing ever cleared the old one.
+        income_host = ui.column().classes('w-full gap-3')
+        # THE HOME OF EVERY TIMER-CREATED DIALOG. A NiceGUI element is a child of the
+        # slot that is current when it is built, and a timer built inside the income
+        # panel's Invest button would put the whole invest-scope dialog -- and the dry run
+        # opened from it -- INSIDE the income panel, which ``_refresh`` clears. The
+        # refresh that ends every Submit would then delete the dry-run table the user is
+        # reading its results in. Nothing in this container is ever cleared.
+        dialog_host = ui.element('div')
+
+        def _defer(callback) -> None:
+            with dialog_host:
+                ui.timer(0.1, callback, once=True)
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
             # SESSION-ONLY, deliberately not persisted: a what-if that survived a
@@ -3857,6 +4751,7 @@ async def content() -> None:
 
         async def _refresh() -> None:
             body.clear()
+            income_host.clear()
             with body:
                 ui.spinner(size='lg').classes('self-center')
             try:
@@ -3893,19 +4788,29 @@ async def content() -> None:
                 try:
                     events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
+                    load_error = None
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
                     events, open_total, working_note = [], 0.0, None
-                    ui.label(f'Income could not be loaded: {e}') \
-                        .classes('text-xs text-orange-400') \
-                        .style(class_color_style('text-orange-400'))
-                render_income_panel(
-                    events, open_total, working_note=working_note,
-                    on_sync=lambda: ui.timer(0.1, _refresh, once=True),
-                    on_invest=lambda amount: ui.timer(
-                        0.1, lambda: _open_invest_flow(
-                            account_id, mode_state['value'], amount, _refresh),
-                        once=True))
+                    load_error = e
+                # CLEARED HERE, right before drawing, and not only at the top of the
+                # refresh: two refreshes can overlap (a double tap on Sync, the
+                # toolbar Refresh during the one that ends a Submit), each reaches this
+                # point after its own awaits, and each used to append its own copy.
+                # Nothing below awaits, so clear-and-draw is atomic.
+                income_host.clear()
+                if load_error is not None:
+                    with income_host:
+                        ui.label(f'Income could not be loaded: {load_error}') \
+                            .classes('text-xs text-orange-400') \
+                            .style(class_color_style('text-orange-400'))
+                with income_host:
+                    render_income_panel(
+                        events, open_total, working_note=working_note,
+                        on_sync=lambda: _defer(_refresh),
+                        on_invest=lambda amount: _defer(
+                            lambda: _open_invest_flow(
+                                account_id, mode_state['value'], amount, _refresh)))
 
         async def _set_mode(event) -> None:
             """Persist the mode EAGERLY and RE-COMPUTE -- never reinterpret silently."""
@@ -4029,10 +4934,15 @@ async def content() -> None:
                 .props('dense outlined hide-bottom-space').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
+            ui.button('Export CSV', icon='download',
+                      on_click=lambda: _export_allocation_csv(account_id)).props('outline')
+            ui.button('Import CSV', icon='upload',
+                      on_click=lambda: _open_import_dialog(account_id, _refresh)).props('outline')
             refresh_button(_refresh)
             # The what-if control sits in the TOOLBAR, beside Valuation: both change
             # how every number below is computed, and neither is a number itself.
-            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
+            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation) \
+                .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
             ui.number(label='Simulated base', format='%.2f', min=0,
                       on_change=_set_simulated_base) \
                 .props('dense outlined hide-bottom-space prefix=$') \

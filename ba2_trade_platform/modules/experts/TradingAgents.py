@@ -1548,11 +1548,11 @@ Please check back in a few minutes for results."""
         """
         try:
             # Check if automatic trade opening is enabled for this expert
+            # ONLY the declared key gates it. A legacy undeclared `automatic_trading` row used
+            # to count as permission too, and its raw string made even "false" truthy.
             allow_automated_trade_opening = self.get_setting_with_interface_default('allow_automated_trade_opening')
-            # Also check legacy setting for backward compatibility
-            legacy_automatic_trading = self.settings.get('automatic_trading', False)  # Legacy setting, keep hardcoded default
-            
-            if not allow_automated_trade_opening and not legacy_automatic_trading:
+
+            if not allow_automated_trade_opening:
                 self.logger.debug(f"[TRADE MANAGER] Automatic trade opening disabled for expert {self.id}, skipping order creation for {symbol}")
                 return
             

@@ -34,7 +34,7 @@ def _make_expert(inst_id, **overrides):
         "factor_weight_pead": 0.0,
         "top_n": 2,
         "weighting": "equal",
-        "max_weight_per_name": 1.0,
+        "max_virtual_equity_per_instrument_percent": 100.0,
         "gross_exposure": 1.0,
         "winsorize_pct": 0.0,
         "pead_drift_window_days": 60,

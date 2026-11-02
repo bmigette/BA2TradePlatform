@@ -578,6 +578,40 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Buy the written call back when covered_call_days_to_expiry <= 7"
         },
+        ExpertEventType.N_SPY_TREND_REGIME.value: {
+            "name": "SPY Trend Regime (market gate)",
+            "description": (
+                "The MARKET's trend, not the instrument's: SPY's last finished daily close against "
+                "its 200-day average, and whether its 50-day average is rising (now vs 10 sessions "
+                "ago). Compare with '==' against a mode: up (1: above and rising), pullback (2: "
+                "above and falling), bear_rally (3: below and rising), down (4: below and falling), "
+                "above_200 (5: up or pullback), below_200 (6: bear_rally or down). The same rule "
+                "runs in the backtest and live. UNKNOWN NEVER PASSES: with fewer than 210 SPY "
+                "closes, no SPY data or nothing published yet the gate is false and says why in the "
+                "activity log (no_regime / insufficient_history); a backtest logs the first date a "
+                "regime exists, so a window that starts earlier trades fewer days. Live reads SPY "
+                "daily closes from FMP like the stock prices; a backtest on another history source "
+                "can classify a few days differently, and a live account whose data feed is not FMP "
+                "only logs a daily warning (it is not refused)."
+            ),
+            "type": "numeric",
+            "example": "Enter only when spy_trend_regime == 5 (SPY above its 200-day average)"
+        },
+        ExpertEventType.N_SPY_VOL_REGIME.value: {
+            "name": "SPY Volatility Regime (market gate)",
+            "description": (
+                "The MARKET's volatility regime: SPY's 20-day realised volatility ranked over the "
+                "last 504 sessions (calm below the 30th percentile, stressed above the 70th). "
+                "Compare with '==' against a mode: calm (1), normal (2), stressed (3), "
+                "not_stressed (4: calm or normal), not_calm (5: normal or stressed). UNKNOWN NEVER "
+                "PASSES: with fewer than 524 SPY closes, no SPY data or nothing published yet the "
+                "gate is false and says why (no_regime / insufficient_history). Same source rule as "
+                "spy_trend_regime: live reads FMP daily closes; the vol percentile is the axis most "
+                "sensitive to a different history source."
+            ),
+            "type": "numeric",
+            "example": "Sell premium only when spy_vol_regime == 4 (SPY not stressed)"
+        },
         ExpertEventType.N_CREDIT_DECAYED_PCT.value: {
             "name": "Credit Decayed % (the buyback trigger)",
             "description": (
@@ -669,8 +703,8 @@ def get_action_type_documentation() -> dict:
                 "Exit the market on negative sentiment change"
             ],
             "parameters": ("Optional Close % (1-100, empty = 100): when the sell closes this "
-                           "expert's long, only that percent of it is sold (whole shares; refused "
-                           "if it rounds to 0, or on a fractional or partly filled position). A "
+                           "expert's long, only that percent of it is sold (fractional shares are "
+                           "preserved; a partly filled lot is refused when it cannot be resized). A "
                            "percent rule RE-TRIMS EVERY TIME IT MATCHES (100 -> 50 -> 25 ...), so "
                            "gate it with conditions that stop it matching again. Closing a long "
                            "needs enable_buy; opening a short from flat needs enable_sell."),
@@ -689,9 +723,9 @@ def get_action_type_documentation() -> dict:
                 "Enter the market on positive sentiment change"
             ],
             "parameters": ("Optional Close % (1-100, empty = 100): when the buy covers this "
-                           "expert's short, only that percent of it is bought back (whole shares; "
-                           "refused if it rounds to 0, or on a fractional or partly filled "
-                           "position). A percent rule RE-TRIMS EVERY TIME IT MATCHES (100 -> 50 -> "
+                           "expert's short, only that percent of it is bought back (fractional "
+                           "shares are preserved; a partly filled lot is refused when it cannot "
+                           "be resized). A percent rule RE-TRIMS EVERY TIME IT MATCHES (100 -> 50 -> "
                            "25 ...), so gate it with conditions that stop it matching again. "
                            "Covering a short needs enable_sell; an entry ignores the percent."),
             "example": "When rating is POSITIVE and confidence > 75% and no_position, action: BUY"
@@ -740,7 +774,7 @@ def get_action_type_documentation() -> dict:
                 "Increase allocation when confidence improves",
                 "Build position gradually over time"
             ],
-            "parameters": "Requires target_percent (e.g., 15.0 for 15% of virtual equity). Automatically calculates required quantity.",
+            "parameters": "Requires the target percent of virtual equity (e.g., 15.0 for 15%), saved as target_percent by the rule editor or value in exported rules; either key works, and both set but different is refused. Automatically calculates required quantity.",
             "example": "When confidence >= 85% and instrument_account_share < 10%, increase_instrument_share to 12%"
         },
         ExpertActionType.DECREASE_INSTRUMENT_SHARE.value: {
@@ -752,7 +786,7 @@ def get_action_type_documentation() -> dict:
                 "Rebalance when instrument share exceeds target",
                 "Reduce exposure when confidence decreases"
             ],
-            "parameters": "Requires target_percent (e.g., 5.0 for 5% of virtual equity). Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
+            "parameters": "Requires the target percent of virtual equity (e.g., 5.0 for 5%), saved as target_percent by the rule editor or value in exported rules; either key works, and both set but different is refused. Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
             "example": "When instrument_account_share > 15%, decrease_instrument_share to 10% (rebalance)"
         },
         ExpertActionType.STOP_PROCESSING.value: {

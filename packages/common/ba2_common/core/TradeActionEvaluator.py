@@ -15,6 +15,7 @@ from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason, AssetClass,
     get_option_action_values,
     get_option_entry_action_values,
+    ACTION_ADJUST_TP_SL,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
@@ -333,6 +334,36 @@ def _is_option_order(order) -> bool:
     return getattr(txn, 'asset_class', None) == AssetClass.OPTION
 
 
+def share_adjust_target_percent(action_type, action_config: Dict[str, Any]) -> Optional[float]:
+    """The target % of virtual equity for an increase/decrease-instrument-share action.
+
+    Two spellings reach here: the unified/tree rule format and the converters write
+    ``value``; the settings rule editor saves ``target_percent``. Before 2026-09-25 only
+    ``value`` was read, so every rule built in the editor reached execution with None and
+    failed. Either key is accepted now. When BOTH are set and disagree the rule is
+    ambiguous, so it is refused (None -> the action fails with its own message) rather
+    than guessing which one the author meant.
+    """
+    name = getattr(action_type, 'value', action_type)
+    value = action_config.get('value')
+    target = action_config.get('target_percent')
+    if value is not None and target is not None:
+        try:
+            same = float(value) == float(target)
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            logger.error(f"{name} action has both value={value!r} and target_percent={target!r} "
+                         f"and they disagree -- refusing the ambiguous rule")
+            return None
+        return value
+    chosen = value if value is not None else target
+    if chosen is None:
+        logger.warning(f"{name} action has no 'value' or 'target_percent' configured -- "
+                       f"target_percent will be None and the action will fail at execution")
+    return chosen
+
+
 class TradeActionEvaluator:
     """
     Evaluates trade conditions and executes actions based on rulesets.
@@ -640,7 +671,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,
@@ -842,6 +873,14 @@ class TradeActionEvaluator:
                                     sl_to_send = None if sl_kept else sl_price
                                     logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"
                                                 + (f" (kept: {sl_reason}; ruleset asked ${requested_sl:.2f})" if sl_kept else ""))
+                                    # Stamp where each level was computed from BEFORE the account
+                                    # builds anything from them (a kept stop keeps its anchor).
+                                    from ba2_common.core.trade_cycle import record_level_anchor
+                                    _anchors = {"tp": last_tp_action.last_anchor_price}
+                                    if sl_to_send is not None:
+                                        _anchors["stop"] = last_sl_action.last_anchor_price
+                                    record_level_anchor(transaction.id, **_anchors)
+                                    transaction = get_instance(Transaction, transaction.id) or transaction
                                     success = self.account.adjust_tp_sl(transaction, tp_price, sl_to_send, source="ruleset")
                                     if sl_kept:
                                         desc = (f"Adjusted TP=${tp_price:.2f} for {self.instrument_name}; "
@@ -858,7 +897,9 @@ class TradeActionEvaluator:
                                     }
                                     action_results.append(result_dict)
                                     log_trade_action_activity(
-                                        action_type=str(ExpertActionType.ADJUST_TAKE_PROFIT),
+                                        # Log what was actually adjusted: a kept stop means only the TP moved.
+                                        action_type=(ExpertActionType.ADJUST_TAKE_PROFIT if sl_kept
+                                                     else ACTION_ADJUST_TP_SL),
                                         symbol=self.instrument_name,
                                         account_id=self.account.id,
                                         expert_id=expert_id,
@@ -907,7 +948,7 @@ class TradeActionEvaluator:
                                 }
                                 action_results.append(result_dict)
                                 log_trade_action_activity(
-                                    action_type=str(action_type),
+                                    action_type=action_type,
                                     symbol=self.instrument_name,
                                     account_id=self.account.id,
                                     expert_id=expert_id,
@@ -951,7 +992,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,
@@ -1303,6 +1344,15 @@ class TradeActionEvaluator:
                             # Fallback to basic config
                             action_summary["action_config"]["reference_value"] = action_config.get('reference_value')
                             action_summary["action_config"]["percent"] = action_config.get('value')
+                    elif action_type in _OPTION_ENTRY_ACTION_TYPES:
+                        # The EFFECTIVE selection box (strike method/param, DTE window, sizing,
+                        # liquidity gates, policy weights) read off the built action, so a key
+                        # the rule left out shows the default the action actually used.
+                        action_summary["action_config"]["option_params"] = {
+                            key: getattr(trade_action, key)
+                            for key in _OPTION_ENTRY_PARAM_KEYS
+                            if isinstance(getattr(trade_action, key, None), (bool, int, float, str))
+                        }
                     
                     action_summaries.append(action_summary)
                     logger.info(f"Created and stored TradeAction: {action_type.value} for {instrument_name}")
@@ -1373,16 +1423,9 @@ class TradeActionEvaluator:
                 kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage
                 # Also allow direct stop_loss_price if provided
                 kwargs['stop_loss_price'] = action_config.get('stop_loss_price')
-            elif action_type == ExpertActionType.INCREASE_INSTRUMENT_SHARE:
-                target_val = action_config.get('value')
-                if target_val is None:
-                    logger.warning(f"INCREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
-                kwargs['target_percent'] = target_val
-            elif action_type == ExpertActionType.DECREASE_INSTRUMENT_SHARE:
-                target_val = action_config.get('value')
-                if target_val is None:
-                    logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
-                kwargs['target_percent'] = target_val
+            elif action_type in (ExpertActionType.INCREASE_INSTRUMENT_SHARE,
+                                 ExpertActionType.DECREASE_INSTRUMENT_SHARE):
+                kwargs['target_percent'] = share_adjust_target_percent(action_type, action_config)
             elif action_type == ExpertActionType.CLOSE_OPTION:
                 # FORCED vs DISCRETIONARY exit (review 2026-08-30 F7): classified from
                 # the firing rule's triggers so the backtest's close concession knows

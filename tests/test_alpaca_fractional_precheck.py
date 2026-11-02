@@ -16,13 +16,13 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
+import pytest
 
 from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
 from alpaca.trading.models import Asset
 
 from ba2_trade_platform.core.account_types import (
-    FRACTIONAL_OUTCOME_FLOORED, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_REJECTED,
-    FRACTIONAL_OUTCOME_SKIPPED, FRACTIONAL_OUTCOME_WHOLE,
+    FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_REJECTED, FRACTIONAL_OUTCOME_WHOLE,
 )
 from ba2_trade_platform.core.db import add_instance, get_instance
 from ba2_trade_platform.core.models import TradingOrder
@@ -122,39 +122,41 @@ def test_an_unknown_fractionability_stays_unknown_rather_than_becoming_ineligibl
     assert "unknown" in preview.reason
 
 
-def test_a_fraction_on_a_limit_order_is_reported_as_floored_before_submission():
+def test_a_fraction_on_a_limit_order_is_preserved():
     preview = plan_fractional_submission("AAPL", 2.5, "buy_limit", fractionable=True)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
-    assert preview.submit_quantity == 2.0
-    assert preview.is_adjusted is True
-    assert "floored to 2.0 whole shares" in preview.reason
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+    assert preview.submit_quantity == 2.5
+    assert preview.is_adjusted is False
+    assert preview.requires_day_tif is True
 
 
-def test_a_fraction_that_floors_to_zero_is_reported_as_skipped_not_as_a_silent_cancel():
+def test_a_sub_share_order_is_preserved_too():
     preview = plan_fractional_submission("AAPL", 0.4, "buy_limit", fractionable=True)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_SKIPPED
-    assert preview.submit_quantity is None
-    assert preview.will_submit is False
-    assert "flooring leaves 0 whole shares" in preview.reason
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+    assert preview.submit_quantity == 0.4
+    assert preview.will_submit is True
+    assert preview.is_adjusted is False
 
 
-def test_the_order_type_rule_wins_over_fractionability():
-    """A non-fractionable symbol on a LIMIT order is floored, not rejected: the floor
-    happens before anything reaches the wire, so the broker never sees a fraction."""
+def test_ineligible_symbol_is_reported_without_resizing_the_order():
     preview = plan_fractional_submission("BRK.A", 2.5, "buy_limit", fractionable=False)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+    assert preview.outcome == FRACTIONAL_OUTCOME_REJECTED
+    assert preview.submit_quantity == 2.5
+    assert preview.is_adjusted is False
 
 
 def test_the_wash_trade_escape_counts_as_a_complex_order():
-    """use_complex_order re-classes a MARKET request as BRACKET/OTO, which Alpaca
-    refuses fractionally just like a limit order."""
+    """Report the broker constraint without substituting a smaller order."""
     preview = plan_fractional_submission("AAPL", 2.5, "market", use_complex_order=True,
                                          fractionable=True)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+    assert preview.outcome == FRACTIONAL_OUTCOME_REJECTED
+    assert preview.submit_quantity == 2.5
+    assert preview.requires_day_tif is True
+    assert preview.is_adjusted is False
     assert "BRACKET/OTO" in preview.reason
 
 
@@ -195,7 +197,7 @@ def test_the_precheck_accepts_the_core_order_type_enum():
 
     preview = acct.preview_fractional_submission("AAPL", 2.5, OrderType.BUY_LIMIT)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +214,7 @@ def test_the_preview_predicts_the_exact_quantity_the_submission_sends():
     acct._submit_order_impl(order)
 
     sent_qty = float(acct.client.submit_order.call_args[0][0].qty)
-    assert preview.submit_quantity == 4.0
+    assert preview.submit_quantity == 4.25
     assert sent_qty == preview.submit_quantity
 
 
@@ -233,23 +235,26 @@ def test_submission_never_spends_an_asset_round_trip_on_the_hot_order_path():
     acct.client.get_all_assets.assert_not_called()
 
 
-def test_the_preview_of_a_skip_matches_the_row_the_submission_actually_cancels():
-    """The failure this whole task exists to prevent: the wizard reporting a 0.4-share
-    buy as submitted, and a CANCELED row appearing afterwards with no warning."""
+def test_preview_of_sub_share_order_matches_the_quantity_submitted():
     acct = _bare_account()
     order = _saved_order(quantity=0.4, order_type=OrderType.BUY_LIMIT, limit_price=100.0)
 
     preview = acct.preview_fractional_submission("AAPL", 0.4, OrderType.BUY_LIMIT)
     result = acct._submit_order_impl(order)
 
-    assert preview.outcome == FRACTIONAL_OUTCOME_SKIPPED
-    assert preview.will_submit is False
-    acct.client.submit_order.assert_not_called()
-    assert result is None
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+    assert preview.will_submit is True
+    assert result is not None
+    assert acct.client.submit_order.call_args[0][0].qty == preview.submit_quantity == 0.4
     stored = get_instance(TradingOrder, order.id)
-    assert stored.status == OrderStatus.CANCELED
-    # The dry run's sentence and the persisted comment are the SAME string.
-    assert stored.comment == preview.reason
+    assert stored.quantity == 0.4
+    assert stored.status != OrderStatus.CANCELED
+
+
+@pytest.mark.parametrize("quantity", [0, -1, float('nan'), float('inf')])
+def test_invalid_quantities_are_not_invented_or_rounded(quantity):
+    with pytest.raises(ValueError, match="Invalid share quantity"):
+        plan_fractional_submission("AAPL", quantity, "market")
 
 
 # ---------------------------------------------------------------------------

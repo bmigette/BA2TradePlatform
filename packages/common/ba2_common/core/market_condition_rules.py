@@ -73,6 +73,9 @@ STRICT_FIELD_NAMES = frozenset({
     "structure_state",
     "structure_bars_since_bos",
     "structure_bars_since_choch",
+    # SPY benchmark regime gates (plan 2026-10-24-spy-regime-gate): no profile serves them.
+    "spy_trend_regime",
+    "spy_vol_regime",
 })
 
 
@@ -419,9 +422,11 @@ def parse_profile_setting(value: Any, *, setting: str = PROFILE_SETTING) -> Tupl
 
 def served_fields(profiles: Sequence[str]) -> frozenset:
     """Every field name the listed profiles serve (empty for an empty list)."""
-    from ba2_common.core.market_conditions import PROFILES
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
 
-    return frozenset(f.name for p in profiles for f in PROFILES[p].fields)
+    # The benchmark (SPY) regime fields need no profile: the host publishes them, so they are
+    # served whatever the profile list says.
+    return frozenset(f.name for p in profiles for f in PROFILES[p].fields) | frozenset(BENCHMARK_FIELDS)
 
 
 def assert_fields_served(used: Iterable[Tuple[str, str]], profiles: Sequence[str], *,

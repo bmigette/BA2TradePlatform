@@ -146,6 +146,28 @@ def test_use_atr_stop_off_removes_the_indicator_requirement():
     assert dep.rule_requirements(settings, None, ["AAPL"], WINDOW) == []
 
 
+def test_use_atr_stop_as_a_decoded_ga_int_gene_still_requests_atr():
+    """atr_grid_2027 design §3.2/§3.8: a policy run's ``model:use_atr_stop`` gene decodes to a
+    real Python ``int`` (0/1), NOT a bool, before it ever reaches the expert's settings dict --
+    this is exactly the shape ``_build_daily_trial_config`` merges into ``expert.settings`` for
+    an atr-searched trial. ``as_bool`` must read it as a real boolean (int 1 -> True) so the warm
+    plan requests the ATR indicator for a policy row whose gene decoded ON; a naive ``bool()``
+    would have agreed here (bool(1) is True) but this pins the requirement lives on the actual
+    read path (``as_bool``), not on int happening to work with bool()."""
+    settings = {"use_atr_stop": 1, "sizing_mode": "risk_atr", "atr_period": 21}
+
+    out = dep.rule_requirements(settings, None, ["AAPL"], WINDOW)
+
+    assert [r.kind for r in out] == [dep.KIND_INDICATOR]
+    assert out[0].namespace == "atr_21"
+
+    # And the off gene (0, not False) must still turn the requirement off -- the historic
+    # bool("0")-is-True defect this whole design section exists to stay clear of, restated for
+    # the int shape a decoded gene actually carries.
+    off_settings = {"use_atr_stop": 0, "sizing_mode": "risk_atr", "atr_period": 21}
+    assert dep.rule_requirements(off_settings, None, ["AAPL"], WINDOW) == []
+
+
 def test_an_earnings_condition_adds_the_calendar_and_its_optional_annual_fallback():
     out = dep.rule_requirements(RM_SETTINGS, [_event_action("days_to_earnings")],
                                 ["AAPL"], WINDOW)

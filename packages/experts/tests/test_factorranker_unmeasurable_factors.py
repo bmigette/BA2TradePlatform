@@ -641,7 +641,7 @@ def _process_bundle(factors, holdings=()):
 
 
 _PROCESS_SETTINGS = {"_factor_weights": _THREE, "winsorize_pct": 0.0, "top_n": 5,
-                     "weighting": "equal", "max_weight_per_name": 1.0,
+                     "weighting": "equal", "max_virtual_equity_per_instrument_percent": 100.0,
                      "gross_exposure": 1.0}
 
 

@@ -312,7 +312,13 @@ async def startup_event():
     task_queue.register_handler('build_screener_metrics', handle_build_screener_metrics)
     task_queue.register_handler('build_options', handle_build_options)
     task_queue.register_handler('prewarm', handle_prewarm)
-    logger.info("Registered main task handlers: dataset_regeneration, news_batch_fetch, daily_backtest, strategy_optimization, build_screener_metrics, build_options, prewarm")
+    # Custom ML model search (stage A): trains in its own worker processes on the GPU (ml_search.py).
+    from app.services.ml_search import handle_ml_model_search
+    task_queue.register_handler('ml_model_search', handle_ml_model_search)
+    # ML exploration v2 stage-1 grid (cells x seeds on out-of-sample walk-forward signals; ml_grid.py).
+    from app.services.ml_grid import handle_ml_grid
+    task_queue.register_handler('ml_grid', handle_ml_grid)
+    logger.info("Registered main task handlers: dataset_regeneration, news_batch_fetch, daily_backtest, strategy_optimization, build_screener_metrics, build_options, prewarm, ml_model_search, ml_grid")
 
     # Initialize dedicated training queue (2 workers — keeps GPU from being overloaded)
     init_training_task_queue(max_workers=2)
@@ -455,6 +461,7 @@ async def global_exception_handler(request, exc):
 
 # Import and include routers
 from app.api import datasets, jobs, workers, dashboard, models, backtests, ml, settings, websocket, tasks, indicator_collections, tools, target_sets, strategies, admin, cache, experts, rules, ruleset_meta, data_build
+from app.api import ml_search as ml_search_api
 
 app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 app.include_router(tools.router, prefix="/api/tools", tags=["tools"])
@@ -478,6 +485,7 @@ app.include_router(strategies.optimization_router)
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(cache.router, prefix="/api/cache", tags=["cache"])
 app.include_router(data_build.router, prefix="/api/data", tags=["data-build"])
+app.include_router(ml_search_api.router, prefix="/api/ml-search", tags=["ml-search"])
 app.include_router(experts.router, tags=["experts"])
 # ruleset_meta carries its own /api prefix -> /api/ruleset/vocabulary, /api/ruleset/exit-presets
 app.include_router(ruleset_meta.router, tags=["ruleset-meta"])

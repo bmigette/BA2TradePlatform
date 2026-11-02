@@ -116,6 +116,54 @@ def test_screen_universe_for_day_honors_weinstein_stage2_only():
     assert set(ms.screen_universe_for_day(df, "2023-01-31", {})) == {"AAA", "BBB", "CCC"}
 
 
+def test_screen_universe_for_day_per_run_excluded_symbols():
+    """goal2027atr split-basis fix: an optional PER-CALL ``excluded_symbols`` list is applied on
+    top of the module-level ``EXCLUDED_SYMBOLS`` (_drop_excluded). Absent/empty is a no-op."""
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB", "CCC"], "date": ["2023-01-31"] * 3,
+        "close": [10, 20, 30.0], "market_cap": [5e9, 2e9, 9e9],
+        "relative_volume": [2.0, 2.0, 2.0], "price_drop_pct": [0.0, 0.0, 0.0],
+        "sector": ["Tech"] * 3, "volume": [2e6] * 3, "price": [10, 20, 30.0]})
+    # BBB would otherwise pass every gate (this mirrors the real defect: a split-basis symbol
+    # passes the numeric thresholds on corrupted values and must be excluded by NAME).
+    sel = ms.screen_universe_for_day(df, "2023-01-31", {"max_stocks": 5}, excluded_symbols=["BBB"])
+    assert set(sel) == {"AAA", "CCC"}
+    # case-insensitive
+    sel_lower = ms.screen_universe_for_day(df, "2023-01-31", {"max_stocks": 5},
+                                           excluded_symbols=["bbb"])
+    assert set(sel_lower) == {"AAA", "CCC"}
+    # absent/empty -> no-op, byte-identical to before this parameter existed.
+    assert set(ms.screen_universe_for_day(df, "2023-01-31", {"max_stocks": 5})) == \
+        {"AAA", "BBB", "CCC"}
+    assert set(ms.screen_universe_for_day(df, "2023-01-31", {"max_stocks": 5},
+                                          excluded_symbols=[])) == {"AAA", "BBB", "CCC"}
+
+
+def test_screen_universe_as_of_forwards_excluded_symbols():
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2023-01-31"] * 2,
+        "close": [10, 20.0], "market_cap": [5e9, 2e9],
+        "relative_volume": [2.0, 2.0], "price_drop_pct": [0.0, 0.0],
+        "sector": ["Tech"] * 2, "volume": [2e6] * 2, "price": [10, 20.0]})
+    assert ms.screen_universe_as_of(df, "2023-02-10", {"max_stocks": 5},
+                                    excluded_symbols=["BBB"]) == ["AAA"]
+
+
+def test_screened_symbol_union_forwards_excluded_symbols():
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB"] * 2,
+        "date": ["2023-01-31", "2023-01-31", "2023-02-28", "2023-02-28"],
+        "close": [10, 20.0, 11, 21.0], "market_cap": [5e9, 2e9, 5e9, 2e9],
+        "relative_volume": [2.0, 2.0, 2.0, 2.0], "price_drop_pct": [0.0, 0.0, 0.0, 0.0],
+        "sector": ["Tech"] * 4, "volume": [2e6] * 4, "price": [10, 20.0, 11, 21.0]})
+    union = ms.screened_symbol_union(df, "2023-01-01", "2023-03-01", {"max_stocks": 5},
+                                     excluded_symbols=["BBB"])
+    assert union == ["AAA"]
+    # absent -> unchanged (both symbols ever selectable).
+    assert ms.screened_symbol_union(df, "2023-01-01", "2023-03-01", {"max_stocks": 5}) == \
+        ["AAA", "BBB"]
+
+
 def test_store_write_is_incremental_by_partition(tmp_path):
     store = str(tmp_path / "mstore")
     df_jan = pd.DataFrame({"symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
@@ -180,16 +228,19 @@ def test_screened_symbol_union_matches_per_day_loop_and_bounds_to_window():
         ref.update(ms.screen_universe_for_day(df, d, settings))
     assert ref == {"AAA", "BBB", "CCC"}          # top-cap qualifier differs by day; DDD never wins
 
-    union = ms.screened_symbol_union(df, "2023-01-01", "2023-12-31", settings)
+    union = ms.screened_symbol_union(df, "2023-01-01", "2023-04-10", settings)
     assert union == sorted(ref)
 
     # window bound: excluding March's scan date drops CCC even though CCC alone would qualify then
     narrow = ms.screened_symbol_union(df, "2023-01-01", "2023-02-28", settings)
     assert narrow == ["AAA", "BBB"]
 
-    # a start_day AFTER every scan date still resolves to the latest prior scan (held-as-of), not empty
-    held = ms.screened_symbol_union(df, "2023-06-01", "2023-06-30", settings)
+    # a window just past the newest scan still holds the latest prior scan (held-as-of), not empty
+    held = ms.screened_symbol_union(df, "2023-04-05", "2023-04-10", settings)
     assert held == ["CCC"]                        # holds March's pick forward
+    # ... but one far past the store's end is REFUSED (read-side staleness guard), not silently held
+    with pytest.raises(ms.MetricStoreStaleError):
+        ms.screened_symbol_union(df, "2023-06-01", "2023-06-30", settings)
 
 
 def test_screen_universe_as_of_holds_between_scans():

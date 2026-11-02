@@ -361,26 +361,28 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4254":
+    "ba2_trade_platform/ui/pages/settings.py:4457":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
-        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the option-stage2 entry_tag follow-up gave TriggerTypePicker a rule_subtype filter (+9), :4254; the equity-short netting rule (dev) removed a permission checkbox and its load/save, which dev's note recorded as :4240 although its key (correctly) stayed :4245; the plan/option-stage2 merge of origin/dev 7fc918ee, :4254 (only the branch's +9 moves it)",
-    "ba2_trade_platform/ui/pages/settings.py:4304":
+        ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298; its review fixes (no-edit no-op, unset method, account save order), :4389; the declared app settings + dropdown errors, :4352; the re-review (no rewrite of stored values, forced-method errors), :4374; the fractional checkbox + _strike_param_text (2026-09-27), :4403",
+    "ba2_trade_platform/ui/pages/settings.py:4507":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
-        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the option-stage2 entry_tag picker filter (+9), :4254/:4304; the equity-short netting rule (dev), noted :4240/:4290 on dev but the lines stayed :4245/:4295; the plan/option-stage2 merge of origin/dev 7fc918ee, :4254/:4304 (only the branch's +9 moves them)",
-    "ba2_trade_platform/ui/components/performance_charts.py:475":
+        "batch export/import toolbar + handlers moved them 127 lines down, :4016/:4066, then :4056/:4106; the trigger picker moved the pair again, :4215/:4265; the review fixes moved them once more, :4238/:4288; the ruleset rule picker added one import line, :4239/:4289); the UI consistency pass added the shared refresh_button import, :4240/:4290; the pullback/market-exits merge with origin/dev, :4245/:4295; the equity-short netting rule, :4240/:4290; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298/:4348; its review fixes (no-edit no-op, unset method, account save order), :4389/:4439; the declared app settings + dropdown errors, :4352/:4402; the re-review (no rewrite of stored values, forced-method errors), :4374/:4424; the fractional checkbox + _strike_param_text (2026-09-27), :4403/:4453",
+    "packages/common/ba2_common/analytics/performance.py:50":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
-        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging)",
-    "ba2_trade_platform/ui/components/performance_charts.py:476":
+        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl, then :458 before PerformanceTable gained its mobile_hide column tagging; "
+        "was ba2_trade_platform/ui/components/performance_charts.py:475 before calculate_win_loss_ratio moved verbatim to ba2_common.analytics.performance, site plan P0a)",
+    "packages/common/ba2_common/analytics/performance.py:51":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
-        "scored as either",
+        "scored as either (was ba2_trade_platform/ui/components/performance_charts.py:476 "
+        "before the P0a move)",
     "testplatform/backend/app/services/data_build_handler.py:126":
         "screener CONFIG bound: an absent price_min means 'no minimum', which is what 0.0 "
         "expresses; it is not a quote (was :157 before the prewarm handler moved to "
@@ -388,7 +390,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:2216":
+    "packages/common/ba2_common/core/TradeActions.py:2206":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -419,11 +421,8 @@ ALLOWLIST: dict = {
         "direction moved to _position_is_long (+9); :2135 after the close percent + permission "
         "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it; :2197 "
         "after the be1a0aab review fixes (partial-close refusals, FIFO plan) grew them; :2203 "
-        "after refusals gained closed_transaction_ids (dev); on plan/option-stage2 it was :1807 "
-        "after the option-stage2 entry_tag follow-up added one module-level import (+1) and :1814 "
-        "after E1 gave BuyAction its entry_tag (+7); :2216 after the plan/option-stage2 merge "
-        "of origin/dev 7fc918ee combined both (dev's :2203 + the branch's import, entry_tag and "
-        "the cover-does-not-stamp note, +13)",
+        "after refusals gained closed_transaction_ids; :2206 after fractional partial "
+        "closes replaced the whole-share floor above it (+3)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -454,7 +453,7 @@ BASELINE: dict = {
     # ``_build_structure`` into ba2_common.core.OptionRiskManagement (the shared sleeve
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
-    "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
+    "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
     # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
     # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
     # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
@@ -482,7 +481,7 @@ BASELINE: dict = {
     # growing a second copy of it. The two coercions travelled verbatim.
     "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
-    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
+    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 2,
     # The three PROMOTED sleeve-reader coercions, moved verbatim out of
     # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
     # filled/ordered quantity, a transaction quantity and the contract multiplier, each
@@ -507,7 +506,7 @@ BASELINE: dict = {
     # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
     # must never say. Debt paid off leaves the register entirely.
 }
-BASELINE_TOTAL = 168
+BASELINE_TOTAL = 165
 
 
 # =========================================================================== #

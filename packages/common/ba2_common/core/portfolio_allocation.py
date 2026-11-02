@@ -112,7 +112,7 @@ __all__ = [
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
     "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
     "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
-    "REASON_SELL_ROUNDED_UP_FMT",
+    "REASON_SELL_ROUNDED_UP_FMT", "REASON_BUY_ROUNDED_UP_FMT",
     "REASON_REDISTRIBUTED_FMT", "REASON_REDISTRIBUTED_PREFIX",
     "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
@@ -174,9 +174,17 @@ ALLOCATION_MODE_INVEST_LABEL = "INVEST_LABEL"
 VALUATION_MODE_COST = "cost"
 VALUATION_MODE_MARKET = "market"
 
-#: Decimal places used for a fractional quantity when the broker publishes no
-#: ``min_trade_increment``.
-DEFAULT_FRACTIONAL_DECIMALS = 4
+#: The share GRID -- ``DEFAULT_FRACTIONAL_DECIMALS``, ``QUANTITY_EPSILON``, the rounding
+#: and the unit -- lives in ``share_grid`` so the classic risk manager and FactorRanker
+#: size on the same grid as this allocator. Re-exported under the old names; see
+#: ``__all__``.
+from ba2_common.core.share_grid import (  # noqa: E402
+    DEFAULT_FRACTIONAL_DECIMALS,
+    QUANTITY_EPSILON,
+    is_fractional_quantity as _is_fractional_quantity,
+    round_shares as _round_shares,
+    tradeable_unit,
+)
 
 #: Decimal places the DRY-RUN TABLE shows a share quantity to. Deliberately wider
 #: than DEFAULT_FRACTIONAL_DECIMALS: that 4 is a SIZING fallback, this is a
@@ -190,10 +198,6 @@ DRY_RUN_QUANTITY_DECIMALS = 8
 #: Tolerance (percentage points) when checking that label targets total 100.
 LABEL_TOTAL_TOLERANCE_PCT = 0.01
 
-#: SHARE quantities closer to zero than this are exactly zero (float noise guard).
-#: Shares only -- money has its own tolerance, because the two are different units
-#: and tightening one must never silently move the other.
-QUANTITY_EPSILON = 1e-9
 
 #: MONEY amounts closer to zero than this are exactly zero. Looser than
 #: QUANTITY_EPSILON: a tenth of a microdollar of residual income is not worth a
@@ -297,6 +301,15 @@ REASON_UNTRACKED_NO_SELL = (
 #: with this one only by coincidence. The bound is INCLUSIVE, which is what puts the
 #: exact 0.5 case (200%) on the "buy" side, as round-half-up requires.
 #:
+#: THE SAME RULE COVERS ALL THREE WHOLE-SHARE CASES -- round half-up to the nearest
+#: share, from both sides. OPEN a flat position: this bound (raw >= 0.5 bumps).
+#: ADD to an existing holding and SELL: ``_round_delta_shares`` rounds the delta
+#: half-up (+0.9987 -> +1, -0.8773 -> -1, +2.6 -> +3, +0.49 -> 0). A flat buy is left
+#: floored there so it still reaches ``size_sub_unit_target``; the leftover then is an
+#: add and rounds on the next run. Every rounding that sends more than was asked for is
+#: announced on the row (REASON_BUMPED_TO_ONE_SHARE_FMT, REASON_BUY_ROUNDED_UP_FMT,
+#: REASON_SELL_ROUNDED_UP_FMT).
+#:
 #: WAS 1.5, and the reason it changed is worth keeping. At 1.5 the worked examples were
 #: a 200 target on a 300 share (150%, filled, exactly on the bound) and a 50 target on a
 #: 500 share (1000%, refused) -- but it also refused ``raw = 0.6`` at 167%, which is the
@@ -370,6 +383,11 @@ REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid
 #: requested and that must never be silent.
 REASON_SELL_ROUNDED_UP_FMT = (
     "{raw:.4f} shares wanted, sold {sent:g} - nearest whole share")
+#: The mirror image: a whole-share BUY added to an EXISTING holding that was rounded
+#: UP to the nearest share. Same duty -- the row now spends MORE than the weights asked
+#: for, so it says what was wanted and what is sent.
+REASON_BUY_ROUNDED_UP_FMT = (
+    "{raw:.4f} shares wanted, bought {sent:g} - nearest whole share")
 
 #: How many redistribution passes a label gets before the engine gives up and
 #: reports what is left. The loop is finite on its own arithmetic -- every step is
@@ -615,6 +633,21 @@ def position_sign(side) -> Optional[int]:
     return None
 
 
+def position_magnitude_and_direction(side, quantity) -> Tuple[float, bool]:
+    """One broker position row's ``(abs_quantity, is_long)``, whatever sign convention it arrived in.
+
+    The platform's canonical ``Position.qty`` is SIGNED (a short is negative: Alpaca, TastyTrade
+    since e45ed98c, and the IBKR adapter), but consumers that need a share COUNT plus a direction
+    (the allocator's TP/SL guards) must not depend on that: a row is SHORT when its quantity is
+    negative OR its ``side`` says short; a long needs neither. The magnitude is always ``abs``.
+    Never invents a direction: a row that states neither sign nor side is a long (the only thing
+    a bare positive number can be).
+    """
+    qty = float(quantity)
+    is_long = not (qty < 0 or position_sign(side) == -1)
+    return abs(qty), is_long
+
+
 def signed_position_values(side, *, quantity, cost_basis,
                            market_value=None) -> Tuple[float, float, Optional[float]]:
     """One broker position row's ``(quantity, cost_basis, market_value)``, SIGNED.
@@ -625,10 +658,9 @@ def signed_position_values(side, *, quantity, cost_basis,
     something that REDUCES the allocatable base, and every sum is a plain sum.
 
     The two live brokers disagree at source and this is the single place that
-    reconciles them: Alpaca passes the broker's own negative signs straight
-    through (``AlpacaAccount.alpaca_position_to_position``) while TastyTrade
-    stores ``qty=abs_qty`` with positive money and puts the direction in ``side``
-    (``TastyTradeAccount.py:520-547``). It lives HERE, in the pure engine, because
+    reconciles them: Alpaca and TastyTrade (since e45ed98c) pass negative signs
+    straight through, and any adapter that still publishes ``qty=abs_qty`` with
+    positive money and the direction only in ``side`` is signed here. It lives HERE, in the pure engine, because
     it has two callers that must never drift apart -- the page's
     ``ui/utils/portfolio_allocation_view.positions_by_symbol`` and the live
     service's ``core/portfolio_allocation_service.build_position_states``. They
@@ -1288,29 +1320,6 @@ def split_unrealised_pnl(pnl: UnrealisedPnL) -> Tuple[str, Optional[str], str]:
     return full[:at], note, full[at + len(note):]
 
 
-def _round_shares(raw: float, margin: Optional[MarginInfo], *,
-                  allow_fractional: bool) -> float:
-    """Round a POSITIVE share count DOWN onto the broker's tradeable grid.
-
-    The single definition of that grid: whole shares unless fractional trading is
-    on AND the broker calls the symbol fractionable, then the published
-    ``min_trade_increment`` or ``DEFAULT_FRACTIONAL_DECIMALS`` places. Everything
-    that produces a quantity goes through here, so a target and a delta can never
-    be rounded onto two different grids.
-    """
-    if raw is None or raw <= 0:
-        return 0.0
-    if allow_fractional and margin is not None and margin.fractionable:
-        inc = margin.min_trade_increment
-        if inc and inc > 0:
-            qty = round(math.floor(round(raw / inc, 9)) * inc, 10)
-        else:
-            f = 10.0 ** DEFAULT_FRACTIONAL_DECIMALS
-            qty = math.floor(raw * f) / f
-    else:
-        qty = float(math.floor(raw))
-    return qty if qty > 0 else 0.0
-
 
 def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
                         allow_fractional: bool, current_quantity: float) -> float:
@@ -1324,22 +1333,41 @@ def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
     negative quantity, so the engine can only ever buy a short back (targets are
     long-only).
 
-    A WHOLE-SHARE SELL ROUNDS TO THE NEAREST SHARE, not down. Flooring is right for a
-    buy -- overshooting spends money nobody authorised -- but on a sell it leaves the
-    position FURTHER from target than the alternative: IYRI wanted -0.8773 shares and
-    got 0, when selling 1 misses by 0.12 instead of 0.88. Both rows sat about twice
-    their target weight and no run could ever correct them, because every run recomputed
-    the same sub-share trim and floored it away again (live 2026-09-07, IYRI and NIHI).
-    Reported by the operator: "we should have similar logic, sell down to rounded int".
+    ONE ROUNDING RULE FOR WHOLE-SHARE SYMBOLS, HALF-UP TO THE NEAREST SHARE, from both
+    sides (operator decision 2026-08-31: "buy 1 share if we want to buy 0.6, but 0 if
+    we want 0.3"). Three cases, one rule:
 
-    SYMMETRIC WITH THE BUY BUMP, and that is what makes it safe rather than churning.
-    ``size_sub_unit_target`` bumps a sub-unit BUY up to one share when the raw target is
-    at least half a share; rounding a sell half-up applies the same threshold from the
-    other side, so the two cannot fight: a 0.6-share target rounds to one share whether
-    the position is being opened or trimmed to it, and a 0.3-share target rounds to none
-    from either direction. (Flooring the TARGET, as an earlier version of the caller
-    warned, is a different and genuinely broken thing: it would sell a whole 1-share
-    holding down to a 0.33-share target, then buy it straight back next run.)
+      * OPEN a flat position: a sub-share target is bumped to one share when the raw
+        count is >= 0.5 -- ``size_sub_unit_target`` / ``BUMP_TO_ONE_SHARE_MAX_MULTIPLE``.
+        This function leaves a flat BUY floored on purpose so that path is still
+        reached (see below).
+      * ADD to an EXISTING position (``current_quantity > 0``): the buy delta rounds
+        half-up here. IYRI held 1.047 and wanted +0.9987 and got 0 under the old floor,
+        sitting at 0.46% against a 0.95% target; no run could ever correct it, because
+        every run recomputed the same delta and floored it away again (live 2026-10-02,
+        IYRI and NIHI). Including above one share: +2.6 -> 3, +2.4 -> 2.
+      * SELL: the delta rounds half-up, then is clamped to the holding. IYRI wanted
+        -0.8773 shares and got 0, when selling 1 misses by 0.12 instead of 0.88 (live
+        2026-09-07, IYRI and NIHI). Reported by the operator: "we should have similar
+        logic, sell down to rounded int".
+
+    A FLAT BUY STAYS FLOORED. Rounding a flat +0.6 up to 1 here would hand the caller a
+    non-zero delta, and the caller's D1 gate only fires on a delta the grid ZEROED -- so
+    the bump bound, the fractional notional floor, the minimum order size and the
+    ``bumped-to-1`` outcome would all be skipped. Flat +2.6 therefore opens at 2; the
+    residual 0.6 is then an add to an existing holding and rounds to 3 on the next run.
+    Converges, never churns, and keeps the D1 decisions in the one function that owns
+    them.
+
+    SYMMETRIC, and that is what makes it safe rather than churning: a 0.6-share shortfall
+    and a 0.6-share excess both round to ONE share, and after the trade the remaining
+    gap is 0.4 either way, which rounds to nothing in both directions. A 0.3-share gap
+    rounds to none from either direction. (Flooring the TARGET, as an earlier version of
+    the caller warned, is a different and genuinely broken thing: it would sell a whole
+    1-share holding down to a 0.33-share target, then buy it straight back next run.)
+
+    The caller announces any rounding that sends MORE than was asked for
+    (``REASON_SELL_ROUNDED_UP_FMT`` / ``REASON_BUY_ROUNDED_UP_FMT``).
 
     THE HOLDING'S OWN FRACTION IS NOT SELLABLE, so the clamp is ``floor(held)``. A
     non-fractionable symbol can still be HELD in fractions -- DRIP pays them -- but
@@ -1350,40 +1378,19 @@ def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
     """
     magnitude = _round_shares(abs(float(delta or 0.0)), margin,
                               allow_fractional=allow_fractional)
+    on_whole_grid = not (allow_fractional and margin is not None and margin.fractionable)
     if delta >= 0:
+        if on_whole_grid and float(current_quantity or 0.0) > 0:
+            # ADD to an existing whole-share holding: half-up, same as the sell.
+            return float(math.floor(float(delta) + 0.5))
         return magnitude
     held = max(0.0, float(current_quantity or 0.0))
-    if not (allow_fractional and margin is not None and margin.fractionable):
+    if on_whole_grid:
         # Round HALF UP, then clamp to the sellable (whole) part of the holding.
         magnitude = math.floor(abs(float(delta or 0.0)) + 0.5)
         return -min(float(magnitude), math.floor(held))
     return -min(magnitude, held)
 
-
-def tradeable_unit(margin: Optional[MarginInfo], *, allow_fractional: bool) -> float:
-    """The SMALLEST quantity this symbol can trade -- one step of the grid.
-
-    1.0 on the whole-share grid; the broker's published ``min_trade_increment`` on
-    the fractional one, or ``10 ** -DEFAULT_FRACTIONAL_DECIMALS`` when fractional
-    trading is allowed but no step was published (``fractionable=True,
-    min_trade_increment=None`` is a legal pair).
-
-    Deliberately mirrors ``_round_shares``' branch exactly, including the tri-state
-    read: only ``fractionable is True`` selects the fractional grid, so ``None``
-    ("the broker did not say") sizes as whole shares -- the conservative direction,
-    and the same one the rounding itself takes. Plan and execution must never round
-    on two different grids.
-
-    This is the QUANTITY grid only. It says nothing about whether an order of that
-    size is ACCEPTABLE: ``min_order_size`` (shares) and ``min_fractional_notional``
-    (dollars) are separate thresholds, weighed together in ``size_sub_unit_target``.
-    """
-    if allow_fractional and margin is not None and margin.fractionable is True:
-        inc = margin.min_trade_increment
-        if inc and inc > 0:
-            return float(inc)
-        return 10.0 ** -DEFAULT_FRACTIONAL_DECIMALS
-    return 1.0
 
 
 def size_sub_unit_target(target_notional: float, price: float,
@@ -1515,8 +1522,9 @@ def round_delta_quantity(delta_notional: float, unit_value: float,
     different divisors. Passing the market price for a sell is the bug that made a
     50%-down position liquidate instead of half-trim -- see ``compute_allocation``.
 
-    The magnitude is rounded DOWN onto the broker's grid and a sell is clamped to
-    the holding (never oversell, never short).
+    The magnitude is rounded DOWN onto the broker's grid, except on the whole-share
+    grid where ``_round_delta_shares`` applies the half-up rule (see there); a sell is
+    clamped to the holding (never oversell, never short).
 
     ``apply_min_order_size`` defaults to FALSE. A minimum ORDER size must be
     checked on the final signed delta, after the clamp, by the caller -- which
@@ -1535,17 +1543,6 @@ def round_delta_quantity(delta_notional: float, unit_value: float,
         return 0.0
     return delta
 
-
-def _is_fractional_quantity(quantity: float) -> bool:
-    """True when this share count is NOT a whole number of shares.
-
-    Tested against ``QUANTITY_EPSILON`` from BOTH sides, because a quantity that
-    came off a fractional grid can land at 2.9999999999 as easily as at
-    3.0000000001, and calling either of those "fractional" would apply a
-    fractional-only broker rule to what is really a 3-share order.
-    """
-    part = abs(float(quantity)) % 1.0
-    return min(part, 1.0 - part) > QUANTITY_EPSILON
 
 
 def is_untracked_holding(state: Optional["PositionState"]) -> bool:
@@ -2523,6 +2520,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         if delta < 0 and abs(delta) > abs(raw_delta) + QUANTITY_EPSILON:
             row.reasons.append(REASON_SELL_ROUNDED_UP_FMT.format(
                 raw=abs(raw_delta), sent=abs(delta)))
+        # The same duty on the BUY side: an add to an existing whole-share holding
+        # rounded UP spends more than the weights asked for. (A flat buy is floored,
+        # so this never fires for the D1 path.)
+        elif delta > 0 and delta > raw_delta + QUANTITY_EPSILON:
+            row.reasons.append(REASON_BUY_ROUNDED_UP_FMT.format(
+                raw=raw_delta, sent=delta))
         # D1, and it runs BEFORE _suppress_below_min_order on purpose (L8b): the
         # suppression zeroes the row, and a bump that runs afterwards finds nothing
         # left to decide about.

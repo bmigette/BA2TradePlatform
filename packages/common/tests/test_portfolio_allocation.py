@@ -236,7 +236,8 @@ def test_whole_share_mode_never_emits_a_fractional_delta():
     plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
                                  allow_fractional=False, default_bp_factor=1.0,
                                  valuation_mode=pa.VALUATION_MODE_MARKET)
-    assert plan.rows[0].delta_quantity == 9.0
+    # +9.5 on an existing holding rounds half-up to 10 (2026-10-02), never fractional.
+    assert plan.rows[0].delta_quantity == 10.0
 
 
 def test_fractional_on_without_increment_rounds_to_four_decimals():
@@ -1129,8 +1130,9 @@ def test_both_modes_report_target_quantity_as_the_post_trade_holding():
     """ONE meaning for target_quantity: what the account HOLDS if the row executes.
 
     Holding 10.5 with whole-share rounding and a 2000 target at 100, the ideal
-    count is 20 but only 9 whole shares can be bought, so the honest answer is
-    19.5 in both modes -- always current_quantity + delta_quantity.
+    count is 20 but only whole shares can be bought: the +9.5 add rounds half-up to
+    10, so the honest answer is 20.5 in both modes -- always
+    current_quantity + delta_quantity.
     """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=10.5, cost_basis=1_050.0)}
@@ -1139,8 +1141,8 @@ def test_both_modes_report_target_quantity_as_the_post_trade_holding():
                                   valuation_mode=mode).rows[0]
             for mode in (pa.VALUATION_MODE_COST, pa.VALUATION_MODE_MARKET)]
     for row in rows:
-        assert row.delta_quantity == 9.0
-        assert row.target_quantity == 19.5
+        assert row.delta_quantity == 10.0
+        assert row.target_quantity == 20.5
         assert row.target_quantity == row.current_quantity + row.delta_quantity
     assert rows[0].target_quantity == rows[1].target_quantity
 
@@ -2106,20 +2108,22 @@ def test_label_investment_weighs_the_fractional_floor_before_suppressing():
 
 
 def test_a_sub_unit_TOP_UP_to_an_existing_position_is_never_bumped():
-    """The mirror of the trim case, and the dangerous one: holding 10 at 100 with
-    a 1,050 target wants +0.5 shares. Bumping that to a whole share buys 100 of
-    stock to close a 50 gap -- an unrequested trade twice the size of the miss.
-    D1 fires ONLY when the sub-unit amount is the symbol's WHOLE position."""
+    """The mirror of the trim case: holding 10 at 100 with a 1,049 target wants
+    +0.49 shares. That is under half a share, so it rounds to nothing and D1 does NOT
+    bump it. D1 fires ONLY when the sub-unit amount is the symbol's WHOLE position.
+    (A +0.5 or larger add now rounds half-up to a whole share through
+    ``_round_delta_shares`` instead -- see
+    test_portfolio_allocation_round_whole_share_adds.py.)"""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
     current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
-    row = pa.compute_allocation(1_050.0, 1_000_000.0, labels, current, margin,
+    row = pa.compute_allocation(1_049.0, 1_000_000.0, labels, current, margin,
                                 allow_fractional=False, default_bp_factor=1.0,
                                 valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
     assert row.delta_quantity == 0.0
     assert row.side is None
     assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
-    assert row.unmet_notional == pytest.approx(50.0)
+    assert row.unmet_notional == pytest.approx(49.0)
     assert any("rounds to 0" in r for r in row.reasons)
 
 

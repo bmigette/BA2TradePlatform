@@ -1,0 +1,84 @@
+{
+ "backtest_id": 903,
+ "name": "synthetic-opt-FMPInsiderClusterBuy",
+ "entry_rules": [
+  {
+   "continueProcessing": false,
+   "id": "buy",
+   "name": "enter-buy",
+   "conditions": {
+    "id": "grp-syn-ic",
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "buy-bullish",
+      "field": "bullish",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     },
+     {
+      "id": "c0",
+      "field": "has_no_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "buy",
+     "action_type": "buy"
+    }
+   ],
+   "continue_processing": false
+  }
+ ],
+ "exit_rules": [
+  {
+   "continueProcessing": false,
+   "toggleOptimize": true,
+   "id": "syn-x2",
+   "conditions": {
+    "operator": "AND",
+    "type": "AND",
+    "conditions": [
+     {
+      "id": "c0",
+      "field": "has_position",
+      "fieldType": "flag",
+      "field_type": "flag",
+      "comparison": "is_true",
+      "op": "is_true",
+      "optimizeEnabled": false,
+      "optimize": false
+     }
+    ]
+   },
+   "actions": [
+    {
+     "action": "close",
+     "action_type": "close"
+    }
+   ],
+   "continue_processing": false,
+   "toggle_optimize": true
+  }
+ ],
+ "optimized_genes": {
+  "cond:c1:enabled": 0,
+  "cond:c1:value": 35.0,
+  "cond:c2:enabled": 0,
+  "cond:c2:value": 2.5,
+  "exit:syn-x2:enabled": 1,
+  "exit:syn-x3:enabled": 0
+ }
+}

@@ -51,14 +51,59 @@ def test_local_path_recycles_per_slot_not_globally():
     A chunk-and-barrier design is correct but wastes the fleet: this grid has 1104s genomes
     against a 57s median, so three slots would idle a quarter of an hour waiting on one straggler,
     several times per generation.
+
+    Since P6 (2026-10-24) ``_local_execute_jobs`` delegates to ``_dispatch_with_stall_guard``; the
+    slot-feeding loop lives there. Structure first, then the behaviour.
     """
     body = TEXT[TEXT.index("def _local_execute_jobs"):]
     body = body[:body.index("def make_batch_fitness")]
-    assert "idle_slots()" in body, "the dispatcher no longer fills idle slots"
-    assert "mark_done(" in body, "slots are never released back to idle"
-    assert "as_completed(" not in body, (
+    assert "_dispatch_with_stall_guard(" in body and "_pool" in body, (
+        "the local executor no longer goes through the per-slot dispatcher")
+    disp = TEXT[TEXT.index("def _dispatch_with_stall_guard"):]
+    disp = disp[:disp.index("class _SlotPools")]
+    assert "idle_slots()" in disp, "the dispatcher no longer fills idle slots"
+    assert "mark_done(" in disp, "slots are never released back to idle"
+    assert "as_completed(" not in disp, (
         "as_completed waits on a fixed submitted set -- that is the chunk-barrier shape this "
         "replaced. FIRST_COMPLETED + refill is what keeps every slot busy.")
+    assert "FIRST_COMPLETED" in disp
+
+
+def test_dispatcher_recycles_each_slot_while_idle_and_never_drains_the_fleet():
+    """Behaviour: 2 slots, recycle quota 2, 7 trials. Every trial lands, each slot is torn down and
+    respawned (only ever between its own trials), and no more than ``slots`` trials are ever in flight --
+    i.e. recycling happens per slot, with no global barrier."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import importlib
+    mod = importlib.import_module("app.services.strategy_optimization_handler")
+
+    state = {"running": 0, "peak": 0, "built": 0}
+    lock = threading.Lock()
+
+    def make_one():
+        with lock:
+            state["built"] += 1
+        return ThreadPoolExecutor(max_workers=1)
+
+    def work(cfg, metric):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        import time
+        time.sleep(0.02)
+        with lock:
+            state["running"] -= 1
+        return {"ok": True, "cfg": cfg}
+
+    pool = mod._SlotPools(make_one, 2, 2, log=lambda m: None)
+    jobs = [(i, {"g": i}, f"k{i}", i) for i in range(7)]
+    got = list(mod._dispatch_with_stall_guard(jobs, pool, work, "m", 60.0, 0))
+    assert sorted(g[0] for g in got) == list(range(7)) and all(g[3]["ok"] for g in got)
+    assert pool.recycles >= 2, "no slot was ever recycled at its task quota"
+    assert state["built"] == 2 + pool.recycles, "a recycle must build exactly one fresh pool"
+    assert state["peak"] <= 2, "more trials in flight than slots"
+    assert pool.idle_slots() == [0, 1], "a slot was left busy"
 
 
 def test_stall_guard_present():

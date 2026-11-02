@@ -174,6 +174,16 @@ class _FakeExpert:
         self._equity = equity
 
     def get_setting_with_interface_default(self, name, log_warning=True):
+        if name == "use_atr_stop" and name not in self._settings:
+            # The REAL interface never returns None here -- it falls back to the declared
+            # default (True), which would send _ensure_safeguard_stop through
+            # get_latest_atr(self.indicator_provider) -- and this fixture's manager has
+            # indicator_provider=None (no test in this file exercises ATR). False matches
+            # what every test here already implicitly assumed (and what INERT_RM_TOGGLES
+            # pins in every real run on record): coerce_bool(None) now raises rather than
+            # reading None as False the way bool() silently did, so a bare test double has
+            # to say what it means instead of relying on that accident.
+            return False
         return self._settings.get(name)          # a test double, not a settings read
 
     def _get_enabled_instruments_config(self):

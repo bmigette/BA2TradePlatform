@@ -594,9 +594,10 @@ class TestAWholeShareSellRoundsToTheNearestShare:
         assert self._sell(-1.747, 2.047) == -2.0
         assert self._sell(-0.4, 0.5) == 0.0
 
-    def test_a_buy_is_untouched_and_still_floors(self):
-        """Overshooting a BUY spends money nobody authorised; the asymmetry is the
-        point. The sub-unit bump is a separate, bounded decision (D1)."""
+    def test_a_flat_buy_is_untouched_and_still_floors(self):
+        """A FLAT buy (held 0) keeps flooring here so the sub-unit case reaches the
+        bounded D1 bump. An add to an EXISTING holding now rounds half-up instead --
+        see test_portfolio_allocation_round_whole_share_adds.py."""
         assert self._sell(+0.8773, 0.0) == 0.0
         assert self._sell(+1.9, 0.0) == 1.0
 

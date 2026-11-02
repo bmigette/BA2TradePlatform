@@ -101,7 +101,7 @@ def clear_worker_5m_bars_cache() -> None:
 def _get_5m_bars_cached(provider: Any, symbol: str, start_date: Any, end_date: Any) -> Any:
     """Worker-cached ``provider.get_ohlcv_data(symbol, ..., interval="5m")`` for the whole
     [start_date, end_date] window -- see the cache docstring above."""
-    key = (symbol, start_date, end_date)
+    key = (symbol, start_date, end_date, type(provider).__name__)   # the provider class IS the history folder
     df = _WORKER_5M_BARS_CACHE.get(key)
     if df is not None:
         _WORKER_5M_BARS_CACHE.move_to_end(key)  # LRU: mark most-recently-used
@@ -210,6 +210,13 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     trades = [_trade_row(t) for t in raw_trades]
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
+    # Options runs only. A CAPPED run is excluded: its curve is restated on the cap
+    # denominator, so ``final - initial`` is no longer the account's dollar P&L.
+    # Reported, never raised: see ``warn_if_rows_do_not_tie_to_equity``.
+    metrics_gap = None
+    check_rows_tie = _cap is None and getattr(account, "has_options_provider", False) is True
+    if check_rows_tie:
+        metrics_gap = warn_if_rows_do_not_tie_to_equity(trades, initial=initial, final=final)
 
     # The cap goes in explicitly: on a capped run ``drawdown_curve`` is cap-denominated, and the
     # refinement's dips must be measured on that same denominator (see refine_max_drawdown).
@@ -220,6 +227,8 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
+    if check_rows_tie:
+        metrics["trade_rows_equity_gap"] = metrics_gap
     # See BacktestAccount.snapshot_equity / DailyBacktestEngine.run: the sim stops early the
     # moment net_liquidating_value hits zero, since anything simulated past that point is
     # meaningless. strategy_fitness.compute_fitness reads this to invalidate the trial instead
@@ -258,6 +267,45 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
         if callable(stats):
             metrics.update(stats())
     return metrics
+
+
+# A run whose trade rows and equity disagree by more than this share of the starting capital is
+# reported. Measured runs leave small UNEXPLAINED residuals (0.2-1.3% on other strategies), so this
+# is a smoke alarm for a bookkeeping defect like the assigned-option double count (which was 28% of
+# capital on the measured wheel run), not a proof of tie-out.
+ROWS_EQUITY_GAP_TOLERANCE_PCT = 0.5
+
+
+def warn_if_rows_do_not_tie_to_equity(trades: List[Dict[str, Any]], *, initial: float,
+                                      final: float) -> Optional[float]:
+    """Compare sum(round-trip row P&L) with the equity change and WARN, loudly, on a gap.
+
+    Rows include positions still open at the end (``open_at_end`` rows are marked), so the
+    identity is ``sum(pnl) == final - initial``. Returns ``sum(pnl) - (final - initial)`` in
+    dollars (None when it cannot be computed), recorded in the results as
+    ``trade_rows_equity_gap``. NEVER raises: it reports, it does not gate.
+    """
+    row_sum = sum(float(t["pnl"]) for t in trades)
+    gap = row_sum - (float(final) - float(initial))
+    if not math.isfinite(gap):
+        logger.error(
+            "[backtest] trade-row/equity tie-out is NON-FINITE: sum of row P&L=%r, initial=%r, "
+            "final=%r, gap=%r.", row_sum, initial, final, gap)
+        return None
+    # The base is the LARGER of start and end capital: a $20k run that ends at $1.7M must not be
+    # held to a fixed $100.
+    base = max(abs(float(initial)), abs(float(final)))
+    tolerance = base * ROWS_EQUITY_GAP_TOLERANCE_PCT / 100.0
+    if abs(gap) > max(tolerance, 1.0):
+        logger.warning(
+            "[backtest] TRADE ROWS DO NOT TIE TO EQUITY: sum of round-trip P&L is $%.2f but "
+            "equity moved $%.2f (gap $%.2f = %.2f%% of max(start, end) equity, tolerance %.1f%%). "
+            "Every metric built from the trade rows (win rate, profit factor, profit-cap "
+            "adjusted_*, fitness robustness screens) is off by about this much.",
+            row_sum, float(final) - float(initial), gap,
+            100.0 * abs(gap) / base if base else float("inf"),
+            ROWS_EQUITY_GAP_TOLERANCE_PCT)
+    return round(gap, 2)
 
 
 def _short_borrow_echo(account: Any, config: Dict[str, Any]) -> Dict[str, float]:
@@ -337,9 +385,10 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
     commission = float(config["account_settings"]["commission_per_trade"])
     # get_provider() constructs a FRESH provider instance every call (no internal caching) --
     # build it ONCE per backtest here, not once per flagged trade inside _bars_5m_between.
-    from ba2_providers import get_provider
+    from app.services.backtest.history_source import job_history_provider
 
-    ohlcv_5m_provider = get_provider("ohlcv", "fmp")
+    # The job's own history source (an option job is fmp-only: it refuses any other at job start).
+    ohlcv_5m_provider = job_history_provider(config)
     window_start = config.get("start_date")
     window_end = config.get("end_date")
 
@@ -409,6 +458,28 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
                            exc_info=True)
             return None
 
+    iv_reader = getattr(options, "iv_at_entry", None)
+    rate_source_fn = getattr(account, "options_risk_free_rate_source", None)
+    rate_source = rate_source_fn() if callable(rate_source_fn) else None
+
+    def _iv_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
+        # The multi-leg refinement's second option seam (Black-Scholes needs the leg's iv).
+        # Same discipline as ``_delta_at_entry``: never fatal, never 0.0.
+        try:
+            return iv_reader(underlying, contract, dt)
+        except Exception:  # noqa: BLE001
+            logger.warning("[backtest] iv_at_entry(%s, %s, %s) failed; the multi-leg structure "
+                           "is left out of the intraday refinement.", underlying, contract, dt,
+                           exc_info=True)
+            return None
+
+    def _risk_free_rate(dt: Any) -> float:
+        # THE RUN'S OWN rate (``options_risk_free_rate_source``, FRED as-of), the one the
+        # engine's Black-Scholes mark uses -- never a flat default. A FRED series that does
+        # not cover the date raises, which counts the structure as errored (loud).
+        day = dt.date() if hasattr(dt, "date") else dt
+        return float(rate_source.rate_on(day))
+
     def _bars_5m_between(symbol: str, entry: Any, exit_: Any) -> List[Dict[str, Optional[float]]]:
         df = _bars_5m_for_symbol(symbol)
         if df is None or df.empty or entry is None or exit_ is None:
@@ -421,7 +492,8 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
         # the post-split bars would otherwise read as a fake k-fold move. Without a split
         # inside the trade the two factors are the same number.
         k = _entry_factor(symbol, entry)
-        return [{"Low": _in_basis(row["Low"], k), "High": _in_basis(row["High"], k)}
+        return [{"Date": row["Date"], "Low": _in_basis(row["Low"], k),
+                 "High": _in_basis(row["High"], k)}
                 for _, row in window.iterrows()]
 
     def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
@@ -458,9 +530,14 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
                 return running_peaks[0]
             return running_peaks[max(bisect_right(snap_dates, dt) - 1, 0)]
 
+        stats: Dict[str, int] = {}
+        _refine.last_stats = stats
         return refine_max_drawdown(
             parsed_trades,
             max_drawdown,
+            iv_at_entry=_iv_at_entry if callable(iv_reader) and rate_source is not None else None,
+            risk_free_rate=_risk_free_rate if rate_source is not None else None,
+            stats=stats,
             equity_at=lambda dt: getattr(account, "_equity_at", lambda _dt: None)(dt),
             peak_at=_peak_at,
             drawdown_base=equity_cap,
@@ -472,6 +549,7 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any], *,
             commission_per_trade=commission,
         )
 
+    _refine.last_stats = {}
     return _refine
 
 
@@ -582,8 +660,19 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         # no-op for equities, per-FILL fallback rows and blobs persisted before the round-trip
         # recorder published the column.
         "transaction_id": trade.get("transaction_id"),
-        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier", default=1.0),
+        # An OPTION leg has no safe default: 1.0 would read a 100x contract as one share and
+        # cap a structure's max loss 100x too small. Equity / per-FILL rows keep the 1.0 no-op.
+        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier",
+                              default=None if _is_option_leg(trade) else 1.0),
     }
+    # The entry's protective levels AFTER the fill (what the bracket test enforced) and BEFORE it
+    # (as built from the decision price): only on equity rows of a transaction that carried levels
+    # at its entry fill (``BacktestAccount._rebase_levels_at_entry_fill``); every other row keeps
+    # exactly the keys above. None is a level that did not exist.
+    if "stop_loss_at_fill" in trade:
+        for key in ("stop_loss_at_fill", "take_profit_at_fill", "stop_loss_pre_fill",
+                    "take_profit_pre_fill", "fill_reference_price"):
+            row[key] = None if trade[key] is None else _finite(trade[key], f"trade.{key}")
     # THE OPTION TRADE RECORD (BT/live option parity, plan Part C4), OPTION ROWS ONLY and only
     # when the recorder attached it: every equity row -- and every per-FILL fallback row --
     # keeps exactly the keys above. ``option_strategy`` / ``recommendation_confidence`` ride
@@ -737,6 +826,10 @@ def _compute_metrics(
     #: the curve was empty), "applied" (it ran; the figure may or may not have moved) or
     #: "failed:<ExcType>" (it raised; the daily figure stands). Recorded next to the figure.
     refinement_status = "none"
+    #: The refinement's coverage counters (structures priced, capped, unbounded, uncovered,
+    #: staggered, rolled ...), recorded next to the figure: a GA trial child runs with logging
+    #: disabled, so the log line is not where a reader will find them.
+    refinement_stats: Dict[str, int] = {}
     if refine_drawdown_fn is not None and dd_values:
         # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
         # single-bar-held option trade, or one whose exit day made a new low vs. the day
@@ -747,6 +840,7 @@ def _compute_metrics(
         try:
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
             refinement_status = "applied"
+            refinement_stats = dict(getattr(refine_drawdown_fn, "last_stats", None) or {})
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
             # Kept running on the daily figure, but LOUDLY and on the record: a refinement that
             # failed reports a max_drawdown that is a different quantity from one that ran, and
@@ -995,7 +1089,8 @@ def _compute_metrics(
         # Only where a refinement exists (option runs): an equity result must keep exactly its
         # old key set, so a stored stock backtest re-runs byte-identical (user acceptance gate,
         # 2026-09-25 -- the key used to be written as "none" on every equity run).
-        **({"max_drawdown_refinement": refinement_status}
+        **({"max_drawdown_refinement": refinement_status,
+            "max_drawdown_refinement_stats": refinement_stats}
            if refine_drawdown_fn is not None else {}),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),

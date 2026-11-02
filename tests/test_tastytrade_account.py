@@ -406,23 +406,88 @@ def test_get_positions_maps_a_short_to_the_sell_side():
     assert acct.get_positions()[0].side == OrderDirection.SELL
 
 
-def test_get_positions_reports_quantity_as_a_positive_magnitude():
-    """N06/N07. Position.qty is a MAGNITUDE and `side` carries the direction -- the
-    Alpaca convention every consumer here assumes. A signed qty would make
-    market_value, cost_basis and every allocation weight negative for a short.
-    qty_available mirrors it: TastyTrade publishes no separate held-for-orders
-    quantity, so reporting anything else would understate what can be closed."""
+def test_a_long_position_is_reported_exactly_as_before():
+    """LONG positions are unchanged by the short-sign fix (TastyTrade is long-only in production):
+    positive qty / cost basis / market value, P&L = mark - cost."""
     acct = _bare_account()
     acct._account.get_positions = AsyncMock(return_value=[
-        _tt_position(symbol="AAPL", quantity="-10", direction="Short",
+        _tt_position(symbol="AAPL", quantity="10", direction="Long",
                      average_open_price="140", close_price="150", mark_price="155")])
 
-    position = acct.get_positions()[0]
+    p = acct.get_positions()[0]
 
-    assert position.qty == 10.0
-    assert position.qty_available == 10.0
-    assert position.cost_basis == pytest.approx(1400.0)
-    assert position.market_value == pytest.approx(1550.0)
+    assert p.qty == 10.0 and p.qty_available == 10.0
+    assert p.cost_basis == pytest.approx(1400.0)
+    assert p.market_value == pytest.approx(1550.0)
+    assert p.unrealized_pl == pytest.approx(150.0)
+    assert p.unrealized_plpc == pytest.approx(150.0 / 1400.0)
+    assert p.unrealized_intraday_pl == pytest.approx(50.0)      # (155 - 150) x 10
+    assert p.change_today == pytest.approx(5.0 / 150.0)
+
+
+def test_a_short_position_is_reported_signed_negative_like_alpaca():
+    """TastyTrade publishes ``quantity`` ABSOLUTE and the direction in ``quantity_direction``. The
+    platform's Position contract (Alpaca's, read by get_signed_position_quantity, the exposure gate
+    and the breach sweep) is SIGNED: a short's qty, cost basis and market value are negative, and
+    its P&L is positive when the price FALLS. (It used to report +qty and a P&L with the long sign.)"""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", close_price="150", mark_price="155")])
+
+    p = acct.get_positions()[0]
+
+    assert p.qty == -10.0 and p.qty_available == -10.0
+    assert p.cost_basis == pytest.approx(-1400.0)
+    assert p.market_value == pytest.approx(-1550.0)
+    assert p.unrealized_pl == pytest.approx(-150.0)             # shorted at 140, now 155: a LOSS
+    assert p.unrealized_plpc == pytest.approx(-150.0 / 1400.0)
+    assert p.unrealized_intraday_pl == pytest.approx(-50.0)     # rose 5 on 10 short shares
+    assert acct.get_signed_position_quantity("AAPL") == -10.0
+
+
+def test_a_short_that_fell_is_a_gain():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", close_price="130", mark_price="120")])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_pl == pytest.approx(200.0)
+    assert p.unrealized_plpc == pytest.approx(200.0 / 1400.0)
+
+
+def test_a_zero_position_row_is_skipped_and_reads_flat():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="0", direction="Zero")])
+
+    assert acct.get_positions() == []
+    assert acct.get_signed_position_quantity("AAPL") == 0.0
+
+
+def test_a_held_row_with_an_unknown_direction_makes_the_book_unreadable():
+    """No guessing a direction: None (fetch failure) is what every caller refuses on."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Sideways")])
+
+    assert acct.get_positions() is None
+    assert acct.get_signed_position_quantity("AAPL") is None
+
+
+def test_the_allocation_sign_helper_agrees_with_the_signed_short():
+    """``signed_position_values`` is idempotent on an already-negative short, so the portfolio
+    allocation read is unchanged by the fix."""
+    from ba2_common.core.portfolio_allocation import signed_position_values
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", direction="Short",
+                     average_open_price="140", mark_price="155")])
+    p = acct.get_positions()[0]
+    assert signed_position_values(p.side, quantity=p.qty, cost_basis=p.cost_basis,
+                                  market_value=p.market_value) == (-10.0, -1400.0, -1550.0)
 
 
 def test_get_positions_treats_an_absent_multiplier_as_one():
@@ -1253,7 +1318,10 @@ def test_time_in_force_survives_a_broker_round_trip(tif):
     mapped = acct.tastytrade_order_to_tradingorder(_placed_order(time_in_force=tif))
     assert mapped.good_for == tif.value
 
-    account_def, order = _tt_trading_order(good_for=mapped.good_for)
+    # A LIMIT order: a market order accepts DAY/IOC only (see the market tests below).
+    from ba2_trade_platform.core.types import OrderType
+    account_def, order = _tt_trading_order(good_for=mapped.good_for,
+                                           order_type=OrderType.BUY_LIMIT, limit_price=34.0)
     acct.id = account_def.id
     with patch("tastytrade.instruments.Equity.get",
                new=AsyncMock(return_value=_FakeEquity("AAPL"))):
@@ -1265,9 +1333,33 @@ def test_time_in_force_survives_a_broker_round_trip(tif):
 @pytest.mark.parametrize("good_for", [None, "", "  ", "banana"])
 def test_an_unknown_time_in_force_falls_back_to_gtc(good_for):
     """N19. The documented default, matching AlpacaAccount's tif_map default."""
-    new_order = _built_order(good_for=good_for)
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.BUY_LIMIT,
+                             limit_price=34.0)
 
     assert new_order.time_in_force == OrderTimeInForce.GTC
+
+
+@pytest.mark.parametrize("good_for", [None, "", "gtc", "GTC Ext", "gtd", "banana"])
+def test_a_market_order_is_never_sent_with_a_resting_time_in_force(good_for):
+    """Live 2026-10-02: TastyTrade answers a GTC market order with HTTP 422
+    `tif_market_orders_not_supported`. The add-to-position and close writers leave
+    `good_for` unset, which resolved to the GTC default -- 42 orders of one allocation
+    run were rejected. A market order goes out as DAY."""
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.MARKET)
+
+    assert new_order.order_type == TTOrderType.MARKET
+    assert new_order.time_in_force == OrderTimeInForce.DAY
+
+
+@pytest.mark.parametrize("good_for,expected", [("day", OrderTimeInForce.DAY),
+                                               ("ioc", OrderTimeInForce.IOC)])
+def test_a_market_order_keeps_a_time_in_force_the_broker_accepts(good_for, expected):
+    from ba2_trade_platform.core.types import OrderType
+    new_order = _built_order(good_for=good_for, order_type=OrderType.MARKET)
+
+    assert new_order.time_in_force == expected
 
 
 def test_an_unrecognised_time_in_force_is_logged_rather_than_silently_downgraded(monkeypatch):
@@ -4336,10 +4428,20 @@ def test_every_place_order_call_site_passes_dry_run_explicitly():
     source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
     call_sites = [line.strip() for line in source.splitlines() if ".place_order(" in line]
 
-    assert len(call_sites) == 2, call_sites
+    # Five: the order submit/preview pair, the allocator's stop-only protective order pair, and the
+    # protective dry-run check (dry_run=True only: it can never place anything).
+    assert len(call_sites) == 5, call_sites
     assert all("dry_run=" in line for line in call_sites), call_sites
-    assert sum("dry_run=False" in line for line in call_sites) == 1, call_sites
-    assert sum("dry_run=True" in line for line in call_sites) == 1, call_sites
+    assert sum("dry_run=False" in line for line in call_sites) == 2, call_sites
+    assert sum("dry_run=True" in line for line in call_sites) == 3, call_sites
+
+    # ...and the same discipline for the complex-order endpoint the protective OCOs use: its
+    # SDK default is ALSO dry_run=True.
+    complex_sites = [line.strip() for line in source.splitlines() if ".place_complex_order(" in line]
+    assert len(complex_sites) == 3, complex_sites
+    assert all("dry_run=" in line for line in complex_sites), complex_sites
+    assert sum("dry_run=False" in line for line in complex_sites) == 1, complex_sites
+    assert sum("dry_run=True" in line for line in complex_sites) == 2, complex_sites
 
 
 def test_no_tastytrade_order_is_ever_priced_by_dollar_value():

@@ -23,7 +23,8 @@ from types import SimpleNamespace
 import pytest
 
 from ba2_common.core.TradeActions import BuyCallAction, create_action
-from ba2_common.core.types import ExpertActionType
+from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.types import ExpertActionType, OrderDirection
 
 from tests.test_option_assignment_capacity_wiring import (  # noqa: F401
     FakeAccount, _own_db, act, held_short_put,
@@ -40,6 +41,9 @@ class _Acct:
     def get_option_tradable_balance(self):
         return self._balance
 
+    def option_capital_equity(self):
+        return self._balance                  # the sizing base: equity (no positions here)
+
 
 def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=0.0):
     """A BuyCallAction with only what the sizing tail reads. ``cap_pct=None`` means no
@@ -49,6 +53,7 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     a.instrument_name = "TSM"
     a.account = _Acct(balance)
     a.expert_recommendation = None          # _virtual_equity: no instance -> 100%
+    a._capital_headroom = lambda: (balance, ())   # this double holds nothing but its balance
     a.existing_order = None
     a.sizing = sizing
     if floor is not None:
@@ -60,13 +65,15 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     results, submitted = [], []
     a._result = lambda success, message, data=None: (
         results.append((success, message)) or {"success": success, "message": message})
-    a._submit_option_order = lambda legs, quantity, limit, strategy: (
+    a._submit_option_order = lambda legs, quantity, limit, strategy, **kw: (
         submitted.append(quantity) or {"success": True, "quantity": quantity})
     return a, submitted
 
 
 _TSM = SimpleNamespace(
     cost_per_contract=11.32 * 100.0, option_strategy="long_call", legs=[], limit_price=11.32,
+    sizing_basis="premium",
+    payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY, premium=11.32, strike=400.0)],
     budget_refusal_message="Insufficient budget to size long_call for TSM (premium=11.32)")
 
 
@@ -241,7 +248,7 @@ def test_the_floored_contract_still_faces_the_buying_power_guard():
     acct.hold(held_short_put(strike=50.0, qty=1, reserve=8_000.0, symbol="OTHER"))
     res = _floored(acct, "sell_cash_secured_put", 80.0, **CSP).execute()
     assert not res["success"]
-    assert "Insufficient buying power" in res["message"], res["message"]
+    assert "broker limit" in res["message"], res["message"]
     assert acct.submitted == []
 
 
@@ -399,6 +406,25 @@ def test_a_waiting_debit_without_a_fill_is_measured_off_its_order_price():
     assert why is None and committed == pytest.approx(300.0)
 
 
+def test_an_unbalanced_fly_counts_its_debit_plus_the_recorded_excess():
+    """A call fly whose worst loss exceeds its debit records only the EXCESS as its
+    ``option_reserve`` (the debit is already spent). The per-instrument commitment must count
+    debit + excess: 3 contracts, $2.00 debit, $5.00/share excess -> 600 + 1,500 = 2,100, not
+    the 1,500 the reserve alone gives. A balanced fly (no reserve) is still just its debit."""
+    from ba2_common.core.types import AssetClass
+
+    fly = _txn(quantity=3, open_price=2.0, asset_class=AssetClass.OPTION,
+               option_strategy="call_butterfly", multiplier=100)
+    _order(fly, data={"option_reserve": 5.0 * 100.0 * 3})
+    committed, why = _measuring()._committed_to_underlying()
+    assert why is None and committed == pytest.approx(2_100.0)
+
+    _txn(quantity=1, open_price=2.0, asset_class=AssetClass.OPTION,
+         option_strategy="call_butterfly", multiplier=100)          # balanced: no reserve
+    committed, _ = _measuring()._committed_to_underlying()
+    assert committed == pytest.approx(2_100.0 + 200.0)
+
+
 def test_the_room_check_refuses_a_second_floored_ticket_on_the_same_name():
     """End to end off real rows: one floored $1,132 ticket already on TSM, cap $2,000 ->
     the next floored ticket on TSM has $868 of room and is refused."""
@@ -424,6 +450,9 @@ class _RMExpert:
         self.settings = {"risk_manager_mode": "classic_options",
                          "max_virtual_equity_per_instrument_percent": 10.0}
         self._rails = rails
+
+    def get_available_equity_balance_detail(self):
+        return 1e12, ()                     # the capital model is not what these tests exercise
 
     def get_setting_with_interface_default(self, key, log_warning=True):
         if key not in self._rails:
@@ -542,8 +571,11 @@ def test_every_builder_offered_the_floor_really_sizes_by_cost():
         return "".join(inspect.getsource(k) for k in cls.__mro__
                        if issubclass(k, TA._OptionEntryAction) and k is not TA._OptionEntryAction)
 
-    assert "self._size_by_cost(resolved.cost_per_contract" in inspect.getsource(
-        TA._OptionEntryAction._size_and_submit)
+    # ``cost`` starts as ``resolved.cost_per_contract`` and is only RAISED to the structure's
+    # true max loss (``option_payoff.sizing_risk``) -- still the one cost sizer.
+    src_sas = inspect.getsource(TA._OptionEntryAction._size_and_submit)
+    assert "cost = resolved.cost_per_contract" in src_sas
+    assert "self._size_by_cost(cost, self.sizing)" in src_sas
     for value in get_min_one_contract_action_values():
         cls = type(create_action(ExpertActionType(value), "AAPL", SimpleNamespace(),
                                  SimpleNamespace(), None, None))

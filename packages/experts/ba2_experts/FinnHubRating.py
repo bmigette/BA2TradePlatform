@@ -171,8 +171,7 @@ class FinnHubRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, Market
             trends_data = []
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
         return {"trends_data": trends_data, "current_price": current_price, "symbol": symbol}
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],

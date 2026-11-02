@@ -16,6 +16,7 @@ from ba2_common.core.provider_utils import (
     log_provider_call,
     insider_effective_date,
 )
+from ba2_common.core.knowability import intraday_decision_clock
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 
@@ -201,10 +202,16 @@ class FMPInsiderProvider(CompanyInsiderInterface):
                 # original transactionDate-range-only behaviour byte-for-byte. The effective
                 # date is likewise memoized per row (``_eff_memo``).
                 if as_of is not None:
-                    eff = transaction.get("_eff_memo", _UNPARSED)
-                    if eff is _UNPARSED:
+                    # The memo is keyed by the clock kind: these rows live in a process-wide
+                    # cache shared by every run, and the intraday-clock effective date (a filing
+                    # INSTANT) differs from the legacy one (a date).
+                    _kind = intraday_decision_clock()
+                    _memo = transaction.get("_eff_memo", _UNPARSED)
+                    if _memo is _UNPARSED or _memo[0] != _kind:
                         eff = insider_effective_date(transaction)
-                        transaction["_eff_memo"] = eff
+                        transaction["_eff_memo"] = (_kind, eff)
+                    else:
+                        eff = _memo[1]
                     if eff is None or eff > as_of:
                         continue
 

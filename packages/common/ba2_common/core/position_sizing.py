@@ -25,8 +25,12 @@ import math
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from ba2_common.core.knowability import require_decision_price
+from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
+
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.replay import replay_now
 
 
@@ -59,6 +63,7 @@ def compute_risk_based_quantity(
     available_balance: Optional[float] = None,
     commission_per_trade: float = 0.0,
     lot_size: Optional[int] = None,
+    quantity_unit: float = 1.0,
 ) -> dict:
     """Compute a risk-based share quantity. Pure function (no IO).
 
@@ -83,9 +88,17 @@ def compute_risk_based_quantity(
             by up to one commission at near-full deployment. 0.0 (the default, and what live
             equities cost at Alpaca) is an exact no-op.
         lot_size: round-lot constraint (e.g. 100); quantity is floored to a multiple.
+            A lot constraint FORCES the whole-share grid whatever ``quantity_unit`` says:
+            a round lot exists for an option overlay (one contract per 100 shares), and a
+            fractional share can never be part of one.
+        quantity_unit: the share GRID step (``share_grid.fractional_unit``). ``1.0`` --
+            the default, and every caller before fractional support -- is whole shares
+            and keeps ``quantity`` an ``int`` exactly as before. A smaller step (e.g.
+            0.0001) floors every figure onto that grid instead and returns a ``float``.
 
     Returns:
-        dict with: quantity (int), risk_per_share, risk_dollars, qty_by_risk (the
+        dict with: quantity (int on the whole-share grid, float on a fractional one),
+        risk_per_share, risk_dollars, qty_by_risk (the
         pre-clamp count the risk budget alone bought, absent when sizing refused
         before reaching it), reason (str when quantity is 0 explaining why),
         capped_by (None | 'notional' | 'balance').
@@ -136,13 +149,29 @@ def compute_risk_based_quantity(
             risk_per_share = floor
     out["risk_per_share"] = risk_per_share
 
-    qty = int(risk_dollars // risk_per_share)
+    # THE GRID. A round lot forces whole shares; otherwise the caller's unit decides. Every
+    # floor below goes through ``floor_to_unit`` so the risk count and both clamps land on
+    # the SAME grid -- a whole-share cash clamp applied to a fractional risk count would cut
+    # 2.5 shares to 2 for no reason the budget can explain.
+    unit = 1.0 if (lot_size and lot_size > 1) else float(quantity_unit or 1.0)
+    whole = is_whole_grid(unit)
+
+    def _floor(numerator: float, denominator: float):
+        # WHOLE GRID KEEPS ``//``, deliberately, and not ``floor(a / b)``: the two differ on
+        # float edges (``1.0 // 0.1 == 9.0`` but ``floor(1.0 / 0.1) == 10``). The whole-
+        # share path must stay byte-identical to what every backtest already produced, so
+        # only the NEW fractional path uses the grid's own tolerant floor.
+        if whole:
+            return int(numerator // denominator)
+        return floor_to_unit(numerator / denominator, unit)
+
+    qty = _floor(risk_dollars, risk_per_share)
     # The share count the RISK BUDGET alone buys, before the notional/cash/lot clamps below.
     # Reported, not recomputed by the caller: the run record needs to show whether the budget
     # or a clamp produced the final size, and a caller re-deriving this from risk_dollars and
     # risk_per_share would be a second copy of the formula, free to drift from this one.
     out["qty_by_risk"] = qty
-    if qty < 1:
+    if qty <= 0:
         out["reason"] = (f"risk budget ${risk_dollars:.2f} too small for risk/share "
                          f"${risk_per_share:.2f} (need a wider risk % or tighter stop)")
         return out
@@ -155,7 +184,7 @@ def compute_risk_based_quantity(
     # A negative ceiling floors max_by_notional below 1 and lands on the same refusal, which
     # is the right answer for a nonsensical limit.
     if max_position_value is not None:
-        max_by_notional = int(max_position_value // current_price)
+        max_by_notional = _floor(max_position_value, current_price)
         if qty > max_by_notional:
             qty = max_by_notional
             out["capped_by"] = "notional"
@@ -168,7 +197,7 @@ def compute_risk_based_quantity(
     if available_balance is not None:
         # Reserve the round-trip commission before dividing — a fill costs qty*price + commission,
         # so raw cash / price over-sizes by up to one commission at near-full deployment.
-        max_by_cash = int(max(0.0, available_balance - float(commission_per_trade or 0.0)) // current_price)
+        max_by_cash = _floor(max(0.0, available_balance - float(commission_per_trade or 0.0)), current_price)
         if qty > max_by_cash:
             qty = max_by_cash
             out["capped_by"] = "balance"
@@ -179,7 +208,7 @@ def compute_risk_based_quantity(
         below_one_lot = 1 <= qty < lot_size
         qty = (qty // lot_size) * lot_size
 
-    if qty < 1:
+    if qty <= 0:
         out["reason"] = (
             f"lot sizing refused: the affordable quantity is less than one lot of {lot_size}"
             if below_one_lot else
@@ -259,6 +288,17 @@ def derive_stop_for_quantity(
     return out
 
 
+#: ``trace["safeguard_candidate"]`` values written by ``synthesize_safeguard_stop`` -- WHICH
+#: candidate the synthesised stop distance actually came from (atr_grid_2027 design §3.3, "the
+#: ATR-bound share of entries"). "risk_pct" and "atr" are the two competing DISTANCE candidates
+#: (the tighter wins); "min_stop_floor" means the min_stop_pct floor widened past whichever of
+#: those won. A winner recorded "atr" or (rarer) "min_stop_floor" with atr>0 means ATR bound;
+#: "risk_pct" with use_atr_stop on means the risk-budget distance was tighter than ATR that day.
+SAFEGUARD_CANDIDATE_ATR = "atr"
+SAFEGUARD_CANDIDATE_RISK_PCT = "risk_pct"
+SAFEGUARD_CANDIDATE_MIN_STOP_FLOOR = "min_stop_floor"
+
+
 def synthesize_safeguard_stop(
     current_price: float,
     is_long: bool,
@@ -267,6 +307,7 @@ def synthesize_safeguard_stop(
     atr: Optional[float] = None,
     atr_multiplier: float = 2.0,
     min_stop_pct: float = 7.0,
+    trace: Optional[dict] = None,
 ) -> Optional[float]:
     """Safeguard stop-loss PRICE to place when an order has NO explicit SL from its conditions.
 
@@ -280,22 +321,36 @@ def synthesize_safeguard_stop(
 
     Mirrors the SmartRiskManager's auto-SL so the classic RM — and the backtest, which shares the
     same sizing path — never leaves a position without a hard stop when the strategy's exit
-    conditions set none (e.g. trailing rules that only fire once in profit)."""
+    conditions set none (e.g. trailing rules that only fire once in profit).
+
+    ``trace`` (optional, result-neutral): when given a dict, this writes
+    ``trace["safeguard_candidate"]`` -- one of the ``SAFEGUARD_CANDIDATE_*`` constants, or is left
+    untouched when no stop could be synthesised -- naming which candidate the stop distance
+    actually came from (atr_grid_2027 design §3.3). Callers that pass nothing get exactly
+    today's return value and no other side effect."""
     if not current_price or current_price <= 0:
         return None
     if not risk_per_trade_pct or risk_per_trade_pct <= 0:
         return None
+    require_decision_price(current_price, what="safeguard stop")
     risk_dist = current_price * (risk_per_trade_pct / 100.0)
-    candidates = [risk_dist]
+    candidates = [(SAFEGUARD_CANDIDATE_RISK_PCT, risk_dist)]
     if atr and atr > 0 and atr_multiplier and atr_multiplier > 0:
-        candidates.append(atr_multiplier * atr)
-    stop_dist = min(candidates)                                    # the tighter stop
+        candidates.append((SAFEGUARD_CANDIDATE_ATR, atr_multiplier * atr))
+    winner, stop_dist = min(candidates, key=lambda c: c[1])         # the tighter stop
     if min_stop_pct and min_stop_pct > 0:
-        stop_dist = max(stop_dist, current_price * (min_stop_pct / 100.0))   # floor
+        floor_dist = current_price * (min_stop_pct / 100.0)
+        if floor_dist > stop_dist:
+            stop_dist = floor_dist
+            winner = SAFEGUARD_CANDIDATE_MIN_STOP_FLOOR
     if stop_dist <= 0:
         return None
     sl = current_price - stop_dist if is_long else current_price + stop_dist
-    return round(sl, 2) if sl > 0 else None
+    if not (sl > 0):
+        return None
+    if trace is not None:
+        trace["safeguard_candidate"] = winner
+    return round(sl, 2)
 
 
 def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optional[float],
@@ -446,6 +501,10 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
                 return float(v)
         logger.warning(f"get_latest_atr: no ATR value returned for {symbol}")
         return None
+    except HistoryUnavailable:
+        # a named history refusal (too new, lock timeout, gap, stale corporate actions, failed live fetch) is NOT "no ATR":
+        # falling back to a risk-only stop would trade without the input. The caller refuses the order.
+        raise
     except Exception as e:
         # Let CODE DEFECTS through. This handler previously absorbed a tz naive/aware TypeError
         # and returned None, which is indistinguishable from "this symbol has no ATR" -- so ATR

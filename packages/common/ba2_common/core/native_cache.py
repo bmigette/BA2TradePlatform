@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
+from ba2_common.core import ohlcv_final_bars
 from ba2_common.core.db import get_db
 from ba2_common.core.provider_cache_model import ProviderCache
 from ba2_common.logger import logger
@@ -258,9 +259,39 @@ def read_timeseries(provider: str, symbol: str, interval: str,
     return df
 
 
-def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
+def intraday_paths(provider: str, symbol: str) -> List[str]:
+    """Every EXISTING intraday parquet of ``(provider, symbol)``, one path per interval (canonical
+    interval order, each resolved through its alias spellings)."""
+    out = []
+    for canon in _INTRADAY_CANON:
+        p = find_timeseries_path(provider, symbol, canon)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+_INTRADAY_CANON = ("1m", "5m", "15m", "30m", "1h", "4h")
+
+
+def is_intraday_interval(interval: str) -> bool:
+    return normalize_interval(interval) in _INTRADAY_CANON
+
+
+def write_timeseries(provider: str, symbol: str, interval: str, df, *,
+                     replace_stale: bool = False) -> bool:
     """Atomic temp+rename parquet write. df MUST carry an effective_date column
     (for OHLCV effective_date == bar Date).
+
+    A STALE INTRADAY FILE IS NOT WRITTEN TO (``split_basis.IntradayBasisStale``): its symbol's daily
+    history was rewritten on a new split basis after the file was fetched, so merging fresh bars into it
+    would only bury the defect. ``replace_stale=True`` is for the ONE caller that replaces the whole file on
+    the vendor's current basis (``MarketDataProviderInterface.force_full_refetch``); the marker is cleared
+    after that write.
+
+    NEVER persists an unfinished bar (a daily bar before its session's close + settlement, an
+    intraday bar before its interval ended; ``ba2_common.core.ohlcv_final_bars``): such rows are
+    dropped here, and a write that would leave nothing writes nothing: it returns ``False`` (after an
+    INFO line naming the dropped bars) instead of creating an empty file; ``True`` when written.
 
     The target is the file that ALREADY EXISTS under any alias spelling, and only
     falls back to the canonical write path when there is none. Building the path from
@@ -272,12 +303,44 @@ def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
     bars (2022-06-06..2025-12-31); 8 such pairs existed. Every read then sliced the
     stub to empty and re-downloaded the whole intraday window.
     """
+    # THE RULE (ba2_common.core.ohlcv_final_bars): a bar whose session / interval is not final is
+    # never written, by any caller. This is the ONLY OHLCV parquet writer, so every writer (live
+    # top-up, fetch-cache, prewarm, force_full_refetch, repair tools) is covered here.
+    df, dropped = ohlcv_final_bars.drop_unfinished_bars(df, symbol, interval)
+    if dropped:
+        logger.info(f"{provider} {symbol} ({interval}): not persisting {len(dropped)} unfinished "
+                    f"bar(s) {dropped} (final {ohlcv_final_bars.SETTLE_AFTER_CLOSE} after the close)")
+        if df.empty:
+            return False
     path = find_timeseries_path(provider, symbol, interval) or \
         timeseries_path(provider, symbol, interval)
+    intraday = is_intraday_interval(interval)
+    if intraday and not replace_stale:
+        from ba2_common.core import split_basis
+        stale = split_basis.read_intraday_stale(path)
+        if stale is not None and not os.path.exists(path):
+            # A marker describes a FILE. The file is gone (deleted for a cold refill): the marker outlived
+            # it and would refuse the very write that replaces it.
+            split_basis.clear_intraday_stale(path)
+            split_basis.clear_intraday_rebase(path)
+            logger.info(f"{provider} {symbol} ({interval}): stale marker removed, its file no longer exists")
+            stale = None
+        if stale is not None:
+            raise split_basis.IntradayBasisStale(
+                f"{provider} {symbol} ({interval}): write REFUSED, the file is marked stale -- "
+                f"{stale.get('reason')} (marked {stale.get('marked_at_utc')}). Replace it on the "
+                f"vendor's current basis first: force_full_refetch('{symbol}', '{interval}')."
+                + split_basis.OPERATOR_HINT)
     with _lock_for(path):
         tmp = path + ".tmp"
         df.to_parquet(tmp, index=False)
         os.replace(tmp, path)
+        if intraday and replace_stale:
+            from ba2_common.core import split_basis
+            split_basis.clear_intraday_stale(path)
+            # a full replacement is vendor data again: a rebase sidecar described the file it replaced
+            split_basis.clear_intraday_rebase(path)
+    return True
 
 
 def _as_utc(dt: datetime):

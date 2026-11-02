@@ -30,29 +30,30 @@ just discouraged here.
 
 PREFLIGHT IS THE POINT OF THIS DRIVER (design Section 4/5), same discipline as grid 2's:
 `tools/probe_option_chain_depth.py` measures whether each universe symbol's parquet tree
-carries an expiry with bars at DTE >= 270 over the run window -- broader than grid 2's LEAPS
-threshold (365) because O_CONVEX's entry band is 180-540 DTE, not January-cycle-only. A
-threshold that keeps NOTHING fails the whole run rather than launching a job with an empty
-universe.
+carries an expiry with bars at DTE >= 270 over the run window -- the SAME number grid 2's own
+LEAPS/PMCC threshold now uses (both lowered/aligned to 270; grid 2's floor was 365 until
+2026-09-30), reached for a different reason: O_CONVEX's entry band is 180-540 DTE, not
+January-cycle-only, so regular monthlies at DTE >= 270 already qualify it. A threshold that
+keeps NOTHING fails the whole run rather than launching a job with an empty universe.
 
 Jobs are named `convex-<expert>-O_CONVEX[suffix]` and are IDEMPOTENT/RESUMABLE: a job whose
 StrategyOptimization row is already `completed` is skipped, so the driver can be killed and
 re-run to continue.
 
-Prereqs: the TastyTrade options PARQUET tree must cover the window (`--options-store parquet`
-is forced below, same reasoning as grid 2's driver), plus the usual OHLCV/FMP prewarm for the
-expert signals.
+Prereqs: the ThetaData options tree must cover the window (`--options-store thetadata` by default,
+2020-01-01..2025-12-31 like grid 2's driver), plus the usual OHLCV prewarm for the expert signals.
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_convex_matrix.py \
         [--experts FMPRating,DeterministicScorer] \
-        [--start 2023-01-01] [--end 2025-12-31] \
+        [--start 2020-01-01] [--end 2025-12-31] \
         [--population 40] [--generations 6] [--dry-run]
 
 Environment overrides (so a longer/shorter search does not need a code edit):
     BA2_CONVEX_POPULATION, BA2_CONVEX_GENERATIONS
 """
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -62,7 +63,9 @@ import sys
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from matrix_flags import cap_passthrough  # noqa: E402
+from matrix_flags import (  # noqa: E402
+    finish_matrix, note_job_exit,
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
 
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
@@ -76,8 +79,10 @@ _DEFAULT_STRATEGIES = ["O_CONVEX"]
 
 # The CHAIN-DEPTH O_CONVEX needs, in DTE (design Section 4: "keep a stage-1-universe symbol
 # iff the cache carries expiries with bars at DTE >= 270 in-window -- regular monthlies
-# qualify; January-only names too"). Broader than grid 2's LEAPS threshold (365) because
-# O_CONVEX's entry band starts at 180 DTE, not a January-cycle-only 365+. Keyed by strategy,
+# qualify; January-only names too"). Same number as grid 2's LEAPS/PMCC threshold as of
+# 2026-09-30 (grid 2's floor was 365 before that), for a different reason: O_CONVEX's entry
+# band starts at 180 DTE, not a January-cycle-only 365+, so monthlies at 270 already qualify
+# it. Keyed by strategy,
 # mirroring run_options2_matrix.py's ``_MIN_DTE``, so a second convex-grid key added later
 # cannot run unfiltered by omission.
 _MIN_DTE = {
@@ -220,15 +225,20 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         "--population", str(args.population),
         "--generations", str(args.generations),
         "--initial-capital", str(args.initial_capital),
-        # THE PARQUET STORE, ALWAYS -- same reasoning as grid 2's driver: the sqlite/Alpaca
-        # store's history floor is 2024-01-18 and cannot serve the design's 2023-01 start.
+        # The options store is always stated (default thetadata, the 2020 window): the sqlite/Alpaca
+        # store's history floor is 2024-01-18 and tastytrade's 2022-10-01.
         "--options-store", args.options_store,
+        # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
+        # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
+        "--ohlcv-history-source", args.ohlcv_history_source,
         "--fitness", args.fitness,
         # Daily cadence, matching grid 2's driver: option entries want the day's signal.
         "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel),
     ]
     if args.early_stop is not None:
         cmd += ["--early-stop", str(args.early_stop)]
+    # Always forwarded: absent, the launcher falls back to the legacy rule (any strict gain resets).
+    cmd += ["--early-stop-min-rel", str(args.early_stop_min_rel)]
     if args.mutation_prob is not None:
         cmd += ["--mutation-prob", str(args.mutation_prob)]
     # "Pass 0 to disable": a 0 must be FORWARDED, or the launcher re-applies its own default.
@@ -261,6 +271,14 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
 # test_the_spread_stress_lowers_the_convex_return_term.
 
 
+def _min_rel(text: str) -> float:
+    """``--early-stop-min-rel``: finite and in (0, 1); 0 would be the legacy rule under a new name."""
+    v = float(text)
+    if not math.isfinite(v) or not 0 < v < 1:
+        raise argparse.ArgumentTypeError("must be finite and in (0, 1) (a fraction: 0.01 means 1%)")
+    return v
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The driver's CLI, split out of ``main`` so a test can parse the REAL defaults rather
     than a hand-written stand-in that can drift from them."""
@@ -272,8 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
                     help="Comma list of stage-1 experts (default FMPRating,DeterministicScorer "
                          "-- both have measured large-cap results on this options universe).")
-    ap.add_argument("--start", default="2023-01-01",
-                    help="Backtest start (design Section 5 window; needs the parquet store).")
+    ap.add_argument("--start", default="2020-01-01",
+                    help="Backtest start (the goal2020 window, served by the thetadata store whose floor is "
+                         "2018-09-14; operator checklist item 1, owner 2026-10-22: every option grid on thetadata).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (2026 is the reserved walk-forward holdout and the "
                          "launcher refuses to search into it).")
@@ -283,6 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--generations", type=int, default=_DEFAULT_GENERATIONS,
                     help=f"GA generations (default {_DEFAULT_GENERATIONS}; "
                          f"$BA2_CONVEX_GENERATIONS overrides).")
+    ap.add_argument("--early-stop-min-rel", type=_min_rel, default=0.01,
+                    help="Minimum RELATIVE gain (a fraction in (0, 1): 0.01 = 1%%) for a generation to "
+                         "reset the --early-stop patience (default 0.01, the owner's GA budget rule: "
+                         "patience 5 + 1%%). Always forwarded to the launcher.")
     ap.add_argument("--early-stop", type=int, default=None,
                     help="Generations without improvement before a job stops. Omitted -> "
                          "launcher default.")
@@ -296,9 +319,12 @@ def build_parser() -> argparse.ArgumentParser:
                          f"refuses any other metric for --strategy O_CONVEX).")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f}).")
-    ap.add_argument("--options-store", default="tastytrade",
-                    help="Options store serving the run (default tastytrade -- floor 2022-10-01, "
-                         "reaches this driver's 2023 start; 'parquet' is its accepted alias).")
+    ap.add_argument("--ohlcv-history-source", choices=("alpaca", "fmp"), default="alpaca",
+                    help="OHLCV history of the underlyings (default alpaca, owner 2026-10-22; the as-traded "
+                         "split basis then comes from the verified split table of the alpaca cache).")
+    ap.add_argument("--options-store", default="thetadata",
+                    help="Options store serving the run (default thetadata -- floor 2018-09-14, the only "
+                         "vendor whose history reaches the 2020 start; tastytrade floors at 2022-10-01).")
     ap.add_argument("--universe-file", default=_UNIVERSE_FILE,
                     help="Symbol list probed and then passed to each job.")
     ap.add_argument("--probe-out-dir", default=_TOOLS_DIR,
@@ -341,8 +367,14 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    add_refused_decision_times_flag(ap)
+    args = ap.parse_args(argv)
+    refuse_decision_times_and_announce(args)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -390,8 +422,8 @@ def main(argv=None) -> int:
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
-    print("convex-harvest grid driver: done.")
-    return 0
+        note_job_exit(_FAILED_JOBS, name, rc)
+    return finish_matrix(_FAILED_JOBS, "convex-harvest grid driver")
 
 
 if __name__ == "__main__":

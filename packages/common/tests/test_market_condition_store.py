@@ -363,3 +363,57 @@ def test_an_absent_digest_still_raises_key_error(store):
         reader.retained_window("sha256:" + "e" * 64)
     # ... and the index it built on the way is reusable, not poisoned.
     assert reader.retained_window(rec["window_digest"])[0].size == WINDOW
+
+
+# ---------------------------------------------------------------------------
+# gap_fill_policy: an OPTIONAL manifest key (operator decision 2026-09-30). Default (None, never
+# passed) must leave every manifest byte-for-byte as it was before this key existed; setting it
+# must change the identity, so a filled snapshot can never be mistaken for an unfilled one.
+# ---------------------------------------------------------------------------
+def test_default_gap_fill_policy_is_omitted_and_identity_unchanged(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m_implicit = _manifest(store, [obj], raws)
+    m_explicit_none = store.make_manifest(
+        PROFILE, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
+        objects=[obj], raw_objects=raws, coverage={"AAA": {"rows": 1}}, universe=("AAA",),
+        sessions=(date(2024, 3, 27), date(2024, 3, 28)), window_start=date(2024, 3, 1),
+        window_end=date(2024, 3, 29), gap_fill_policy=None)
+    assert "gap_fill_policy" not in m_implicit
+    assert "gap_fill_policy" not in m_explicit_none
+    assert manifest_identity(m_implicit) == manifest_identity(m_explicit_none)
+    # A manifest from BEFORE this feature existed (no such key at all) still normalizes and
+    # verifies: write_manifest/_normalize never demand the optional key.
+    digest = store.write_manifest(m_implicit)
+    read_back = store.read_manifest(digest)
+    assert "gap_fill_policy" not in read_back
+    assert store.verify(read_back, digest).ok
+
+
+def test_gap_fill_policy_changes_the_manifest_identity(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    kwargs = dict(
+        source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
+        objects=[obj], raw_objects=raws, coverage={"AAA": {"rows": 1}}, universe=("AAA",),
+        sessions=(date(2024, 3, 27), date(2024, 3, 28)), window_start=date(2024, 3, 1),
+        window_end=date(2024, 3, 29), created_at="2024-03-29T00:00:00+00:00")
+    unfilled = store.make_manifest(PROFILE, **kwargs)
+    filled = store.make_manifest(PROFILE, gap_fill_policy="previous", **kwargs)
+    assert filled["gap_fill_policy"] == "previous"
+    assert manifest_identity(unfilled) != manifest_identity(filled)
+    # Both publish to DIFFERENT files (digest is the filename) and both verify independently.
+    d1 = store.write_manifest(unfilled)
+    d2 = store.write_manifest(filled)
+    assert d1 != d2
+    assert store.verify(store.read_manifest(d1), d1).ok
+    assert store.verify(store.read_manifest(d2), d2).ok
+
+
+def test_unknown_manifest_key_is_still_refused(store):
+    rec, raws, _ = _valid_setup(store)
+    obj, _ = store.write_feature_object(PROFILE, "AAA", [rec])
+    m = dict(_manifest(store, [obj], raws))
+    m["not_a_real_key"] = "oops"
+    with pytest.raises(ManifestError, match="unknown keys"):
+        store.write_manifest(m)

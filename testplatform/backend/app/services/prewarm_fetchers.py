@@ -37,7 +37,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -122,20 +122,16 @@ def resolve_keys() -> Dict[str, Optional[str]]:
 
 
 def resolve_fred_key() -> Optional[str]:
-    """The FRED key: env first, then the app-settings DB (the order FMP/Finnhub use).
+    """The FRED key through the ONE shared resolver (``ba2_common.core.fred_api_key``): env
+    ``FRED_API_KEY`` first, then the AppSetting ``fred_api_key`` (the order FMP/Finnhub use).
 
     ``None`` when unconfigured -- refused by :func:`prewarm_fred`, which is the only
     caller that needs it, rather than failing a 500-symbol FMP prewarm over a key
-    only DeterministicScorer's macro section uses.
+    only DeterministicScorer's macro section uses. A key stored only under the legacy name
+    ``FRED_API_KEY`` raises (``FredApiKeyMisnamed``) instead of reading as "no key".
     """
-    key = os.getenv("FRED_API_KEY")
-    if not key:
-        try:
-            from ba2_common.config import get_app_setting
-            key = get_app_setting("fred_api_key")
-        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
-            key = None
-    return key
+    from ba2_common.core.fred_api_key import resolve_fred_api_key
+    return resolve_fred_api_key()
 
 
 def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None,
@@ -167,8 +163,6 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
     stdout, where both are equally visible) and to ``logger.warning`` otherwise -- never
     to ``logger.info``.
     """
-    import time
-
     from ba2_providers.macro import fred_series
 
     say = log if log is not None else logger.info
@@ -181,8 +175,10 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
 
     refreshed = skipped = errors = 0
     for sid in fred_series.SERIES_SPEC:
-        path = fred_series.cache_path(sid)
-        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
+        # Young AND in the format its reader accepts: a young file in the old observation-date
+        # format is refused by the first-release reader, so it is not "fresh" (review
+        # 2026-09-26, item 4).
+        if fred_series.cache_is_fresh(sid, max_age_hours):
             skipped += 1
             continue
         try:
@@ -192,6 +188,105 @@ def prewarm_fred(max_age_hours: float, *, log: Optional[Callable[[str], None]] =
             errors += 1
             complain(f"!! prewarm FRED {sid} failed: {redact(str(e))}")
     return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+
+
+#: Alpaca trading-API hosts, tried in order. ``/v2/assets`` returns the same eligibility
+#: data on both, but a key only authenticates against the host it was issued for, and the
+#: configured key may be either -- so a 401/403 from the live host is retried on paper.
+_ALPACA_ASSET_HOSTS = ("https://api.alpaca.markets", "https://paper-api.alpaca.markets")
+
+
+def resolve_alpaca_keys() -> Tuple[Optional[str], Optional[str]]:
+    """``(key, secret)`` for Alpaca: env first, then the app-settings DB.
+
+    The env names are the ones the options cache builder already reads; the settings rows
+    are the ones ``AlpacaOHLCVProvider`` uses. No new configuration is introduced.
+    """
+    def _setting(key: str) -> Optional[str]:
+        try:
+            from ba2_common.config import get_app_setting
+            return get_app_setting(key)
+        except Exception:  # noqa: BLE001 - no DB / no settings row: the env answer stands
+            return None
+
+    key = (os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+           or _setting("alpaca_api_key"))
+    secret = (os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_API_SECRET")
+              or os.getenv("APCA_API_SECRET_KEY") or _setting("alpaca_api_secret"))
+    return key, secret
+
+
+def fetch_alpaca_fractionable(key: str, secret: str, *, timeout: float = 60.0) -> Dict[str, bool]:
+    """``{SYMBOL: fractionable}`` for every active US equity Alpaca lists. ONE request.
+
+    ``/v2/assets`` returns the whole universe (~12k rows) in a single response, so this is
+    a bulk call rather than one per symbol -- cheap enough to run on every prewarm.
+
+    ``fractionable`` is a REQUIRED boolean on Alpaca's Asset, so every row carries a real
+    answer; a row without one (a future API change) is skipped rather than guessed.
+    """
+    import requests
+
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+    params = {"status": "active", "asset_class": "us_equity"}
+    last_error: Optional[str] = None
+    for host in _ALPACA_ASSET_HOSTS:
+        resp = requests.get(f"{host}/v2/assets", headers=headers, params=params,
+                            timeout=timeout)
+        if resp.status_code in (401, 403):
+            last_error = f"{host} refused the key (HTTP {resp.status_code})"
+            continue
+        resp.raise_for_status()
+        out: Dict[str, bool] = {}
+        for row in resp.json() or []:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            flag = row.get("fractionable")
+            if symbol and (flag is True or flag is False):
+                out[symbol] = flag
+        return out
+    raise PrewarmConfigError(f"Alpaca asset list unavailable: {last_error}")
+
+
+def prewarm_fractionable(max_age_hours: float, *, log: Optional[Callable[[str], None]] = None,
+                         warn: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Refresh the on-disk fractional-share eligibility map backtests read.
+
+    Global, not per-symbol -- the whole US equity universe in one broker call -- so it runs
+    once per prewarm, like the FRED series, rather than entering the per-symbol work list.
+    Skipped when the file is younger than ``max_age_hours`` (24h by default, matching the
+    live account's cache TTL, so a backtest and a live expert see answers of the same age).
+
+    NOT FATAL. Only an expert that opted in to ``allow_fractional_shares`` reads this, and
+    without the file every symbol sizes in whole shares -- exactly the pre-feature
+    behaviour. So a missing key or a failed call is reported through ``warn`` and the rest
+    of the prewarm continues; it must not fail a 500-symbol FMP prewarm.
+
+    The file lands under CACHE_FOLDER, so remote workers receive it with the cache sync.
+    """
+    from ba2_common.core import fractionable_store
+
+    say = log if log is not None else logger.info
+    complain = warn if warn is not None else (log if log is not None else logger.warning)
+
+    age = fractionable_store.store_age_hours()
+    if age is not None and age < max_age_hours:
+        return {"fresh": True, "age_hours": round(age, 2)}
+
+    key, secret = resolve_alpaca_keys()
+    if not key or not secret:
+        msg = ("alpaca_api_key/alpaca_api_secret not configured (AppSetting or ALPACA_API_KEY"
+               "/ALPACA_SECRET_KEY); backtests will size every symbol in whole shares")
+        complain(f"!! prewarm fractionable: {msg}")
+        return {"error": msg}
+    try:
+        flags = fetch_alpaca_fractionable(key, secret)
+        written = fractionable_store.save_fractionable_map(flags, source="alpaca")
+    except Exception as e:  # noqa: BLE001 - never abort the prewarm over an optional input
+        complain(f"!! prewarm fractionable failed: {redact(str(e))}")
+        return {"error": redact(str(e))}
+    fractional = sum(1 for v in flags.values() if v)
+    say(f">> fractionable map: {written} symbols ({fractional} fractionable)")
+    return {"written": written, "fractionable": fractional}
 
 
 class PrewarmFetchers:
@@ -553,3 +648,108 @@ def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str
         "end": end.isoformat(),
         "elapsed_seconds": round(time.time() - t0, 1),
     }
+
+
+# ---------------------------------------------------------------------------------------------------------
+# THE SCREENER DAILY PANEL (criteria live-daily-v2): everything the screener simulation needs
+# ---------------------------------------------------------------------------------------------------------
+PANEL_FIRST_DAY = "2019-03-01"          # the OHLCV cache starts here; a panel serves any job that starts later
+
+
+def prewarm_screener_panel(store_dir: str, start: Optional[str], end: Optional[str], *, fmp_key: Optional[str],
+                           share_history_max_age_days: int = 7, vendor_table_max_age_days: int = 7,
+                           workers: int = 4, force: bool = False,
+                           log: Optional[Callable[[str], None]] = None,
+                           warn: Optional[Callable[[str], None]] = None,
+                           cache_folder: Optional[str] = None, history_source: str) -> Dict[str, Any]:
+    """Produce / refresh every input of the screener simulation for the universe of ``store_dir`` and BUILD the
+    daily criteria panel (``ba2_providers.screener.live_sim_build``).  Resumable and idempotent: a fresh cache
+    file is never fetched twice, an up-to-date panel is a no-op.  The steps (each printed):
+
+      1. the vendor's bulk share table                  (ONE call, skipped while < ``vendor_table_max_age_days`` old)
+      2. the vendor's share history of every symbol     (one call per symbol, skipped while < N days old)
+      3. FMP historical market cap + float per symbol   (the metric-store caches; fetched only where missing)
+      4. a check that every symbol has cached DAILY bars (the data this does NOT fetch: ``ba2-test fetch-cache``)
+      5. the panel itself
+
+    ``history_source`` (REQUIRED, ``fmp`` | ``alpaca``) is the OHLCV history the panel is built from; the panel
+    records it and a job on the other history refuses it.  The share/float/split fetches stay FMP.
+
+    The run never ends silently short: a symbol whose share history failed, or that lacks daily bars, is listed
+    in the summary, and the panel's own coverage check (``live_sim.panel_problems``) refuses a job that needs more.
+    """
+    from datetime import date as _date, timedelta as _td
+    import ba2_common.config as _cfg
+    from ba2_providers.screener import live_sim_build as lb, metric_store as ms
+
+    say = log if log is not None else logger.info
+    complain = warn if warn is not None else (log if log is not None else logger.warning)
+    if not fmp_key:
+        raise PrewarmConfigError("screener panel prewarm needs the FMP key (env FMP_API_KEY or the app-settings DB)")
+    cache = cache_folder or _cfg.CACHE_FOLDER
+    symbols = lb.store_symbols(store_dir)
+    if not symbols:
+        raise PrewarmConfigError(f"screener store {store_dir!r} holds no symbols: build it first "
+                                 f"(ba2-test build-screener-metrics)")
+    today = _date.today().isoformat()
+    end_day = max((end or today)[:10], today)          # the panel must serve today's runs too
+    first_day = min(PANEL_FIRST_DAY, (_date.fromisoformat((start or PANEL_FIRST_DAY)[:10]) - _td(days=300)).isoformat())
+    summary: Dict[str, Any] = {"symbols": len(symbols), "first_day": first_day, "end_day": end_day}
+    say(f">> screener panel: universe {len(symbols)} symbols (store {store_dir}); window {first_day}..{end_day}")
+
+    snap = lb.latest_vendor_snapshot(cache)
+    if force or not lb.vendor_snapshot_is_fresh(snap, vendor_table_max_age_days):
+        snap = lb.fetch_vendor_snapshot(cache, fmp_key)
+        say(f">> vendor share table: fetched {os.path.basename(snap)} (1 call)")
+        summary["vendor_table"] = "fetched"
+    else:
+        say(f">> vendor share table: {os.path.basename(snap)} is fresh")
+        summary["vendor_table"] = "fresh"
+
+    summary["share_history"] = lb.prefetch_shares(cache, symbols, fmp_key, max_age_days=share_history_max_age_days,
+                                                  workers=workers, log=say)
+    failures = []
+    if summary["share_history"]["failed"]:
+        failures.append(f"{summary['share_history']['failed']} share-history fetches FAILED "
+                        f"({summary['share_history']['failed_symbols']})")
+    # split calendars: the OHLCV cache is split-adjusted, the vendor's share counts are raw as of each day
+    summary["split_calendars"] = lb.prefetch_splits(cache, symbols, fmp_key, workers=workers, log=say)
+    if summary["split_calendars"]["failed"] or summary["split_calendars"]["skipped"]:
+        failures.append(f"split calendars: {summary['split_calendars']}")
+
+    # FMP historical market cap + float: only where the cache file is missing altogether
+    lead = (_date.fromisoformat(first_day) - _td(days=120)).isoformat()
+    fetched = {"market_cap": 0, "float": 0}
+    for i, sym in enumerate(symbols, 1):
+        for kind, fn in (("market_cap", ms.fetch_historical_market_cap), ("float", ms.fetch_historical_float)):
+            if os.path.exists(ms._fund_cache_path(kind, sym)):
+                continue
+            try:
+                fn(sym, fmp_key, lead, end_day)
+                fetched[kind] += 1
+            except Exception as e:  # noqa: BLE001 - collected; the run ENDS with an error listing them
+                failures.append(f"{kind} fetch for {sym} failed: {redact(str(e))}")
+        if i % 1000 == 0:
+            say(f">> market-cap/float caches: {i}/{len(symbols)} checked, fetched {fetched}")
+    summary["fundamentals_fetched"] = fetched
+    if failures:
+        # a failed fundamentals fetch is an ERROR, not a warning: the panel would silently fall back to a weaker
+        # source for those symbols. Re-run to resume (everything fetched so far is cached).
+        for f_ in failures[:20]:
+            complain(f"!! screener panel: {f_}")
+        raise PrewarmConfigError(f"screener panel prewarm: {len(failures)} fetch failure(s), first: {failures[0]}. "
+                                 f"Nothing was built; re-run to resume.")
+
+    no_bars = lb.symbols_without_daily_bars(cache, symbols, history_source)
+    summary["without_daily_bars"] = len(no_bars)
+    if no_bars:
+        complain(f"!! screener panel: {len(no_bars)} universe symbols have NO cached daily bars "
+                 f"({no_bars[:12]}...): run `ba2-test fetch-cache --timeframes 1d --start {first_day} "
+                 f"--end {end_day} --symbols <them>`; the panel carries them as unscreenable")
+    man = lb.build_daily_panel(cache, symbols, first_day, end_day, force=force, log=say,
+                               history_source=history_source)
+    summary["panel"] = {k: man.get(k) for k in ("status", "first_session", "last_session", "last_bar_date",
+                                                "n_symbols", "fresh_fraction", "criteria_version", "build_seconds")}
+    summary["shares_sources"] = (man.get("shares_report") or {}).get("sources")
+    say(f">> screener panel: {summary['panel']}; share sources {summary['shares_sources']}")
+    return summary

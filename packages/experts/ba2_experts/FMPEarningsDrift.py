@@ -353,8 +353,7 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                 latest = earnings[0] if earnings else None
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
-        current_price = (self._get_current_price(symbol) if as_of is None
-                         else providers.price_at_date(symbol, as_of))
+        current_price = self._decision_price(providers, symbol, as_of)
         bundle = {"latest_earnings": latest, "current_price": current_price, "symbol": symbol}
         # Only fetch the model's inputs when expected_profit_mode='model' -- avoids the extra
         # I/O (and disk-cache pressure) on every other run, matching the opt-in/default-off

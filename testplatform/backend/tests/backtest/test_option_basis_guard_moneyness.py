@@ -250,3 +250,47 @@ def test_a_crossed_quote_never_loosens_the_width_gate():
                {(s, 0): (1.30, 0.10), (s, 1): (0.10, 1.30)})
     assert g._half_spread(u, 0) == 0.0 and g._half_spread(u, 1) == pytest.approx(0.60)
     assert g.parity_spot(u, s.toordinal()) is None
+
+
+# ---- one set of pair gates (review round 2, I5) ------------------------------------------------
+def test_parity_spot_and_the_carry_term_read_the_same_pairs():
+    """``parity_spot`` IS the first usable expiry of ``expiry_parities``: both go through
+    ``_best_pair``, so the carry measure can never read a pair the spot check would reject."""
+    import app.services.backtest.option_basis_guard as g
+
+    s = date(2020, 3, 18)
+    rows = [(s, date(2020, 3, 20), 5.0, 2.925),        # far OTM of its own parity: skipped
+            (s, date(2020, 4, 17), 3.5, 3.40),         # usable: the spot check's answer
+            (s, date(2020, 5, 15), 3.5, 3.38),         # usable
+            (s, date(2020, 6, 19), 5.0, 3.30)]         # far OTM: skipped
+    u = _pair_store("MUFG", rows)
+    term = g.expiry_parities(u, s.toordinal())
+    assert [date.fromordinal(e) for e, _p in term] == [date(2020, 4, 17), date(2020, 5, 15)]
+    assert term[0][1] == pytest.approx(g.parity_spot(u, s.toordinal()))
+    for d in (date(2020, 3, 19), date(2020, 3, 23)):
+        g.clear_basis_guard_cache()
+        u2 = _pair_store("MUFG", [(d, e, k, p) for _s, e, k, p in rows])
+        t2 = g.expiry_parities(u2, d.toordinal())
+        p2 = g.parity_spot(u2, d.toordinal())
+        assert (t2[0][1] if t2 else None) == (pytest.approx(p2) if p2 is not None else None)
+
+
+def test_the_wide_pair_gate_applies_to_the_carry_term_too():
+    import app.services.backtest.option_basis_guard as g
+
+    s, e1, e2 = date(2024, 1, 25), date(2024, 3, 15), date(2024, 4, 19)
+    contracts = [(e1, 10.0, True), (e1, 10.0, False), (e2, 10.0, True), (e2, 10.0, False)]
+    quotes = {(s, 0): (0.10, 1.30), (s, 1): (0.65, 1.00),       # too wide: never used
+              (s, 2): (0.65, 0.75), (s, 3): (1.15, 1.25)}       # tight: par 9.5
+    u = _Store("MUFG", contracts, quotes)
+    assert g.expiry_parities(u, s.toordinal()) == [(e2.toordinal(), pytest.approx(9.5))]
+    assert g.parity_spot(u, s.toordinal()) == pytest.approx(9.5)
+
+
+def test_the_term_cache_is_reported():
+    import app.services.backtest.option_basis_guard as g
+
+    s = date(2020, 3, 18)
+    u = _pair_store("MUFG", [(s, date(2020, 4, 17), 3.5, 3.40)])
+    g.expiry_parities(u, s.toordinal())
+    assert g.basis_guard_cache_stats()["term_entries"] == 1

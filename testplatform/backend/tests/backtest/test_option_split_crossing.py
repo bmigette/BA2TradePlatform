@@ -70,7 +70,11 @@ class _Chain:
     """An AS-TRADED option store: one dict of (occ, day) -> bar."""
 
     def __init__(self, bars):
+        from ba2_providers.macro.risk_free_rate import explicit_rate
+
         self.bars = dict(bars)
+        #: The run's rate, held by the reader as the real ones do (BS marks read it).
+        self.risk_free_rate_source = explicit_rate(0.045, origin="test stub")
 
     def get_bar(self, occ, as_of):
         b = self.bars.get((occ, as_of))
@@ -172,9 +176,7 @@ def _lot_mark(acct, contract):
 
 
 def _bs_lot_basis(spot_contract_basis, strike, day, right):
-    from app.services.backtest.options_store import default_options_risk_free_rate
-    px = bs_price(spot_contract_basis, strike, (EXPIRY - day).days, IV, right,
-                  r=default_options_risk_free_rate())
+    px = bs_price(spot_contract_basis, strike, (EXPIRY - day).days, IV, right, r=0.045)
     intrinsic = max(0.0, (strike - spot_contract_basis) if right == OptionRight.PUT
                     else (spot_contract_basis - strike))
     return max(px, intrinsic)
@@ -365,7 +367,9 @@ def test_a_short_put_assigned_across_the_split_books_shares_in_the_equity_basis(
 
         _expire(engine, acct, ps)
 
-        assert _expiry_close(acct, PUT).open_price == pytest.approx(30.0)
+        # Assigned short put: closes at 0 (the intrinsic 30 is the share leg's, at the strike).
+        assert _expiry_close(acct, PUT).open_price == pytest.approx(0.0)
+        assert _expiry_close(acct, PUT).data["exit_record"]["trigger"] == "assigned"
         pos = acct._positions["AAPL"]
         assert pos.qty == pytest.approx(400.0)
         assert pos.avg_price == pytest.approx(102.5)
@@ -635,4 +639,5 @@ def test_the_round_trip_row_carries_the_entry_basis_and_the_refinement_uses_it(m
              "entry_time": "2020-08-31T00:00:00", "exit_time": "2020-09-02T00:00:00",
              "option_basis_factor": 4.0}], 0.1)
         assert seen["entry"] == pytest.approx(110.0 * 4)
-        assert seen["bars"] == [{"Low": pytest.approx(420.0), "High": pytest.approx(444.0)}]
+        assert [{"Low": b["Low"], "High": b["High"]} for b in seen["bars"]] == [
+            {"Low": pytest.approx(420.0), "High": pytest.approx(444.0)}]

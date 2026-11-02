@@ -100,12 +100,11 @@ class FREDMacroProvider(MacroEconomicsInterface):
     
     def __init__(self):
         """Initialize FRED macro provider."""
-        self._api_key = get_app_setting("fred_api_key")
-        if not self._api_key:
-            raise ValueError(
-                "FRED API key not configured. "
-                "Please set 'fred_api_key' in AppSetting table."
-            )
+        from ba2_common.core.fred_api_key import require_fred_api_key
+
+        # The ONE resolver (env FRED_API_KEY override, else AppSetting fred_api_key); raises a
+        # ValueError subclass when unconfigured, as this constructor always did.
+        self._api_key = require_fred_api_key("FREDMacroProvider")
         logger.debug("Initialized FREDMacroProvider")
     
     def _get_fred_data(self, series_id: str, start_date: str, end_date: str) -> Dict:

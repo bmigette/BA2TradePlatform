@@ -532,8 +532,10 @@ def test_the_risk_manager_sees_a_DEFINED_risk_structure(action_type):
         quantity=sub["quantity"],
         max_loss_per_contract=res["data"]["max_loss_per_contract"])
     assert candidate.is_defined_risk is True
-    # The put version owes delivery on its ONE short put; the call version owes none.
-    expected = (100.0 * 100.0 * sub["quantity"]) if action_type == PUT_BS else 0.0
+    # The put version owes delivery on its ONE short put, netted by the long 90 puts of the
+    # same expiry down to the width (operator decision 2026-10-15): (100 - 90) x 100 per
+    # unit; the call version owes none.
+    expected = ((100.0 - 90.0) * 100.0 * sub["quantity"]) if action_type == PUT_BS else 0.0
     assert candidate.short_put_assignment == pytest.approx(expected)
 
 

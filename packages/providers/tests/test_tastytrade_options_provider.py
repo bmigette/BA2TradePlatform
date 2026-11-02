@@ -22,6 +22,7 @@ from ba2_common.core.interfaces import OptionContractMeta, OptionsDataProviderIn
 from ba2_providers import OPTIONS_PROVIDERS, get_provider
 from ba2_providers.options.tastytrade import (
     StreamInterrupted, TastyTradeOptionsProvider, candle_to_bar, expiry_calendar,
+    is_monthly_expiry, monthly_expiry_calendar,
     is_empty_snapshot, occ_symbol, occ_to_streamer, parse_occ, strike_ladder,
     streamer_to_occ, strip_candle_suffix, _run_sync,
 )
@@ -673,6 +674,55 @@ def test_expiry_calendar_is_inclusive_of_a_friday_endpoint():
 def test_expiry_calendar_rejects_a_reversed_window():
     with pytest.raises(ValueError):
         expiry_calendar(date(2023, 2, 1), date(2023, 1, 1))
+
+
+# --------------------------------------------------------------------------- #
+# monthly-only expiry filter (``--monthly-only``, tools/warm_options_history.py) --
+# LEAPS only ever list on standard monthly expiries, so a LEAPS backfill filters down to
+# these rather than the every-Friday grid ``expiry_calendar`` produces.
+# --------------------------------------------------------------------------- #
+def test_is_monthly_expiry_accepts_an_ordinary_third_friday():
+    # 2026-01-16 is the 3rd Friday of January 2026, an ordinary (non-holiday) month.
+    assert is_monthly_expiry(date(2026, 1, 16)) is True
+
+
+def test_is_monthly_expiry_rejects_a_non_third_friday():
+    # 2026-01-09 is the 2nd Friday -- a weekly, never a standard monthly.
+    assert is_monthly_expiry(date(2026, 1, 9)) is False
+
+
+def test_is_monthly_expiry_rejects_a_weekday_that_is_not_a_friday_or_shift_thursday():
+    assert is_monthly_expiry(date(2026, 1, 15)) is False  # the Thursday of an ordinary month
+
+
+def test_is_monthly_expiry_shifts_to_thursday_on_a_holiday_third_friday():
+    """2026-06-19 (Juneteenth) is an NYSE holiday AND that month's 3rd Friday, so June 2026's
+    monthly options expire 2026-06-18 (Thursday) instead -- the exact case named in the
+    LEAPS backfill plan."""
+    assert is_monthly_expiry(date(2026, 6, 18)) is True
+    assert is_monthly_expiry(date(2026, 6, 19)) is False, \
+        "the 3rd Friday itself is a holiday -- the observed expiry moved off it"
+
+
+def test_monthly_expiry_calendar_lists_one_expiry_per_month():
+    got = monthly_expiry_calendar(date(2026, 9, 1), date(2026, 12, 31))
+    assert got == [date(2026, 9, 18), date(2026, 10, 16), date(2026, 11, 20),
+                   date(2026, 12, 18)]
+
+
+def test_monthly_expiry_calendar_includes_the_juneteenth_holiday_shift():
+    got = monthly_expiry_calendar(date(2026, 6, 1), date(2026, 6, 30))
+    assert got == [date(2026, 6, 18)]
+
+
+def test_monthly_expiry_calendar_is_inclusive_of_endpoints():
+    got = monthly_expiry_calendar(date(2026, 10, 16), date(2026, 10, 16))
+    assert got == [date(2026, 10, 16)]
+
+
+def test_monthly_expiry_calendar_rejects_a_reversed_window():
+    with pytest.raises(ValueError):
+        monthly_expiry_calendar(date(2026, 2, 1), date(2026, 1, 1))
 
 
 def test_strike_ladder_brackets_the_price_range_on_a_round_increment():

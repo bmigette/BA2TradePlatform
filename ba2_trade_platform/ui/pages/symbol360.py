@@ -1,16 +1,21 @@
 """
 SYMBOL360 Tool
 
-Consolidated per-symbol research dashboard: pulls every metric the platform's
-experts already compute (Weinstein stage, RVOL, earnings/PEAD, insider
-activity, analyst ratings, Senate/House trades, DeterministicScorer's
-technical/fundamental/macro breakdown, FactorRanker's factor score) plus a
-price chart, tagging each with buy/sell/neutral where applicable.
+An at-a-glance opportunity check for one symbol. The data still comes from the
+platform's own experts and providers (DeterministicScorer's technical and fundamental
+evidence, analyst ratings and price targets, earnings, insider and congressional
+activity, Weinstein stage, relative volume) -- but it is presented as a verdict per
+area (Strong Buy .. Strong Sell) with plain-English reasons, and an overall YES/NO
+reached by a transparent tally of those areas. The derivations and per-expert settings
+remain available, collapsed, under "Advanced".
 
-Design: docs/superpowers/specs/2026-08-17-symbol360-design.md
+The verdict logic lives in ``ui/utils/symbol360_view.py`` (pure, unit-tested); this
+module fetches and draws.
+
+Original design: docs/superpowers/specs/2026-08-17-symbol360-design.md
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -23,16 +28,22 @@ from ...modules.dataproviders import get_provider
 from ...modules.dataproviders.indicators.PandasIndicatorCalc import PandasIndicatorCalc
 from ...modules.experts.DeterministicScorer import DeterministicScorer
 from ...modules.experts.expert_mixins import FMPCongressTradingMixin
-from ...modules.experts.FactorRanker import FactorRanker
 from ...modules.experts.FinnHubRating import FinnHubRating
 from ...modules.experts.FMPEarningsDrift import FMPEarningsDrift
 from ...modules.experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
 from ...modules.experts.FMPRating import FMPRating
 from ..components.InstrumentGraph import InstrumentGraph
 from ..components.symbol_chart_data import build_chart_data
+from ..utils.symbol360_view import (
+    VERDICT_COLOR, VERDICT_LABEL, Overall, SummaryCard, build_summary,
+)
 # DeterministicScorer.data has no in-tree shim (package-only helper, like
 # symbol_snapshot below) -- reached directly, same convention Task 9/10 used.
 from ba2_experts.DeterministicScorer.data import fetch_price_targets
+from ba2_experts.FactorRanker.data import (
+    fetch_close_prices, fetch_quality_inputs, fetch_value_inputs,
+)
+from ba2_experts.FactorRanker.factors import momentum_12_1
 from ba2_common.core.interfaces.ExpertDataExportInterface import (
     DETAIL_TOOLTIP_STYLE, plan_metric_detail,
 )
@@ -56,6 +67,22 @@ def _signal_badge(signal: Optional[str]) -> None:
     if not signal:
         return
     ui.badge(signal.upper(), color=_SIGNAL_COLOR.get(signal, "grey"))
+
+
+#: Same greens and reds as the rest of the app (allocation deltas, P&L).
+_STATUS_COLOR = {"good": "#21ba45", "bad": "#c10015", "neutral": "#a0aec0"}
+_STATUS_ICON = {"good": "✓", "bad": "✗", "neutral": "–"}
+
+
+def _verdict_chip(verdict: Optional[str], *, large: bool = False) -> None:
+    """Strong Buy .. Strong Sell. A card that abstains says so rather than drawing Hold:
+    'no signal' and 'hold' are different statements."""
+    if verdict is None:
+        ui.badge("No signal", color="grey-8").props("outline")
+        return
+    chip = ui.badge(VERDICT_LABEL[verdict], color=VERDICT_COLOR[verdict])
+    if large:
+        chip.classes("text-md q-px-md q-py-xs")
 
 
 # --------------------------------------------------------------------------
@@ -149,18 +176,69 @@ def _fetch_congress(symbol: str) -> Optional[Dict[str, Any]]:
     return {"senate": senate, "house": house}
 
 
-def _fetch_factorranker(symbol: str, overrides: Dict[str, Any]) -> ExpertDataExport:
-    """FactorRanker is basket-level; pin a synthetic single-symbol static
-    universe so export_symbol_data scores just this one symbol. The 3
-    universe keys are applied AFTER the user's overrides so pinning always
-    wins for them; every other override key passes through untouched."""
-    pinned = {
-        **overrides,
-        "instrument_selection_method": "static",
-        "universe_source": "static",
-        "enabled_instruments": {symbol: {"enabled": True}},
+def _fetch_factors(symbol: str) -> Optional[Dict[str, Any]]:
+    """FactorRanker's per-symbol factor INPUTS, from FactorRanker's own fetchers.
+
+    Its ranking score is a cross-sectional z-score -- zero against a one-symbol
+    universe -- so the expert itself is not run. What it measures per symbol is real,
+    though: the 12-1 return, the value inputs (EPS, price, FCF, EV) and the quality
+    inputs (ROE, gross profit, assets, accruals). The view judges those on absolute bars.
+    """
+    if not get_app_setting("FMP_API_KEY"):
+        return None
+    closes = fetch_close_prices([symbol])
+    momentum = momentum_12_1(closes).get(symbol) if symbol in closes else None
+    return {
+        "momentum_12_1": momentum,
+        "value": fetch_value_inputs([symbol]).get(symbol),
+        "quality": fetch_quality_inputs([symbol]).get(symbol),
     }
-    return FactorRanker.export_symbol_data(symbol, overrides=pinned)
+
+
+#: DeterministicScorer's skip reason for a symbol with fewer bars than min_history_days.
+_DS_SHORT_HISTORY = "insufficient_history"
+
+
+def _fetch_detscorer(symbol: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """DeterministicScorer's export, plus what the summary cards should read.
+
+    ``min_history_days`` (260) is a trading gate: the scorer will not score a young
+    listing. It also blanks all three DS cards at once, although fundamentals need no
+    price history and ``technical_score`` already omits each leg it lacks the bars
+    for. So when -- and only when -- that gate is why it skipped, the summary cards
+    get a second run with the gate lifted. The Advanced panel keeps the expert's own
+    verdict (``export``).
+    """
+    export = DeterministicScorer.export_symbol_data(symbol, overrides=overrides)
+    out: Dict[str, Any] = {"export": export, "summary": export, "short_history_min": None}
+    if export.skipped and any(getattr(m, "value", None) == _DS_SHORT_HISTORY
+                              for m in export.metrics or []):
+        relaxed = DeterministicScorer.export_symbol_data(
+            symbol, overrides={**overrides, "min_history_days": 1})
+        if relaxed.error is None and not relaxed.skipped:
+            out["summary"] = relaxed
+            out["short_history_min"] = int(export.settings_used["min_history_days"])
+    return out
+
+
+#: Quarters of earnings history shown, and how far ahead the calendar is read so the
+#: next SCHEDULED report is in it (FMP lists those as dated rows without an EPS).
+_EARNINGS_QUARTERS = 8
+_EARNINGS_LOOKAHEAD_DAYS = 120
+
+
+def _fetch_earnings_history(symbol: str) -> Optional[Dict[str, Any]]:
+    """The quarterly earnings calendar, past and scheduled -- see build_earnings_card
+    for why the PEAD expert's export is not enough on its own."""
+    if not get_app_setting("FMP_API_KEY"):
+        return None
+    provider = get_provider("fundamentals_details", "fmp")
+    data = provider.get_past_earnings(
+        symbol, "quarterly", datetime.now() + timedelta(days=_EARNINGS_LOOKAHEAD_DAYS),
+        lookback_periods=_EARNINGS_QUARTERS + 2, format_type="dict")
+    if not isinstance(data, dict) or data.get("error"):
+        raise RuntimeError(f"earnings history unavailable: {data.get('error') if isinstance(data, dict) else data}")
+    return {"rows": data.get("earnings") or []}
 
 
 def _get_overrides(expert_name: str) -> Dict[str, Any]:
@@ -198,7 +276,7 @@ class Symbol360Tab:
     def render(self) -> None:
         with ui.card().classes("w-full"):
             ui.label("SYMBOL360").classes("text-lg font-bold")
-            ui.label("Every metric the platform's experts compute for one symbol").classes(
+            ui.label("Is this symbol a good opportunity? One verdict per area, and an overall call").classes(
                 "text-sm mb-4").style("color: #a0aec0;")
             with ui.row().classes("w-full gap-4 items-center"):
                 self.symbol_input = ui.input(label="Symbol", placeholder="e.g., AAPL").props(
@@ -275,7 +353,14 @@ class Symbol360Tab:
                 logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
-            ui.notify(f"Error searching {symbol}: {str(e)}", type="negative")
+            # After the awaits this task has no slot of its own; notify through a
+            # container, and let a torn-down page swallow the toast rather than raise
+            # a second traceback over the first.
+            try:
+                with self.cards_container:
+                    ui.notify(f"Error searching {symbol}: {str(e)}", type="negative")
+            except RuntimeError as notify_error:
+                logger.debug(f"[Symbol360Tab] Could not show the error toast: {notify_error}")
         finally:
             self._searching = False
             try:
@@ -293,7 +378,6 @@ class Symbol360Tab:
         earnings_overrides = _get_overrides("FMPEarningsDrift")
         insider_overrides = _get_overrides("FMPInsiderClusterBuy")
         detscorer_overrides = _get_overrides("DeterministicScorer")
-        factorranker_overrides = _get_overrides("FactorRanker")
 
         return [
             ("header", "Header", _fetch_header),
@@ -308,66 +392,112 @@ class Symbol360Tab:
              lambda sym: _fetch_analyst(sym, fmp_rating_overrides, finnhub_overrides)),
             ("congress", "Senate/House Activity", _fetch_congress),
             ("detscorer", "DeterministicScorer",
-             lambda sym: DeterministicScorer.export_symbol_data(sym, overrides=detscorer_overrides)),
-            ("factorranker", "FactorRanker",
-             lambda sym: _fetch_factorranker(sym, factorranker_overrides)),
+             lambda sym: _fetch_detscorer(sym, detscorer_overrides)),
+            ("earnings_history", "Earnings history", _fetch_earnings_history),
+            # FactorRanker's inputs, not the expert: see _fetch_factors.
+            ("factors", "Momentum / Value / Quality factors", _fetch_factors),
         ]
 
     def _render_cards(self, symbol: str, results: Dict[str, Any]) -> None:
+        """The at-a-glance view: verdict banner, chart, one card per area, context.
+
+        Every decision -- which lines are good or bad, each card's verdict, the overall
+        tally -- is made by the pure ``symbol360_view`` module. This method only draws, so
+        what a card SAYS is unit-tested without a browser.
+        """
+        header, cards, backdrop, overall = build_summary(symbol, results, date.today())
         with self.cards_container:
-            self._render_header_card(results.get("header"))
+            self._render_banner(header, overall)
             self._render_chart_card(symbol, results.get("chart"))
-            with ui.row().classes("w-full gap-4"):
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_weinstein_card(results.get("weinstein"))
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_rvol_card(results.get("rvol"))
-            with ui.row().classes("w-full gap-4"):
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_export_card("Earnings / PEAD", results.get("earnings"))
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_export_card("Insider Activity", results.get("insider"))
-            with ui.row().classes("w-full gap-4"):
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_analyst_card(results.get("analyst"))
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_congress_card(results.get("congress"))
-            self._render_export_card("DeterministicScorer", results.get("detscorer"))
-            self._render_export_card("FactorRanker", results.get("factorranker"))
+            with ui.grid(columns=2).classes("w-full gap-4"):
+                for card in [*cards, backdrop]:
+                    self._render_summary_card(card)
+            self._render_advanced(results)
 
-    # ---------------------------------------------------------------- direct-data cards
+    # ---------------------------------------------------------------- summary view
 
-    def _render_header_card(self, header: Optional[Dict[str, Any]]) -> None:
+    def _render_banner(self, header: Dict[str, str], overall: Overall) -> None:
         with ui.card().classes("w-full"):
-            if header is None:
-                ui.label("Header unavailable (missing FMP API key or bad symbol)").classes(
-                    "text-sm text-red-400")
+            with ui.row().classes("w-full items-center justify-between gap-4"):
+                with ui.column().classes("gap-0 min-w-0"):
+                    with ui.row().classes("items-baseline gap-3"):
+                        ui.label(header["symbol"]).classes("text-2xl font-bold")
+                        ui.label(header["price"]).classes("text-xl")
+                        ui.label(header["change"]).classes("text-md").style(
+                            f"color: {_STATUS_COLOR[header['change_status']]};")
+                    if header["name"]:
+                        ui.label(header["name"]).classes("text-md")
+                    meta = " · ".join(x for x in (header["sector"],
+                                                  f"Market cap {header['market_cap']}")
+                                      if x and "n/a" not in x)
+                    if meta:
+                        ui.label(meta).classes("text-sm").style("color: #a0aec0;")
+                with ui.column().classes("items-end gap-1"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("OVERALL").classes("text-sm").style("color: #a0aec0;")
+                        _verdict_chip(overall.verdict, large=True)
+                        if overall.answer:
+                            good = overall.answer == "YES"
+                            ui.label(f"{'✅' if good else '❌'} {overall.answer}").classes(
+                                "text-lg font-bold").style(
+                                f"color: {_STATUS_COLOR['good' if good else 'bad']};")
+                    ui.label(overall.summary).classes("text-sm").style("color: #a0aec0;")
+
+    def _render_summary_card(self, card: SummaryCard) -> None:
+        with ui.card().classes("w-full"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label(card.title).classes("text-md font-bold")
+                if card.votes:
+                    _verdict_chip(card.verdict)
+                else:
+                    ui.label("context").classes("text-xs").style("color: #a0aec0;")
+            if card.unavailable is not None:
+                ui.label(card.unavailable).classes("text-sm").style("color: #a0aec0;")
                 return
-            quote = header.get("quote") or {}
-            profile = header.get("profile") or {}
-            with ui.row().classes("w-full items-center gap-6 flex-wrap"):
-                name = profile.get("companyName")
-                if name:
-                    ui.label(name).classes("text-lg font-bold")
-                price = quote.get("price")
-                if price is not None:
-                    ui.label(f"${price:,.2f}").classes("text-xl")
-                change_pct = quote.get("changesPercentage")
-                if change_pct is not None:
-                    color = "#26a69a" if change_pct >= 0 else "#ef5350"
-                    ui.label(f"{change_pct:+.2f}%").classes("text-lg").style(f"color: {color};")
-            with ui.row().classes("w-full gap-6 flex-wrap mt-1"):
-                sector = profile.get("sector")
-                industry = profile.get("industry")
-                mcap = quote.get("marketCap") or profile.get("mktCap")
-                exch = quote.get("exchange") or profile.get("exchangeShortName")
-                for label, value in (
-                    ("Sector", sector), ("Industry", industry),
-                    ("Mkt Cap", f"${mcap:,.0f}" if mcap else None),
-                    ("Exchange", exch),
-                ):
-                    if value:
-                        ui.label(f"{label}: {value}").classes("text-xs").style("color: #a0aec0;")
+            for line in card.lines:
+                with ui.row().classes("items-start gap-2 no-wrap"):
+                    ui.label(_STATUS_ICON[line.status]).style(
+                        f"color: {_STATUS_COLOR[line.status]}; min-width: 1.1rem;")
+                    ui.label(line.text).classes("text-sm")
+            if card.votes and card.verdict is not None:
+                ui.label(card.tally_text).classes("text-xs mt-1").style("color: #a0aec0;")
+            if card.note:
+                ui.label(card.note).classes("text-xs italic").style("color: #a0aec0;")
+            if card.facts or card.tables:
+                with ui.expansion("Show details").classes("w-full text-sm"):
+                    if card.facts:
+                        with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-1"):
+                            for label, value in card.facts:
+                                ui.label(label).classes("text-sm").style("color: #a0aec0;")
+                                ui.label(value).classes("text-sm")
+                    for table in card.tables:
+                        ui.label(table.title).classes("text-sm font-bold mt-3")
+                        columns = [{"name": f"c{i}", "label": c, "field": f"c{i}",
+                                    "align": "left"} for i, c in enumerate(table.columns)]
+                        rows = [{"id": n, **{f"c{i}": v for i, v in enumerate(r)}}
+                                for n, r in enumerate(table.rows)]
+                        ui.table(columns=columns, rows=rows, row_key="id",
+                                 pagination={"rowsPerPage": 10}).classes("w-full").props("dense")
+
+    def _render_advanced(self, results: Dict[str, Any]) -> None:
+        """The previous per-expert view, kept for power use but out of the way.
+
+        The expert breakdowns (with their scoring derivations) and the per-expert
+        settings overrides both live here. Collapsed by default: the summary above is the
+        page; this is for checking how an expert reached a number or re-running it with
+        different settings.
+        """
+        analyst = results.get("analyst") or {}
+        exports = [
+            ("DeterministicScorer", (results.get("detscorer") or {}).get("export")),
+            ("Earnings / PEAD", results.get("earnings")),
+            ("Insider Activity", results.get("insider")),
+            ("FMP Rating", analyst.get("fmp")),
+            ("FinnHub Rating", analyst.get("finnhub")),
+        ]
+        with ui.expansion("Advanced — expert breakdowns and settings").classes("w-full"):
+            for title, export in exports:
+                self._render_export_card(title, export)
 
     def _render_chart_card(self, symbol: str, chart) -> None:
         if chart is None:
@@ -383,137 +513,11 @@ class Symbol360Tab:
             return
         InstrumentGraph(symbol=symbol, price_data=price_data, indicators_data=indicators_data).render()
 
-    def _render_weinstein_card(self, w: Optional[Dict[str, Any]]) -> None:
-        with ui.card().classes("w-full"):
-            ui.label("Weinstein Stage").classes("text-md font-bold")
-            if w is None:
-                ui.label("Unavailable").classes("text-sm text-red-400")
-                return
-            stage = w.get("stage")
-            with ui.row().classes("items-center gap-2 mt-1"):
-                ui.label(f"Stage {stage}" if stage is not None else "Unknown").classes("text-lg")
-                _signal_badge(w.get("signal"))
-            if w.get("reason"):
-                ui.label(w["reason"]).classes("text-xs").style("color: #a0aec0;")
-            for key, label in (("price", "Price"), ("sma", "SMA150"), ("slope_pct", "Slope %")):
-                value = w.get(key)
-                if value is not None:
-                    ui.label(f"{label}: {value:,.2f}").classes("text-sm")
-
-    def _render_rvol_card(self, r: Optional[Dict[str, Any]]) -> None:
-        with ui.card().classes("w-full"):
-            ui.label("Relative Volume").classes("text-md font-bold")
-            if r is None:
-                ui.label("Unavailable").classes("text-sm text-red-400")
-                return
-            rvol = r.get("rvol")
-            with ui.row().classes("items-center gap-2 mt-1"):
-                if rvol is None:
-                    ui.label("Unknown (no average volume)").classes("text-sm").style(
-                        "color: #a0aec0;")
-                else:
-                    ui.label(f"{rvol:.2f}x").classes("text-lg")
-                    if rvol >= 2.0:
-                        ui.badge("ELEVATED", color="warning")
-            quote = r.get("quote") or {}
-            volume, avg_volume = quote.get("volume"), quote.get("avgVolume")
-            if volume is not None:
-                ui.label(f"Volume: {volume:,}").classes("text-xs").style("color: #a0aec0;")
-            if avg_volume is not None:
-                ui.label(f"Avg Volume: {avg_volume:,}").classes("text-xs").style("color: #a0aec0;")
-
-    def _render_analyst_card(self, analyst: Optional[Dict[str, Any]]) -> None:
-        with ui.card().classes("w-full"):
-            ui.label("Analyst Ratings").classes("text-md font-bold mb-2")
-            if analyst is None:
-                ui.label("Unavailable").classes("text-sm text-red-400")
-                return
-            with ui.row().classes("w-full gap-4 flex-wrap"):
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_export_card("FMP Rating", analyst.get("fmp"))
-                with ui.column().classes("flex-1 min-w-0"):
-                    self._render_export_card("FinnHub Rating", analyst.get("finnhub"))
-            targets = analyst.get("price_targets") or []
-            if targets:
-                with ui.expansion(f"Dated Price Targets ({len(targets)})").classes("w-full"):
-                    columns = [
-                        {"name": "date", "label": "Published", "field": "date", "align": "center", "sortable": True},
-                        {"name": "analyst", "label": "Analyst", "field": "analyst", "align": "left"},
-                        {"name": "firm", "label": "Firm", "field": "firm", "align": "left"},
-                        {"name": "target", "label": "Target", "field": "target", "align": "right", "sortable": True},
-                    ]
-                    rows = []
-                    for i, t in enumerate(targets):
-                        rows.append({
-                            "id": i,
-                            "date": t.get("publishedDate") or "",
-                            "analyst": t.get("analystName") or "",
-                            "firm": t.get("analystCompany") or "",
-                            "target": t.get("priceTarget"),
-                        })
-                    rows.sort(key=lambda row: row["date"], reverse=True)
-                    ui.table(columns=columns, rows=rows, row_key="id",
-                            pagination={"rowsPerPage": 10, "sortBy": "date", "descending": True}
-                            ).classes("w-full dark-pagination")
-
-    def _render_congress_card(self, congress: Optional[Dict[str, Any]]) -> None:
-        with ui.card().classes("w-full"):
-            ui.label("Senate/House Activity").classes("text-md font-bold mb-2")
-            if congress is None:
-                ui.label("Unavailable (missing FMP API key)").classes("text-sm text-red-400")
-                return
-            trades = []
-            for t in congress.get("senate") or []:
-                t = dict(t); t["_chamber"] = "Senate"; trades.append(t)
-            for t in congress.get("house") or []:
-                t = dict(t); t["_chamber"] = "House"; trades.append(t)
-            if not trades:
-                # Not a "recent" window -- _fetch_congress's FMP call returns this
-                # symbol's FULL disclosed history in one request (no lookback to
-                # narrow/widen, hence no settings expander on this card), so an
-                # empty result means zero senate/house trades on record, ever.
-                ui.label("No senate/house trades on record for this symbol").classes(
-                    "text-sm").style("color: #a0aec0;")
-                return
-            rows = []
-            for i, t in enumerate(trades):
-                first = t.get("firstName", "") or ""
-                last = t.get("lastName", "") or ""
-                rows.append({
-                    "id": i,
-                    "chamber": t["_chamber"],
-                    "trader": f"{first} {last}".strip() or "Unknown",
-                    "transaction_type": t.get("type") or t.get("transactionType") or "Unknown",
-                    "amount": t.get("amount") or t.get("amountRange") or "",
-                    "transaction_date": t.get("transactionDate") or "",
-                })
-            rows.sort(key=lambda row: row["transaction_date"], reverse=True)
-            columns = [
-                {"name": "chamber", "label": "Chamber", "field": "chamber", "align": "center", "sortable": True},
-                {"name": "trader", "label": "Trader", "field": "trader", "align": "left", "sortable": True},
-                {"name": "transaction_type", "label": "Type", "field": "transaction_type", "align": "center"},
-                {"name": "amount", "label": "Amount", "field": "amount", "align": "right"},
-                {"name": "transaction_date", "label": "Date", "field": "transaction_date", "align": "center", "sortable": True},
-            ]
-            table = ui.table(columns=columns, rows=rows, row_key="id",
-                             pagination={"rowsPerPage": 10, "sortBy": "transaction_date", "descending": True}
-                             ).classes("w-full dark-pagination")
-            # Same Purchase/Sale coloring slot as FMPSenateTradeTab in tools.py.
-            table.add_slot("body-cell-transaction_type", '''
-                <q-td :props="props">
-                    <q-badge :color="props.value.includes('Purchase') || props.value.includes('Buy') ? 'positive' : props.value.includes('Sale') || props.value.includes('Sell') ? 'negative' : 'grey'">
-                        {{ props.value }}
-                    </q-badge>
-                </q-td>
-            ''')
-
-    # ---------------------------------------------------------------- ExpertDataExport cards
-
     def _render_export_card(self, title: str, export: Optional[ExpertDataExport]) -> None:
         """Shared renderer for every ExpertDataExportInterface-backed card
-        (earnings/insider/FMPRating/FinnHubRating/DeterministicScorer/
-        FactorRanker) -- error/skip states, signal badge, metric rows, and
-        the per-card settings expander, written once instead of 6 times."""
+        (earnings/insider/FMPRating/FinnHubRating/DeterministicScorer) --
+        error/skip states, signal badge, metric rows, and the per-card
+        settings expander, written once instead of 5 times."""
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label(title).classes("text-md font-bold")
