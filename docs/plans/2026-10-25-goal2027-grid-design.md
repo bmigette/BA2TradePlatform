@@ -66,6 +66,11 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
 
 - Sizing mode: `risk_atr` or `notional` (§2.1).
 - ATR stop, searched: the `atr-searched` RM block.
+- SPY-stress regime overlay, searched (added 2026-11-03, user decision; reverses D3 of the ATR grid design for
+  goal2027 only): `--rm-toggle-policy atr-regime-searched` unpins `regime_overlay_enabled` (gene 0/1) and keeps
+  `regime_risk_scale`, `regime_stop_scale` and `regime_tp_scale` (0.5-2.0). While SPY volatility is stressed they
+  scale size, stop distance and TP distance. Job names carry `-rgov`. Live publishes the stress flag from FMP SPY
+  closes, the backtest from the run's history source: the same split the SPY gates accept (§2.3).
 - Market profile: off, `ohlcv-v1`, `ta-structure-v1` or both, plus market exits (§2.2).
 - SPY trend gate and SPY volatility gate, each with an off value (§2.3).
 - Stop-loss loosening (`--search-sl-loosen`).

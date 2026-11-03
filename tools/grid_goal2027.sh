@@ -37,7 +37,8 @@
 # per-band spread is a per-call flag. Every call adds to ONE summary under $WF_REPORT_DIR.
 #
 # GENES per kind (design 1.3):
-#   classic (S1-S7, Senate too): sizing gene, ATR searched, market profile gene + exits, SL loosen,
+#   classic (S1-S7, Senate too): sizing gene, ATR searched, SPY-stress regime overlay searched (rgov:
+#            on/off + size/stop/TP scales), market profile gene + exits, SL loosen,
 #            SPY regime entry gates (spy-trend, spy-vol), entry/manage time genes; DS adds the factor
 #            genes; explr where the pair has ranges.
 #   sqm:     sizing, time and factor genes + explr; no market, SPY, ATR or SL-loosen genes (SQM's
@@ -283,12 +284,12 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
   case "$kind" in
     fr|ds|ed|icb|senate)
       args+=(--strategy-plan "$PLAN_FILE" --decision-times split --search-sizing-mode
-             --rm-toggle-policy atr-searched
+             --rm-toggle-policy atr-regime-searched
              --market-condition-profile ohlcv-v1,ta-structure-v1
              --market-condition-manifest "ohlcv-v1=${mc_o},ta-structure-v1=${mc_t}"
              --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
              --benchmark-regime-gates --exclude-symbols "@$EXCLUDE_FILE")
-      suffix="${suffix}-atr27-sizegene-mktprof-spyreg"
+      suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg"
       if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
       if [ "$kind" != "senate" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
     sqm)

@@ -46,7 +46,7 @@ order carries no explicit stop.
 | `min_stop_loss_pct` | stop floor, also the sizing stop fallback | stop floor | keep |
 | `use_atr_stop` | stop synthesis toggle | stop synthesis toggle | keep (searched only under atr-searched) |
 | `max_virtual_equity_per_instrument_percent` | ceiling (`max_position_value`) | the main sizer | keep in both (design) |
-| `regime_*` | pinned off by policy (`regime_overlay_enabled`=0) | same | not mode-specific; unchanged |
+| `regime_*` | searched under `atr-regime-searched` (2026-11-03): overlay 0/1 + 3 scales | same | not mode-specific |
 | expert/rule/screener/schedule genes | no sizing read | no sizing read | keep |
 
 Caveat: `risk_per_trade_pct`/`atr_*`/`min_stop_loss_pct` act only on an order WITHOUT an explicit ruleset stop; that

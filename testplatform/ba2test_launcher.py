@@ -1097,7 +1097,7 @@ def _daily_manage_schedule() -> dict:
 _INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
 
 #: Mirrors strategy_param_space.ALLOWED_RM_TOGGLES_UNPINNED. See _pinned_rm_toggles.
-_ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
+_ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop", "regime_overlay_enabled"})
 
 #: --rm-toggle-policy values (see _cmd_optimize / _cmd_optimize_batch). "pinned" (default) is
 #: today's behaviour, byte-identical. "atr-searched" is the 2027 ATR grid's run-level policy
@@ -1105,7 +1105,22 @@ _ALLOWED_RM_TOGGLES_UNPINNED = frozenset({"use_atr_stop"})
 #: persisted on the run (backtest_block['rm_toggles_unpinned']) so every path that rebuilds a
 #: trial from the stored config -- GA trials, top-N persist, re-runs, robustness variants,
 #: tools/recover_missing_topn.py, tools/rerun_dev_deployed_on_worker.py -- sees the same policy.
-_RM_TOGGLE_POLICIES = ("pinned", "atr-searched")
+#: "atr-regime-searched" (goal2027, user decision 2026-11-03) is "atr-searched" PLUS the SPY-stress
+#: regime overlay: it also unpins regime_overlay_enabled, searched 0/1, and keeps the three
+#: regime_*_scale genes (see _RM_OPT_ATR_REGIME_SEARCHED).
+_RM_TOGGLE_POLICIES = ("pinned", "atr-searched", "atr-regime-searched")
+
+#: The policies that search use_atr_stop: both get the ATR-searched RM block and weekday-only
+#: schedule genes (atr_grid_2027 design §3.2 / D8).
+_ATR_SEARCHED_POLICIES = frozenset({"atr-searched", "atr-regime-searched"})
+
+
+def _policy_searches_atr(policy: str) -> bool:
+    return policy in _ATR_SEARCHED_POLICIES
+
+
+def _policy_searches_regime(policy: str) -> bool:
+    return policy == "atr-regime-searched"
 
 
 def _rm_toggles_unpinned_for_policy(policy: str) -> list:
@@ -1114,6 +1129,8 @@ def _rm_toggles_unpinned_for_policy(policy: str) -> list:
         return []
     if policy == "atr-searched":
         return ["use_atr_stop"]
+    if policy == "atr-regime-searched":
+        return ["use_atr_stop", "regime_overlay_enabled"]
     raise ValueError(f"unknown --rm-toggle-policy {policy!r}; choices are {_RM_TOGGLE_POLICIES}")
 
 
@@ -1132,16 +1149,22 @@ def _pinned_rm_toggles(rm_toggles_unpinned: "list | None" = None) -> dict:
 
 def _refuse_atr_policy_without_job_name(policy: str, name: "str | None") -> None:
     """An ``atr-searched`` run must be named so it can never be confused with -- or accidentally
-    resume the checkpoint of -- a pinned run of the same expert/strategy. ``pinned`` (the
-    default) is unrestricted."""
-    if policy != "atr-searched":
+    resume the checkpoint of -- a pinned run of the same expert/strategy. ``atr-regime-searched``
+    must ALSO carry ``-rgov``, so it cannot resume an ``atr-searched`` run's checkpoint either.
+    ``pinned`` (the default) is unrestricted."""
+    if not _policy_searches_atr(policy):
         return
     if not name or "-atr27" not in name:
         sys.exit(
-            f"ba2-test: --rm-toggle-policy atr-searched requires --name (or --name-prefix) to "
+            f"ba2-test: --rm-toggle-policy {policy} requires --name (or --name-prefix) to "
             f"contain '-atr27' (got {name!r}) -- this policy changes what the run scores, and a "
             f"job name that could collide with a pinned run's name risks resuming its checkpoint "
             f"into the wrong search or skipping a policy run as 'already completed'.")
+    if _policy_searches_regime(policy) and "-rgov" not in name:
+        sys.exit(
+            f"ba2-test: --rm-toggle-policy {policy} requires --name (or --name-prefix) to "
+            f"contain '-rgov' as well as '-atr27' (got {name!r}) -- it searches the regime "
+            f"overlay, so its name must never match an atr-searched run's.")
 
 
 #: The name token a ``--decision-times`` job must carry (see ``_resolve_decision_times``).
@@ -1914,6 +1937,19 @@ _RM_OPT_ATR_SEARCHED = {
     "regime_overlay_enabled": _REGIME_OPT["regime_overlay_enabled"],
 }
 
+#: The ``atr-regime-searched`` policy's RM block (goal2027, user decision 2026-11-03): the
+#: ATR-searched block PLUS the SPY-stress regime overlay. ``regime_overlay_enabled`` is a real
+#: 0/1 gene here (the policy unpins it, persisted as rm_toggles_unpinned) and the three
+#: regime_*_scale genes come back, same ranges as _REGIME_OPT. While SPY is not stressed, or with
+#: the gene at 0, the scales are inert and the trial scores exactly as under atr-searched.
+_RM_OPT_ATR_REGIME_SEARCHED = {
+    **_RM_OPT_ATR_SEARCHED,
+    "regime_overlay_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    "regime_risk_scale": _REGIME_OPT["regime_risk_scale"],
+    "regime_stop_scale": _REGIME_OPT["regime_stop_scale"],
+    "regime_tp_scale": _REGIME_OPT["regime_tp_scale"],
+}
+
 #: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.
 #:
 #: A cash-secured put at spot $100 reserves strike*100 = $10,000, exactly 50% of the grid's $20k
@@ -1945,12 +1981,15 @@ def _effective_sizing_mode(spec: dict, args) -> "str | None":
     return ((spec or {}).get("fixed_settings") or {}).get("sizing_mode")
 
 
-def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bool = False) -> dict:
+def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bool = False,
+                regime_searched: bool = False) -> dict:
     """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
 
     ``atr_searched`` (--rm-toggle-policy atr-searched) swaps the base block for
     ``_RM_OPT_ATR_SEARCHED`` -- use_atr_stop searched, wider atr_multiplier floor, the 3
     regime_*_scale genes dropped (D3/D4). False (default) is today's ``_RM_OPT``, unchanged.
+    ``regime_searched`` (--rm-toggle-policy atr-regime-searched; requires ``atr_searched``) uses
+    ``_RM_OPT_ATR_REGIME_SEARCHED`` instead: the same block with the regime overlay searched.
 
     EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
     point of the function. ``O_STK`` is ``_build_strategy_stock`` -> ``_build_strategy_S2``, i.e.
@@ -1966,7 +2005,10 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bo
     Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
     for that reason.
     """
-    base = _RM_OPT_ATR_SEARCHED if atr_searched else _RM_OPT
+    if regime_searched and not atr_searched:
+        raise ValueError("regime_searched requires atr_searched (policy atr-regime-searched)")
+    base = (_RM_OPT_ATR_REGIME_SEARCHED if regime_searched
+            else _RM_OPT_ATR_SEARCHED if atr_searched else _RM_OPT)
     block = ({**base, **_OPTION_RM_OVERRIDE}
              if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(base))
     # atr_risk_budget_pct IS THE SIZING BUDGET, and only ``_risk_atr_quantity`` reads it -- which
@@ -9225,7 +9267,7 @@ def _cmd_optimize(args) -> int:
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
         # 2 weekend genes); the pinned policy keeps all 7.
-        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if rm_toggle_policy == "atr-searched"
+        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if _policy_searches_atr(rm_toggle_policy)
                      else _SCHEDULE_DAY_OPT)
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
         schedule_genes.update(_decision_time_gene(          # after the days: no index shift
@@ -9245,7 +9287,8 @@ def _cmd_optimize(args) -> int:
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
                               else {**spec["expert_params"],
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
-                                                 atr_searched=(rm_toggle_policy == "atr-searched")),
+                                                 atr_searched=_policy_searches_atr(rm_toggle_policy),
+                                                 regime_searched=_policy_searches_regime(rm_toggle_policy)),
                                     **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
                                     **_sizing_mode_gene_space(), **_ds_factor_gene_space()}),
             "backtest": backtest_block,
@@ -9561,10 +9604,11 @@ def _cmd_optimize_batch(args) -> int:
                 "expert_params": (_bypass_gene_space(spec) if bypass
                                   else {**spec["expert_params"],
                                         **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
-                                                     atr_searched=(rm_toggle_policy == "atr-searched")),
+                                                     atr_searched=_policy_searches_atr(rm_toggle_policy),
+                                                     regime_searched=_policy_searches_regime(rm_toggle_policy)),
                                         **{f"schedule:{k}": v for k, v in
                                            (_WEEKDAY_SCHEDULE_DAY_OPT
-                                            if rm_toggle_policy == "atr-searched"
+                                            if _policy_searches_atr(rm_toggle_policy)
                                             else _SCHEDULE_DAY_OPT).items()},
                                         **_decision_time_gene(
                                             decision_times,
@@ -11132,13 +11176,16 @@ def main(argv: "list | None" = None) -> int:
                     help="'pinned' (default): use_atr_stop/regime_overlay_enabled are pinned OFF "
                          "for this run, exactly as every run on record -- byte-identical to "
                          "before this flag existed. 'atr-searched': unpins ONLY use_atr_stop for "
-                         "this run (D3: regime_overlay_enabled can never be unpinned), searched "
+                         "this run, searched "
                          "0/1 with a widened atr_multiplier floor, the 3 regime_*_scale genes "
                          "dropped, and weekday-only schedule genes (see "
                          "docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2). "
                          "Persisted on the run (optimization_config.backtest.rm_toggles_unpinned), "
                          "never an env var, so re-runs/top-N/robustness variants of THIS run stay "
-                         "under the same policy. Requires --name to contain '-atr27'.")
+                         "under the same policy. Requires --name to contain '-atr27'. "
+                         "'atr-regime-searched' (goal2027): atr-searched PLUS the SPY-stress regime "
+                         "overlay -- regime_overlay_enabled unpinned and searched 0/1, the 3 "
+                         "regime_*_scale genes kept. Requires --name to contain '-atr27' and '-rgov'.")
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
                          "Requires --screener-store; the run universe becomes the store's full "
@@ -11293,7 +11340,8 @@ def main(argv: "list | None" = None) -> int:
                     help="See optimize --lattice-anchor (per-strategy default).")
     ob.add_argument("--rm-toggle-policy", choices=_RM_TOGGLE_POLICIES, default="pinned",
                     help="See optimize --rm-toggle-policy. Applies to every job in this batch; "
-                         "--name-prefix must contain '-atr27' under 'atr-searched'.")
+                         "--name-prefix must contain '-atr27' under 'atr-searched', and also "
+                         "'-rgov' under 'atr-regime-searched'.")
     ob.add_argument("--fr-top-n-below-pool", action=argparse.BooleanOptionalAction, default=True,
                     help="See `optimize --fr-top-n-below-pool` -- DEFAULT ON, written only onto a "
                          "bypass expert's (FactorRanker) job in this batch (never a classic "

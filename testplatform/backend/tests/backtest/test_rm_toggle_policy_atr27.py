@@ -3,7 +3,9 @@
 docs/strategy_research/atr_grid/atr_grid_2027_design.md §3.2. The DEFAULT policy ("pinned") must
 stay byte-identical to today -- ``test_inert_rm_toggles_stay_off.py`` is the (unmodified) control
 for that. This file covers the NEW policy: unpinning ``use_atr_stop`` only, persisted on the run
-so every path that rebuilds a trial from the stored config sees it, refused for any other key,
+so every path that rebuilds a trial from the stored config sees it, refused for any key outside
+the allowlist (``regime_overlay_enabled`` joined it 2026-11-03 for ``atr-regime-searched`` -- see
+test_rm_toggle_policy_rgov.py),
 folded into the checkpoint fingerprint, gated on the job name containing '-atr27', and a
 search-space shape (D3/D4/D8) that drops the regime scale genes and the weekend schedule genes.
 """
@@ -82,13 +84,11 @@ class TestPinnedRmToggles:
         out2 = _M._pinned_rm_toggles(["use_atr_stop"])
         assert out2 == {"regime_overlay_enabled": False}
 
-    def test_regime_overlay_enabled_can_never_be_unpinned(self):
-        """THE POINT of the allowlist: only use_atr_stop may ever be unpinned."""
-        assert ALLOWED_RM_TOGGLES_UNPINNED == frozenset({"use_atr_stop"})
-        with pytest.raises(ValueError):
-            pinned_rm_toggles(["regime_overlay_enabled"])
-        with pytest.raises(ValueError):
-            _M._pinned_rm_toggles(["regime_overlay_enabled"])
+    def test_the_allowlist_is_exactly_the_two_toggles(self):
+        """THE POINT of the allowlist: only the two RM toggles may ever be unpinned (the overlay
+        since 2026-11-03, for atr-regime-searched), and the two mirrors agree."""
+        assert ALLOWED_RM_TOGGLES_UNPINNED == frozenset({"use_atr_stop", "regime_overlay_enabled"})
+        assert _M._ALLOWED_RM_TOGGLES_UNPINNED == ALLOWED_RM_TOGGLES_UNPINNED
 
     def test_any_unknown_key_is_refused_too(self):
         with pytest.raises(ValueError):
@@ -178,12 +178,14 @@ class TestThePinnedDefaultStaysPinned:
         assert cfg["experts"][0]["settings"]["use_atr_stop"] is False
 
 
-class TestAPolicyRunCannotUnpinTheOverlay:
-    def test_build_daily_trial_config_refuses_it(self):
-        backtest_cfg = _bt_cfg(rm_toggles_unpinned=["regime_overlay_enabled"])
-        decoded = _decoded()
-        with pytest.raises(ValueError):
-            _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
+class TestAnAtrSearchedRunStillPinsTheOverlay:
+    def test_a_decoded_overlay_gene_does_not_win_under_atr_searched(self):
+        """atr-searched persists ["use_atr_stop"] only: an overlay gene in the genome (a hand-edited
+        or foreign row) must still be pinned off."""
+        backtest_cfg = _bt_cfg(rm_toggles_unpinned=_M._rm_toggles_unpinned_for_policy("atr-searched"))
+        decoded = _decoded(use_atr_stop=1, regime_overlay_enabled=1)
+        cfg = _build_daily_trial_config(backtest_cfg, decoded, None, option_trade_records=False)
+        assert cfg["experts"][0]["settings"]["regime_overlay_enabled"] is False
 
 
 # ==================================================================================================

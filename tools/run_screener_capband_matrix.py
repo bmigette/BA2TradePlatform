@@ -614,7 +614,7 @@ def main() -> int:
     ap.add_argument("--early-stop-min-rel", type=float, default=None,
                     help="Minimum RELATIVE gain (a fraction, 0.01 = 1%%) that resets the "
                          "early-stop patience; passthrough, forwarded only when given.")
-    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched"),
+    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched", "atr-regime-searched"),
                     help="See ba2-test optimize --rm-toggle-policy; passthrough, forwarded only "
                          "when given, so every existing matrix command stays unchanged. "
                          "'atr-searched' requires every job name this driver builds to contain "

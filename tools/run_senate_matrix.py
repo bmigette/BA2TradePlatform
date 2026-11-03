@@ -201,7 +201,7 @@ def main() -> int:
                     help="Rank on the RAW metric instead (the pre-2026-09-17 default) -- "
                          "forwarded to every job. Scores are NOT comparable across this "
                          "setting; use a fresh --name-suffix when flipping it on a re-run.")
-    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched"),
+    ap.add_argument("--rm-toggle-policy", default=None, choices=("pinned", "atr-searched", "atr-regime-searched"),
                     help="See `ba2-test optimize --rm-toggle-policy`; passthrough, forwarded "
                          "only when given, so every existing command is unchanged. "
                          "'atr-searched' requires --name (or --name-suffix, folded into the "
