@@ -1339,6 +1339,17 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
         settings["risk_manager_mode"] = spec["risk_manager_mode"]
+    # A style's risk block (stage 2, plan §3 items 8-9) selects the mode and writes its FIXED
+    # rails; its searched rails are genes (``_rm_opt_for``). A spec naming another mode is a
+    # conflict, refused rather than silently overridden.
+    risk = _style_risk(strategy_kind)
+    if risk:
+        mode = risk["risk_manager_mode"]
+        if spec.get("risk_manager_mode") not in (None, mode):
+            raise ValueError(f"style risk_manager_mode {mode!r} conflicts with the expert "
+                             f"spec's {spec['risk_manager_mode']!r}")
+        settings["risk_manager_mode"] = mode
+        settings.update(risk.get("fixed", {}))
     if overrides:
         settings.update(overrides)
     return settings
@@ -1978,6 +1989,17 @@ def _rm_opt_for(kind: str, sizing_mode: "str | None" = None, *, atr_searched: bo
         block.pop("atr_risk_budget_pct", None)
     for pinned in _STRATEGY_FIXED_SETTINGS.get(kind, {}):
         block.pop(pinned, None)         # pinned by the strategy (see _STRATEGY_FIXED_SETTINGS): no gene
+    # A style's own risk block (``_validate_style_risk``): its fixed rails are settings, never
+    # genes (``_expert_run_settings`` writes them); its searched rails REPLACE the option
+    # per-instrument band and add the rail genes. No block = the block above, unchanged.
+    risk = _style_risk(kind)
+    if risk:
+        for fixed in risk.get("fixed", {}):
+            block.pop(fixed, None)
+        for key, band in risk.get("genes", {}).items():
+            block[key] = {"optimize": True, "min": float(band["min"]),
+                          "max": float(band["max"]), "step": float(band["step"]),
+                          "type": "float"}
     return block
 
 
@@ -7327,7 +7349,19 @@ _STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL", "O_CBS", "O_PBS", "O
 #: nothing to act on for them.
 _STYLE_EQUITY_ENTRY = {"O_CC", "O_PP"}
 _STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note"}
-_STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver"}
+_STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver", "risk"}
+#: A style's own option risk manager (plan 2026-09-25 §3 items 8-9; job A values user 2026-11-03).
+#: ``risk_manager_mode`` plus every rail, each either ``fixed`` (an expert setting) or searched
+#: (``genes``: a float band). The per-instrument cap may be narrowed here too, replacing the
+#: stage-1 ``_OPTION_RM_OVERRIDE`` 5..50 band for this style only. Absent = today's settings.
+_STYLE_RISK_FIELDS = {"risk_manager_mode", "fixed", "genes"}
+_STYLE_RISK_MODES = {"classic_options"}
+#: ``OptionRiskManagement.REQUIRED_RAIL_SETTINGS`` (restated; a test pins the two together).
+_STYLE_RISK_REQUIRED = ("max_concurrent_structures", "max_deployment_pct",
+                        "max_notional_leverage", "circuit_breaker_pct")
+_STYLE_RISK_KEYS = set(_STYLE_RISK_REQUIRED) | {"undefined_risk_max_pct",
+                                                "max_virtual_equity_per_instrument_percent"}
+_STYLE_RISK_GENE_FIELDS = {"min", "max", "step"}
 _STYLE_STATUSES = {"candidate", "approved"}
 _STYLE_PRICE_CAP_POLICIES = {"group_min", "none"}
 _STYLE_ACTION_OVERRIDE_KEYS = {"option_dte_min", "option_dte_max", "option_dte_min_range",
@@ -7595,6 +7629,58 @@ def _validate_style_price_caps(where: str, style: dict, keys: list) -> None:
             f"See Q3 in {_STYLE_PLAN}.")
 
 
+def _style_risk_number(value) -> bool:
+    return _style_is_number(value) and value >= 0
+
+
+def _validate_style_risk(where: str, risk) -> None:
+    """A style's ``risk`` block: a known mode, every required rail declared exactly once
+    (fixed or searched), known keys only, non-negative finite numbers, decodable bands."""
+    where = f"{where} risk"
+    if not isinstance(risk, dict):
+        raise ValueError(f"{where}: must be an object, got {risk!r}")
+    unknown = sorted(set(risk) - _STYLE_RISK_FIELDS)
+    if unknown:
+        raise ValueError(f"{where}: unknown risk field(s) {unknown} "
+                         f"(allowed: {sorted(_STYLE_RISK_FIELDS)})")
+    if risk.get("risk_manager_mode") not in _STYLE_RISK_MODES:
+        raise ValueError(f"{where}: risk_manager_mode must be one of {sorted(_STYLE_RISK_MODES)}, "
+                         f"got {risk.get('risk_manager_mode')!r}")
+    fixed, genes = risk.get("fixed", {}), risk.get("genes", {})
+    if not isinstance(fixed, dict) or not isinstance(genes, dict):
+        raise ValueError(f"{where}: fixed and genes must be objects")
+    bad = sorted((set(fixed) | set(genes)) - _STYLE_RISK_KEYS)
+    if bad:
+        raise ValueError(f"{where}: unknown rail key(s) {bad} (allowed: {sorted(_STYLE_RISK_KEYS)})")
+    both = sorted(set(fixed) & set(genes))
+    if both:
+        raise ValueError(f"{where}: {both} both fixed and searched; declare each rail once")
+    missing = [k for k in _STYLE_RISK_REQUIRED if k not in fixed and k not in genes]
+    if missing:
+        raise ValueError(f"{where}: required rail(s) {missing} not declared; the option risk "
+                         f"manager refuses every entry of an expert missing one")
+    for key, value in fixed.items():
+        if not _style_risk_number(value):
+            raise ValueError(f"{where}: fixed {key}={value!r} must be a non-negative finite number")
+    for key, band in genes.items():
+        if not isinstance(band, dict) or set(band) != _STYLE_RISK_GENE_FIELDS:
+            raise ValueError(f"{where}: gene {key} must be exactly "
+                             f"{sorted(_STYLE_RISK_GENE_FIELDS)}, got {band!r}")
+        if not all(_style_risk_number(band[f]) for f in _STYLE_RISK_GENE_FIELDS):
+            raise ValueError(f"{where}: gene {key} {band} must be non-negative finite numbers")
+        if band["min"] > band["max"] or band["step"] <= 0:
+            raise ValueError(f"{where}: gene {key} {band} is undecodable (min > max or step <= 0)")
+
+
+def _style_risk(kind: "str | None") -> "dict | None":
+    """The active style's ``risk`` block for the ``O_STYLE`` key; None for every other key, for
+    a style that declares none, and while no style is loaded (generic per-key callers; an
+    ``O_STYLE`` RUN cannot get that far without one -- the CLI and the builder refuse it)."""
+    if kind != _STYLE_KEY or _STYLE_ACTIVE is None:
+        return None
+    return _STYLE_ACTIVE.get("risk")
+
+
 def _validate_style(name: str, style: dict) -> None:
     """Every rule of the style spec, refusing by name (plan Task 3, as revised 2026-09-25)."""
     where = f"style {name!r}"
@@ -7614,6 +7700,8 @@ def _validate_style(name: str, style: dict) -> None:
             and style["convex_fitness_waiver"].strip()):
         raise ValueError(f"{where}: convex_fitness_waiver, when present, must be a non-empty "
                          f"string recording who accepted it and when (Q5)")
+    if "risk" in style:
+        _validate_style_risk(where, style["risk"])
     if "members" not in style or not isinstance(style["members"], list):
         raise ValueError(f"{where}: members must be a list of member objects")
     members = style["members"]

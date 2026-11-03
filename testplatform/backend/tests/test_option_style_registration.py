@@ -216,6 +216,9 @@ def test_option_fixed_settings_reach_a_style_job(monkeypatch):
 
 def test_the_option_rm_ceiling_applies_to_a_style():
     assert L._rm_opt_for("O_STYLE") == L._rm_opt_for("O_LC")
+    # a style WITHOUT a risk block too (test_option_style_risk.py pins one with it)
+    L._STYLE_ACTIVE = _with_style("short")
+    assert L._rm_opt_for("O_STYLE") == L._rm_opt_for("O_LC")
 
 
 # --- per-run rules decided from the members -----------------------------------------------------
