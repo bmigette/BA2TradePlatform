@@ -683,16 +683,15 @@ class TradeManager:
         backtest engine never calls this refresh path. It exists precisely to make live
         agree with the backtest:
 
-        WHY. Alpaca exits go out as an OCO whose stop leg is a stop-LIMIT, with the limit
-        placed ``OCO_STOP_LIMIT_CUSHION`` through the stop so an ordinary trigger still
-        fills (``AlpacaAccount._submit_order_impl``). When a gap clears BOTH the stop and
-        that cushion in one print, the triggered leg becomes a limit order on the wrong
-        side of the market: it rests unfilled, the OCO stays working, and the position is
-        open with no stop beneath it. Prod saw exactly this on 2026-09-10 (RARE, ENOV).
-        The backtest, by contrast, models every stop as a MARKET stop that fills at the
-        stop or at the gap open (``backtest_account._gap_stop_fill``), so the two diverge
-        on the days that hurt most. This closes that gap rather than widening the cushion,
-        which would only move the cliff.
+        WHY. Until APP 2026.09.1261 Alpaca OCO exits had a stop-LIMIT stop leg, its limit
+        ``OCO_STOP_LIMIT_CUSHION`` through the stop. When a gap cleared BOTH the stop and
+        that cushion in one print, the triggered leg became a limit order on the wrong side
+        of the market: it rested unfilled and the position stayed open with no stop beneath
+        it (prod RARE/ENOV 2026-09-10, PLTR 2026-11-03). The backtest models every stop as a
+        MARKET stop that fills at the stop or at the gap open
+        (``backtest_account._gap_stop_fill``). New Alpaca stop legs are plain stops, so they
+        match it; this sweep remains the backstop for legacy stop-limit legs still resting
+        at the broker, for IBKR's stop-limit legs, and for a stop that is held or missing.
 
         THE RULE. For each OPENED **equity** transaction of ``account`` carrying a
         ``stop_loss``, breached means the price is past the stop by more than the cushion:
@@ -828,7 +827,7 @@ class TradeManager:
                     f"[Account {account.id}] STOP BREACHED WITHOUT FILLING: {symbol} "
                     f"{side.value if hasattr(side, 'value') else side} transaction {txn_id}, "
                     f"stop={stop}, price={price}, cushion={OCO_STOP_LIMIT_CUSHION:.3%}. The "
-                    f"stop-limit exit leg cannot fill from here — force-closing at market."
+                    f"stop exit did not fill — force-closing at market."
                 )
 
                 result = account.close_transaction(txn_id)

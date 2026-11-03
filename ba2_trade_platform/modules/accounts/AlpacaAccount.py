@@ -50,16 +50,15 @@ _DIVIDEND_KEY_PREFIX = "DIV:"
 # Calendar.__init__ with strptime("%Y-%m-%d %H:%M") (alpaca/trading/models.py:374-388).
 _MARKET_TZ = pytz.timezone("America/New_York")
 
-# How far THROUGH its stop price the OCO stop leg's limit price is placed, so that a
-# normally-triggered stop still fills (a stop-LIMIT with limit == stop rests unfilled the
-# moment the market ticks past it).
+# How far past its stop the price must be before TradeManager._force_close_breached_stops
+# treats a still-held position as "stop breached without filling" and closes it at market.
 #
-# THIS NUMBER HAS TWO READERS AND MUST STAY ONE CONSTANT. The other is
-# TradeManager._force_close_breached_stops: on a gap that jumps the stop AND this cushion
-# in a single print, the triggered leg becomes a limit order on the wrong side of the
-# market and never fills, leaving the position open and unprotected (prod 2026-09-10:
-# RARE/ENOV). That safety net force-closes exactly the positions this cushion could not
-# protect, so it has to measure the breach with the very same number.
+# Until APP 2026.09.1261 this was also the OCO stop leg's limit offset (the leg was a
+# stop-LIMIT, which rests unfilled once a gap clears stop AND cushion: prod RARE/ENOV
+# 2026-09-10, PLTR 2026-11-03). Alpaca stop legs are now PLAIN stops, so the safety net only
+# catches what should not happen any more: a legacy stop-limit leg still resting at the
+# broker, or a stop that is held/missing. The name is kept because IBKR's protective legs
+# (ba2_common.core.protective_legs) pin the same value for their own stop-limit leg.
 OCO_STOP_LIMIT_CUSHION = 0.005
 
 # PENDING_CANCEL lifetime. A cancel is a WAIT for the broker's confirmation, and a wait
@@ -1621,13 +1620,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Round prices using Alpaca pricing rules
                 rounded_tp_price = self._round_price(trading_order.limit_price, trading_order.symbol)
                 rounded_sl_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
-                # Stop-loss limit price should be slightly worse than stop price to ensure execution
-                rounded_sl_limit_price = self._round_price(
-                    rounded_sl_stop_price * (1.0 - OCO_STOP_LIMIT_CUSHION) if side == OrderSide.SELL
-                    else rounded_sl_stop_price * (1.0 + OCO_STOP_LIMIT_CUSHION),
-                    trading_order.symbol
-                )
-                
+                # The stop leg is a PLAIN stop (no limit_price): triggered, it becomes a market
+                # order and fills at the stop or at the gap open, exactly what the backtest
+                # models (_gap_stop_fill). A stop-LIMIT leg rests unfilled once a gap clears its
+                # limit (prod PLTR 2026-11-03, RARE/ENOV 2026-09-10). Alpaca accepts an OCO whose
+                # stop_loss has no limit_price (paper test 2026-11-03: leg stored as type "stop").
+
                 # Validate order has ID before submission
                 if not trading_order.id:
                     raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
@@ -1640,10 +1638,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     time_in_force=time_in_force,
                     order_class=OrderClass.OCO,
                     take_profit=TakeProfitRequest(limit_price=rounded_tp_price),
-                    stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price, limit_price=rounded_sl_limit_price),
+                    stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price),
                     client_order_id=str(trading_order.id)
                 )
-                logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} limit=${rounded_sl_limit_price:.4f}")
+                logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} (market on trigger)")
                 
             else:
                 raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")

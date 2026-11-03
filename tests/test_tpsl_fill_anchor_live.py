@@ -78,10 +78,10 @@ def test_a_short_with_a_stamped_anchor():
     assert leg.stop_price == A(105.0)       # 100 * 94.5 / 90
 
 
-def test_the_rebased_stop_is_what_reaches_the_broker_oco_stop_limit_leg(monkeypatch):
-    """The OCO leg is sent as stop + limit (live Alpaca derives the stop-LIMIT leg's limit from the
-    stop at submit, with the OCO_STOP_LIMIT_CUSHION). The re-base runs BEFORE that submit, so the
-    broker is handed the re-based stop, not the pre-fill one."""
+def test_the_rebased_stop_is_what_reaches_the_broker_oco_stop_leg(monkeypatch):
+    """The OCO leg is sent as stop + take-profit limit (live Alpaca sends the stop leg as a plain
+    stop). The re-base runs BEFORE that submit, so the broker is handed the re-based stop, not the
+    pre-fill one."""
     sent = []
 
     class _Broker:
