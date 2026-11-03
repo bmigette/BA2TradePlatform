@@ -21,6 +21,7 @@
  },
  "backtest_only": {
   "hold_assigned_stock": false,
+  "hold_assigned_stock_tags": null,
   "entry_action": null
  },
  "execution": {

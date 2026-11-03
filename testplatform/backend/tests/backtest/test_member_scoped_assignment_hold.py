@@ -29,6 +29,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
+from app.services.backtest.backtest_account import SYNTHETIC_FILL_KEY
 from tests.backtest._no_atr import NoAtrIndicatorProvider
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
@@ -340,7 +341,8 @@ def test_without_a_tag_set_the_run_level_flag_still_decides_for_everyone():
         assert _delivered(orders, sym) > 0
         assert _held(account, sym) == pytest.approx(_delivered(orders, sym)), sym
         (delivered,) = [o for o in _stock(orders, sym) if o.comment == "option_assignment"]
-        assert delivered.data is None, "an untagged assignment wrote order data"
+        # only the synthetic-fill marker every backtest fill carries; no assignment entry data
+        assert delivered.data == {SYNTHETIC_FILL_KEY: True}, "an untagged assignment wrote order data"
 
 
 # =========================================================================================== #

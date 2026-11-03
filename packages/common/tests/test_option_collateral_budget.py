@@ -110,8 +110,10 @@ def test_the_used_balance_pass_reports_each_option_positions_own_charge():
     with ts.inmem_trades():
         account = _StubAccount(stock_price=150.0, quote=None)
         expert = _StubExpert(expert_id=1)
+        # a DEBIT: its charge is the premium paid (a strategy-less SHORT option commits only a
+        # recorded reserve, see option_transaction_commitment)
         opt_id = _option_txn(expert_id=1, open_price=2.0, quantity=3, multiplier=100.0,
-                             side=OrderDirection.SELL)
+                             side=OrderDirection.BUY)
         add_instance(Transaction(symbol="AAPL", quantity=10, side=OrderDirection.BUY,
                                  status=TransactionStatus.OPENED, expert_id=1,
                                  open_price=140.0, multiplier=None))

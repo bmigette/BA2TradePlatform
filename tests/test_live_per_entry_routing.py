@@ -80,9 +80,9 @@ def test_live_routes_each_entry_through_the_shared_router(file_db):
     from ba2_common.core.TradeRiskManagement import TradeRiskManagement
     real_size = TradeRiskManagement.size_candidate_orders
 
-    def size_spy(self, expert_id, candidates):
+    def size_spy(self, expert_id, candidates, **kwargs):
         sized.extend(c.symbol for c, _rec in candidates)
-        return real_size(self, expert_id, candidates)
+        return real_size(self, expert_id, candidates, **kwargs)
 
     with patch.object(trade_cycle, "entry_route", spy), \
          patch.object(TradeRiskManagement, "size_candidate_orders", size_spy):
