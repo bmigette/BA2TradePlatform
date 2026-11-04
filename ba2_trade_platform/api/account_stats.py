@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 
 from ..services import account_growth as growth_svc
+from ..services import dividends as dividends_svc
 from ..services import stats as stats_svc
 from .common import Paging, paging
 
@@ -33,3 +34,9 @@ def growth_by_position(account_id: int, label: str, from_: Optional[date] = Quer
 def closed_pnl(account_id: int, from_: Optional[datetime] = Query(None, alias="from"), to: Optional[datetime] = None,
                group_by: str = "day", p: Paging = Depends(paging)):
     return stats_svc.closed_pnl(account_id, from_, to, group_by, limit=p.limit, offset=p.offset)
+
+
+@router.get("/{account_id}/dividends")
+def account_dividends(account_id: int, from_: Optional[date] = Query(None, alias="from"), to: Optional[date] = None,
+                      symbol: Optional[str] = None, p: Paging = Depends(paging)):
+    return dividends_svc.account_dividends(account_id, from_, to, symbol, limit=p.limit, offset=p.offset)

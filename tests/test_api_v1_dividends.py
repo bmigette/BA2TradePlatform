@@ -1,0 +1,109 @@
+"""GET /accounts/{id}/dividends."""
+from datetime import date, datetime, timedelta
+
+import pytest
+
+from ba2_trade_platform.core.db import add_instance
+from ba2_trade_platform.core.models import PortfolioIncomeEvent
+from ba2_trade_platform.services import accounts as accounts_svc
+from tests.api_helpers import FakeAccount, v1_client
+from tests.factories import create_account_definition
+
+pytestmark = pytest.mark.api_db
+TODAY = date.today()
+
+
+def _div(days_ago, symbol, amount, **extra):
+    row = {"date": datetime.combine(TODAY - timedelta(days=days_ago), datetime.min.time()), "symbol": symbol,
+           "amount": amount, "gross_amount": amount + 0.1, "tax_withheld": 0.1, "drip_quantity": None,
+           "drip_price": None}
+    row.update(extra)
+    return row
+
+
+class DivBroker(FakeAccount):
+    def __init__(self, account_id):
+        super().__init__(account_id)
+        self.rows = [_div(3, "KO", 4.0), _div(10, "KO", 4.0, drip_quantity=0.07, drip_price=57.0),
+                     _div(20, "PEP", 6.5), _div(400, "KO", 9.0)]
+        self.calls = []
+
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        self.calls.append((symbol, start_date, end_date))
+        return [dict(r) for r in self.rows if symbol is None or r["symbol"] == symbol]
+
+
+@pytest.fixture
+def world(monkeypatch):
+    acct = create_account_definition(name="Paper")
+    broker = DivBroker(acct.id)
+    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id",
+                        lambda account_id: broker if account_id == acct.id else None)
+    return acct, broker
+
+
+def _get(acct, **params):
+    r = v1_client().get(f"/accounts/{acct.id}/dividends", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_broker_rows_totals_cash_vs_drip_and_cash_by_symbol(world):
+    acct, _ = world
+    body = _get(acct)                 # default window: the last 365 days (the 400-day-old row is out)
+    b = body["broker"]
+    assert b["total"] == 3 and b["fetch_ok"] is True
+    assert [i["symbol"] for i in b["items"]] == ["KO", "KO", "PEP"]            # newest first
+    assert [i["kind"] for i in b["items"]] == ["cash", "drip", "cash"]
+    t = b["totals"]
+    assert t["net"] == pytest.approx(14.5) and t["cash_net"] == pytest.approx(10.5) and t["drip_net"] == pytest.approx(4.0)
+    assert t["tax_withheld"] == pytest.approx(0.3) and t["gross"] == pytest.approx(14.8)
+    assert b["cash_by_symbol"] == {"KO": pytest.approx(4.0), "PEP": pytest.approx(6.5)}   # the DRIP payment is not cash
+    assert "as_of" in body
+
+
+def test_symbol_filter_window_and_paging(world):
+    acct, broker = world
+    ko = _get(acct, symbol="ko")
+    assert ko["symbol"] == "KO" and ko["broker"]["total"] == 2 and broker.calls[-1][0] == "KO"
+    wide = _get(acct, **{"from": (TODAY - timedelta(days=500)).isoformat()})
+    assert wide["broker"]["total"] == 4
+    page = _get(acct, limit=1, offset=1)
+    assert len(page["broker"]["items"]) == 1 and page["broker"]["total"] == 3 and page["broker"]["totals"]["payments"] == 3
+
+
+def test_empty_broker_answer_is_flagged_not_reported_as_no_dividends(world):
+    acct, broker = world
+    broker.rows = []
+    b = _get(acct)["broker"]
+    assert b["fetch_ok"] is False and "cannot be told" in b["note"] and b["totals"]["net"] == 0
+
+
+def test_rows_without_gross_or_tax_are_counted_not_zeroed(world):
+    acct, broker = world
+    broker.rows = [{"date": datetime.combine(TODAY - timedelta(days=2), datetime.min.time()), "symbol": "KO",
+                    "amount": 4.0, "drip_quantity": None}]
+    t = _get(acct)["broker"]["totals"]
+    assert t["rows_without_gross"] == 1 and t["rows_without_tax"] == 1 and t["net"] == 4.0
+
+
+def test_ledger_events_and_open_income_total(world):
+    acct, _ = world
+    add_instance(PortfolioIncomeEvent(account_id=acct.id, external_id="a", event_date=TODAY - timedelta(days=2),
+                                      event_type="DIVIDEND", symbol="KO", amount=10.0, consumed_amount=4.0),
+                 expunge_after_flush=True)
+    add_instance(PortfolioIncomeEvent(account_id=acct.id, external_id="b", event_date=TODAY - timedelta(days=5),
+                                      event_type="DEPOSIT", symbol=None, amount=100.0), expunge_after_flush=True)
+    body = _get(acct)
+    assert body["ledger"]["open_income_total"] == pytest.approx(106.0)
+    assert [(e["external_id"], e["open_amount"]) for e in body["ledger"]["events"]] == [("a", 6.0), ("b", 100.0)]
+    only_ko = _get(acct, symbol="KO")
+    assert [e["external_id"] for e in only_ko["ledger"]["events"]] == ["a"]
+
+
+def test_validation_and_unknown_account(world):
+    acct, _ = world
+    c = v1_client()
+    assert c.get(f"/accounts/{acct.id}/dividends?from=2026-10-01&to=2026-09-01").status_code == 422
+    assert c.get(f"/accounts/{acct.id}/dividends?from=2000-01-01").status_code == 422
+    assert c.get("/accounts/999/dividends").status_code == 404
