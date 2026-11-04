@@ -457,7 +457,12 @@ BASELINE: dict = {
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
-    # moved verbatim out of ui/pages/overview.py (the Account Growth series); same debt, new home.
+    # moved verbatim out of ui/pages/overview.py (the Account Growth series); same debt, new home. The page kept
+    # its display behaviour (a golden number would shift). The API path never reaches these sites with a missing
+    # field: services/account_growth.py validates every broker row first and SKIPS + COUNTS a bad one
+    # (partial: true, skipped_rows), so no missing balance / quantity / price is read as 0 there.
+    # (Net effect on the register: overview.py was ALREADY one over its old baseline of 16 -- it scanned 17 before
+    # the move -- so 17 = 7 kept + 10 moved; the +1 in BASELINE_TOTAL is that pre-existing site, now counted.)
     "ba2_trade_platform/services/growth.py": 10,
     # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
     # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated

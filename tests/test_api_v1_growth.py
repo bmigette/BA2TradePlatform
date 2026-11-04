@@ -51,6 +51,9 @@ def world(monkeypatch):
     closes = seed.historical_prices()
     broker.closes = closes
     monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: {s: closes[s] for s in symbols if s in closes})
+    svc.clear_cache()
+    from ba2_trade_platform.services import portfolio
+    portfolio._DIVIDENDS_CACHE.clear()
 
     def no_auto_add():
         raise AssertionError("a GET must not queue instruments for auto-add")
@@ -99,10 +102,11 @@ def test_growth_by_label_matches_the_service_and_can_be_filtered(world):
     acct, broker = world
     c = v1_client()
     body = c.get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()
-    assert set(body["labels"]) == {"Core", "Energy", "Growth", "Unlabeled"}
-    assert body["labels"]["Energy"]["value"][-1] == pytest.approx(20 * broker.closes["XLE"][body["dates"][-1]], abs=0.01)
+    by = {x["name"]: x for x in body["labels"]}
+    assert set(by) == {"Core", "Energy", "Growth", "Unlabeled"}
+    assert by["Energy"]["value"][-1] == pytest.approx(20 * broker.closes["XLE"][body["dates"][-1]], abs=0.01)
     only = c.get(f"/accounts/{acct.id}/growth/labels?{WINDOW}&labels=Energy,Core").json()
-    assert set(only["labels"]) == {"Energy", "Core"} and only["dates"] == body["dates"]
+    assert {x["name"] for x in only["labels"]} == {"Energy", "Core"} and only["dates"] == body["dates"]
     assert c.get(f"/accounts/{acct.id}/growth/labels?{WINDOW}&labels=Nope").status_code == 404
 
 
@@ -116,8 +120,9 @@ def test_too_many_labels_must_be_asked_for_by_name(world, monkeypatch):
 def test_growth_by_position_inside_a_label(world):
     acct, _ = world
     body = v1_client().get(f"/accounts/{acct.id}/growth/labels/Growth/positions?{WINDOW}").json()
-    assert set(body["positions"]) == {"AAPL", "MSFT"} and body["label"] == "Growth"
-    assert len(body["positions"]["AAPL"]["value"]) == len(body["dates"])
+    pos = {x["symbol"]: x for x in body["positions"]}
+    assert set(pos) == {"AAPL", "MSFT"} and body["label"] == "Growth"
+    assert len(pos["AAPL"]["value"]) == len(body["dates"])
     assert v1_client().get(f"/accounts/{acct.id}/growth/labels/Nope/positions?{WINDOW}").status_code == 404
 
 
@@ -136,10 +141,91 @@ def test_a_position_without_cost_basis_is_unmeasurable(world):
     acct, broker = world
     broker.positions = [AttrDict(symbol="AAPL", qty=1.0)]
     r = v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}")
-    assert r.status_code == 503 and "cost_basis" in r.json()["message"]
+    assert r.status_code == 503 and r.json()["detail"]["skipped_positions"][0]["reason"] == "no cost_basis"
 
 
 def test_failed_positions_fetch_is_unreachable(world):
     acct, broker = world
     broker.positions = None
     assert v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()["error"] == "broker_unreachable"
+
+
+def test_to_in_the_past_keeps_todays_quantity_walk_and_only_truncates_the_output(world):
+    """The seed has trades AFTER 2026-09-30 (an AAPL sell and buy in October, MSFT/XLE/BND buys): the quantity timeline
+    walks back from today's quantity through ALL of them, so September's value is the same whatever `to` is."""
+    acct, _ = world
+    c = v1_client()
+    full = c.get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()
+    early = c.get(f"/accounts/{acct.id}/growth/labels?from=2026-09-01&to=2026-09-30").json()
+    n = len(early["dates"])
+    assert 0 < n < len(full["dates"]) and early["dates"][-1] <= "2026-09-30"
+    f = {x["name"]: x for x in full["labels"]}
+    e = {x["name"]: x for x in early["labels"]}
+    for name in f:
+        for series in ("value", "cumulative_dividends", "invested"):
+            assert e[name][series] == f[name][series][:n], (name, series)
+    pos_full = c.get(f"/accounts/{acct.id}/growth/labels/Growth/positions?{WINDOW}").json()
+    pos_early = c.get(f"/accounts/{acct.id}/growth/labels/Growth/positions?from=2026-09-01&to=2026-09-30").json()
+    assert pos_early["positions"][0]["value"] == pos_full["positions"][0]["value"][:len(pos_early["dates"])]
+
+
+def test_bad_broker_rows_are_skipped_and_counted_never_read_as_zero(world):
+    acct, broker = world
+    broker.balance.append({"date": seed.balance_history()[0]["date"], "account_id": 1,
+                           "net_liquidating_value": None, "cash_balance": 1.0})
+    broker.trades.append({"date": seed.trades()[0]["date"], "symbol": "AAPL", "side": "BUY", "qty": None, "price": 1.0})
+    broker.dividends.append({"date": seed.dividends()[0]["date"], "symbol": "AAPL", "amount": None})
+    body = v1_client().get(f"/accounts/{acct.id}/growth?{WINDOW}").json()
+    assert body["partial"] is True and body["skipped_rows"] == 3
+    assert body["skipped"]["balance_history"] == {"no net_liquidating_value": 1}
+    assert body["skipped"]["filled_trades"] == {"no qty or price": 1} and body["skipped"]["dividends"] == {"no amount": 1}
+    assert min(body["series"]["balance"]) > 0                                # no fabricated 0 balance
+    clean = v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()
+    assert clean["partial"] is True and clean["skipped_rows"] == 2           # (trades + dividends; no balance read)
+
+
+def test_adapter_rows_are_not_mutated_and_fetches_are_cached_for_60s(world):
+    acct, broker = world
+    calls = {"n": 0}
+    orig = broker.get_filled_trades
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+    broker.get_filled_trades = counting
+    c = v1_client()
+    c.get(f"/accounts/{acct.id}/growth?{WINDOW}")
+    c.get(f"/accounts/{acct.id}/growth/labels?{WINDOW}")
+    assert calls["n"] == 1
+    assert all("account_id" not in t or t["account_id"] in (1, 2) for t in broker.trades)
+    assert broker.trades == seed.trades()
+
+
+def test_a_position_without_cost_basis_is_skipped_and_listed_not_a_503(world):
+    acct, broker = world
+    broker.positions.append(AttrDict(symbol="ZZZ", qty=1.0))
+    body = v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()
+    assert body["partial"] is True and body["skipped_positions"] == [{"symbol": "ZZZ", "reason": "no cost_basis"}]
+
+
+def test_prices_are_fetched_only_for_the_requested_labels_symbols(world, monkeypatch):
+    acct, broker = world
+    asked = []
+    monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: asked.append(list(symbols)) or
+                        {s: broker.closes[s] for s in symbols})
+    v1_client().get(f"/accounts/{acct.id}/growth/labels/Energy/positions?{WINDOW}")
+    assert asked == [["XLE"]]
+
+
+def test_price_deadline_is_a_503_price_source_unreachable(monkeypatch):
+    import time
+    monkeypatch.setattr(svc, "PRICE_DEADLINE_S", 0.2)
+    import types, sys
+    fake = types.ModuleType("yfinance")
+    fake.download = lambda *a, **k: time.sleep(1.0)
+    monkeypatch.setitem(sys.modules, "yfinance", fake)
+    from ba2_trade_platform.services.errors import PriceSourceUnreachable
+    from datetime import date
+    with pytest.raises(PriceSourceUnreachable):
+        svc.fetch_closes(["AAPL"], date(2026, 9, 1))
+    assert PriceSourceUnreachable.code == "price_source_unreachable" and PriceSourceUnreachable.status_code == 503
