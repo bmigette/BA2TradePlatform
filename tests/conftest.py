@@ -579,3 +579,24 @@ def _mock_expert_is_resolvable(monkeypatch):
     real_account = _utils.get_account_class
     monkeypatch.setattr(_utils, "get_account_class",
                         lambda name: MockAccount if name == "MockAccount" else real_account(name))
+
+
+@pytest.fixture(autouse=True)
+def api_threadsafe_db(request, patch_db_engine):
+    """Management-API tests only (modules that import ``tests.api_helpers``): serve the DB from ONE shared
+    connection. ``test_engine`` is a per-thread ``:memory:`` pool, and a ``TestClient`` request runs in another
+    thread than the test, so it would see an empty database ("no such table: appsetting")."""
+    if not any(getattr(v, "__module__", None) == "tests.api_helpers" for v in vars(request.module).values()):
+        yield
+        return
+    import ba2_common.core.db as _pkg_db
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    saved = _pkg_db._engine
+    _pkg_db._engine = engine
+    try:
+        yield
+    finally:
+        _pkg_db._engine = saved
+        engine.dispose()

@@ -25,8 +25,13 @@ Today the app exposes three endpoints (`ui/api_routes.py`: `/api/reload`, `/api/
   `services/`; the page keeps only dialogs and notifications. The API can then never disagree
   with the UI.
 - **Auth.** A new `api_token` AppSetting per instance, generated from the Settings page.
+  - A new AppSetting `api_allow_remote` (bool, default OFF, read per request) gates non-local access.
+    A request from any address except 127.0.0.1 / ::1 is refused with 403 `remote_disabled` while it
+    is off, BEFORE any token check, for reads, writes, `/docs`, `/openapi.json` and the legacy `/api/*`
+    aliases alike (a valid token does not help). Local callers are unaffected by it.
+    The Settings page has a toggle "Allow API access from other machines" next to the Generate button.
   - Every write needs `Authorization: Bearer <token>`.
-  - Reads need no token from 127.0.0.1; from any other address they need the token.
+  - Reads need no token from 127.0.0.1; from any other address (once `api_allow_remote` is on) they need the token.
   - With no token set, writes and non-local requests are refused (403). Nothing is open by
     default. This also applies to the three existing endpoints, so local
     `/api/run-schedule` keeps working only once the instance has a token.
