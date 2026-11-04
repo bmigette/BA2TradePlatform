@@ -2082,7 +2082,9 @@ _SCHEDULE_DAY_OPT = {
 #: every backtest bar is a weekday). Dropping them from the merged expert_params (not just from
 #: the search) means decode_params never sees a schedule:saturday/schedule:sunday key, so both
 #: default to False via its existing ``schedule_by_day.get(day, False)`` repair -- no change
-#: needed there. The pinned policy keeps _SCHEDULE_DAY_OPT (all 7 days) untouched.
+#: needed there. Since 2026-11-04 EVERY policy uses it: a re-run of a stage-2 genome with the
+#: weekend genes flipped was identical (425 trades, +424.55%), so under ``pinned`` they were
+#: 2 dead genes per job. _SCHEDULE_DAY_OPT (all 7) stays as the full day list.
 _WEEKDAY_SCHEDULE_DAY_OPT = {
     day: spec for day, spec in _SCHEDULE_DAY_OPT.items() if day not in ("saturday", "sunday")
 }
@@ -9469,10 +9471,9 @@ def _cmd_optimize(args) -> int:
         _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
-        # D8 under the ATR-searched policy: weekdays only (_WEEKDAY_SCHEDULE_DAY_OPT drops the
-        # 2 weekend genes); the pinned policy keeps all 7.
-        _sched_opt = (_WEEKDAY_SCHEDULE_DAY_OPT if _policy_searches_atr(rm_toggle_policy)
-                     else _SCHEDULE_DAY_OPT)
+        # Weekdays only under EVERY policy (_WEEKDAY_SCHEDULE_DAY_OPT drops the 2 weekend genes:
+        # no session, so they never change a daily-clock trial).
+        _sched_opt = _WEEKDAY_SCHEDULE_DAY_OPT
         schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
         schedule_genes.update(_decision_time_gene(          # after the days: no index shift
             decision_times, split=_decision_times_is_split(getattr(args, "decision_times", None))))
@@ -9828,9 +9829,7 @@ def _cmd_optimize_batch(args) -> int:
                                                      atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                      regime_searched=_policy_searches_regime(rm_toggle_policy)),
                                         **{f"schedule:{k}": v for k, v in
-                                           (_WEEKDAY_SCHEDULE_DAY_OPT
-                                            if _policy_searches_atr(rm_toggle_policy)
-                                            else _SCHEDULE_DAY_OPT).items()},
+                                           _WEEKDAY_SCHEDULE_DAY_OPT.items()},
                                         **_decision_time_gene(
                                             decision_times,
                                             split=_decision_times_is_split(getattr(args, "decision_times", None))),
