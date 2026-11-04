@@ -107,7 +107,7 @@ import os
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -116,7 +116,8 @@ import pandas as pd
 from ba2_common import config as _cfg
 from ba2_providers.ohlcv.alpaca_history.ipo_dates import load_ipo_dates
 from ba2_providers.ohlcv.alpaca_history.split_build import DEFAULT_OUT, atomic_write, sha256_text_file, drop_placeholder_bars, read_fmp_frame
-from ba2_providers.ohlcv.alpaca_history.split_table import OVERRIDES_PATH, load_bar_caps
+from ba2_providers.ohlcv.alpaca_history.split_table import (
+    OVERRIDES_PATH, PREDECESSOR_SEP, cusip_only_changes, load_bar_caps, read_corporate_actions, split_predecessor_key)
 
 DEFAULT_DAILY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store_daily2016")
 DEFAULT_INTRADAY_STORE = os.path.join(_cfg.BA2_HOME, "alpaca_store")
@@ -143,6 +144,9 @@ REUSE_IPO_TOL_DAYS = 7           # a profile ipoDate this close to the END of a 
 REUSED_NAME = "reused_tickers.json"
 REVIEW_NO_FILE, REVIEW_NO_IPO, REVIEW_AFTER = "no_ipo_dates_file", "no_ipo_date", "ipo_after_resume"
 IPO_DATES_FILE = "ipo_dates.json"
+SEAM_DAYS = 10                   # CUSIP-change predecessor: the last / first this many sessions either side of the change are compared with FMP ...
+SEAM_MIN_DAYS = 3                # ... and each side needs at least this many sessions that FMP also has ...
+SEAM_TOL = 0.02                  # ... where the two sides' median (Alpaca raw close / FMP close) may differ by at most this much
 RUN_ID_CSVS = ("split_review.csv", "split_accepted.csv", "split_vs_fmp.csv", "fmp_daily_inputs.csv", "yahoo_inputs.csv")
 
 
@@ -567,10 +571,152 @@ def detect_exchange_events(dates: Sequence[pd.Timestamp], fmp: Optional[pd.DataF
     return events
 
 
+
+# ---------------------------------------------------------------------------
+# CUSIP-only change: the predecessor series (module docstring of split_table.cusip_predecessor_rows)
+# ---------------------------------------------------------------------------
+def _ny_days(t: pd.Series) -> pd.Series:
+    return t.dt.tz_convert(NY).dt.tz_localize(None).dt.normalize()
+
+
+def _predecessor_chunks(store: str, key: str, prefix: str, asof: str, what: str) -> Tuple[List[str], Dict[str, Any]]:
+    """(digest lines, COMPLETE chunks) of a predecessor key's manifest; every chunk must carry the key's asof, no chunk may be refused / empty."""
+    m = _read_manifest(store, key)
+    if m is None:
+        raise BuildError(f"{what}: predecessor bars without manifest/symbol={key}.json in {store}")
+    lines, chunks, absent = _chunk_digest(m, prefix, what)
+    if absent:
+        raise BuildError(f"{what}: predecessor chunk(s) {sorted(absent.items())} are empty or refused: the old series is not complete")
+    bad = sorted(k for k, c in chunks.items() if c.get("asof") != asof)
+    if not chunks or bad:
+        raise BuildError(f"{what}: predecessor chunks {bad or 'none'} not fetched as of {asof}")
+    return lines, chunks
+
+
+def seam_check(symbol: str, pre_close: pd.Series, cur_close: pd.Series, fmp_close: Optional[pd.Series]) -> Dict[str, Any]:
+    """Prove the old and the new security are ONE price series at the change.  ``pre_close`` / ``cur_close``: Alpaca raw closes indexed by
+    New York session (the old series BEFORE the change, the new one FROM it); ``fmp_close``: FMP's close by session.  The median of
+    (Alpaca raw close / FMP close) over the last ``SEAM_DAYS`` sessions before and the first ``SEAM_DAYS`` from the change must agree
+    within ``SEAM_TOL``: a share ratio other than 1 (an ADR that is not 1:1 with the ordinary share) would make them differ by that
+    ratio.  FMP is a witness only, never the data.  No witness (no FMP file, too few common sessions) REFUSES: never a guess."""
+    if fmp_close is None:
+        raise BuildError(f"{symbol}: predecessor seam cannot be checked: no FMP daily file (the witness)")
+    out: Dict[str, Any] = {}
+    for name, series in (("before", pre_close.tail(SEAM_DAYS)), ("after", cur_close.head(SEAM_DAYS))):
+        ratio = (series / fmp_close.reindex(series.index)).dropna()
+        if len(ratio) < SEAM_MIN_DAYS:
+            raise BuildError(f"{symbol}: predecessor seam: only {len(ratio)} session(s) {name} the change also in FMP (need {SEAM_MIN_DAYS})")
+        out[name] = {"sessions": int(len(ratio)), "median_ratio": float(ratio.median())}
+    diff = out["before"]["median_ratio"] / out["after"]["median_ratio"] - 1.0
+    out["relative_difference"] = float(diff)
+    if abs(diff) > SEAM_TOL:
+        raise BuildError(f"{symbol}: predecessor seam does not line up: Alpaca/FMP close ratio {out['before']['median_ratio']:.4f} before the change, "
+                         f"{out['after']['median_ratio']:.4f} after it ({diff:+.1%}, tolerance {SEAM_TOL:.0%}): the old and the new security "
+                         f"are not one price series (a share ratio?); add a reviewed treatment before merging")
+    return out
+
+
+def merge_predecessor(symbol: str, key: str, cut: date, *, daily_store: str, intraday_store: str, cur_daily: pd.DataFrame,
+                      cur_5min_files: Sequence[str], fmp_dir: Optional[str]) -> Dict[str, Any]:
+    """The old security's bars of a CUSIP-only change (``key`` = ``SYM@asof``, fetched as of the day before ``cut``), cut STRICTLY before
+    ``cut`` (the change's process_date), checked against the current series and FMP.  Returns {"daily": raw store frame to PREPEND,
+    "5min": [raw store frames], "digest": [...], "record": {...}}.  Raises ``BuildError`` when the current series already has a bar before
+    ``cut`` (overlap: the predecessor is not needed or the series are not what the key says) or the seam does not line up."""
+    asof = (cut - timedelta(days=1)).isoformat()
+    d_lines, d_chunks = _predecessor_chunks(daily_store, key, "1Day", asof, f"{symbol} predecessor {key} daily")
+    pre = pd.read_parquet(os.path.join(daily_store, "bars", "1Day", f"symbol={key}", "all.parquet"))
+    _check_columns(pre, f"{key} daily")
+    pre_days = _ny_days(pre["t"])
+    post = (pre_days >= pd.Timestamp(cut)).to_numpy()
+    pre = pre[~post].reset_index(drop=True)
+    if pre.empty:
+        raise BuildError(f"{symbol}: predecessor {key} holds no daily bar before {cut}")
+    cur_days = _ny_days(cur_daily["t"])
+    early = cur_days[cur_days < pd.Timestamp(cut)]
+    if len(early):
+        raise BuildError(f"{symbol}: the current series already has {len(early)} bar(s) before the change {cut} (first {early.iloc[0].date()}): "
+                         f"predecessor {key} would overlap it")
+    if cur_days.empty:
+        raise BuildError(f"{symbol}: no bar on/after the change {cut}")
+    pre_days = _ny_days(pre["t"])
+    fmp_close = None
+    fp = os.path.join(fmp_dir, f"{symbol}_1d.parquet") if fmp_dir else None
+    if fp and os.path.isfile(fp):
+        f = read_fmp_frame(fp, ["Date", "Close"])
+        f["Date"] = f["Date"].dt.normalize()
+        fmp_close = f.drop_duplicates("Date").set_index("Date")["Close"].astype("float64")
+    seam = seam_check(symbol, pd.Series(pre["c"].astype("float64").to_numpy(), index=pre_days),
+                      pd.Series(cur_daily["c"].astype("float64").to_numpy(), index=cur_days), fmp_close)
+    out: Dict[str, Any] = {"daily": pre, "5min": [], "digest": [f"predecessor:{x}" for x in d_lines]}
+    rec: Dict[str, Any] = {"key": key, "cut": str(cut), "asof": asof, "daily_bars": int(len(pre)),
+                           "daily_first": str(pre_days.iloc[0].date()), "daily_last": str(pre_days.iloc[-1].date()),
+                           "dropped_on_or_after_cut": int(post.sum()), "seam": seam, "5min_bars": 0}
+    i_dir = os.path.join(intraday_store, "bars", "5Min", f"symbol={key}")
+    pre_files = sorted(f for f in os.listdir(i_dir) if f.endswith(".parquet")) if os.path.isdir(i_dir) else []
+    if pre_files:
+        i_lines, i_chunks = _predecessor_chunks(intraday_store, key, "5Min", asof, f"{symbol} predecessor {key} 5min")
+        listed = {k.split("/")[1] + ".parquet" for k in i_chunks if i_chunks[k]["bars"] > 0}
+        if listed != set(pre_files):
+            raise BuildError(f"{symbol}: predecessor 5Min files {pre_files} differ from the manifest's {sorted(listed)}")
+        out["digest"] += [f"predecessor:{x}" for x in i_lines]
+        n = 0
+        for fn in pre_files:
+            raw = pd.read_parquet(os.path.join(i_dir, fn))
+            _check_columns(raw, f"{key} {fn}")
+            raw = raw[(_ny_days(raw["t"]) < pd.Timestamp(cut)).to_numpy()]
+            if len(raw):
+                out["5min"].append(raw.reset_index(drop=True))
+                n += len(raw)
+        rec["5min_bars"] = n
+    return {**out, "record": rec}
+
+
+_EVENT_DAY_FIELDS = (("forward_splits", "symbol", "ex_date"), ("reverse_splits", "symbol", "ex_date"), ("stock_dividends", "symbol", "ex_date"),
+                     ("unit_splits", "old_symbol", "effective_date"), ("spin_offs", "source_symbol", "ex_date"))
+
+
+def listed_event_days(months: Iterable[Mapping[str, Any]], symbol: str, before: date) -> List[str]:
+    """Days before ``before`` on which Alpaca lists a split / stock dividend / unit split / spin-off of ``symbol``.  The split-table step judges
+    events against the CURRENT series only, so one dated inside the predecessor's range was never judged: the build refuses unless the table
+    holds it (a reviewed override)."""
+    out = set()
+    for month in months:
+        for kind, sym_field, day_field in _EVENT_DAY_FIELDS:
+            for e in (month[kind] if kind in month else []):
+                if _norm(e[sym_field]) == symbol and e[day_field] < before.isoformat():
+                    out.add(e[day_field])
+    return sorted(out)
+
+
+def find_predecessors(daily_store: str, intraday_store: str) -> Dict[str, Tuple[str, date, List[str]]]:
+    """symbol -> (store key, change date) of every predecessor key in the stores.  Each key must be explained by a CUSIP-only name change of
+    its symbol in the store's corporate actions whose process_date is the key's asof + 1 day; one key per symbol; refuses otherwise."""
+    keys: set = set()
+    for store, kind in ((daily_store, "1Day"), (intraday_store, "5Min")):
+        d = os.path.join(store, "bars", kind)
+        if os.path.isdir(d):
+            keys.update(n.split("=", 1)[1] for n in os.listdir(d) if n.startswith("symbol=") and PREDECESSOR_SEP in n)
+    if not keys:
+        return {}
+    months = read_corporate_actions(daily_store)          # read only when a key exists: a store without keys needs no action files
+    changes = cusip_only_changes(months)
+    out: Dict[str, Tuple[str, date, List[str]]] = {}
+    for key in sorted(keys):
+        sym, cut = split_predecessor_key(key)
+        if cut is None or not any(c[0] == cut for c in changes.get(sym, ())):
+            raise BuildError(f"predecessor key {key} has no CUSIP-only name change of {sym} dated {cut} in the corporate actions")
+        if sym in out:
+            raise BuildError(f"{sym}: two predecessor keys {out[sym][0]} and {key}")
+        out[sym] = (key, cut, listed_event_days(months, sym, cut))
+    return out
+
+
 def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str, table: SplitTable,
                  fmp_dir: Optional[str] = None, bar_caps: Sequence[Mapping[str, Any]] = (),
-                 ipo_dates: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Any]:
-    """Build both files of one symbol; returns its manifest entry.  One symbol at a time: memory is one symbol's bars.
+                 ipo_dates: Optional[Mapping[str, Optional[str]]] = None,
+                 predecessor: Optional[Tuple[str, date, List[str]]] = None) -> Dict[str, Any]:
+    """Build both files of one symbol; returns its manifest entry.  ``predecessor`` = (store key, change date, listed split / spin-off days before it) of a CUSIP-only change
+    whose new security restarted Alpaca's history: the old security's bars strictly before the change are prepended (``merge_predecessor``).  One symbol at a time: memory is one symbol's bars.
     ``ipo_dates``: the ipo-dates step's ``{symbol: ISO date | None}`` (None = no such file: every gap is listed for review)."""
     t0 = time.time()
     entry: Dict[str, Any] = {"symbol": symbol}
@@ -592,6 +738,12 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     if not d_chunks:
         raise BuildError(f"{symbol}: a daily file exists but its manifest has no complete 1Day chunk")
     raw_daily = pd.read_parquet(d_path)
+    pre_merge = None
+    if predecessor is not None:
+        pre_merge = merge_predecessor(symbol, predecessor[0], predecessor[1], daily_store=daily_store, intraday_store=intraday_store,
+                                      cur_daily=raw_daily, cur_5min_files=year_files, fmp_dir=fmp_dir)
+        digest += pre_merge["digest"]
+        raw_daily = pd.concat([pre_merge["daily"], raw_daily], ignore_index=True)
     if "n" not in raw_daily.columns:
         raise BuildError(f"{symbol} daily: column 'n' missing (have {list(raw_daily.columns)}): cannot tell placeholder bars apart")
     ph_mask = ((raw_daily["v"] == 0) & (raw_daily["n"] == 0)).to_numpy()
@@ -623,17 +775,26 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     intr = None
     env_raw = None
     dropped_5m = 0
-    if year_files:
-        i_manifest = _read_manifest(intraday_store, symbol)
-        if i_manifest is None:
-            raise BuildError(f"{symbol}: 5-minute bars without manifest/symbol={symbol}.json in {intraday_store}")
-        i_digest, chunks, absent = _chunk_digest(i_manifest, "5Min", f"{symbol} 5min")
-        digest += i_digest
-        refused = {k.split("/")[1]: st for k, st in absent.items() if st.startswith(REFUSED_PREFIX)}
-        listed = {k.split("/")[1] + ".parquet" for k in chunks if chunks[k]["bars"] > 0}
-        if listed != set(year_files):
-            raise BuildError(f"{symbol}: 5Min files {sorted(year_files)} differ from the manifest's {sorted(listed)}")
+    pre_5min = pre_merge["5min"] if pre_merge is not None else []
+    if year_files or pre_5min:
+        chunks = {}
+        if year_files:
+            i_manifest = _read_manifest(intraday_store, symbol)
+            if i_manifest is None:
+                raise BuildError(f"{symbol}: 5-minute bars without manifest/symbol={symbol}.json in {intraday_store}")
+            i_digest, chunks, absent = _chunk_digest(i_manifest, "5Min", f"{symbol} 5min")
+            digest += i_digest
+            refused = {k.split("/")[1]: st for k, st in absent.items() if st.startswith(REFUSED_PREFIX)}
+            listed = {k.split("/")[1] + ".parquet" for k in chunks if chunks[k]["bars"] > 0}
+            if listed != set(year_files):
+                raise BuildError(f"{symbol}: 5Min files {sorted(year_files)} differ from the manifest's {sorted(listed)}")
         parts = [split_5min(pd.read_parquet(os.path.join(i_dir, f)), f"{symbol} {f}") for f in year_files]
+        if pre_5min:
+            cut_ts = pd.Timestamp(predecessor[1])
+            for f in parts:
+                if (f[0]["Date"] < cut_ts).any():
+                    raise BuildError(f"{symbol}: current 5-minute bars before the change {predecessor[1]}: predecessor {predecessor[0]} would overlap")
+            parts = [split_5min(f, f"{predecessor[0]} 5min") for f in pre_5min] + parts
         frames = [a for a, _ in parts]
         env_raw = pd.concat([b for _, b in parts]).groupby(level=0).agg(High=("High", "max"), Low=("Low", "min"))   # a NY day can span two UTC year files
         if eff_brk is not None:
@@ -654,6 +815,7 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
             if days or g["count"] == 0:
                 gap_days[k.split("/")[1]] = {"count": len(days), "of": g["of"], "days": days}
     entry["inputs_sha256"] = hashlib.sha256("\n".join(digest).encode()).hexdigest()
+    entry["predecessor"] = None if pre_merge is None else pre_merge["record"]
     entry["break_date"] = brk
     entry["dropped_by_break"] = {"1d": dropped_1d, "5min": dropped_5m}
     entry["dropped_placeholders"] = n_placeholders
@@ -661,6 +823,11 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     entry["refused_5min_years"] = refused
 
     first_day = daily["Date"].iloc[0].normalize() if len(daily) else None
+    if predecessor is not None:
+        unjudged = [d for d in predecessor[2] if d not in {x for x, _ in splits} | {x for x, _ in spinoffs}]
+        if unjudged:
+            raise BuildError(f"{symbol}: Alpaca lists corporate action(s) on {unjudged} inside the predecessor series {predecessor[0]}, which the "
+                             f"split table never judged (it sees the current series only): decide them in split_overrides.json first")
     ev_s = [[d, f] for d, f in splits if first_day is not None and pd.Timestamp(d) > first_day]
     ev_o = [[d, f] for d, f in spinoffs if first_day is not None and pd.Timestamp(d) > first_day]
     entry["events"] = {"splits": ev_s, "spinoffs": ev_o}
@@ -718,12 +885,12 @@ def build_symbol(symbol: str, *, daily_store: str, intraday_store: str, out: str
     return entry
 
 
-def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str], Sequence[Mapping[str, Any]], Optional[Mapping[str, Optional[str]]]]
+def _task(args: Tuple[str, str, str, str, "SplitTable", Optional[str], Sequence[Mapping[str, Any]], Optional[Mapping[str, Optional[str]]], Optional[Tuple[str, date, List[str]]]]
           ) -> Dict[str, Any]:
-    symbol, daily_store, intraday_store, out, table, fmp_dir, bar_caps, ipo_dates = args
+    symbol, daily_store, intraday_store, out, table, fmp_dir, bar_caps, ipo_dates, predecessor = args
     try:
         return build_symbol(symbol, daily_store=daily_store, intraday_store=intraday_store, out=out, table=table, fmp_dir=fmp_dir,
-                            bar_caps=bar_caps, ipo_dates=ipo_dates)
+                            bar_caps=bar_caps, ipo_dates=ipo_dates, predecessor=predecessor)
     except Exception as e:                       # reported per symbol; the run finishes and then fails, named
         return {"symbol": symbol, "error": f"{type(e).__name__}: {e}"}
 
@@ -749,7 +916,7 @@ def list_symbols(daily_store: str, intraday_store: str) -> List[str]:
         d = os.path.join(store, "bars", kind)
         if not os.path.isdir(d):
             raise BuildError(f"{d} not found")
-        syms.update(n.split("=", 1)[1] for n in os.listdir(d) if n.startswith("symbol="))
+        syms.update(n.split("=", 1)[1] for n in os.listdir(d) if n.startswith("symbol=") and PREDECESSOR_SEP not in n)
     dots = sorted(s for s in syms if "." in s)
     if dots:
         raise BuildError(f"store folder names with '.': {dots[:5]} (the stores spell share classes with '-')")
@@ -789,8 +956,11 @@ def build_cache(*, daily_store: str = DEFAULT_DAILY_STORE, intraday_store: str =
     ipo_all = load_ipo_dates(ipo_path)                           # None = no file: every gap is listed for review, nothing is dropped
     if ipo_all is None:
         log(f"build: {ipo_path} not found: reused tickers cannot be told (run the ipo-dates step); every gap is listed for review")
+    predecessors = find_predecessors(daily_store, intraday_store)
+    if predecessors:
+        log(f"build: {len(predecessors)} CUSIP-change predecessor series: {', '.join(v[0] for v in predecessors.values())}")
     jobs = [(s, daily_store, intraday_store, out, table, fmp_daily_dir, bar_caps,
-             None if ipo_all is None else {s: ipo_all.get(s)}) for s in todo]
+             None if ipo_all is None else {s: ipo_all.get(s)}, predecessors.get(s)) for s in todo]
     if workers <= 1:
         for i, j in enumerate(jobs, 1):
             results.append(_task(j))

@@ -136,9 +136,32 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+PREDECESSOR_SEP = "@"
+
+
 def alpaca_symbol(symbol: str) -> str:
-    """Our (FMP-style) class-share spelling BRK-B is BRK.B at Alpaca."""
-    return symbol.replace("-", ".")
+    """Our (FMP-style) class-share spelling BRK-B is BRK.B at Alpaca.  A predecessor key ``TEVA@2026-09-13`` asks Alpaca for TEVA."""
+    return symbol.split(PREDECESSOR_SEP, 1)[0].replace("-", ".")
+
+
+def split_predecessor_key(symbol: str) -> tuple[str, Optional[str]]:
+    """``("TEVA", "2026-09-13")`` for the predecessor key ``TEVA@2026-09-13``; ``(symbol, None)`` for an ordinary symbol.
+
+    A predecessor key names a CUSIP-only change (old ticker == new ticker, new security) that restarted Alpaca's history: the
+    store's pinned asof returns only the new security's bars, so the OLD security's bars are fetched as of the day BEFORE the
+    change (the date after the ``@``).  Its chunks sit under their own folder / manifest (the key), carry that asof in their
+    manifest entries, and end at the change date (asof + 1 day = the corporate action's ``process_date``): they cannot
+    collide with the symbol's own chunks, and the store's pinned asof keeps its meaning for every ordinary symbol."""
+    base, sep, asof = symbol.partition(PREDECESSOR_SEP)
+    if not sep:
+        return symbol, None
+    try:
+        dt.date.fromisoformat(asof)
+    except ValueError as error:
+        raise FatalError(f"bad predecessor key {symbol!r}: want SYMBOL@YYYY-MM-DD") from error
+    if not base:
+        raise FatalError(f"bad predecessor key {symbol!r}: no symbol")
+    return base, asof
 
 
 class Transport:
@@ -425,7 +448,7 @@ class Downloader:
         return not self.retry_refused  # a refused chunk is retried only on request
 
     def _write_bars(self, manifest: SymbolManifest, key: str, window: dict, path: Path,
-                    frame: pd.DataFrame, pages: int, extra: Optional[dict] = None) -> None:
+                    frame: pd.DataFrame, pages: int, asof: str, extra: Optional[dict] = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         frame.to_parquet(tmp, index=False, compression="zstd")
@@ -433,14 +456,14 @@ class Downloader:
         entry = dict(window, status=STATUS_COMPLETE, bars=int(len(frame)), pages=pages,
                      first_t=iso_z(frame["t"].iloc[0]), last_t=iso_z(frame["t"].iloc[-1]),
                      file=path.relative_to(self.store).as_posix(), file_bytes=path.stat().st_size,
-                     sha256=sha256_file(path), asof=self.asof, fetched_at=iso_z(dt.datetime.now(UTC)))
+                     sha256=sha256_file(path), asof=asof, fetched_at=iso_z(dt.datetime.now(UTC)))
         entry.update(extra or {})
         manifest.record(key, entry)
         self.counts["written"] += 1
 
     def _refuse(self, manifest: SymbolManifest, key: str, window: dict, path: Path,
-                error: ChunkRefused) -> None:
-        refusal = dict(window, status=f"refused_{error.reason}", detail=error.detail, asof=self.asof,
+                error: ChunkRefused, asof: str) -> None:
+        refusal = dict(window, status=f"refused_{error.reason}", detail=error.detail, asof=asof,
                        fetched_at=iso_z(dt.datetime.now(UTC)))
         entry = manifest.entry(key)
         if entry is not None and entry["status"] == STATUS_COMPLETE:
@@ -452,37 +475,49 @@ class Downloader:
         self.consecutive_failures = 0  # the vendor answered: this is not an outage
         log(f"REFUSED {manifest.data['symbol']} {key}: {error.reason} {json.dumps(error.detail)[:300]}")
 
+    def _scope(self, symbol: str) -> tuple[str, dt.datetime]:
+        """(asof, end_exclusive) of one store key: the run's own for an ordinary symbol; for a predecessor key the asof
+        in the key and the change date (asof + 1 day) as the end."""
+        _, key_asof = split_predecessor_key(symbol)
+        if key_asof is None:
+            return self.asof, self.end_exclusive
+        end = parse_day(key_asof) + dt.timedelta(days=1)
+        if end > self.end_exclusive:
+            raise FatalError(f"{symbol}: its change date {end.date()} is after --end {self.end_exclusive.date()}")
+        return key_asof, end
+
     # --- daily ---------------------------------------------------------------------------------
     def daily(self, symbol: str) -> None:
         manifest = SymbolManifest(self.store, symbol)
+        asof, end_exclusive = self._scope(symbol)
         key = f"{DAILY_TIMEFRAME}/all"
-        window = self._window(self.start, self.end_exclusive)
+        window = self._window(self.start, end_exclusive)
         path = self.store / "bars" / DAILY_TIMEFRAME / f"symbol={symbol}" / "all.parquet"
         if self._is_done(manifest, key, window, path):
             self.counts["skipped"] += 1
             return
         try:
             bars, pages = fetch_bars(self.transport, manifest.data["alpaca_symbol"], DAILY_TIMEFRAME,
-                                     self.start, self.end_exclusive, self.asof)
-            frame = bars_to_frame(bars, self.start, self.end_exclusive)
+                                     self.start, end_exclusive, asof)
+            frame = bars_to_frame(bars, self.start, end_exclusive)
             if not frame.empty and len(session_days(frame)) != len(frame):
                 raise ChunkRefused("two_daily_bars_on_one_day")
             if frame.empty and (manifest.entry(key) or {}).get("status") == STATUS_COMPLETE:
                 raise ChunkRefused("no_bars_where_an_earlier_fetch_had_some")
         except ChunkRefused as error:
-            self._refuse(manifest, key, window, path, error)
+            self._refuse(manifest, key, window, path, error, asof)
             return
         except ChunkFailed as error:
             self._failure(symbol, key, error)
             return
         self.consecutive_failures = 0
         if frame.empty:
-            manifest.record(key, dict(window, status=STATUS_NO_DATA, asof=self.asof,
+            manifest.record(key, dict(window, status=STATUS_NO_DATA, asof=asof,
                                       fetched_at=iso_z(dt.datetime.now(UTC))))
             self.counts["empty"] += 1
             log(f"NO DATA {symbol} ({manifest.data['alpaca_symbol']}): Alpaca has no daily bars in the window")
             return
-        self._write_bars(manifest, key, window, path, frame, pages)
+        self._write_bars(manifest, key, window, path, frame, pages, asof)
 
     def _daily_days(self, symbol: str, manifest: SymbolManifest) -> Optional[tuple]:
         """(traded days, zero-trade days) from the stored daily file; None when there is no usable daily chunk.
@@ -490,7 +525,7 @@ class Downloader:
         Alpaca serves a placeholder daily bar on a day nothing traded (volume 0, 0 trades, flat price); no
         intraday bar can exist on such a day, so it is not a day an intraday chunk must cover."""
         key = f"{DAILY_TIMEFRAME}/all"
-        window = self._window(self.start, self.end_exclusive)
+        window = self._window(self.start, self._scope(symbol)[1])
         entry = manifest.entry(key)
         if entry is None or {name: entry.get(name) for name in window} != window:
             return None
@@ -511,7 +546,8 @@ class Downloader:
             log(f"SKIP {symbol} {INTRADAY_TIMEFRAME}: no complete daily chunk for this window to check against")
             return
         days, zero_trade_days = daily
-        for chunk_start, chunk_end in year_chunks(self.start, self.end_exclusive):
+        asof, end_exclusive = self._scope(symbol)
+        for chunk_start, chunk_end in year_chunks(self.start, end_exclusive):
             key = f"{INTRADAY_TIMEFRAME}/{chunk_start.year}"
             window = self._window(chunk_start, chunk_end)
             path = self.store / "bars" / INTRADAY_TIMEFRAME / f"symbol={symbol}" / f"{chunk_start.year}.parquet"
@@ -523,30 +559,30 @@ class Downloader:
             if not expected:
                 if (manifest.entry(key) or {}).get("status") == STATUS_COMPLETE:
                     self._refuse(manifest, key, window, path,
-                                 ChunkRefused("no_daily_days_where_an_earlier_fetch_had_bars"))
+                                 ChunkRefused("no_daily_days_where_an_earlier_fetch_had_bars"), asof)
                     continue
-                manifest.record(key, dict(window, status=STATUS_NO_DAILY_DAYS, asof=self.asof,
+                manifest.record(key, dict(window, status=STATUS_NO_DAILY_DAYS, asof=asof,
                                           fetched_at=iso_z(dt.datetime.now(UTC))))
                 self.counts["empty"] += 1
                 continue
             began = time.time()
             try:
                 bars, pages = fetch_bars(self.transport, manifest.data["alpaca_symbol"], INTRADAY_TIMEFRAME,
-                                         chunk_start, chunk_end, self.asof)
+                                         chunk_start, chunk_end, asof)
                 frame = bars_to_frame(bars, chunk_start, chunk_end)
                 missing = sorted(expected - session_days(frame))
                 gaps = {"count": len(missing), "of": len(expected), "days": [day.isoformat() for day in missing[:400]]}
                 if missing and (len(missing) > self.max_gap_days or frame.empty):
                     raise ChunkRefused("days_without_intraday_bars", gaps)
             except ChunkRefused as error:
-                self._refuse(manifest, key, window, path, error)
+                self._refuse(manifest, key, window, path, error, asof)
                 continue
             except ChunkFailed as error:
                 self._failure(symbol, key, error)
                 continue
             self.consecutive_failures = 0
             extra_days = len(session_days(frame) - expected)
-            self._write_bars(manifest, key, window, path, frame, pages,
+            self._write_bars(manifest, key, window, path, frame, pages, asof,
                              {"daily_days": len(expected), "zero_trade_daily_days": len(zero_trade),
                               "days_without_daily_bar": extra_days, "days_without_intraday_bars": gaps})
             log(f"  {symbol} {key}: {len(frame):,} bars, {pages} pages, {time.time() - began:.1f}s")

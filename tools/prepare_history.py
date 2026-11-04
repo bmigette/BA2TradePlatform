@@ -11,7 +11,7 @@ REQUIRED ``--source {alpaca,fmp}``.  Steps valid per source (in this order):
   over complete stores) -- pass ``--steps`` to run less.
 
 STEP alpaca / download
-  download      Runs ``tools/alpaca_history_download.py`` up to five times with the RECORDED arguments (code constants ``ALPACA_DOWNLOADS``:
+  download      Runs ``tools/alpaca_history_download.py`` up to seven times with the RECORDED arguments (code constants ``ALPACA_DOWNLOADS``:
                 this is the runbook's source of truth).  Keys and account come from the arguments below.
                   1. 5-minute store ``--store-5min``: ``<store>/symbols.txt``, start 2019-01-01, end 2026-10-13, phases default
                      (corporate_actions, daily, intraday), max-gap-days 5;
@@ -26,7 +26,12 @@ STEP alpaca / download
                      5-minute ones), and
                   5. the daily store, phases daily, start 2016-01-01, asof as run 2, symbols ``rename_successors_missing_daily.txt``
                      (absent from the DAILY store).
-                  Run 4 / 5 runs only when its file exists and lists a symbol (otherwise it is logged as skipped).  The build covers
+                  6./7. CUSIP-only changes (same ticker, new security, e.g. TEVA 2026-09-14) whose new security RESTARTED Alpaca's history
+                     (the store's first bar lies within 7 days of the change): the OLD security's bars, fetched as of the day before the
+                     change under the store key ``SYMBOL@asof`` and ending at the change; 6. 5-minute store (daily,intraday), 7. daily
+                     store (daily); symbols ``cusip_predecessors_missing_{5min,daily}.txt`` of the split-table step.  DERIVED from the pinned
+                     corporate actions and the stores (``cusip_predecessors.csv``), not a hand list.  The build merges them (see REPRODUCE 4.0).
+                  Runs 4-7 run only when its file exists and lists a symbol (otherwise it is logged as skipped).  The build covers
                   every symbol with bars in either store, so a downloaded successor is built (``_1d`` and ``_5min``) and gated like any other.
                 Common: ``--keys-db`` (default: ``--db``) ``--account-id 1 --rpm 150 --min-remaining 60``.  A rerun over complete
                 stores makes ~0 data requests; a run that exits non-zero fails the step.
@@ -132,7 +137,9 @@ MC_PROFILES = ("ohlcv-v1", "ta-structure-v1")
 SPINCO_SYMBOLS_FILE = "symbols_spinco_20261020.txt"       # in the daily store: spin-off companies fetched by hand on 2026-10-20
 SPINCO_MISSING_FILE = "spinco_symbols_missing.txt"        # <out>/_meta, written by the split-table step
 RENAME_MISSING_FILES = {"renames_daily": "rename_successors_missing_daily.txt",     # <out>/_meta, written by the split-table step: the rename
-                        "renames_5min": "rename_successors_missing_5min.txt"}       # successors absent from the daily / the 5-minute store
+                        "renames_5min": "rename_successors_missing_5min.txt",       # successors absent from the daily / the 5-minute store
+                        "cusip_daily": "cusip_predecessors_missing_daily.txt",      # CUSIP-only changes that restarted a symbol's history: the
+                        "cusip_5min": "cusip_predecessors_missing_5min.txt"}        # predecessor keys SYMBOL@asof absent from the daily / 5-minute store
 DOWNLOAD_END = "2026-10-13"                                # first day NOT fetched (the stores' asof is the day before)
 DOWNLOAD_ASOF = "2026-10-12"
 #: THE RECORDED ``alpaca_history_download.py`` runs (runbook source of truth).  store: which store argument; symbols: file name in
@@ -148,6 +155,12 @@ ALPACA_DOWNLOADS = (
     {"label": "5-minute store, rename successors", "store": "5min", "symbols": None, "list": "renames_5min", "start": "2019-01-01",
      "end": DOWNLOAD_END, "asof": None, "phases": "daily,intraday", "max_gap_days": 5},
     {"label": "daily store, rename successors", "store": "daily", "symbols": None, "list": "renames_daily", "start": "2016-01-01",
+     "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
+    # CUSIP-only changes (same ticker, new security) whose new security restarted Alpaca's history: the OLD security's bars, fetched as of
+    # the day before the change under the store key SYMBOL@asof (alpaca_history_download.split_predecessor_key); the build merges them.
+    {"label": "5-minute store, CUSIP-change predecessors", "store": "5min", "symbols": None, "list": "cusip_5min", "start": "2019-01-01",
+     "end": DOWNLOAD_END, "asof": None, "phases": "daily,intraday", "max_gap_days": 5},
+    {"label": "daily store, CUSIP-change predecessors", "store": "daily", "symbols": None, "list": "cusip_daily", "start": "2016-01-01",
      "end": DOWNLOAD_END, "asof": DOWNLOAD_ASOF, "phases": "daily", "max_gap_days": 5},
 )
 FMP_TIMEFRAMES = "5min,1d"

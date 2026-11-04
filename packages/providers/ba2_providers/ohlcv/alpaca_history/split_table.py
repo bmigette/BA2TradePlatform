@@ -438,6 +438,70 @@ def build_rename_map(corporate_actions: Iterable[Mapping[str, Any]]) -> Dict[str
     return out
 
 
+PREDECESSOR_SEP = "@"        # store key of a predecessor series: ``TEVA@2026-09-13`` (see ``cusip_predecessor_rows``)
+CUSIP_RESTART_DAYS = 7       # the store's first real daily bar of a symbol lies on/after the change, at most this many days after it: history restarted there
+
+
+def predecessor_key(symbol: str, process_date: date) -> str:
+    """The store key of the OLD security's series of a CUSIP-only change: ``<SYMBOL>@<day before process_date>``.  The day is the
+    ``asof`` the bars are fetched with (the ticker mapping before the change); process_date = that day + 1."""
+    return f"{_norm_symbol(symbol)}{PREDECESSOR_SEP}{(process_date - timedelta(days=1)).isoformat()}"
+
+
+def split_predecessor_key(key: str) -> Tuple[str, Optional[date]]:
+    """``("TEVA", date(2026, 9, 14))`` (symbol, process_date) for ``TEVA@2026-09-13``; ``(key, None)`` for an ordinary symbol."""
+    base, sep, asof = key.partition(PREDECESSOR_SEP)
+    if not sep:
+        return key, None
+    return base, date.fromisoformat(asof) + timedelta(days=1)
+
+
+def cusip_only_changes(corporate_actions: Iterable[Mapping[str, Any]]) -> Dict[str, List[Tuple[date, str, str]]]:
+    """symbol -> [(process_date, old_cusip, new_cusip)] sorted, of the ``name_changes`` whose ticker stays (old == new) and whose CUSIP
+    changes: a new security under the same ticker (an ADR becoming ordinary shares, a redomiciliation).  ``build_rename_map``
+    skips these (no ticker moves); Alpaca keys its history by the ticker AND, as of a later date, may serve only the new security."""
+    out: Dict[str, List[Tuple[date, str, str]]] = {}
+    for month in corporate_actions:
+        for nc in _kind(month, "name_changes"):
+            old, new = _norm_symbol(nc["old_symbol"]), _norm_symbol(nc["new_symbol"])
+            if old != new or nc["old_cusip"] == nc["new_cusip"]:
+                continue
+            out.setdefault(old, []).append((date.fromisoformat(nc["process_date"]), nc["old_cusip"], nc["new_cusip"]))
+    for lst in out.values():
+        lst.sort()
+    return out
+
+
+CUSIP_PREDECESSOR_COLUMNS = ["symbol", "process_date", "old_cusip", "new_cusip", "first_bar", "key", "in_daily", "in_5min"]
+
+
+def cusip_predecessor_rows(changes: Mapping[str, Sequence[Tuple[date, str, str]]], first_bars: Mapping[str, date],
+                           in_daily: Callable[[str], bool], in_5min: Optional[Callable[[str], bool]] = None,
+                           window_days: int = CUSIP_RESTART_DAYS) -> List[Dict[str, Any]]:
+    """One row per CUSIP-only change whose symbol's history RESTARTED there: ``first_bars`` = symbol -> its first REAL daily bar in the
+    store; the change qualifies when that bar is on/after ``process_date`` and at most ``window_days`` after it (a series that starts
+    before the change already holds the old security: nothing to fetch, and a predecessor would overlap it; an IPO a week before a
+    CUSIP change, INBX 2024-06-05, is such a series).  A symbol with several changes qualifies at its LATEST match (one predecessor
+    per symbol, earlier changes are not chained).
+    ``in_daily`` / ``in_5min``: the store already holds the predecessor key (folder exists).  Sorted by symbol.
+    This is DERIVED from the pinned corporate actions and the stores, not a hand-kept list: a hand list goes stale at the next
+    ``asof`` refresh; the build re-checks every key it merges against the same actions."""
+    rows = []
+    for sym in sorted(changes):
+        first = first_bars.get(sym)
+        if first is None:
+            continue
+        hit = [c for c in changes[sym] if 0 <= (first - c[0]).days <= window_days]
+        if not hit:
+            continue
+        pdate, ocusip, ncusip = hit[-1]
+        key = predecessor_key(sym, pdate)
+        rows.append({"symbol": sym, "process_date": pdate.isoformat(), "old_cusip": ocusip, "new_cusip": ncusip,
+                     "first_bar": first.isoformat(), "key": key, "in_daily": "yes" if in_daily(key) else "no",
+                     "in_5min": "unknown" if in_5min is None else ("yes" if in_5min(key) else "no")})
+    return rows
+
+
 def map_to_current(symbol: str, on: date, renames: Mapping[str, Sequence[Tuple[date, str]]],
                    in_store: Optional[Callable[[str, date], bool]] = None) -> str:
     """The symbol the bars of ``symbol`` as of ``on`` sit under: follow every rename effective AFTER ``on`` (a same-day one is ambiguous: tickers swap on a date),

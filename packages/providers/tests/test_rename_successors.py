@@ -151,19 +151,34 @@ def test_download_runs_4_and_5_fetch_each_store_its_own_missing_successors(tmp_p
     sub = tmp_path / "one"
     sub.mkdir()
     calls, res, logs = _run_download(ph, _dl_args(ph, sub, "# only comments\n", "NEW\n"), monkeypatch)
-    assert len(calls) == 4 and calls[3][0][1] == str(sub / "intra") and len(res["skipped"]) == 1 and len(res["runs"]) == 4
-    assert sum("SKIPPED" in m and "_daily.txt" in m for m in logs) == 1
+    assert len(calls) == 4 and calls[3][0][1] == str(sub / "intra") and len(res["skipped"]) == 3 and len(res["runs"]) == 4        # + the 2 CUSIP-predecessor runs (no list)
+    assert sum("SKIPPED" in m and "rename_successors_missing_daily.txt" in m for m in logs) == 1
     sub = tmp_path / "none"
     sub.mkdir()
     calls, res, logs = _run_download(ph, _dl_args(ph, sub, None, None), monkeypatch)
-    assert len(calls) == 3 and sum("SKIPPED" in m for m in logs) == 2
+    assert len(calls) == 3 and sum("SKIPPED" in m for m in logs) == 4
 
 
 def test_download_plan_lists_runs_4_and_5_only_with_a_non_empty_list(tmp_path):
     ph = load_ph()
     lines = ph.plan_alpaca_download(_dl_args(ph, tmp_path, "NEW\n", "NEW\n"))
-    assert len(lines) == 5 and not any("SKIPPED" in x for x in lines)
+    assert len(lines) == 7 and sum("SKIPPED" in x for x in lines) == 2     # the 2 CUSIP-predecessor runs: no list
     sub = tmp_path / "none"
     sub.mkdir()
     lines = ph.plan_alpaca_download(_dl_args(ph, sub, None, "NEW\n"))
-    assert len(lines) == 5 and sum("would be SKIPPED" in x for x in lines) == 1
+    assert len(lines) == 7 and sum("would be SKIPPED" in x for x in lines) == 3
+
+
+def test_cusip_predecessor_lists_drive_runs_6_and_7(tmp_path, monkeypatch):
+    ph = load_ph()
+    a = _dl_args(ph, tmp_path, "NEW\n", "NEW\n")
+    meta = Path(a.out) / "_meta"
+    (meta / "cusip_predecessors_missing_5min.txt").write_text("# run_id: x\nTEVA@2026-09-13\n")
+    (meta / "cusip_predecessors_missing_daily.txt").write_text("# run_id: x\nTEVA@2026-09-13\n")
+    calls, res, _ = _run_download(ph, a, monkeypatch)
+    assert len(calls) == 7 and not res["skipped"]
+    argv6, argv7 = calls[5][0], calls[6][0]
+    assert argv6[:2] == ["--store", str(tmp_path / "intra")] and argv6[argv6.index("--phases") + 1] == "daily,intraday" and "--asof" not in argv6
+    assert argv7[:2] == ["--store", str(tmp_path / "daily")] and argv7[argv7.index("--phases") + 1] == "daily"
+    assert argv7[argv7.index("--asof") + 1] == "2026-10-12"             # the store's pin; the key carries the predecessor's own asof
+    assert calls[5][1] == calls[6][1] == ["TEVA@2026-09-13"]
