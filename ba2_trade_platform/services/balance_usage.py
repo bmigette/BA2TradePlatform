@@ -112,6 +112,9 @@ def balance_usage_per_expert(account_id: Optional[int]) -> Dict[str, Dict[str, f
                 'account_id': acc_id,
                 'account_total': account_balance,
                 'broker_bp': bp_by_account[acc_id],
+                # Symbols of this expert's open/waiting trades the account gave no price for: their value is
+                # MISSING from 'filled'/'pending', so a reader (the API) can say the figure is understated.
+                'unpriced_symbols': [],
             }
 
         # Now calculate used balance from transactions
@@ -176,6 +179,8 @@ def balance_usage_per_expert(account_id: Optional[int]) -> Dict[str, Dict[str, f
                 acc_id = account_by_txn.get(transaction.id)
                 market_price = prices_by_account.get(acc_id, {}).get(transaction.symbol) if acc_id is not None else None
                 if not market_price:
+                    if transaction.symbol not in balance_data[expert_name]['unpriced_symbols']:
+                        balance_data[expert_name]['unpriced_symbols'].append(transaction.symbol)
                     continue
 
                 if transaction.status in [TransactionStatus.OPENED, TransactionStatus.CLOSING]:
