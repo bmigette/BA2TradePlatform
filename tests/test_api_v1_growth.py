@@ -217,17 +217,18 @@ def test_prices_are_fetched_only_for_the_requested_labels_symbols(world, monkeyp
     assert asked == [["XLE"]]
 
 
-def test_prices_come_from_the_accounts_history_provider_and_a_slow_source_is_a_503(monkeypatch):
-    import time
+def _frame(prices=((  "2026-09-01", 10.0),)):
+    import pandas as pd
+    return pd.DataFrame({"Date": pd.to_datetime([d for d, _ in prices], utc=True), "Close": [c for _, c in prices]})
+
+
+def test_prices_come_from_the_accounts_history_provider(monkeypatch):
     from datetime import date
     import pandas as pd
     from ba2_trade_platform.services import price_history
-    from ba2_trade_platform.services.errors import PriceSourceUnreachable
 
     class Provider:
         def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d"):
-            if symbol == "SLOW":
-                time.sleep(1.0)
             if symbol == "NONE":
                 return pd.DataFrame(columns=["Date", "Close"])
             return pd.DataFrame({"Date": pd.to_datetime(["2026-09-01", "2026-09-02"], utc=True),
@@ -235,13 +236,24 @@ def test_prices_come_from_the_accounts_history_provider_and_a_slow_source_is_a_5
     monkeypatch.setattr(price_history, "_provider", lambda account_id: Provider())
     got = svc.fetch_closes(1, ["AAPL", "NONE"], date(2026, 9, 1))
     assert got == {"AAPL": {"2026-09-01": 10.0}}                         # NaN row dropped, empty symbol absent
-    monkeypatch.setattr(price_history, "PRICE_DEADLINE_S", 0.2)
-    with pytest.raises(PriceSourceUnreachable):
-        svc.fetch_closes(1, ["SLOW"], date(2026, 9, 1))
-    assert PriceSourceUnreachable.code == "price_source_unreachable" and PriceSourceUnreachable.status_code == 503
 
 
-def test_every_symbol_failing_is_price_source_unreachable(monkeypatch):
+def test_a_provider_that_raises_for_one_symbol_leaves_that_symbol_unpriced(monkeypatch):
+    from datetime import date
+    from ba2_trade_platform.services import price_history
+
+    class Provider:
+        def get_ohlcv_data(self, symbol, **k):
+            if symbol == "WEIRD":
+                raise ValueError("unknown symbol")
+            return _frame()
+    monkeypatch.setattr(price_history, "_provider", lambda account_id: Provider())
+    got = svc.fetch_closes(1, ["AAPL", "WEIRD"], date(2026, 9, 1))
+    assert set(got) == {"AAPL"} and got.timed_out is False
+    assert dict(svc.fetch_closes(1, ["WEIRD"], date(2026, 9, 1))) == {}          # nothing priced, but NOT a 503
+
+
+def test_every_symbol_failing_on_the_network_is_price_source_unreachable(monkeypatch):
     from datetime import date
     from ba2_trade_platform.services import price_history
     from ba2_trade_platform.services.errors import PriceSourceUnreachable
@@ -252,6 +264,65 @@ def test_every_symbol_failing_is_price_source_unreachable(monkeypatch):
     monkeypatch.setattr(price_history, "_provider", lambda account_id: Down())
     with pytest.raises(PriceSourceUnreachable):
         svc.fetch_closes(1, ["AAPL", "MSFT"], date(2026, 9, 1))
+    assert PriceSourceUnreachable.code == "price_source_unreachable" and PriceSourceUnreachable.status_code == 503
+
+
+def test_at_the_deadline_what_finished_is_returned_flagged_partial_and_the_rest_unfetched(monkeypatch):
+    import time
+    from datetime import date
+    from ba2_trade_platform.services import price_history
+
+    class Provider:
+        def get_ohlcv_data(self, symbol, **k):
+            if symbol.startswith("SLOW"):
+                time.sleep(0.6)
+            return _frame()
+    monkeypatch.setattr(price_history, "_provider", lambda account_id: Provider())
+    monkeypatch.setattr(price_history, "WORKERS", 1)
+    monkeypatch.setattr(price_history, "PRICE_DEADLINE_S", 0.2)
+    got = svc.fetch_closes(1, ["AAPL", "SLOW1", "ZZZ"], date(2026, 9, 1))
+    assert set(got) == {"AAPL"} and got.timed_out is True and got.unfetched == ["ZZZ"]
+    time.sleep(0.8)                                                # let the slow call return and free its slot
+    from ba2_trade_platform.services.errors import PriceSourceUnreachable
+    with pytest.raises(PriceSourceUnreachable):
+        svc.fetch_closes(1, ["SLOW2"], date(2026, 9, 1))           # nothing finished by the deadline at all
+    time.sleep(0.8)
+
+
+def test_concurrent_slow_requests_never_exceed_the_slot_count_and_the_rest_are_refused_busy(monkeypatch):
+    import threading
+    import time
+    from datetime import date
+    from ba2_trade_platform.services import price_history
+    from ba2_trade_platform.services.errors import PriceSourceUnreachable
+    live, peak, lock = {"n": 0}, {"n": 0}, threading.Lock()
+
+    class Provider:
+        def get_ohlcv_data(self, symbol, **k):
+            with lock:
+                live["n"] += 1
+                peak["n"] = max(peak["n"], live["n"])
+            time.sleep(0.3)
+            with lock:
+                live["n"] -= 1
+            return _frame()
+    monkeypatch.setattr(price_history, "_provider", lambda account_id: Provider())
+    results = []
+
+    def request(i):
+        try:
+            results.append(("ok", svc.fetch_closes(1, [f"A{i}", f"B{i}", f"C{i}"], date(2026, 9, 1))))
+        except PriceSourceUnreachable as e:
+            results.append(("busy", e.detail))
+    threads = [threading.Thread(target=request, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert peak["n"] <= price_history.MAX_CONCURRENT == 4
+    assert any(kind == "busy" and detail.get("busy") for kind, detail in results)
+    assert any(kind == "ok" for kind, _ in results)
+    assert live["n"] == 0 and price_history._SLOTS._value == price_history.MAX_CONCURRENT     # every slot came back
 
 
 def test_the_fetch_cache_is_pruned_and_capped():

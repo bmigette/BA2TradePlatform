@@ -231,6 +231,8 @@ def _position_inputs(account_id: int, from_: date, select: Callable[[Dict[str, d
     known = sorted({lb for i in info.values() for lb in i['labels']})
     info = select(info)
     closes = fetch_closes(account_id, sorted(info), from_)
+    timed_out = bool(getattr(closes, "timed_out", False))        # the deadline passed with symbols unfetched
+    report = dict(report, partial=report["partial"] or timed_out, price_timed_out=timed_out)
     unpriced = sorted(s for s in info if s not in closes)
     if len(unpriced) == len(info):
         raise Unmeasurable("No historical prices could be fetched for any held symbol", {"unpriced_symbols": unpriced})
@@ -247,7 +249,7 @@ def _upto(dates: List[str], to: date) -> int:
 
 def _partial(report, skipped_positions) -> Dict[str, Any]:
     partial = report["partial"] or bool(skipped_positions)
-    return {"partial": partial, "skipped_rows": report["skipped_rows"], "skipped": report["skipped"],
+    return {"partial": partial, "price_timed_out": report["price_timed_out"], "skipped_rows": report["skipped_rows"], "skipped": report["skipped"],
             "skipped_positions": skipped_positions}
 
 
