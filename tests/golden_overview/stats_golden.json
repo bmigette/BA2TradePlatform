@@ -1,0 +1,164 @@
+{
+ "distribution": {
+  "categories": [
+   [
+    "Tech",
+    1500.5
+   ],
+   [
+    "Energy",
+    250.25
+   ],
+   [
+    "etf",
+    100.0
+   ],
+   [
+    "Uncategorized",
+    75.0
+   ],
+   [
+    "Unknown",
+    40.0
+   ]
+  ],
+  "labels": [
+   [
+    "Growth",
+    1000.5
+   ],
+   [
+    "Tech",
+    500.0
+   ],
+   [
+    "Energy",
+    250.25
+   ],
+   [
+    "etf",
+    100.0
+   ],
+   [
+    "Uncategorized",
+    75.0
+   ],
+   [
+    "Unknown",
+    40.0
+   ]
+  ]
+ },
+ "ids": {
+  "acct1": 1,
+  "acct2": 2,
+  "e1": 1,
+  "e2": 2,
+  "e3": 3
+ },
+ "inline_code_commit": "04dd460042fa656a4c4a0f7c84babbfd2ccb47be",
+ "order_counts": {
+  "acct1": [
+   [
+    "Alpaca Paper",
+    16,
+    2,
+    1
+   ]
+  ],
+  "acct2": [
+   [
+    "Manual TT",
+    2,
+    0,
+    1
+   ]
+  ],
+  "all": [
+   [
+    "Alpaca Paper",
+    16,
+    2,
+    1
+   ],
+   [
+    "Manual TT",
+    2,
+    0,
+    1
+   ]
+  ]
+ },
+ "profit_per_expert": {
+  "acct1": [
+   [
+    "MockExpert-2",
+    250.0
+   ],
+   [
+    "Alpha-1",
+    30.0
+   ],
+   [
+    "Gamma-3",
+    20.0
+   ]
+  ],
+  "acct2": [],
+  "all": [
+   [
+    "MockExpert-2",
+    250.0
+   ],
+   [
+    "Alpha-1",
+    30.0
+   ],
+   [
+    "Gamma-3",
+    20.0
+   ]
+  ]
+ },
+ "trade_performance": {
+  "acct1": {
+   "closed_count": 7,
+   "losses_30d": 2,
+   "losses_7d": 1,
+   "open_count": 2,
+   "pnl_30d": 180.0,
+   "pnl_7d": 0.0,
+   "pnl_prev_30d": 20.0,
+   "pnl_prev_7d": 260.0,
+   "total_count": 12,
+   "wins_30d": 4,
+   "wins_7d": 1
+  },
+  "acct2": {
+   "closed_count": 1,
+   "losses_30d": 0,
+   "losses_7d": 0,
+   "open_count": 1,
+   "pnl_30d": 10.0,
+   "pnl_7d": 10.0,
+   "pnl_prev_30d": 0,
+   "pnl_prev_7d": 0,
+   "total_count": 2,
+   "wins_30d": 1,
+   "wins_7d": 1
+  },
+  "all": {
+   "closed_count": 8,
+   "losses_30d": 2,
+   "losses_7d": 1,
+   "open_count": 3,
+   "pnl_30d": 190.0,
+   "pnl_7d": 10.0,
+   "pnl_prev_30d": 20.0,
+   "pnl_prev_7d": 260.0,
+   "total_count": 14,
+   "wins_30d": 5,
+   "wins_7d": 2
+  }
+ }
+}
