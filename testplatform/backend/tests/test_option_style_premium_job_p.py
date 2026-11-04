@@ -26,7 +26,7 @@ _POLICY_P = _ROOT / "tools/stage2_seed_policy.jobP.json"
 DEAD = ["model:k_stop", "model:risk_per_trade_pct", "model:atr_risk_budget_pct", "model:atr_multiplier",
         "model:min_stop_loss_pct", "model:regime_risk_scale", "model:regime_stop_scale",
         "model:regime_tp_scale", "schedule:saturday", "schedule:sunday"]
-MEMBERS = ["O_CSP", "O_BULLPS", "O_JL", "O_RS", "O_WHEEL", "O_CC", "O_PP", "O_IC"]
+MEMBERS = ["O_WHEEL", "O_CSP", "O_BULLPS", "O_JL", "O_RS", "O_CC", "O_PP", "O_IC"]
 
 
 @pytest.fixture(autouse=True)
