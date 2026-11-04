@@ -1,6 +1,6 @@
 """Stage-2 job C (style ``long``, DRAFT) and the seed-policy graft.
 
-* ``long`` in tools/option_styles.stage2.json: members/order, draft status, no price cap, the DTE-invariant members
+* ``long`` in tools/option_styles.stage2.json: members/order, approved status, no price cap, the DTE-invariant members
   carry no action_overrides, O_PBS is out, the risk block does not widen job A's rails.
 * tools/stage2_seed_policy.jobC.json is a valid policy for it, and assembles offline against the style's real gene
   space (synthetic source genomes: the real stage-1.5 DB is not available in CI).
@@ -56,9 +56,9 @@ def _space():
 
 
 # ------------------------------------------------------------------ the style
-def test_long_is_a_draft_with_the_expected_members_in_order():
+def test_long_is_approved_with_the_expected_members_in_order():
     style = L._load_style_spec(_STAGE2, "long")
-    assert style["status"] == "draft"
+    assert style["status"] == "approved"
     assert [m["key"] for m in style["members"]] == MEMBERS
     assert style["price_cap_policy"] == "none"
     assert "O_PBS" not in {m["key"] for m in style["members"]}
