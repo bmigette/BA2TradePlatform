@@ -4,6 +4,10 @@ from fastapi import Depends, FastAPI
 from ba2_trade_platform.api.common import Paging, paging
 from ba2_trade_platform.api.errors import install_error_handlers
 from tests.api_helpers import FakeAccount, client_for, v1_client
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def _app():

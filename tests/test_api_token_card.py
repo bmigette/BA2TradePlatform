@@ -3,7 +3,10 @@ from ba2_trade_platform.api.auth import get_allow_remote, get_api_token
 from ba2_trade_platform.ui.pages.api_token_card import (
     generate_token_for_ui, set_allow_remote_for_ui, token_status_text,
 )
-from tests.api_helpers import set_api_token  # noqa: F401  (marks this module as an API test: shared-thread DB)
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def test_status_text_reflects_stored_token_without_revealing_it():

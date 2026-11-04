@@ -15,6 +15,9 @@ from ba2_trade_platform.services._common import (
 from tests.factories import create_account_definition
 
 
+pytestmark = pytest.mark.api_db
+
+
 def test_error_classes_carry_code_and_status():
     cases = {
         errors.NotFound: (404, "not_found"),

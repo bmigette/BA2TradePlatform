@@ -7,6 +7,10 @@ from ba2_trade_platform.core.ExpertInstanceCache import ExpertInstanceCache
 from ba2_trade_platform.ui import api_routes
 from ba2_trade_platform.version import APP_VERSION
 from tests.api_helpers import TOKEN, client_for, set_allow_remote, set_api_token
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def test_ping_reports_version_to_local_reader_without_token():

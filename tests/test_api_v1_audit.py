@@ -6,6 +6,10 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from ba2_trade_platform.api.audit import AuditedRoute
 from ba2_trade_platform.api.auth import require_access
 from tests.api_helpers import TOKEN, client_for, set_api_token
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def _app() -> FastAPI:

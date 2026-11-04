@@ -583,10 +583,10 @@ def _mock_expert_is_resolvable(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def api_threadsafe_db(request, patch_db_engine):
-    """Management-API tests only (modules that import ``tests.api_helpers``): serve the DB from ONE shared
+    """Management-API tests only (``pytestmark = pytest.mark.api_db``): serve the DB from ONE shared
     connection. ``test_engine`` is a per-thread ``:memory:`` pool, and a ``TestClient`` request runs in another
     thread than the test, so it would see an empty database ("no such table: appsetting")."""
-    if not any(getattr(v, "__module__", None) == "tests.api_helpers" for v in vars(request.module).values()):
+    if request.node.get_closest_marker("api_db") is None:
         yield
         return
     import ba2_common.core.db as _pkg_db

@@ -3,6 +3,10 @@ from fastapi import FastAPI
 
 from ba2_trade_platform.api.app import register_management_api
 from tests.api_helpers import client_for
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def test_register_management_api_mounts_v1_and_legacy_aliases():

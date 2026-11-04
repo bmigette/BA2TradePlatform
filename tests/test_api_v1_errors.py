@@ -5,6 +5,10 @@ from pydantic import BaseModel
 
 from ba2_trade_platform.api.errors import install_error_handlers
 from ba2_trade_platform.services import errors as se
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 class Body(BaseModel):

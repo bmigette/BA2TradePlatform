@@ -9,6 +9,9 @@ from ba2_trade_platform.api.auth import (
 )
 from tests.api_helpers import TOKEN, client_for, set_allow_remote as allow_remote, set_api_token
 
+
+pytestmark = pytest.mark.api_db
+
 REMOTE = "192.168.1.9"
 
 

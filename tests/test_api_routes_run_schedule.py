@@ -12,6 +12,9 @@ from ba2_trade_platform.ui import api_routes
 from tests.api_helpers import TOKEN, client_for, set_api_token
 
 
+pytestmark = pytest.mark.api_db
+
+
 def _client():
     set_api_token()
     app = FastAPI()

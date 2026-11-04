@@ -12,6 +12,10 @@ from ba2_trade_platform.core.ExpertInstanceCache import ExpertInstanceCache
 from ba2_trade_platform.ui import api_routes
 from tests.api_helpers import TOKEN, client_for, set_api_token
 from tests.factories import create_account_definition, create_expert_instance
+import pytest
+
+
+pytestmark = pytest.mark.api_db
 
 
 def _client():
