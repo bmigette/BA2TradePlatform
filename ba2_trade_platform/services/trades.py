@@ -18,12 +18,13 @@ from ..core.db import get_db, update_instance
 from ..core.models import AccountDefinition, ActivityLog, TradingOrder, Transaction
 from ..core.TransactionHelper import TransactionHelper
 from ..core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
-from ..core.utils import close_transaction_with_logging, get_account_instance_from_transaction
+from ..core.utils import (close_transaction_with_logging, get_account_instance_from_id,
+                          get_account_instance_from_transaction)
 from ..logger import logger
 from ..modules.accounts import get_account_class
 from ._common import jsonable, naive_utc, page, parse_enum, require_row, row_dict
 from ._locks import expert_write_lock
-from .accounts import map_broker_error
+from .accounts import broker_write, map_broker_error
 from .errors import BrokerRefused, Conflict, Invalid, NotFound
 
 
@@ -489,3 +490,53 @@ def close_transaction(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
         if key in result:
             out[key] = result[key]
     return jsonable(out)
+
+
+# ======================================================================================================
+# Cancel one order
+# ======================================================================================================
+
+#: Statuses an order cannot be cancelled from: finished ones, a fill, and a cancel already on its way.
+_NOT_CANCELLABLE = OrderStatus.get_terminal_statuses() | {OrderStatus.FILLED, OrderStatus.PENDING_CANCEL}
+
+
+def _cancel_guards(order: TradingOrder) -> None:
+    detail = {"id": order.id, "status": order.status.value}
+    if order.status in _NOT_CANCELLABLE:
+        raise Conflict(f"Order {order.id} is {order.status.value}: it cannot be cancelled", detail)
+    if not order.broker_order_id:
+        raise Conflict(f"Order {order.id} has not been sent to the broker (status {order.status.value}); "
+                       f"there is nothing to cancel there. To drop a staged exit, close or adjust its transaction",
+                       detail)
+
+
+def cancel_order(order_id: int, *, dry_run: bool) -> Dict[str, Any]:
+    """POST /orders/{id}/cancel: ask the broker to cancel one working order -- the call the TP/SL flows already
+    make for a standing leg (``account.cancel_order(order.id)``). The account marks the order PENDING_CANCEL; the
+    account refresh confirms CANCELED once the broker does. 409 on a finished order, a fill, a cancel already
+    pending, or an order the broker never received."""
+    with get_db() as session:
+        order = require_row(session, TradingOrder, order_id, "order")
+        expert_id = None
+        if order.transaction_id is not None:
+            txn = session.get(Transaction, order.transaction_id)
+            expert_id = txn.expert_id if txn is not None else None
+        session.expunge(order)
+    _cancel_guards(order)
+    if dry_run:
+        return jsonable({"order_id": order_id, "dry_run": True, "would_cancel": _leg_dict(order)})
+    with expert_write_lock(expert_id):
+        with get_db() as session:
+            order = require_row(session, TradingOrder, order_id, "order")
+            session.expunge(order)
+        _cancel_guards(order)                                  # re-checked under the lock
+        account = get_account_instance_from_id(order.account_id)
+        if account is None:
+            raise NotFound(f"No account with id {order.account_id}", {"id": order.account_id})
+        accepted = broker_write(order.account_id, "the order cancel", account.cancel_order, order.id)
+    if not accepted:
+        raise BrokerRefused(f"The broker did not accept the cancel of order {order_id}", {"id": order_id})
+    with get_db() as session:
+        status = require_row(session, TradingOrder, order_id, "order").status
+    return jsonable({"order_id": order_id, "dry_run": False, "cancel_requested": True, "status": status,
+                     "broker_order_id": order.broker_order_id})
