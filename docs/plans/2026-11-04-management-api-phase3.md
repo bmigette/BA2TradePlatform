@@ -72,3 +72,16 @@ switched to call it; a parity test drives both callers against a call-recording 
 3. `validate_tp_sl` falls back to the transaction's open price when the current price cannot be read (page
    behaviour, at odds with the no-fallback rule).
 4. The settings page save (one form, ~40 widgets) is not extracted; only the shared primitives are.
+
+## As built (addendum)
+
+- Retry-close ("Reset & Retry") shares `prepare_close(retry=True)` with Close; both page buttons go through
+  `LiveTradesTab._close_flow`.
+- `POST /experts/{id}/run` takes the expert's locks while it submits, then calls the same `ui/api_routes.run_schedule`
+  as `/api/run-schedule` (an invalid subtype is therefore 400 `bad_request`, as on the legacy path).
+- Enabling an expert (not disabling) and changing `market_condition_profile` run `check_market_gates`; a refusal is a 409.
+- `virtual_equity_pct` is capped at 1000 (the dialog has no cap); PATCH settings stops at the first save error and
+  reports which keys were already written (422 `invalid`, detail `saved`).
+- `?dry_run=true` still reads the account's current price for the TP/SL direction check (a read, never a write).
+- Not extracted (kept in their pages): the quantity edit in `_update_position`, the `_recreate_tpsl_orders` button,
+  the batch close / batch TP buttons, and the widget-bound parts of the Settings save.
