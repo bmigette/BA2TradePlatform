@@ -414,8 +414,9 @@ the verified split table); stage 1 stays on `fmp`, stage 1.5 runs on `alpaca` (o
 |---|---|---|---|---|
 | 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) | `2b958769b8a44539d90b4f9b3e156a3e9a5461c425cb717c118400eb999c275f` | `7e1904763ec74ca61aa6f580f1328630c160e4de141bd93a4252fb71bdc42070` |
 | 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` | `59f8826b7381baa6039c8b5c2467c785aa0770e2435cf717537880183fa78d65` | `8fac4e9de1d2b68669d34b87ed121765979ae3f51a22e7eeefd8ea40869859d7` |
+| 753 names (stage 2), local, Alpaca build `20261104T193527Z-5773e25c` (TEVA predecessor merge), synced to remote227 | (fmp unchanged) | (fmp unchanged) | `f0fe573aa4c92ca0f3a6cb88553c085f43b6dfe93b4994ab6c0a8d21e5db337a` | `e2ff85f617671c4b5ff8fde1e0375ecf7a4424b13ed9a12918c69df7624d1be4` |
 
-The alpaca digests are those of the local workstation on the Alpaca cache build `20261022T161730Z-94bd45e0` (gate
+Stage 2 (2026-11-04 on) uses the `20261104T193527Z-5773e25c` row: `prepare_history.py --source alpaca --steps split-table,build,verify,market-conditions --panel-symbols <screener daily panel 03d21a4a2f176c69 symbols.json> --universe-file tools/options_universe_stage2.txt --start 2020-01-02 --end 2025-12-31 --workers 6`; its window check leaves only PS (listed 2026-04-29, no 2020-2025 bars), so PS was removed from `tools/options_universe_stage2.txt` (752 names). The alpaca digests are those of the local workstation on the Alpaca cache build `20261022T161730Z-94bd45e0` (gate
 certificate PASS, 2026-10-22: exchange_gap events, reused-ticker truncation, the TIGO rights-offering override), window
 2020-01-02..2025-12-31, `--gap-fill previous`; a worker that holds the pushed cache reproduces them. The previous build
 (`20261021T135237Z-4de54841`, 2026-10-21) gave `32b94b83…` / `61ea5c16…` (97 names) and `d00d1c52…` / `1b627b4c…` (753).
