@@ -544,3 +544,45 @@ def portfolio_view(account_id: int) -> Dict[str, Any]:
                    "synced_by": "the Portfolio Allocation page load / Refresh; the API never syncs the ledger"},
     }
     return jsonable(out)
+
+
+_RUN_LIST_COLUMNS = ("id", "account_id", "mode", "scope_label", "base_notional", "available_buying_power",
+                     "allow_fractional", "filled_buy_value", "filled_sell_value", "order_ids",
+                     "income_consumed_at", "created_at")
+
+
+def allocation_runs(account_id: int, *, limit: int, offset: int) -> Dict[str, Any]:
+    """``GET /accounts/{id}/portfolio/runs``: allocation runs, newest first, paged in SQL over the list columns
+    only (``plan_json`` and ``income_consumed_events`` are never loaded).
+
+    Fill status is read from the stored order rows (DB only, no broker): ``working`` while any execution order can
+    still fill or could not be valued, ``settled`` once all are final, ``no_orders`` for a run that placed none.
+    ``filled_*`` are the figures the run recorded; ``measured_*`` are the same sums over the order rows NOW."""
+    from ..core.models import AccountDefinition, PortfolioAllocationRun
+    from ..core.portfolio_allocation import measure_filled_values
+    from ._common import jsonable, page, require_row
+
+    with get_db() as session:
+        require_row(session, AccountDefinition, account_id, "account")
+        columns = [getattr(PortfolioAllocationRun, name) for name in _RUN_LIST_COLUMNS]
+        stmt = (select(*columns).where(PortfolioAllocationRun.account_id == account_id)
+                .order_by(PortfolioAllocationRun.created_at.desc(), PortfolioAllocationRun.id.desc()))
+        result = page(session, stmt, limit=limit, offset=offset, convert=lambda r: dict(r._mapping))
+    wanted = sorted({int(i) for run in result["items"] for i in (run["order_ids"] or [])})
+    fills_by_order = {f.order_id: f for f in svc.collect_order_fills(account_id, wanted)}
+    for run in result["items"]:
+        ids = [int(i) for i in (run["order_ids"] or [])]
+        fills = [fills_by_order[i] for i in dict.fromkeys(ids) if i in fills_by_order]
+        totals = measure_filled_values(fills)
+        run["order_ids"] = ids
+        run["income_consumed"] = run["income_consumed_at"] is not None
+        run["fill"] = {
+            "status": "no_orders" if not fills else ("settled" if totals.settled else "working"),
+            "orders": len(ids), "execution_orders": len(fills),
+            "working_order_ids": list(totals.working_order_ids),
+            "unmeasurable_order_ids": list(totals.unmeasurable_order_ids),
+            # A fill that cannot be valued makes the sums lower bounds: null, not a smaller number.
+            "measured_buy_value": None if totals.unmeasurable_order_ids else totals.buy_value,
+            "measured_sell_value": None if totals.unmeasurable_order_ids else totals.sell_value,
+        }
+    return jsonable(result)
