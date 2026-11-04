@@ -1,6 +1,7 @@
 """Platform trades (Transaction / TradingOrder): the reads of the management API (phase 2) and the writes the Live
 Trades page and the API SHARE (phase 3: TP/SL, close, cancel). "One function, two callers": the page keeps only its
 dialogs and notifications; every decision and every broker call is made here, so the two cannot disagree."""
+import asyncio
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -16,7 +17,8 @@ from ba2_common.core.utils import calculate_transaction_pnl
 from ..core.db import get_db, update_instance
 from ..core.models import AccountDefinition, ActivityLog, TradingOrder, Transaction
 from ..core.TransactionHelper import TransactionHelper
-from ..core.types import OrderStatus, OrderType, TransactionStatus
+from ..core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
+from ..core.utils import close_transaction_with_logging, get_account_instance_from_transaction
 from ..logger import logger
 from ..modules.accounts import get_account_class
 from ._common import jsonable, naive_utc, page, parse_enum, require_row, row_dict
@@ -375,3 +377,115 @@ def unlock_tp_sl(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
     with _write_scope(expert_id, dry_run):
         result = clear_override_locks(transaction_id)
     return {"transaction_id": transaction_id, "dry_run": False, "cleared": result.cleared}
+
+
+# ======================================================================================================
+# Close (shared with the Live Trades page: _close_position and _retry_close_position)
+# ======================================================================================================
+
+@dataclass
+class PreparedClose:
+    """What ``prepare_close`` decided. ``immediate`` is set when the close was completed on the spot (an orphaned
+    transaction with no orders: marked closed, no broker involved); otherwise ``account`` runs the close."""
+    transaction_id: int
+    account: Any
+    immediate: Optional[Dict[str, Any]]
+
+
+def _close_guards(txn: Transaction, retry: bool) -> None:
+    """The refusals, in the page's order. ``detail["severity"] == "warning"`` marks the two the page shows as a
+    warning rather than an error."""
+    detail = {"id": txn.id, "status": txn.status.value}
+    if retry:
+        if txn.status != TransactionStatus.CLOSING:
+            raise Conflict("Transaction is not in CLOSING status", dict(detail, severity="warning"))
+    elif txn.status == TransactionStatus.CLOSING:
+        raise Conflict("Transaction is already being closed", dict(detail, severity="warning"))
+    elif txn.status == TransactionStatus.CLOSED:
+        raise Conflict(f"Transaction {txn.id} is already closed", detail)
+    if txn.status == TransactionStatus.FAILED:
+        raise Conflict("Cannot process FAILED transaction - transaction was previously marked as failed", detail)
+
+
+def prepare_close(transaction_id: int, *, retry: bool = False) -> PreparedClose:
+    """Guards, account lookup and the orphaned-transaction branch of "Close Position" (``retry=True``: the
+    "Reset & Retry" button for a transaction stuck in CLOSING, which requires that status)."""
+    with get_db() as session:
+        txn = session.get(Transaction, transaction_id)
+        if txn is None:
+            raise NotFound("Transaction not found", {"id": transaction_id})
+        session.expunge(txn)
+    _close_guards(txn, retry)
+    account = get_account_instance_from_transaction(transaction_id)
+    if not account:
+        # Transaction is orphaned (no orders found) - mark as closed with logging
+        logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
+        close_transaction_with_logging(
+            txn,
+            account_id=1,  # default account ID for orphaned transactions (the page has always done this)
+            close_reason="orphaned_no_orders",
+            additional_data={"note": "Transaction had no associated orders"}
+        )
+        update_instance(txn)
+        return PreparedClose(transaction_id, None, {"success": True, "orphaned": True,
+                                                    "message": "Transaction closed (was orphaned with no orders)"})
+    return PreparedClose(transaction_id, account, None)
+
+
+async def run_close(prepared: PreparedClose) -> Dict[str, Any]:
+    """Run the close on the account (cancels unfilled orders, deletes WAITING_TRIGGER ones, submits or retries the
+    closing order, refreshes orders and transactions) and return its result dict."""
+    if prepared.immediate is not None:
+        return prepared.immediate
+    return await prepared.account.close_transaction_async(prepared.transaction_id)
+
+
+def describe_close(transaction_id: int) -> Dict[str, Any]:
+    """Dry run of a close: the guards, then the orders ``close_transaction`` would cancel or delete and the closing
+    order it would submit. Reads the order store only -- no account object, no broker."""
+    with get_db() as session:
+        txn = require_row(session, Transaction, transaction_id, "transaction")
+        session.expunge(txn)
+    _close_guards(txn, False)
+    orders = sorted(orders_where(transaction_id=transaction_id), key=lambda o: o.id)
+    if not orders:
+        return {"transaction_id": transaction_id, "dry_run": True, "orphaned": True, "would_cancel": [],
+                "would_delete": [], "would_submit_close": None,
+                "note": "no orders: the transaction would be marked closed without contacting the broker"}
+    working = [o for o in orders if o.status not in OrderStatus.get_terminal_statuses()
+               and o.status != OrderStatus.FILLED]
+    return {"transaction_id": transaction_id, "dry_run": True, "orphaned": False,
+            "would_cancel": [_leg_dict(o) for o in working if o.broker_order_id],
+            "would_delete": [_leg_dict(o) for o in working if not o.broker_order_id
+                             and o.status == OrderStatus.WAITING_TRIGGER],
+            "would_submit_close": {"symbol": txn.symbol, "quantity": txn.quantity,
+                                   "side": "SELL" if txn.side == OrderDirection.BUY else "BUY"},
+            "note": "the account decides the details: an existing live closing order is left alone, a dead one is "
+                    "retried; the listed orders are the ones that may be touched"}
+
+
+def close_transaction(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
+    """POST /transactions/{id}/close: the page's "Close Position". Runs the account's async close on a private
+    event loop (this function is called from a worker thread)."""
+    if dry_run:
+        return jsonable(describe_close(transaction_id))
+    with get_db() as session:
+        txn = require_row(session, Transaction, transaction_id, "transaction")
+        expert_id = txn.expert_id
+    with expert_write_lock(expert_id):
+        prepared = prepare_close(transaction_id)
+        try:
+            result = asyncio.run(run_close(prepared))
+        except Exception as e:
+            mapped = map_broker_error(e, _account_id_of(prepared.account) or 0, "the close")
+            if mapped is None:
+                raise
+            raise mapped from e
+    if not result["success"]:
+        raise BrokerRefused(result["message"], {"id": transaction_id})
+    out = {"transaction_id": transaction_id, "dry_run": False, "success": True, "message": result["message"],
+           "orphaned": "orphaned" in result and result["orphaned"]}
+    for key in ("canceled_count", "deleted_count", "close_order_id"):
+        if key in result:
+            out[key] = result[key]
+    return jsonable(out)

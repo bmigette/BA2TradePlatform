@@ -1314,65 +1314,51 @@ class LiveTradesTab:
         dialog.open()
 
     def _retry_close_position(self, transaction_id, dialog):
-        """Reset transaction status from CLOSING to allow retry, then close using AccountInterface."""
-        from ...core.models import Transaction, TradingOrder
-        from ...core.types import TransactionStatus, OrderStatus
-        from ...core.db import update_instance
+        """Retry closing a transaction stuck in CLOSING (guards and close live in services.trades)."""
+        self._close_flow(transaction_id, dialog, retry=True)
 
+    def _close_flow(self, transaction_id, dialog, retry: bool):
+        """Shared body of "Close Position" and "Reset & Retry": the service decides (guards, orphaned
+        transaction, account lookup) and runs the account's async close; this only notifies."""
+        from ...services import trades as trade_service
+        from ...services.errors import Conflict, ServiceError
+
+        label = 'Retry close transaction' if retry else 'Close transaction'
         try:
-            txn = get_instance(Transaction, transaction_id)
-            if not txn:
-                ui.notify('Transaction not found', type='negative')
+            try:
+                prepared = trade_service.prepare_close(transaction_id, retry=retry)
+            except ServiceError as e:
+                warning = 'severity' in e.detail and e.detail['severity'] == 'warning'
+                ui.notify(e.message, type='warning' if warning else 'negative')
+                if isinstance(e, Conflict):
+                    dialog.close()
                 return
 
-            if txn.status != TransactionStatus.CLOSING:
-                ui.notify('Transaction is not in CLOSING status', type='warning')
+            if prepared.immediate is not None:      # orphaned transaction: closed without a broker
+                ui.notify(prepared.immediate['message'], type='positive')
                 dialog.close()
+                self._refresh_transactions()
                 return
-
-            # Get account interface using centralized helper
-            from ...core.utils import get_account_instance_from_transaction, close_transaction_with_logging
-
-            account = get_account_instance_from_transaction(transaction_id)
-            if not account:
-                if txn.status.value == 'FAILED':
-                    ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
-                    dialog.close()
-                    return
-                else:
-                    # Transaction is orphaned (no orders found) - mark as closed with logging
-                    logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
-                    close_transaction_with_logging(
-                        txn,
-                        account_id=1,  # Use default account ID for orphaned transactions
-                        close_reason="orphaned_no_orders",
-                        additional_data={"note": "Transaction had no associated orders"}
-                    )
-                    update_instance(txn)
-                    ui.notify('Transaction closed (was orphaned with no orders)', type='positive')
-                    dialog.close()
-                    self._refresh_transactions()
-                    return
 
             # Capture client for background task
             from nicegui import context
             client = context.client
 
-            # Use async AccountInterface close_transaction method (handles retry logic and refresh)
-            logger.info(f"Retrying close for transaction {transaction_id}")
+            # Use async AccountInterface close_transaction method (includes refresh)
+            logger.info(f"{'Retrying close for' if retry else 'Closing'} transaction {transaction_id}")
 
-            async def retry_close_async():
+            async def close_async():
                 try:
-                    result = await account.close_transaction_async(transaction_id)
+                    result = await trade_service.run_close(prepared)
 
                     # Use client.safe_invoke for UI updates from background task
                     def show_result():
                         if result['success']:
                             ui.notify(result['message'], type='positive')
-                            logger.info(f"Retry close transaction {transaction_id}: {result['message']}")
+                            logger.info(f"{label} {transaction_id}: {result['message']}")
                         else:
                             ui.notify(result['message'], type='negative')
-                            logger.error(f"Retry close transaction {transaction_id} failed: {result['message']}")
+                            logger.error(f"{label} {transaction_id} failed: {result['message']}")
                         self._refresh_transactions()
 
                     client.safe_invoke(show_result)
@@ -1380,13 +1366,13 @@ class LiveTradesTab:
                 except Exception as e:
                     # Schedule error notification via client
                     def show_error():
-                        ui.notify(f'Error during retry close: {str(e)}', type='negative')
+                        ui.notify(f"Error during {'retry close' if retry else 'close'}: {str(e)}", type='negative')
                     client.safe_invoke(show_error)
-                    logger.error(f"Error in retry_close_async: {e}", exc_info=True)
+                    logger.error(f"Error in close_async: {e}", exc_info=True)
 
             # Run async operation using background_tasks
             from nicegui import background_tasks
-            background_tasks.create(retry_close_async(), name=f'retry_close_{transaction_id}')
+            background_tasks.create(close_async(), name=f"{'retry_close' if retry else 'close'}_{transaction_id}")
 
             dialog.close()
             # Show immediate feedback
@@ -1394,7 +1380,7 @@ class LiveTradesTab:
 
         except Exception as e:
             ui.notify(f'Error: {str(e)}', type='negative')
-            logger.error(f"Error retrying close position: {e}", exc_info=True)
+            logger.error(f"Error closing position: {e}", exc_info=True)
 
     def _show_close_dialog(self, event_data):
         """Show confirmation dialog before closing a position."""
@@ -1422,93 +1408,14 @@ class LiveTradesTab:
 
     def _close_position(self, transaction_id, dialog):
         """
-        Close a position using AccountInterface.close_transaction method.
-        This handles all closing logic including:
+        Close a position using AccountInterface.close_transaction (via services.trades.prepare_close /
+        run_close, shared with the management API). That handles all closing logic including:
         - Canceling unfilled orders
         - Deleting WAITING_TRIGGER orders
         - Checking for existing close orders
         - Creating new closing orders if needed
         """
-        from ...core.models import Transaction, TradingOrder
-        from ...core.types import TransactionStatus
-
-        try:
-            txn = get_instance(Transaction, transaction_id)
-            if not txn:
-                ui.notify('Transaction not found', type='negative')
-                return
-
-            # Check if transaction is already being closed
-            if txn.status == TransactionStatus.CLOSING:
-                ui.notify('Transaction is already being closed', type='warning')
-                dialog.close()
-                return
-
-            # Get account interface using centralized helper
-            from ...core.utils import get_account_instance_from_transaction, close_transaction_with_logging
-
-            account = get_account_instance_from_transaction(transaction_id)
-            if not account:
-                if txn.status.value == 'FAILED':
-                    ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
-                    dialog.close()
-                    return
-                else:
-                    # Transaction is orphaned (no orders found) - mark as closed with logging
-                    logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
-                    close_transaction_with_logging(
-                        txn,
-                        account_id=1,  # Use default account ID for orphaned transactions
-                        close_reason="orphaned_no_orders",
-                        additional_data={"note": "Transaction had no associated orders"}
-                    )
-                    update_instance(txn)
-                    ui.notify('Transaction closed (was orphaned with no orders)', type='positive')
-                    dialog.close()
-                    self._refresh_transactions()
-                    return
-
-            # Capture client for background task
-            from nicegui import context
-            client = context.client
-
-            # Use async AccountInterface close_transaction method (includes refresh)
-            logger.info(f"Closing transaction {transaction_id}")
-
-            async def close_async():
-                try:
-                    result = await account.close_transaction_async(transaction_id)
-
-                    # Use client.safe_invoke for UI updates from background task
-                    def show_result():
-                        if result['success']:
-                            ui.notify(result['message'], type='positive')
-                            logger.info(f"Close transaction {transaction_id}: {result['message']}")
-                        else:
-                            ui.notify(result['message'], type='negative')
-                            logger.error(f"Close transaction {transaction_id} failed: {result['message']}")
-                        self._refresh_transactions()
-
-                    client.safe_invoke(show_result)
-
-                except Exception as e:
-                    # Schedule error notification via client
-                    def show_error():
-                        ui.notify(f'Error during close: {str(e)}', type='negative')
-                    client.safe_invoke(show_error)
-                    logger.error(f"Error in close_async: {e}", exc_info=True)
-
-            # Run async operation using background_tasks
-            from nicegui import background_tasks
-            background_tasks.create(close_async(), name=f'close_{transaction_id}')
-
-            dialog.close()
-            # Show immediate feedback
-            ui.notify('Closing transaction...', type='info')
-
-        except Exception as e:
-            ui.notify(f'Error: {str(e)}', type='negative')
-            logger.error(f"Error closing position: {e}", exc_info=True)
+        self._close_flow(transaction_id, dialog, retry=False)
 
     def _show_recommendation_dialog(self, event_data):
         """Show expert recommendation details in a dialog."""
