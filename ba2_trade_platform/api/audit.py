@@ -91,7 +91,8 @@ def _begin_idempotent(request: Request, body: bytes):
     key = key.strip()
     if not key or len(key) > idempotency.MAX_KEY_CHARS:
         raise HTTPException(status_code=422, detail=f"Idempotency-Key must be 1-{idempotency.MAX_KEY_CHARS} characters")
-    scope = f"{request.method} {request.url.path}"
+    tail = request.state.token_tail if hasattr(request.state, "token_tail") else None
+    scope = f"{tail}:{request.method} {request.url.path}"
     outcome, stored = idempotency.STORE.begin(scope, key, idempotency.fingerprint(body, request.url.query))
     if outcome == "run":
         return scope, key
@@ -118,27 +119,30 @@ class AuditedRoute(APIRoute):
                 return await original(request)
             body = b""
             claimed = None
+            finished = False
             try:
-                await run_in_threadpool(require_access, request)
-                body = await _read_capped_body(request)
-                replay = _begin_idempotent(request, body)
-                if isinstance(replay, Response):
-                    audit_write(request, body, replay.status_code)
-                    return replay
-                claimed = replay
-                response = await original(request)
-            except Exception as exc:
-                if claimed is not None:
-                    idempotency.STORE.abort(*claimed)
-                audit_write(request, body, _status_of(exc))
-                raise
-            if claimed is not None:
-                if 200 <= response.status_code < 300:
+                try:
+                    await run_in_threadpool(require_access, request)
+                    body = await _read_capped_body(request)
+                    replay = _begin_idempotent(request, body)
+                    if isinstance(replay, Response):
+                        audit_write(request, body, replay.status_code)
+                        return replay
+                    claimed = replay
+                    response = await original(request)
+                except Exception as exc:
+                    audit_write(request, body, _status_of(exc))
+                    raise
+                if claimed is not None and 200 <= response.status_code < 300:
                     idempotency.STORE.finish(*claimed, idempotency.Stored(
                         response.status_code, bytes(response.body), response.media_type))
-                else:
+                    finished = True
+                audit_write(request, body, response.status_code)
+                return response
+            finally:
+                # Whatever happened -- a failure, a non-2xx answer, or a cancellation (BaseException) -- a claim that
+                # was not completed is dropped, so the key is never left "busy".
+                if claimed is not None and not finished:
                     idempotency.STORE.abort(*claimed)
-            audit_write(request, body, response.status_code)
-            return response
 
         return handler

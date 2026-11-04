@@ -2764,10 +2764,11 @@ class TradeManager:
                 self._processing_locks[lock_key] = threading.Lock()
             return self._processing_locks[lock_key]
 
-    def hold_expert_locks(self, expert_instance_id: int, timeout: float):
-        """Context manager for a MANAGEMENT-API write: holds BOTH per-expert processing locks (the ones the
-        enter_market and open_positions passes take) so the write cannot interleave with a pass. Waits up to
-        ``timeout`` seconds in total; yields True when both were taken, False (holding neither) otherwise.
+    def hold_expert_locks(self, expert_instance_id: int, timeout: float, use_cases=None):
+        """Context manager for a MANAGEMENT-API write: holds the per-expert processing locks named by
+        ``use_cases`` (default BOTH: the ones the enter_market and open_positions passes take) so the write cannot
+        interleave with a pass. Waits up to ``timeout`` seconds in total; yields True when all were taken, False
+        (holding none) otherwise.
         Passes use a 0.5 s try-lock and skip when busy, so a held write makes them skip, never deadlock."""
         import time
         from contextlib import contextmanager
@@ -2776,8 +2777,10 @@ class TradeManager:
         def _hold():
             deadline = time.monotonic() + timeout
             held = []
+            wanted = self._PROCESSING_USE_CASES if use_cases is None else [
+                u for u in self._PROCESSING_USE_CASES if u in use_cases]
             try:
-                for use_case in self._PROCESSING_USE_CASES:      # fixed order: two writers cannot deadlock
+                for use_case in wanted:      # fixed order: two writers cannot deadlock
                     lock = self._processing_lock(expert_instance_id, use_case)
                     if not lock.acquire(blocking=True, timeout=max(0.0, deadline - time.monotonic())):
                         yield False
