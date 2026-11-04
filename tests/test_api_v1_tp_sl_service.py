@@ -5,7 +5,8 @@ from ba2_trade_platform.core.db import get_instance
 from ba2_trade_platform.core.models import Transaction
 from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
 from ba2_trade_platform.services import trades as svc
-from ba2_trade_platform.services.errors import BrokerRefused, BrokerUnreachable, Conflict, Invalid, NotFound
+from ba2_trade_platform.services.errors import (BrokerRefused, BrokerUnreachable, Conflict, Invalid, NotFound,
+                                                  Unmeasurable)
 from tests.api_write_fakes import RecordingAccount, install_account
 from tests.factories import create_account_definition, create_expert_instance, create_trading_order, create_transaction
 
@@ -109,15 +110,14 @@ def test_context_errors_use_the_dialog_wording():
         svc.tp_sl_context(t.id)
 
 
-def test_validate_rejects_swapped_values_and_falls_back_to_open_price(acct):
+def test_validate_rejects_swapped_values_and_never_falls_back_to_the_open_price(acct):
     t = _txn()
     txn, account = svc.tp_sl_context(t.id)
     with pytest.raises(Invalid, match="swapped"):
         svc.validate_tp_sl(account, txn, 90.0, 120.0)
-    acct.price = None                       # unreadable: the open price (100) is the reference
-    svc.validate_tp_sl(account, txn, 130.0, 80.0)
-    with pytest.raises(Invalid):
-        svc.validate_tp_sl(account, txn, 95.0, 80.0)
+    acct.price = None                       # unreadable: refused, NOT judged against the open price
+    with pytest.raises(Unmeasurable):
+        svc.validate_tp_sl(account, txn, 130.0, 80.0)
 
 
 # --- clear_override_locks ----------------------------------------------------------------------------------------
@@ -237,10 +237,10 @@ def test_set_tp_sl_waits_for_the_expert_lock(acct, monkeypatch):
     monkeypatch.setattr(_locks, "get_trade_manager", lambda: tm)
     t = _txn(with_expert=True)
     expert_id = get_instance(Transaction, t.id).expert_id
-    lock = tm._processing_lock(expert_id, "enter_market")
+    lock = tm._processing_lock(expert_id, "open_positions")
     lock.acquire()
     real = tm.hold_expert_locks
-    monkeypatch.setattr(tm, "hold_expert_locks", lambda eid, timeout: real(eid, 0.2))
+    monkeypatch.setattr(tm, "hold_expert_locks", lambda eid, timeout, use_cases=None: real(eid, 0.2, use_cases))
     try:
         with pytest.raises(Conflict, match="being processed"):
             svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)

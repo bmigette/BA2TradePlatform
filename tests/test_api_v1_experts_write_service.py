@@ -72,7 +72,7 @@ def test_update_expert_dry_run_writes_nothing(env):
     assert out["changed"] == ["enabled"] and get_instance(ExpertInstance, e.id).enabled is True and refreshed == []
 
 
-@pytest.mark.parametrize("kw", [{}, {"virtual_equity_pct": 0.0}, {"virtual_equity_pct": -5.0},
+@pytest.mark.parametrize("kw", [{}, {"virtual_equity_pct": -5.0},
                                 {"virtual_equity_pct": float("nan")}, {"virtual_equity_pct": 5000.0},
                                 {"virtual_equity_pct": True}, {"enabled": "yes"}])
 def test_update_expert_rejects_bad_input(env, kw):

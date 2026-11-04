@@ -137,7 +137,8 @@ def test_page_shows_the_guard_refusals(monkeypatch, page, acct):
     dialog = _Dialog()
     page._close_position(closing.id, dialog)
     assert page.notes[-1] == ("Transaction is already being closed", "warning") and dialog.closed
-    failed = _txn(status=TransactionStatus.FAILED)
+    monkeypatch.setattr(svc, "get_account_instance_from_transaction", lambda tid: None)    # FAILED: no account
+    failed = _txn(status=TransactionStatus.FAILED, orders=False)
     page._close_position(failed.id, _Dialog())
     assert page.notes[-1][1] == "negative" and "FAILED" in page.notes[-1][0]
     assert acct.calls == []

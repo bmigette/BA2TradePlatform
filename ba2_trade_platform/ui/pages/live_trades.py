@@ -1324,13 +1324,17 @@ class LiveTradesTab:
         from ...services.errors import Conflict, ServiceError
 
         label = 'Retry close transaction' if retry else 'Close transaction'
+        prepared = None
         try:
             try:
                 prepared = trade_service.prepare_close(transaction_id, retry=retry)
             except ServiceError as e:
                 warning = 'severity' in e.detail and e.detail['severity'] == 'warning'
                 ui.notify(e.message, type='warning' if warning else 'negative')
-                if isinstance(e, Conflict):
+                # The dialog closes for the CLOSING warning and the FAILED (orphan) refusal only; a busy
+                # transaction lock or a missing transaction leaves it open.
+                failed = 'status' in e.detail and e.detail['status'] == 'FAILED'
+                if isinstance(e, Conflict) and (warning or failed):
                     dialog.close()
                 return
 
@@ -1379,6 +1383,8 @@ class LiveTradesTab:
             ui.notify('Closing transaction...', type='info')
 
         except Exception as e:
+            if prepared is not None:
+                prepared.release()       # the transaction lock is held until run_close finishes
             ui.notify(f'Error: {str(e)}', type='negative')
             logger.error(f"Error closing position: {e}", exc_info=True)
 

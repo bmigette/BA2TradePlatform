@@ -23,14 +23,16 @@ from ..core.utils import (close_transaction_with_logging, get_account_instance_f
 from ..logger import logger
 from ..modules.accounts import get_account_class
 from ._common import jsonable, naive_utc, page, parse_enum, require_row, row_dict
-from ._locks import expert_write_lock
+from ._locks import (EXIT_USE_CASES, acquire_transaction_lock, expert_write_lock,
+                     transaction_write_lock)
 from .accounts import broker_write, map_broker_error
-from .errors import BrokerRefused, Conflict, Invalid, NotFound
+from .errors import BrokerRefused, BrokerUnreachable, Conflict, Invalid, NotFound, Unmeasurable
 
 
 def _write_scope(expert_id: Optional[int], dry_run: bool):
-    """A real write holds the expert's processing locks; a dry run writes nothing and holds none."""
-    return nullcontext() if dry_run else expert_write_lock(expert_id)
+    """A real write holds the expert's EXIT-side processing lock (open_positions; never the entry pass's); a dry run
+    writes nothing and holds none."""
+    return nullcontext() if dry_run else expert_write_lock(expert_id, None, EXIT_USE_CASES)
 
 
 def _transaction_dict(tx: Transaction) -> Dict[str, Any]:
@@ -153,16 +155,24 @@ def tp_sl_context(transaction_id: int):
 def validate_tp_sl(account, txn: Transaction, tp_price: Optional[float], sl_price: Optional[float]) -> None:
     """Direction-aware sanity check BEFORE anything is touched: catches swapped values (TP below entry / SL above
     it on a long) which the broker would reject anyway (Alpaca 42210000) or fill instantly. The reference is the
-    account's current price, the open price when that cannot be read (what the dialog has always done).
-    Raises ``Invalid`` with the reason."""
+    account's CURRENT price and nothing else: an unreadable price refuses (``BrokerUnreachable`` for a connection
+    failure, ``Unmeasurable`` for an unpublished or invalid figure) -- there is no fallback to the open price.
+    Raises ``Invalid`` with the reason for a wrong-sided price."""
     if not (tp_price or sl_price):
         return
     try:
         ref_price = account.get_instrument_current_price(txn.symbol)
-    except Exception:
-        ref_price = None
+    except OSError as e:
+        raise BrokerUnreachable(f"The current price of {txn.symbol} could not be read: {type(e).__name__}",
+                                {"id": txn.id}) from e
+    except ValueError as e:
+        raise Unmeasurable(f"The current price of {txn.symbol} is unavailable: {type(e).__name__}",
+                           {"id": txn.id}) from e
+    if ref_price is None or isinstance(ref_price, bool) or not isinstance(ref_price, (int, float)) \
+            or not math.isfinite(ref_price) or ref_price <= 0:
+        raise Unmeasurable(f"The current price of {txn.symbol} is unavailable", {"id": txn.id})
     ok, reason = TransactionHelper.validate_tp_sl_prices(
-        txn.side, tp_price or None, sl_price or None, reference_price=ref_price or txn.open_price)
+        txn.side, tp_price or None, sl_price or None, reference_price=ref_price)
     if not ok:
         raise Invalid(reason, {"id": txn.id})
 
@@ -223,12 +233,28 @@ def _cancel_standing_tpsl(account, txn: Transaction) -> None:
                 logger.warning(f"Failed to cancel order {order.id}: {e}")
 
 
+def _fresh_transaction(transaction_id: int) -> Transaction:
+    with get_db() as session:
+        txn = require_row(session, Transaction, transaction_id, "transaction")
+        session.expunge(txn)
+    return txn
+
+
 def apply_tp_sl(account, txn: Transaction, tp_price: Optional[float], sl_price: Optional[float], *,
                 source: str) -> TpSlResult:
     """Make the transaction's TP/SL ``tp_price`` / ``sl_price`` (falsy = no leg), exactly as the Live Trades dialog
     does when the quantity is not edited: persist the transaction values first (they are the source of truth),
     then ask the account to sync its orders. A raised account call is logged and returned in ``error``; it is not
-    re-raised (the page notifies it, the API maps it)."""
+    re-raised (the page notifies it, the API maps it).
+
+    Takes the transaction's lock (so an API write and a page edit serialize) and re-reads the transaction under it,
+    so "changed" is judged against the stored values, not a stale copy. ``Conflict`` when the lock stays busy."""
+    with transaction_write_lock(txn.id, with_expert=False):
+        return _apply_tp_sl_locked(account, _fresh_transaction(txn.id), tp_price, sl_price, source=source)
+
+
+def _apply_tp_sl_locked(account, txn: Transaction, tp_price: Optional[float], sl_price: Optional[float], *,
+                        source: str) -> TpSlResult:
     tp_value = tp_price if tp_price else None
     sl_value = sl_price if sl_price else None
     step = plan_tp_sl(txn, tp_value, sl_value)
@@ -263,7 +289,12 @@ class OverrideClear:
 
 def clear_override_locks(transaction_id: int) -> OverrideClear:
     """Clear tp_manual_override / sl_manual_override so the next automation cycle may adjust TP and SL again.
-    ``cleared`` is empty when neither side was locked (nothing is written)."""
+    ``cleared`` is empty when neither side was locked (nothing is written). Under the transaction's lock."""
+    with transaction_write_lock(transaction_id, with_expert=False):
+        return _clear_override_locks_locked(transaction_id)
+
+
+def _clear_override_locks_locked(transaction_id: int) -> OverrideClear:
     with get_db() as session:
         txn = session.get(Transaction, transaction_id)
         if txn is None:
@@ -306,22 +337,39 @@ def _positive_price(name: str, value: Optional[float]) -> Optional[float]:
     return float(value)
 
 
+def _force_override_flags(transaction_id: int, tp: bool, sl: bool) -> None:
+    """Set the manual-override flag(s) directly. The account sets a flag only for a side it is CALLED with, and a
+    side whose value did not change is never sent -- so ``lock=true`` on it would otherwise lock nothing."""
+    with get_db() as session:
+        txn = require_row(session, Transaction, transaction_id, "transaction")
+        if (tp and not txn.tp_manual_override) or (sl and not txn.sl_manual_override):
+            if tp:
+                txn.tp_manual_override = True
+            if sl:
+                txn.sl_manual_override = True
+            update_instance(txn, session)
+
+
 def set_tp_sl(transaction_id: int, *, take_profit: Optional[float], stop_loss: Optional[float],
               lock: bool, dry_run: bool) -> Dict[str, Any]:
     """POST /transactions/{id}/tp-sl: the Live Trades dialog's TP/SL path (no quantity edit).
 
     The request names the sides to CHANGE; an omitted side keeps its stored value, and the RESULTING state is what
     is validated and applied -- exactly what the dialog submits. ``lock=True`` is the dialog's own call
-    (``source="manual"``: the account sets the manual-override lock); otherwise ``source="api"``, and a side that is
-    currently locked is REFUSED (409) instead of being silently dropped by the account's lock rule.
-    ``dry_run`` validates, then reports the planned account call and the standing exit legs it may replace, and
-    writes and calls nothing."""
+    (``source="manual"``: the account sets the manual-override lock) and ALSO locks a named side whose value did
+    not change; otherwise ``source="api"``, and a side that is currently locked is REFUSED (409) instead of being
+    silently dropped by the account's lock rule. ``lock_applied`` says, per side, whether the lock is (or, in a
+    dry run, would be) set by this request. ``dry_run`` validates, then reports the planned account call and the
+    standing exit legs it may replace, and writes and calls nothing.
+
+    Real writes hold the expert's exit lock and the transaction's lock; every guard is checked under them."""
     take_profit = _positive_price("take_profit", take_profit)
     stop_loss = _positive_price("stop_loss", stop_loss)
     if take_profit is None and stop_loss is None:
         raise Invalid("Give take_profit and/or stop_loss", {"fields": ["take_profit", "stop_loss"]})
-    txn, account = tp_sl_context(transaction_id)
-    with _write_scope(txn.expert_id, dry_run):
+    txn, _ = tp_sl_context(transaction_id)
+    scope = nullcontext() if dry_run else transaction_write_lock(transaction_id, txn.expert_id)
+    with scope:
         txn, account = tp_sl_context(transaction_id)        # re-read under the lock
         if txn.status in _NOT_ADJUSTABLE:
             raise Conflict(f"Transaction {transaction_id} is {txn.status.value}: its TP/SL cannot be adjusted",
@@ -337,17 +385,22 @@ def set_tp_sl(transaction_id: int, *, take_profit: Optional[float], stop_loss: O
         sl_value = stop_loss if stop_loss is not None else txn.stop_loss
         validate_tp_sl(account, txn, tp_value, sl_value)
         source = "manual" if lock else "api"
+        lock_applied = {"take_profit": bool(lock and take_profit is not None),
+                        "stop_loss": bool(lock and stop_loss is not None)}
         out: Dict[str, Any] = {"transaction_id": transaction_id, "dry_run": dry_run, "source": source,
-                               "lock": bool(lock), "take_profit": tp_value or None, "stop_loss": sl_value or None}
+                               "lock": bool(lock), "lock_applied": lock_applied,
+                               "take_profit": tp_value or None, "stop_loss": sl_value or None}
         if dry_run:
             step = plan_tp_sl(txn, tp_value or None, sl_value or None)
             out.update({"changed": step is not None, "action": step.method if step else None,
-                        "would_set_locks": (["TP"] if lock and take_profit is not None else [])
-                        + (["SL"] if lock and stop_loss is not None else []),
+                        "would_set_locks": (["TP"] if lock_applied["take_profit"] else [])
+                        + (["SL"] if lock_applied["stop_loss"] else []),
                         "standing_legs": [_leg_dict(o) for o in _standing_tpsl_orders(transaction_id)],
                         "note": "the account decides which standing legs it replaces; they are listed, not simulated"})
             return jsonable(out)
-        result = apply_tp_sl(account, txn, tp_value, sl_value, source=source)
+        if lock:                                           # the operator's intent, committed before any broker work
+            _force_override_flags(transaction_id, lock_applied["take_profit"], lock_applied["stop_loss"])
+        result = _apply_tp_sl_locked(account, _fresh_transaction(transaction_id), tp_value, sl_value, source=source)
         if result.step is not None and not result.success:
             _raise_for_failed(account, transaction_id, result)
         out.update({"changed": result.step is not None, "action": result.step.method if result.step else None,
@@ -376,7 +429,7 @@ def unlock_tp_sl(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
     if dry_run:
         return {"transaction_id": transaction_id, "dry_run": True, "cleared": would}
     with _write_scope(expert_id, dry_run):
-        result = clear_override_locks(transaction_id)
+        result = clear_override_locks(transaction_id)        # takes the transaction's lock itself
     return {"transaction_id": transaction_id, "dry_run": False, "cleared": result.cleared}
 
 
@@ -387,58 +440,88 @@ def unlock_tp_sl(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
 @dataclass
 class PreparedClose:
     """What ``prepare_close`` decided. ``immediate`` is set when the close was completed on the spot (an orphaned
-    transaction with no orders: marked closed, no broker involved); otherwise ``account`` runs the close."""
+    transaction with no orders: marked closed, no broker involved); otherwise ``account`` runs the close.
+    ``lock`` is the transaction's lock, held from the guards until ``run_close`` finishes (``release`` is
+    idempotent; a caller that never reaches ``run_close`` must call it)."""
     transaction_id: int
     account: Any
     immediate: Optional[Dict[str, Any]]
+    lock: Any = None
+
+    def release(self) -> None:
+        lock, self.lock = self.lock, None
+        if lock is not None:
+            lock.release()
 
 
-def _close_guards(txn: Transaction, retry: bool) -> None:
+def _close_guards(txn: Transaction, retry: bool, api: bool = False) -> None:
     """The refusals, in the page's order. ``detail["severity"] == "warning"`` marks the two the page shows as a
-    warning rather than an error."""
+    warning rather than an error. ``api=True`` adds the API-only refusals of an ended transaction (the page lets
+    the account decide those)."""
     detail = {"id": txn.id, "status": txn.status.value}
     if retry:
         if txn.status != TransactionStatus.CLOSING:
             raise Conflict("Transaction is not in CLOSING status", dict(detail, severity="warning"))
     elif txn.status == TransactionStatus.CLOSING:
         raise Conflict("Transaction is already being closed", dict(detail, severity="warning"))
-    elif txn.status == TransactionStatus.CLOSED:
-        raise Conflict(f"Transaction {txn.id} is already closed", detail)
-    if txn.status == TransactionStatus.FAILED:
-        raise Conflict("Cannot process FAILED transaction - transaction was previously marked as failed", detail)
+    if api:
+        if txn.status == TransactionStatus.CLOSED:
+            raise Conflict(f"Transaction {txn.id} is already closed", detail)
+        if txn.status == TransactionStatus.FAILED:
+            raise Conflict(_FAILED_MESSAGE, detail)
 
 
-def prepare_close(transaction_id: int, *, retry: bool = False) -> PreparedClose:
+_FAILED_MESSAGE = "Cannot process FAILED transaction - transaction was previously marked as failed"
+
+
+def prepare_close(transaction_id: int, *, retry: bool = False, api: bool = False) -> PreparedClose:
     """Guards, account lookup and the orphaned-transaction branch of "Close Position" (``retry=True``: the
-    "Reset & Retry" button for a transaction stuck in CLOSING, which requires that status)."""
-    with get_db() as session:
-        txn = session.get(Transaction, transaction_id)
-        if txn is None:
-            raise NotFound("Transaction not found", {"id": transaction_id})
-        session.expunge(txn)
-    _close_guards(txn, retry)
-    account = get_account_instance_from_transaction(transaction_id)
-    if not account:
-        # Transaction is orphaned (no orders found) - mark as closed with logging
-        logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
-        close_transaction_with_logging(
-            txn,
-            account_id=1,  # default account ID for orphaned transactions (the page has always done this)
-            close_reason="orphaned_no_orders",
-            additional_data={"note": "Transaction had no associated orders"}
-        )
-        update_instance(txn)
-        return PreparedClose(transaction_id, None, {"success": True, "orphaned": True,
-                                                    "message": "Transaction closed (was orphaned with no orders)"})
-    return PreparedClose(transaction_id, account, None)
+    "Reset & Retry" button for a transaction stuck in CLOSING, which requires that status).
+
+    Takes the transaction's lock FIRST and checks every guard under it, so two closes cannot both pass the CLOSING
+    check; the lock stays held (in the returned ``PreparedClose``) until ``run_close`` is done. Like the page, a
+    FAILED transaction is refused only when no account resolves for it (no orders); ``api=True`` also refuses
+    CLOSED and FAILED outright."""
+    lock = acquire_transaction_lock(transaction_id)
+    keep = False
+    try:
+        with get_db() as session:
+            txn = session.get(Transaction, transaction_id)
+            if txn is None:
+                raise NotFound("Transaction not found", {"id": transaction_id})
+            session.expunge(txn)
+        _close_guards(txn, retry, api)
+        account = get_account_instance_from_transaction(transaction_id)
+        if not account:
+            if txn.status == TransactionStatus.FAILED:
+                raise Conflict(_FAILED_MESSAGE, {"id": txn.id, "status": txn.status.value})
+            # Transaction is orphaned (no orders found) - mark as closed with logging
+            logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
+            close_transaction_with_logging(
+                txn,
+                account_id=1,  # default account ID for orphaned transactions (the page has always done this)
+                close_reason="orphaned_no_orders",
+                additional_data={"note": "Transaction had no associated orders"}
+            )
+            update_instance(txn)
+            return PreparedClose(transaction_id, None, {"success": True, "orphaned": True,
+                                                        "message": "Transaction closed (was orphaned with no orders)"})
+        keep = True
+        return PreparedClose(transaction_id, account, None, lock)
+    finally:
+        if not keep:
+            lock.release()
 
 
 async def run_close(prepared: PreparedClose) -> Dict[str, Any]:
     """Run the close on the account (cancels unfilled orders, deletes WAITING_TRIGGER ones, submits or retries the
-    closing order, refreshes orders and transactions) and return its result dict."""
-    if prepared.immediate is not None:
-        return prepared.immediate
-    return await prepared.account.close_transaction_async(prepared.transaction_id)
+    closing order, refreshes orders and transactions) and return its result dict. Releases the transaction lock."""
+    try:
+        if prepared.immediate is not None:
+            return prepared.immediate
+        return await prepared.account.close_transaction_async(prepared.transaction_id)
+    finally:
+        prepared.release()
 
 
 def describe_close(transaction_id: int) -> Dict[str, Any]:
@@ -447,7 +530,7 @@ def describe_close(transaction_id: int) -> Dict[str, Any]:
     with get_db() as session:
         txn = require_row(session, Transaction, transaction_id, "transaction")
         session.expunge(txn)
-    _close_guards(txn, False)
+    _close_guards(txn, False, api=True)
     orders = sorted(orders_where(transaction_id=transaction_id), key=lambda o: o.id)
     if not orders:
         return {"transaction_id": transaction_id, "dry_run": True, "orphaned": True, "would_cancel": [],
@@ -467,14 +550,15 @@ def describe_close(transaction_id: int) -> Dict[str, Any]:
 
 def close_transaction(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
     """POST /transactions/{id}/close: the page's "Close Position". Runs the account's async close on a private
-    event loop (this function is called from a worker thread)."""
+    event loop (this function is called from a worker thread). Holds the expert's exit lock and the transaction's
+    lock; the guards (incl. CLOSED / FAILED, API-only) are checked under them."""
     if dry_run:
         return jsonable(describe_close(transaction_id))
     with get_db() as session:
         txn = require_row(session, Transaction, transaction_id, "transaction")
         expert_id = txn.expert_id
-    with expert_write_lock(expert_id):
-        prepared = prepare_close(transaction_id)
+    with expert_write_lock(expert_id, None, EXIT_USE_CASES):
+        prepared = prepare_close(transaction_id, api=True)
         try:
             result = asyncio.run(run_close(prepared))
         except Exception as e:
@@ -482,6 +566,8 @@ def close_transaction(transaction_id: int, *, dry_run: bool) -> Dict[str, Any]:
             if mapped is None:
                 raise
             raise mapped from e
+        finally:
+            prepared.release()
     if not result["success"]:
         raise BrokerRefused(result["message"], {"id": transaction_id})
     out = {"transaction_id": transaction_id, "dry_run": False, "success": True, "message": result["message"],
@@ -510,11 +596,40 @@ def _cancel_guards(order: TradingOrder) -> None:
                        detail)
 
 
+UNPROTECTED_WARNING = "position now unprotected: stored take_profit/stop_loss no longer has a live order"
+
+
+def _cancel_warnings(order: TradingOrder) -> List[str]:
+    """What cancelling this order leaves behind. An order on the OPPOSITE side of its transaction is an exit leg or
+    the close order: cancelling the last live exit leg of a transaction that still stores a TP/SL leaves it
+    unprotected; cancelling a CLOSING transaction's close order leaves it CLOSING."""
+    if order.transaction_id is None:
+        return []
+    with get_db() as session:
+        txn = session.get(Transaction, order.transaction_id)
+        if txn is not None:
+            session.expunge(txn)
+    if txn is None or order.side == txn.side:
+        return []
+    if txn.status == TransactionStatus.CLOSING:
+        return ["transaction stays CLOSING: its close order was cancelled; use Reset & Retry in the Live Trades page "
+                "or close it again once it leaves CLOSING"]
+    if txn.take_profit or txn.stop_loss:
+        live = [o for o in orders_where(transaction_id=txn.id)
+                if o.id != order.id and o.side != txn.side and o.status not in _NOT_CANCELLABLE
+                and o.status != OrderStatus.WAITING_TRIGGER]
+        if not live:
+            return [UNPROTECTED_WARNING]
+    return []
+
+
 def cancel_order(order_id: int, *, dry_run: bool) -> Dict[str, Any]:
     """POST /orders/{id}/cancel: ask the broker to cancel one working order -- the call the TP/SL flows already
     make for a standing leg (``account.cancel_order(order.id)``). The account marks the order PENDING_CANCEL; the
     account refresh confirms CANCELED once the broker does. 409 on a finished order, a fill, a cancel already
-    pending, or an order the broker never received."""
+    pending, or an order the broker never received. ``warnings`` lists what the cancel leaves behind (an
+    unprotected position, a transaction that stays CLOSING). Holds the expert's exit lock and, for an order of a
+    transaction, that transaction's lock."""
     with get_db() as session:
         order = require_row(session, TradingOrder, order_id, "order")
         expert_id = None
@@ -524,12 +639,16 @@ def cancel_order(order_id: int, *, dry_run: bool) -> Dict[str, Any]:
         session.expunge(order)
     _cancel_guards(order)
     if dry_run:
-        return jsonable({"order_id": order_id, "dry_run": True, "would_cancel": _leg_dict(order)})
-    with expert_write_lock(expert_id):
+        return jsonable({"order_id": order_id, "dry_run": True, "would_cancel": _leg_dict(order),
+                         "warnings": _cancel_warnings(order)})
+    scope = transaction_write_lock(order.transaction_id, expert_id) if order.transaction_id is not None \
+        else expert_write_lock(expert_id, None, EXIT_USE_CASES)
+    with scope:
         with get_db() as session:
             order = require_row(session, TradingOrder, order_id, "order")
             session.expunge(order)
-        _cancel_guards(order)                                  # re-checked under the lock
+        _cancel_guards(order)                                  # re-checked under the locks
+        warnings = _cancel_warnings(order)
         account = get_account_instance_from_id(order.account_id)
         if account is None:
             raise NotFound(f"No account with id {order.account_id}", {"id": order.account_id})
@@ -539,4 +658,5 @@ def cancel_order(order_id: int, *, dry_run: bool) -> Dict[str, Any]:
     with get_db() as session:
         status = require_row(session, TradingOrder, order_id, "order").status
     return jsonable({"order_id": order_id, "dry_run": False, "cancel_requested": True, "status": status,
-                     "broker_order_id": order.broker_order_id})
+                     "broker_order_id": order.broker_order_id, "warnings": warnings})
+

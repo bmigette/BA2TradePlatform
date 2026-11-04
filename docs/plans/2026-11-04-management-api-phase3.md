@@ -85,3 +85,27 @@ switched to call it; a parity test drives both callers against a call-recording 
 - `?dry_run=true` still reads the account's current price for the TP/SL direction check (a read, never a write).
 - Not extracted (kept in their pages): the quantity edit in `_update_position`, the `_recreate_tpsl_orders` button,
   the batch close / batch TP buttons, and the widget-bound parts of the Settings save.
+
+## Review fixes (addendum 2)
+
+- **Close guards follow the page.** `prepare_close` refuses CLOSING (plain) or not-CLOSING (retry), and FAILED only
+  when no account resolves (no orders; the real lookup returns None for FAILED, as before). CLOSED and FAILED are
+  refused outright only by the API entries (`close_transaction`, `describe_close`).
+- **No live-price fallback.** `validate_tp_sl` uses the account's current price only: connection failure ->
+  `BrokerUnreachable` (503), unpublished/invalid -> `Unmeasurable` (503), other exceptions propagate. The page shows
+  the refusal as an error notification; nothing is written.
+- **`lock=true`** also locks a named side whose value did not change (the override flag is set directly, before any
+  broker work). `lock_applied` per side is returned in real and dry runs.
+- **Locks.** Order everywhere: expert processing locks first, then the per-transaction `threading.Lock`
+  (`services/_locks.py`). The transaction lock is taken by every API close / TP/SL / unlock / cancel and, through the
+  shared service, by the page's close, retry-close, TP/SL edit and revert paths. Guards are re-checked under it
+  (the CLOSING check is what stops a second close).
+- **Lock scope.** Close, TP/SL, unlock and cancel hold only the `open_positions` expert lock, so they never make the
+  entry pass skip. Settings PATCH, enable/PATCH and `run` hold both (short).
+- **Idempotency** claims are aborted in a `finally` (cancellation included) and scoped by token tail + method + path
+  + key.
+- **Minor.** `update_expert` judges against the row re-read under the lock; `virtual_equity_pct` is 0..1000;
+  `secret_setting_keys` swallows only NotFound (an unreadable definition refuses the PATCH with 503); cancel returns
+  `warnings` (unprotected position; transaction stays CLOSING); the page closes the close-dialog only for the
+  CLOSING warning and the FAILED refusal.
+- **Dry runs write an audit row** (log line + ActivityLog, `query=dry_run=true` recorded) and nothing else. Intended.

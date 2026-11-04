@@ -175,32 +175,38 @@ def update_expert(expert_id: int, *, enabled: Optional[bool], virtual_equity_pct
         raise Invalid("enabled must be true or false", {"field": "enabled"})
     if virtual_equity_pct is not None:
         if isinstance(virtual_equity_pct, bool) or not isinstance(virtual_equity_pct, (int, float)) \
-                or not math.isfinite(virtual_equity_pct) or not 0 < virtual_equity_pct <= MAX_VIRTUAL_EQUITY_PCT:
-            raise Invalid(f"virtual_equity_pct must be a number above 0 and at most {MAX_VIRTUAL_EQUITY_PCT:g}",
+                or not math.isfinite(virtual_equity_pct) or not 0 <= virtual_equity_pct <= MAX_VIRTUAL_EQUITY_PCT:
+            raise Invalid(f"virtual_equity_pct must be a number from 0 to {MAX_VIRTUAL_EQUITY_PCT:g}",
                           {"field": "virtual_equity_pct"})
         virtual_equity_pct = float(virtual_equity_pct)
+    def view(row: ExpertInstance):
+        previous = {"enabled": row.enabled, "virtual_equity_pct": row.virtual_equity_pct}
+        wanted = {"enabled": previous["enabled"] if enabled is None else enabled,
+                  "virtual_equity_pct": previous["virtual_equity_pct"] if virtual_equity_pct is None
+                  else virtual_equity_pct}
+        return previous, wanted, sorted(k for k, v in wanted.items() if v != previous[k])
+
     row = _require_expert_row(expert_id)
-    previous = {"enabled": row.enabled, "virtual_equity_pct": row.virtual_equity_pct}
-    wanted = {"enabled": previous["enabled"] if enabled is None else enabled,
-              "virtual_equity_pct": previous["virtual_equity_pct"] if virtual_equity_pct is None else virtual_equity_pct}
+    previous, wanted, changed = view(row)
     if enabled and not previous["enabled"]:
         try:
             check_market_gates(row.enter_market_ruleset_id, row.open_positions_ruleset_id,
                                lambda: _stored_profile(expert_id))
         except ValueError as e:
             raise Conflict(f"Expert {expert_id} cannot be enabled: {e}", {"id": expert_id}) from e
-    changed = {k: v for k, v in wanted.items() if v != previous[k]}
-    out = {"id": expert_id, "dry_run": dry_run, "previous": previous, "current": wanted, "changed": sorted(changed)}
     if dry_run or not changed:
-        return out
+        return {"id": expert_id, "dry_run": dry_run, "previous": previous, "current": wanted, "changed": changed}
     with expert_write_lock(expert_id):
-        row = _require_expert_row(expert_id)
-        row.enabled, row.virtual_equity_pct = wanted["enabled"], wanted["virtual_equity_pct"]
-        update_instance(row)
-        logger.info(f"Updated expert instance: {expert_id} ({', '.join(sorted(changed))})")
-    _drop_caches(expert_id)
-    refresh_schedules(expert_id)
-    return out
+        row = _require_expert_row(expert_id)           # re-read under the lock: judge against what is stored NOW
+        previous, wanted, changed = view(row)
+        if changed:
+            row.enabled, row.virtual_equity_pct = wanted["enabled"], wanted["virtual_equity_pct"]
+            update_instance(row)
+            logger.info(f"Updated expert instance: {expert_id} ({', '.join(changed)})")
+    if changed:
+        _drop_caches(expert_id)
+        refresh_schedules(expert_id)
+    return {"id": expert_id, "dry_run": False, "previous": previous, "current": wanted, "changed": changed}
 
 
 def _check_setting_value(key: str, definition: Dict[str, Any], value: Any) -> None:
@@ -229,11 +235,17 @@ def _check_setting_value(key: str, definition: Dict[str, Any], value: Any) -> No
 
 def secret_setting_keys(expert_id: int) -> List[str]:
     """Names of the expert's settings that are credentials (by definition flag or by name), so the audit trail can
-    redact their values whatever the request body looked like. Never raises: unknown expert -> none."""
+    redact their values whatever the request body looked like. An unknown expert has none (the write will 404
+    before anything is stored). If the definitions CANNOT be determined the PATCH is refused (503): auditing with
+    weaker redaction is not an option."""
     try:
-        definitions = type(_live_expert(expert_id)).get_merged_settings_definitions()
-    except Exception:
+        expert = _live_expert(expert_id)
+    except NotFound:
         return []
+    except Invalid as e:
+        raise Unmeasurable(f"Expert {expert_id}: its settings definitions cannot be read, so the write is refused "
+                           f"({e.message})", {"id": expert_id}) from e
+    definitions = type(expert).get_merged_settings_definitions()
     return [k for k, d in definitions.items() if is_secret_setting(k, d)]
 
 

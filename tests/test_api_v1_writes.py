@@ -133,13 +133,13 @@ def test_a_running_pass_makes_the_write_a_409_without_a_broker_call(acct, client
     tm = TradeManager()
     monkeypatch.setattr(_locks, "get_trade_manager", lambda: tm)
     real = tm.hold_expert_locks
-    monkeypatch.setattr(tm, "hold_expert_locks", lambda eid, timeout: real(eid, 0.2))
+    monkeypatch.setattr(tm, "hold_expert_locks", lambda eid, timeout, use_cases=None: real(eid, 0.2, use_cases))
     a = create_account_definition()
     expert = create_expert_instance(account_id=a.id)
     t = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED, open_price=100.0, take_profit=120.0,
                            stop_loss=90.0, expert_id=expert.id)
     create_trading_order(a.id, transaction_id=t.id, status=OrderStatus.FILLED)
-    lock = tm._processing_lock(expert.id, "enter_market")
+    lock = tm._processing_lock(expert.id, "open_positions")
     lock.acquire()
     try:
         r = client.post(f"/transactions/{t.id}/tp-sl", json={"take_profit": 130.0})
@@ -221,7 +221,7 @@ def test_patch_expert_route(fake_expert, client):
     assert r.status_code == 200 and r.json()["changed"] == ["enabled", "virtual_equity_pct"]
     row = get_instance(ExpertInstance, e.id)
     assert (row.enabled, row.virtual_equity_pct) == (False, 40.0)
-    for bad in ({}, {"enabled": None}, {"enabled": "false"}, {"virtual_equity_pct": 0}, {"other": 1}):
+    for bad in ({}, {"enabled": None}, {"enabled": "false"}, {"virtual_equity_pct": -1}, {"other": 1}):
         assert client.patch(f"/experts/{e.id}", json=bad).status_code == 422, bad
     assert client.patch("/experts/9999", json={"enabled": True}).status_code == 404
     assert client.patch(f"/experts/{e.id}?dry_run=1", json={"enabled": True}).json()["dry_run"] is True
