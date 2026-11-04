@@ -1326,6 +1326,36 @@ def _resolve_parallel_individuals(ga: Dict[str, Any]) -> int:
     return 1 if raw is None else int(raw)
 
 
+def split_expert_cfg(expert_cfg: Optional[Dict[str, Any]]):
+    """``ga["expert_params"]`` -> ``(model_cfg, screener_cfg, schedule_cfg)``: the ``screener:``/``schedule:``
+    entries are routed to their own namespace (prefix stripped), the rest is the model space. Shared by the
+    handler and the launcher's seed check so both see the same gene space."""
+    model_cfg = None
+    screener_cfg = None
+    schedule_cfg = None
+    if expert_cfg:
+        model_cfg = {k: v for k, v in expert_cfg.items()
+                     if not k.startswith("screener:") and not k.startswith("schedule:")}
+        screener_cfg = {
+            k[len("screener:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("screener:")
+        } or None
+        schedule_cfg = {
+            k[len("schedule:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("schedule:")
+        } or None
+    return model_cfg, screener_cfg, schedule_cfg
+
+
+def job_param_space(strategy, expert_cfg: Optional[Dict[str, Any]], bypass: bool) -> Dict[str, Any]:
+    """The joint GA gene space a job searches (what the handler stores as ``parameter_ranges``)."""
+    model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
+    return collect_param_space(strategy, expert_cfg=model_cfg, bypass=bypass,
+                               screener_cfg=screener_cfg, schedule_cfg=schedule_cfg)
+
+
 def _resolve_lattice_anchor(ga: Dict[str, Any]) -> str:
     """The GA step-lattice anchor a job runs under (``genetic.LATTICE_ANCHORS``).
 
@@ -1797,22 +1827,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # by _collect_expert: the model space gets the remaining keys, and a screener_cfg/
         # schedule_cfg (prefix stripped back to the bare name) is passed alongside so
         # collect_param_space emits the ``screener:<setting>``/``schedule:<day>`` genes.
-        model_cfg = None
-        screener_cfg = None
-        schedule_cfg = None
-        if expert_cfg:
-            model_cfg = {k: v for k, v in expert_cfg.items()
-                        if not k.startswith("screener:") and not k.startswith("schedule:")}
-            screener_cfg = {
-                k[len("screener:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("screener:")
-            } or None
-            schedule_cfg = {
-                k[len("schedule:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("schedule:")
-            } or None
+        model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
 
         # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
         # is known, in addition to the launcher's check -- a hand-written config that bypassed the
@@ -1837,10 +1852,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         # --- Build the joint param space (Task 1) ---
         try:
-            param_space = collect_param_space(
-                strategy, expert_cfg=model_cfg, bypass=bypass_expert,
-                screener_cfg=screener_cfg, schedule_cfg=schedule_cfg,
-            )
+            param_space = job_param_space(strategy, expert_cfg, bypass_expert)
         except ValueError as e:
             return _fail(opt_id, db, str(e))
         opt.parameter_ranges = param_space
@@ -3766,6 +3778,11 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     early_stop_min_rel = _resolve_early_stop_min_rel(ga)
     if early_stop_min_rel is not None:
         payload["early_stop_min_rel"] = early_stop_min_rel
+    if "seedPopulation" in ga:
+        # A seeded run is a different experiment from an unseeded (or differently seeded) one with the same
+        # gene space: its generation-0 population differs, so a checkpoint must never cross.
+        payload["seed_population"] = hashlib.sha1(json.dumps(
+            ga["seedPopulation"], sort_keys=True, default=str).encode("utf-8")).hexdigest()
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 

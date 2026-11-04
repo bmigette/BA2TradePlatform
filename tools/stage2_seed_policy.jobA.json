@@ -1,0 +1,479 @@
+{
+ "note": "DRAFT for user review (2026-11-04): stage-2 job A seed policy. 20 single-member seeds (behaviour-distinct ranks 1-4 of each stage-1 source, other members off) + 4 combined seeds (rank k from all five members, shared genes from O_LC). Fill values are the least restrictive ones; confirm before launch.",
+ "schema": 1,
+ "style": "mid",
+ "individuals": [
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 0,
+   "other_members": "off"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "shared_from": 4,
+   "other_members": "authored"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "shared_from": 4,
+   "other_members": "authored"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "shared_from": 4,
+   "other_members": "authored"
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_STRG",
+     "source": {
+      "opt_id": 129,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_STRD",
+     "source": {
+      "opt_id": 128,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_BULLCS",
+     "source": {
+      "opt_id": 119,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_BF",
+     "source": {
+      "opt_id": 122,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_LC",
+     "source": {
+      "opt_id": 117,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "shared_from": 4,
+   "other_members": "authored"
+  }
+ ],
+ "fill": {
+  "cond:*-spy-trend:mode": "off",
+  "cond:*-spy-vol:mode": "off",
+  "model:max_deployment_pct": 80,
+  "model:circuit_breaker_pct": 50,
+  "model:max_notional_leverage": 10
+ },
+ "out_of_range": "clamp"
+}
