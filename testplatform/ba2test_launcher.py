@@ -7390,7 +7390,9 @@ _STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL", "O_CBS", "O_PBS", "O
 #: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
 #: nothing to act on for them.
 _STYLE_EQUITY_ENTRY = {"O_CC", "O_PP"}
-_STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note"}
+_STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note", "neutral_entry_mode"}
+#: Values of a member's ``neutral_entry_mode`` (the ``--neutral-entry-mode`` choices).
+_STYLE_NEUTRAL_MODES = ("legacy", "hold", "low_confidence", "joint")
 _STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver", "risk"}
 #: A style's own option risk manager (plan 2026-09-25 §3 items 8-9; job A values user 2026-11-03).
 #: ``risk_manager_mode`` plus every rail, each either ``fixed`` (an expert setting) or searched
@@ -7723,6 +7725,15 @@ def _style_risk(kind: "str | None") -> "dict | None":
     return _STYLE_ACTIVE.get("risk")
 
 
+def _style_member_neutral_mode(mem: dict) -> str:
+    """A style member's neutral entry mode; absent = ``legacy`` (today's behaviour)."""
+    return mem["neutral_entry_mode"] if "neutral_entry_mode" in mem else "legacy"
+
+
+def _style_has_non_legacy_neutral(style: dict) -> bool:
+    return any(_style_member_neutral_mode(m) != "legacy" for m in style["members"])
+
+
 def _validate_style(name: str, style: dict) -> None:
     """Every rule of the style spec, refusing by name (plan Task 3, as revised 2026-09-25)."""
     where = f"style {name!r}"
@@ -7770,10 +7781,27 @@ def _validate_style(name: str, style: dict) -> None:
         keys.append(key)
         if "note" in mem and not isinstance(mem["note"], str):
             raise ValueError(f"{mwhere}: note must be a string")
+        if "neutral_entry_mode" in mem:
+            nmode = mem["neutral_entry_mode"]
+            if nmode not in _STYLE_NEUTRAL_MODES:
+                raise ValueError(f"{mwhere}: neutral_entry_mode must be one of "
+                                 f"{list(_STYLE_NEUTRAL_MODES)}, got {nmode!r}")
+            if key not in _NEUTRAL_ENTRY_MEMBERS:
+                raise ValueError(f"{mwhere}: neutral_entry_mode applies only to the neutral "
+                                 f"members {sorted(_NEUTRAL_ENTRY_MEMBERS)}; {key} is directional")
         if "action_overrides" in mem:
             _validate_style_action_overrides(mwhere, key, mem["action_overrides"])
         if "exit_overrides" in mem:
             _validate_style_exit_overrides(mwhere, mem["exit_overrides"])
+    if _style_has_non_legacy_neutral(style):
+        legacy_neutral = [m["key"] for m in members if m["key"] in _NEUTRAL_ENTRY_MEMBERS
+                          and _style_member_neutral_mode(m) == "legacy"]
+        if legacy_neutral:
+            raise ValueError(
+                f"{where}: member(s) {legacy_neutral} use the legacy neutral gate, but another "
+                f"member sets a non-legacy neutral_entry_mode, which turns "
+                f"evaluate_entry_rules_on_hold on for the whole run and so changes what the "
+                f"legacy gate means; give every neutral member an explicit neutral_entry_mode")
     # Inside a style every member's ids are namespaced (``_style_member_id``), which is what
     # lets O_CSP + O_WHEEL and O_CC + O_PP coexist. What can STILL collide is two members that
     # own the same id prefix (e.g. a group key beside one of its own arms): refused, because
@@ -8185,11 +8213,21 @@ def _build_strategy_style(kind: str):
     id_maps: dict = {}
     owners: dict = {}
     shared: dict = {}
+    style_non_legacy = _style_has_non_legacy_neutral(style)
     for mem in style["members"]:
         key = mem["key"]
         tag = _STYLE_MEMBER_TAGS[key]
         try:
             src = _STRATEGY_BUILDERS[key](key)
+            nmode = _style_member_neutral_mode(mem)
+            if nmode != "legacy":
+                # The member's OWN build, exactly as the single job configures it, so its
+                # entry rule ids and genes are the single job's (o_strd-entry-hold, ...).
+                _configure_neutral_entry(src, key, nmode)
+            elif style_non_legacy and key not in _NEUTRAL_ENTRY_MEMBERS:
+                # evaluate_entry_rules_on_hold lets HOLD reach entry rules; this fixed
+                # leaf (no gene) keeps a directional member's admission what it was.
+                _append_directional_leaf(src, key)
             e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
                                                 mem.get("action_overrides"))
             x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
@@ -8775,6 +8813,22 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
     return _clamp_confidence_genes(strat, expert)
 
 
+def _directional_leaf(kind):
+    """The fixed (gene-less) ``rec_direction != 0`` leaf: the recommendation is not HOLD."""
+    return {"id": f"{kind.lower()}-directional", "field": "rec_direction",
+            "op": "!=", "value": 0}
+
+
+def _append_directional_leaf(strategy, kind):
+    """Append the fixed non-HOLD leaf to each entry rule's root AND list (in place)."""
+    for rule in strategy.entry_rules:
+        root = rule["conditions"]
+        if root.get("type") != "AND":
+            raise ValueError(f"{kind}: entry rule {rule.get('id')!r} root is not an AND, so "
+                             f"the fixed directional leaf cannot be appended")
+        root["conditions"].append(_directional_leaf(kind))
+
+
 def _configure_neutral_entry(strategy, kind, mode):
     """Fixed or joint HOLD/low-confidence experiments; never an impossible AND."""
     if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence", "joint"):
@@ -8803,8 +8857,7 @@ def _configure_neutral_entry(strategy, kind, mode):
         if mode == "low_confidence":
             # Confidence alone also accepts HOLD. Make the directional arm explicit
             # using the existing condition, rather than filtering expert outputs.
-            leaves.append({"id": f"{m}-directional", "field": "rec_direction",
-                           "op": "!=", "value": 0})
+            leaves.append(_directional_leaf(kind))
         if mode == "hold":
             # HOLD has no directional price target. Requiring expected_profit > N
             # would silently make this arm untradeable even after admitting HOLD.
@@ -8821,6 +8874,17 @@ def _configure_neutral_entry(strategy, kind, mode):
                     c["toggle_optimize"] = False
                     c["toggleOptimize"] = False
         rule["conditions"]["conditions"] = leaves
+
+
+def _style_effective_neutral_mode(strategy_key, mode):
+    """The mode ``_apply_neutral_entry_setting`` sees: a style's members own it (spec), so the
+    run-level flag is on iff any member is non-legacy."""
+    if strategy_key == _STYLE_KEY:
+        if mode != "legacy":
+            raise ValueError(f"--neutral-entry-mode cannot be combined with --strategy "
+                             f"{_STYLE_KEY}: the style spec owns it (member 'neutral_entry_mode')")
+        return "joint" if _style_has_non_legacy_neutral(_STYLE_ACTIVE) else "legacy"
+    return mode
 
 
 def _apply_neutral_entry_setting(backtest_block, mode):
@@ -9031,6 +9095,10 @@ def _cmd_optimize(args) -> int:
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
         neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+        if args.strategy == _STYLE_KEY and neutral_mode != "legacy":
+            sys.exit(f"optimize: --neutral-entry-mode {neutral_mode} cannot be combined with "
+                     f"--strategy {_STYLE_KEY}: the style spec owns it (set "
+                     f"'neutral_entry_mode' on a member)")
         if bypass and neutral_mode != "legacy":
             raise ValueError("Neutral option entry experiments require a ruleset expert")
         try:
@@ -9137,7 +9205,8 @@ def _cmd_optimize(args) -> int:
         _apply_options_store(args, backtest_block)
         # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
         _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
-        _apply_neutral_entry_setting(backtest_block, neutral_mode)
+        _apply_neutral_entry_setting(
+            backtest_block, _style_effective_neutral_mode(args.strategy, neutral_mode))
         # STAGE 2: the resolved style (content + sha + the path it came from) on the run config.
         # Only style jobs write the key, so every other stored config keeps its shape; the
         # handler carries it into every trial config (_build_daily_trial_config).
