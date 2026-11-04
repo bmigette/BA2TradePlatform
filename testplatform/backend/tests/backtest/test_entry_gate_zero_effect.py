@@ -16,11 +16,34 @@ def _host_db():
     yield
 
 
-def _run(name):
+def _run(name, style=True):
+    from app.services.backtest import daily_backtest_handler as H
+
     bid = new_backtest_row(name)
-    r = run_daily_backtest(earnings_drift_payload(bid, seed=7), task_id=name)
+    payload = earnings_drift_payload(bid, seed=7)
+    real_build = H._build_config
+
+    def build(p):
+        cfg = real_build(p)
+        if style:
+            # Counts are written for STYLE jobs only: their trial configs carry option_style
+            # (strategy_optimization_handler._build_daily_trial_config); inject it the same way.
+            cfg["option_style"] = {"name": "eg-test"}
+        return cfg
+
+    H._build_config = build
+    try:
+        r = run_daily_backtest(payload, task_id=name)
+    finally:
+        H._build_config = real_build
     assert r["status"] == "completed", r.get("error")
     return load_backtest(bid)
+
+
+def test_counts_are_written_for_style_runs_only():
+    plain = _run("eg-plain", style=False)
+    assert "entry_gate_record" not in (plain.results or {})
+    assert plain.total_trades >= 1
 
 
 def test_recorder_changes_nothing_and_records_counts(monkeypatch):

@@ -1572,7 +1572,13 @@ class DailyBacktestEngine:
                 existing_order=None,
             )
             if self._eg is not None:
-                self._eg.note_rules(evaluator.rule_evaluations)
+                try:
+                    self._eg.note_rules(evaluator.rule_evaluations)
+                except (TypeError, KeyError, AttributeError, ValueError) as e:
+                    # Telemetry must never cost a real entry: log once, stop counting this run
+                    # (its record is then absent, never partial).
+                    logger.error(f"entry-gate counter disabled for this run: {e}", exc_info=True)
+                    self._eg = None
             if self._mc is not None:
                 # Classify this recommendation's market leaves. NOTE the evaluator's default
                 # ``evaluate_all_conditions=False``: it stops at the FIRST failing condition,
