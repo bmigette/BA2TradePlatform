@@ -79,6 +79,13 @@ class FakeAccount:
     def _pending_stock_entry_notional(self, exclude_order_id=None):
         return 500.0
 
+    # The portfolio-allocation reads (services.portfolio) also price the book and ask for dividends.
+    def get_instrument_current_price(self, symbols, price_type=None):
+        return {s: 100.0 for s in symbols}
+
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        return []
+
 
 def v1_client(**kwargs) -> TestClient:
     from ba2_trade_platform.api.app import create_v1_app
@@ -91,7 +98,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     from datetime import datetime, timezone
 
     from ba2_trade_platform.core.models import (
-        AccountSetting, ActivityLog, AnalysisOutput, RiskManagerRun, SmartRiskManagerJob)
+        AccountSetting, ActivityLog, AnalysisOutput, PortfolioAllocationRun, RiskManagerRun, SmartRiskManagerJob)
     from ba2_trade_platform.core.types import (
         ActivityLogSeverity, ActivityLogType, MarketAnalysisStatus, TransactionStatus)
     from tests.factories import (
@@ -125,7 +132,24 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
                     "available_balance": 1.0, "equivalent_unlevered_balance": 1.0}
 
     monkeypatch.setattr(experts_svc, "get_expert_instance_from_id", lambda i: SeededExpert())
-    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda i: FakeAccount(i))
+    def _seeded_account(i):
+        fake = FakeAccount(i)
+        fake.positions = [{"symbol": "AAPL", "qty": 10.0, "cost_basis": 900.0, "market_value": 1000.0, "side": "BUY"}]
+        return fake
+
+    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", _seeded_account)
+
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        set_allocation_config, set_managed_label, set_symbol_weight)
+    from ba2_trade_platform.core.utils import add_label_to_instruments
+    set_allocation_config(acct.id, valuation_mode="market")
+    set_managed_label(acct.id, "CORE", target_pct=100.0, comment="see token=PFLABELSECRET1")
+    add_label_to_instruments(["AAPL"], "CORE")
+    set_symbol_weight(acct.id, "CORE", "AAPL", weight_pct=100.0, comment="Bearer PFSYMBOLSECRET2")
+    secrets += ["PFLABELSECRET1", "PFSYMBOLSECRET2"]
+    add_instance(PortfolioAllocationRun(account_id=acct.id, mode="REBALANCE", scope_label="key=PFRUNSECRET3",
+                                        plan_json={}), expunge_after_flush=True)
+    secrets.append("PFRUNSECRET3")
 
     tx = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED, expert_id=expert.id)
     create_trading_order(acct.id, symbol="AAPL", transaction_id=tx.id)
