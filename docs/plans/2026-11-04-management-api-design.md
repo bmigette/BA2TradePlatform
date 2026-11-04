@@ -35,6 +35,17 @@ Today the app exposes three endpoints (`ui/api_routes.py`: `/api/reload`, `/api/
   - With no token set, writes and non-local requests are refused (403). Nothing is open by
     default. This also applies to the three existing endpoints, so local
     `/api/run-schedule` keeps working only once the instance has a token.
+  - **Locality is the socket peer, never a header.** A request counts as remote unless its peer is a
+    loopback address (parsed with `ipaddress`, IPv4-mapped forms unwrapped, unparseable = remote) and it
+    carries none of `X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`; those headers can only
+    make the check stricter. The token-free local read also needs a `Host` of localhost / 127.0.0.1 / ::1
+    (DNS-rebinding guard); otherwise the token is required. The remote gate is a pure ASGI middleware
+    that runs before routing, so 404/405/307 paths do not leak either. 401 answers carry
+    `WWW-Authenticate: Bearer`.
+  - **Threat model.** The NiceGUI UI itself is unauthenticated on the LAN: anyone who can reach the UI
+    can generate a token or enable remote access. The API gate protects the API port's programmatic
+    surface (scripts, other hosts, a browser tricked into calling it), not against UI access. The Settings
+    page asks for confirmation before enabling remote access and before replacing an existing token.
 - **Audit.** Every write logs an INFO line (caller IP, endpoint, arguments, result, the token's
   last four characters only) and writes an ActivityLog entry with source `api`. TP/SL writes pass
   `source="api"` to `adjust_tp_sl`.

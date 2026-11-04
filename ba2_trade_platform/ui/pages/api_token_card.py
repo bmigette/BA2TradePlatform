@@ -24,6 +24,11 @@ def set_allow_remote_for_ui(allow: bool) -> None:
     set_allow_remote(allow)
 
 
+def needs_remote_confirmation(currently_allowed: bool, wanted: bool) -> bool:
+    """Only the off -> on flip asks for confirmation (switching access off never needs it)."""
+    return wanted and not currently_allowed
+
+
 def render_api_token_card() -> None:
     with ui.card().classes('w-full mb-4'):
         ui.label('Management API').classes('text-xl font-bold mb-2')
@@ -56,8 +61,27 @@ def render_api_token_card() -> None:
             confirm.open()
 
         ui.button('Generate token', icon='key', on_click=_on_click)
-        ui.switch('Allow API access from other machines', value=get_allow_remote(),
-                  on_change=lambda e: set_allow_remote_for_ui(bool(e.value)))
+        remote_switch = ui.switch('Allow API access from other machines', value=get_allow_remote())
+
+        def _on_remote_change(e):
+            if not needs_remote_confirmation(get_allow_remote(), bool(e.value)):
+                set_allow_remote_for_ui(bool(e.value))      # on -> off (or unchanged): no confirmation
+                return
+            with ui.dialog() as confirm, ui.card():
+                ui.label('Expose the management API to other machines? Anyone on the network who holds the '
+                         'API token can then read and change this instance.')
+
+                def _cancel():
+                    confirm.close()
+                    remote_switch.set_value(False)
+
+                with ui.row():
+                    ui.button('Cancel', on_click=_cancel)
+                    ui.button('Allow', color='negative',
+                              on_click=lambda: (set_allow_remote_for_ui(True), confirm.close()))
+            confirm.open()
+
+        remote_switch.on_value_change(_on_remote_change)
         ui.label('OFF (default): only this machine (127.0.0.1) can reach the API. ON exposes the API to the '
                  'LAN; callers still need the token. Saved immediately, no restart needed.'
                  ).classes('text-xs text-gray-500')
