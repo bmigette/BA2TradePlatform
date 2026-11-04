@@ -11,6 +11,7 @@ from ...core.db import (get_db, get_all_instances, delete_instance, add_instance
                         update_instance, get_instance, ruleset_event_actions,
                         rulesets_for_event_action)
 from ...core.instrument_enrichment import enrich_instruments
+from ...core.account_creation_guard import FmpKeyRequired, require_fmp_key_for_account_creation
 from ba2_common.core.instrument_info import needs_instrument_info
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
@@ -1219,6 +1220,16 @@ class AccountDefinitionsTab:
                 logger.warning(f"Refused to save account settings: {problem}")
                 return
 
+            # ADDING an account needs the FMP key (screeners, prices, market regime); editing
+            # an existing account does not. Checked before any write.
+            if account is None:
+                try:
+                    require_fmp_key_for_account_creation()
+                except FmpKeyRequired as e:
+                    ui.notify(e.message, type='negative')
+                    logger.warning(f"Refused to add an account: {e.message}")
+                    return
+
             # A NO-EDIT SAVE IS A NO-OP: an unedited field is not written -- a missing row
             # stays missing, and a stored value (a credential, a native-JSON bool) keeps its
             # exact bytes rather than being rewritten through the shared writer.
@@ -1342,6 +1353,13 @@ class AccountDefinitionsTab:
 
     def show_dialog(self, account: Optional[AccountDefinition] = None) -> None:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
+        if account is None:
+            # Read at click time, so no page reload is needed after the key is entered.
+            try:
+                require_fmp_key_for_account_creation()
+            except FmpKeyRequired as e:
+                ui.notify(e.message, type='negative')
+                return
         with self.dialog:
             self.dialog.clear()
             # An abstract provider (IBKRAccount today) can never be built: it is not offered
