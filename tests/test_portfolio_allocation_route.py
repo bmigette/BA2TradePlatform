@@ -241,8 +241,10 @@ def test_the_page_wires_the_unconsumed_run_reconcile_hook():
     AND the page's load call, so this asserts the panel loader really syncs. The
     drain itself is pinned service-side by
     ``test_syncing_income_also_drains_the_deferred_runs``."""
-    body = _function_source(_page_source(), "_load_income_panel")
-    assert "svc.sync_income_events(" in body
+    # The loader moved to services.portfolio (one function, two callers); the page keeps a wrapper.
+    service = (REPO_ROOT / "ba2_trade_platform" / "services" / "portfolio.py").read_text(encoding="utf-8")
+    assert "svc.sync_income_events(" in _function_source(service, "load_income_panel")
+    assert "portfolio_svc.load_income_panel(" in _function_source(_page_source(), "_load_income_panel")
 
 
 def _render_income_panel_note_argument(source: str):
@@ -267,9 +269,11 @@ def test_the_page_asks_what_is_still_outstanding_and_tells_the_panel():
     has not been consumed yet. A panel rendered without the note shows an
     unallocated figure that never goes down and never explains itself."""
     source = _page_source()
-    body = _function_source(source, "_load_income_panel")
+    service = (REPO_ROOT / "ba2_trade_platform" / "services" / "portfolio.py").read_text(encoding="utf-8")
+    body = _function_source(service, "read_income_panel")
     assert "svc.describe_unconsumed_runs(" in body
     assert "unconsumed_income_notice(" in body
+    assert "read_income_panel(" in _function_source(service, "load_income_panel")
     # ...and the render call must be handed the COMPUTED note. `working_note=None`
     # satisfies a substring check while dropping the whole point of the task, so
     # the keyword's value is read off the AST and has to be a variable.
