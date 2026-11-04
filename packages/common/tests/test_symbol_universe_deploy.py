@@ -1,4 +1,4 @@
-"""A restricted option job's candidate list travels from the run config to the live setting ``screener_symbol_universe``."""
+"""A restricted option job's candidate list is BACKTEST-ONLY: never exported, and a deploy clears ``screener_symbol_universe``."""
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -28,12 +28,13 @@ def _export(restriction, *, expert="DeterministicScorer"):
     return be.derive_export_payload(bt, "expert_settings", opt_backtest_block=block)
 
 
-def test_export_carries_the_restriction_minus_the_uncovered_names():
+def test_export_never_carries_the_backtest_only_restriction(caplog):
+    """Owner 2026-11-04: the restriction is BACKTEST-ONLY; live screens without it, so nothing is exported."""
     p = _export({"symbols": ["AAA", "BBB", "CCC", "DDD"], "sha256": "x", "uncovered": ["BBB", "DDD"]})
     assert p["universe"]["mode"] == "screener"
-    assert p["universe"]["screener_settings"]["screener_symbol_universe"] == "AAA,CCC"     # key name + join + guard
+    assert "screener_symbol_universe" not in p["universe"]["screener_settings"]
     out = live_settings_from_universe(p["universe"])
-    assert out["screener_symbol_universe"] == "AAA,CCC" and unmapped_screener_keys(p["universe"]) == []
+    assert "screener_symbol_universe" not in out and unmapped_screener_keys(p["universe"]) == []
 
 
 def test_export_without_a_restriction_carries_no_key():
@@ -41,7 +42,7 @@ def test_export_without_a_restriction_carries_no_key():
     assert "screener_symbol_universe" not in p["universe"]["screener_settings"]
 
 
-@pytest.mark.parametrize("bad", [{}, {"symbols": []}, {"symbols": "AAA"}, {"symbols": ["AAA"], "uncovered": ["AAA"]}])
+@pytest.mark.parametrize("bad", [{}, {"symbols": []}, {"symbols": "AAA"}])
 def test_export_refuses_a_malformed_or_empty_restriction(bad):
     with pytest.raises(be.ExportRefused):
         _export(bad)
