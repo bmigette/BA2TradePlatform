@@ -1509,3 +1509,220 @@ def pinned_rm_toggles(rm_toggles_unpinned=None) -> Dict[str, bool]:
             f"rm_toggles_unpinned may only unpin {sorted(ALLOWED_RM_TOGGLES_UNPINNED)}; "
             f"refusing to unpin {bad}")
     return {k: v for k, v in INERT_RM_TOGGLES.items() if k not in unpinned}
+
+
+# ---------------------------------------------------------------------------------------------
+# AUTHORED GENOME (stage-2 seeding, plan 2026-11-04 T4)
+# ---------------------------------------------------------------------------------------------
+#: Gene namespaces a template can answer. model:/schedule:/screener:/market: are run-level, not
+#: authored by a strategy template, so they are absent from the result (never an error).
+_AUTHORED_NAMESPACES = ("cond", "entry", "exit", "optsel")
+
+_OP_TO_MODE = {">": "above", ">=": "above", "<": "below", "<=": "below"}
+
+
+def _snap_authored(key: str, value: Any, cfg: Dict[str, Any], anchor: str) -> Any:
+    """A template value as a numeric gene value the DECODER can reproduce: ``snap_to_lattice(clip(v))``.
+
+    A value more than one step outside ``[min, max]`` is a template bug, not a lattice artefact."""
+    from app.services.genetic import snap_to_lattice
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"authored genome: {key!r}: template value {value!r} is not a number")
+    step = cfg.get("step") or (1 if cfg["type"] == "int" else 0.01)
+    tol = 1e-9 * max(1.0, abs(step))
+    if value < cfg["min"] - step - tol or value > cfg["max"] + step + tol:
+        raise ValueError(f"authored genome: {key!r}: template value {value!r} is more than one step "
+                         f"({step}) outside [{cfg['min']}, {cfg['max']}]")
+    clipped = min(max(value, cfg["min"]), cfg["max"])
+    return snap_to_lattice(clipped, cfg, anchor)
+
+
+def _authored_mode(leaf: Dict[str, Any], cid: str, choices: list) -> str:
+    """The ``cond:<id>:mode`` choice a template leaf stands for.
+
+    * a leaf already carrying a resolved ``mode`` token: that token;
+    * a numeric (threshold) leaf: its operator (``>``/``>=`` -> above, ``<``/``<=`` -> below);
+    * a categorical leaf with a ``value``: the choice whose registry code equals it;
+    * a categorical leaf with NO value (every template one: the model forbids a threshold on an
+      undecoded categorical leaf, so the SPY regime gates and the categorical market gates
+      author no value): ``off`` -- the gate is not applied, which is what the leaf means undecoded."""
+    tok = leaf.get("mode")
+    if tok is not None:
+        if tok not in choices:
+            raise ValueError(f"authored genome: cond:{cid}:mode: template mode {tok!r} not in {choices!r}")
+        return tok
+    kind = leaf_mode_kind(leaf)
+    if kind == "numeric":
+        op = leaf.get("comparison") or leaf.get("op") or leaf.get("operator")
+        if op not in _OP_TO_MODE:
+            raise ValueError(f"authored genome: cond:{cid}:mode: numeric mode leaf has operator {op!r}, "
+                             f"which maps to no mode (expected one of {sorted(_OP_TO_MODE)})")
+        return _OP_TO_MODE[op]
+    value = leaf.get("value")
+    if value is None:
+        return MODE_OFF
+    for token, code in field_codes(leaf["field"]).items():
+        if float(code) == float(value):
+            if token not in choices:
+                raise ValueError(f"authored genome: cond:{cid}:mode: {token!r} not in {choices!r}")
+            return token
+    raise ValueError(f"authored genome: cond:{cid}:mode: value {value!r} is no registered code of "
+                     f"{leaf['field']!r}")
+
+
+def authored_genome(strategy, space: Dict[str, Any], *, lattice_anchor: str = "zero") -> Dict[str, Any]:
+    """The template's own value for every ``cond:``/``entry:``/``exit:``/``optsel:`` gene of ``space``.
+
+    The inverse of ``decode_params`` at the template: decoding this genome reproduces the template's
+    thresholds, operators, toggles and option parameters (up to the lattice snap, see below).
+    ``model:`` / ``schedule:`` / ``screener:`` / ``market:`` genes are NOT authored here (absent, no error).
+
+    Which genes a node declares is decided by the collector's OWN functions (``_walk_condition_nodes`` /
+    ``_collect_action_genes`` run on that one node), so the two cannot drift. Numeric values are returned
+    SNAPPED to the decode image (``snap_to_lattice(clip(v, min, max), cfg, lattice_anchor)``), so every
+    result passes ``GeneticOptimizer.encode_params_strict`` under the same anchor; a template value more
+    than one step outside ``[min, max]`` raises. Any gene of the strategy namespaces the template cannot
+    answer raises ValueError naming the key.
+
+    Mapping notes (where the template has no literal value):
+      * ``<ns>:<rid>:enabled`` is 0 iff the rule is authored ``enabled: False``, else 1; ``cond:<id>:enabled``
+        and ``...:a<i>:enabled`` are 1 (a present node is on);
+      * ``option_dte`` is the window centre ``(option_dte_min + option_dte_max) // 2``, the inverse of
+        ``_apply_option_dte`` (exact for a symmetric window at least 14 days wide; a narrower window is
+        widened by the decoder, and no gene can undo that);
+      * ``option_strike_param`` is the action's percent-OTM param (refused when the method is delta, or the
+        param is a per-leg list); ``option_strike_delta`` / ``_long`` the action's own delta keys;
+      * a ``value_offset_from`` leaf's gene is its WIDTH: authored value minus its base's effective value
+        (the base's snapped gene when it has one);
+      * ``optsel:<half>:<w>`` is the action's ``option_<w>``, ``0.0`` when it carries none (the
+        SelectionPolicy default, i.e. no re-ranking);
+      * a categorical mode leaf (SPY regime, categorical market gates) has no authored value -> ``off``."""
+    wanted = {k for k in space if k.split(":", 1)[0] in _AUTHORED_NAMESPACES}
+    out: Dict[str, Any] = {}
+    origin: Dict[str, str] = {}
+
+    def put(key: str, value: Any, where: str) -> None:
+        if key not in wanted:
+            return
+        cfg = space[key]
+        if cfg["type"] == "choice":
+            if value not in cfg["choices"]:
+                raise ValueError(f"authored genome: {key!r}: template value {value!r} is not one of "
+                                 f"{cfg['choices']!r} ({where})")
+            v = value
+        else:
+            v = _snap_authored(key, value, cfg, lattice_anchor)
+        if key in out and out[key] != v:
+            raise ValueError(f"authored genome: {key!r} is declared by two template nodes with different "
+                             f"authored values ({out[key]!r} at {origin[key]}, {v!r} at {where})")
+        out[key] = v
+        origin[key] = where
+
+    for ns, attr in (("entry", "entry_rules"), ("exit", "exit_rules")):
+        rules = [r for r in (getattr(strategy, attr, None) or []) if isinstance(r, dict)]
+        for rule in rules:
+            rid = rule.get("id")
+            tree = rule.get("conditions")
+            authored_abs: Dict[str, Any] = {}
+            _collect_authored_values(tree, authored_abs)
+            if rid and rule.get("toggle_optimize"):
+                put(f"{ns}:{rid}:enabled", 0 if rule.get("enabled") is False else 1, f"{ns} rule {rid}")
+            if rid:
+                for idx, action in enumerate(a for a in (rule.get("actions") or []) if isinstance(a, dict)):
+                    _author_action(ns, rid, idx, action, put)
+            _author_tree(tree, authored_abs, space, lattice_anchor, put, f"{ns} rule {rid}")
+
+    missing = sorted(wanted - set(out))
+    if missing:
+        raise ValueError(f"authored genome: the template cannot answer gene(s) {missing}")
+    return {k: out[k] for k in space if k in out}
+
+
+def _author_tree(node, authored_abs, space, anchor, put, where) -> None:
+    if not isinstance(node, dict):
+        return
+    for child in (node.get("conditions") or []):
+        _author_tree(child, authored_abs, space, anchor, put, where)
+    cid = node.get("id")
+    if not cid:
+        return
+    shallow = {k: v for k, v in node.items() if k != "conditions"}
+    declared: Dict[str, Any] = {}
+    _walk_condition_nodes(shallow, declared)
+    for key, cfg in declared.items():
+        field = key.rsplit(":", 1)[1]
+        loc = f"{where} leaf {cid}"
+        if field == "value":
+            if node.get("value") is None:
+                raise ValueError(f"authored genome: {key!r}: the template leaf carries no value ({loc})")
+            value = float(node["value"])
+            base_id = node.get("value_offset_from")
+            if base_id is not None:
+                bkey = f"cond:{base_id}:value"
+                if bkey in space and space[bkey]["type"] != "choice":
+                    base = _snap_authored(bkey, authored_abs[base_id], space[bkey], anchor)
+                elif base_id in authored_abs:
+                    base = authored_abs[base_id]
+                else:
+                    raise ValueError(f"authored genome: {key!r}: value_offset_from {base_id!r} has no value")
+                value = value - float(base)
+            put(key, value, loc)
+        elif field == "confirmation_bars":
+            if node.get("confirmation_bars") is None:
+                raise ValueError(f"authored genome: {key!r}: the template leaf carries no "
+                                 f"confirmation_bars ({loc})")
+            put(key, node["confirmation_bars"], loc)
+        elif field == "enabled":
+            put(key, 1, loc)
+        elif field == "mode":
+            put(key, _authored_mode(node, cid, list(cfg["choices"])), loc)
+        else:
+            raise ValueError(f"authored genome: cannot answer {key!r} ({loc})")
+
+
+def _author_action(ns, rid, idx, action, put) -> None:
+    prefix = f"{ns}:{rid}:a{idx}"
+    declared: Dict[str, Any] = {}
+    _collect_action_genes(ns, rid, idx, action, declared)
+    loc = f"{ns} rule {rid} action {idx}"
+    method = str(action.get("option_strike_method") or "percent_otm")
+
+    for key in declared:
+        if key.startswith("optsel:"):
+            w = key.split(":", 2)[2]
+            put(key, action.get(f"option_{w}", 0.0), loc)
+            continue
+        field = key[len(prefix) + 1:]
+
+        def need(name: str, key=key):
+            if action.get(name) is None:
+                raise ValueError(f"authored genome: {key!r}: the template action carries no {name!r} ({loc})")
+            return action[name]
+
+        if field == "enabled":
+            value = 1
+        elif field == "action_value":
+            value = action["action_value"] if action.get("action_value") is not None else need("value")
+        elif field == "option_strike_param":
+            value = need("option_strike_param")
+            if method != "percent_otm" or isinstance(value, (list, tuple, dict)):
+                raise ValueError(f"authored genome: {key!r}: the template strike param {value!r} is not a "
+                                 f"percent-OTM scalar (method {method!r}) ({loc})")
+        elif field == "option_strike_method":
+            value = method
+        elif field == "option_strike_delta":
+            value = need("option_strike_delta")
+        elif field == "option_strike_delta_long":
+            value = need("option_strike_delta_long")
+        elif field == "option_structure":
+            value = need("action_type")
+        elif field == "option_dte":
+            value = (int(need("option_dte_min")) + int(need("option_dte_max"))) // 2
+        elif field == "option_wing_width":
+            value = need("option_wing_width_pct")
+        elif field in ("option_sizing", "option_min_arc", "option_entry_cross"):
+            value = need(field)
+        else:
+            raise ValueError(f"authored genome: cannot answer {key!r} ({loc})")
+        put(key, value, loc)
