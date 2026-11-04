@@ -1,38 +1,52 @@
 """Token auth of the management API.
 
 Rules (design section 1):
-* A request from a NON-LOCAL address (anything but 127.0.0.1 / ::1) is refused with 403 ``remote_disabled``
-  unless the AppSetting ``api_allow_remote`` is on (default OFF). This runs BEFORE any token check and covers
-  reads, writes, /docs and /openapi.json. The setting is read per request, so a flip needs no restart.
-* Every write needs ``Authorization: Bearer <api_token>``; a read needs no token from the loopback address and
-  the token from anywhere else (once remote access is allowed).
-* With NO token set, writes and non-local requests are refused with 403 -- nothing is open by default.
-
-The caller address is the SOCKET PEER (``request.client.host``). ``X-Forwarded-For`` is deliberately not read:
-it is client-controlled, and trusting it would let any LAN host claim to be local. The platform is not run
-behind a reverse proxy; if that ever changes, a local read through the proxy would present the proxy's
-address and be refused, which fails closed.
+* A request is REMOTE unless its socket peer is a loopback address (``ipaddress``: 127.0.0.0/8, ::1, and the
+  IPv4-mapped forms of those; an unparseable peer is remote) AND it carries none of the proxy headers
+  ``X-Forwarded-For``, ``Forwarded``, ``X-Real-IP``, ``X-Forwarded-Host``. Those headers are client-controlled
+  and are NEVER trusted to prove locality; their mere presence can only make the check stricter (a tunnel or
+  reverse proxy in front of the platform shows a loopback peer, and the header betrays it).
+* A remote request is refused with 403 ``remote_disabled`` unless the AppSetting ``api_allow_remote`` is on
+  (default OFF). The check is applied by ``RemoteGateMiddleware`` before routing (so 404/405/307 paths cannot
+  leak) and again by ``require_access``; it covers reads, writes, /docs and /openapi.json and runs BEFORE any
+  token check. The setting is read per request, so a flip needs no restart.
+* Every write needs ``Authorization: Bearer <api_token>``. A read needs no token only from a local request whose
+  Host header names localhost / 127.0.0.1 / ::1 (DNS-rebinding guard: a browser tricked into resolving an
+  attacker's name to 127.0.0.1 sends the attacker's Host); otherwise it needs the token.
+* With NO token set, writes and token-requiring reads are refused with 403 -- nothing is open by default.
 """
 import hmac
+import ipaddress
 import secrets
 from typing import Optional
 
 from fastapi import HTTPException, Request
 from sqlmodel import select
 
-from ..core.db import add_instance, get_db, get_setting, update_instance
+from ..core.db import add_instance, get_db, update_instance
 from ..core.models import AppSetting
 from ..logger import logger
 
 API_TOKEN_KEY = "api_token"
 ALLOW_REMOTE_KEY = "api_allow_remote"
 SAFE_METHODS = frozenset({"GET", "HEAD"})
-LOCAL_HOSTS = frozenset({"127.0.0.1", "::1"})
+LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-forwarded-host"})
+REMOTE_DISABLED_MESSAGE = ("API access from other machines is disabled on this instance "
+                           "(Settings -> Management API -> Allow API access from other machines).")
+
+
+def _read_setting(key: str) -> Optional[str]:
+    """The AppSetting's value_str, or None for a missing row. A direct query, not ``get_setting``, which logs a
+    'Setting not found' WARNING for every missing row (this is read on every request)."""
+    with get_db() as session:
+        row = session.exec(select(AppSetting).where(AppSetting.key == key)).first()
+        return None if row is None else row.value_str
 
 
 def get_api_token() -> Optional[str]:
     """The stored token, or None when none is set (missing row or blank value)."""
-    value = get_setting(API_TOKEN_KEY)
+    value = _read_setting(API_TOKEN_KEY)
     if value is None or not value.strip():
         return None
     return value.strip()
@@ -59,7 +73,7 @@ def rotate_api_token() -> str:
 
 def get_allow_remote() -> bool:
     """Whether non-local callers may use the API. A missing row means False."""
-    value = get_setting(ALLOW_REMOTE_KEY)
+    value = _read_setting(ALLOW_REMOTE_KEY)
     return value is not None and value.strip().lower() in ("true", "1", "yes", "on")
 
 
@@ -68,13 +82,37 @@ def set_allow_remote(allow: bool) -> None:
     logger.info(f"Management API remote access {'ENABLED' if allow else 'disabled'}")
 
 
+def is_loopback_peer(host: Optional[str]) -> bool:
+    """True iff ``host`` parses as a loopback IP address (IPv4-mapped IPv6 unwrapped). Anything else, including
+    a non-IP such as 'testclient' or a missing peer, is not loopback."""
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def is_remote_scope(scope) -> bool:
+    """Whether the ASGI request counts as REMOTE: a non-loopback peer, or any proxy/forwarding header."""
+    client = scope["client"] if "client" in scope else None
+    if client is None or not is_loopback_peer(client[0]):
+        return True
+    names = {name.decode("latin-1").lower() for name, _ in scope["headers"]}
+    return not FORWARD_HEADERS.isdisjoint(names)
+
+
 def _presented_token(request: Request) -> Optional[str]:
     header = request.headers.get("authorization")
     if header is None:
         return None
     scheme, _, value = header.partition(" ")
     if scheme.lower() != "bearer" or not value.strip():
-        raise HTTPException(status_code=401, detail="Authorization must be 'Bearer <token>'")
+        raise HTTPException(status_code=401, detail="Authorization must be 'Bearer <token>'",
+                            headers={"WWW-Authenticate": "Bearer"})
     return value.strip()
 
 
@@ -83,22 +121,21 @@ def require_access(request: Request) -> None:
     ``request.state.token_tail`` for the audit log."""
     request.state.token_tail = None
     is_write = request.method not in SAFE_METHODS
-    host = request.client.host if request.client is not None else None
-    is_local = host in LOCAL_HOSTS
-    if not is_local and not get_allow_remote():
-        raise HTTPException(status_code=403, detail={
-            "error": "remote_disabled",
-            "message": "API access from other machines is disabled on this instance "
-                       "(Settings -> Management API -> Allow API access from other machines)."})
-    if not is_write and is_local:
+    remote = is_remote_scope(request.scope)
+    if remote and not get_allow_remote():
+        raise HTTPException(status_code=403, detail={"error": "remote_disabled",
+                                                     "message": REMOTE_DISABLED_MESSAGE})
+    hostname = request.url.hostname
+    if not is_write and not remote and hostname is not None and hostname.lower() in LOCAL_HOSTNAMES:
         return
     stored = get_api_token()
     if stored is None:
         raise HTTPException(
             status_code=403,
-            detail="No api_token is set on this instance: writes and non-local requests are refused. "
+            detail="No api_token is set on this instance: writes and token-requiring reads are refused. "
                    "Generate one on the Settings page.")
     presented = _presented_token(request)
     if presented is None or not hmac.compare_digest(presented.encode(), stored.encode()):
-        raise HTTPException(status_code=401, detail="Missing or wrong API token")
+        raise HTTPException(status_code=401, detail="Missing or wrong API token",
+                            headers={"WWW-Authenticate": "Bearer"})
     request.state.token_tail = presented[-4:]

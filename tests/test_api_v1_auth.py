@@ -4,7 +4,7 @@ import pytest
 from fastapi import Depends, FastAPI, Request
 
 from ba2_trade_platform.api.auth import (
-    ALLOW_REMOTE_KEY, API_TOKEN_KEY, get_allow_remote, get_api_token, require_access,
+    ALLOW_REMOTE_KEY, API_TOKEN_KEY, get_allow_remote, get_api_token, is_loopback_peer, require_access,
     rotate_api_token, set_allow_remote,
 )
 from tests.api_helpers import TOKEN, client_for, set_allow_remote as allow_remote, set_api_token
@@ -124,3 +124,77 @@ def test_write_success_records_token_last_four_only():
 
     client_for(app, token=TOKEN).post("/w")
     assert seen["tail"] == TOKEN[-4:] == "abcd"
+
+
+# --- review fixes: forwarded headers, Host header, loopback parsing, quiet reads, WWW-Authenticate ---------
+
+FORWARDED = ["X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Forwarded-Host"]
+
+
+@pytest.mark.parametrize("header", FORWARDED)
+def test_forwarded_header_makes_a_loopback_peer_remote(header):
+    set_api_token()
+    c = client_for(_app(), token=TOKEN)
+    r = c.get("/r", headers={header: "203.0.113.7"})
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "remote_disabled"
+    r = c.post("/w", headers={header: "203.0.113.7"})
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "remote_disabled"
+
+
+@pytest.mark.parametrize("header", FORWARDED)
+def test_forwarded_header_with_remote_allowed_needs_the_token(header):
+    set_api_token()
+    allow_remote(True)
+    assert client_for(_app()).get("/r", headers={header: "203.0.113.7"}).status_code == 401
+    assert client_for(_app(), token=TOKEN).get("/r", headers={header: "203.0.113.7"}).status_code == 200
+
+
+@pytest.mark.parametrize("host_header", ["localhost", "localhost:8080", "127.0.0.1:8081", "[::1]:8080", "LOCALHOST"])
+def test_local_read_accepts_loopback_host_names(host_header):
+    set_api_token()
+    assert client_for(_app()).get("/r", headers={"Host": host_header}).status_code == 200
+
+
+def test_foreign_host_header_from_a_local_peer_needs_the_token_but_is_not_a_remote_case():
+    set_api_token()
+    c = client_for(_app())
+    r = c.get("/r", headers={"Host": "evil.example.com:8080"})        # DNS rebinding
+    assert r.status_code == 401 and r.json()["detail"] != {}
+    assert "remote_disabled" not in r.text
+    assert client_for(_app(), token=TOKEN).get("/r", headers={"Host": "evil.example.com"}).status_code == 200
+
+
+def test_foreign_host_header_with_no_token_set_is_403():
+    assert client_for(_app()).get("/r", headers={"Host": "evil.example.com"}).status_code == 403
+
+
+@pytest.mark.parametrize("host,local", [
+    ("127.0.0.1", True), ("127.0.0.2", True), ("::1", True), ("::ffff:127.0.0.1", True),
+    ("192.168.1.9", False), ("::ffff:192.168.1.9", False), ("10.0.0.5", False), ("::2", False),
+    ("testclient", False), ("", False), (None, False), ("localhost", False),
+])
+def test_loopback_detection_parses_addresses(host, local):
+    assert is_loopback_peer(host) is local
+
+
+def test_mapped_ipv6_loopback_peer_reads_locally():
+    assert client_for(_app(), host="::ffff:127.0.0.1").get("/r").status_code == 200
+    assert client_for(_app(), host="testclient").get("/r").status_code == 403    # unparseable => remote
+
+
+def test_401_carries_www_authenticate_bearer():
+    set_api_token()
+    r = client_for(_app()).post("/w")
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    r = client_for(_app(), token="wrong" * 8).post("/w")
+    assert r.headers["www-authenticate"] == "Bearer"
+
+
+def test_settings_reads_do_not_go_through_get_setting(monkeypatch):
+    """get_setting logs a 'Setting not found' WARNING for a missing row; the auth path must stay quiet."""
+    def boom(key):
+        raise AssertionError("auth must read AppSetting rows directly")
+    monkeypatch.setattr("ba2_trade_platform.core.db.get_setting", boom)
+    monkeypatch.setattr("ba2_common.core.db.get_setting", boom)
+    assert get_allow_remote() is False and get_api_token() is None
+    assert client_for(_app()).get("/r").status_code == 200

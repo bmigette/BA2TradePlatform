@@ -24,7 +24,10 @@ def auth_headers(token: str = TOKEN) -> dict:
 def client_for(app: FastAPI, *, host: str = "127.0.0.1", token: str | None = None) -> TestClient:
     """TestClient whose peer address is ``host`` (the auth rule reads the socket peer) and which sends
     ``Authorization: Bearer <token>`` when ``token`` is given."""
-    return TestClient(app, client=(host, 50000), headers=auth_headers(token) if token else {})
+    # base_url localhost: the token-free local read also requires a loopback Host header (DNS-rebinding guard),
+    # and TestClient's default Host is "testserver".
+    return TestClient(app, base_url="http://localhost", client=(host, 50000),
+                      headers=auth_headers(token) if token else {})
 
 
 from ba2_trade_platform.core.account_types import AccountSnapshot
