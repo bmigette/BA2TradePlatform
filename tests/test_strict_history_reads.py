@@ -162,15 +162,18 @@ def test_tasty_strict_balance_history_refuses_a_snapshot_without_nlv_and_unauthe
 
 # ------------------------------------------------------------------------------------------------- IBKR
 def test_ibkr_strict_filled_trades_raise_where_the_lenient_one_answers_empty(monkeypatch):
+    from datetime import timedelta
     account, fake = make_account(monkeypatch)
     try:
         aapl = fake.add_stock("AAPL", 265598)
+        recent = datetime.now(timezone.utc) - timedelta(days=1)
         fake.make_fill_record(aapl, "BOT", 1, 150.0, when=datetime.now(timezone.utc))
-        assert account.get_filled_trades_strict() == account.get_filled_trades() and account.get_filled_trades_strict()
+        assert account.get_filled_trades_strict(start_date=recent) == account.get_filled_trades(start_date=recent)
+        assert account.get_filled_trades_strict(start_date=recent)
         fake.fail_calls["reqExecutionsAsync"] = ConnectionError("x")
         assert account.get_filled_trades() == []
         with pytest.raises(Exception):
-            account.get_filled_trades_strict()
+            account.get_filled_trades_strict(start_date=recent)
     finally:
         account.close()
 
@@ -205,5 +208,22 @@ def test_ibkr_strict_flex_reads_raise_when_unconfigured_or_unreachable_and_match
         assert account.get_dividends() == []
         with pytest.raises(ConnectionError):
             account.get_dividends_strict()
+    finally:
+        account.close()
+
+
+def test_ibkr_strict_filled_trades_refuse_a_window_older_than_the_api_keeps(monkeypatch):
+    from datetime import timedelta
+    account, fake = make_account(monkeypatch)
+    try:
+        aapl = fake.add_stock("AAPL", 265598)
+        now = datetime.now(timezone.utc)
+        fake.make_fill_record(aapl, "BOT", 1, 150.0, when=now)
+        assert len(account.get_filled_trades_strict(start_date=now - timedelta(days=2))) == 1
+        with pytest.raises(ValueError, match="only the last 7 days"):
+            account.get_filled_trades_strict(start_date=now - timedelta(days=60))
+        with pytest.raises(ValueError):
+            account.get_filled_trades_strict()                       # no start = "everything": not available
+        assert len(account.get_filled_trades()) == 1                 # the lenient read still answers (and warns)
     finally:
         account.close()

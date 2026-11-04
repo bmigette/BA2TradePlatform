@@ -2487,7 +2487,14 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         return self._trades_from_fills(fills, symbol, start_date, end_date)
 
     def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None):
-        """``get_filled_trades`` that RAISES when the executions cannot be read (the lenient one answers [])."""
+        """``get_filled_trades`` that RAISES when the executions cannot be read (the lenient one answers []) AND when
+        the window asked for is longer than the ~``_EXECUTION_WINDOW_DAYS`` days the IBKR API keeps (a missing or older
+        ``start_date`` would otherwise hand back a truncated history as if it were complete): ``ValueError``."""
+        floor = self._utcnow() - timedelta(days=self._EXECUTION_WINDOW_DAYS)
+        start = None if start_date is None else (start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc))
+        if start is None or start < floor:
+            raise ValueError(f"IBKR keeps only the last {self._EXECUTION_WINDOW_DAYS} days of executions; "
+                             f"a complete history older than that is not available through the API")
         fills = self._call(self._read_fills, op="executions", timeout=40.0)
         return self._trades_from_fills(fills, symbol, start_date, end_date)
 

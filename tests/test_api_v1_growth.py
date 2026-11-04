@@ -339,3 +339,17 @@ def test_expired_entries_are_dropped_when_something_new_is_inserted(monkeypatch)
     monkeypatch.setattr(svc, "FETCH_TTL_S", -1.0)             # everything cached so far is now expired
     svc._cached(("trades", 2), lambda: [{"n": 2}])
     assert list(svc._CACHE) == [("trades", 2)]
+
+
+def test_a_broker_that_only_sees_recent_executions_makes_the_growth_response_partial_with_a_reason(world):
+    acct, broker = world
+    asked = {}
+
+    def strict(symbol=None, start_date=None, end_date=None):
+        asked["start"] = start_date
+        return [dict(t) for t in broker.trades]
+    broker._EXECUTION_WINDOW_DAYS = 7
+    broker.get_filled_trades_strict = strict
+    body = v1_client().get(f"/accounts/{acct.id}/growth?{WINDOW}").json()
+    assert asked["start"] is not None and body["partial"] is True
+    assert "only the last 7 days" in body["partial_reasons"][0]

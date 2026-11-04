@@ -16,7 +16,7 @@ computed through today (trades and dividends are not cut at ``to``) and only the
 import math
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..core.utils import get_labels_by_symbol
@@ -159,7 +159,13 @@ def _fetch(account_id: int, account, from_: date, to: date, *, with_balance: boo
     dividends_raw, _age, _hit = portfolio.cached_dividends(
         account_id, lambda: read("the dividends fetch", "get_dividends"))
     dividends_raw = [dict(r) for r in dividends_raw]
-    trades_raw = _cached(("trades", account_id), lambda: read("the filled trades fetch", "get_filled_trades"))
+    # An adapter that can only see recent executions (IBKR: ~7 days) declares it; its trades are asked for that window
+    # and the response says PARTIAL, with the reason, instead of presenting a truncated history as complete.
+    window_days = getattr(account, "_EXECUTION_WINDOW_DAYS", None)
+    trade_kwargs = {} if not window_days else {
+        "start_date": datetime.now(timezone.utc) - timedelta(days=window_days - 1)}
+    trades_raw = _cached(("trades", account_id), lambda: read("the filled trades fetch", "get_filled_trades",
+                                                             **trade_kwargs))
     balance, sk_b = _validated(balance_raw, _bad_balance, account_id)
     dividends, sk_d = _validated(dividends_raw, _bad_dividend, account_id)
     trades, sk_t = _validated(trades_raw, _bad_trade, account_id)
@@ -167,8 +173,10 @@ def _fetch(account_id: int, account, from_: date, to: date, *, with_balance: boo
     # (strict reads: a failure already raised, so an empty dataset is a real "nothing", and the old fetch_ok flag is gone)
     report = {"datasets": {"balance_history": {"rows": len(balance_raw)}, "dividends": {"rows": len(dividends_raw)},
                            "filled_trades": {"rows": len(trades_raw)}},
-              "partial": bool(skipped), "skipped_rows": sum(sum(v.values()) for v in skipped.values()),
-              "skipped": skipped}
+              "partial": bool(skipped) or bool(window_days), "skipped_rows": sum(sum(v.values()) for v in skipped.values()),
+              "skipped": skipped,
+              "partial_reasons": ([f"the broker keeps only the last {window_days} days of executions: the filled-trade "
+                                   f"history, and every series that depends on it, is incomplete"] if window_days else [])}
     return balance, dividends, trades, report
 
 
@@ -249,7 +257,8 @@ def _upto(dates: List[str], to: date) -> int:
 
 def _partial(report, skipped_positions) -> Dict[str, Any]:
     partial = report["partial"] or bool(skipped_positions)
-    return {"partial": partial, "price_timed_out": report["price_timed_out"], "skipped_rows": report["skipped_rows"], "skipped": report["skipped"],
+    return {"partial": partial, "partial_reasons": report["partial_reasons"],
+            "price_timed_out": report["price_timed_out"], "skipped_rows": report["skipped_rows"], "skipped": report["skipped"],
             "skipped_positions": skipped_positions}
 
 
