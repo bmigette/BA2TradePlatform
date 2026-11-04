@@ -1756,7 +1756,7 @@ def refresh_orders_from_broker(account) -> bool:
         return False
 
 
-def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill]:
+def collect_order_fills(account_id: int, order_ids: List[int], *, on_missing=None) -> List[OrderFill]:
     """Read the run's EXECUTION orders back out of the DB as pure fill facts.
 
     ONLY ``OrderType.MARKET`` rows. A run's ``order_ids`` also carry the protective
@@ -1772,6 +1772,9 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
     stalling is the only safe reading of it. The query is scoped by ``account_id``
     as well, so an order that belongs to somebody else reads as absent rather than
     pricing this run from another account's fill.
+
+    ``on_missing`` (the management API's runs list): when given, a missing row is NOT logged here at ERROR; the
+    missing ids are handed to ``on_missing(ids)`` once, so one request logs one line instead of one per call.
 
     A NULL ``filled_qty`` is passed through AS ``None``, exactly like a NULL
     ``open_price`` on the next line -- never coerced to 0.0. Both broker adapters
@@ -1795,8 +1798,13 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
                           row.filled_qty, row.open_price) for row in rows}
 
     fills: List[OrderFill] = []
+    missing: List[int] = []
     for order_id in wanted:
         found = by_id.get(order_id)
+        if found is None and on_missing is not None:
+            missing.append(order_id)
+            fills.append(OrderFill(order_id=order_id))
+            continue
         if found is None:
             logger.error(f"[Account {account_id}] Allocation order {order_id} has no "
                          f"TradingOrder row; its run cannot be income-consumed until "
@@ -1813,6 +1821,8 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
             filled_quantity=float(filled_qty) if filled_qty is not None else None,
             fill_price=float(open_price) if open_price is not None else None,
         ))
+    if missing:
+        on_missing(missing)
     return fills
 
 

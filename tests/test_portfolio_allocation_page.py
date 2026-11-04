@@ -2241,7 +2241,9 @@ def test_the_account_value_survives_a_base_notional_that_blows_up(monkeypatch,
                             positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
-    monkeypatch.setattr(page, 'compute_base_notional',
+    # The loader moved to services.portfolio (one function, two callers): patch the name where it is looked up.
+    from ba2_trade_platform.services import portfolio as portfolio_svc
+    monkeypatch.setattr(portfolio_svc, 'compute_base_notional',
                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('boom')))
 
     payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
@@ -8290,9 +8292,10 @@ def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
     """
     import inspect
     from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_trade_platform.services import portfolio as portfolio_svc
 
     sources = {
-        "portfolio_allocation.py::_load_view_payload": inspect.getsource(page._load_view_payload),
+        "services/portfolio.py::load_view_payload": inspect.getsource(portfolio_svc.load_view_payload),
         "portfolio_allocation_service.py::build_position_states":
             inspect.getsource(svc.build_position_states),
     }

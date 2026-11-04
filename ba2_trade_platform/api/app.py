@@ -11,7 +11,7 @@ from .gate import RemoteGateMiddleware
 from .scrub import ScrubMiddleware
 
 #: Router modules (relative to this package), each exposing ``router``.
-_ROUTER_MODULES = ["system", "maintenance", "accounts", "transactions", "orders", "experts", "analysis", "risk_manager", "activity", "stats", "account_stats"]
+_ROUTER_MODULES = ["system", "maintenance", "accounts", "transactions", "orders", "experts", "analysis", "risk_manager", "activity", "portfolio", "stats", "account_stats"]
 
 
 def create_v1_app() -> FastAPI:

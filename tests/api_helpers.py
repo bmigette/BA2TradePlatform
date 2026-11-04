@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 from ba2_trade_platform.core.db import add_instance
 from ba2_trade_platform.core.models import AppSetting
+# registers the allocator tables with SQLModel.metadata BEFORE the per-test engine's create_all (the portfolio GET reads them)
+import ba2_trade_platform.core.allocator_protection_models  # noqa: F401
 
 
 # Fake credentials in these tests are ASSEMBLED at runtime (``SK``, ``PW_KEY``, ``userinfo_url``) so secret
@@ -92,8 +94,9 @@ class FakeAccount:
     def get_broker_floating_pl(self):
         return None
 
-    def get_instrument_current_price(self, symbols, price_type="mid"):
-        return {}
+    # The portfolio-allocation reads (services.portfolio) also price the book and ask for dividends.
+    def get_instrument_current_price(self, symbols, price_type=None):
+        return {s: 100.0 for s in symbols}
 
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
         return []
@@ -123,7 +126,7 @@ def _chartable_account(account_id: int) -> "FakeAccount":
     history / dividend / fill in the last 30 days."""
     from datetime import datetime, timedelta
     acct = FakeAccount(account_id)
-    acct.positions = [_AttrDict(symbol="AAPL", qty=10.0, cost_basis=1000.0)]
+    acct.positions = [_AttrDict(symbol="AAPL", qty=10.0, cost_basis=900.0, market_value=1000.0, side="BUY")]
     now = datetime.now()
     acct.get_balance_history = lambda start_date=None, end_date=None: [
         {"date": now - timedelta(days=n), "net_liquidating_value": 10000.0 + n, "cash_balance": 2500.0,
@@ -147,7 +150,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     from datetime import datetime, timezone
 
     from ba2_trade_platform.core.models import (
-        AccountSetting, ActivityLog, AnalysisOutput, RiskManagerRun, SmartRiskManagerJob)
+        AccountSetting, ActivityLog, AnalysisOutput, PortfolioAllocationRun, RiskManagerRun, SmartRiskManagerJob)
     from ba2_trade_platform.core.types import (
         ActivityLogSeverity, ActivityLogType, MarketAnalysisStatus, TransactionStatus)
     from tests.factories import (
@@ -185,9 +188,21 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     # phase 4: the Overview calculators resolve the account through their own module / a local import
     _factory = lambda i, session=None, use_cache=True: _chartable_account(i)    # noqa: E731
     monkeypatch.setattr("ba2_trade_platform.services.account_growth.fetch_closes",
-                        lambda symbols, start: {s: _recent_closes() for s in symbols})
+                        lambda symbols, start, **kw: {s: _recent_closes() for s in symbols})
     monkeypatch.setattr("ba2_trade_platform.services.floating_pl.get_account_instance_from_id", _factory)
     monkeypatch.setattr("ba2_trade_platform.core.utils.get_account_instance_from_id", _factory)
+
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        set_allocation_config, set_managed_label, set_symbol_weight)
+    from ba2_trade_platform.core.utils import add_label_to_instruments
+    set_allocation_config(acct.id, valuation_mode="market")
+    set_managed_label(acct.id, "CORE", target_pct=100.0, comment="see token=PFLABELSECRET1")
+    add_label_to_instruments(["AAPL"], "CORE")
+    set_symbol_weight(acct.id, "CORE", "AAPL", weight_pct=100.0, comment="Bearer PFSYMBOLSECRET2")
+    secrets += ["PFLABELSECRET1", "PFSYMBOLSECRET2"]
+    add_instance(PortfolioAllocationRun(account_id=acct.id, mode="REBALANCE", scope_label="key=PFRUNSECRET3",
+                                        plan_json={}), expunge_after_flush=True)
+    secrets.append("PFRUNSECRET3")
 
     tx = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED, expert_id=expert.id)
     create_trading_order(acct.id, symbol="AAPL", transaction_id=tx.id)

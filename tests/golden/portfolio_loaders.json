@@ -1,0 +1,981 @@
+{
+ "gate": {
+  "allowed": true,
+  "expert_names": [],
+  "message": "",
+  "reason_code": "OK"
+ },
+ "income": {
+  "events": [
+   {
+    "amount": 100.0,
+    "event_date": "<dt>",
+    "event_type": "DEPOSIT",
+    "external_id": "ev-2",
+    "id": 2,
+    "open_amount": 100.0,
+    "symbol": null
+   },
+   {
+    "amount": 12.5,
+    "event_date": "<dt>",
+    "event_type": "DIVIDEND",
+    "external_id": "ev-1",
+    "id": 1,
+    "open_amount": 12.5,
+    "symbol": "O"
+   }
+  ],
+  "note": null,
+  "open_total": 112.5
+ },
+ "valuation_mode": "market",
+ "view_cost": {
+  "account_id": 1,
+  "account_value": 20000.0,
+  "available_buying_power": 5000.0,
+  "base_notional": 11900.0,
+  "exclusions": {
+   "KO": {
+    "account_id": 1,
+    "excluded_reason": "disabled",
+    "id": 1,
+    "note": "paused",
+    "since": "<dt>",
+    "symbol": "KO"
+   }
+  },
+  "protection": {
+   "items": {},
+   "quantities": {},
+   "supported": false
+  },
+  "real_base_notional": 11900.0,
+  "simulated_base": false,
+  "symbol_facts": {
+   "AAPL": {
+    "account_id": 1,
+    "bp_factor": 1.0,
+    "fetched_at": "<dt>",
+    "fractionable": true,
+    "id": 1,
+    "initial_margin_rate": null,
+    "maintenance_margin_rate": null,
+    "marginable": true,
+    "min_fractional_notional": null,
+    "min_order_size": null,
+    "min_trade_increment": null,
+    "source": "default",
+    "symbol": "AAPL",
+    "tradable": null
+   }
+  },
+  "symbol_stats": {
+   "AAPL": {
+    "company_name": null,
+    "dividend_yield_pct": 0.5,
+    "error": null,
+    "fetched_at": "<dt>",
+    "id": 1,
+    "symbol": "AAPL",
+    "total_return_1y_pct": 12.0,
+    "total_return_3y_pct": null
+   }
+  },
+  "symbols_by_label": {
+   "CORE": [
+    "AAPL",
+    "KO",
+    "MSFT"
+   ],
+   "INCOME": [
+    "O",
+    "SPY"
+   ]
+  },
+  "unallocated_pct": 10.0,
+  "valuation_mode": "cost",
+  "views": [
+   {
+    "color": "#0072B2",
+    "comment": "core",
+    "cost_basis": 3300.0,
+    "current_value": 3300.0,
+    "excluded_count": 1,
+    "excluded_value": 1100.0,
+    "freed_pct": 0.0,
+    "label": "CORE",
+    "pct_of_base": 27.731092437,
+    "pct_of_total": 47.826086957,
+    "pnl": {
+     "abs_cost_basis": 3300.0,
+     "amount": 700.0,
+     "cost_basis": 3300.0,
+     "dividends": 0.0,
+     "market_value": 4000.0,
+     "pct": 21.212121212,
+     "priced": 2,
+     "total_amount": null,
+     "total_pct": null,
+     "unpriced": 0
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1800.0,
+      "current_value": 1800.0,
+      "effective_weight_pct": 39.375,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 54.545454545,
+      "pct_of_label_target": 28.011204482,
+      "pct_of_total": 26.086956522,
+      "pnl": {
+       "abs_cost_basis": 1800.0,
+       "amount": 200.0,
+       "cost_basis": 1800.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 11.111111111,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 400.0,
+      "quantity": 5.0,
+      "symbol": "MSFT",
+      "target_value": 2530.2375,
+      "weight_pct": 30.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1500.0,
+      "current_value": 1500.0,
+      "effective_weight_pct": 65.625,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 45.454545455,
+      "pct_of_label_target": 23.342670401,
+      "pct_of_total": 21.739130435,
+      "pnl": {
+       "abs_cost_basis": 1500.0,
+       "amount": 500.0,
+       "cost_basis": 1500.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 33.333333333,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 200.0,
+      "quantity": 10.0,
+      "symbol": "AAPL",
+      "target_value": 4217.0625,
+      "weight_pct": 50.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1100.0,
+      "current_value": 1100.0,
+      "effective_weight_pct": null,
+      "excluded": true,
+      "excluded_note": "paused",
+      "excluded_reason": "disabled",
+      "excluded_since": "<dt>",
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 1200.0,
+      "measurable": true,
+      "pct_of_label": 0.0,
+      "pct_of_label_target": 0.0,
+      "pct_of_total": 0.0,
+      "pnl": {
+       "abs_cost_basis": 1100.0,
+       "amount": 100.0,
+       "cost_basis": 1100.0,
+       "dividends": 0.0,
+       "market_value": 1200.0,
+       "pct": 9.090909091,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 60.0,
+      "quantity": 20.0,
+      "symbol": "KO",
+      "target_value": null,
+      "weight_pct": 25.0,
+      "weight_source": "actual"
+     }
+    ],
+    "target_pct": 60.0,
+    "target_value": 6426.0
+   },
+   {
+    "color": null,
+    "comment": null,
+    "cost_basis": 3600.0,
+    "current_value": 3600.0,
+    "excluded_count": 0,
+    "excluded_value": 0,
+    "freed_pct": 0.0,
+    "label": "INCOME",
+    "pct_of_base": 30.25210084,
+    "pct_of_total": 52.173913043,
+    "pnl": {
+     "abs_cost_basis": 1700.0,
+     "amount": -50.0,
+     "cost_basis": 1700.0,
+     "dividends": 40.0,
+     "market_value": 1650.0,
+     "pct": -2.941176471,
+     "priced": 1,
+     "total_amount": -10.0,
+     "total_pct": -0.588235294,
+     "unpriced": 1
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1900.0,
+      "current_value": 1900.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 2100.0,
+      "measurable": true,
+      "pct_of_label": 52.777777778,
+      "pct_of_label_target": 59.134765017,
+      "pct_of_total": 27.536231884,
+      "pnl": {
+       "abs_cost_basis": 0.0,
+       "amount": null,
+       "cost_basis": 0.0,
+       "dividends": 0.0,
+       "market_value": 0.0,
+       "pct": null,
+       "priced": 0,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 1
+      },
+      "previous_weight_pct": null,
+      "price": null,
+      "quantity": 4.0,
+      "symbol": "SPY",
+      "target_value": 1695.8214,
+      "weight_pct": 52.78,
+      "weight_source": "actual"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1700.0,
+      "current_value": 1700.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 1650.0,
+      "measurable": true,
+      "pct_of_label": 47.222222222,
+      "pct_of_label_target": 52.91005291,
+      "pct_of_total": 24.637681159,
+      "pnl": {
+       "abs_cost_basis": 1700.0,
+       "amount": -50.0,
+       "cost_basis": 1700.0,
+       "dividends": 40.0,
+       "market_value": 1650.0,
+       "pct": -2.941176471,
+       "priced": 1,
+       "total_amount": -10.0,
+       "total_pct": -0.588235294,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 55.0,
+      "quantity": 30.0,
+      "symbol": "O",
+      "target_value": 1517.1786,
+      "weight_pct": 47.22,
+      "weight_source": "actual"
+     }
+    ],
+    "target_pct": 30.0,
+    "target_value": 3213.0
+   }
+  ]
+ },
+ "view_market": {
+  "account_id": 1,
+  "account_value": 20000.0,
+  "available_buying_power": 5000.0,
+  "base_notional": 10650.0,
+  "exclusions": {
+   "KO": {
+    "account_id": 1,
+    "excluded_reason": "disabled",
+    "id": 1,
+    "note": "paused",
+    "since": "<dt>",
+    "symbol": "KO"
+   }
+  },
+  "protection": {
+   "items": {},
+   "quantities": {},
+   "supported": false
+  },
+  "real_base_notional": 10650.0,
+  "simulated_base": false,
+  "symbol_facts": {
+   "AAPL": {
+    "account_id": 1,
+    "bp_factor": 1.0,
+    "fetched_at": "<dt>",
+    "fractionable": true,
+    "id": 1,
+    "initial_margin_rate": null,
+    "maintenance_margin_rate": null,
+    "marginable": true,
+    "min_fractional_notional": null,
+    "min_order_size": null,
+    "min_trade_increment": null,
+    "source": "default",
+    "symbol": "AAPL",
+    "tradable": null
+   }
+  },
+  "symbol_stats": {
+   "AAPL": {
+    "company_name": null,
+    "dividend_yield_pct": 0.5,
+    "error": null,
+    "fetched_at": "<dt>",
+    "id": 1,
+    "symbol": "AAPL",
+    "total_return_1y_pct": 12.0,
+    "total_return_3y_pct": null
+   }
+  },
+  "symbols_by_label": {
+   "CORE": [
+    "AAPL",
+    "KO",
+    "MSFT"
+   ],
+   "INCOME": [
+    "O",
+    "SPY"
+   ]
+  },
+  "unallocated_pct": 10.0,
+  "valuation_mode": "market",
+  "views": [
+   {
+    "color": "#0072B2",
+    "comment": "core",
+    "cost_basis": 3300.0,
+    "current_value": 4000.0,
+    "excluded_count": 1,
+    "excluded_value": 1200.0,
+    "freed_pct": 0.0,
+    "label": "CORE",
+    "pct_of_base": 37.558685446,
+    "pct_of_total": 70.796460177,
+    "pnl": {
+     "abs_cost_basis": 3300.0,
+     "amount": 700.0,
+     "cost_basis": 3300.0,
+     "dividends": 0.0,
+     "market_value": 4000.0,
+     "pct": 21.212121212,
+     "priced": 2,
+     "total_amount": null,
+     "total_pct": null,
+     "unpriced": 0
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1500.0,
+      "current_value": 2000.0,
+      "effective_weight_pct": 64.425,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 50.0,
+      "pct_of_label_target": 34.776560598,
+      "pct_of_total": 35.398230088,
+      "pnl": {
+       "abs_cost_basis": 1500.0,
+       "amount": 500.0,
+       "cost_basis": 1500.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 33.333333333,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 200.0,
+      "quantity": 10.0,
+      "symbol": "AAPL",
+      "target_value": 3705.08175,
+      "weight_pct": 50.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1800.0,
+      "current_value": 2000.0,
+      "effective_weight_pct": 38.655,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 50.0,
+      "pct_of_label_target": 34.776560598,
+      "pct_of_total": 35.398230088,
+      "pnl": {
+       "abs_cost_basis": 1800.0,
+       "amount": 200.0,
+       "cost_basis": 1800.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 11.111111111,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 400.0,
+      "quantity": 5.0,
+      "symbol": "MSFT",
+      "target_value": 2223.04905,
+      "weight_pct": 30.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1100.0,
+      "current_value": 1200.0,
+      "effective_weight_pct": null,
+      "excluded": true,
+      "excluded_note": "paused",
+      "excluded_reason": "disabled",
+      "excluded_since": "<dt>",
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 1200.0,
+      "measurable": true,
+      "pct_of_label": 0.0,
+      "pct_of_label_target": 0.0,
+      "pct_of_total": 0.0,
+      "pnl": {
+       "abs_cost_basis": 1100.0,
+       "amount": 100.0,
+       "cost_basis": 1100.0,
+       "dividends": 0.0,
+       "market_value": 1200.0,
+       "pct": 9.090909091,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 60.0,
+      "quantity": 20.0,
+      "symbol": "KO",
+      "target_value": null,
+      "weight_pct": 23.08,
+      "weight_source": "actual"
+     }
+    ],
+    "target_pct": 60.0,
+    "target_value": 5751.0
+   },
+   {
+    "color": null,
+    "comment": null,
+    "cost_basis": 3600.0,
+    "current_value": 1650.0,
+    "excluded_count": 0,
+    "excluded_value": 0,
+    "freed_pct": 0.0,
+    "label": "INCOME",
+    "pct_of_base": 15.492957746,
+    "pct_of_total": 29.203539823,
+    "pnl": {
+     "abs_cost_basis": 1700.0,
+     "amount": -50.0,
+     "cost_basis": 1700.0,
+     "dividends": 40.0,
+     "market_value": 1650.0,
+     "pct": -2.941176471,
+     "priced": 1,
+     "total_amount": -10.0,
+     "total_pct": -0.588235294,
+     "unpriced": 1
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1700.0,
+      "current_value": 1650.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 1650.0,
+      "measurable": true,
+      "pct_of_label": 100.0,
+      "pct_of_label_target": 57.381324987,
+      "pct_of_total": 29.203539823,
+      "pnl": {
+       "abs_cost_basis": 1700.0,
+       "amount": -50.0,
+       "cost_basis": 1700.0,
+       "dividends": 40.0,
+       "market_value": 1650.0,
+       "pct": -2.941176471,
+       "priced": 1,
+       "total_amount": -10.0,
+       "total_pct": -0.588235294,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 55.0,
+      "quantity": 30.0,
+      "symbol": "O",
+      "target_value": null,
+      "weight_pct": null,
+      "weight_source": "unknown"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1900.0,
+      "current_value": 0.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 2100.0,
+      "measurable": false,
+      "pct_of_label": 0.0,
+      "pct_of_label_target": 0.0,
+      "pct_of_total": 0.0,
+      "pnl": {
+       "abs_cost_basis": 0.0,
+       "amount": null,
+       "cost_basis": 0.0,
+       "dividends": 0.0,
+       "market_value": 0.0,
+       "pct": null,
+       "priced": 0,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 1
+      },
+      "previous_weight_pct": null,
+      "price": null,
+      "quantity": 4.0,
+      "symbol": "SPY",
+      "target_value": null,
+      "weight_pct": null,
+      "weight_source": "unknown"
+     }
+    ],
+    "target_pct": 30.0,
+    "target_value": 2875.5
+   }
+  ]
+ },
+ "view_simulated": {
+  "account_id": 1,
+  "account_value": 20000.0,
+  "available_buying_power": 24350.0,
+  "base_notional": 30000.0,
+  "exclusions": {
+   "KO": {
+    "account_id": 1,
+    "excluded_reason": "disabled",
+    "id": 1,
+    "note": "paused",
+    "since": "<dt>",
+    "symbol": "KO"
+   }
+  },
+  "protection": {
+   "items": {},
+   "quantities": {},
+   "supported": false
+  },
+  "real_base_notional": 10650.0,
+  "simulated_base": true,
+  "symbol_facts": {
+   "AAPL": {
+    "account_id": 1,
+    "bp_factor": 1.0,
+    "fetched_at": "<dt>",
+    "fractionable": true,
+    "id": 1,
+    "initial_margin_rate": null,
+    "maintenance_margin_rate": null,
+    "marginable": true,
+    "min_fractional_notional": null,
+    "min_order_size": null,
+    "min_trade_increment": null,
+    "source": "default",
+    "symbol": "AAPL",
+    "tradable": null
+   }
+  },
+  "symbol_stats": {
+   "AAPL": {
+    "company_name": null,
+    "dividend_yield_pct": 0.5,
+    "error": null,
+    "fetched_at": "<dt>",
+    "id": 1,
+    "symbol": "AAPL",
+    "total_return_1y_pct": 12.0,
+    "total_return_3y_pct": null
+   }
+  },
+  "symbols_by_label": {
+   "CORE": [
+    "AAPL",
+    "KO",
+    "MSFT"
+   ],
+   "INCOME": [
+    "O",
+    "SPY"
+   ]
+  },
+  "unallocated_pct": 10.0,
+  "valuation_mode": "market",
+  "views": [
+   {
+    "color": "#0072B2",
+    "comment": "core",
+    "cost_basis": 3300.0,
+    "current_value": 4000.0,
+    "excluded_count": 1,
+    "excluded_value": 1200.0,
+    "freed_pct": 0.0,
+    "label": "CORE",
+    "pct_of_base": 13.333333333,
+    "pct_of_total": 70.796460177,
+    "pnl": {
+     "abs_cost_basis": 3300.0,
+     "amount": 700.0,
+     "cost_basis": 3300.0,
+     "dividends": 0.0,
+     "market_value": 4000.0,
+     "pct": 21.212121212,
+     "priced": 2,
+     "total_amount": null,
+     "total_pct": null,
+     "unpriced": 0
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1500.0,
+      "current_value": 2000.0,
+      "effective_weight_pct": 64.425,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 50.0,
+      "pct_of_label_target": 12.345679012,
+      "pct_of_total": 35.398230088,
+      "pnl": {
+       "abs_cost_basis": 1500.0,
+       "amount": 500.0,
+       "cost_basis": 1500.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 33.333333333,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 200.0,
+      "quantity": 10.0,
+      "symbol": "AAPL",
+      "target_value": 10436.85,
+      "weight_pct": 50.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1800.0,
+      "current_value": 2000.0,
+      "effective_weight_pct": 38.655,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 2000.0,
+      "measurable": true,
+      "pct_of_label": 50.0,
+      "pct_of_label_target": 12.345679012,
+      "pct_of_total": 35.398230088,
+      "pnl": {
+       "abs_cost_basis": 1800.0,
+       "amount": 200.0,
+       "cost_basis": 1800.0,
+       "dividends": 0.0,
+       "market_value": 2000.0,
+       "pct": 11.111111111,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 400.0,
+      "quantity": 5.0,
+      "symbol": "MSFT",
+      "target_value": 6262.11,
+      "weight_pct": 30.0,
+      "weight_source": "saved"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1100.0,
+      "current_value": 1200.0,
+      "effective_weight_pct": null,
+      "excluded": true,
+      "excluded_note": "paused",
+      "excluded_reason": "disabled",
+      "excluded_since": "<dt>",
+      "labels": [
+       "CORE"
+      ],
+      "market_value": 1200.0,
+      "measurable": true,
+      "pct_of_label": 0.0,
+      "pct_of_label_target": 0.0,
+      "pct_of_total": 0.0,
+      "pnl": {
+       "abs_cost_basis": 1100.0,
+       "amount": 100.0,
+       "cost_basis": 1100.0,
+       "dividends": 0.0,
+       "market_value": 1200.0,
+       "pct": 9.090909091,
+       "priced": 1,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 60.0,
+      "quantity": 20.0,
+      "symbol": "KO",
+      "target_value": null,
+      "weight_pct": 23.08,
+      "weight_source": "actual"
+     }
+    ],
+    "target_pct": 60.0,
+    "target_value": 16200.0
+   },
+   {
+    "color": null,
+    "comment": null,
+    "cost_basis": 3600.0,
+    "current_value": 1650.0,
+    "excluded_count": 0,
+    "excluded_value": 0,
+    "freed_pct": 0.0,
+    "label": "INCOME",
+    "pct_of_base": 5.5,
+    "pct_of_total": 29.203539823,
+    "pnl": {
+     "abs_cost_basis": 1700.0,
+     "amount": -50.0,
+     "cost_basis": 1700.0,
+     "dividends": 40.0,
+     "market_value": 1650.0,
+     "pct": -2.941176471,
+     "priced": 1,
+     "total_amount": -10.0,
+     "total_pct": -0.588235294,
+     "unpriced": 1
+    },
+    "previous_target_pct": null,
+    "rows": [
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1700.0,
+      "current_value": 1650.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 1650.0,
+      "measurable": true,
+      "pct_of_label": 100.0,
+      "pct_of_label_target": 20.37037037,
+      "pct_of_total": 29.203539823,
+      "pnl": {
+       "abs_cost_basis": 1700.0,
+       "amount": -50.0,
+       "cost_basis": 1700.0,
+       "dividends": 40.0,
+       "market_value": 1650.0,
+       "pct": -2.941176471,
+       "priced": 1,
+       "total_amount": -10.0,
+       "total_pct": -0.588235294,
+       "unpriced": 0
+      },
+      "previous_weight_pct": null,
+      "price": 55.0,
+      "quantity": 30.0,
+      "symbol": "O",
+      "target_value": null,
+      "weight_pct": null,
+      "weight_source": "unknown"
+     },
+     {
+      "comment": null,
+      "company_name": null,
+      "cost_basis": 1900.0,
+      "current_value": 0.0,
+      "effective_weight_pct": null,
+      "excluded": false,
+      "excluded_note": null,
+      "excluded_reason": null,
+      "excluded_since": null,
+      "labels": [
+       "INCOME"
+      ],
+      "market_value": 2100.0,
+      "measurable": false,
+      "pct_of_label": 0.0,
+      "pct_of_label_target": 0.0,
+      "pct_of_total": 0.0,
+      "pnl": {
+       "abs_cost_basis": 0.0,
+       "amount": null,
+       "cost_basis": 0.0,
+       "dividends": 0.0,
+       "market_value": 0.0,
+       "pct": null,
+       "priced": 0,
+       "total_amount": null,
+       "total_pct": null,
+       "unpriced": 1
+      },
+      "previous_weight_pct": null,
+      "price": null,
+      "quantity": 4.0,
+      "symbol": "SPY",
+      "target_value": null,
+      "weight_pct": null,
+      "weight_source": "unknown"
+     }
+    ],
+    "target_pct": 30.0,
+    "target_value": 8100.0
+   }
+  ]
+ }
+}
