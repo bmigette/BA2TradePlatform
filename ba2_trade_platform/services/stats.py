@@ -123,23 +123,24 @@ def profit_per_expert(account_id: Optional[int], skipped: Optional[List[Dict[str
         if expert_ids is not None:
             query = query.where(Transaction.expert_id.in_(expert_ids))
         for transaction in session.exec(query).all():
-            expert = session.get(ExpertInstance, transaction.expert_id)
-            if not expert:
-                logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
-                continue
             try:
+                expert = session.get(ExpertInstance, transaction.expert_id)
+                if not expert:
+                    logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
+                    if skipped is not None:
+                        skipped.append({"transaction": transaction.id, "reason": "expert instance not found"})
+                    continue
                 profit = calculate_transaction_pnl(transaction)
-            except (TypeError, ValueError, AttributeError) as e:
-                logger.error(f"Error calculating profit for transaction {transaction.id}: {e}", exc_info=True)
+                if profit is None:
+                    if skipped is not None:
+                        skipped.append({"transaction": transaction.id, "reason": "pnl not computable"})
+                    continue
+                name = expert_display_name(expert)
+                profits[name] = profits.get(name, 0.0) + profit
+            except Exception as e:  # noqa: BLE001 -- the page's own behaviour (75431922): ONE bad row never blanks the chart
+                logger.warning(f"Skipping transaction {transaction.id} in profit per expert: {type(e).__name__}: {e}")
                 if skipped is not None:
                     skipped.append({"transaction": transaction.id, "reason": type(e).__name__})
-                continue
-            if profit is None:
-                if skipped is not None:
-                    skipped.append({"transaction": transaction.id, "reason": "pnl not computable"})
-                continue
-            name = expert_display_name(expert)
-            profits[name] = profits.get(name, 0.0) + profit
     return dict(sorted(profits.items(), key=lambda x: x[1], reverse=True))
 
 
@@ -178,7 +179,7 @@ def position_distribution(positions: Iterable[Dict[str, Any]], grouping_field: s
                 else:
                     category = 'Uncategorized'
                 distribution[category] += abs(market_value)
-            except (TypeError, ValueError, AttributeError) as e:
+            except Exception as e:  # noqa: BLE001 -- the page's own behaviour (75431922): ONE bad row never blanks the chart
                 logger.warning(f"Skipping position {symbol} in the distribution: {type(e).__name__}: {e}")
                 if skipped is not None:
                     skipped.append({"symbol": symbol, "reason": type(e).__name__})

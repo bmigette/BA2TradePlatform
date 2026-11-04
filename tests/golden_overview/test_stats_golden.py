@@ -57,3 +57,22 @@ def test_a_position_with_no_market_value_is_skipped_not_fatal(ids):
     got = stats.position_distribution(POSITIONS + [{"symbol": "AAPL", "market_value": None}], "labels", skipped)
     assert [[k, v] for k, v in got.items()] == GOLDEN["distribution"]["labels"]      # the survivors are unchanged
     assert {"symbol": "AAPL", "reason": "TypeError"} in skipped
+
+
+def test_any_exception_on_one_row_skips_that_row_only_in_both_charts(ids, monkeypatch):
+    """The charts' own behaviour at 75431922: a per-row ``except Exception``, whatever its type."""
+    skipped = []
+    got = stats.position_distribution(POSITIONS + [{"symbol": "AAPL", "market_value": object()}], "labels", skipped)
+    assert [[k, v] for k, v in got.items()] == GOLDEN["distribution"]["labels"] and skipped
+
+    real = stats.calculate_transaction_pnl
+
+    def flaky(tx):
+        if tx.symbol == "AAPL":
+            raise RuntimeError("odd row")
+        return real(tx)
+    monkeypatch.setattr(stats, "calculate_transaction_pnl", flaky)
+    skipped = []
+    got = stats.profit_per_expert(ids["acct1"], skipped)
+    assert {"transaction": 1, "reason": "RuntimeError"} in skipped
+    assert "Alpha-1" in got and got["Alpha-1"] == GOLDEN["profit_per_expert"]["acct1"][1][1] - 100.0   # AAPL's +100 is out
