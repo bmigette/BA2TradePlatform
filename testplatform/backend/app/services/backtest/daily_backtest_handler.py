@@ -1225,6 +1225,9 @@ def run_daily_backtest(
             # single chokepoint every path goes through (trial worker, master top-N persist,
             # parallel=1), so both compute_fitness call sites get it without touching either.
             results["analysis_failures"] = engine.analysis_failures_record()
+            _eg_rec = engine.entry_gate_record()
+            if _eg_rec is not None:
+                results["entry_gate_record"] = _eg_rec
             # Whether the entry's stop/target were re-based to the real fill (as live does) and what
             # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
             results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
