@@ -87,3 +87,51 @@ def test_legacy_alias_from_remote_is_refused_while_api_allow_remote_is_off():
     assert r.status_code == 403 and r.json()["detail"]["error"] == "remote_disabled"
     set_allow_remote(True)
     assert client_for(host, host="10.1.1.1", token=TOKEN).post("/api/reload", json={}).status_code == 200
+
+
+# --- routing-level gate (RemoteGateMiddleware) ---------------------------------------------------------------
+
+REMOTE = "10.1.1.1"
+
+
+def _registered_host() -> FastAPI:
+    from ba2_trade_platform.api.app import register_management_api
+    host = FastAPI()
+    register_management_api(host)
+    return host
+
+
+def test_remote_off_is_403_remote_disabled_even_for_404_405_and_redirect_paths():
+    set_api_token()
+    c = client_for(_registered_host(), host=REMOTE, token=TOKEN)
+    for method, path in [("get", "/api/v1/nonexist"), ("post", "/api/v1/ping"), ("get", "/api/v1/ping/"),
+                         ("get", "/api/reload"), ("get", "/api/nonexist")]:
+        r = getattr(c, method)(path, follow_redirects=False)
+        assert r.status_code == 403, (method, path, r.status_code)
+        assert r.json()["error"] == "remote_disabled", (method, path)
+
+
+def test_forwarded_header_on_a_loopback_peer_is_gated_by_the_middleware():
+    set_api_token()
+    r = client_for(_registered_host(), token=TOKEN).get("/api/v1/nonexist", headers={"X-Forwarded-For": "1.2.3.4"})
+    assert r.status_code == 403 and r.json()["error"] == "remote_disabled"
+
+
+def test_sub_app_alone_gates_remote_before_routing():
+    set_api_token()
+    r = client_for(create_v1_app(), host=REMOTE, token=TOKEN).get("/nonexist")
+    assert r.status_code == 403 and r.json()["error"] == "remote_disabled"
+
+
+def test_remote_on_lets_unknown_paths_reach_routing_and_non_api_paths_are_untouched():
+    set_api_token()
+    set_allow_remote(True)
+    host = _registered_host()
+
+    @host.get("/ui-page")
+    def page():
+        return {"ok": True}
+
+    c = client_for(host, host=REMOTE, token=TOKEN)
+    assert c.get("/api/v1/nonexist").status_code == 404
+    assert client_for(host, host=REMOTE).get("/ui-page").status_code == 200   # not an /api path: not gated here
