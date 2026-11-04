@@ -11,7 +11,7 @@ from pandas import MultiIndex
 
 from ..core.utils import get_labels_by_symbol, normalize_symbol
 from ..logger import logger
-from ..ui.utils.overview_range import date_in_range, filter_dates
+from .date_range import date_in_range, filter_dates
 
 
 def signed_trade_qty(side, qty) -> float:

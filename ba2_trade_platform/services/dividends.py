@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from ba2_common.core.portfolio_allocation import cash_dividends_by_symbol
 
 from ..core.portfolio_allocation_service import get_open_income_total, get_recent_income_events
-from ..ui.utils.overview_range import date_in_range
+from .date_range import date_in_range
 from . import accounts as accounts_svc
 from ._common import jsonable, utcnow_iso
 from .errors import BrokerUnreachable, Invalid

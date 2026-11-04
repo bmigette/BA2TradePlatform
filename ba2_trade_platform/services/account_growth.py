@@ -17,7 +17,7 @@ from ..logger import logger
 from . import accounts as accounts_svc
 from . import growth
 from ._common import jsonable, utcnow_iso
-from ..ui.utils.overview_range import date_in_range
+from .date_range import date_in_range
 from .errors import BrokerUnreachable, Invalid, NotFound, Unmeasurable
 
 #: Longest window one request may ask for (the series is one point per day per account).
