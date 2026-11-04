@@ -105,8 +105,7 @@ class RunScheduleRequest(BaseModel):
     subtype: str
 
 
-@router.post("/run-schedule")
-def run_schedule_now(body: RunScheduleRequest):
+def run_schedule(expert_instance_id: int, subtype_text: str, dry_run: bool = False):
     """Manually fire a currently-registered scheduled analysis job right now -- the API
     equivalent of the Scheduled Jobs page's "Run Now" button. Restarting a job normally
     means waiting for its next cron occurrence (e.g. next Monday 09:30 ET); this lets an
@@ -125,11 +124,11 @@ def run_schedule_now(body: RunScheduleRequest):
     from ..core.types import AnalysisUseCase
 
     try:
-        subtype = AnalysisUseCase(body.subtype)
+        subtype = AnalysisUseCase(subtype_text)
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid subtype {body.subtype!r}; expected one of "
+            detail=f"Invalid subtype {subtype_text!r}; expected one of "
                    f"{[m.value for m in AnalysisUseCase]}",
         )
 
@@ -137,7 +136,7 @@ def run_schedule_now(body: RunScheduleRequest):
     match = None
     for job in jm._scheduled_jobs.values():
         args = getattr(job, "args", None) or []
-        if len(args) >= 3 and args[0] == body.expert_instance_id and args[2] == subtype:
+        if len(args) >= 3 and args[0] == expert_instance_id and args[2] == subtype:
             match = args
             break
 
@@ -145,11 +144,19 @@ def run_schedule_now(body: RunScheduleRequest):
         raise HTTPException(
             status_code=404,
             detail=f"No currently-scheduled job found for expert_instance_id="
-                   f"{body.expert_instance_id}, subtype={subtype.value!r} "
+                   f"{expert_instance_id}, subtype={subtype.value!r} "
                    f"(is the expert enabled? does it have this schedule configured?)",
         )
 
     expert_instance_id, symbol, resolved_subtype = match[0], match[1], match[2]
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "would_submit": True,
+            "expert_instance_id": expert_instance_id,
+            "symbol": symbol,
+            "subtype": resolved_subtype.value,
+        }
     try:
         task_id = jm.submit_market_analysis(
             expert_instance_id, symbol, subtype=resolved_subtype,
@@ -178,6 +185,12 @@ def run_schedule_now(body: RunScheduleRequest):
         "symbol": symbol,
         "subtype": resolved_subtype.value,
     }
+
+
+@router.post("/run-schedule")
+def run_schedule_now(body: RunScheduleRequest):
+    """Fire a registered schedule now (see ``run_schedule``); also served as POST /api/v1/run-schedule."""
+    return run_schedule(body.expert_instance_id, body.subtype)
 
 
 class ProcessRecommendationsRequest(BaseModel):

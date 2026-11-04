@@ -101,6 +101,38 @@ def broker_read(account_id: int, what: str, fn: Callable, *args, **kwargs):
         raise
 
 
+def map_broker_error(exc: Exception, account_id: int, what: str) -> Optional[ServiceError]:
+    """The typed error for a broker exception raised by a WRITE, or None when it is a defect (the caller re-raises).
+    Class names only in the message (a broker error can echo request data); the full error goes to the log.
+    OSError family -> BrokerUnreachable (503). A broker SDK API error, or a ValueError (an adapter refusing an
+    order it cannot build) -> BrokerRefused (502): unlike a read, a ValueError on a write is a refusal, not an
+    unmeasurable figure."""
+    if isinstance(exc, ServiceError):
+        return exc
+    if isinstance(exc, OSError):
+        logger.warning(f"API: account {account_id} {what}: {type(exc).__name__}: {exc}")
+        return BrokerUnreachable(f"Account {account_id}: {what} failed: {type(exc).__name__}",
+                                 {"account_id": account_id})
+    if isinstance(exc, ValueError) or any(c.__name__ in _SDK_ERROR_NAMES for c in type(exc).__mro__):
+        logger.warning(f"API: account {account_id} {what}: {type(exc).__name__}: {exc}")
+        return BrokerRefused(f"Account {account_id}: the broker refused {what}: {type(exc).__name__}",
+                             {"account_id": account_id})
+    return None
+
+
+def broker_write(account_id: int, what: str, fn: Callable, *args, **kwargs):
+    """Run ONE broker write and map its failures with ``map_broker_error``. Anything else is a defect and propagates."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        mapped = map_broker_error(e, account_id, what)
+        if mapped is None:
+            raise
+        if mapped is e:
+            raise
+        raise mapped from e
+
+
 def _balance_age_s(account) -> Optional[float]:
     """Age of the account's cached balance, for adapters that keep one (Alpaca: ``_balance_cache`` /
     ``_balance_cache_time``); None when the adapter exposes none (age unknown, not zero)."""
