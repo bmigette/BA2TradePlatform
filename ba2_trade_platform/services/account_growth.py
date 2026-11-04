@@ -3,7 +3,8 @@
 The broker data (balance history, dividends, fills, positions) is read through ``accounts.broker_read`` and kept
 ``FETCH_TTL_S`` seconds per (account, window) so a client polling the three endpoints costs one broker round trip;
 the series are the SAME functions the Account Growth tab calls (``services.growth``). Historical closes come from the
-same yfinance download the tab uses (``fetch_closes``), from the window start, with a timeout and an overall deadline.
+same FMP-by-default source the tab uses (``services.price_history``, the account's history provider), from the window start,
+within an overall deadline.
 
 A GET: nothing here writes. In particular the tab's "queue unknown instruments for auto-add" side effect is NOT
 reproduced: a symbol without an Instrument row is simply 'Unlabeled'. The datasets are read through the adapters' STRICT
@@ -15,18 +16,17 @@ computed through today (trades and dividends are not cut at ``to``) and only the
 import math
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..core.utils import get_labels_by_symbol
 from ..logger import logger
 from . import accounts as accounts_svc
-from . import growth
+from . import growth, price_history
 from ._common import jsonable, utcnow_iso
 from ._positions_cache import read_positions
 from .date_range import _as_date, date_in_range
-from .errors import BrokerUnreachable, Invalid, NotFound, PriceSourceUnreachable, Unmeasurable
+from .errors import BrokerUnreachable, Invalid, NotFound, Unmeasurable
 
 #: Longest window one request may ask for (the series is one point per day per account).
 MAX_SPAN_DAYS = 365 * 5
@@ -35,9 +35,6 @@ DEFAULT_SPAN_DAYS = 365
 MAX_LABELS = 25
 #: How long fetched broker rows are reused (per account and window).
 FETCH_TTL_S = 60.0
-#: yfinance: per-request timeout and the overall deadline of one download.
-PRICE_TIMEOUT_S = 15.0
-PRICE_DEADLINE_S = 45.0
 
 _CACHE: Dict[tuple, Tuple[float, list]] = {}
 _LOCK = threading.Lock()
@@ -65,37 +62,11 @@ def _cached(key: tuple, fetch: Callable[[], Optional[list]]):
     return [dict(r) for r in rows]
 
 
-def fetch_closes(symbols: List[str], start: date) -> Dict[str, Dict[str, float]]:
-    """``{symbol: {YYYY-MM-DD: close}}`` for ``symbols`` from ``start`` on (yfinance, as the Account Growth tab does).
-    A symbol Yahoo returns nothing for is absent. Bounded: ``PRICE_TIMEOUT_S`` per request and ``PRICE_DEADLINE_S`` for
-    the whole download, past which ``PriceSourceUnreachable`` (503) is raised (the worker thread cannot be killed; it
-    finishes on its own)."""
-    if not symbols:
-        return {}
-    import yfinance as yf
-
-    def download():
-        return yf.download(symbols, start=start.isoformat(), progress=False, auto_adjust=False,
-                           timeout=PRICE_TIMEOUT_S)
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(download)
-    try:
-        hist = future.result(timeout=PRICE_DEADLINE_S)
-    except FutureTimeout as e:
-        pool.shutdown(wait=False)
-        raise PriceSourceUnreachable(f"The price source did not answer within {PRICE_DEADLINE_S:.0f}s",
-                                     {"symbols": len(symbols)}) from e
-    except OSError as e:
-        pool.shutdown(wait=False)
-        logger.warning(f"API: price download failed: {type(e).__name__}: {e}")
-        raise PriceSourceUnreachable(f"The price source failed: {type(e).__name__}", {"symbols": len(symbols)}) from e
-    pool.shutdown(wait=False)
-    out = {}
-    for sym in symbols:
-        closes = growth.extract_yf_close_prices(hist, sym)
-        if closes:
-            out[sym] = closes
-    return out
+def fetch_closes(account_id: int, symbols: List[str], start: date) -> Dict[str, Dict[str, float]]:
+    """``{symbol: {YYYY-MM-DD: close}}`` for ``symbols`` from ``start`` on, from the account's own history source (FMP by
+    default; see ``services.price_history``). A symbol the source has nothing for is absent; a dead source or the
+    deadline is ``PriceSourceUnreachable``."""
+    return price_history.fetch_closes({account_id: list(symbols)}, start)
 
 
 def _window(from_: Optional[date], to: Optional[date]):
@@ -252,7 +223,7 @@ def _position_inputs(account_id: int, from_: date, select: Callable[[Dict[str, d
                            {"account_id": account_id, "skipped_positions": skipped_positions})
     known = sorted({lb for i in info.values() for lb in i['labels']})
     info = select(info)
-    closes = fetch_closes(sorted(info), from_)
+    closes = fetch_closes(account_id, sorted(info), from_)
     unpriced = sorted(s for s in info if s not in closes)
     if len(unpriced) == len(info):
         raise Unmeasurable("No historical prices could be fetched for any held symbol", {"unpriced_symbols": unpriced})

@@ -181,14 +181,13 @@ def test_changing_the_range_does_not_refetch_broker_data(nicegui_client, monkeyp
     import asyncio
     from types import SimpleNamespace
     from nicegui import ui
-    import yfinance
     import ba2_trade_platform.ui.pages.overview as ov
     acct = _CountingAccount()
     monkeypatch.setattr(ov, 'get_all_instances', lambda m: [SimpleNamespace(id=1, name='A')])
     monkeypatch.setattr(ov, 'get_account_instance_from_id', lambda i: acct)
     yf_calls = []
-    monkeypatch.setattr(yfinance, 'download', lambda *a, **k: yf_calls.append(k.get('period')))
-    monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: yf_calls.append(period) or {s: {'2026-09-01': 1.0} for s in syms})
     for name in ('_render_monthly_realized_income_chart', '_render_monthly_profit_by_label_chart',
                  '_render_total_growth_chart', '_render_growth_by_label_charts',
                  '_render_growth_by_position_in_label_charts', '_render_per_position_section',

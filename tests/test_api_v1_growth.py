@@ -50,7 +50,7 @@ def world(monkeypatch):
     monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda account_id: broker if account_id == acct.id else None)
     closes = seed.historical_prices()
     broker.closes = closes
-    monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: {s: closes[s] for s in symbols if s in closes})
+    monkeypatch.setattr(svc, "fetch_closes", lambda account_id, symbols, start: {s: closes[s] for s in symbols if s in closes})
     svc.clear_cache()
     from ba2_trade_platform.services import portfolio
     portfolio._DIVIDENDS_CACHE.clear()
@@ -129,10 +129,10 @@ def test_growth_by_position_inside_a_label(world):
 def test_symbols_without_prices_are_named_and_all_unpriced_is_unmeasurable(world, monkeypatch):
     acct, broker = world
     closes = {k: v for k, v in broker.closes.items() if k != "XLE"}
-    monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: {s: closes[s] for s in symbols if s in closes})
+    monkeypatch.setattr(svc, "fetch_closes", lambda account_id, symbols, start: {s: closes[s] for s in symbols if s in closes})
     body = v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}").json()
     assert body["unpriced_symbols"] == ["XLE"]
-    monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: {})
+    monkeypatch.setattr(svc, "fetch_closes", lambda account_id, symbols, start: {})
     r = v1_client().get(f"/accounts/{acct.id}/growth/labels?{WINDOW}")
     assert r.status_code == 503 and r.json()["error"] == "unmeasurable"
 
@@ -211,31 +211,44 @@ def test_a_position_without_cost_basis_is_skipped_and_listed_not_a_503(world):
 def test_prices_are_fetched_only_for_the_requested_labels_symbols(world, monkeypatch):
     acct, broker = world
     asked = []
-    monkeypatch.setattr(svc, "fetch_closes", lambda symbols, start: asked.append(list(symbols)) or
+    monkeypatch.setattr(svc, "fetch_closes", lambda account_id, symbols, start: asked.append(list(symbols)) or
                         {s: broker.closes[s] for s in symbols})
     v1_client().get(f"/accounts/{acct.id}/growth/labels/Energy/positions?{WINDOW}")
     assert asked == [["XLE"]]
 
 
-def test_price_deadline_is_a_503_price_source_unreachable(monkeypatch):
+def test_prices_come_from_the_accounts_history_provider_and_a_slow_source_is_a_503(monkeypatch):
     import time
-    monkeypatch.setattr(svc, "PRICE_DEADLINE_S", 0.2)
-    import types, sys
-    fake = types.ModuleType("yfinance")
-    fake.download = lambda *a, **k: time.sleep(1.0)
-    monkeypatch.setitem(sys.modules, "yfinance", fake)
-    from ba2_trade_platform.services.errors import PriceSourceUnreachable
     from datetime import date
+    import pandas as pd
+    from ba2_trade_platform.services import price_history
+    from ba2_trade_platform.services.errors import PriceSourceUnreachable
+
+    class Provider:
+        def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d"):
+            if symbol == "SLOW":
+                time.sleep(1.0)
+            if symbol == "NONE":
+                return pd.DataFrame(columns=["Date", "Close"])
+            return pd.DataFrame({"Date": pd.to_datetime(["2026-09-01", "2026-09-02"], utc=True),
+                                 "Close": [10.0, float("nan")]})
+    monkeypatch.setattr(price_history, "_provider", lambda account_id: Provider())
+    got = svc.fetch_closes(1, ["AAPL", "NONE"], date(2026, 9, 1))
+    assert got == {"AAPL": {"2026-09-01": 10.0}}                         # NaN row dropped, empty symbol absent
+    monkeypatch.setattr(price_history, "PRICE_DEADLINE_S", 0.2)
     with pytest.raises(PriceSourceUnreachable):
-        svc.fetch_closes(["AAPL"], date(2026, 9, 1))
+        svc.fetch_closes(1, ["SLOW"], date(2026, 9, 1))
     assert PriceSourceUnreachable.code == "price_source_unreachable" and PriceSourceUnreachable.status_code == 503
 
 
-def test_a_failed_trades_fetch_is_a_503_and_not_an_empty_history(world):
-    acct, broker = world
+def test_every_symbol_failing_is_price_source_unreachable(monkeypatch):
+    from datetime import date
+    from ba2_trade_platform.services import price_history
+    from ba2_trade_platform.services.errors import PriceSourceUnreachable
 
-    def down(*a, **k):
-        raise TimeoutError("slow")
-    broker.get_filled_trades_strict = down
-    r = v1_client().get(f"/accounts/{acct.id}/growth?{WINDOW}")
-    assert r.status_code == 503 and r.json()["error"] == "broker_unreachable"
+    class Down:
+        def get_ohlcv_data(self, *a, **k):
+            raise ConnectionError("fmp down")
+    monkeypatch.setattr(price_history, "_provider", lambda account_id: Down())
+    with pytest.raises(PriceSourceUnreachable):
+        svc.fetch_closes(1, ["AAPL", "MSFT"], date(2026, 9, 1))

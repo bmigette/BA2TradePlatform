@@ -86,19 +86,18 @@ def nicegui_client():
 
 @pytest.fixture
 def env(monkeypatch, nicegui_client):
-    import yfinance
     import ba2_trade_platform.ui.pages.overview as ov
     drawn, yf_calls = [], []
     state = SimpleNamespace(acct=Acct(), yf_fail=False)
     monkeypatch.setattr(ov, 'get_all_instances', lambda m: [SimpleNamespace(id=1, name='A1')])
     monkeypatch.setattr(ov, 'get_account_instance_from_id', lambda i: state.acct)
 
-    def fake_download(*a, **k):
-        yf_calls.append(k.get('period'))
+    def fake_download(self, syms, period):
+        yf_calls.append(period)
         if state.yf_fail:
-            raise RuntimeError('yahoo down')
-    monkeypatch.setattr(yfinance, 'download', fake_download)
-    monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
+            raise RuntimeError('price source down')
+        return {s: {'2026-09-01': 1.0} for s in syms}
+    monkeypatch.setattr(ov.AccountGrowthTab, '_download_closes', fake_download)
     for name in ('_render_monthly_realized_income_chart', '_render_monthly_profit_by_label_chart',
                  '_render_growth_by_label_charts', '_render_growth_by_position_in_label_charts',
                  '_render_per_position_section', '_render_dividend_history_table',

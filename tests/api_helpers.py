@@ -198,7 +198,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     # phase 4: the Overview calculators resolve the account through their own module / a local import
     _factory = lambda i, session=None, use_cache=True: _chartable_account(i)    # noqa: E731
     monkeypatch.setattr("ba2_trade_platform.services.account_growth.fetch_closes",
-                        lambda symbols, start, **kw: {s: _recent_closes() for s in symbols})
+                        lambda account_id, symbols, start: {s: _recent_closes() for s in symbols})
     monkeypatch.setattr("ba2_trade_platform.services.floating_pl.get_account_instance_from_id", _factory)
     monkeypatch.setattr("ba2_trade_platform.core.utils.get_account_instance_from_id", _factory)
 

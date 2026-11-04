@@ -48,7 +48,7 @@ def world(monkeypatch):
         monkeypatch.setattr(module, "get_account_instance_from_id", factory)
     monkeypatch.setattr(portfolio, "get_account_instance_from_id", factory, raising=False)
     monkeypatch.setattr(account_growth, "fetch_closes",
-                        lambda symbols, start: {s: {(datetime.now() - timedelta(days=n)).date().isoformat(): 100.0 + n
+                        lambda account_id, symbols, start: {s: {(datetime.now() - timedelta(days=n)).date().isoformat(): 100.0 + n
                                                     for n in range(35, 0, -1)} for s in symbols})
     monkeypatch.setattr(experts_svc, "get_expert_instance_from_id", lambda i: None, raising=False)
     closed = create_transaction(symbol=SYMBOL, quantity=5.0, status=TransactionStatus.CLOSED, open_price=100.0,

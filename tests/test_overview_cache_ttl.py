@@ -55,7 +55,6 @@ def _div(sym, days_ago, amount=5.0):
 
 @pytest.fixture
 def env(monkeypatch, nicegui_client):  # noqa: F811
-    import yfinance
     import ba2_trade_platform.ui.pages.overview as ov
     acct = LiveAcct()
     clock = SimpleNamespace(t=1000.0)
@@ -66,8 +65,8 @@ def env(monkeypatch, nicegui_client):  # noqa: F811
     from ba2_trade_platform.services import growth as growth_service    # the label lookup moved there with the monthly maths
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
     monkeypatch.setattr(growth_service, 'get_labels_by_symbol', lambda syms: {})
-    monkeypatch.setattr(yfinance, 'download', lambda *a, **k: None)
-    monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: {s: {'2026-09-01': 1.0} for s in syms})
     for name in ('_render_monthly_profit_by_label_chart', '_render_total_growth_chart',
                  '_render_growth_by_label_charts', '_render_growth_by_position_in_label_charts',
                  '_render_per_position_section', '_render_dividend_history_table',
@@ -200,9 +199,9 @@ def test_updated_stamp_follows_fetches_not_cached_draws(env):
 
 
 def test_price_cache_has_its_own_longer_ttl(env, monkeypatch):
-    import yfinance
     calls = []
-    monkeypatch.setattr(yfinance, 'download', lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(env.ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: calls.append(1) or {s: {'2026-09-01': 1.0} for s in syms})
 
     async def go():
         tab = env.new_tab()

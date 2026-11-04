@@ -63,7 +63,6 @@ class Broker:
 
 @pytest.fixture
 def env(monkeypatch):
-    import yfinance
     from nicegui import ui
     from nicegui.client import Client
     from nicegui.page import page as nicegui_page
@@ -82,8 +81,8 @@ def env(monkeypatch):
     from ba2_trade_platform.services import growth as growth_service    # the label lookup moved there with the monthly maths
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
     monkeypatch.setattr(growth_service, 'get_labels_by_symbol', lambda syms: {})
-    monkeypatch.setattr(yfinance, 'download', lambda *a, **k: yf_calls.append(k.get('period')))
-    monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: yf_calls.append(period) or {s: {'2026-09-01': 1.0} for s in syms})
     from nicegui.slot import Slot
 
     def notify(msg, *a, **k):
@@ -432,11 +431,10 @@ def test_unknown_trade_sides_are_ignored_by_the_forecast_like_the_timeline():
 
 
 def test_partial_price_download_is_not_asked_again_within_a_broker_ttl(env, monkeypatch):
-    import yfinance
     ov = env.ov
     calls = []
-    monkeypatch.setattr(yfinance, 'download', lambda syms, **k: calls.append(list(syms)))
-    monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0} if s == 'AAA' else {})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: calls.append(list(syms)) or {'AAA': {'2026-09-01': 1.0}})
 
     async def go():
         tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
@@ -604,8 +602,9 @@ def test_a_click_after_the_ttl_keeps_the_all_accounts_symbol_pick_and_does_not_r
 
 def test_a_checkbox_click_after_the_ttl_keeps_the_choice_and_does_not_reload(env, monkeypatch):
     from datetime import timedelta as td
-    monkeypatch.setattr(env.ov, '_extract_yf_close_prices',
-                        lambda h, s: {(TODAY - td(days=i)).isoformat(): 10.0 + i * 0.01 for i in range(1, 100)})
+    monkeypatch.setattr(env.ov.AccountGrowthTab, '_download_closes',
+                        lambda self, syms, period: {s: {(TODAY - td(days=i)).isoformat(): 10.0 + i * 0.01
+                                                        for i in range(1, 100)} for s in syms})
     env.restore('_render_growth_by_label_charts')
     env.state.brokers[0].positions = [SimpleNamespace(symbol='AAA', qty=10, avg_entry_price=10.0,
                                                       cost_basis=100.0)]

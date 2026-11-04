@@ -58,6 +58,7 @@ from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.account_scope import scope_transactions_to_account
 from ...services import stats as stats_service
 from ...services import growth as growth_service
+from ...services import price_history
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
 from ..components.refresh_button import refresh_button
@@ -4956,11 +4957,6 @@ class PerformanceTab:
         selected_account_id = get_selected_account_id()
         PerformanceAnalytics(selected_account_id).render()
 
-def _extract_yf_close_prices(hist_data, symbol):
-    """Close prices from a yfinance DataFrame (see services.growth.extract_yf_close_prices)."""
-    return growth_service.extract_yf_close_prices(hist_data, symbol)
-
-
 def _pnl_color_gradient(pnl_data, positive_color, negative_color):
     """
     Compute a horizontal linear gradient that changes color at zero-crossings.
@@ -5023,7 +5019,7 @@ _build_qty_timeline = growth_service.build_qty_timeline
 #: past it ANY redraw refetches the FULL lists -- never "since the last fetch", because a
 #: payment can be booked a day or three BACK-DATED and an incremental fetch would miss it.
 BROKER_DATA_TTL_SECONDS = 60
-#: yfinance prices have their own, longer, TTL (today's bar can be at most this old).
+#: The price history (FMP by default) has its own, longer, TTL (today's bar can be at most this old).
 PRICE_TTL_SECONDS = 15 * 60
 #: Gentle auto-refresh of a long-open, VISIBLE tab: refetch, redraw only if the data changed.
 AUTO_REFRESH_SECONDS = 5 * 60
@@ -6228,13 +6224,7 @@ class AccountGrowthTab:
         ok = True
         if symbols:
             try:
-                import yfinance as yf
-                hist = await asyncio.to_thread(
-                    lambda: yf.download(symbols, period=need, progress=False, auto_adjust=False))
-                for sym in symbols:
-                    prices = _extract_yf_close_prices(hist, sym)
-                    if prices:
-                        data[sym] = prices
+                data = await asyncio.to_thread(self._download_closes, symbols, need)
                 ok = bool(data)
             except Exception as e:
                 logger.warning(f"Could not fetch historical prices: {e}")
@@ -6245,6 +6235,13 @@ class AccountGrowthTab:
             cache['prices'] = {'period': need, 'symbols': set(data), 'data': data,
                                'missing': set(symbols) - set(data), 'fetched_at': _clock()}
         return data
+
+    def _download_closes(self, symbols, period):
+        """``{symbol: {date: close}}`` from the platform's own price source -- the history provider of the account that
+        holds the symbol (FMP by default; ``services.price_history``), the same one the management API charts with."""
+        start = price_history.start_for_period(period, getattr(self, '_earliest', None))
+        by_account = price_history.symbols_by_account(self._broker_cache.get('positions_by_account') or {}, symbols)
+        return price_history.fetch_closes(by_account, start)
 
     def _cached_symbol_prices(self, symbol):
         held = self._broker_cache.get('prices')
@@ -7215,14 +7212,11 @@ class AccountGrowthTab:
                     dividends = divs_by_symbol.get(symbol, [])
                     filled_trades = trades_by_symbol.get(symbol, [])
 
-                    # Fetch historical prices from Yahoo Finance
+                    # Fetch historical prices from the platform's price source (FMP by default)
                     hist_prices = self._cached_symbol_prices(symbol)
                     if hist_prices is None:
-                        import yfinance as yf
-                        hist_data = await asyncio.to_thread(
-                            lambda: yf.download(symbol, period=yf_period_for(self._range), progress=False, auto_adjust=False)
-                        )
-                        hist_prices = _extract_yf_close_prices(hist_data, symbol)
+                        closes = await asyncio.to_thread(self._download_closes, [symbol], yf_period_for(self._range))
+                        hist_prices = closes[symbol] if symbol in closes else {}
                 except Exception as e:
                     try:
                         if loading:
