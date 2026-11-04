@@ -1,7 +1,7 @@
 """Stage-2 job P (style ``premium``) and the O_STYLE dead-gene pins.
 
 * ``_STYLE_DEAD_GENES`` (proven dead 2026-11-04) leave the O_STYLE search and ONLY the O_STYLE search.
-* ``premium`` (status draft) in tools/option_styles.stage2.json: members, DTE floor 5, no price cap,
+* ``premium`` (status approved 2026-11-04) in tools/option_styles.stage2.json: members, DTE floor 5, no price cap,
   a risk block under which a fully cash-secured CSP is admitted by the option rails.
 * tools/stage2_seed_policy.jobP.json is a valid policy for it.
 """
@@ -89,9 +89,9 @@ def test_dead_gene_keys_are_the_namespaced_pins():
 
 
 # ------------------------------------------------------------------ Task 2: the premium style
-def test_premium_is_a_draft_with_the_expected_members_in_order():
+def test_premium_is_approved_with_the_expected_members_in_order():
     style = L._load_style_spec(_STAGE2, "premium")
-    assert style["status"] == "draft"
+    assert style["status"] == "approved"
     assert [m["key"] for m in style["members"]] == MEMBERS
     assert style["price_cap_policy"] == "none"
     assert style["risk"]["fixed"]["undefined_risk_max_pct"] == 100
