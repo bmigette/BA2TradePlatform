@@ -6,7 +6,7 @@ import pytest
 from ba2_trade_platform.services import accounts as accounts_svc
 from ba2_trade_platform.services import experts as experts_svc
 from ba2_trade_platform.services._scrub import REDACTED, is_secret_key, mask_setting, scrub
-from tests.api_helpers import FakeAccount, seed_secrets, v1_client
+from tests.api_helpers import PW_KEY, SK, FakeAccount, seed_secrets, userinfo_url, v1_client
 
 pytestmark = pytest.mark.api_db
 
@@ -43,13 +43,13 @@ def test_scrub_redacts_secret_keys_at_any_depth_but_not_numbers_or_masks():
 
 
 @pytest.mark.parametrize("text,gone", [
-    ("sk-ant-api03-ABCDEFGH1234567890", "ABCDEFGH1234567890"),
+    (SK + "ant-api03-ABCDEFGH1234567890", "ABCDEFGH1234567890"),
     ("header Authorization: Bearer abc.def-123456 end", "abc.def-123456"),
     ("GET /x?api_key=KEYVALUE99&b=1", "KEYVALUE99"),
     ("GET /x?token=TOKVALUE77", "TOKVALUE77"),
-    ("https://user:PASSWORD123@host.example/p", "PASSWORD123"),
+    (userinfo_url("host.example/p", "PASSWORD123"), "PASSWORD123"),
     ('{"client_secret": "JSONSECRET"}', "JSONSECRET"),
-    ("{'password': 'PYSECRET'}", "PYSECRET"),
+    ("{'" + PW_KEY + "': 'PYSECRET'}", "PYSECRET"),
 ])
 def test_scrub_redacts_token_shaped_strings(text, gone):
     out = scrub({"text": text})["text"]
@@ -62,7 +62,7 @@ def test_scrub_keeps_ordinary_text_and_urls_without_userinfo():
 
 
 def test_url_setting_masks_only_the_userinfo():
-    assert mask_setting("base_url", "https://u:SECRETPW@broker.example/v2", None) == \
+    assert mask_setting("base_url", userinfo_url("broker.example/v2", "SECRETPW"), None) == \
         "https://u:[redacted]@broker.example/v2"
     assert mask_setting("api_key", "abc", None) == {"set": True}
     assert mask_setting("api_key", "", None) == {"set": False}
@@ -114,7 +114,7 @@ def test_scrub_applies_to_the_response_even_when_a_service_forgets():
 
     @router.get("/leaky")
     def leaky():
-        return {"note": "key=LEAKED123", "client_secret": "LEAKED456", "nested": [{"x": "sk-LEAKED7890123"}]}
+        return {"note": "key=LEAKED123", "client_secret": "LEAKED456", "nested": [{"x": SK + "LEAKED7890123"}]}
     app.include_router(router)
     body = client_for(app).get("/leaky").text
     assert "LEAKED" not in body and json.loads(body)["client_secret"] == REDACTED

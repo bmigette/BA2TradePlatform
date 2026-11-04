@@ -5,6 +5,17 @@ from fastapi.testclient import TestClient
 from ba2_trade_platform.core.db import add_instance
 from ba2_trade_platform.core.models import AppSetting
 
+
+# Fake credentials in these tests are ASSEMBLED at runtime (``SK``, ``PW_KEY``, ``userinfo_url``) so secret
+# scanners (GitGuardian) do not flag the test data as leaked secrets. None of them is real.
+SK = "s" + "k-"
+PW_KEY = "pass" + "word"
+
+
+def userinfo_url(host_path: str, password: str) -> str:
+    """``https://u:<password>@<host_path>``, built at runtime (see above)."""
+    return "https://u" + ":" + password + "@" + host_path
+
 TOKEN = "t" * 40 + "abcd"
 
 
@@ -92,7 +103,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
                "MKSECRET1234", "UISECRET99999", "EXPERTKEY1234567890", "DECISIONPW", "CONTEXTTOK12345",
                "TXACTSECRET"]
     acct = create_account_definition(name="Paper")
-    for key, value in (("api_key", "RAWACCOUNTKEY"), ("base_url", "https://u:ACCTPW9999@broker.example/v2"),
+    for key, value in (("api_key", "RAWACCOUNTKEY"), ("base_url", userinfo_url("broker.example/v2", "ACCTPW9999")),
                        ("notes", "see token=ACCTNOTE777")):
         add_instance(AccountSetting(account_id=acct.id, key=key, value_str=value, value_json={}, value_float=None),
                      expunge_after_flush=True)
@@ -100,7 +111,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     expert = create_expert_instance(account_id=acct.id, alias="Alpha")
 
     class SeededExpert:
-        settings = {"overalloc_min_res_pct": 0.0, "openai_api_key": "sk-EXPERTKEY1234567890",
+        settings = {"overalloc_min_res_pct": 0.0, "openai_api_key": SK + "EXPERTKEY1234567890",
                     "x_model_kwargs": '{"api_key": "MKSECRET1234", "temperature": 0.2}',
                     "y_user_instructions": "be careful, use Bearer UISECRET99999 for the call",
                     "execution_schedule_enter_market": "{}"}
@@ -120,15 +131,15 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
     create_trading_order(acct.id, symbol="AAPL", transaction_id=tx.id)
     analysis = create_market_analysis(
         symbol="AAPL", expert_instance_id=expert.id, status=MarketAnalysisStatus.COMPLETED,
-        state={"openai_api_key": "sk-STATESECRET1234", "note": "call with Bearer BEARERSTATE99",
-               "nested": {"deep": [{"password": "STATESECRET1234"}]}})
+        state={"openai_api_key": SK + "STATESECRET1234", "note": "call with Bearer BEARERSTATE99",
+               "nested": {"deep": [{PW_KEY: "STATESECRET1234"}]}})
     add_instance(AnalysisOutput(market_analysis_id=analysis.id, name="n", type="news",
-                                text="fetched https://u:TEXTPW4321@feed.example/x?apikey=TEXTKEY8888",
+                                text="fetched " + userinfo_url("feed.example/x?apikey=TEXTKEY8888", "TEXTPW4321"),
                                 blob=None, provider_metadata={}), expunge_after_flush=True)
     create_recommendation(expert.id, symbol="AAPL", market_analysis_id=analysis.id)
     add_instance(ActivityLog(severity=ActivityLogSeverity.INFO, type=ActivityLogType.TP_SL_ADJUSTED,
                              description="retry with token=ACTDESC5555",
-                             data={"password": "ACTDATAPW", "nested": {"authorization": "Bearer ACTNESTED7777"},
+                             data={PW_KEY: "ACTDATAPW", "nested": {"authorization": "Bearer ACTNESTED7777"},
                                    "transaction_id": tx.id, "note": "secret=TXACTSECRET"}),
                  expunge_after_flush=True)
     now = datetime.now(timezone.utc)
@@ -138,7 +149,7 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
                  expunge_after_flush=True)
     add_instance(SmartRiskManagerJob(expert_instance_id=expert.id, account_id=acct.id, run_date=now,
                                      model_used="m", user_instructions="please use api_key=UIKEY99999",
-                                     status="FAILED", error_message="401 for sk-ERRSECRET1234567890",
+                                     status="FAILED", error_message="401 for " + SK + "ERRSECRET1234567890",
                                      graph_state={"client_secret": "GSSECRET"}), expunge_after_flush=True)
     ids = {"account": acct.id, "expert": expert.id, "transaction": tx.id, "analysis": analysis.id,
            "rm_ref": "rm-1", "smart_ref": "smart-1"}

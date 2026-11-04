@@ -11,7 +11,7 @@ pytestmark = pytest.mark.api_db
 
 class FakeExpert:
     settings = {"overalloc_min_res_pct": 10.0, "execution_schedule_enter_market": "{\"days\": [\"monday\"]}",
-                "openai_api_key": "sk-secret", "min_confidence": 70}
+                "openai_api_key": "fake-secret", "min_confidence": 70}
 
     @classmethod
     def get_merged_settings_definitions(cls):
@@ -43,7 +43,7 @@ def test_detail_masks_secrets_and_reports_balance_and_reserve(fake):
     e = create_expert_instance(account_id=acct.id, virtual_equity_pct=50.0)
     d = v1_client().get(f"/experts/{e.id}").json()
     assert d["settings"]["openai_api_key"] == {"set": True}
-    assert "sk-secret" not in str(d)
+    assert "fake-secret" not in str(d)
     assert d["settings"]["min_confidence"] == 70
     assert d["overalloc_min_res_pct"] == 10.0
     assert d["capital"]["available_balance"] == 3800.0 and d["capital"]["virtual_balance"] == 5000.0
