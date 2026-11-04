@@ -420,3 +420,127 @@ def load_income_panel(account_id: int):
         raise RuntimeError(f"Account {account_id} could not be instantiated")
     svc.sync_income_events(account)
     return read_income_panel(account_id)
+
+
+
+# ---------------------------------------------------------------------------
+# Management API reads. Pure: nothing below writes the DB or asks a broker to refresh anything.
+# ---------------------------------------------------------------------------
+
+def _pnl_dict(pnl) -> Dict[str, Any]:
+    """``UnrealisedPnL`` as the API shows it. ``amount`` / ``pct`` are null when they cannot be measured, and the
+    ``with_dividends_*`` pair is null whenever there is no dividend cash to add (the engine's own rule)."""
+    return {"amount": pnl.amount, "pct": pnl.pct, "with_dividends_amount": pnl.total_amount,
+            "with_dividends_pct": pnl.total_pct, "dividend_cash": pnl.dividends,
+            "priced": pnl.priced, "unpriced": pnl.unpriced}
+
+
+def _row_dict(row, facts, stats) -> Dict[str, Any]:
+    f = facts[row.symbol] if row.symbol in facts else None
+    st = stats[row.symbol] if row.symbol in stats else None
+    measured = row.measurable
+    return {
+        "symbol": row.symbol, "company_name": row.company_name, "labels": list(row.labels),
+        "quantity": row.quantity, "cost_basis": row.cost_basis, "price": row.price,
+        "market_value": row.market_value,
+        # An unpriced holding has no knowable value: null, never the 0.0 the view builder uses internally.
+        "measured": measured,
+        "current_value": row.current_value if measured else None,
+        "pct_of_label": row.pct_of_label if measured else None,
+        "pct_of_label_target": row.pct_of_label_target if measured else None,
+        "pct_of_total": row.pct_of_total if measured else None,
+        "target_share_pct": row.weight_pct, "target_share_source": row.weight_source,
+        "effective_target_share_pct": row.effective_weight_pct, "target_value": row.target_value,
+        "previous_target_share_pct": row.previous_weight_pct, "comment": row.comment,
+        "pnl": _pnl_dict(row.pnl),
+        "excluded": row.excluded, "excluded_reason": row.excluded_reason, "excluded_note": row.excluded_note,
+        "excluded_since": row.excluded_since,
+        "facts": None if f is None else {"fractionable": f.fractionable, "marginable": f.marginable,
+                                         "tradable": f.tradable, "bp_factor": f.bp_factor,
+                                         "fetched_at": f.fetched_at},
+        "stats": None if st is None else {"dividend_yield_pct": st.dividend_yield_pct,
+                                          "total_return_1y_pct": st.total_return_1y_pct,
+                                          "total_return_3y_pct": st.total_return_3y_pct, "error": st.error,
+                                          "fetched_at": st.fetched_at},
+    }
+
+
+def _label_dict(view, facts, stats) -> Dict[str, Any]:
+    rows = [_row_dict(r, facts, stats) for r in view.rows]
+    unmeasured = [r["symbol"] for r in rows if not r["measured"] and not r["excluded"]]
+    complete = not unmeasured
+    return {
+        "label": view.label, "color": view.color, "comment": view.comment,
+        "target_pct": view.target_pct, "previous_target_pct": view.previous_target_pct,
+        # Current weight is comparable with the target: share of the allocatable base (buying power + managed
+        # value). With an unpriced holding in the label the sum is understated, so it is null, not a smaller number.
+        "current_pct_of_base": view.pct_of_base if complete else None,
+        "pct_of_managed": view.pct_of_total if complete else None,
+        "target_value": view.target_value,
+        "invested": view.cost_basis,                 # what the held positions cost
+        "current_value": view.current_value if complete else None,
+        "current_value_measured_part": view.current_value,
+        "complete": complete, "unmeasured_symbols": unmeasured,
+        "pnl": _pnl_dict(view.pnl),
+        "excluded_value": view.excluded_value, "freed_pct": view.freed_pct,
+        "symbol_counts": {"total": len(rows), "held": sum(1 for r in rows if r["quantity"]),
+                          "excluded": view.excluded_count, "unmeasured": len(unmeasured)},
+        "symbols": rows,
+    }
+
+
+def _newest(rows) -> Optional[Any]:
+    stamps = [r.fetched_at for r in rows.values() if r.fetched_at is not None]
+    return max(stamps) if stamps else None
+
+
+def portfolio_view(account_id: int) -> Dict[str, Any]:
+    """``GET /accounts/{id}/portfolio``: the allocation page's payload for one account, as plain data.
+
+    Pure: built by ``load_view_payload(read_only=True)`` (stored symbol facts, config row never created) and
+    ``read_income_panel`` (stored ledger). ``NotFound`` when the account, or its allocation config, does not exist;
+    a failed position fetch is ``BrokerUnreachable`` (never an empty book)."""
+    from ..core.models import AccountDefinition
+    from ..core.portfolio_allocation import PositionFetchFailed
+    from ._common import jsonable, require_row, utcnow_iso
+    from .accounts import _live_account, broker_read
+    from .errors import BrokerUnreachable, NotFound
+
+    with get_db() as session:
+        require_row(session, AccountDefinition, account_id, "account")
+    config = peek_allocation_config(account_id)
+    if config is None:
+        raise NotFound("no portfolio on this account", {"account_id": account_id})
+    account = _live_account(account_id)
+    try:
+        payload = broker_read(account_id, "the portfolio payload", load_view_payload, account_id,
+                              config.valuation_mode, read_only=True, account=account, config=config)
+    except PositionFetchFailed as e:
+        raise BrokerUnreachable(f"Account {account_id}: the broker positions fetch failed",
+                                {"account_id": account_id}) from e
+    _events, open_total, working_note = read_income_panel(account_id)
+    facts, stats = payload["symbol_facts"], payload["symbol_stats"]
+    labels = [_label_dict(v, facts, stats) for v in payload["views"]]
+    unmeasured = []
+    if not payload["snapshot_available"]:
+        unmeasured += ["base_notional", "available_buying_power", "account_value"]
+    unmeasured += [f"label:{lb['label']}" for lb in labels if not lb["complete"]]
+    payments = payload["dividend_payments"]
+    out = {
+        "as_of": utcnow_iso(), "account_id": account_id, "valuation_mode": payload["valuation_mode"],
+        "allow_fractional": config.allow_fractional, "unallocated_pct": payload["unallocated_pct"],
+        "base_notional": payload["base_notional"], "available_buying_power": payload["available_buying_power"],
+        "account_value": payload["account_value"],
+        "target_total_pct": sum(lb["target_pct"] for lb in labels),
+        "unmeasured": unmeasured, "labels": labels,
+        "dividends": {"payments": payments,
+                      "note": None if payments else
+                      "The broker returned no dividend payments; a failed fetch reads the same, so the "
+                      "with_dividends figures are null rather than equal to the plain P&L."},
+        "stored": {"symbol_facts_fetched_at": _newest(facts), "symbol_stats_fetched_at": _newest(stats),
+                   "note": "Symbol facts and stats are the stored rows (a GET never refreshes them); the page's "
+                           "Refresh updates them."},
+        "income": {"open_total": open_total, "working_note": working_note,
+                   "synced_by": "the Portfolio Allocation page load / Refresh; the API never syncs the ledger"},
+    }
+    return jsonable(out)
