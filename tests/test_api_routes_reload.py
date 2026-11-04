@@ -6,18 +6,19 @@ The router is mounted on a throwaway FastAPI app (not the full NiceGUI ``app``, 
 ``ui.run()`` to bind) — ``include_router`` is all TestClient needs to exercise the routes.
 """
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from ba2_trade_platform.core.AccountInstanceCache import AccountInstanceCache
 from ba2_trade_platform.core.ExpertInstanceCache import ExpertInstanceCache
 from ba2_trade_platform.ui import api_routes
+from tests.api_helpers import TOKEN, client_for, set_api_token
 from tests.factories import create_account_definition, create_expert_instance
 
 
 def _client():
+    set_api_token()
     app = FastAPI()
     app.include_router(api_routes.router)
-    return TestClient(app)
+    return client_for(app, token=TOKEN)
 
 
 def test_reload_scoped_to_expert_invalidates_only_that_instance():

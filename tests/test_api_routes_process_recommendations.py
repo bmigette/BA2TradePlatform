@@ -15,17 +15,18 @@ test DB would not be visible anyway.
 from types import SimpleNamespace
 
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from ba2_trade_platform.ui import api_routes
+from tests.api_helpers import TOKEN, client_for, set_api_token
 
 EXPERT = 10
 
 
-def _client() -> TestClient:
+def _client():
+    set_api_token()
     app = FastAPI()
     app.include_router(api_routes.router)
-    return TestClient(app)
+    return client_for(app, token=TOKEN)
 
 
 def _expert_exists(monkeypatch, *ids):

@@ -6,16 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from ba2_trade_platform.core.types import AnalysisUseCase
 from ba2_trade_platform.ui import api_routes
+from tests.api_helpers import TOKEN, client_for, set_api_token
 
 
 def _client():
+    set_api_token()
     app = FastAPI()
     app.include_router(api_routes.router)
-    return TestClient(app)
+    return client_for(app, token=TOKEN)
 
 
 def _job_manager_with_scheduled_job(monkeypatch, expert_instance_id, symbol, subtype):

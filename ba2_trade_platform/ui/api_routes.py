@@ -10,15 +10,23 @@ and re-read from the DB, without a full process restart) and a
 manual schedule trigger (the API equivalent of the Scheduled Jobs page's "Run Now" button,
 for restarting a job that's already fired today -- e.g. a screener scan that returned nothing
 because of a since-fixed data bug -- without waiting for its next scheduled occurrence).
+
+Also served under /api/v1 (see ba2_trade_platform/api/maintenance.py); these paths are the legacy aliases.
 """
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..api.audit import AuditedRoute
+from ..api.auth import require_access
 from ..logger import logger
 
-router = APIRouter(prefix="/api", tags=["reload"])
+# Legacy /api/* paths: aliases of the /api/v1 maintenance endpoints (api/maintenance.py registers the same
+# functions). Behind the same access rule as /api/v1 -- non-local callers need api_allow_remote, and with no
+# api_token set the writes answer 403.
+router = APIRouter(prefix="/api", tags=["reload"], route_class=AuditedRoute,
+                   dependencies=[Depends(require_access)])
 
 
 class ReloadRequest(BaseModel):
