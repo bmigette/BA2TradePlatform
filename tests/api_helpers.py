@@ -79,6 +79,31 @@ class FakeAccount:
     def _pending_stock_entry_notional(self, exclude_order_id=None):
         return 500.0
 
+    # --- phase 4 (stats / growth / dividends): the reads the Overview calculators make --------------------------
+    def get_tradable_balance(self):
+        return self.capital["tradable_balance"]
+
+    def get_balance(self):
+        return self.capital["balance"]
+
+    def get_buying_power(self):
+        return self.snapshot.buying_power
+
+    def get_broker_floating_pl(self):
+        return None
+
+    def get_instrument_current_price(self, symbols, price_type="mid"):
+        return {}
+
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        return []
+
+    def get_filled_trades(self, symbol=None, start_date=None, end_date=None):
+        return []
+
+    def get_balance_history(self, start_date=None, end_date=None):
+        return []
+
 
 def v1_client(**kwargs) -> TestClient:
     from ba2_trade_platform.api.app import create_v1_app
@@ -126,6 +151,10 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
 
     monkeypatch.setattr(experts_svc, "get_expert_instance_from_id", lambda i: SeededExpert())
     monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda i: FakeAccount(i))
+    # phase 4: the Overview calculators resolve the account through their own module / a local import
+    _factory = lambda i, session=None, use_cache=True: FakeAccount(i)    # noqa: E731
+    monkeypatch.setattr("ba2_trade_platform.services.floating_pl.get_account_instance_from_id", _factory)
+    monkeypatch.setattr("ba2_trade_platform.core.utils.get_account_instance_from_id", _factory)
 
     tx = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED, expert_id=expert.id)
     create_trading_order(acct.id, symbol="AAPL", transaction_id=tx.id)
