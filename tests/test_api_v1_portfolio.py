@@ -10,6 +10,21 @@ from tests.portfolio_golden import build_scenario
 pytestmark = pytest.mark.api_db
 
 
+@pytest.fixture(autouse=True)
+def _fresh_dividends_cache():
+    """The dividends TTL cache is keyed by account id and every test's first account is id 1."""
+    from ba2_trade_platform.services import portfolio as portfolio_svc
+    portfolio_svc._DIVIDENDS_CACHE.clear()
+    yield
+    portfolio_svc._DIVIDENDS_CACHE.clear()
+
+
+def _installer(monkeypatch):
+    def install(account):
+        monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda account_id: account)
+    return install
+
+
 @pytest.fixture
 def scenario(monkeypatch):
     def install(account):
@@ -27,15 +42,20 @@ def test_portfolio_payload_per_label_and_symbol(scenario):
     assert r.status_code == 200
     body = r.json()
     assert body["valuation_mode"] == "market" and "as_of" in body
-    assert body["base_notional"] == 10650.0 and body["unallocated_pct"] == 10.0
+    # SPY is held and unpriced: compute_base_notional values it at 0, so 10650 is only a LOWER BOUND.
+    assert body["base_notional"] is None and body["base_notional_lower_bound"] == 10650.0
+    assert "base_notional" in body["unmeasured"] and body["unpriced_managed_holdings"] == ["SPY"]
+    assert body["unallocated_pct"] == 10.0
     core = _label(body, "CORE")
     assert core["target_pct"] == 60.0 and core["complete"] is True
     assert core["current_value"] == 4000.0 and core["invested"] == 3300.0
-    assert round(core["current_pct_of_base"], 3) == 37.559
+    assert core["current_pct_of_base"] is None and core["target_value"] is None      # base-derived
     assert core["pnl"]["amount"] == 700.0 and core["pnl"]["with_dividends_amount"] is None
     assert core["symbol_counts"] == {"total": 3, "held": 3, "excluded": 1, "unmeasured": 0}
     aapl = next(s for s in core["symbols"] if s["symbol"] == "AAPL")
     assert aapl["target_share_pct"] == 50.0 and aapl["current_value"] == 2000.0
+    assert aapl["target_value"] is None and aapl["pct_of_label_target"] is None   # base-derived
+    assert aapl["pct_of_label"] is not None                                        # CORE is complete
     assert next(s for s in core["symbols"] if s["symbol"] == "KO")["excluded"] is True
     income = _label(body, "INCOME")
     assert income["pnl"]["dividend_cash"] == 40.0 and income["pnl"]["with_dividends_amount"] == -10.0
@@ -133,3 +153,74 @@ def test_response_is_scrubbed(scenario):
     set_managed_label(acct_id, "CORE", comment="note " + SK + "ABCDEFGH12345678")
     r = v1_client().get(f"/accounts/{acct_id}/portfolio")
     assert "ABCDEFGH12345678" not in r.text and "sk-[redacted]" in r.text
+
+
+def test_complete_book_reports_the_base_and_every_derived_figure(monkeypatch):
+    acct_id, _ = build_scenario(_installer(monkeypatch), extra_prices={"SPY": 525.0})
+    body = v1_client().get(f"/accounts/{acct_id}/portfolio").json()
+    assert body["base_notional"] == 12750.0 and body["base_notional_lower_bound"] is None
+    assert body["unmeasured"] == [] and body["unpriced_managed_holdings"] == []
+    core = _label(body, "CORE")
+    assert core["target_value"] is not None and core["current_pct_of_base"] is not None
+    aapl = next(s for s in core["symbols"] if s["symbol"] == "AAPL")
+    assert aapl["pct_of_total"] is not None and aapl["pct_of_label"] is not None
+    assert aapl["target_value"] is not None and aapl["pct_of_label_target"] is not None
+
+
+def test_all_none_snapshot_is_listed_as_unmeasured(monkeypatch):
+    """AlpacaAccount.get_account_snapshot returns an all-None snapshot on auth failure WITHOUT raising."""
+    acct_id, _ = build_scenario(_installer(monkeypatch), snapshot_all_none=True, extra_prices={"SPY": 525.0})
+    body = v1_client().get(f"/accounts/{acct_id}/portfolio").json()
+    assert body["base_notional"] is None and body["base_notional_lower_bound"] is None
+    assert body["available_buying_power"] is None and body["account_value"] is None
+    assert {"base_notional", "available_buying_power", "account_value"} <= set(body["unmeasured"])
+
+
+def test_pct_of_label_is_null_for_every_row_of_an_incomplete_label(scenario):
+    acct_id, _ = scenario
+    body = v1_client().get(f"/accounts/{acct_id}/portfolio").json()
+    income = _label(body, "INCOME")
+    assert all(r["pct_of_label"] is None for r in income["symbols"])
+    assert next(r for r in income["symbols"] if r["symbol"] == "O")["measured"] is True   # measured, yet no share
+
+
+def test_pct_of_total_is_null_for_every_row_when_any_symbol_is_unmeasured(scenario):
+    acct_id, _ = scenario
+    body = v1_client().get(f"/accounts/{acct_id}/portfolio").json()
+    assert all(r["pct_of_total"] is None for lb in body["labels"] for r in lb["symbols"])
+    assert all(lb["pct_of_managed"] is None for lb in body["labels"])
+
+
+def test_dividends_are_cached_for_60s_and_the_age_is_reported(scenario, monkeypatch):
+    from ba2_trade_platform.services import portfolio as portfolio_svc
+    acct_id, account = scenario
+    clock = [1000.0]
+    monkeypatch.setattr(portfolio_svc.time, "monotonic", lambda: clock[0])
+    c = v1_client()
+    first = c.get(f"/accounts/{acct_id}/portfolio").json()["dividends"]
+    clock[0] += 30.0
+    second = c.get(f"/accounts/{acct_id}/portfolio").json()["dividends"]
+    assert account.dividend_calls == 1
+    assert first["cached"] is False and first["age_s"] == 0.0
+    assert second["cached"] is True and second["age_s"] == 30.0 and second["payments"] == first["payments"]
+    clock[0] += 31.0
+    third = c.get(f"/accounts/{acct_id}/portfolio").json()["dividends"]
+    assert account.dividend_calls == 2 and third["cached"] is False
+
+
+def test_an_empty_dividend_answer_is_never_cached(monkeypatch):
+    acct_id, account = build_scenario(_installer(monkeypatch), dividends=False)
+    c = v1_client()
+    c.get(f"/accounts/{acct_id}/portfolio")
+    c.get(f"/accounts/{acct_id}/portfolio")
+    assert account.dividend_calls == 2
+
+
+@pytest.mark.parametrize("model_name", ["AccountSymbolFacts", "SymbolMarketStats"])
+def test_unreadable_stored_rows_are_503_not_empty(scenario, monkeypatch, model_name):
+    import ba2_trade_platform.core.models as models
+    acct_id, _ = scenario
+    monkeypatch.setattr(models, model_name, object())        # select(<object>) raises inside the strict reader
+    r = v1_client().get(f"/accounts/{acct_id}/portfolio")
+    assert r.status_code == 503 and r.json()["error"] == "unmeasurable"
+    assert r.json()["detail"]["stored_read_failed"] in ("symbol_facts", "symbol_stats")

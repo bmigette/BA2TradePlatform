@@ -5,6 +5,8 @@ The page calls these with their default arguments and keeps its old private name
 ``load_view_payload(..., read_only=True)`` and ``read_income_panel`` so a GET never writes the DB or the broker
 (see ``docs/plans/2026-11-04-management-api-phase5.md``). Blocking; the page calls them through
 ``asyncio.to_thread``."""
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from sqlmodel import select
@@ -15,7 +17,7 @@ from ..core import portfolio_allocation_service as svc
 from ..core.db import get_db
 from ..core.models import ExpertInstance
 from ..core.portfolio_allocation import (
-    cash_dividends_by_symbol, compute_base_notional, unconsumed_income_notice)
+    VALUATION_MODE_MARKET, cash_dividends_by_symbol, compute_base_notional, unconsumed_income_notice)
 from ..core.portfolio_allocation_store import (
     get_allocation_config, get_managed_labels, get_previous_symbol_weights, get_symbol_comments, get_symbol_rows)
 from ..logger import logger
@@ -36,7 +38,6 @@ def enabled_expert_names(account_id: int) -> List[str]:
             )
         ).all()
         return [(r.alias or r.expert) for r in rows]
-
 
 
 def load_gate(account_id: Optional[int]) -> GateResult:
@@ -61,7 +62,6 @@ def load_gate(account_id: Optional[int]) -> GateResult:
     return evaluate_gate(account_id, manual, enabled_expert_names(account_id))
 
 
-
 def load_protection_payload(account, account_id: int, positions) -> Dict[str, Any]:
     """The TP/SL layer's share of one render. Blocking (a broker read on a supporting account).
 
@@ -80,6 +80,45 @@ def load_protection_payload(account, account_id: int, positions) -> Dict[str, An
     quantities = {sym: float(state.quantity) for sym, state in positions.items()}
     return {'supported': True, 'items': items, 'quantities': quantities}
 
+
+def read_symbol_facts_strict(account_id: int, symbols) -> Dict[str, Any]:
+    """Stored symbol facts for the API: like ``load_symbol_facts`` but a read FAILURE raises ``Unmeasurable``
+    instead of reading as "no facts" (that helper returns ``{}`` on any error)."""
+    from ..core.models import AccountSymbolFacts
+    from .errors import Unmeasurable
+    wanted = sorted({(x or "").strip().upper() for x in symbols if (x or "").strip()})
+    if not wanted:
+        return {}
+    try:
+        with get_db() as session:
+            rows = session.exec(select(AccountSymbolFacts).where(
+                AccountSymbolFacts.account_id == account_id,
+                AccountSymbolFacts.symbol.in_(wanted))).all()
+            for row in rows:
+                session.expunge(row)
+            return {row.symbol: row for row in rows}
+    except Exception as e:  # noqa: BLE001 -- any DB failure is "unreadable", never "empty"
+        logger.error(f"API: reading stored symbol facts for account {account_id} failed: {e}", exc_info=True)
+        raise Unmeasurable(f"Account {account_id}: the stored symbol facts could not be read",
+                           {"account_id": account_id, "stored_read_failed": "symbol_facts"}) from e
+
+
+def read_symbol_stats_strict(symbols) -> Dict[str, Any]:
+    """Stored symbol stats for the API; a read failure raises ``Unmeasurable`` (see ``read_symbol_facts_strict``)."""
+    from ..core.models import SymbolMarketStats
+    from .errors import Unmeasurable
+    wanted = sorted({(x or "").strip().upper() for x in symbols if (x or "").strip()})
+    if not wanted:
+        return {}
+    try:
+        with get_db() as session:
+            rows = session.exec(select(SymbolMarketStats).where(SymbolMarketStats.symbol.in_(wanted))).all()
+            for row in rows:
+                session.expunge(row)
+            return {row.symbol: row for row in rows}
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"API: reading stored symbol stats failed: {e}", exc_info=True)
+        raise Unmeasurable("The stored symbol stats could not be read", {"stored_read_failed": "symbol_stats"}) from e
 
 
 def refresh_symbol_facts(account, account_id: int, symbols):
@@ -112,7 +151,7 @@ def refresh_symbol_facts(account, account_id: int, symbols):
 
 def load_view_payload(account_id: int, valuation_mode: str,
                       base_override: Optional[float] = None, *, read_only: bool = False,
-                      account=None, config=None) -> Dict[str, Any]:
+                      account=None, config=None, dividends_source=None) -> Dict[str, Any]:
     """One render's worth of data: managed labels, membership, positions, prices.
 
     ``valuation_mode`` is threaded through to ``build_label_views`` and echoed back
@@ -191,7 +230,10 @@ def load_view_payload(account_id: int, valuation_mode: str,
     # survive a broker that will not answer: a failed fetch falls back to the last
     # stored answer rather than blanking facts that were true five minutes ago.
     # Never fatal -- the page's job is the label table, and the chips are on top.
-    facts = load_symbol_facts(account_id, symbols) if read_only else         refresh_symbol_facts(account, account_id, symbols)
+    if read_only:
+        facts = read_symbol_facts_strict(account_id, symbols)
+    else:
+        facts = refresh_symbol_facts(account, account_id, symbols)
     # READ ONLY. The yield and the 1Y/3Y return need several FMP calls per symbol,
     # far too slow for a render, so the page draws whatever is already cached (nothing
     # on a cold start) and the top-up runs from the PAGE's refresh handler instead.
@@ -200,7 +242,7 @@ def load_view_payload(account_id: int, valuation_mode: str,
     # the page tests, and a daemon thread doing DB work outlives the test that started
     # it -- which raced the fixture's teardown into a Windows access violation. A
     # loader that spawns background work is a loader that cannot be called safely.
-    stats = load_symbol_stats(symbols)
+    stats = read_symbol_stats_strict(symbols) if read_only else load_symbol_stats(symbols)
 
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
@@ -291,7 +333,12 @@ def load_view_payload(account_id: int, valuation_mode: str,
         if managed_real is not None:
             buying_power = base_notional - managed_real
 
-    dividends = account.get_dividends()
+    dividends = account.get_dividends() if dividends_source is None else dividends_source()
+    # Market mode values an unpriced managed holding at 0 inside ``compute_base_notional``, so the base above is a
+    # LOWER BOUND whenever one exists (the page does not flag this; the API does).
+    unpriced_managed = sorted(sym for sym in enabled_symbols
+                              if sym in positions and valuation_mode == VALUATION_MODE_MARKET
+                              and positions[sym].quantity and positions[sym].price is None)
     return {
         'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
                                    valuation_mode=valuation_mode,
@@ -360,11 +407,12 @@ def load_view_payload(account_id: int, valuation_mode: str,
         'account_id': account_id,
         #: False when the snapshot read failed (base / buying power / account value are then None).
         'snapshot_available': snapshot_available,
+        #: Enabled managed holdings with no quote (market mode): the base excludes their value.
+        'unpriced_managed_holdings': unpriced_managed,
         #: How many rows ``get_dividends`` returned. It returns ``[]`` on a failed fetch too, so 0 cannot tell
         #: "pays nothing" from "could not ask"; the API says so next to the figure.
         'dividend_payments': len(dividends or []),
     }
-
 
 
 def load_valuation_mode(account_id: int) -> str:
@@ -422,10 +470,29 @@ def load_income_panel(account_id: int):
     return read_income_panel(account_id)
 
 
-
 # ---------------------------------------------------------------------------
 # Management API reads. Pure: nothing below writes the DB or asks a broker to refresh anything.
 # ---------------------------------------------------------------------------
+
+#: Per-account TTL cache of ``get_dividends()`` for the API path only (the call is a REST fetch of the broker's
+#: full dividend history). Only a non-empty answer is cached: ``[]`` is also what a failed fetch returns.
+DIVIDENDS_TTL_S = 60.0
+_DIVIDENDS_CACHE: Dict[int, Any] = {}
+_DIVIDENDS_LOCK = threading.Lock()
+
+
+def cached_dividends(account_id: int, fetch):
+    """``(rows, age_s, from_cache)``: ``fetch()`` at most once per ``DIVIDENDS_TTL_S`` per account."""
+    with _DIVIDENDS_LOCK:
+        hit = _DIVIDENDS_CACHE[account_id] if account_id in _DIVIDENDS_CACHE else None
+        if hit is not None and time.monotonic() - hit[0] < DIVIDENDS_TTL_S:
+            return list(hit[1]), time.monotonic() - hit[0], True
+    rows = fetch()
+    if rows:
+        with _DIVIDENDS_LOCK:
+            _DIVIDENDS_CACHE[account_id] = (time.monotonic(), list(rows))
+    return rows, 0.0, False
+
 
 def _pnl_dict(pnl) -> Dict[str, Any]:
     """``UnrealisedPnL`` as the API shows it. ``amount`` / ``pct`` are null when they cannot be measured, and the
@@ -435,7 +502,7 @@ def _pnl_dict(pnl) -> Dict[str, Any]:
             "priced": pnl.priced, "unpriced": pnl.unpriced}
 
 
-def _row_dict(row, facts, stats) -> Dict[str, Any]:
+def _row_dict(row, facts, stats, *, label_complete: bool, book_complete: bool, base_known: bool) -> Dict[str, Any]:
     f = facts[row.symbol] if row.symbol in facts else None
     st = stats[row.symbol] if row.symbol in stats else None
     measured = row.measurable
@@ -446,11 +513,14 @@ def _row_dict(row, facts, stats) -> Dict[str, Any]:
         # An unpriced holding has no knowable value: null, never the 0.0 the view builder uses internally.
         "measured": measured,
         "current_value": row.current_value if measured else None,
-        "pct_of_label": row.pct_of_label if measured else None,
-        "pct_of_label_target": row.pct_of_label_target if measured else None,
-        "pct_of_total": row.pct_of_total if measured else None,
+        # A share is a ratio over a denominator that includes the unpriced holdings: with one unmeasured it is
+        # understated for every other row, so it is null (pct_of_label: per label; pct_of_total: whole book).
+        "pct_of_label": row.pct_of_label if measured and label_complete else None,
+        "pct_of_label_target": row.pct_of_label_target if measured and base_known else None,
+        "pct_of_total": row.pct_of_total if measured and book_complete else None,
         "target_share_pct": row.weight_pct, "target_share_source": row.weight_source,
-        "effective_target_share_pct": row.effective_weight_pct, "target_value": row.target_value,
+        "effective_target_share_pct": row.effective_weight_pct,
+        "target_value": row.target_value if base_known else None,
         "previous_target_share_pct": row.previous_weight_pct, "comment": row.comment,
         "pnl": _pnl_dict(row.pnl),
         "excluded": row.excluded, "excluded_reason": row.excluded_reason, "excluded_note": row.excluded_note,
@@ -465,18 +535,19 @@ def _row_dict(row, facts, stats) -> Dict[str, Any]:
     }
 
 
-def _label_dict(view, facts, stats) -> Dict[str, Any]:
-    rows = [_row_dict(r, facts, stats) for r in view.rows]
-    unmeasured = [r["symbol"] for r in rows if not r["measured"] and not r["excluded"]]
+def _label_dict(view, facts, stats, *, book_complete: bool, base_known: bool) -> Dict[str, Any]:
+    unmeasured = [r.symbol for r in view.rows if not r.measurable and not r.excluded]
     complete = not unmeasured
+    rows = [_row_dict(r, facts, stats, label_complete=complete, book_complete=book_complete,
+                      base_known=base_known) for r in view.rows]
     return {
         "label": view.label, "color": view.color, "comment": view.comment,
         "target_pct": view.target_pct, "previous_target_pct": view.previous_target_pct,
         # Current weight is comparable with the target: share of the allocatable base (buying power + managed
         # value). With an unpriced holding in the label the sum is understated, so it is null, not a smaller number.
-        "current_pct_of_base": view.pct_of_base if complete else None,
-        "pct_of_managed": view.pct_of_total if complete else None,
-        "target_value": view.target_value,
+        "current_pct_of_base": view.pct_of_base if complete and base_known else None,
+        "pct_of_managed": view.pct_of_total if book_complete else None,
+        "target_value": view.target_value if base_known else None,
         "invested": view.cost_basis,                 # what the held positions cost
         "current_value": view.current_value if complete else None,
         "current_value_measured_part": view.current_value,
@@ -512,28 +583,40 @@ def portfolio_view(account_id: int) -> Dict[str, Any]:
     if config is None:
         raise NotFound("no portfolio on this account", {"account_id": account_id})
     account = _live_account(account_id)
+    div_age: Dict[str, Any] = {}
+
+    def dividends_source():
+        rows, age, cached = cached_dividends(account_id, account.get_dividends)
+        div_age.update(age_s=age, cached=cached)
+        return rows
+
     try:
         payload = broker_read(account_id, "the portfolio payload", load_view_payload, account_id,
-                              config.valuation_mode, read_only=True, account=account, config=config)
+                              config.valuation_mode, read_only=True, account=account, config=config,
+                              dividends_source=dividends_source)
     except PositionFetchFailed as e:
         raise BrokerUnreachable(f"Account {account_id}: the broker positions fetch failed",
                                 {"account_id": account_id}) from e
     _events, open_total, working_note = read_income_panel(account_id)
     facts, stats = payload["symbol_facts"], payload["symbol_stats"]
-    labels = [_label_dict(v, facts, stats) for v in payload["views"]]
-    unmeasured = []
-    if not payload["snapshot_available"]:
-        unmeasured += ["base_notional", "available_buying_power", "account_value"]
-    unmeasured += [f"label:{lb['label']}" for lb in labels if not lb["complete"]]
+    book_complete = all(r.measurable or r.excluded for v in payload["views"] for r in v.rows)
+    base = payload["base_notional"]
+    # compute_base_notional values an unpriced managed holding at 0, so the base is only a lower bound then.
+    base_known = base is not None and not payload["unpriced_managed_holdings"]
+    labels = [_label_dict(v, facts, stats, book_complete=book_complete, base_known=base_known)
+              for v in payload["views"]]
     payments = payload["dividend_payments"]
     out = {
         "as_of": utcnow_iso(), "account_id": account_id, "valuation_mode": payload["valuation_mode"],
         "allow_fractional": config.allow_fractional, "unallocated_pct": payload["unallocated_pct"],
-        "base_notional": payload["base_notional"], "available_buying_power": payload["available_buying_power"],
+        "base_notional": base if base_known else None,
+        "base_notional_lower_bound": base if base is not None and not base_known else None,
+        "unpriced_managed_holdings": payload["unpriced_managed_holdings"],
+        "available_buying_power": payload["available_buying_power"],
         "account_value": payload["account_value"],
         "target_total_pct": sum(lb["target_pct"] for lb in labels),
-        "unmeasured": unmeasured, "labels": labels,
-        "dividends": {"payments": payments,
+        "labels": labels,
+        "dividends": {"payments": payments, "age_s": div_age["age_s"], "cached": div_age["cached"],
                       "note": None if payments else
                       "The broker returned no dividend payments; a failed fetch reads the same, so the "
                       "with_dividends figures are null rather than equal to the plain P&L."},
@@ -543,6 +626,10 @@ def portfolio_view(account_id: int) -> Dict[str, Any]:
         "income": {"open_total": open_total, "working_note": working_note,
                    "synced_by": "the Portfolio Allocation page load / Refresh; the API never syncs the ledger"},
     }
+    # Derived from the values actually being None (an all-None snapshot does not raise on some adapters).
+    out["unmeasured"] = ([name for name in ("base_notional", "available_buying_power", "account_value")
+                          if out[name] is None]
+                         + [f"label:{lb['label']}" for lb in labels if not lb["complete"]])
     return jsonable(out)
 
 
@@ -568,16 +655,42 @@ def allocation_runs(account_id: int, *, limit: int, offset: int) -> Dict[str, An
         stmt = (select(*columns).where(PortfolioAllocationRun.account_id == account_id)
                 .order_by(PortfolioAllocationRun.created_at.desc(), PortfolioAllocationRun.id.desc()))
         result = page(session, stmt, limit=limit, offset=offset, convert=lambda r: dict(r._mapping))
-    wanted = sorted({int(i) for run in result["items"] for i in (run["order_ids"] or [])})
-    fills_by_order = {f.order_id: f for f in svc.collect_order_fills(account_id, wanted)}
+    from .errors import Unmeasurable
+    run_orders: Dict[int, List[int]] = {}
     for run in result["items"]:
-        ids = [int(i) for i in (run["order_ids"] or [])]
+        try:
+            run_orders[run["id"]] = [int(i) for i in (run["order_ids"] or [])]
+        except (TypeError, ValueError) as e:
+            raise Unmeasurable(f"Allocation run {run['id']}: its stored order_ids are corrupt "
+                               f"({type(e).__name__}); its fills cannot be read",
+                               {"run_id": run["id"], "account_id": account_id}) from e
+    wanted = sorted({i for ids in run_orders.values() for i in ids})
+    missing_ids: List[int] = []
+    fills_by_order = {f.order_id: f for f in svc.collect_order_fills(account_id, wanted, on_missing=missing_ids.extend)}
+    if missing_ids:
+        logger.warning(f"API: account {account_id} allocation runs reference order rows that do not exist: "
+                       f"{sorted(missing_ids)}")
+    for run in result["items"]:
+        ids = run_orders[run["id"]]
         fills = [fills_by_order[i] for i in dict.fromkeys(ids) if i in fills_by_order]
         totals = measure_filled_values(fills)
         run["order_ids"] = ids
         run["income_consumed"] = run["income_consumed_at"] is not None
+        if not ids:
+            status = "no_orders"
+        elif not fills:
+            status = "no_execution_orders"          # only protective TP/SL legs
+        else:
+            status = "settled" if totals.settled else "working"
+        # A run that never finalised (income not consumed, orders not final) carries the zeros it was recorded
+        # with before the fills were measured: those are not figures.
+        if status == "working" and run["income_consumed_at"] is None:
+            run["filled_buy_value"] = run["filled_sell_value"] = None
+            run["filled_note"] = "The run has not finalised: the recorded filled values are not final."
+        else:
+            run["filled_note"] = None
         run["fill"] = {
-            "status": "no_orders" if not fills else ("settled" if totals.settled else "working"),
+            "status": status,
             "orders": len(ids), "execution_orders": len(fills),
             "working_order_ids": list(totals.working_order_ids),
             "unmeasurable_order_ids": list(totals.unmeasurable_order_ids),

@@ -20,7 +20,8 @@ from tests.factories import create_account_definition, create_expert_instance
 
 
 class GoldenAccount(MockAccount):
-    def __init__(self, account_id, positions, prices, dividends=(), buying_power=5_000.0, snapshot_error=None):
+    def __init__(self, account_id, positions, prices, dividends=(), buying_power=5_000.0, snapshot_error=None,
+                 snapshot_all_none=False):
         super().__init__(account_id)
         self._settings_cache = {"manual_trading_enabled": True}
         self._positions = positions
@@ -28,6 +29,8 @@ class GoldenAccount(MockAccount):
         self.dividends = list(dividends)
         self.buying_power = buying_power
         self.snapshot_error = snapshot_error
+        self.snapshot_all_none = snapshot_all_none     # AlpacaAccount's auth-failure answer: no raise, no figures
+        self.dividend_calls = 0
         self.margin_requests = []
         self.calls = []
 
@@ -40,6 +43,8 @@ class GoldenAccount(MockAccount):
     def get_account_snapshot(self):
         if self.snapshot_error is not None:
             raise self.snapshot_error
+        if self.snapshot_all_none:
+            return AccountSnapshot()
         return AccountSnapshot(cash=5_000.0, equity=20_000.0, net_liquidation=20_000.0,
                                buying_power=self.buying_power, margin_multiplier=1.0, is_margin_account=False,
                                supports_fractional=True)
@@ -50,6 +55,7 @@ class GoldenAccount(MockAccount):
         return {s: MarginInfo(symbol=s, bp_factor=1.0, fractionable=True) for s in symbols if s == "AAPL"}
 
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        self.dividend_calls += 1
         return list(self.dividends)
 
     def get_cash_transfers(self, start_date=None, end_date=None):
@@ -61,7 +67,8 @@ def _pos(symbol, qty, cost, mv):
     return {"symbol": symbol, "qty": qty, "cost_basis": cost, "market_value": mv, "side": "BUY"}
 
 
-def build_scenario(use_account, *, dividends=True, snapshot_error=None, positions="default"):
+def build_scenario(use_account, *, dividends=True, snapshot_error=None, positions="default", extra_prices=None,
+                   snapshot_all_none=False):
     """Seed the DB and install the account. ``use_account(account)`` makes the factory return it."""
     acct_id = create_account_definition(name="Manual", provider="MockAccount").id
     create_expert_instance(account_id=acct_id, alias="Alpha", enabled=False)
@@ -81,8 +88,8 @@ def build_scenario(use_account, *, dividends=True, snapshot_error=None, position
     divs = [{"symbol": "O", "amount": 40.0, "drip_quantity": None, "date": datetime(2026, 9, 1)},
             {"symbol": "AAPL", "amount": 3.0, "drip_quantity": 0.01, "date": datetime(2026, 9, 2)}] if dividends else []
     # SPY has no quote: a held, unmeasurable holding in market mode.
-    account = GoldenAccount(acct_id, book, {"AAPL": 200.0, "MSFT": 400.0, "KO": 60.0, "O": 55.0},
-                            dividends=divs, snapshot_error=snapshot_error)
+    account = GoldenAccount(acct_id, book, {"AAPL": 200.0, "MSFT": 400.0, "KO": 60.0, "O": 55.0, **(extra_prices or {})},
+                            dividends=divs, snapshot_error=snapshot_error, snapshot_all_none=snapshot_all_none)
     use_account(account)
     return acct_id, account
 
