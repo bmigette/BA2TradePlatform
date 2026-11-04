@@ -67,3 +67,47 @@ def test_token_opens_every_get_for_a_remote_caller():
     assert c.get("/ping").status_code == 200
     assert c.get("/transactions").status_code == 200
     assert c.get("/activity").status_code == 200
+
+
+# --- review fixes: no route can hide in a Mount; every GET is secret-free -----------------------------------
+
+#: Route-table entries that are not APIRoutes and are allowed anyway (none today). A Mount hides its routes from
+#: every other test in this file, so adding one must be a deliberate edit HERE.
+ALLOWED_NON_API_ROUTES: frozenset = frozenset()
+
+
+def test_every_route_is_an_api_route_or_explicitly_allowed():
+    from fastapi.routing import APIRoute
+    for r in create_v1_app().routes:
+        assert isinstance(r, APIRoute) or getattr(r, "path", None) in ALLOWED_NON_API_ROUTES, (
+            f"{type(r).__name__} at {getattr(r, 'path', '?')} is not an APIRoute: its routes would escape the "
+            f"auth/guard tests")
+
+
+def test_no_get_route_body_contains_a_seeded_secret(monkeypatch):
+    """Walk the real route table (not a hand-kept list), so a new GET router is covered the day it lands."""
+    from ba2_trade_platform.services import accounts as accounts_svc
+    from ba2_trade_platform.services import experts as experts_svc
+    from tests.api_helpers import seed_secrets
+    ids, secrets = seed_secrets(monkeypatch, experts_svc, accounts_svc)
+    values = {"{account_id}": ids["account"], "{transaction_id}": ids["transaction"],
+              "{expert_id}": ids["expert"], "{analysis_id}": ids["analysis"]}
+    c = client_for(create_v1_app())
+    seen = 0
+    for method, path in _routes():
+        if method != "GET":
+            continue
+        concrete = [path]
+        for placeholder, value in values.items():
+            concrete = [p.replace(placeholder, str(value)) for p in concrete]
+        if "{ref}" in path:
+            concrete = [p.replace("{ref}", ref) for p in concrete for ref in (ids["rm_ref"], ids["smart_ref"])]
+        for p in concrete:
+            assert "{" not in p, f"unknown path parameter in {p}"
+            for suffix in ("", "?include_text=true&include_state=true"):
+                r = c.get(p + suffix) if not (suffix and "?" in p) else c.get(p)
+                assert r.status_code == 200, (p, r.status_code, r.text[:200])
+                for secret in secrets:
+                    assert secret not in r.text, (p + suffix, secret)
+                seen += 1
+    assert seen >= 15
