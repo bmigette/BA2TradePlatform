@@ -3261,6 +3261,8 @@ class TastyTradeAccount(AccountInterface):
 
         result = []
         for snap in snapshots:
+            # In the SDK both are REQUIRED Decimal fields (AccountBalanceSnapshot): a margin or an empty account reports
+            # Decimal('0'), never None, so None means a malformed snapshot -- refused, not skipped.
             if strict and (snap.cash_balance is None or snap.net_liquidating_value is None):
                 raise ValueError(f"balance snapshot {getattr(snap, 'snapshot_date', None)} has no cash / NLV")
             cash = float(snap.cash_balance) if snap.cash_balance else 0.0

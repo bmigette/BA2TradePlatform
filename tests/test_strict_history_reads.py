@@ -227,3 +227,12 @@ def test_ibkr_strict_filled_trades_refuse_a_window_older_than_the_api_keeps(monk
         assert len(account.get_filled_trades()) == 1                 # the lenient read still answers (and warns)
     finally:
         account.close()
+
+
+def test_tasty_strict_balance_history_accepts_a_genuinely_empty_account_as_a_measured_zero():
+    """In the SDK cash_balance / net_liquidating_value are required Decimals: an empty or margin account reports
+    Decimal('0'), which is a measurement. Only None (a malformed snapshot) is refused."""
+    acct = tasty_account()
+    acct._account.get_balance_snapshots = AsyncMock(return_value=[_snapshot(cash="0", nlv="0")])
+    got = acct.get_balance_history_strict()
+    assert got[0]["net_liquidating_value"] == 0.0 and got[0]["cash_balance"] == 0.0
