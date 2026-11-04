@@ -13,7 +13,8 @@ from ...core.models import Transaction, ExpertInstance
 from ...core.types import TransactionStatus
 from ...core.utils import calculate_transaction_pnl
 from ...logger import logger
-from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from ..account_filter_context import get_selected_account_id
+from ...services import stats as stats_service
 from .echart_theme import make_chart_options, MUTED_TEXT
 
 
@@ -33,67 +34,9 @@ class ProfitPerExpertChart:
         Returns:
             Dict mapping expert names to their total profit/loss
         """
-        profits = {}
-        
-        # Get global account filter
-        selected_account_id = get_selected_account_id()
-        account_expert_ids = get_expert_ids_for_account(selected_account_id)
-        
-        with get_db() as session:
-            # Build query for closed transactions
-            query = (
-                select(Transaction)
-                .where(Transaction.status == TransactionStatus.CLOSED)
-                .where(Transaction.expert_id.isnot(None))
-                .where(Transaction.open_price.isnot(None))
-                .where(Transaction.close_price.isnot(None))
-            )
-            
-            # Apply account filter if selected
-            if account_expert_ids is not None:
-                if account_expert_ids:
-                    query = query.where(Transaction.expert_id.in_(account_expert_ids))
-                else:
-                    # No experts for selected account - return empty
-                    return {}
-            
-            closed_transactions = session.exec(query).all()
-            
-            logger.debug(f"Found {len(closed_transactions)} closed transactions with experts")
-            
-            # Calculate profit for each transaction and group by expert
-            for transaction in closed_transactions:
-                try:
-                    # Get expert instance
-                    expert = session.get(ExpertInstance, transaction.expert_id)
-                    if not expert:
-                        logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
-                        continue
-                    
-                    # Create unique expert name using alias or expert type with ID
-                    expert_name = f"{expert.alias or expert.expert}-{expert.id}"
-                    
-                    # Calculate profit/loss (handles both long and short positions)
-                    profit = calculate_transaction_pnl(transaction)
-                    if profit is None:
-                        continue
-                    
-                    # Add to expert's total
-                    if expert_name not in profits:
-                        profits[expert_name] = 0.0
-                    profits[expert_name] += profit
-                    
-                except Exception as e:
-                    logger.error(f"Error calculating profit for transaction {transaction.id}: {e}", exc_info=True)
-                    continue
-            
-            # Sort by profit (highest to lowest)
-            profits = dict(sorted(profits.items(), key=lambda x: x[1], reverse=True))
-            
-            logger.info(f"Calculated profits for {len(profits)} experts")
-        
-        return profits
-    
+        # The computation lives in services.stats (the management API calls the same function).
+        return stats_service.profit_per_expert(get_selected_account_id())
+
     def render(self):
         """Render the profit per expert chart."""
         with ui.card().classes('p-4') as card:

@@ -11,6 +11,7 @@ from collections import defaultdict
 from ...core.db import get_db
 from ...core.models import Position, Instrument
 from ...logger import logger
+from ...services import stats as stats_service
 from .echart_theme import make_chart_options, MUTED_TEXT
 
 
@@ -39,73 +40,9 @@ class InstrumentDistributionChart:
         Returns:
             Dict mapping labels/categories to their total market value
         """
-        distribution = defaultdict(float)
-        
-        with get_db() as session:
-            logger.debug(f"Processing {len(self.positions)} positions for distribution by {self.grouping_field}")
-            
-            if not self.positions:
-                return {}
-            
-            # Group by instrument labels/categories based on grouping_field
-            for position in self.positions:
-                try:
-                    # Get symbol from position dict
-                    symbol = position.get('symbol', '')
-                    if not symbol:
-                        logger.debug(f"Position without symbol: {position}")
-                        continue
-                    
-                    # Get market value (convert from string if needed)
-                    market_value_str = position.get('market_value', '0')
-                    try:
-                        market_value = float(market_value_str) if isinstance(market_value_str, str) else market_value_str
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid market_value for {symbol}: {market_value_str}")
-                        continue
-                    
-                    # Get instrument info from database
-                    instrument = session.exec(
-                        select(Instrument).where(Instrument.name == symbol)
-                    ).first()
-                    
-                    if instrument:
-                        # Select categorization based on grouping_field
-                        if self.grouping_field == 'labels':
-                            # Use labels if available, otherwise categories, otherwise type
-                            if instrument.labels and len(instrument.labels) > 0:
-                                category = instrument.labels[0]
-                            elif instrument.categories and len(instrument.categories) > 0:
-                                category = instrument.categories[0]
-                            else:
-                                category = instrument.instrument_type.value if instrument.instrument_type else 'Unknown'
-                        else:  # grouping_field == 'categories'
-                            # Use categories if available, otherwise labels, otherwise type
-                            if instrument.categories and len(instrument.categories) > 0:
-                                category = instrument.categories[0]
-                            elif instrument.labels and len(instrument.labels) > 0:
-                                category = instrument.labels[0]
-                            else:
-                                category = instrument.instrument_type.value if instrument.instrument_type else 'Unknown'
-                    else:
-                        # Instrument not in database, use symbol as category
-                        category = 'Uncategorized'
+        # The computation lives in services.stats (the management API calls the same function).
+        return stats_service.position_distribution(self.positions, self.grouping_field)
 
-                    # Add market value to category
-                    distribution[category] += abs(market_value)
-                    
-                except Exception as e:
-                    symbol = position.get('symbol', 'unknown') if isinstance(position, dict) else 'unknown'
-                    logger.error(f"Error processing position {symbol}: {e}", exc_info=True)
-                    continue
-            
-            # Sort by value (highest to lowest)
-            distribution = dict(sorted(distribution.items(), key=lambda x: x[1], reverse=True))
-            
-            logger.info(f"Calculated distribution across {len(distribution)} {self.grouping_field}")
-        
-        return distribution
-    
     def render(self):
         """Render the instrument distribution pie chart."""
         # Determine category label based on grouping field

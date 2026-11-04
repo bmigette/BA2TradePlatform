@@ -56,6 +56,7 @@ from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.account_scope import scope_transactions_to_account
+from ...services import stats as stats_service
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
 from ..components.refresh_button import refresh_button
@@ -750,56 +751,21 @@ class OverviewTab:
         try:
             selected_account_id = get_selected_account_id()
 
-            all_accounts = get_all_instances(AccountDefinition)
-            if selected_account_id is not None:
-                accounts = [acc for acc in all_accounts if acc.id == selected_account_id]
-            else:
-                accounts = all_accounts
+            account_stats = [(r['account'], r['open'], r['pending'], r['error'])
+                             for r in stats_service.order_counts(selected_account_id)]
 
             try:
                 loading_label.delete()
             except RuntimeError:
                 return
 
-            if not accounts:
+            if not account_stats:
                 try:
                     with content_container:
                         ui.label('No accounts configured').classes('text-sm text-gray-500')
                 except RuntimeError:
                     pass
                 return
-
-            # Fetch all counts in a single session
-            account_stats = []
-            with get_db() as session:
-                for account in accounts:
-                    open_count = session.exec(
-                        select(func.count(TradingOrder.id))
-                        .where(TradingOrder.account_id == account.id)
-                        .where(TradingOrder.status.in_([
-                            OrderStatus.FILLED,
-                            OrderStatus.NEW,
-                            OrderStatus.OPEN,
-                            OrderStatus.ACCEPTED
-                        ]))
-                        .where(TradingOrder.order_type == OrderType.MARKET)
-                    ).first() or 0
-
-                    pending_count = session.exec(
-                        select(func.count(TradingOrder.id))
-                        .where(TradingOrder.account_id == account.id)
-                        .where(TradingOrder.status.in_([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
-                        .where(TradingOrder.order_type == OrderType.MARKET)
-                    ).first() or 0
-
-                    error_count = session.exec(
-                        select(func.count(TradingOrder.id))
-                        .where(TradingOrder.account_id == account.id)
-                        .where(TradingOrder.status == OrderStatus.ERROR)
-                        .where(TradingOrder.order_type == OrderType.MARKET)
-                    ).first() or 0
-
-                    account_stats.append((account.name, open_count, pending_count, error_count))
 
             # Render the UI with fetched data
             try:
@@ -851,64 +817,14 @@ class OverviewTab:
             # real book. See ui/components/account_scope.py.
             selected_account_id = get_selected_account_id()
 
-            now = datetime.now()
-            d7 = now - timedelta(days=7)
-            d14 = now - timedelta(days=14)
-            d30 = now - timedelta(days=30)
-            d60 = now - timedelta(days=60)
-
-            with get_db() as session:
-                def scoped(query):
-                    return scope_transactions_to_account(query, selected_account_id)
-
-                # Does this account have ANY transaction at all? Distinguishes "nothing
-                # has ever happened here" (render words) from "nothing happened in the
-                # last 30 days" (render the real, measured zeros).
-                total_count = session.exec(
-                    scoped(select(func.count(Transaction.id)))
-                ).first() or 0
-
-                # Open trade count
-                open_count = session.exec(scoped(
-                    select(func.count(Transaction.id))
-                    .where(Transaction.status == TransactionStatus.OPENED)
-                )).first() or 0
-
-                # Closed trades in different periods
-                def get_closed_in_range(start, end):
-                    q = scoped(select(Transaction)).where(
-                        Transaction.status == TransactionStatus.CLOSED,
-                        Transaction.close_date.isnot(None),
-                        Transaction.close_date >= start,
-                        Transaction.close_date < end
-                    )
-                    return session.exec(q).all()
-
-                closed_7d = get_closed_in_range(d7, now)
-                closed_prev_7d = get_closed_in_range(d14, d7)
-                closed_30d = get_closed_in_range(d30, now)
-                closed_prev_30d = get_closed_in_range(d60, d30)
-
-            # Compute P&L
-            def compute_pnl_stats(transactions):
-                pnls = []
-                for txn in transactions:
-                    pnl = calculate_transaction_pnl(txn)
-                    if pnl is not None:
-                        pnls.append(pnl)
-                total = sum(pnls)
-                wins = sum(1 for p in pnls if p > 0)
-                losses = sum(1 for p in pnls if p < 0)
-                return total, wins, losses
-
-            pnl_7d, wins_7d, losses_7d = compute_pnl_stats(closed_7d)
-            pnl_prev_7d, _, _ = compute_pnl_stats(closed_prev_7d)
-            pnl_30d, wins_30d, losses_30d = compute_pnl_stats(closed_30d)
-            pnl_prev_30d, _, _ = compute_pnl_stats(closed_prev_30d)
-
-            total_wins = wins_30d
-            total_losses = losses_30d
-            closed_count = len(closed_30d)
+            # The figures come from services.stats (the management API's /stats/overview calls the same
+            # function); `now` is read here so the page's clock stays the one thing a test freezes.
+            perf = stats_service.trade_performance(selected_account_id, now=datetime.now())
+            total_count, open_count = perf['total_count'], perf['open_count']
+            pnl_7d, pnl_prev_7d = perf['pnl_7d'], perf['pnl_prev_7d']
+            pnl_30d, pnl_prev_30d = perf['pnl_30d'], perf['pnl_prev_30d']
+            total_wins, total_losses = perf['wins_30d'], perf['losses_30d']
+            closed_count = perf['closed_count']
 
             try:
                 loading_label.delete()
