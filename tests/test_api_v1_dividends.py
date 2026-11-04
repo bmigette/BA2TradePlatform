@@ -35,6 +35,8 @@ class DivBroker(FakeAccount):
 
 @pytest.fixture
 def world(monkeypatch):
+    from ba2_trade_platform.services import portfolio
+    portfolio._DIVIDENDS_CACHE.clear()
     acct = create_account_definition(name="Paper")
     broker = DivBroker(acct.id)
     monkeypatch.setattr(accounts_svc, "get_account_instance_from_id",
@@ -58,14 +60,14 @@ def test_broker_rows_totals_cash_vs_drip_and_cash_by_symbol(world):
     t = b["totals"]
     assert t["net"] == pytest.approx(14.5) and t["cash_net"] == pytest.approx(10.5) and t["drip_net"] == pytest.approx(4.0)
     assert t["tax_withheld"] == pytest.approx(0.3) and t["gross"] == pytest.approx(14.8)
-    assert b["cash_by_symbol"] == {"KO": pytest.approx(4.0), "PEP": pytest.approx(6.5)}   # the DRIP payment is not cash
+    assert {x["symbol"]: x["cash"] for x in b["cash_by_symbol"]} == {"KO": pytest.approx(4.0), "PEP": pytest.approx(6.5)}
     assert "as_of" in body
 
 
 def test_symbol_filter_window_and_paging(world):
     acct, broker = world
     ko = _get(acct, symbol="ko")
-    assert ko["symbol"] == "KO" and ko["broker"]["total"] == 2 and broker.calls[-1][0] == "KO"
+    assert ko["symbol"] == "KO" and ko["broker"]["total"] == 2
     wide = _get(acct, **{"from": (TODAY - timedelta(days=500)).isoformat()})
     assert wide["broker"]["total"] == 4
     page = _get(acct, limit=1, offset=1)
@@ -107,3 +109,25 @@ def test_validation_and_unknown_account(world):
     assert c.get(f"/accounts/{acct.id}/dividends?from=2026-10-01&to=2026-09-01").status_code == 422
     assert c.get(f"/accounts/{acct.id}/dividends?from=2000-01-01").status_code == 422
     assert c.get("/accounts/999/dividends").status_code == 404
+
+
+def test_a_payment_without_an_amount_is_skipped_and_flagged_partial(world):
+    acct, broker = world
+    broker.rows.append(dict(_div(5, "KO", 0.0), amount=None))
+    b = _get(acct)["broker"]
+    assert b["partial"] is True and b["skipped_rows"] == 1 and b["total"] == 3
+
+
+def test_one_cached_fetch_serves_repeat_calls_and_the_rows_are_not_mutated(world):
+    acct, broker = world
+    _get(acct)
+    _get(acct, symbol="KO")
+    assert len(broker.calls) == 1 and _get(acct)["broker"]["from_cache"] is True
+    assert "account_id" not in broker.rows[0]
+
+
+def test_a_full_page_is_flagged_as_possibly_truncated(world):
+    acct, broker = world
+    broker.rows = [_div(n % 300, "KO", 1.0) for n in range(100)]
+    b = _get(acct)["broker"]
+    assert b["truncation_suspected"] is True and "older payments" in b["truncation_note"]
