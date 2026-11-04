@@ -320,8 +320,8 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
 def test_explicit_default_settings_helper():
     from ba2_common.core.deploy_parity import explicit_default_settings
     from ba2_experts.DeterministicScorer import DeterministicScorer
-    assert explicit_default_settings(DeterministicScorer, {}) == {"macro_short_side": "same"}
-    assert explicit_default_settings(DeterministicScorer, {"macro_short_side": "mirror"}) == {}
+    assert explicit_default_settings(DeterministicScorer, {}) == {"macro_short_side": "same", "screener_symbol_universe": ""}
+    assert explicit_default_settings(DeterministicScorer, {"macro_short_side": "mirror"}) == {"screener_symbol_universe": ""}
 
     class _NoList:
         pass

@@ -51,6 +51,30 @@ def test_a_list_that_matches_nothing_returns_no_candidates(monkeypatch):
     assert out["results"] == [] and out["stats"]["dropped_symbol_universe"] == 6
 
 
+def test_share_class_spelling_and_comments_are_normalised_like_the_backtest_side(monkeypatch):
+    rows = _rows() + [{"symbol": "BRK.B", "market_cap": 3e11, "price": 400.0, "volume": 1e6}]
+    monkeypatch.setattr(ba2_providers, "get_provider", lambda *a, **k: _Provider(rows))
+    st = {"screener_relative_volume_min": 0, "screener_price_drop_pct": 0, "screener_float_min": 0,
+          "screener_volume_min": 0, "screener_max_stocks": 5,
+          "screener_symbol_universe": "brk-b  # share class\n# whole-line comment\nccc"}
+    out = S.StockScreener(st, as_of=AS_OF).screen()
+    assert [r["symbol"] for r in out["results"]] == ["CCC", "BRK.B"]       # vendor dotted spelling matches the dash
+
+
+def test_an_empty_intersection_logs_a_warning(monkeypatch):
+    seen = []
+
+    class _Log:
+        def __getattr__(self, level):
+            return lambda msg, *a, **k: seen.append((level, str(msg)))
+    monkeypatch.setattr(S, "logger", _Log())
+    _screen(monkeypatch, screener_symbol_universe="ZZZ")
+    assert any(lv == "warning" and "NOTHING is left" in m for lv, m in seen)
+    seen.clear()
+    _screen(monkeypatch, screener_symbol_universe="CCC")
+    assert not [1 for lv, _ in seen if lv == "warning"]
+
+
 def test_parse_forms_and_malformed_value():
     assert S.parse_symbol_universe(None) is None and S.parse_symbol_universe("") is None
     assert S.parse_symbol_universe(" a ,B,,a") == frozenset({"A", "B"})

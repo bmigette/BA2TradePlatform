@@ -11,7 +11,9 @@ Synthetic world of ``test_screener_launch_shared`` (no vendor call, tmp cache).
 """
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_screener_launch_shared as S  # noqa: E402
+from test_launcher_seed_population import (  # noqa: E402,F401
+    _bundle, _fill_for, _no_style_leaks, _space_of, style_cfg)
 
 from app.services.backtest import screener_gate as sg  # noqa: E402
 from app.services.backtest import screener_launch as sl  # noqa: E402
@@ -181,21 +185,78 @@ def test_universe_file_flag_refusals(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------ seed fill
+def _gene_space():
+    return {f"screener:{k}": {"min": v["min"], "max": v["max"], "step": v["step"], "type": v["type"]}
+            for k, v in us.SCREENER_OPT.items()}
+
+
 def test_seed_fill_is_the_loosest_screen_of_each_declared_range():
-    space = {f"screener:{k}": {"min": v["min"], "max": v["max"], "step": v["step"], "type": v["type"]}
-             for k, v in us.SCREENER_OPT.items()}
+    space = _gene_space()
     space["model:x"] = {"min": 0, "max": 1, "step": 1, "type": "int"}
-    fill = S.L._screener_seed_fill(space)
-    assert set(fill) == {k for k in space if k.startswith("screener:")}
-    assert fill["screener:screener_relative_volume_min"] == 0.0 and fill["screener:screener_price_drop_pct"] == 0.0
+    fill, notes = S.L._screener_seed_fill(space)
+    assert set(fill) == {k for k in space if k.startswith("screener:")} and notes == []
+    assert fill["screener:screener_relative_volume_min"] == 0 and fill["screener:screener_price_drop_pct"] == 0
     assert fill["screener:screener_weinstein_stage2_only"] == 0
     assert fill["screener:screener_max_stocks"] == 50                 # the LARGEST cut = the loosest
     assert fill["screener:screener_market_cap_min"] == us.SCREENER_OPT["screener_market_cap_min"]["min"]
 
 
-def test_seed_fill_refuses_a_screener_gene_with_no_rule():
+def test_seed_fill_upper_bound_genes_and_a_nonzero_drop_floor_note():
+    space = {"screener:screener_price_max": {"min": 0, "max": 300, "step": 50, "type": "float"},
+             "screener:screener_market_cap_max": {"min": 1e9, "max": 5e9, "step": 1e9, "type": "float"},
+             "screener:screener_price_drop_pct": {"min": 5.0, "max": 25.0, "step": 1.0, "type": "float"}}
+    fill, notes = S.L._screener_seed_fill(space)
+    assert fill["screener:screener_price_max"] == 0                   # the range reaches 0 = no ceiling
+    assert fill["screener:screener_market_cap_max"] == 5e9            # otherwise the largest ceiling
+    assert fill["screener:screener_price_drop_pct"] == 5.0
+    assert len(notes) == 1 and "screener_price_drop_pct" in notes[0] and "cannot be switched off" in notes[0]
+
+
+def test_the_bundles_own_fill_wins_on_an_identical_key_and_on_a_glob():
+    space = _gene_space()
+    fill, _ = S.L._screener_seed_fill(space, {"screener:screener_max_stocks": 20, "screener:*weinstein*": 1})
+    assert fill["screener:screener_max_stocks"] == 20 and fill["screener:*weinstein*"] == 1
+    # the covered genes are not computed (so a categorical gene the bundle states is not refused), the rest are
+    assert "screener:screener_weinstein_stage2_only" not in fill and fill["screener:screener_price_drop_pct"] == 0
+    # ordering: the bundle's patterns are consulted first
+    assert list(fill)[:2] == ["screener:screener_max_stocks", "screener:*weinstein*"]
+
+
+@pytest.mark.parametrize("gene,cfg", [
+    ("screener:screener_sort_metric", {"type": "choice", "choices": ["market_cap", "volume"]}),
+    ("screener:screener_mystery", {"min": 0, "max": 1, "step": 1, "type": "int"}),
+    ("screener:screener_market_cap_min", {"min": None, "max": 1, "step": 1, "type": "int"}),
+])
+def test_seed_fill_refuses_loudly_never_a_keyerror(gene, cfg):
     with pytest.raises(SystemExit, match="no loosest-value rule"):
-        S.L._screener_seed_fill({"screener:screener_mystery": {"min": 0, "max": 1, "step": 1, "type": "int"}})
+        S.L._screener_seed_fill({gene: cfg})
+
+
+def test_seed_fill_end_to_end_through_assemble_seed_population(style_cfg, tmp_path, monkeypatch, capsys):
+    """Stage-1 style seeds carry no screener gene: the assembled seeds get the loosest screen, the bundle's fill wins."""
+    fill = _fill_for(style_cfg, monkeypatch)
+    path, space = _bundle(style_cfg, tmp_path, monkeypatch, fill={**fill, "screener:screener_max_stocks": 20})
+    bundle = json.loads(path.read_text())
+    seen = _space_of(style_cfg, monkeypatch)
+    space2 = {**space, **_gene_space()}
+    seeds, prov = S.L._assemble_seed_population(bundle, seen["strat"], space2, seen["anchor"], 10)
+    assert len(seeds) == 3 and all(set(g) == set(space2) for g in seeds)
+    for g in seeds:
+        assert g["screener:screener_max_stocks"] == 20                # the bundle's value, not the seed fill's 50
+        assert g["screener:screener_relative_volume_min"] == 0 and g["screener:screener_price_drop_pct"] == 0
+        assert g["screener:screener_weinstein_stage2_only"] == 0
+        assert g["screener:screener_market_cap_min"] == us.SCREENER_OPT["screener_market_cap_min"]["min"]
+    assert "screener:screener_relative_volume_min" in prov[0]["fills"]
+    out = capsys.readouterr().out
+    assert "seed screener fill" in out and "screener:screener_relative_volume_min" in out
+
+
+def test_seed_fill_end_to_end_refuses_a_categorical_screener_gene(style_cfg, tmp_path, monkeypatch):
+    path, space = _bundle(style_cfg, tmp_path, monkeypatch, fill=_fill_for(style_cfg, monkeypatch))
+    seen = _space_of(style_cfg, monkeypatch)
+    space2 = {**space, "screener:screener_sort_metric": {"type": "choice", "choices": ["a", "b"], "min": 0, "max": 1, "step": 1}}
+    with pytest.raises(SystemExit, match="screener_sort_metric"):
+        S.L._assemble_seed_population(json.loads(path.read_text()), seen["strat"], space2, seen["anchor"], 10)
 
 
 # ------------------------------------------------------------------------------------------ standalone refusal
@@ -204,3 +265,115 @@ def test_standalone_screener_backtest_refuses_a_restricted_universe():
     u = {"mode": "screener", "screener_store": "x", "screener_settings": {"screener_symbol_universe": "AAPL,MSFT"}}
     with pytest.raises(ValueError, match="screener_symbol_universe"):
         D._build_screener_runtime({"universe": u})
+
+
+# ------------------------------------------------------------------------------------------ replay paths
+def test_a_stored_empty_restriction_is_refused_not_replayed_unrestricted(env):
+    for stored in ({"symbols": []}, {}, {"uncovered": []}):
+        syms = sl.stored_restriction_symbols({"universe_restriction": stored})
+        assert syms == []                                              # present but unusable: NOT None
+        with pytest.raises(sl.ScreenerLaunchRefused, match="no symbols"):
+            _prep(env, universe_restriction=syms)
+    assert sl.stored_restriction_symbols({}) is None                   # no key = an unrestricted job
+    assert sl.stored_restriction_symbols({"universe_restriction": {"symbols": ["A", "B"]}}) == ["A", "B"]
+    with pytest.raises(sl.ScreenerLaunchRefused, match="not an object"):
+        sl.stored_restriction_symbols({"universe_restriction": ["A"]})
+
+
+def _stored_block(env, prep):
+    start, end = S._window(env)
+    return {"backtest_id": 7, "start_date": start, "end_date": end, "enabled_instruments": list(prep.enabled),
+            "execution_interval": "1d", "ohlcv_history_source": "fmp",
+            "experts": [{"class": "FMPRating", "settings": {}}], "initial_capital": 100000.0,
+            "account_settings": {"starting_cash": 100000.0}, "warmup_days": 30, "seed": 42,
+            "screener_universe_rule": us.RULE_ID, "screener_opt": prep.screener_opt}
+
+
+PARAMETER_RANGES = {f"screener:{k}": dict(v) for k, v in us.SCREENER_OPT.items()}
+
+
+def test_recompute_static_universe_applies_the_stored_restriction(env):
+    from app.services.backtest import rerun_handler as RH
+    keep = _symbols(env)[:15]
+    prep = _prep(env, universe_restriction=keep)
+    out = RH.recompute_static_universe(_stored_block(env, prep), PARAMETER_RANGES, row_id=1)
+    assert set(out["enabled_instruments"]) <= set(keep) and out["enabled_instruments"]
+    free = RH.recompute_static_universe(_stored_block(env, _prep(env)) | {}, PARAMETER_RANGES, row_id=2)
+    assert len(free["enabled_instruments"]) > len(out["enabled_instruments"])
+
+
+def test_recompute_static_universe_refuses_an_empty_stored_restriction(env):
+    from app.services.backtest import rerun_handler as RH
+    prep = _prep(env, universe_restriction=_symbols(env)[:15])
+    blk = _stored_block(env, prep)
+    blk["screener_opt"] = {**blk["screener_opt"], "universe_restriction": {"symbols": []}}
+    with pytest.raises(sg.ScreenerGateRefusal, match="empty universe_restriction"):
+        RH.recompute_static_universe(blk, PARAMETER_RANGES, row_id=3)
+
+
+def test_recompute_static_universe_refuses_a_restriction_without_the_panel_gate(env):
+    from app.services.backtest import rerun_handler as RH
+    prep = _prep(env, universe_restriction=_symbols(env)[:15])
+    blk = _stored_block(env, prep)
+    so = {k: v for k, v in blk["screener_opt"].items() if k not in ("criteria_version", "panel", "panel_fingerprint")}
+    blk["screener_opt"] = {**so, "store": env["store"]}
+    with pytest.raises(ValueError, match="needs the daily-panel gate"):
+        RH.recompute_static_universe(blk, PARAMETER_RANGES, row_id=4)
+
+
+# ------------------------------------------------------------------------------------------ trial config
+def _trial_cfg(env, restriction):
+    prep = _prep(env, universe_restriction=restriction)
+    cfg = _stored_block(env, prep)
+    decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {}, "buy_tree": None, "sell_tree": None,
+               "exit_rules": [], "entry_rules": [],
+               "screener_overrides": {"screener_market_cap_min": 2e9, "screener_relative_volume_min": 0,
+                                      "screener_price_drop_pct": 0, "screener_price_drop_days": 5,
+                                      "screener_max_stocks": 10, "screener_weinstein_stage2_only": 0}}
+    from app.services import strategy_optimization_handler as H
+    return H._build_daily_trial_config(cfg, decoded, H._build_hoisted_state(cfg), option_trade_records=False), prep
+
+
+def test_universe_restriction_reaches_the_trial_runtime_and_the_panel_gate(env):
+    keep = _symbols(env)[:15]
+    trial, prep = _trial_cfg(env, keep)
+    rt = trial["screener_runtime"]
+    assert rt["universe_restriction"] == sorted(keep)
+    assert set(trial["enabled_instruments"]) <= set(keep)               # the per-trial candidate bound is restricted too
+
+    class _PS:
+        interval = "1d"
+        def screener_now_price(self, sym, at): return 50.0
+        def screener_session_high(self, sym, at): return 50.0
+        def has_symbol(self, sym): return True
+    gate = sg.PanelGate(rt, _PS(), intraday=False, history_source="fmp")
+    assert gate.valid.sum() == len(keep)
+    day = datetime.fromisoformat(S._window(env)[0]) + timedelta(days=7)
+    picked = gate.symbols(day)
+    assert picked and set(picked) <= set(keep) and len(picked) <= 10
+
+
+def test_an_unrestricted_trial_runtime_has_no_restriction_key(env):
+    trial, _ = _trial_cfg(env, None)
+    assert "universe_restriction" not in trial["screener_runtime"]
+
+
+# ------------------------------------------------------------------------------------------ one parser, both sides
+def test_universe_file_parsing_comments_blanks_and_share_class_spelling(tmp_path):
+    from ba2_providers.screener import symbol_universe as su
+    f = tmp_path / "u.txt"
+    f.write_text("# header\n\naapl   # trailing comment\nBRK.B\nbf-b, msft\n   \n#MSFT2\nAAPL\n", encoding="utf-8")
+    assert su.read_universe_file(str(f)) == ["AAPL", "BF-B", "BRK-B", "MSFT"]
+    assert su.parse_symbols("brk.b,AAPL\n# x\nZZZ # y") == ["AAPL", "BRK-B", "ZZZ"]
+    with pytest.raises(ValueError):
+        su.parse_symbols(5)
+    # the launcher flag and the live setting use these very functions
+    ns = _args(screener_universe_file=str(f), screener=True)
+    assert S.L._screener_universe_restriction(ns) == ["AAPL", "BF-B", "BRK-B", "MSFT"]
+    assert su.parse_symbol_universe("brk.b, AAPL # c") == frozenset({"BRK-B", "AAPL"})
+
+
+def test_the_restriction_stamp_is_canonical_so_the_exported_list_matches_the_panel(env):
+    syms = _symbols(env)
+    got = _prep(env, universe_restriction=[syms[0].lower(), syms[1]])
+    assert got.screener_opt["universe_restriction"]["symbols"] == sorted({syms[0], syms[1]})

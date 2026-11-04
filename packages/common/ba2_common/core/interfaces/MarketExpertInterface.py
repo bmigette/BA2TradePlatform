@@ -576,6 +576,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
 
+    # Settings a deploy writes with their class default when the payload omits them (deploy_parity.explicit_default_settings):
+    # a deploy never deletes, so a restricted option deploy's screener list must be CLEARED by a later unrestricted one.
+    # A subclass that declares its own tuple must repeat these.
+    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("screener_symbol_universe",)
+
     # Set to False in subclasses that manage their own risk (e.g. LiveExpertInterface).
     # When False, the platform's risk manager settings are hidden in the UI.
     uses_risk_manager: bool = True

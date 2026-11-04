@@ -106,6 +106,7 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     from ba2_providers.screener import metric_store as ms
     from ba2_providers.screener import universe_superset as us
     from app.services.backtest.history_source import load_job_store
+    from app.services.backtest import screener_launch as _sl
 
     ranges = us.gene_ranges_from_parameter_ranges(parameter_ranges if isinstance(parameter_ranges, dict) else {})
     if not ranges:
@@ -123,9 +124,9 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
                                                   history_source=resolve_job_history_source(bt_block)), str(bt_block["start_date"])[:10],
                                  str(bt_block["end_date"])[:10], so["base_settings"], ranges,
                                  intraday=us.interval_is_intraday(interval), excluded_symbols=excluded,
-                                 restrict_to=((so.get("universe_restriction") or {}).get("symbols") or None))
+                                 restrict_to=_sl.stored_restriction_symbols(so))
     else:
-        if so.get("universe_restriction"):
+        if so.get("universe_restriction") is not None:
             raise ValueError(f"--recompute-universe row {row_id}: a universe_restriction needs the daily-panel gate")
         df = load_job_store(so["store"], bt_block)
         new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],

@@ -164,9 +164,18 @@ def derive_export_payload(
                 eff_screener = {**(screener_opt.get("base_settings") or {}), **screener_overrides}
                 # An option job's screen is restricted to a fixed candidate list BEFORE the cut; live reads it as
                 # ``screener_symbol_universe`` (StockScreener), so it travels in the same block as the other keys.
+                # The backtest's panel could not select the ``uncovered`` names (accepted at launch with
+                # --screener-universe-allow-uncovered), so they are NOT exported: live can never pick a name the
+                # backtest could not.
                 _restr = screener_opt.get("universe_restriction")
-                if _restr:
-                    eff_screener = {**eff_screener, "screener_symbol_universe": ",".join(_restr["symbols"])}
+                if _restr is not None:
+                    if not isinstance(_restr, dict) or not isinstance(_restr.get("symbols"), list):
+                        raise ExportRefused(f"screener_opt.universe_restriction is malformed: {_restr!r}")
+                    _unc = {str(x).upper() for x in (_restr.get("uncovered") or [])}
+                    _syms = [str(x).upper() for x in _restr["symbols"] if str(x).upper() not in _unc]
+                    if not _syms:
+                        raise ExportRefused("screener_opt.universe_restriction leaves no exportable symbol")
+                    eff_screener = {**eff_screener, "screener_symbol_universe": ",".join(_syms)}
                 universe = {
                     "mode": "screener",
                     "screener_store": screener_opt["store"],

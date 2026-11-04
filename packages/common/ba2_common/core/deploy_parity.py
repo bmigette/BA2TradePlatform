@@ -381,7 +381,12 @@ def explicit_default_settings(expert_cls: Any, expert_params: Dict[str, Any]) ->
     keys = getattr(expert_cls, "DEPLOY_EXPLICIT_DEFAULT_SETTINGS", ())
     if not keys:
         return {}
-    defs = expert_cls.get_settings_definitions()
+    defs = dict(expert_cls.get_settings_definitions())
+    missing = [k for k in keys if k not in defs]
+    if missing:        # the interface's own (builtin) settings are not in the expert-specific table
+        from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+        MarketExpertInterface._ensure_builtin_settings()
+        defs.update({k: MarketExpertInterface._builtin_settings[k] for k in missing})
     return {k: defs[k]["default"] for k in keys if k not in expert_params}
 
 

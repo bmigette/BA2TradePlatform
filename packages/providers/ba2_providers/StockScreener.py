@@ -111,19 +111,7 @@ class ScreenerDataError(FMPError):
 SYMBOL_UNIVERSE_KEY = "screener_symbol_universe"
 
 
-def parse_symbol_universe(raw: Any) -> Optional[frozenset]:
-    """The restriction as a set of upper-case symbols; None = no restriction. A value that is neither a string nor a
-    list of strings raises (a malformed restriction must not silently become "no restriction")."""
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        parts = [x.strip().upper() for x in raw.replace(chr(10), ",").split(",")]
-    elif isinstance(raw, (list, tuple, set, frozenset)) and all(isinstance(x, str) for x in raw):
-        parts = [x.strip().upper() for x in raw]
-    else:
-        raise ValueError(f"{SYMBOL_UNIVERSE_KEY} must be a comma-separated string, got {type(raw).__name__}: {raw!r}")
-    syms = frozenset(x for x in parts if x)
-    return syms or None
+from ba2_providers.screener.symbol_universe import canonical_symbol, parse_symbol_universe  # noqa: E402,F401
 
 
 class StockScreener:
@@ -326,10 +314,14 @@ class StockScreener:
             self._record_stage("provider", candidates)
         if self._symbol_universe is not None:
             n_before = len(candidates)
-            candidates = [c for c in candidates if str(c.get("symbol") or "").upper() in self._symbol_universe]
+            candidates = [c for c in candidates if canonical_symbol(c.get("symbol")) in self._symbol_universe]
             stats["dropped_symbol_universe"] = n_before - len(candidates)
-            logger.info(f"StockScreener: {SYMBOL_UNIVERSE_KEY} ({len(self._symbol_universe)} symbols) kept "
-                        f"{len(candidates)} of {n_before} vendor candidates")
+            _msg = (f"StockScreener: {SYMBOL_UNIVERSE_KEY} ({len(self._symbol_universe)} symbols) kept "
+                    f"{len(candidates)} of {n_before} vendor candidates")
+            if candidates:
+                logger.info(_msg)
+            else:
+                logger.warning(_msg + ": NOTHING is left to screen (is the list stale, or the vendor call empty?)")
         if self._symbol_universe is not None and diag is not None:
             self._record_stage("symbol_universe", candidates)
         if live:

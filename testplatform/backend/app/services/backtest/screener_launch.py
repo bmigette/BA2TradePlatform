@@ -121,6 +121,19 @@ def _print(msg: str) -> None:
     print(msg, flush=True)
 
 
+def stored_restriction_symbols(screener_opt: Dict[str, Any]) -> Optional[List[str]]:
+    """The restriction symbols of a STORED ``screener_opt`` (a replay), None when the job carried none. A stored block
+    that has the key but no usable list (``{}``, ``{"symbols": []}``) is returned as ``[]`` so the launch REFUSES it:
+    it must never be replayed as an unrestricted job."""
+    stored = screener_opt.get("universe_restriction")
+    if stored is None:
+        return None
+    if not isinstance(stored, dict):
+        raise ScreenerLaunchRefused(f"stored universe_restriction is not an object: {stored!r}", plain=True)
+    syms = stored.get("symbols")
+    return list(syms) if isinstance(syms, (list, tuple)) else []
+
+
 def declared_ranges_of(scr_opt: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """``{gene (unprefixed): {min, max}}`` of the searched genes: the ranges the static universe is the superset of."""
     return {k[len("screener_"):] if k.startswith("screener_") else k: {"min": v["min"], "max": v["max"]}
@@ -144,7 +157,11 @@ def prepare_screener_launch(req: ScreenerLaunchRequest, *, emit: Emit = _print) 
     panel_dir: Optional[str] = None
     restriction_syms: Optional[List[str]] = None
     if req.universe_restriction is not None:
-        restriction_syms = sorted({str(x).strip().upper() for x in req.universe_restriction if str(x).strip()})
+        from ba2_providers.screener.symbol_universe import parse_symbols
+        try:
+            restriction_syms = parse_symbols(list(req.universe_restriction), what="the universe restriction")
+        except ValueError as e:
+            raise ScreenerLaunchRefused(str(e), surface=req.surface, plain=True) from None
         if not restriction_syms:
             raise ScreenerLaunchRefused("the universe restriction lists no symbols", surface=req.surface, plain=True)
         if not use_sim:
