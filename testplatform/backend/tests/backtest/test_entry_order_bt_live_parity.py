@@ -31,11 +31,14 @@ from ba2_common.core.types import (
     Recommendation, TransactionStatus)
 
 from tests.backtest.test_max_loss_stop_engine import _store_mode
+from tests.backtest.test_short_selling_bt_live_parity import _install_live_utils_stub
 
 SYM = "EOPX"
 EXPERT = 1
 ACCOUNT = 1
-T0 = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) - timedelta(days=20)
+# Timezone-AWARE: sqlmodel >= 0.0.45 (what CI resolves) stores datetimes as UTCDateTime and refuses
+# a naive value on insert; 0.0.38 (the local venvs) accepts either.
+T0 = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=20)
 
 
 def _txn(label, *, days, status=TransactionStatus.OPENED, side=OrderDirection.SELL,
@@ -219,9 +222,10 @@ def _live_pick(book, monkeypatch, run):
             expert_instance_id=EXPERT, symbol=SYM, as_of=datetime.now(timezone.utc),
             allow_hold=True, subtype=AnalysisUseCase.OPEN_POSITIONS)
         book()
-        with patch("ba2_trade_platform.core.utils.get_expert_instance_from_id",
-                   return_value=_LiveExpert()), \
-             patch("ba2_trade_platform.modules.accounts.get_account_class",
+        # A stand-in for the live utils shim: patching an attribute of the real one imports the
+        # live expert registry (TradingAgents / LLM stack), which the CI job does not install.
+        _install_live_utils_stub(monkeypatch, _LiveExpert(), None)
+        with patch("ba2_trade_platform.modules.accounts.get_account_class",
                    return_value=_LiveAccount), \
              patch.object(TradeActionEvaluator, "evaluate", spy):
             TradeManager().process_open_positions_recommendations(EXPERT)
