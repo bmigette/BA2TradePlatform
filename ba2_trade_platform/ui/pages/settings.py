@@ -1021,6 +1021,9 @@ class AppSettingsTab:
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
             self.alpaca_secret_input = _secret_input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret')).classes('w-full')
         
+        from .api_token_card import render_api_token_card
+        render_api_token_card()
+
         # =================================================================
         # System Settings Section
         # =================================================================
