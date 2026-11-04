@@ -1966,6 +1966,34 @@ _OPTION_RM_OVERRIDE = {
 }
 
 
+#: Genes that are DEAD for an ``O_STYLE`` job: proven 2026-11-04 by re-running an O_STYLE genome with
+#: every one of them changed -- identical trades and P&L. The style's exits are the members' own
+#: rules (no stop/target comes from the classic RM's ATR block), its sizing is each member's
+#: ``option_sizing`` bounded by the style's per-instrument cap, and the backtest clock has no
+#: weekend bars. They are removed from the SEARCH (keys of the merged ``expert_params``, before
+#: namespacing); an absent gene decodes to the expert's own declared default, exactly the value a
+#: genome that never touched it carried, so the deployed settings are today's defaults.
+#: ``k_target`` and ``atr_period`` are NOT here: they are live (DS target -> exp_profit gate).
+_STYLE_DEAD_GENES = frozenset({
+    "k_stop", "risk_per_trade_pct", "atr_risk_budget_pct", "atr_multiplier", "min_stop_loss_pct",
+    "regime_risk_scale", "regime_stop_scale", "regime_tp_scale",
+    "schedule:saturday", "schedule:sunday",
+})
+
+
+def _style_dead_gene_keys() -> frozenset:
+    """``_STYLE_DEAD_GENES`` as the namespaced gene keys a stage-1 genome carries."""
+    return frozenset(g if g.startswith("schedule:") else f"model:{g}" for g in _STYLE_DEAD_GENES)
+
+
+def _pin_style_dead_genes(kind: "str | None", expert_params: dict) -> dict:
+    """``expert_params`` for a gene space: unchanged for every key but ``O_STYLE``; for it, the
+    ``_STYLE_DEAD_GENES`` removed (a new dict -- the caller's spec table is shared)."""
+    if kind != _STYLE_KEY:
+        return expert_params
+    return {k: v for k, v in expert_params.items() if k not in _STYLE_DEAD_GENES}
+
+
 def _effective_sizing_mode(spec: dict, args) -> "str | None":
     """The sizing mode a run will ACTUALLY use, or None when it cannot be determined.
 
@@ -7408,10 +7436,16 @@ _STYLE_RISK_REQUIRED = ("max_concurrent_structures", "max_deployment_pct",
 _STYLE_RISK_KEYS = set(_STYLE_RISK_REQUIRED) | {"undefined_risk_max_pct",
                                                 "max_virtual_equity_per_instrument_percent"}
 _STYLE_RISK_GENE_FIELDS = {"min", "max", "step"}
-_STYLE_STATUSES = {"candidate", "approved"}
+#: ``draft``: written for the owner's review, not yet approved to run (stage-2 job P).
+_STYLE_STATUSES = {"candidate", "draft", "approved"}
 _STYLE_PRICE_CAP_POLICIES = {"group_min", "none"}
+#: The DTE band, plus the member's searched SIZING band (``option_sizing_min/max/step``): a
+#: full-notional member (CSP, wheel, jade lizard, ratio spread) can only use all the cash if its
+#: own sizing band reaches the per-instrument cap (the budget is ``min(option_sizing%, cap%)``;
+#: the authored band tops out at 50).
 _STYLE_ACTION_OVERRIDE_KEYS = {"option_dte_min", "option_dte_max", "option_dte_min_range",
-                               "option_dte_max_range", "option_dte_step"}
+                               "option_dte_max_range", "option_dte_step",
+                               "option_sizing_min", "option_sizing_max", "option_sizing_step"}
 _STYLE_EXIT_OVERRIDE_FIELDS = {"value", "value_min", "value_max", "value_step"}
 #: Members whose DTE band carries an invariant of its OWN that a moved band would silently
 #: break, and that cannot be re-checked on a merged action (each is asserted only against the
@@ -7546,16 +7580,18 @@ def _validate_style_action_overrides(where: str, key: str, overrides) -> None:
             f"{_STYLE_DTE_INVARIANT_MEMBERS[key]}")
     unknown = sorted(set(overrides) - _STYLE_ACTION_OVERRIDE_KEYS)
     if unknown:
-        raise ValueError(f"{where}: action_overrides may only move the DTE band "
+        raise ValueError(f"{where}: action_overrides may only move the DTE and sizing bands "
                          f"({sorted(_STYLE_ACTION_OVERRIDE_KEYS)}); refused {unknown}")
     for k, v in overrides.items():
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
             raise ValueError(f"{where}: action_overrides[{k!r}] must be a non-negative "
                              f"integer, got {v!r}")
-    if "option_dte_step" in overrides and overrides["option_dte_step"] == 0:
-        raise ValueError(f"{where}: action_overrides option_dte_step must be > 0")
+    for step in ("option_dte_step", "option_sizing_step"):
+        if step in overrides and overrides[step] == 0:
+            raise ValueError(f"{where}: action_overrides {step} must be > 0")
     for lo, hi in (("option_dte_min", "option_dte_max"),
-                   ("option_dte_min_range", "option_dte_max_range")):
+                   ("option_dte_min_range", "option_dte_max_range"),
+                   ("option_sizing_min", "option_sizing_max")):
         if lo in overrides and hi in overrides and overrides[lo] > overrides[hi]:
             raise ValueError(f"{where}: action_overrides {lo}={overrides[lo]} > "
                              f"{hi}={overrides[hi]}")
@@ -7891,6 +7927,20 @@ def _style_check_dte_band(key: str, rid: str, action: dict, overrides: dict) -> 
     The validator checked the overrides on their own; this checks them MERGED with the
     member's authored band (a lone ``option_dte_min`` can pass the authored max)."""
     where = f"{key} entry rule {rid!r}: action_overrides"
+    sizing = {"option_sizing_min", "option_sizing_max", "option_sizing_step"} & set(overrides)
+    if sizing:
+        smin, smax, sstep = (action.get("option_sizing_min"), action.get("option_sizing_max"),
+                             action.get("option_sizing_step"))
+        authored = action.get("option_sizing")
+        if not action.get("option_sizing_optimize") or authored is None:
+            raise ValueError(f"{where} set {sorted(sizing)} on an action that does not search "
+                             f"its sizing (no option_sizing_optimize / option_sizing): inert")
+        if smin is None or smax is None or sstep is None or smin > smax or sstep <= 0:
+            raise ValueError(f"{where} leave an undecodable sizing range "
+                             f"[{smin}, {smax}] step {sstep}")
+        if not smin <= authored <= smax:
+            raise ValueError(f"{where} leave the authored option_sizing {authored:g} outside "
+                             f"the searched sizing range [{smin}, {smax}]")
     lo, hi = action.get("option_dte_min"), action.get("option_dte_max")
     if lo is None or hi is None:
         raise ValueError(f"{where} move a DTE band the action does not author "
@@ -9001,6 +9051,7 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
     opt = GeneticOptimizer(param_ranges=space, population_size=population, n_generations=1,
                            lattice_anchor=anchor)
     seeds, provenance = [], []
+    dropped_dead: dict = {}
     for i, ind in enumerate(inds):
         contributions = []
         for c in ind["contributions"]:
@@ -9008,9 +9059,14 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
             if member not in strat.style_id_maps:
                 sys.exit(f"optimize: seed bundle refused: seed #{i}: {member!r} is not a member of the style "
                          f"({sorted(strat.style_id_maps)})")
+            # A stage-1 source still carries the genes pinned dead for a style job (_STYLE_DEAD_GENES):
+            # they are not in the style's space, so they are dropped HERE, by name, and reported.
+            dead = sorted(g for g in c["genes"] if g not in space and g in _style_dead_gene_keys())
+            if dead:
+                dropped_dead.setdefault(i, []).extend(f"{member}:{g}" for g in dead)
             try:
                 genes = {_style_translate_key(g, strat.style_id_maps[member], member, space): v
-                         for g, v in c["genes"].items()}
+                         for g, v in c["genes"].items() if g not in dead}
             except ValueError as e:
                 sys.exit(f"optimize: seed bundle refused: seed #{i}: {e}")
             r = c["resolved"]
@@ -9021,7 +9077,8 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
             genes, prov = assemble_individual(
                 space, authored, member_keys, contributions, shared_from=ind.get("shared_from", 0),
                 other_members=ind.get("other_members", "authored"), fill=bundle.get("fill") or {},
-                out_of_range=bundle.get("out_of_range", "clamp"), lattice_anchor=anchor)
+                out_of_range=bundle.get("out_of_range", "clamp"), lattice_anchor=anchor,
+                set_values=ind["set"] if "set" in ind else None)
             opt.encode_params_strict(genes)
         except (SeedRefused, ValueError) as e:
             sys.exit(f"optimize: seed bundle refused: seed #{i}: {e}")
@@ -9035,7 +9092,8 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
             "contributions": [{"member": c["member"], "resolved": cc["resolved"]}
                               for c, cc in zip(contributions, ind["contributions"])],
             "origin_counts": counts, "clamped": prov["clamped"], "conflicts": prov["conflicts"],
-            "fills": sorted(k for k, o in prov["origin"].items() if o == "fill")})
+            "fills": sorted(k for k, o in prov["origin"].items() if o == "fill"),
+            "dropped_dead": sorted(set(dropped_dead.get(i, [])))})
     return seeds, provenance
 
 
@@ -9054,6 +9112,9 @@ def _print_seed_report(provenance: list, space: dict, anchor: str, fill: dict) -
             print(f"    clamp {c['key']}: {c['from']!r} -> {c['to']!r}")
         for c in p["conflicts"]:
             print(f"    conflict {c['key']}: values {c['values']!r}, used contribution {c['used']}")
+    dead = sorted({k.split(":", 1)[1] for p in provenance for k in p["dropped_dead"]})
+    if dead:
+        print(f"  stage-1 genes dropped (pinned dead for a style job, not in its space): {dead}")
     filled = sorted({k for p in provenance for k in p["fills"]})
     if filled:
         print(f"  filled genes ({len(filled)}), policy fill patterns {json.dumps(fill, sort_keys=True)}:")
@@ -9490,12 +9551,12 @@ def _cmd_optimize(args) -> int:
             # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
             # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"],
+                              else _pin_style_dead_genes(args.strategy, {**spec["expert_params"],
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                  regime_searched=_policy_searches_regime(rm_toggle_policy)),
                                     **screener_genes, **schedule_genes, **_sl_loosen_gene_space(),
-                                    **_sizing_mode_gene_space(), **_ds_factor_gene_space()}),
+                                    **_sizing_mode_gene_space(), **_ds_factor_gene_space()})),
             "backtest": backtest_block,
         }
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
@@ -9824,7 +9885,7 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"],
+                                  else _pin_style_dead_genes(strat_kind, {**spec["expert_params"],
                                         **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
                                                      atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                      regime_searched=_policy_searches_regime(rm_toggle_policy)),
@@ -9833,7 +9894,7 @@ def _cmd_optimize_batch(args) -> int:
                                         **_decision_time_gene(
                                             decision_times,
                                             split=_decision_times_is_split(getattr(args, "decision_times", None))),
-                                        **_sl_loosen_gene_space()}),
+                                        **_sl_loosen_gene_space()})),
                 "backtest": backtest_block,
             }
             _apply_lattice_anchor(cfg, strat_kind, getattr(args, "lattice_anchor", None))

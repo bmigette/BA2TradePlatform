@@ -53,7 +53,8 @@ def assemble_individual(space: Dict[str, Any], authored: Dict[str, Any],
                         member_keys: Dict[str, Iterable[str]], contributions: List[Dict[str, Any]], *,
                         shared_from: int = 0, other_members: str = "authored",
                         fill: Optional[Dict[str, Any]] = None, out_of_range: str = "clamp",
-                        lattice_anchor: str = "zero") -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                        lattice_anchor: str = "zero",
+                        set_values: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """-> ``(genes, provenance)``; ``genes`` covers EXACTLY ``space``.
 
     ``member_keys``: ``{member: target gene keys that member owns}``; every other key of ``space`` is
@@ -71,12 +72,19 @@ def assemble_individual(space: Dict[str, Any], authored: Dict[str, Any],
 
     Every value is checked against its gene (choice membership; numeric decode-image rule). Out of range
     or off-lattice: ``out_of_range="clamp"`` snaps ``clip(v)`` onto the lattice and records it in
-    ``provenance["clamped"]``; ``"refuse"`` raises."""
+    ``provenance["clamped"]``; ``"refuse"`` raises.
+
+    ``set_values`` (a glob -> value dict, the policy individual's ``set``) overrides EVERY other source for
+    the keys it matches (origin ``set``), e.g. to seed a market gate ON. A pattern matching no gene refuses."""
     if other_members not in OTHER_MEMBERS_MODES:
         raise SeedRefused(f"other_members must be one of {OTHER_MEMBERS_MODES}, got {other_members!r}")
     if out_of_range not in OUT_OF_RANGE_MODES:
         raise SeedRefused(f"out_of_range must be one of {OUT_OF_RANGE_MODES}, got {out_of_range!r}")
     fill = dict(fill or {})
+    set_values = dict(set_values or {})
+    for pat in set_values:
+        if not any(fnmatch(k, pat) for k in space):
+            raise SeedRefused(f"set pattern {pat!r} matches no gene of the space")
 
     owner: Dict[str, str] = {}
     for member, keys in member_keys.items():
@@ -122,7 +130,10 @@ def assemble_individual(space: Dict[str, Any], authored: Dict[str, Any],
 
     for key, cfg in space.items():
         member = owner.get(key)
-        if member is not None and member in seeded:
+        forced = [v for pat, v in set_values.items() if fnmatch(key, pat)]
+        if forced:
+            value, org = forced[-1], "set"
+        elif member is not None and member in seeded:
             i = seeded[member]
             cg = contributions[i]["genes"]
             if key in cg:

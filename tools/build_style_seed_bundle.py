@@ -60,6 +60,8 @@ def validate_policy(p: Any) -> None:
               f"{f}.shared_from", f"must be an index 0..{len(cs) - 1}, got {sf!r}")
         om = ind.get("other_members", "authored")
         _need(om in OTHER_MEMBERS, f"{f}.other_members", f"must be one of {OTHER_MEMBERS}, got {om!r}")
+        st = ind.get("set", {})
+        _need(isinstance(st, dict), f"{f}.set", "must be an object of gene-glob -> value")
         seen = set()
         for j, c in enumerate(cs):
             g = f"{f}.contributions[{j}]"

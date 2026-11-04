@@ -22,6 +22,31 @@
           "max_virtual_equity_per_instrument_percent": {"min": 5, "max": 25, "step": 5}
         }
       }
+    },
+    "premium": {
+      "status": "draft",
+      "note": "Stage-2 job P, PREMIUM (credit/carry) structures: every stage-1-profitable credit or carry structure the O_STYLE builder supports (O_CSP, O_BULLPS, O_JL, O_RS, O_WHEEL, O_CC, O_PP, O_IC). DRAFT, owner approval pending. Member order is precedence (first passing rule wins; one structure per underlying): CSP first (owner idea: sell a put after a pullback expecting a rebound; the pullback gate is seeded ON by the seed policy, never forced here), BULLPS (defined-risk bullish credit), JL and RS (skewed credit), WHEEL (the CSP entry that HOLDS its assignment, so it takes names the CSP gate refuses), CC and PP (stock + call/put overlay in round lots), IC last (neutral, joint entry mode, only HOLD signals reach it). DTE: every option-entry member searches a centre range 12..30 step 2 around an authored 15..29 window (half-width 7), so the decoded window is centre +/- 7 = 5..37 days and never starts below 5. O_CC/O_PP calls/puts and the wheel's covered call are exit overlays whose DTE (centre 20..60, half-width 10, so min 10) the spec cannot move. Full-notional members (CSP, WHEEL, JL, RS) search option_sizing 5..100 so one contract can use all the cash (budget = min(option_sizing, per-instrument cap)). No price cap. The $20k equity cap is a launch flag. O_VERT left out: debit bear put vertical (stage-1 fitness 0.088), the debit family is job A's. Risk block: undefined_risk_max_pct fixed 100 because a cash-secured put is classed as undefined risk (naked sub-cap) and charges its full strike*100 to it; 0 would refuse every CSP/JL/RS/WHEEL entry. The real limits are the searched max_deployment_pct, the per-instrument cap, and the assignment-cash rail.",
+      "price_cap_policy": "none",
+      "members": [
+        {"key": "O_CSP", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_BULLPS", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2}},
+        {"key": "O_JL", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_RS", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_WHEEL", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_CC"},
+        {"key": "O_PP"},
+        {"key": "O_IC", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2}}
+      ],
+      "risk": {
+        "risk_manager_mode": "classic_options",
+        "fixed": {"max_concurrent_structures": 20, "undefined_risk_max_pct": 100},
+        "genes": {
+          "max_deployment_pct": {"min": 30, "max": 100, "step": 10},
+          "circuit_breaker_pct": {"min": 20, "max": 50, "step": 10},
+          "max_notional_leverage": {"min": 1, "max": 5, "step": 1},
+          "max_virtual_equity_per_instrument_percent": {"min": 10, "max": 100, "step": 10}
+        }
+      }
     }
   }
 }

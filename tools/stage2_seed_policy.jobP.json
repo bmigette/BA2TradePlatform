@@ -1,0 +1,675 @@
+{
+ "fill": {
+  "cond:*-spy-trend:mode": "off",
+  "cond:*-spy-vol:mode": "off",
+  "model:circuit_breaker_pct": 50,
+  "model:max_deployment_pct": 100,
+  "model:max_notional_leverage": 5
+ },
+ "individuals": [
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "set": {
+    "cond:o_csp-spy-trend:mode": "pullback"
+   },
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "set": {
+    "cond:o_csp-spy-trend:mode": "pullback"
+   },
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "set": {
+    "cond:o_bullps-spy-trend:mode": "pullback"
+   },
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "set": {
+    "cond:o_bullps-spy-trend:mode": "pullback"
+   },
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_JL",
+     "source": {
+      "opt_id": 125,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_JL",
+     "source": {
+      "opt_id": 125,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_IC",
+     "source": {
+      "opt_id": 124,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_IC",
+     "source": {
+      "opt_id": 124,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_JL",
+     "source": {
+      "opt_id": 125,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_IC",
+     "source": {
+      "opt_id": 124,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "authored",
+   "set": {
+    "cond:o_bullps-spy-trend:mode": "pullback",
+    "cond:o_csp-spy-trend:mode": "pullback"
+   },
+   "shared_from": 5
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_JL",
+     "source": {
+      "opt_id": 125,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_IC",
+     "source": {
+      "opt_id": 124,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "authored",
+   "set": {
+    "cond:o_bullps-spy-trend:mode": "pullback",
+    "cond:o_csp-spy-trend:mode": "pullback"
+   },
+   "shared_from": 5
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 4
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CSP",
+     "source": {
+      "opt_id": 127,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_BULLPS",
+     "source": {
+      "opt_id": 134,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_RS",
+     "source": {
+      "opt_id": 126,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_WHEEL",
+     "source": {
+      "opt_id": 121,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_CC",
+     "source": {
+      "opt_id": 130,
+      "pick": "distinct",
+      "rank": 4
+     }
+    },
+    {
+     "member": "O_PP",
+     "source": {
+      "opt_id": 131,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 4
+  }
+ ],
+ "note": "DRAFT (owner approval pending): stage-2 job P (style premium) seed policy. Single-member seeds (behaviour-distinct ranks of each stage-1 source, other members off): 4 ranks for CSP/BULLPS/RS/WHEEL/CC/PP, 2 for JL (stage-1 fitness 0.11) and IC (0.013); then 4 combined seeds (rank k of every member that has one; ranks 3-4 omit JL/IC, which are off; shared genes from O_CC's source). The SPY pullback gate (cond:<m>-spy-trend:mode = pullback) is seeded ON through `set` for the rank 1-2 CSP and BULLPS seeds and the rank 1-2 combined seeds; ranks 3-4 stay ungated as controls. Sources: 127 CSP, 134 BULLPS (netput relaunch; 120 is the old rule), 125 JL, 126 RS, 121 WHEEL, 130 CC, 131 PP, 124 IC (joint). Fill values are the least restrictive (SPY gates off, RM rails at their loosest). Stage-1 DTE centres above 30 clamp to 30 (recorded by --seed-check-only).",
+ "out_of_range": "clamp",
+ "schema": 1,
+ "style": "premium"
+}

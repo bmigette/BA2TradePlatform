@@ -168,13 +168,26 @@ def _candidate_styles():
 
 STYLE_AUDIT_STYLES = _candidate_styles()
 
+#: The stage-2 spec file (tools/option_styles.stage2.json): its styles (mid = job A, premium = job P)
+#: are audited like the candidates, so a stage-2 job's own member overrides and risk block are covered.
+_STAGE2_SPEC = os.path.join(os.path.dirname(_STYLE_SPEC), "option_styles.stage2.json")
+
+
+def _stage2_styles():
+    import json
+    with open(_STAGE2_SPEC, encoding="utf-8") as fh:
+        return sorted(json.load(fh)["styles"])
+
+
+STAGE2_AUDIT_STYLES = _stage2_styles()
+
 
 @contextlib.contextmanager
-def _style(m, name):
-    """Build ``O_STYLE`` from candidate style ``name`` for the duration of a case (the launcher
-    reads the loaded style from a module global, as ``optimize`` sets it from --style)."""
+def _style(m, name, spec_path=None):
+    """Build ``O_STYLE`` from style ``name`` of the candidate spec (or ``spec_path``) for the duration
+    of a case (the launcher reads the loaded style from a module global, as ``optimize`` sets it)."""
     saved = m._STYLE_ACTIVE
-    m._STYLE_ACTIVE = m._load_style_spec(_STYLE_SPEC, name)
+    m._STYLE_ACTIVE = m._load_style_spec(spec_path or _STYLE_SPEC, name)
     try:
         yield
     finally:
@@ -219,8 +232,9 @@ def _launcher_expert_cfg(m, key, expert, screener):
     run (ba2test_launcher.py, the ``cfg = {...}`` dict), with the ``screener:`` block merged in
     exactly when ``--screener`` would have been passed."""
     spec = m._EXPERT_OPT[expert]
-    cfg = {**spec["expert_params"], **m._rm_opt_for(key),
-           **{f"schedule:{k}": v for k, v in m._SCHEDULE_DAY_OPT.items()}}
+    cfg = m._pin_style_dead_genes(key, {
+        **spec["expert_params"], **m._rm_opt_for(key),
+        **{f"schedule:{k}": v for k, v in m._SCHEDULE_DAY_OPT.items()}})
     if screener:
         cfg.update({f"screener:{k}": v for k, v in m._SCREENER_OPT.items()})
     return cfg
@@ -856,6 +870,22 @@ def test_every_style_gene_lands_at_its_own_destination(style):
 def test_every_style_toggle_gene_changes_the_emitted_ruleset(style):
     m = _M
     with _style(m, style):
+        _run_toggle_audit(m, "O_STYLE")
+
+
+@pytest.mark.parametrize("style", STAGE2_AUDIT_STYLES)
+def test_every_stage2_style_gene_lands_at_its_own_destination(style):
+    """The destination audit for each style of the STAGE-2 spec (job A ``mid``, job P ``premium``)."""
+    assert "premium" in STAGE2_AUDIT_STYLES
+    m = _M
+    with _style(m, style, _STAGE2_SPEC):
+        _run_destination_audit(m, "O_STYLE", "FMPRating", False)
+
+
+@pytest.mark.parametrize("style", STAGE2_AUDIT_STYLES)
+def test_every_stage2_style_toggle_gene_changes_the_emitted_ruleset(style):
+    m = _M
+    with _style(m, style, _STAGE2_SPEC):
         _run_toggle_audit(m, "O_STYLE")
 
 
