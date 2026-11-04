@@ -303,6 +303,56 @@ def assert_market_fields_mappable(tree: Any, where: str) -> None:
             f"ruleset.")
 
 
+def _leaf_label(leaf: dict, i: int) -> str:
+    """Stable label of a condition leaf: its ``id``, else ``<field>@<position>``."""
+    return str(leaf.get("id") or f"{leaf.get('field')}@{i}")
+
+
+def _triggers_and_leaf_ids(tree: Any, warn: bool = True):
+    """The ONE walk behind :func:`triggers_from_condition_tree` and :func:`trigger_leaf_ids`:
+    ``(triggers, {trigger_key: leaf label})``. Keys are positional ``cond_{i}`` and a dropped
+    leaf leaves a gap, so the label map must come from this same walk."""
+    triggers: Dict[str, dict] = {}
+    leaf_ids: Dict[str, str] = {}
+    for i, leaf in enumerate(tree_leaves(tree)):
+        field = str(leaf.get("field"))
+        flag_et = FLAG_FIELD_EVENT.get(field)
+        if flag_et is not None:
+            triggers[f"cond_{i}"] = {"event_type": flag_et.value}
+            leaf_ids[f"cond_{i}"] = _leaf_label(leaf, i)
+            continue
+        num_et = FIELD_EVENT.get(field)
+        if num_et is None:
+            if warn:
+                logger.warning(
+                    f"Condition leaf {leaf.get('id') or i!r} names field {field!r}, which has no "
+                    f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
+                    f"and the rule will run without it")
+            continue
+        if field == ORDER_ENTRY_TAG_KEY:
+            raw_op = leaf.get("operator") or leaf.get("op") or leaf.get("comparison")
+            # No operator is REFUSED, not defaulted: _operator_of's ">" fallback would turn an
+            # authoring slip into an ordering comparison on a label.
+            validate_entry_tag_comparison(
+                _operator_of(leaf) if raw_op else None, leaf.get("value"),
+                where=f"condition leaf {leaf.get('id') or i!r}")
+        if leaf.get("value") is None:
+            if warn:
+                logger.warning(
+                    f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
+                    f"the gate is DROPPED and the rule will run without it")
+            continue
+        triggers[f"cond_{i}"] = {
+            "event_type": num_et.value,
+            "operator": _operator_of(leaf),
+            "value": leaf.get("value"),
+        }
+        leaf_ids[f"cond_{i}"] = _leaf_label(leaf, i)
+    return triggers, leaf_ids
+
+
+
+
 def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     """Build an EventAction 'triggers' dict (ANDed) from a condition tree. Flag leaves ->
     value-less {event_type}; numeric leaves -> {event_type, operator, value}. Unknown fields
@@ -322,38 +372,13 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     path, since they all come through this function. A tree without a tag leaf (every rule that
     existed before the tag) converts exactly as before.
     """
-    triggers: Dict[str, dict] = {}
-    for i, leaf in enumerate(tree_leaves(tree)):
-        field = str(leaf.get("field"))
-        flag_et = FLAG_FIELD_EVENT.get(field)
-        if flag_et is not None:
-            triggers[f"cond_{i}"] = {"event_type": flag_et.value}
-            continue
-        num_et = FIELD_EVENT.get(field)
-        if num_et is None:
-            logger.warning(
-                f"Condition leaf {leaf.get('id') or i!r} names field {field!r}, which has no "
-                f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
-                f"and the rule will run without it")
-            continue
-        if field == ORDER_ENTRY_TAG_KEY:
-            raw_op = leaf.get("operator") or leaf.get("op") or leaf.get("comparison")
-            # No operator is REFUSED, not defaulted: _operator_of's ">" fallback would turn an
-            # authoring slip into an ordering comparison on a label.
-            validate_entry_tag_comparison(
-                _operator_of(leaf) if raw_op else None, leaf.get("value"),
-                where=f"condition leaf {leaf.get('id') or i!r}")
-        if leaf.get("value") is None:
-            logger.warning(
-                f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
-                f"the gate is DROPPED and the rule will run without it")
-            continue
-        triggers[f"cond_{i}"] = {
-            "event_type": num_et.value,
-            "operator": _operator_of(leaf),
-            "value": leaf.get("value"),
-        }
-    return triggers
+    return _triggers_and_leaf_ids(tree)[0]
+
+
+def trigger_leaf_ids(tree: Any) -> Dict[str, str]:
+    """``{trigger key: leaf id}`` for exactly the triggers :func:`triggers_from_condition_tree`
+    returns for ``tree`` (same walk, same dropped leaves; read-only, used by backtest gate counters)."""
+    return _triggers_and_leaf_ids(tree, warn=False)[1]
 
 
 def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:

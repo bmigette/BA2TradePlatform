@@ -30,7 +30,9 @@ from sqlmodel import Session
 
 from ba2_common.core.db import add_instance, get_db
 from ba2_common.core.models import EventAction, Ruleset, RulesetEventActionLink
+from app.services.backtest.entry_gate_bt import register_entry_rule
 from ba2_common.core.rule_builders import (
+    trigger_leaf_ids,
     FIELD_EVENT,
     FLAG_FIELD_EVENT,
     EXIT_ACTION,
@@ -127,16 +129,20 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
             continue
         triggers = rule_triggers_from_tree(
             rule.get("conditions"), f"{name}: {getattr(subtype, 'value', subtype)} rule {rule.get('id') or idx!r}")
-        ea_ids.append(
-            _make_event_action(
-                name=rule.get("name") or f"{name}-rule-{idx}",
-                triggers=triggers,
-                actions=actions,
-                subtype=subtype,
-                continue_processing=bool(rule.get("continue_processing")
-                                         or rule.get("continueProcessing") or False),
-            )
+        ea_name = rule.get("name") or f"{name}-rule-{idx}"
+        ea_id = _make_event_action(
+            name=ea_name,
+            triggers=triggers,
+            actions=actions,
+            subtype=subtype,
+            continue_processing=bool(rule.get("continue_processing")
+                                     or rule.get("continueProcessing") or False),
         )
+        ea_ids.append(ea_id)
+        if subtype == AnalysisUseCase.ENTER_MARKET:
+            # Read-only telemetry: which leaf each positional trigger key came from (entry gate counter).
+            register_entry_rule(ea_id, ea_name, str(rule.get("id") or ea_name),
+                                trigger_leaf_ids(rule.get("conditions")))
     if ea_ids:
         _link(ruleset_id, ea_ids)
     return ruleset_id

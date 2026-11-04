@@ -419,6 +419,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                "max_drawdown": results.get("max_drawdown"),
                **_analysis_failures_field(results),
                **_screener_gate_field(results),
+               **_entry_gate_field(results),
                # The decision-time counter, so the MASTER can warn once per job (see
                # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
                **_decision_time_missing(results),
@@ -1371,6 +1372,14 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _entry_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"eg": {rule: {"n", "met", "b", "order"}}}`` -- the per-trial entry-gate counts
+    (``results["entry_gate_record"]``, see ``entry_gate_bt``), or ``{}`` when the run recorded none.
+    Summed over a job's trials by ``tools/report_entry_gates.py``."""
+    eg = (results or {}).get("entry_gate_record")
+    return {"eg": eg} if eg else {}
+
+
 def _screener_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
     """``{"sg": {"no_price": n, "outside": m, "symbols": k}}`` for a trial whose screener gate dropped candidates for want of a
     price (``results["screener_gate"]``), so the persisted per-trial rows and the job-level summary show it (silent otherwise)."""
@@ -1929,6 +1938,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     **_decision_time_missing(results or {}),
                     **_analysis_failures_field(results or {}),
                     **_screener_gate_field(results or {}),
+                    **_entry_gate_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -2218,6 +2228,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "max_drawdown": out.get("max_drawdown"),
                              **({"af": out["af"]} if out.get("af") else {}),
                              **({"sg": out["sg"]} if out.get("sg") else {}),
+                             **({"eg": out["eg"]} if out.get("eg") else {}),
                              **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
