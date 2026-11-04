@@ -10,7 +10,7 @@ from .errors import install_error_handlers
 from .gate import RemoteGateMiddleware
 
 #: Router modules (relative to this package), each exposing ``router``.
-_ROUTER_MODULES = ["system", "maintenance"]
+_ROUTER_MODULES = ["system", "maintenance", "accounts"]
 
 
 def create_v1_app() -> FastAPI:
