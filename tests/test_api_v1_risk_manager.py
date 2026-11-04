@@ -46,3 +46,39 @@ def test_detail_by_ref():
     assert c.get(f"/risk-manager/runs/{ref_s}").json()["graph_state"] == {"actions_log": [1]}
     assert c.get("/risk-manager/runs/rm-99999").status_code == 404
     assert c.get("/risk-manager/runs/garbage").status_code == 422
+
+
+def test_list_paginates_in_sql_and_never_selects_the_big_json_columns():
+    from sqlalchemy import event
+    import ba2_common.core.db as pkg_db
+    acct = create_account_definition()
+    e = create_expert_instance(account_id=acct.id)
+    now = datetime.now(timezone.utc)
+    for i in range(6):
+        add_instance(RiskManagerRun(expert_instance_id=e.id, account_id=acct.id, mode="classic",
+                                    run_date=now - timedelta(minutes=10 * i), symbols_received=i, symbols_funded=0,
+                                    decisions=[{"x": "D" * 50}], context={"c": "C" * 50}), expunge_after_flush=True)
+        add_instance(SmartRiskManagerJob(expert_instance_id=e.id, account_id=acct.id,
+                                         run_date=now - timedelta(minutes=10 * i + 5), model_used="m",
+                                         user_instructions="u", status="COMPLETED",
+                                         graph_state={"g": "G" * 50}), expunge_after_flush=True)
+    statements = []
+    engine = pkg_db.get_engine()
+
+    def spy(conn, cursor, statement, *a):
+        statements.append(statement)
+    event.listen(engine, "before_cursor_execute", spy)
+    try:
+        body = v1_client().get("/risk-manager/runs?limit=3&offset=4").json()
+    finally:
+        event.remove(engine, "before_cursor_execute", spy)
+    assert body["total"] == 12 and len(body["items"]) == 3
+    # globally ordered newest first: rm0, smart0, rm1, smart1, rm2, smart2 ... -> offset 4 = rm2, smart2, rm3
+    assert [i["ref"].split("-")[0] for i in body["items"]] == ["rm", "smart", "rm"]
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT") and
+               ("riskmanagerrun" in s.lower() or "smartriskmanagerjob" in s.lower()) and "count(" not in s.lower()]
+    assert selects
+    for s in selects:
+        head = s.lower().split(" from ")[0]
+        assert "decisions" not in head and "graph_state" not in head and "context" not in head, head
+        assert "limit" in s.lower()
