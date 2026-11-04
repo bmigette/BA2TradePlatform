@@ -582,7 +582,7 @@ def _mock_expert_is_resolvable(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def api_threadsafe_db(request, patch_db_engine):
+def api_threadsafe_db(request, patch_db_engine, monkeypatch):
     """Management-API tests only (``pytestmark = pytest.mark.api_db``): serve the DB from ONE shared
     connection. ``test_engine`` is a per-thread ``:memory:`` pool, and a ``TestClient`` request runs in another
     thread than the test, so it would see an empty database ("no such table: appsetting")."""
@@ -591,6 +591,10 @@ def api_threadsafe_db(request, patch_db_engine):
         return
     import ba2_common.core.db as _pkg_db
     from sqlalchemy.pool import StaticPool
+    # log_activity hands the row to a background writer thread that outlives the test; letting it write to (or
+    # worse, race the teardown of) the per-test shared engine segfaulted sqlite on Windows. Audit tests assert on
+    # the call itself, so a no-op default here loses nothing.
+    monkeypatch.setattr("ba2_trade_platform.api.audit.log_activity", lambda *a, **k: None)
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     saved = _pkg_db._engine
@@ -598,5 +602,4 @@ def api_threadsafe_db(request, patch_db_engine):
     try:
         yield
     finally:
-        _pkg_db._engine = saved
-        engine.dispose()
+        _pkg_db._engine = saved      # no dispose(): a straggler thread may still hold the connection
