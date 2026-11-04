@@ -61,7 +61,11 @@ def account_definition(account_id: int) -> Dict[str, Any]:
 
 
 def _live_account(account_id: int):
-    account = broker_read(account_id, "the account connection", get_account_instance_from_id, account_id)
+    from ba2_common.core.db import InstanceNotFound
+    try:
+        account = broker_read(account_id, "the account connection", get_account_instance_from_id, account_id)
+    except InstanceNotFound as e:        # the real factory raises this for an id with no AccountDefinition row
+        raise NotFound(f"No account with id {account_id}", {"id": account_id}) from e
     if account is None:
         raise NotFound(f"No account with id {account_id}", {"id": account_id})
     return account
