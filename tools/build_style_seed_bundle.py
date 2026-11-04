@@ -9,6 +9,12 @@ Policy (schema 1): ``{"schema":1, "style":"mid", "individuals":[{"contributions"
 ``opt_name`` (with ``pick`` "best" or "distinct"+``rank``) or ``{"backtest_id": N}``.  "distinct" uses
 ``app.services.distinct_topn.select_behaviour_distinct`` with its default tolerances and min-trades.
 
+A contribution may GRAFT (stage-2 job C, plan section 0.3 item 7): ``"donor": {"source": <source>, "keys":
+[<glob>, ...]}`` takes every donor gene matching a glob (the source's own matches are removed), and
+``"drop": [<glob>, ...]`` removes source genes the style has no gene for (e.g. the FMPRating-only
+``model:min_analysts``). So option/structure genes come from the source and expert genes from the donor, in one
+contribution (``resolved["donor"]`` records the donor). A pattern matching no gene is refused (no silent no-op).
+
 The bundle is the policy plus, per contribution, ``genes`` and ``resolved``; plus ``policy_sha256``,
 ``built_at``, ``db_path``.  The DB is opened ``mode=ro``; nothing is written to it.
 Exit 0 ok, 2 refused (message on stderr).
@@ -17,6 +23,7 @@ Plan: docs/plans/2026-11-04-stage2-jobA-seeding-and-gate-counter.md T6.
 from __future__ import annotations
 
 import argparse
+from fnmatch import fnmatch
 import hashlib
 import json
 import os
@@ -42,6 +49,32 @@ class Refused(Exception):
 def _need(cond: bool, field: str, msg: str) -> None:
     if not cond:
         raise Refused(f"policy field {field}: {msg}")
+
+
+_CONTRIBUTION_KEYS = {"member", "source", "donor", "drop"}
+
+
+def _glob_list(v: Any) -> bool:
+    return isinstance(v, list) and bool(v) and all(isinstance(x, str) and x for x in v)
+
+
+def _validate_source(s: Any, f: str) -> None:
+    _need(isinstance(s, dict), f, "must be an object")
+    extra = set(s) - _SOURCE_KEYS
+    _need(not extra, f, f"unknown keys {sorted(extra)}")
+    if "backtest_id" in s:
+        _need(set(s) == {"backtest_id"} and isinstance(s["backtest_id"], int),
+              f, 'a backtest source is exactly {"backtest_id": int}')
+        return
+    _need(("opt_id" in s) != ("opt_name" in s), f, "give exactly one of opt_id / opt_name (or backtest_id)")
+    pick = s.get("pick")
+    _need(pick in ("best", "distinct"), f"{f}.pick", f"must be 'best' or 'distinct', got {pick!r}")
+    if pick == "distinct":
+        r = s.get("rank")
+        _need(isinstance(r, int) and not isinstance(r, bool) and r >= 1, f"{f}.rank",
+              f"a distinct pick needs an integer rank >= 1, got {r!r}")
+    else:
+        _need("rank" not in s, f"{f}.rank", "a 'best' pick takes no rank")
 
 
 def validate_policy(p: Any) -> None:
@@ -70,25 +103,16 @@ def validate_policy(p: Any) -> None:
                   "must be a non-empty string")
             _need(c["member"] not in seen, f"{g}.member", f"{c['member']!r} appears twice in one individual")
             seen.add(c["member"])
-            s = c.get("source")
-            _need(isinstance(s, dict), f"{g}.source", "must be an object")
-            extra = set(s) - _SOURCE_KEYS
-            _need(not extra, f"{g}.source", f"unknown keys {sorted(extra)}")
-            if "backtest_id" in s:
-                _need(set(s) == {"backtest_id"} and isinstance(s["backtest_id"], int),
-                      f"{g}.source", 'a backtest source is exactly {"backtest_id": int}')
-                continue
-            _need(("opt_id" in s) != ("opt_name" in s), f"{g}.source",
-                  "give exactly one of opt_id / opt_name (or backtest_id)")
-            pick = s.get("pick")
-            _need(pick in ("best", "distinct"), f"{g}.source.pick",
-                  f"must be 'best' or 'distinct', got {pick!r}")
-            if pick == "distinct":
-                r = s.get("rank")
-                _need(isinstance(r, int) and not isinstance(r, bool) and r >= 1, f"{g}.source.rank",
-                      f"a distinct pick needs an integer rank >= 1, got {r!r}")
-            else:
-                _need("rank" not in s, f"{g}.source.rank", "a 'best' pick takes no rank")
+            _need(not set(c) - _CONTRIBUTION_KEYS, g, f"unknown keys {sorted(set(c) - _CONTRIBUTION_KEYS)}")
+            _validate_source(c.get("source"), f"{g}.source")
+            if "drop" in c:
+                _need(_glob_list(c["drop"]), f"{g}.drop", "must be a non-empty list of gene globs")
+            if "donor" in c:
+                d = c["donor"]
+                _need(isinstance(d, dict) and set(d) == {"source", "keys"}, f"{g}.donor",
+                      'must be exactly {"source": <source>, "keys": [<glob>, ...]}')
+                _validate_source(d["source"], f"{g}.donor.source")
+                _need(_glob_list(d["keys"]), f"{g}.donor.keys", "must be a non-empty list of gene globs")
     _need(isinstance(p.get("fill", {}), dict), "fill", "must be an object of glob -> value")
     _need(p.get("out_of_range", "clamp") in OUT_OF_RANGE, "out_of_range",
           f"must be one of {OUT_OF_RANGE}, got {p.get('out_of_range')!r}")
@@ -161,7 +185,32 @@ def _years(cfg: Any) -> Optional[float]:
 
 
 def resolve_contribution(con, c: Dict[str, Any], allow_running: bool, label: str) -> Dict[str, Any]:
-    src = c["source"]
+    """The contribution's genes and ``resolved`` record; with a ``donor`` / ``drop`` the graft is applied."""
+    out = _resolve_source(con, c["source"], allow_running, label)
+    drop, donor = c.get("drop"), c.get("donor")
+    if not drop and not donor:
+        return out
+    genes = dict(out["genes"])
+    for pat in drop or []:
+        hit = [k for k in genes if fnmatch(k, pat)]
+        if not hit:
+            raise Refused(f"{label}: drop pattern {pat!r} matches no gene of the source genome")
+        for k in hit:
+            del genes[k]
+    if donor:
+        dres = _resolve_source(con, donor["source"], allow_running, f"{label} donor")
+        for pat in donor["keys"]:
+            hit = {k: v for k, v in dres["genes"].items() if fnmatch(k, pat)}
+            if not hit:
+                raise Refused(f"{label}: donor pattern {pat!r} matches no gene of the donor genome")
+            for k in [k for k in genes if fnmatch(k, pat)]:
+                del genes[k]         # the donor answers these genes; the source's own values go
+            genes.update(hit)
+        out["resolved"]["donor"] = dres["resolved"]
+    return {"genes": genes, "resolved": out["resolved"]}
+
+
+def _resolve_source(con, src: Dict[str, Any], allow_running: bool, label: str) -> Dict[str, Any]:
     if "backtest_id" in src:
         r = con.execute("select id,name,status,strategy_params,total_trades,ga_fitness,optimization_id "
                         "from backtests where id=?", (src["backtest_id"],)).fetchone()
