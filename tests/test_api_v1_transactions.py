@@ -60,3 +60,53 @@ def test_detail_has_orders_locks_and_activity():
     assert [o["symbol"] for o in d["orders"]] == ["AAPL"]
     assert [a["description"] for a in d["activity"]] == ["tp moved"]
     assert v1_client().get("/transactions/99999").status_code == 404
+
+
+def test_pnl_status_distinguishes_open_realized_and_unmeasured():
+    acct, expert, open_tx, closed, short = _setup()
+    no_price = create_transaction(symbol="NOPX", status=TransactionStatus.CLOSED, open_price=100.0,
+                                  close_price=None, quantity=1.0)
+    by_sym = {i["symbol"]: i for i in v1_client().get("/transactions").json()["items"]}
+    assert by_sym["AAPL"]["pnl_status"] == "open" and by_sym["AAPL"]["realized_pnl"] is None
+    assert by_sym["MSFT"]["pnl_status"] == "realized" and by_sym["MSFT"]["realized_pnl"] == 50.0
+    assert by_sym["NOPX"]["pnl_status"] == "unmeasured" and by_sym["NOPX"]["realized_pnl"] is None
+    assert v1_client().get(f"/transactions/{no_price.id}").json()["pnl_status"] == "unmeasured"
+
+
+def test_timezone_aware_bounds_are_converted_to_naive_utc():
+    _setup()
+    now = datetime.now(timezone.utc)
+    plus5 = timezone(timedelta(hours=5))
+    c = v1_client()
+    later = (now + timedelta(hours=1)).astimezone(plus5).isoformat()       # +05:00 spelling of "in an hour"
+    earlier = (now - timedelta(hours=1)).astimezone(plus5).isoformat()
+    assert c.get("/transactions", params={"from": later}).json()["total"] == 0
+    assert c.get("/transactions", params={"from": earlier}).json()["total"] == 3
+    assert c.get("/transactions", params={"to": earlier}).json()["total"] == 0
+    assert c.get("/transactions", params={"to": later}).json()["total"] == 3
+    naive = (now + timedelta(hours=1)).replace(tzinfo=None).isoformat()    # a naive bound is taken as UTC
+    assert c.get("/transactions", params={"from": naive}).json()["total"] == 0
+
+
+def test_detail_activity_scan_is_bounded_by_the_transactions_creation():
+    from sqlalchemy import event
+    import ba2_common.core.db as pkg_db
+    acct, expert, open_tx, *_ = _setup()
+    add_instance(ActivityLog(severity=ActivityLogSeverity.INFO, type=ActivityLogType.TP_SL_ADJUSTED,
+                             description="before the trade existed", data={"transaction_id": open_tx.id},
+                             created_at=datetime.now(timezone.utc) - timedelta(days=30)), expunge_after_flush=True)
+    add_instance(ActivityLog(severity=ActivityLogSeverity.INFO, type=ActivityLogType.TP_SL_ADJUSTED,
+                             description="during", data={"transaction_id": open_tx.id}), expunge_after_flush=True)
+    statements = []
+    engine = pkg_db.get_engine()
+
+    def spy(conn, cursor, statement, *a):
+        statements.append(statement)
+    event.listen(engine, "before_cursor_execute", spy)
+    try:
+        d = v1_client().get(f"/transactions/{open_tx.id}").json()
+    finally:
+        event.remove(engine, "before_cursor_execute", spy)
+    assert [a["description"] for a in d["activity"]] == ["during"]
+    scan = [s for s in statements if "from activitylog" in s.lower()]
+    assert scan and all("created_at >=" in s.lower() or "created_at>=" in s.lower() for s in scan)

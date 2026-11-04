@@ -3,7 +3,7 @@ import dataclasses
 import math
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, Type
+from typing import Any, Callable, Dict, Optional, Type
 
 from sqlalchemy import func
 from sqlmodel import select
@@ -13,6 +13,14 @@ from .errors import Invalid, NotFound, Unmeasurable
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def naive_utc(moment: Optional[datetime]) -> Optional[datetime]:
+    """The DB columns hold naive UTC. A timezone-aware bound is converted to UTC and made naive; a naive bound
+    is taken as UTC already. (Comparing an aware value with a naive column compares the wrong instants.)"""
+    if moment is None or moment.tzinfo is None:
+        return moment
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def jsonable(value: Any) -> Any:

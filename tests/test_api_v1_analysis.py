@@ -91,3 +91,18 @@ def test_state_is_scrubbed_before_it_is_truncated(monkeypatch):
     monkeypatch.setattr(svc, "MAX_STATE_BYTES", 75)        # would cut the secret in half if truncation came first
     body = v1_client().get(f"/analyses/{a.id}?include_state=true").text
     assert "ABCDEF" not in body
+
+
+def test_analysis_and_recommendation_bounds_accept_aware_timestamps():
+    from datetime import timezone as tz
+    e, done, _ = _setup()
+    create_recommendation(e.id, symbol="AAPL")
+    plus5 = tz(timedelta(hours=5))
+    now = datetime.now(tz.utc)
+    later = (now + timedelta(hours=1)).astimezone(plus5).isoformat()
+    earlier = (now - timedelta(hours=1)).astimezone(plus5).isoformat()
+    c = v1_client()
+    assert c.get("/analyses", params={"from": later}).json()["total"] == 0
+    assert c.get("/analyses", params={"from": earlier}).json()["total"] == 2
+    assert c.get("/recommendations", params={"from": later}).json()["total"] == 0
+    assert c.get("/recommendations", params={"from": earlier}).json()["total"] == 1

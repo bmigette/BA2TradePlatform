@@ -34,3 +34,12 @@ def test_activity_filters():
     assert item["data"] == {"source": "api"} and item["severity"] == "warning"
     future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     assert c.get("/activity", params={"from": future}).json()["total"] == 0
+
+
+def test_activity_bound_accepts_aware_timestamps():
+    _log(ActivityLogType.ORDER_FILLED)
+    plus5 = timezone(timedelta(hours=5))
+    now = datetime.now(timezone.utc)
+    c = v1_client()
+    assert c.get("/activity", params={"from": (now + timedelta(hours=1)).astimezone(plus5).isoformat()}).json()["total"] == 0
+    assert c.get("/activity", params={"from": (now - timedelta(hours=1)).astimezone(plus5).isoformat()}).json()["total"] == 1

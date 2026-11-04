@@ -8,7 +8,7 @@ from sqlmodel import select
 from ..core.db import get_db
 from ..core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ..core.types import AnalysisUseCase, MarketAnalysisStatus
-from ._common import jsonable, page, parse_enum, require_row, row_dict
+from ._common import jsonable, naive_utc, page, parse_enum, require_row, row_dict
 from ._scrub import scrub
 
 #: Largest analysis ``state`` (serialised JSON, in characters) the detail endpoint returns; beyond it the state is
@@ -39,7 +39,7 @@ def list_analyses(*, expert: Optional[int], symbol: Optional[str], status: Optio
     if subtype is not None:
         stmt = stmt.where(MarketAnalysis.subtype == parse_enum(AnalysisUseCase, subtype, "subtype"))
     if from_ is not None:
-        stmt = stmt.where(MarketAnalysis.created_at >= from_)
+        stmt = stmt.where(MarketAnalysis.created_at >= naive_utc(from_))
     with get_db() as session:
         return page(session, stmt.order_by(MarketAnalysis.id.desc()), limit=limit, offset=offset,
                     convert=_analysis_summary)
@@ -85,7 +85,7 @@ def list_recommendations(*, expert: Optional[int], symbol: Optional[str], from_:
     if symbol is not None:
         stmt = stmt.where(ExpertRecommendation.symbol == symbol.upper())
     if from_ is not None:
-        stmt = stmt.where(ExpertRecommendation.created_at >= from_)
+        stmt = stmt.where(ExpertRecommendation.created_at >= naive_utc(from_))
     with get_db() as session:
         return page(session, stmt.order_by(ExpertRecommendation.id.desc()), limit=limit, offset=offset,
                     convert=row_dict)
