@@ -61,7 +61,8 @@ def widget(monkeypatch):
 
 
 def _row(widget, monkeypatch, account):
-    monkeypatch.setattr(mod, "get_account_instance_from_id",
+    import ba2_trade_platform.services.floating_pl as _calc     # the calculator resolves the account factory
+    monkeypatch.setattr(_calc, "get_account_instance_from_id",
                         lambda account_id, session=None: account)
     rows = widget._rows_for_manual_account(2, [], "TastyTrade", session=None)
     assert len(rows) == 1

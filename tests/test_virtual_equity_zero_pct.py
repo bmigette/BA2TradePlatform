@@ -103,7 +103,6 @@ class TestBalanceUsageChartHonoursAZeroPercentSleeve:
             account_id=acct_def.id, expert="MockExpert", virtual_equity_pct=pct
         )
         monkeypatch.setattr(chart_module, "get_selected_account_id", lambda: None)
-        monkeypatch.setattr(chart_module, "get_expert_ids_for_account", lambda _acc_id: None)
         monkeypatch.setattr(
             "ba2_trade_platform.core.utils.get_account_instance_from_id",
             lambda account_id, session=None, use_cache=True: account,
