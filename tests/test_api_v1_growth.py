@@ -72,7 +72,7 @@ def test_total_growth_is_the_service_series_and_carries_datasets(world):
     assert body["series"]["balance"] == want["aligned_balance"]
     assert body["series"]["pnl_pct"] == want["pnl_pct_data"]
     assert body["latest"]["balance"] == want["aligned_balance"][-1]
-    assert body["datasets"]["balance_history"] == {"rows": len(broker.get_balance_history()), "fetch_ok": True}
+    assert body["datasets"]["balance_history"] == {"rows": len(broker.get_balance_history())}
     assert "as_of" in body and body["from"] == "2026-09-01"
 
 
@@ -87,7 +87,7 @@ def test_no_data_at_all_is_unmeasurable_not_a_flat_series(world):
     broker.balance, broker.dividends, broker.trades = [], [], []
     r = v1_client().get(f"/accounts/{acct.id}/growth?{WINDOW}")
     assert r.status_code == 503 and r.json()["error"] == "unmeasurable"
-    assert r.json()["detail"]["datasets"]["balance_history"]["fetch_ok"] is False
+    assert r.json()["detail"]["datasets"]["balance_history"] == {"rows": 0}
 
 
 def test_window_validation_and_unknown_account(world):
@@ -229,3 +229,13 @@ def test_price_deadline_is_a_503_price_source_unreachable(monkeypatch):
     with pytest.raises(PriceSourceUnreachable):
         svc.fetch_closes(["AAPL"], date(2026, 9, 1))
     assert PriceSourceUnreachable.code == "price_source_unreachable" and PriceSourceUnreachable.status_code == 503
+
+
+def test_a_failed_trades_fetch_is_a_503_and_not_an_empty_history(world):
+    acct, broker = world
+
+    def down(*a, **k):
+        raise TimeoutError("slow")
+    broker.get_filled_trades_strict = down
+    r = v1_client().get(f"/accounts/{acct.id}/growth?{WINDOW}")
+    assert r.status_code == 503 and r.json()["error"] == "broker_unreachable"

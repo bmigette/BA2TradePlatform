@@ -275,3 +275,25 @@ def broker_orders(account_id: int, status: Optional[str]) -> Dict[str, Any]:
     if wanted is not None and wanted not in _BROKER_SIDE_STATUSES:
         orders = [o for o in orders if _status_of(o) == wanted.value]
     return {"as_of": utcnow_iso(), "items": jsonable(orders), **extra}
+
+
+def strict_history(account_id: int, account, method: str, what: str, *args, **kwargs):
+    """``account.<method>_strict(...)`` -- the raise-on-failure variant of a history read (``get_dividends``,
+    ``get_filled_trades``, ``get_balance_history``). The lenient method answers [] on ANY failure, so an empty answer
+    from it proves nothing; the strict one answers [] only when the broker said there is nothing.
+
+    Failures map like ``broker_read`` (OSError -> BrokerUnreachable 503, SDK API error -> BrokerRefused 502, ValueError
+    -> Unmeasurable 503); any other exception the adapter raises is also reported as BrokerUnreachable (class name only,
+    the text goes to the log). An adapter without the strict variant is an ``Unmeasurable`` with a clear message."""
+    fn = getattr(account, f"{method}_strict", None)
+    if fn is None:
+        raise Unmeasurable(f"Account {account_id}: {type(account).__name__} has no {method}_strict, so {what} cannot "
+                           f"be told from a failed fetch", {"account_id": account_id, "missing": f"{method}_strict"})
+    try:
+        return broker_read(account_id, what, fn, *args, **kwargs)
+    except ServiceError:
+        raise
+    except Exception as e:  # noqa: BLE001 -- deliberate: an adapter's own exception types are all "the read failed"
+        logger.warning(f"API: account {account_id} {what}: {type(e).__name__}: {e}")
+        raise BrokerUnreachable(f"Account {account_id}: {what} failed: {type(e).__name__}",
+                                {"account_id": account_id}) from e

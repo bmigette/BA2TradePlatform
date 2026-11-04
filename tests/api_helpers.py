@@ -107,6 +107,16 @@ class FakeAccount:
     def get_balance_history(self, start_date=None, end_date=None):
         return []
 
+    # the strict variants the API reads through; they follow whatever the test sets on the lenient reads
+    def get_dividends_strict(self, *a, **k):
+        return self.get_dividends(*a, **k)
+
+    def get_filled_trades_strict(self, *a, **k):
+        return self.get_filled_trades(*a, **k)
+
+    def get_balance_history_strict(self, *a, **k):
+        return self.get_balance_history(*a, **k)
+
 
 class _AttrDict(dict):
     def __getattr__(self, name):

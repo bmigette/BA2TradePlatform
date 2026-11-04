@@ -54,7 +54,7 @@ def test_broker_rows_totals_cash_vs_drip_and_cash_by_symbol(world):
     acct, _ = world
     body = _get(acct)                 # default window: the last 365 days (the 400-day-old row is out)
     b = body["broker"]
-    assert b["total"] == 3 and b["fetch_ok"] is True
+    assert b["total"] == 3 and "fetch_ok" not in b
     assert [i["symbol"] for i in b["items"]] == ["KO", "KO", "PEP"]            # newest first
     assert [i["kind"] for i in b["items"]] == ["cash", "drip", "cash"]
     t = b["totals"]
@@ -74,11 +74,24 @@ def test_symbol_filter_window_and_paging(world):
     assert len(page["broker"]["items"]) == 1 and page["broker"]["total"] == 3 and page["broker"]["totals"]["payments"] == 3
 
 
-def test_empty_broker_answer_is_flagged_not_reported_as_no_dividends(world):
+def test_a_failed_broker_read_is_a_503_not_an_empty_list(world):
     acct, broker = world
+
+    def down(*a, **k):
+        raise ConnectionError("down")
+    broker.get_dividends_strict = down
+    r = v1_client().get(f"/accounts/{acct.id}/dividends")
+    assert r.status_code == 503 and r.json()["error"] == "broker_unreachable"
     broker.rows = []
-    b = _get(acct)["broker"]
-    assert b["fetch_ok"] is False and "cannot be told" in b["note"] and b["totals"]["net"] == 0
+    broker.get_dividends_strict = lambda *a, **k: []
+    assert _get(acct)["broker"]["total"] == 0                       # a strict [] really is "no dividends"
+
+
+def test_an_adapter_without_the_strict_read_is_unmeasurable_with_a_clear_message(world, monkeypatch):
+    acct, broker = world
+    monkeypatch.setattr(type(broker), "get_dividends_strict", None)
+    r = v1_client().get(f"/accounts/{acct.id}/dividends")
+    assert r.status_code == 503 and "get_dividends_strict" in r.json()["message"]
 
 
 def test_rows_without_gross_or_tax_are_counted_not_zeroed(world):
@@ -124,10 +137,3 @@ def test_one_cached_fetch_serves_repeat_calls_and_the_rows_are_not_mutated(world
     _get(acct, symbol="KO")
     assert len(broker.calls) == 1 and _get(acct)["broker"]["from_cache"] is True
     assert "account_id" not in broker.rows[0]
-
-
-def test_a_full_page_is_flagged_as_possibly_truncated(world):
-    acct, broker = world
-    broker.rows = [_div(n % 300, "KO", 1.0) for n in range(100)]
-    b = _get(acct)["broker"]
-    assert b["truncation_suspected"] is True and "older payments" in b["truncation_note"]

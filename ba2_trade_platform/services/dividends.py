@@ -8,8 +8,8 @@ The two answer different questions and are returned side by side, never merged:
   (``cash_dividends_by_symbol``); ``totals.drip_net`` is what was reinvested.
 * ``ledger``  -- the cash waiting to be deployed by allocation runs (rolling sync window, consumed oldest-first).
 
-The adapters answer ``[]`` when their fetch fails, so an empty broker answer carries ``fetch_ok: false`` and a note:
-it is not "no dividends"."""
+The history is read through the adapters' STRICT variant (``get_dividends_strict``, every page): a failed fetch is a
+503/502, so an empty ``broker.items`` really means no dividends in the window."""
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -23,8 +23,6 @@ from ._common import jsonable, utcnow_iso
 from .errors import BrokerUnreachable, Invalid
 
 MAX_SPAN_DAYS = 365 * 5
-#: Rows at which a broker answer is suspected to be a truncated first page (Alpaca: 100 per page).
-BROKER_PAGE_SIZE = 100
 DEFAULT_SPAN_DAYS = 365
 
 
@@ -45,7 +43,7 @@ def account_dividends(account_id: int, from_: Optional[date], to: Optional[date]
     # The FULL history through the 60 s per-account cache the portfolio endpoint also uses (one REST fetch serves both);
     # the window and the symbol are applied here.
     def fetch():
-        rows_ = accounts_svc.broker_read(account_id, "the dividends fetch", account.get_dividends)
+        rows_ = accounts_svc.strict_history(account_id, account, "get_dividends", "the dividends fetch")
         if rows_ is None:
             raise BrokerUnreachable(f"Account {account_id}: the dividends fetch failed", {"account_id": account_id})
         return rows_
@@ -87,20 +85,11 @@ def account_dividends(account_id: int, from_: Optional[date], to: Optional[date]
               "drip_quantity": r.get('drip_quantity'), "drip_price": r.get('drip_price')}
              for r in rows[offset:offset + limit]]
     cash_by = cash_dividends_by_symbol(rows)
-    broker: Dict[str, Any] = {"fetch_ok": bool(raw), "items": items, "total": len(rows), "limit": limit,
+    broker: Dict[str, Any] = {"items": items, "total": len(rows), "limit": limit,
                               "offset": offset, "totals": totals,
                               "cash_by_symbol": [{"symbol": k, "cash": v} for k, v in cash_by.items()],
                               "partial": skipped > 0, "skipped_rows": skipped,
-                              "cache_age_s": cache_age_s, "from_cache": from_cache,
-                              # Alpaca's activities endpoint returns at most 100 rows per page and the adapter does
-                              # not page: a full page may be the first of several.
-                              "truncation_suspected": len(raw) >= BROKER_PAGE_SIZE}
-    if broker["truncation_suspected"]:
-        broker["truncation_note"] = (f"The broker returned {len(raw)} rows (>= {BROKER_PAGE_SIZE}, a typical page size): "
-                                     "older payments may be missing.")
-    if not raw:
-        broker["note"] = ("The broker adapter answers [] when its fetch fails, so an empty answer cannot be told "
-                          "from 'no dividends'.")
+                              "cache_age_s": cache_age_s, "from_cache": from_cache}
 
     days = max(1, (date.today() - from_).days)
     events = [e for e in get_recent_income_events(account_id, days=days)

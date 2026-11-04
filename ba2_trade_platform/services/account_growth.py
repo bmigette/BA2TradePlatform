@@ -6,9 +6,8 @@ the series are the SAME functions the Account Growth tab calls (``services.growt
 same yfinance download the tab uses (``fetch_closes``), from the window start, with a timeout and an overall deadline.
 
 A GET: nothing here writes. In particular the tab's "queue unknown instruments for auto-add" side effect is NOT
-reproduced: a symbol without an Instrument row is simply 'Unlabeled'. The adapters turn a failed dividends / fills /
-balance fetch into ``[]``, so an empty dataset is reported (``datasets``) and, when it leaves nothing to draw, raises
-``Unmeasurable``. A broker row that lacks a field the maths needs (a missing balance, quantity, price, amount) is NEVER
+reproduced: a symbol without an Instrument row is simply 'Unlabeled'. The datasets are read through the adapters' STRICT
+variants (``accounts.strict_history``): a failed fetch is a 503/502, never an empty list, so ``datasets`` only counts rows. A broker row that lacks a field the maths needs (a missing balance, quantity, price, amount) is NEVER
 read as 0: it is skipped, counted, and the response says ``partial: true`` with ``skipped_rows`` and the reasons.
 
 LABEL / POSITION SERIES: the quantity timeline walks BACK from today's position quantity, so those series are always
@@ -170,26 +169,26 @@ def _validated(rows: list, check: Callable[[dict], Optional[str]], account_id: i
 def _fetch(account_id: int, account, from_: date, to: date, *, with_balance: bool = True):
     """The broker datasets, validated. Returns ``(balance, dividends, trades, report)``; ``report`` has the
     per-dataset row counts and the skipped rows."""
-    def read(what: str, fn, *args, **kwargs):
-        rows = accounts_svc.broker_read(account_id, what, fn, *args, **kwargs)
+    def read(what: str, method: str, **kwargs):
+        rows = accounts_svc.strict_history(account_id, account, method, what, **kwargs)
         if rows is None:
             raise BrokerUnreachable(f"Account {account_id}: {what} failed", {"account_id": account_id})
         return rows
     from . import portfolio      # the 60 s per-account dividends cache of the portfolio endpoint
     balance_raw = (_cached(("balance", account_id, from_, to), lambda: read(
-        "the balance history", account.get_balance_history, start_date=datetime.combine(from_, datetime.min.time()),
+        "the balance history", "get_balance_history", start_date=datetime.combine(from_, datetime.min.time()),
         end_date=datetime.combine(to, datetime.max.time()))) if with_balance else [])
     dividends_raw, _age, _hit = portfolio.cached_dividends(
-        account_id, lambda: read("the dividends fetch", account.get_dividends))
+        account_id, lambda: read("the dividends fetch", "get_dividends"))
     dividends_raw = [dict(r) for r in dividends_raw]
-    trades_raw = _cached(("trades", account_id), lambda: read("the filled trades fetch", account.get_filled_trades))
+    trades_raw = _cached(("trades", account_id), lambda: read("the filled trades fetch", "get_filled_trades"))
     balance, sk_b = _validated(balance_raw, _bad_balance, account_id)
     dividends, sk_d = _validated(dividends_raw, _bad_dividend, account_id)
     trades, sk_t = _validated(trades_raw, _bad_trade, account_id)
     skipped = {k: v for k, v in (("balance_history", sk_b), ("dividends", sk_d), ("filled_trades", sk_t)) if v}
-    report = {"datasets": {"balance_history": {"rows": len(balance_raw), "fetch_ok": bool(balance_raw)},
-                           "dividends": {"rows": len(dividends_raw), "fetch_ok": bool(dividends_raw)},
-                           "filled_trades": {"rows": len(trades_raw), "fetch_ok": bool(trades_raw)}},
+    # (strict reads: a failure already raised, so an empty dataset is a real "nothing", and the old fetch_ok flag is gone)
+    report = {"datasets": {"balance_history": {"rows": len(balance_raw)}, "dividends": {"rows": len(dividends_raw)},
+                           "filled_trades": {"rows": len(trades_raw)}},
               "partial": bool(skipped), "skipped_rows": sum(sum(v.values()) for v in skipped.values()),
               "skipped": skipped}
     return balance, dividends, trades, report
@@ -202,7 +201,7 @@ def account_growth(account_id: int, from_: Optional[date], to: Optional[date]) -
     series = growth.total_growth(_cut(balance, from_, to), _cut(dividends, from_, to), _cut(trades, from_, to), from_)
     if series is None:
         raise Unmeasurable(f"Account {account_id}: no usable balance history or dividends in the window "
-                           f"(a failed fetch also reads as empty)", {"account_id": account_id, **report})
+                           f"", {"account_id": account_id, **report})
     dates = series['all_dates']
     last = len(dates) - 1
     pnl_last = series['pnl_pct_data'][last]
