@@ -734,6 +734,40 @@ class GeneticOptimizer:
             individual.append(value)
         return creator.Individual(individual)
 
+    def encode_params_strict(self, params: Dict) -> List:
+        """``encode_params`` for SEEDS (``seedPopulation``): refuse instead of guessing.
+
+        Every gene must be present (no ``min`` fill), no unknown gene, every choice one of its
+        declared values (no index-0 fallback), and every numeric value one the decoder can give
+        back: ``snap_to_lattice(clip(v, min, max)) == v`` under this optimizer's own anchor. That
+        accepts a decode-image value just outside ``min`` on the legacy "zero" lattice (410..500
+        step 15 decodes 410 to 405, so a winner can carry 405) and refuses anything the GA could
+        never reproduce. Raises ValueError naming the gene. The stored gene is the clipped raw
+        value, so ``decode_individual`` returns exactly ``params``. Warm start keeps the lenient
+        ``encode_params``."""
+        missing = [k for k in self.param_names if k not in params]
+        unknown = sorted(set(params) - set(self.param_names))
+        if missing or unknown:
+            raise ValueError(f"seed genome: missing {missing!r}, unknown {unknown!r}")
+        out = []
+        for name in self.param_names:
+            cfg, v = self.param_ranges[name], params[name]
+            if cfg['type'] == 'choice':
+                if v not in cfg['choices']:
+                    raise ValueError(f"seed genome: {name!r}={v!r} is not one of {cfg['choices']!r}")
+                out.append(cfg['choices'].index(v))
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"seed genome: {name!r}={v!r} is not a finite number")
+            clipped = min(max(v, cfg['min']), cfg['max'])
+            back = snap_to_lattice(clipped, cfg, self.lattice_anchor)
+            if abs(back - v) > 1e-9 * max(1.0, abs(v)):
+                raise ValueError(f"seed genome: {name!r}={v!r} cannot be decoded from "
+                                 f"[{cfg['min']}, {cfg['max']}] step {cfg.get('step')} "
+                                 f"(anchor {self.lattice_anchor!r}; nearest {back!r})")
+            out.append(int(clipped) if cfg['type'] == 'int' else float(clipped))
+        return creator.Individual(out)
+
     def resume_from_checkpoint(self, checkpoint: Dict) -> tuple:
         """
         Resume optimization from saved checkpoint.
