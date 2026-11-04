@@ -4957,35 +4957,8 @@ class PerformanceTab:
         PerformanceAnalytics(selected_account_id).render()
 
 def _extract_yf_close_prices(hist_data, symbol):
-    """Extract close prices from yfinance DataFrame, handling MultiIndex columns."""
-    if hist_data.empty:
-        return {}
-    try:
-        # yfinance may return MultiIndex columns (Price, Ticker) or flat columns
-        if isinstance(hist_data.columns, __import__('pandas').MultiIndex):
-            # Try (Close, SYMBOL) for multi-ticker or single-ticker MultiIndex
-            if ('Close', symbol) in hist_data.columns:
-                series = hist_data[('Close', symbol)].dropna()
-            elif 'Close' in hist_data.columns.get_level_values(0):
-                close_df = hist_data['Close']
-                if hasattr(close_df, 'columns') and symbol in close_df.columns:
-                    series = close_df[symbol].dropna()
-                elif hasattr(close_df, 'dropna'):
-                    series = close_df.dropna()
-                else:
-                    return {}
-            else:
-                return {}
-        elif 'Close' in hist_data.columns:
-            series = hist_data['Close'].dropna()
-        else:
-            return {}
-        return {
-            d.strftime('%Y-%m-%d'): float(v)
-            for d, v in series.items()
-        }
-    except Exception:
-        return {}
+    """Close prices from a yfinance DataFrame (see services.growth.extract_yf_close_prices)."""
+    return growth_service.extract_yf_close_prices(hist_data, symbol)
 
 
 def _pnl_color_gradient(pnl_data, positive_color, negative_color):

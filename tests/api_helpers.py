@@ -105,6 +105,37 @@ class FakeAccount:
         return []
 
 
+class _AttrDict(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _recent_closes() -> dict:
+    from datetime import date, timedelta
+    return {(date.today() - timedelta(days=n)).isoformat(): 100.0 + n for n in range(30, 0, -1)}
+
+
+def _chartable_account(account_id: int) -> "FakeAccount":
+    """A FakeAccount that also has what the growth endpoints chart: a cost basis on its position and a balance
+    history / dividend / fill in the last 30 days."""
+    from datetime import datetime, timedelta
+    acct = FakeAccount(account_id)
+    acct.positions = [_AttrDict(symbol="AAPL", qty=10.0, cost_basis=1000.0)]
+    now = datetime.now()
+    acct.get_balance_history = lambda start_date=None, end_date=None: [
+        {"date": now - timedelta(days=n), "net_liquidating_value": 10000.0 + n, "cash_balance": 2500.0,
+         "profit_loss": 1.0} for n in (3, 2, 1)]
+    acct.get_dividends = lambda symbol=None, start_date=None, end_date=None: [
+        {"date": now - timedelta(days=2), "symbol": "AAPL", "amount": 2.0, "drip_quantity": None,
+         "drip_price": None}]
+    acct.get_filled_trades = lambda symbol=None, start_date=None, end_date=None: [
+        {"date": now - timedelta(days=20), "symbol": "AAPL", "side": "BUY", "qty": 10.0, "price": 100.0}]
+    return acct
+
+
 def v1_client(**kwargs) -> TestClient:
     from ba2_trade_platform.api.app import create_v1_app
     return client_for(create_v1_app(), **kwargs)
@@ -150,9 +181,11 @@ def seed_secrets(monkeypatch, experts_svc, accounts_svc):
                     "available_balance": 1.0, "equivalent_unlevered_balance": 1.0}
 
     monkeypatch.setattr(experts_svc, "get_expert_instance_from_id", lambda i: SeededExpert())
-    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda i: FakeAccount(i))
+    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda i: _chartable_account(i))
     # phase 4: the Overview calculators resolve the account through their own module / a local import
-    _factory = lambda i, session=None, use_cache=True: FakeAccount(i)    # noqa: E731
+    _factory = lambda i, session=None, use_cache=True: _chartable_account(i)    # noqa: E731
+    monkeypatch.setattr("ba2_trade_platform.services.account_growth.fetch_closes",
+                        lambda symbols, start: {s: _recent_closes() for s in symbols})
     monkeypatch.setattr("ba2_trade_platform.services.floating_pl.get_account_instance_from_id", _factory)
     monkeypatch.setattr("ba2_trade_platform.core.utils.get_account_instance_from_id", _factory)
 

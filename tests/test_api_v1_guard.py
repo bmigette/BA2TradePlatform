@@ -7,7 +7,7 @@ from tests.api_helpers import TOKEN, client_for, set_allow_remote, set_api_token
 pytestmark = pytest.mark.api_db
 
 _PARAMS = {"{account_id}": "1", "{transaction_id}": "1", "{expert_id}": "1", "{analysis_id}": "1",
-           "{ref}": "rm-1"}
+           "{ref}": "rm-1", "{label}": "Unlabeled"}
 
 
 def _routes():
@@ -91,7 +91,7 @@ def test_no_get_route_body_contains_a_seeded_secret(monkeypatch):
     from tests.api_helpers import seed_secrets
     ids, secrets = seed_secrets(monkeypatch, experts_svc, accounts_svc)
     values = {"{account_id}": ids["account"], "{transaction_id}": ids["transaction"],
-              "{expert_id}": ids["expert"], "{analysis_id}": ids["analysis"]}
+              "{expert_id}": ids["expert"], "{analysis_id}": ids["analysis"], "{label}": "Unlabeled"}
     c = client_for(create_v1_app())
     seen = 0
     for method, path in _routes():
