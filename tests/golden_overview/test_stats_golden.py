@@ -50,3 +50,10 @@ def test_position_distribution_equals_the_inline_chart(ids):
 def test_closed_trade_without_a_computable_pnl_is_reported_not_zeroed(ids):
     got = stats.trade_performance(ids["acct1"], now=NOW)
     assert got["unmeasured_30d"] == 1 and got["unmeasured_7d"] == 1      # IBM: no close price
+
+
+def test_a_position_with_no_market_value_is_skipped_not_fatal(ids):
+    skipped = []
+    got = stats.position_distribution(POSITIONS + [{"symbol": "AAPL", "market_value": None}], "labels", skipped)
+    assert [[k, v] for k, v in got.items()] == GOLDEN["distribution"]["labels"]      # the survivors are unchanged
+    assert {"symbol": "AAPL", "reason": "TypeError"} in skipped

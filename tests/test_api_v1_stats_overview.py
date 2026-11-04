@@ -20,6 +20,7 @@ class Broker(FakeAccount):
         self.positions = positions
         self.bids = {}
         self.fail_positions = False
+        self.position_reads = 0
 
     def get_tradable_balance(self):
         return 10000.0
@@ -34,6 +35,7 @@ class Broker(FakeAccount):
         return None
 
     def get_positions(self):
+        self.position_reads += 1
         return None if self.fail_positions else self.positions
 
     def get_instrument_current_price(self, symbols, price_type="mid"):
@@ -42,6 +44,8 @@ class Broker(FakeAccount):
 
 @pytest.fixture
 def world(monkeypatch):
+    from ba2_trade_platform.services import _positions_cache
+    _positions_cache.clear()
     a1 = create_account_definition(name="Expert acct")
     a2 = create_account_definition(name="Manual acct")
     e1 = create_expert_instance(account_id=a1.id, alias="Alpha", virtual_equity_pct=50.0)
@@ -122,7 +126,7 @@ def test_unknown_account_is_404_and_an_unpriced_position_is_named(world):
     assert v1_client().get("/stats/overview?account=999").status_code == 404
     world["brokers"][world["a1"].id].bids = {}
     body = v1_client().get(f"/stats/overview?account={world['a1'].id}").json()
-    assert body["balance_usage"]["understated"] == {f"Alpha-{world['e1'].id}": ["AAPL"]}
+    assert body["balance_usage"]["understated"] == [{"expert": f"Alpha-{world['e1'].id}", "symbols": ["AAPL"]}]
 
 
 def test_a_get_neither_writes_orders_nor_touches_the_buying_power_failure_memory(world):
@@ -132,3 +136,39 @@ def test_a_get_neither_writes_orders_nor_touches_the_buying_power_failure_memory
     assert dict(MarketExpertInterface._BP_FAILED_READS) == before
     from ba2_trade_platform.core.db import get_all_instances
     assert len(get_all_instances(TradingOrder)) == 1
+
+
+def test_one_positions_read_per_account_serves_every_section(world):
+    v1_client().get("/stats/overview")
+    assert [b.position_reads for b in world["brokers"].values()] == [1, 1]
+
+
+def test_a_section_that_blows_up_is_isolated_with_the_class_name(world, monkeypatch):
+    from ba2_trade_platform.services import balance_usage
+    def boom(account_id):
+        raise OSError("connect failed: secret=NOTFORTHEBODY")
+    monkeypatch.setattr(balance_usage, "balance_usage_per_expert", boom)
+    r = v1_client().get("/stats/overview")
+    body = r.json()
+    assert r.status_code == 200
+    assert body["balance_usage"] == {"status": "unmeasurable", "error": "internal", "message": "OSError"}
+    assert "NOTFORTHEBODY" not in r.text
+    assert body["floating_pl"]["status"] == "ok" and body["exposure"]["status"] == "ok"
+
+
+def test_allocation_skips_a_bad_position_and_says_so(world):
+    world["brokers"][world["a1"].id].positions.append({"symbol": "BAD", "market_value": None, "current_price": 1.0})
+    body = v1_client().get(f"/stats/overview?account={world['a1'].id}").json()
+    alloc = body["allocation"]
+    assert alloc["status"] == "partial" and alloc["skipped"]["count"] == 1
+    assert alloc["skipped"]["positions"][0] == {"symbol": "BAD", "reason": "TypeError"}
+    assert alloc["by_label"][0]["percent"] == pytest.approx(100.0) and "included" in alloc["percent_basis"]
+
+
+def test_all_unmeasured_window_has_null_pnl_in_the_overview(world):
+    from ba2_trade_platform.core.types import TransactionStatus as TS
+    from datetime import datetime, timedelta
+    create_transaction(symbol="IBM", status=TS.CLOSED, open_price=100.0, close_price=None, quantity=1.0,
+                       close_date=datetime.now() - timedelta(days=1))
+    perf = v1_client().get("/stats/overview").json()["trade_performance"]
+    assert perf["pnl_7d"] is None and perf["unmeasured_7d"] == 1

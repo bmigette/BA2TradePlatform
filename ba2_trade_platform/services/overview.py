@@ -19,6 +19,7 @@ from ..logger import logger
 from . import accounts as accounts_svc
 from . import balance_usage, floating_pl, stats
 from ._common import jsonable, require_row, utcnow_iso
+from ._positions_cache import share_positions
 from ._readonly import readonly_balance_reads
 from .errors import ServiceError, Unmeasurable
 
@@ -35,14 +36,19 @@ def _failed(error: ServiceError) -> Dict[str, Any]:
     return {"status": "unmeasurable", "error": error.code, "message": error.message}
 
 
-def _section(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
-    """Run one broker-backed section. A typed service error (unreachable / refused / unmeasurable) becomes that
-    section's status; anything else is a defect and propagates."""
+def _section(name: str, fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    """Run one broker-backed section in isolation: whatever it raises (a typed service error, an unbuildable account,
+    an odd broker payload) becomes THAT section's ``{"status": "unmeasurable", "error", "message"}`` while the others
+    still render. ``message`` is the error CLASS name for anything that is not a typed service error (its text can echo
+    broker data); the full error goes to the log."""
     try:
         return {"status": "ok", **fn()}
     except ServiceError as e:
-        logger.warning(f"API: overview section failed: {e.code}: {e.message}")
+        logger.warning(f"API: overview section {name} failed: {e.code}: {e.message}")
         return _failed(e)
+    except Exception as e:   # noqa: BLE001 -- deliberate: section isolation, see the docstring
+        logger.error(f"API: overview section {name} failed: {type(e).__name__}: {e}", exc_info=True)
+        return {"status": "unmeasurable", "error": "internal", "message": type(e).__name__}
 
 
 def _pl_rows(rows: List[floating_pl.PLRow]) -> Dict[str, Any]:
@@ -73,7 +79,8 @@ def _balance_usage(account_id: Optional[int]) -> Dict[str, Any]:
             query = query.where(ExpertInstance.id.in_(ids)) if ids else query.where(ExpertInstance.id == -1)
         wanted = {stats.expert_display_name(e) for e in session.exec(query).all()}
     missing = sorted(wanted - set(rows))
-    unpriced = {name: row["unpriced_symbols"] for name, row in rows.items() if row["unpriced_symbols"]}
+    unpriced = [{"expert": name, "symbols": row["unpriced_symbols"]} for name, row in rows.items()
+                if row["unpriced_symbols"]]
     out: Dict[str, Any] = {
         "experts": [{"expert": name, **{k: v for k, v in row.items() if k != "unpriced_symbols"},
                      "unpriced_symbols": row["unpriced_symbols"]} for name, row in rows.items()],
@@ -95,15 +102,19 @@ def _allocation(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
         except ServiceError as e:
             logger.warning(f"API: overview allocation: account {acc['id']}: {e.code}")
             unreachable.append(acc["name"])
+    skipped: List[Dict[str, Any]] = []
 
     def shaped(grouping: str) -> List[Dict[str, Any]]:
-        dist = stats.position_distribution(positions, grouping)
+        dist = stats.position_distribution(positions, grouping, skipped if grouping == "labels" else None)
         total = sum(dist.values())
         return [{"name": n, "value": v, "percent": (v / total * 100.0) if total else None} for n, v in dist.items()]
     if unreachable and not positions and accounts and len(unreachable) == len(accounts):
         raise Unmeasurable("No account's positions could be read", {"unreachable_accounts": unreachable})
-    out = {"by_label": shaped("labels"), "by_category": shaped("categories"), "unmeasured": unreachable}
-    if unreachable:
+    out = {"by_label": shaped("labels"), "by_category": shaped("categories"), "unmeasured": unreachable,
+           "positions_included": len(positions) - len(skipped),
+           "skipped": {"count": len(skipped), "positions": skipped},
+           "percent_basis": "market value of the included positions only (skipped and unreachable ones are not in the denominator)"}
+    if unreachable or skipped:
         out["status"] = "partial"
     return out
 
@@ -131,15 +142,22 @@ def _exposure(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def stats_overview(account_id: Optional[int]) -> Dict[str, Any]:
     accounts = _accounts_in_scope(account_id)
-    perf = stats.trade_performance(account_id)
+    perf = stats.trade_performance(account_id, strict=True)
+    skipped_profit: List[Dict[str, Any]] = []
+    profits = stats.profit_per_expert(account_id, skipped_profit)
+    with share_positions():      # ONE get_positions per account for every section of this request (15 s)
+        sections = {
+            "balance_usage": _section("balance_usage", lambda: _balance_usage(account_id)),
+            "floating_pl": _section("floating_pl", lambda: _floating_pl(account_id)),
+            "allocation": _section("allocation", lambda: _allocation(accounts)),
+            "exposure": _section("exposure", lambda: _exposure(accounts)),
+        }
     return jsonable({
         "as_of": utcnow_iso(),
         "account": account_id,
         "trade_performance": perf,
         "orders": stats.order_counts(account_id),
-        "profit_per_expert": [{"expert": n, "profit": p} for n, p in stats.profit_per_expert(account_id).items()],
-        "balance_usage": _section(lambda: _balance_usage(account_id)),
-        "floating_pl": _section(lambda: _floating_pl(account_id)),
-        "allocation": _section(lambda: _allocation(accounts)),
-        "exposure": _section(lambda: _exposure(accounts)),
+        "profit_per_expert": {"experts": [{"expert": n, "profit": p} for n, p in profits.items()],
+                              "skipped": {"count": len(skipped_profit), "transactions": skipped_profit}},
+        **sections,
     })

@@ -47,7 +47,7 @@ def test_group_by_day_month_symbol_and_the_unmeasured_count():
     assert [r["group"] for r in day["items"]] == sorted((r["group"] for r in day["items"]), reverse=True)
     by_key = {r["group"]: r for r in day["items"]}
     ibm_day = (NOW - timedelta(days=1)).strftime("%Y-%m-%d")
-    assert by_key[ibm_day]["unmeasured"] == 1 and by_key[ibm_day]["pnl"] == 0     # counted, not summed as a number
+    assert by_key[ibm_day]["unmeasured"] == 1 and by_key[ibm_day]["pnl"] is None     # counted, never a 0
     assert day["total"]["unmeasured"] == 1
     sym = _get(ids["acct1"], group_by="symbol", **_span(30))
     assert {r["group"]: r["pnl"] for r in sym["items"]}["AAPL"] == 100.0
