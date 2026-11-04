@@ -486,11 +486,12 @@ def cached_dividends(account_id: int, fetch):
     with _DIVIDENDS_LOCK:
         hit = _DIVIDENDS_CACHE[account_id] if account_id in _DIVIDENDS_CACHE else None
         if hit is not None and time.monotonic() - hit[0] < DIVIDENDS_TTL_S:
-            return list(hit[1]), time.monotonic() - hit[0], True
+            return [dict(r) for r in hit[1]], time.monotonic() - hit[0], True
     rows = fetch()
     if rows:
         with _DIVIDENDS_LOCK:
-            _DIVIDENDS_CACHE[account_id] = (time.monotonic(), list(rows))
+            _DIVIDENDS_CACHE[account_id] = (time.monotonic(), [dict(r) for r in rows])
+        return [dict(r) for r in rows], 0.0, False      # a copy on a miss too: the caller never holds the cached rows
     return rows, 0.0, False
 
 
@@ -574,7 +575,7 @@ def portfolio_view(account_id: int) -> Dict[str, Any]:
     from ..core.models import AccountDefinition
     from ..core.portfolio_allocation import PositionFetchFailed
     from ._common import jsonable, require_row, utcnow_iso
-    from .accounts import _live_account, broker_read
+    from .accounts import _live_account, broker_read, strict_history
     from .errors import BrokerUnreachable, NotFound
 
     with get_db() as session:
@@ -586,7 +587,10 @@ def portfolio_view(account_id: int) -> Dict[str, Any]:
     div_age: Dict[str, Any] = {}
 
     def dividends_source():
-        rows, age, cached = cached_dividends(account_id, account.get_dividends)
+        # STRICT read (every page, raises on failure): this cache is shared with /dividends and /growth, and a lenient
+        # entry would serve a first page, or a tax-blind gross-as-net amount, to them as if it were complete.
+        rows, age, cached = cached_dividends(
+            account_id, lambda: strict_history(account_id, account, "get_dividends", "the dividends fetch"))
         div_age.update(age_s=age, cached=cached)
         return rows
 

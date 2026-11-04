@@ -58,6 +58,10 @@ class GoldenAccount(MockAccount):
         self.dividend_calls += 1
         return list(self.dividends)
 
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None):
+        # the API reads dividends through the strict variant; this fake has one history, so it is the same rows
+        return self.get_dividends(symbol, start_date, end_date)
+
     def get_cash_transfers(self, start_date=None, end_date=None):
         self.calls.append("get_cash_transfers")
         return []

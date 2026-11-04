@@ -137,3 +137,34 @@ def test_one_cached_fetch_serves_repeat_calls_and_the_rows_are_not_mutated(world
     _get(acct, symbol="KO")
     assert len(broker.calls) == 1 and _get(acct)["broker"]["from_cache"] is True
     assert "account_id" not in broker.rows[0]
+
+
+def test_a_portfolio_call_fills_the_shared_cache_with_the_strict_read(world, monkeypatch):
+    """The portfolio endpoint and /dividends share ``portfolio.cached_dividends``: whoever fills it must use the strict
+    read, or /dividends would serve a lenient entry (first page, tax-blind) as if it were strict."""
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        set_allocation_config, set_managed_label, set_symbol_weight)
+    from ba2_trade_platform.core.utils import add_label_to_instruments
+    acct, broker = world
+    lenient, strict = [_div(3, "KO", 99.0)], [_div(3, "KO", 4.0)]
+    broker.get_dividends = lambda *a, **k: lenient
+    broker.get_dividends_strict = lambda *a, **k: strict
+    broker.positions = [{"symbol": "KO", "qty": 10.0, "cost_basis": 500.0, "market_value": 600.0, "side": "BUY",
+                         "current_price": 60.0, "unrealized_pl": 100.0}]
+    set_allocation_config(acct.id, valuation_mode="market")
+    set_managed_label(acct.id, "CORE", target_pct=100.0, comment="x")
+    add_label_to_instruments(["KO"], "CORE")
+    set_symbol_weight(acct.id, "CORE", "KO", weight_pct=100.0, comment="x")
+    assert v1_client().get(f"/accounts/{acct.id}/portfolio").status_code == 200
+    body = _get(acct)
+    assert [i["amount"] for i in body["broker"]["items"]] == [4.0] and body["broker"]["from_cache"] is True
+
+
+def test_cached_dividends_hands_out_copies_on_a_miss_as_well_as_on_a_hit():
+    from ba2_trade_platform.services import portfolio
+    portfolio._DIVIDENDS_CACHE.clear()
+    source = [{"symbol": "KO", "amount": 1.0}]
+    first, _, hit1 = portfolio.cached_dividends(7, lambda: source)
+    first[0]["amount"] = 999.0
+    second, _, hit2 = portfolio.cached_dividends(7, lambda: source)
+    assert (hit1, hit2) == (False, True) and second[0]["amount"] == 1.0 and source[0]["amount"] == 1.0
