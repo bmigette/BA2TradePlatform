@@ -67,7 +67,9 @@ def test_pnl_status_distinguishes_open_realized_and_unmeasured():
     no_price = create_transaction(symbol="NOPX", status=TransactionStatus.CLOSED, open_price=100.0,
                                   close_price=None, quantity=1.0)
     by_sym = {i["symbol"]: i for i in v1_client().get("/transactions").json()["items"]}
-    assert by_sym["AAPL"]["pnl_status"] == "open" and by_sym["AAPL"]["realized_pnl"] is None
+    # phase 4: an OPENED row is priced at the broker; this account cannot be built, so it is unmeasured (not "open", not 0)
+    assert by_sym["AAPL"]["pnl_status"] == "unmeasured" and by_sym["AAPL"]["realized_pnl"] is None
+    assert by_sym["AAPL"]["open_pnl"] is None and by_sym["AAPL"]["open_pnl_reason"]
     assert by_sym["MSFT"]["pnl_status"] == "realized" and by_sym["MSFT"]["realized_pnl"] == 50.0
     assert by_sym["NOPX"]["pnl_status"] == "unmeasured" and by_sym["NOPX"]["realized_pnl"] is None
     assert v1_client().get(f"/transactions/{no_price.id}").json()["pnl_status"] == "unmeasured"
