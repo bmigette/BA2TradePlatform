@@ -14,11 +14,9 @@ from ..core.types import OrderStatus
 from ..core.utils import get_account_instance_from_id
 from ..logger import logger
 from ..modules.accounts import get_account_class
+from ._scrub import is_secret_key, mask_setting
 from ._common import jsonable, page, parse_enum, require_row, row_dict, utcnow_iso
 from .errors import BrokerRefused, BrokerUnreachable, NotFound, ServiceError, Unmeasurable
-
-_SECRET_KEY_PARTS = ("key", "secret", "token", "password", "pass", "pin", "client_id")
-
 
 def is_secret_setting(key: str, definition: Optional[Dict[str, Any]]) -> bool:
     if definition is not None:
@@ -27,8 +25,7 @@ def is_secret_setting(key: str, definition: Optional[Dict[str, Any]]) -> bool:
             return True
         if "type" in definition and definition["type"] == "password":
             return True
-    lowered = key.lower()
-    return any(part in lowered for part in _SECRET_KEY_PARTS)
+    return is_secret_key(key)
 
 
 def _stored_value(row: AccountSetting) -> Any:
@@ -46,10 +43,7 @@ def masked_settings(provider: str, rows) -> Dict[str, Any]:
     for row in rows:
         value = _stored_value(row)
         definition = definitions[row.key] if row.key in definitions else None
-        if is_secret_setting(row.key, definition):
-            out[row.key] = {"set": value is not None and value != ""}
-        else:
-            out[row.key] = value
+        out[row.key] = mask_setting(row.key, value, definition)
     return out
 
 

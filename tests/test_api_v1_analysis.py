@@ -49,7 +49,9 @@ def test_analysis_detail_state_outputs_and_recommendations():
     create_recommendation(e.id, symbol="AAPL", market_analysis_id=done.id)
     c = v1_client()
     d = c.get(f"/analyses/{done.id}").json()
-    assert d["state"] == {"k": "v"}
+    assert "state" not in d and d["state_included"] is False       # the state is opt-in
+    d = c.get(f"/analyses/{done.id}?include_state=true").json()
+    assert d["state"] == {"k": "v"} and d["state_truncated"] is False
     out = d["outputs"][0]
     assert out["name"] == "AAPL_news" and out["text_length"] == 50
     assert "text" not in out and "blob" not in out
@@ -67,3 +69,25 @@ def test_recommendations_list():
     item = c.get(f"/recommendations?expert={e.id}&symbol=AAPL").json()["items"][0]
     assert item["confidence"] == 78.1 and item["recommended_action"]
     assert c.get("/recommendations?expert=999").json()["total"] == 0
+
+
+def test_state_is_capped_and_truncation_is_flagged(monkeypatch):
+    from ba2_trade_platform.services import analysis as svc
+    e, done, _ = _setup()
+    big = create_market_analysis(symbol="NVDA", expert_instance_id=e.id, status=MarketAnalysisStatus.COMPLETED,
+                                 state={"blob": "x" * 5000})
+    monkeypatch.setattr(svc, "MAX_STATE_BYTES", 1000)
+    d = v1_client().get(f"/analyses/{big.id}?include_state=true").json()
+    assert d["state_truncated"] is True and isinstance(d["state"], str) and len(d["state"]) == 1000
+    small = v1_client().get(f"/analyses/{done.id}?include_state=true").json()
+    assert small["state"] == {"k": "v"} and small["state_truncated"] is False
+
+
+def test_state_is_scrubbed_before_it_is_truncated(monkeypatch):
+    from ba2_trade_platform.services import analysis as svc
+    e, _, _ = _setup()
+    a = create_market_analysis(symbol="X", expert_instance_id=e.id, status=MarketAnalysisStatus.COMPLETED,
+                               state={"pad": "p" * 40, "note": "key=ABCDEFSECRET123"})
+    monkeypatch.setattr(svc, "MAX_STATE_BYTES", 75)        # would cut the secret in half if truncation came first
+    body = v1_client().get(f"/analyses/{a.id}?include_state=true").text
+    assert "ABCDEF" not in body

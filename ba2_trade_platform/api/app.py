@@ -8,6 +8,7 @@ from ..version import APP_VERSION
 from .auth import require_access
 from .errors import install_error_handlers
 from .gate import RemoteGateMiddleware
+from .scrub import ScrubMiddleware
 
 #: Router modules (relative to this package), each exposing ``router``.
 _ROUTER_MODULES = ["system", "maintenance", "accounts", "transactions", "orders", "experts", "analysis", "risk_manager", "activity"]
@@ -21,6 +22,7 @@ def create_v1_app() -> FastAPI:
                   docs_url=None, redoc_url=None, openapi_url=None,
                   dependencies=[Depends(require_access)])
     install_error_handlers(app)
+    app.add_middleware(ScrubMiddleware)         # every JSON body leaves through services._scrub.scrub
     app.add_middleware(RemoteGateMiddleware)
 
     @app.get("/openapi.json", include_in_schema=False)

@@ -7,7 +7,7 @@ from ..core.db import get_db
 from ..core.models import ExpertInstance, MarketAnalysis
 from ..core.utils import get_expert_instance_from_id
 from ._common import page, require_row, row_dict
-from .accounts import is_secret_setting
+from ._scrub import mask_setting
 from ._readonly import readonly_balance_reads
 from .errors import Invalid, NotFound, Unmeasurable
 
@@ -54,7 +54,7 @@ def expert_detail(expert_id: int) -> Dict[str, Any]:
     settings: Dict[str, Any] = {}
     for key, value in expert.settings.items():
         definition = definitions[key] if key in definitions else None
-        settings[key] = {"set": value is not None and value != ""} if is_secret_setting(key, definition) else value
+        settings[key] = mask_setting(key, value, definition)
     out["settings"] = settings
     out["schedule"] = {k: v for k, v in settings.items() if k.startswith(_SCHEDULE_PREFIX)}
     # Explicit access: the key is a built-in MarketExpertInterface setting, so a KeyError is a real bug.

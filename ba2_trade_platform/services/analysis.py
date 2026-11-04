@@ -1,4 +1,5 @@
 """Market analyses and expert recommendations for the management API (reads)."""
+import json
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -8,6 +9,11 @@ from ..core.db import get_db
 from ..core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ..core.types import AnalysisUseCase, MarketAnalysisStatus
 from ._common import jsonable, page, parse_enum, require_row, row_dict
+from ._scrub import scrub
+
+#: Largest analysis ``state`` (serialised JSON, in characters) the detail endpoint returns; beyond it the state is
+#: cut and ``state_truncated`` is true.
+MAX_STATE_BYTES = 1_000_000
 
 
 def _skip_reason(state: Dict[str, Any]) -> Optional[str]:
@@ -47,11 +53,20 @@ def _output_dict(o: AnalysisOutput, include_text: bool) -> Dict[str, Any]:
     return d
 
 
-def analysis_detail(analysis_id: int, include_text: bool) -> Dict[str, Any]:
+def analysis_detail(analysis_id: int, include_text: bool, include_state: bool = False) -> Dict[str, Any]:
     with get_db() as session:
         a = require_row(session, MarketAnalysis, analysis_id, "analysis")
         out = row_dict(a)
-        out["skip_reason"] = _skip_reason(out["state"])
+        state = out.pop("state")
+        out["skip_reason"] = _skip_reason(state)
+        out["state_included"] = include_state
+        if include_state:
+            # scrub BEFORE cutting: a cut can slice a credential in half and leave a prefix no pattern matches
+            text = json.dumps(scrub(state), ensure_ascii=False, default=str)
+            if len(text) > MAX_STATE_BYTES:
+                out["state"], out["state_truncated"] = text[:MAX_STATE_BYTES], True
+            else:
+                out["state"], out["state_truncated"] = json.loads(text), False
         outputs = session.exec(select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
                                .order_by(AnalysisOutput.id)).all()
         recs = session.exec(select(ExpertRecommendation)

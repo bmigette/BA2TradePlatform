@@ -72,3 +72,74 @@ class FakeAccount:
 def v1_client(**kwargs) -> TestClient:
     from ba2_trade_platform.api.app import create_v1_app
     return client_for(create_v1_app(), **kwargs)
+
+
+def seed_secrets(monkeypatch, experts_svc, accounts_svc):
+    """Seed credential-looking strings into every free-form place the API can return, with fake live objects for
+    the accounts and experts. Returns ``(ids, secrets)``: no GET body may contain any of ``secrets``."""
+    from datetime import datetime, timezone
+
+    from ba2_trade_platform.core.models import (
+        AccountSetting, ActivityLog, AnalysisOutput, RiskManagerRun, SmartRiskManagerJob)
+    from ba2_trade_platform.core.types import (
+        ActivityLogSeverity, ActivityLogType, MarketAnalysisStatus, TransactionStatus)
+    from tests.factories import (
+        create_account_definition, create_expert_instance, create_market_analysis, create_recommendation,
+        create_trading_order, create_transaction)
+
+    secrets = ["ACCTPW9999", "ACCTNOTE777", "STATESECRET1234", "BEARERSTATE99", "TEXTPW4321", "TEXTKEY8888",
+               "ACTDESC5555", "ACTDATAPW", "ACTNESTED7777", "ERRSECRET1234567890", "UIKEY99999", "GSSECRET",
+               "MKSECRET1234", "UISECRET99999", "EXPERTKEY1234567890", "DECISIONPW", "CONTEXTTOK12345",
+               "TXACTSECRET"]
+    acct = create_account_definition(name="Paper")
+    for key, value in (("api_key", "RAWACCOUNTKEY"), ("base_url", "https://u:ACCTPW9999@broker.example/v2"),
+                       ("notes", "see token=ACCTNOTE777")):
+        add_instance(AccountSetting(account_id=acct.id, key=key, value_str=value, value_json={}, value_float=None),
+                     expunge_after_flush=True)
+    secrets.append("RAWACCOUNTKEY")
+    expert = create_expert_instance(account_id=acct.id, alias="Alpha")
+
+    class SeededExpert:
+        settings = {"overalloc_min_res_pct": 0.0, "openai_api_key": "sk-EXPERTKEY1234567890",
+                    "x_model_kwargs": '{"api_key": "MKSECRET1234", "temperature": 0.2}',
+                    "y_user_instructions": "be careful, use Bearer UISECRET99999 for the call",
+                    "execution_schedule_enter_market": "{}"}
+
+        @classmethod
+        def get_merged_settings_definitions(cls):
+            return {}
+
+        def describe_capital_mapping(self):
+            return {"expert_id": 1, "virtual_equity_pct": 100.0, "virtual_balance": 1.0, "used_balance": 0.0,
+                    "available_balance": 1.0, "equivalent_unlevered_balance": 1.0}
+
+    monkeypatch.setattr(experts_svc, "get_expert_instance_from_id", lambda i: SeededExpert())
+    monkeypatch.setattr(accounts_svc, "get_account_instance_from_id", lambda i: FakeAccount(i))
+
+    tx = create_transaction(symbol="AAPL", status=TransactionStatus.OPENED, expert_id=expert.id)
+    create_trading_order(acct.id, symbol="AAPL", transaction_id=tx.id)
+    analysis = create_market_analysis(
+        symbol="AAPL", expert_instance_id=expert.id, status=MarketAnalysisStatus.COMPLETED,
+        state={"openai_api_key": "sk-STATESECRET1234", "note": "call with Bearer BEARERSTATE99",
+               "nested": {"deep": [{"password": "STATESECRET1234"}]}})
+    add_instance(AnalysisOutput(market_analysis_id=analysis.id, name="n", type="news",
+                                text="fetched https://u:TEXTPW4321@feed.example/x?apikey=TEXTKEY8888",
+                                blob=None, provider_metadata={}), expunge_after_flush=True)
+    create_recommendation(expert.id, symbol="AAPL", market_analysis_id=analysis.id)
+    add_instance(ActivityLog(severity=ActivityLogSeverity.INFO, type=ActivityLogType.TP_SL_ADJUSTED,
+                             description="retry with token=ACTDESC5555",
+                             data={"password": "ACTDATAPW", "nested": {"authorization": "Bearer ACTNESTED7777"},
+                                   "transaction_id": tx.id, "note": "secret=TXACTSECRET"}),
+                 expunge_after_flush=True)
+    now = datetime.now(timezone.utc)
+    add_instance(RiskManagerRun(expert_instance_id=expert.id, account_id=acct.id, mode="classic", run_date=now,
+                                symbols_received=1, symbols_funded=0,
+                                decisions=[{"why": "key=DECISIONPW"}], context={"api_token": "CONTEXTTOK12345"}),
+                 expunge_after_flush=True)
+    add_instance(SmartRiskManagerJob(expert_instance_id=expert.id, account_id=acct.id, run_date=now,
+                                     model_used="m", user_instructions="please use api_key=UIKEY99999",
+                                     status="FAILED", error_message="401 for sk-ERRSECRET1234567890",
+                                     graph_state={"client_secret": "GSSECRET"}), expunge_after_flush=True)
+    ids = {"account": acct.id, "expert": expert.id, "transaction": tx.id, "analysis": analysis.id,
+           "rm_ref": "rm-1", "smart_ref": "smart-1"}
+    return ids, secrets

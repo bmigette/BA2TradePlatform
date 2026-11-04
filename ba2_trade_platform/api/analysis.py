@@ -19,8 +19,8 @@ def list_analyses(expert: Optional[int] = None, symbol: Optional[str] = None, st
 
 
 @router.get("/analyses/{analysis_id}")
-def analysis_detail(analysis_id: int, include_text: bool = False):
-    return svc.analysis_detail(analysis_id, include_text)
+def analysis_detail(analysis_id: int, include_text: bool = False, include_state: bool = False):
+    return svc.analysis_detail(analysis_id, include_text, include_state)
 
 
 @router.get("/recommendations")
