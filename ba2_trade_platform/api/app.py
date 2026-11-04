@@ -33,3 +33,11 @@ def create_v1_app() -> FastAPI:
     for name in _ROUTER_MODULES:
         app.include_router(import_module(f"{__package__}.{name}").router)
     return app
+
+
+def register_management_api(host_app: FastAPI) -> None:
+    """Attach the management API to the NiceGUI/FastAPI host app: the legacy ``/api/*`` aliases (routes) and
+    the ``/api/v1`` sub-app (mount). Called once from ``ui/main.py``."""
+    from ..ui import api_routes
+    host_app.include_router(api_routes.router)
+    host_app.mount("/api/v1", create_v1_app())

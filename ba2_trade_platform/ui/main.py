@@ -1,13 +1,13 @@
 from nicegui import ui, Client, app
 from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools, portfolio_allocation
 from .layout import layout_render
-from . import api_routes
+from ..api.app import register_management_api
 from pathlib import Path
 from ..logger import logger
 
-# Plain HTTP API routes (non-UI): DB reload callback etc. `app` here is the FastAPI instance
-# NiceGUI wraps, same object `app.on_shutdown` below hooks into.
-app.include_router(api_routes.router)
+# Management HTTP API (non-UI): /api/v1 sub-app + the legacy /api/* aliases. `app` here is the FastAPI
+# instance NiceGUI wraps, same object `app.on_shutdown` below hooks into.
+register_management_api(app)
 
 # Configure NiceGUI JavaScript timeout globally
 # This affects all JavaScript requests throughout the application
