@@ -35,6 +35,8 @@ DEFAULT_SPAN_DAYS = 365
 MAX_LABELS = 25
 #: How long fetched broker rows are reused (per account and window).
 FETCH_TTL_S = 60.0
+#: Entries kept at most (one per account and window): the oldest go first.
+MAX_CACHE_ENTRIES = 64
 
 _CACHE: Dict[tuple, Tuple[float, list]] = {}
 _LOCK = threading.Lock()
@@ -58,7 +60,12 @@ def _cached(key: tuple, fetch: Callable[[], Optional[list]]):
     rows = [dict(r) for r in rows]
     if rows:
         with _LOCK:
-            _CACHE[key] = (time.monotonic(), rows)
+            now = time.monotonic()
+            for stale in [k for k, (stamp, _r) in _CACHE.items() if now - stamp >= FETCH_TTL_S]:
+                del _CACHE[stale]
+            _CACHE[key] = (now, rows)
+            while len(_CACHE) > MAX_CACHE_ENTRIES:               # oldest first (dicts keep insertion order)
+                del _CACHE[next(iter(_CACHE))]
     return [dict(r) for r in rows]
 
 

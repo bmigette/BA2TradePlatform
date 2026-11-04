@@ -252,3 +252,19 @@ def test_every_symbol_failing_is_price_source_unreachable(monkeypatch):
     monkeypatch.setattr(price_history, "_provider", lambda account_id: Down())
     with pytest.raises(PriceSourceUnreachable):
         svc.fetch_closes(1, ["AAPL", "MSFT"], date(2026, 9, 1))
+
+
+def test_the_fetch_cache_is_pruned_and_capped():
+    svc.clear_cache()
+    for i in range(svc.MAX_CACHE_ENTRIES + 20):
+        svc._cached(("trades", i), lambda i=i: [{"n": i}])
+    assert len(svc._CACHE) == svc.MAX_CACHE_ENTRIES
+    assert ("trades", svc.MAX_CACHE_ENTRIES + 19) in svc._CACHE and ("trades", 0) not in svc._CACHE   # oldest go first
+
+
+def test_expired_entries_are_dropped_when_something_new_is_inserted(monkeypatch):
+    svc.clear_cache()
+    svc._cached(("trades", 1), lambda: [{"n": 1}])
+    monkeypatch.setattr(svc, "FETCH_TTL_S", -1.0)             # everything cached so far is now expired
+    svc._cached(("trades", 2), lambda: [{"n": 2}])
+    assert list(svc._CACHE) == [("trades", 2)]
