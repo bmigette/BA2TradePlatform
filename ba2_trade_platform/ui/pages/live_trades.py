@@ -1182,34 +1182,22 @@ class LiveTradesTab:
     def _revert_tpsl_manual_override(self, transaction_id: int, dialog):
         """Clear tp_manual_override / sl_manual_override flags so the next
         automation cycle (ruleset / smart risk manager / expert) is free to
-        adjust TP and SL again."""
-        from ...core.models import Transaction
-        from ...core.db import update_instance
+        adjust TP and SL again. The decision lives in services.trades (shared with the API)."""
+        from ...services import trades as trade_service
+        from ...services.errors import ServiceError
 
         try:
-            txn = get_instance(Transaction, transaction_id)
-            if not txn:
-                ui.notify('Transaction not found', type='negative')
+            try:
+                result = trade_service.clear_override_locks(transaction_id)
+            except ServiceError as e:
+                ui.notify(e.message, type='negative')
                 return
-            had_tp_lock = txn.tp_manual_override
-            had_sl_lock = txn.sl_manual_override
-            if not (had_tp_lock or had_sl_lock):
+            if not result.cleared:
                 ui.notify('TP/SL are not currently manually overridden', type='info')
                 return
-            txn.tp_manual_override = False
-            txn.sl_manual_override = False
-            update_instance(txn)
-
-            cleared = []
-            if had_tp_lock: cleared.append('TP')
-            if had_sl_lock: cleared.append('SL')
             ui.notify(
-                f'{" and ".join(cleared)} lock cleared — automation will manage from next cycle.',
+                f'{" and ".join(result.cleared)} lock cleared — automation will manage from next cycle.',
                 type='positive',
-            )
-            logger.info(
-                f"Cleared manual override on transaction {transaction_id} for {txn.symbol}: "
-                f"tp={had_tp_lock}, sl={had_sl_lock}"
             )
             dialog.close()
             self._refresh_transactions()
@@ -1218,73 +1206,41 @@ class LiveTradesTab:
             logger.error(f"Error reverting overrides for transaction {transaction_id}: {e}", exc_info=True)
 
     def _update_position(self, transaction_id, new_quantity, tp_price, sl_price, dialog):
-        """Update position quantity and/or TP/SL for a transaction."""
-        from ...core.models import Transaction, TradingOrder
-        from ...core.db import update_instance, get_db
-        from sqlmodel import select, Session
-        from ...core.TransactionHelper import TransactionHelper
+        """Update position quantity and/or TP/SL for a transaction.
+
+        The TP/SL half (lookup, direction check, the branch matrix, the account calls) lives in
+        services.trades and is shared with the management API; this method keeps the quantity edit,
+        the notifications and the dialog."""
+        from ...services import trades as trade_service
+        from ...services.errors import ServiceError
 
         try:
-            txn = get_instance(Transaction, transaction_id)
-            if not txn:
-                ui.notify('Transaction not found', type='negative')
+            try:
+                txn, account = trade_service.tp_sl_context(transaction_id)
+            except ServiceError as e:
+                ui.notify(e.message, type='negative')
                 return
 
-            # Query for the first (opening) order associated with this transaction
-            session = get_db()
-            order_statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction_id
-            ).order_by(TradingOrder.created_at).limit(1)
-            order = session.exec(order_statement).first()
-
-            if not order or not order.account_id:
-                ui.notify('No orders linked to this transaction or order account not found', type='negative')
+            # Direction-aware TP/SL sanity check BEFORE touching anything.
+            try:
+                trade_service.validate_tp_sl(account, txn, tp_price, sl_price)
+            except ServiceError as e:
+                ui.notify(e.message, type='negative', timeout=10000)
                 return
-
-            # Get account to use adjust methods
-            from ...modules.accounts import get_account_class
-            from ...core.models import AccountDefinition
-
-            acc_def = get_instance(AccountDefinition, order.account_id)
-            if not acc_def:
-                ui.notify('Account definition not found', type='negative')
-                return
-
-            account_class = get_account_class(acc_def.provider)
-            if not account_class:
-                ui.notify(f'Account provider {acc_def.provider} not found', type='negative')
-                return
-
-            account = account_class(acc_def.id)
-
-            # Direction-aware TP/SL sanity check BEFORE touching anything: catches
-            # swapped values (e.g. TP below entry / SL above it on a long), which
-            # the broker would reject anyway (Alpaca 42210000) or fill instantly.
-            if tp_price or sl_price:
-                try:
-                    ref_price = account.get_instrument_current_price(txn.symbol)
-                except Exception:
-                    ref_price = None
-                ok, reason = TransactionHelper.validate_tp_sl_prices(
-                    txn.side, tp_price or None, sl_price or None,
-                    reference_price=ref_price or txn.open_price)
-                if not ok:
-                    ui.notify(reason, type='negative', timeout=10000)
-                    return
 
             # Check for quantity change
             old_quantity = txn.quantity
             qty_changed = new_quantity != old_quantity
-            
+
             if qty_changed:
                 # Validate new quantity
                 if new_quantity <= 0:
                     ui.notify('Quantity must be greater than 0', type='negative')
                     return
-                
+
                 # Calculate quantity change
                 qty_change = new_quantity - old_quantity
-                
+
                 # Use TransactionHelper to adjust quantity with TP/SL handling
                 result = TransactionHelper.adjust_quantity_with_tpsl(
                     account=account,
@@ -1293,7 +1249,7 @@ class LiveTradesTab:
                     tp_price=tp_price if tp_price else None,
                     sl_price=sl_price if sl_price else None
                 )
-                
+
                 if result["success"]:
                     msg = f'Position adjusted from {old_quantity:.2f} to {new_quantity:.2f}'
                     if tp_price or sl_price:
@@ -1305,176 +1261,11 @@ class LiveTradesTab:
                 else:
                     ui.notify(f'Failed to adjust position: {result["message"]}', type='negative')
                     return
-            
-            # No quantity change - just handle TP/SL updates
-            # Detect changes including deletions (None/0 is a valid change)
-            # Convert empty strings to None for proper comparison
-            tp_value = tp_price if tp_price else None
-            sl_value = sl_price if sl_price else None
-            tp_changed = tp_value != txn.take_profit
-            sl_changed = sl_value != txn.stop_loss
 
-            # Update transaction values first (source of truth)
-            if tp_changed:
-                txn.take_profit = tp_value
-            if sl_changed:
-                txn.stop_loss = sl_value
-
-            if tp_changed or sl_changed:
-                from ...core.db import update_instance
-                update_instance(txn)
-
-            # Now call account methods to sync orders with transaction state
-            # The account methods will determine correct order types (OCO vs individual)
-            if tp_changed and sl_changed:
-                # Both changed
-                if tp_value and sl_value:
-                    # Both have values - account will create/update OCO
-                    try:
-                        success = account.adjust_tp_sl(txn, tp_value, sl_value, source="manual")
-                        if success:
-                            ui.notify(f'TP/SL updated to ${tp_value:.2f}/${sl_value:.2f}', type='positive')
-                        else:
-                            ui.notify('Failed to update TP/SL', type='negative')
-                    except Exception as e:
-                        ui.notify(f'Error updating TP/SL: {str(e)}', type='negative')
-                        logger.error(f"Error updating TP/SL: {e}", exc_info=True)
-                elif tp_value:
-                    # Only TP remains - account will create individual LIMIT order
-                    try:
-                        success = account.adjust_tp(txn, tp_value, source="manual")
-                        if success:
-                            ui.notify(f'TP updated to ${tp_value:.2f}, SL removed', type='positive')
-                        else:
-                            ui.notify('Failed to update TP', type='negative')
-                    except Exception as e:
-                        ui.notify(f'Error updating TP: {str(e)}', type='negative')
-                        logger.error(f"Error updating TP: {e}", exc_info=True)
-                elif sl_value:
-                    # Only SL remains - account will create individual STOP order
-                    try:
-                        success = account.adjust_sl(txn, sl_value, source="manual")
-                        if success:
-                            ui.notify(f'SL updated to ${sl_value:.2f}, TP removed', type='positive')
-                        else:
-                            ui.notify('Failed to update SL', type='negative')
-                    except Exception as e:
-                        ui.notify(f'Error updating SL: {str(e)}', type='negative')
-                        logger.error(f"Error updating SL: {e}", exc_info=True)
-                else:
-                    # Both deleted - cancel all TP/SL orders
-                    try:
-                        with Session(get_db().bind) as session:
-                            orders = session.exec(
-                                select(TradingOrder).where(
-                                    TradingOrder.transaction_id == txn.id,
-                                    TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                    TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
-                                )
-                            ).all()
-                            for order in orders:
-                                if order.broker_order_id:
-                                    try:
-                                        account.cancel_order(order.id)
-                                        logger.info(f"Cancelled order {order.id}")
-                                    except Exception as e:
-                                        logger.warning(f"Failed to cancel order {order.id}: {e}")
-                        ui.notify('TP/SL removed', type='positive')
-                    except Exception as e:
-                        ui.notify(f'Error removing TP/SL: {str(e)}', type='negative')
-                        logger.error(f"Error removing TP/SL: {e}", exc_info=True)
-            elif tp_changed:
-                # Only TP changed - account method will handle OCO ↔ individual transitions
-                if tp_value:
-                    try:
-                        success = account.adjust_tp(txn, tp_value, source="manual")
-                        if success:
-                            ui.notify(f'Take Profit updated to ${tp_value:.2f}', type='positive')
-                        else:
-                            ui.notify('Failed to update Take Profit', type='negative')
-                    except Exception as e:
-                        ui.notify(f'Error updating TP: {str(e)}', type='negative')
-                        logger.error(f"Error updating TP: {e}", exc_info=True)
-                else:
-                    # TP deleted - if SL exists, account will create SL-only order
-                    if txn.stop_loss:
-                        try:
-                            success = account.adjust_sl(txn, txn.stop_loss, source="manual")
-                            if success:
-                                ui.notify('Take Profit removed, Stop Loss kept', type='positive')
-                            else:
-                                ui.notify('Failed to remove Take Profit', type='negative')
-                        except Exception as e:
-                            ui.notify(f'Error removing TP: {str(e)}', type='negative')
-                            logger.error(f"Error removing TP: {e}", exc_info=True)
-                    else:
-                        # No SL either - cancel all TP/SL orders
-                        try:
-                            with Session(get_db().bind) as session:
-                                orders = session.exec(
-                                    select(TradingOrder).where(
-                                        TradingOrder.transaction_id == txn.id,
-                                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                        TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
-                                    )
-                                ).all()
-                                for order in orders:
-                                    if order.broker_order_id:
-                                        try:
-                                            account.cancel_order(order.id)
-                                            logger.info(f"Cancelled order {order.id}")
-                                        except Exception as e:
-                                            logger.warning(f"Failed to cancel order {order.id}: {e}")
-                            ui.notify('Take Profit removed', type='positive')
-                        except Exception as e:
-                            ui.notify(f'Error removing TP: {str(e)}', type='negative')
-                            logger.error(f"Error removing TP: {e}", exc_info=True)
-            elif sl_changed:
-                # Only SL changed - account method will handle OCO ↔ individual transitions
-                if sl_value:
-                    try:
-                        success = account.adjust_sl(txn, sl_value, source="manual")
-                        if success:
-                            ui.notify(f'Stop Loss updated to ${sl_value:.2f}', type='positive')
-                        else:
-                            ui.notify('Failed to update Stop Loss', type='negative')
-                    except Exception as e:
-                        ui.notify(f'Error updating SL: {str(e)}', type='negative')
-                        logger.error(f"Error updating SL: {e}", exc_info=True)
-                else:
-                    # SL deleted - if TP exists, account will create TP-only order
-                    if txn.take_profit:
-                        try:
-                            success = account.adjust_tp(txn, txn.take_profit, source="manual")
-                            if success:
-                                ui.notify('Stop Loss removed, Take Profit kept', type='positive')
-                            else:
-                                ui.notify('Failed to remove Stop Loss', type='negative')
-                        except Exception as e:
-                            ui.notify(f'Error removing SL: {str(e)}', type='negative')
-                            logger.error(f"Error removing SL: {e}", exc_info=True)
-                    else:
-                        # No TP either - cancel all TP/SL orders
-                        try:
-                            with Session(get_db().bind) as session:
-                                orders = session.exec(
-                                    select(TradingOrder).where(
-                                        TradingOrder.transaction_id == txn.id,
-                                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                        TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
-                                    )
-                                ).all()
-                                for order in orders:
-                                    if order.broker_order_id:
-                                        try:
-                                            account.cancel_order(order.id)
-                                            logger.info(f"Cancelled order {order.id}")
-                                        except Exception as e:
-                                            logger.warning(f"Failed to cancel order {order.id}: {e}")
-                            ui.notify('Stop Loss removed', type='positive')
-                        except Exception as e:
-                            ui.notify(f'Error removing SL: {str(e)}', type='negative')
-                            logger.error(f"Error removing SL: {e}", exc_info=True)
+            # No quantity change - just handle TP/SL updates (deletions included).
+            outcome = trade_service.apply_tp_sl(account, txn, tp_price, sl_price, source="manual")
+            if outcome.step is not None:
+                ui.notify(outcome.message, type='positive' if outcome.success else 'negative')
 
             dialog.close()
             self._refresh_transactions()
