@@ -14,7 +14,7 @@ from ..logger import logger
 from ..services.errors import ServiceError
 
 _HTTP_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
-               405: "method_not_allowed", 409: "conflict", 422: "invalid"}
+               405: "method_not_allowed", 409: "conflict", 413: "payload_too_large", 422: "invalid"}
 
 
 def envelope(error: str, message: str, detail: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -38,11 +38,14 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
+        # `input` echoes the offending value (it can be a secret) and `ctx` can carry the raw exception: drop both.
+        errors = [{k: v for k, v in e.items() if k not in ("input", "ctx")} for e in exc.errors()]
         return JSONResponse(status_code=422, content=envelope(
-            "invalid", "Request validation failed", {"errors": jsonable_encoder(exc.errors())}))
+            "invalid", "Request validation failed", {"errors": jsonable_encoder(errors)}))
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
-        logger.error(f"API {request.method} {request.url.path} crashed: {exc}", exc_info=True)
+        # Class name only in the message (the text may echo request data); the traceback goes to the log via exc_info.
+        logger.error(f"API {request.method} {request.url.path} crashed: {type(exc).__name__}", exc_info=exc)
         return JSONResponse(status_code=500,
                             content=envelope("internal", "Internal error (see the platform log)"))

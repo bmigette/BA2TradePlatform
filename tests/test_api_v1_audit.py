@@ -71,3 +71,53 @@ def test_reads_and_refused_writes_write_no_activity_row(monkeypatch):
     client_for(_app()).get("/read")
     assert client_for(_app()).post("/act", json={}).status_code == 401   # no bearer
     assert captured == []
+
+
+def test_oversized_body_is_413_and_not_read_into_the_handler(monkeypatch):
+    set_api_token()
+    from ba2_trade_platform.api import audit
+    captured = []
+    monkeypatch.setattr(audit, "log_activity", lambda *a, **k: captured.append(k["data"]))
+    big = b'{"x": "' + b"a" * (audit.MAX_BODY_BYTES + 10) + b'"}'
+    r = client_for(_app(), token=TOKEN).post("/act", content=big, headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+    assert captured and captured[0]["status"] == 413 and len(captured[0]["arguments"]) <= 500
+
+
+def test_chunked_oversized_body_is_413_too():
+    set_api_token()
+    from ba2_trade_platform.api import audit
+
+    def chunks():
+        for _ in range(audit.MAX_BODY_BYTES // 1024 + 2):
+            yield b"a" * 1024
+    r = client_for(_app(), token=TOKEN).post("/act", content=chunks(), headers={"Content-Type": "application/json"})
+    assert r.status_code == 413
+
+
+def test_body_of_an_unauthenticated_write_is_never_read(monkeypatch):
+    from starlette.requests import Request
+    reads = []
+    original = Request.stream
+
+    async def spy(self):
+        reads.append(1)
+        async for c in original(self):
+            yield c
+    monkeypatch.setattr(Request, "stream", spy)
+    set_api_token()
+    assert client_for(_app()).post("/act", json={"x": 1}).status_code == 401      # no bearer
+    assert reads == []
+
+
+def test_validation_failure_is_audited_as_422_not_500(monkeypatch):
+    set_api_token()
+    from ba2_trade_platform.api import audit
+    from ba2_trade_platform.api.errors import install_error_handlers
+    captured = []
+    monkeypatch.setattr(audit, "log_activity", lambda *a, **k: captured.append(k["data"]))
+    app = _app()
+    install_error_handlers(app)
+    r = client_for(app, token=TOKEN).post("/act", content=b"not json", headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+    assert captured[0]["status"] == 422

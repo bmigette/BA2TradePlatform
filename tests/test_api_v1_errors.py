@@ -78,3 +78,34 @@ def test_unhandled_exception_is_500_internal_without_leaking_the_message():
     r = _client().get("/crash")
     assert r.status_code == 500
     assert r.json() == {"error": "internal", "message": "Internal error (see the platform log)", "detail": {}}
+
+
+def test_validation_envelope_drops_input_and_ctx():
+    r = _client().post("/v", json={"n": "SECRET-VALUE"})
+    err = r.json()["detail"]["errors"][0]
+    assert "input" not in err and "ctx" not in err and "SECRET-VALUE" not in r.text
+    assert err["loc"][-1] == "n" and "msg" in err and "type" in err
+
+
+def test_500_logs_the_exception_class_name_not_its_message(monkeypatch):
+    from ba2_trade_platform.api import errors as api_errors
+    lines = []
+
+    class _Rec:
+        @staticmethod
+        def error(msg, *a, **k):
+            lines.append(msg)
+    monkeypatch.setattr(api_errors, "logger", _Rec)
+    _client().get("/crash")
+    assert lines and "RuntimeError" in lines[0] and "secret internals" not in lines[0]
+
+
+def test_413_is_enveloped_with_its_own_code():
+    app = FastAPI()
+    install_error_handlers(app)
+
+    @app.get("/big")
+    def big():
+        raise HTTPException(status_code=413, detail="too big")
+    r = TestClient(app).get("/big")
+    assert r.status_code == 413 and r.json()["error"] == "payload_too_large"
