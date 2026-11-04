@@ -66,7 +66,7 @@ def _merge_open_pnl(items: list) -> bool:
     return bool(priced)
 
 
-def list_transactions(*, account: Optional[int], expert: Optional[int], status: Optional[str],
+def list_transactions(*, include_open_pnl: bool = True, account: Optional[int], expert: Optional[int], status: Optional[str],
                       symbol: Optional[str], from_: Optional[datetime], to: Optional[datetime],
                       limit: int, offset: int) -> Dict[str, Any]:
     stmt = select(Transaction)
@@ -87,12 +87,12 @@ def list_transactions(*, account: Optional[int], expert: Optional[int], status: 
         result = page(session, stmt.order_by(Transaction.id.desc()), limit=limit, offset=offset,
                       convert=_transaction_dict)
     # after the session is closed: pricing talks to the brokers
-    if _merge_open_pnl(result["items"]):
+    if include_open_pnl and _merge_open_pnl(result["items"]):
         result["as_of"] = utcnow_iso()
     return result
 
 
-def transaction_detail(transaction_id: int) -> Dict[str, Any]:
+def transaction_detail(transaction_id: int, include_open_pnl: bool = True) -> Dict[str, Any]:
     with get_db() as session:
         tx = require_row(session, Transaction, transaction_id, "transaction")
         out = _transaction_dict(tx)
@@ -108,7 +108,7 @@ def transaction_detail(transaction_id: int) -> Dict[str, Any]:
         activity = session.exec(stmt.order_by(ActivityLog.id.desc()).limit(200)).all()
     out["orders"] = [row_dict(o) for o in orders]
     out["activity"] = [row_dict(a) for a in activity]
-    if _merge_open_pnl([out]):
+    if include_open_pnl and _merge_open_pnl([out]):
         out["as_of"] = utcnow_iso()
     return out
 

@@ -14,6 +14,7 @@ from ..core.types import OrderStatus
 from ..core.utils import get_account_instance_from_id
 from ..logger import logger
 from ..modules.accounts import get_account_class
+from ._positions_cache import read_positions
 from ._scrub import is_secret_key, mask_setting
 from ._common import jsonable, page, parse_enum, require_row, row_dict, utcnow_iso
 from .errors import BrokerRefused, BrokerUnreachable, NotFound, ServiceError, Unmeasurable
@@ -223,7 +224,7 @@ def broker_positions(account_id: int) -> Dict[str, Any]:
     """Broker-side positions. ``get_positions()`` is tri-state (``None`` = the fetch failed, ``[]`` = flat):
     a failed fetch is ``BrokerUnreachable``, never an empty list."""
     account = _live_account(account_id)
-    positions = broker_read(account_id, "the positions fetch", account.get_positions)
+    positions = broker_read(account_id, "the positions fetch", read_positions, account, account_id)
     if positions is None:
         raise BrokerUnreachable(f"Account {account_id}: the broker positions fetch failed",
                                 {"account_id": account_id})

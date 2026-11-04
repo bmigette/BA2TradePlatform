@@ -37,3 +37,8 @@ class BrokerUnreachable(ServiceError):
 class Unmeasurable(ServiceError):
     """A figure the request asks for cannot be measured. The request fails; it never reads as 0 or null."""
     status_code, code = 503, "unmeasurable"
+
+
+class PriceSourceUnreachable(ServiceError):
+    """The historical price source (not a broker) did not answer within the request's deadline."""
+    status_code, code = 503, "price_source_unreachable"

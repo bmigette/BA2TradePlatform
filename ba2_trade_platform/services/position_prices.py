@@ -30,12 +30,14 @@ def broker_position_prices_from(positions) -> Dict[str, float]:
     return prices
 
 
-def held_position_prices(account, account_id: int, symbols: Iterable[str]) -> Dict[str, float]:
+def held_position_prices(account, account_id: int, symbols: Iterable[str], positions=None,
+                         sources: Dict[str, str] = None) -> Dict[str, float]:
     """Display prices for *symbols*: the broker's position price, the account feed for the rest."""
     symbols = list(symbols)
     prices: Dict[str, float] = {}
     try:
-        positions = account.get_positions()   # None = fetch failure (tri-state)
+        if positions is None:                 # (the API passes the positions it already read)
+            positions = account.get_positions()   # None = fetch failure (tri-state)
         held = broker_position_prices_from(positions) if positions is not None else None
         failure = "the position read failed"
     except Exception as e:
@@ -47,9 +49,13 @@ def held_position_prices(account, account_id: int, symbols: Iterable[str]) -> Di
     for symbol in symbols:
         if symbol in held:
             prices[symbol] = held[symbol]
+            if sources is not None:
+                sources[symbol] = 'broker'
     rest = [s for s in symbols if s not in prices]
     if rest:
         fed = account.get_instrument_current_price(rest)
         if fed:
             prices.update({s: p for s, p in fed.items() if p is not None})
+            if sources is not None:
+                sources.update({s: 'feed' for s, p in fed.items() if p is not None})
     return prices

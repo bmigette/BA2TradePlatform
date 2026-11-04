@@ -13,6 +13,7 @@ from ..core.models import AccountDefinition, ExpertInstance, TradingOrder, Trans
 from ..core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
 from ..core.utils import get_account_instance_from_id
 from ..logger import logger
+from ._positions_cache import read_positions
 from .position_prices import broker_position_prices_from
 from .account_scope import scope_transactions_to_account
 from .stats import expert_ids_for_account
@@ -305,7 +306,7 @@ class FloatingPLCalculator:
         balance, tradable, broker_bp = self._read_money(account, account_id)
 
         try:
-            broker_positions = account.get_positions()
+            broker_positions = read_positions(account, account_id)
         except Exception as e:
             logger.error(f"get_positions() raised for account {account_id}: {e}",
                          exc_info=True)
@@ -553,7 +554,7 @@ class PerAccountPL(FloatingPLCalculator):
                           tradable=tradable, broker_bp=broker_bp)]
 
         try:
-            broker_positions = account.get_positions()
+            broker_positions = read_positions(account, account_id)
         except Exception as e:
             logger.error(f"get_positions() raised for account {account_id}: {e}",
                          exc_info=True)

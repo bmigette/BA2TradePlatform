@@ -36,6 +36,8 @@ def _open(account, symbol, qty=10.0, price=100.0, side=OrderDirection.BUY, statu
 
 @pytest.fixture
 def world(monkeypatch):
+    from ba2_trade_platform.services import _positions_cache
+    _positions_cache.clear()
     a1, a2 = create_account_definition(name="One"), create_account_definition(name="Two")
     brokers = {a1.id: PriceBroker(a1.id, [{"symbol": "AAPL", "current_price": 110.0},
                                           {"symbol": "TSLA", "current_price": 90.0}], feed={"MSFT": 305.0}),
@@ -106,16 +108,61 @@ def test_option_structures_use_the_options_tab_rule(world, monkeypatch):
     tx = _open(a1, "AAPL", asset_class=AssetClass.OPTION)
     seen = {}
 
-    def fake_rule(trans, orders, account, account_id, quotes, marks):
+    def fake_rule(account, account_id, trans, orders, quotes, marks):
         seen.update(marks=marks, orders=len(orders))
-        return 12.5
-    monkeypatch.setattr(svc.FloatingPLCalculator, "_option_transaction_pl", staticmethod(fake_rule))
+        return 12.5, None
+    monkeypatch.setattr(svc, "_option_amount", fake_rule)
     d = v1_client().get(f"/transactions/{tx.id}").json()
     assert d["open_pnl"] == {"amount": 12.5} and d["pnl_status"] == "open_measured"
     assert seen == {"marks": {"AAPL": 110.0, "TSLA": 90.0}, "orders": 1}
-    monkeypatch.setattr(svc.FloatingPLCalculator, "_option_transaction_pl", staticmethod(lambda *a: None))
+    monkeypatch.setattr(svc, "_option_amount", lambda *a: (None, "the option structure holds nothing (no fills)"))
     d = v1_client().get(f"/transactions/{tx.id}").json()
-    assert d["pnl_status"] == "unmeasured" and d["open_pnl"] is None
+    assert d["pnl_status"] == "unmeasured" and d["open_pnl"] is None and "holds nothing" in d["open_pnl_reason"]
+
+
+def test_price_source_says_broker_or_feed(world):
+    a1, _, _ = world
+    _open(a1, "AAPL")
+    _open(a1, "MSFT", qty=2.0, price=300.0)
+    items, _ = _items()
+    assert items["AAPL"]["price_source"] == "broker" and items["MSFT"]["price_source"] == "feed"
+
+
+def test_any_exception_from_one_broker_marks_only_its_rows_with_the_class_name(world):
+    a1, a2, brokers = world
+    _open(a1, "AAPL")
+    _open(a2, "KO", price=50.0)
+
+    def boom():
+        raise KeyError("odd payload with a secret=SHOULDNOTLEAK")
+    brokers[a2.id].get_positions = boom
+    r = v1_client().get("/transactions")
+    assert r.status_code == 200
+    items = {i["symbol"]: i for i in r.json()["items"]}
+    assert items["AAPL"]["pnl_status"] == "open_measured"
+    assert items["KO"]["pnl_status"] == "unmeasured" and "KeyError" in items["KO"]["open_pnl_reason"]
+    assert "SHOULDNOTLEAK" not in r.text
+
+
+def test_include_open_pnl_false_makes_no_broker_call(world):
+    a1, _, brokers = world
+    tx = _open(a1, "AAPL")
+    c = v1_client()
+    body = c.get("/transactions?include_open_pnl=false").json()
+    assert brokers[a1.id].position_reads == 0 and body["items"][0]["pnl_status"] == "open" and "as_of" not in body
+    assert c.get(f"/transactions/{tx.id}?include_open_pnl=false").json()["open_pnl"] is None
+    assert brokers[a1.id].position_reads == 0
+
+
+def test_positions_are_read_once_across_requests_within_the_ttl(world):
+    from ba2_trade_platform.services import _positions_cache
+    a1, _, brokers = world
+    _positions_cache.clear()
+    _open(a1, "AAPL")
+    c = v1_client()
+    c.get("/transactions")
+    c.get("/transactions")
+    assert brokers[a1.id].position_reads == 1
 
 
 def test_a_transaction_without_orders_has_no_known_account(world):

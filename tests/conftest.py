@@ -591,6 +591,9 @@ def api_threadsafe_db(request, patch_db_engine, monkeypatch):
         return
     import ba2_common.core.db as _pkg_db
     from sqlalchemy.pool import StaticPool
+    # the API's short-lived broker-read caches key on small account ids that every test reuses
+    from ba2_trade_platform.services import _positions_cache
+    _positions_cache.clear()
     # log_activity hands the row to a background writer thread that outlives the test; letting it write to (or
     # worse, race the teardown of) the per-test shared engine segfaulted sqlite on Windows. Audit tests assert on
     # the call itself, so a no-op default here loses nothing.
