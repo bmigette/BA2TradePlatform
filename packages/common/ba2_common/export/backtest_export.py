@@ -162,6 +162,21 @@ def derive_export_payload(
                     if isinstance(k, str) and k.startswith("screener:")
                 } if isinstance(sp, dict) else {}
                 eff_screener = {**(screener_opt.get("base_settings") or {}), **screener_overrides}
+                # BACKTEST-ONLY (owner 2026-11-04): an option job's screen is restricted to the names the
+                # backtest has option data for (``screener_opt.universe_restriction``). Live screens WITHOUT
+                # that restriction -- it has real chains for every name -- so the list is never exported, and
+                # the deploy writes ``screener_symbol_universe`` = "" (DEPLOY_EXPLICIT_DEFAULT_SETTINGS), which
+                # clears any list on the instance. A deliberate, logged BT/live difference: live may pick names
+                # the backtest could not.
+                _restr = screener_opt.get("universe_restriction")
+                if _restr is not None:
+                    if not isinstance(_restr, dict) or not isinstance(_restr.get("symbols"), list) or not _restr["symbols"]:
+                        raise ExportRefused(f"screener_opt.universe_restriction is malformed: {_restr!r}")
+                    logger.warning(
+                        f"backtest {backtest.id}: its screener was restricted to {len(_restr['symbols'])} symbols "
+                        f"(backtest-only universe_restriction); the live instance screens WITHOUT it "
+                        f"(screener_symbol_universe cleared by the deploy), so live may pick names this backtest "
+                        f"could not")
                 universe = {
                     "mode": "screener",
                     "screener_store": screener_opt["store"],

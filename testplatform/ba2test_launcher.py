@@ -2148,6 +2148,27 @@ _SCREEN_PRESETS = {
 }
 
 
+def _screener_universe_restriction(args):
+    """``--screener-universe-file``: the symbols (newline/comma separated; blank lines and ``#`` comments ignored; ``BRK.B``
+    spelled ``BRK-B`` like the panel) the screen is restricted to BEFORE its max_stocks cut, or None.  Needs
+    ``--screener``; an empty file refuses.  Parsed by ``ba2_providers.screener.symbol_universe``, the code live uses."""
+    path = getattr(args, "screener_universe_file", None)
+    if not path:
+        if getattr(args, "screener_universe_allow_uncovered", False):
+            sys.exit("optimize: --screener-universe-allow-uncovered needs --screener-universe-file")
+        return None
+    if not getattr(args, "screener", False):
+        sys.exit("optimize: --screener-universe-file needs --screener")
+    if not os.path.isfile(path):
+        sys.exit(f"optimize: --screener-universe-file {path!r} is not a file (relative paths resolve against "
+                 f"{os.getcwd()!r}; pass an absolute path)")
+    from ba2_providers.screener.symbol_universe import read_universe_file     # the parser live uses too
+    syms = read_universe_file(path)
+    if not syms:
+        sys.exit(f"optimize: --screener-universe-file {path!r} lists no symbols")
+    return syms
+
+
 def _screener_launch_inputs(args):
     """``(base_settings, scr_opt, cap_band)`` of the screener launch request. Without ``--screen-preset`` exactly
     what the launch always used (the base JSON, the searched gene set, the cap band). With it: the preset's fixed
@@ -9031,6 +9052,64 @@ def _load_seed_bundle(path: str, style_name: str) -> "tuple[dict, str]":
     return bundle, hashlib.sha256(raw).hexdigest()
 
 
+def _screener_seed_fill(space: dict, bundle_fill: "dict | None" = None) -> "tuple[dict, list]":
+    """``(fill, notes)``: the fill dict for ``assemble_individual`` = the BUNDLE's own ``fill`` patterns first (they win,
+    ``from_fill`` takes the first match) followed by ``{screener:<gene>: loosest value}`` for every screener gene of the
+    space that no bundle pattern covers.  Needed because stage-1 seeds carry no screener gene (backtested on a fixed
+    list; ``_style_translate_key`` refuses a member's own screener gene since screener genes are run-level), so a
+    ``--screener`` style job would otherwise refuse every seed.
+
+    LOOSEST screen of each declared range, so a seed starts as near as the screen allows to the fixed-list behaviour it
+    was selected on and the GA moves from there:
+      * lower-bound filters (market_cap_min, relative_volume_min, price_drop_pct, price_min ...) and the on/off flag
+        (weinstein_stage2_only): the range minimum, or 0 (= filter off) when the range reaches 0.  A lower-bound range
+        whose minimum is > 0 cannot switch the filter off: the minimum is taken and a NOTE says so;
+      * upper-bound filters (market_cap_max, price_max, volume_max, float_max): the range maximum, or 0 (= no ceiling)
+        when the range reaches 0;
+      * window selector (price_drop_days): the range minimum (inert while price_drop_pct is 0);
+      * max_stocks: the range maximum (the largest cut).
+      * sort_metric (categorical): market_cap (no loosest ordering exists; today's fixed behaviour; a bundle fill overrides);
+    Any other categorical gene, an ordering gene other than max_stocks, a gene with no declared role or a
+    malformed range refuses, naming the gene: never a guess, never a KeyError."""
+    from fnmatch import fnmatch
+    from ba2_providers.screener import universe_superset as _usr
+    bundle_fill = dict(bundle_fill or {})
+    seed: dict = {}
+    notes: list = []
+    for key, cfg in space.items():
+        if not key.startswith("screener:") or any(fnmatch(key, pat) for pat in bundle_fill):
+            continue
+        gene = key[len("screener:"):]
+        full = gene if gene.startswith("screener_") else f"screener_{gene}"
+        ref = (f"optimize: seed bundle refused: screener gene {key!r} has no loosest-value rule for a seed fill "
+               f"({{why}}); state it in the bundle's fill")
+        if full == "screener_sort_metric":
+            # An ORDERING has no "loosest" value; the sensible default is today's fixed behaviour, market_cap.  Stated here, not
+            # guessed: a bundle's own fill (checked above) still wins.
+            if not isinstance(cfg, dict) or "market_cap" not in (cfg.get("choices") or ()):
+                raise SystemExit(ref.format(why="a sort gene without market_cap among its choices"))
+            seed[key] = "market_cap"
+            notes.append(f"{key}: an ordering has no loosest value; seeds start at market_cap (today's fixed behaviour)")
+            continue
+        if not isinstance(cfg, dict) or cfg.get("type") == "choice" or cfg.get("min") is None or cfg.get("max") is None:
+            raise SystemExit(ref.format(why="categorical or without a numeric min/max range"))
+        lo, hi = cfg["min"], cfg["max"]
+        if full in _usr._LOWER or full in _usr._FLAG:
+            seed[key] = 0 if lo <= 0 else lo
+            if lo > 0 and full in _usr._LOWER and full != "screener_market_cap_min":
+                notes.append(f"{key}: range minimum {lo} > 0, so the filter cannot be switched off; seeds start at {lo}")
+        elif full in _usr._SELECTOR:
+            seed[key] = lo
+        elif full in _usr._UPPER:
+            seed[key] = 0 if lo <= 0 else hi
+        elif full == "screener_max_stocks":
+            seed[key] = hi
+        else:
+            raise SystemExit(ref.format(why="no role in universe_superset"))
+    return {**bundle_fill, **seed}, notes
+
+
+
 def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, population: int) -> "tuple[list, list]":
     """-> ``(seed gene dicts, provenance list)`` for a bundle against the job's own gene space; every
     refusal is a ``SystemExit`` naming the seed (and the gene, where there is one). Each assembled
@@ -9050,6 +9129,13 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
         sys.exit(f"optimize: seed bundle refused: authored genome: {e}")
     opt = GeneticOptimizer(param_ranges=space, population_size=population, n_generations=1,
                            lattice_anchor=anchor)
+    seed_fill, fill_notes = _screener_seed_fill(space, bundle.get("fill"))
+    if any(k.startswith("screener:") for k in space):
+        print("optimize: seed screener fill (loosest screen of the declared ranges, for genes the seeds do not carry): "
+              + json.dumps({k: v for k, v in seed_fill.items() if k.startswith("screener:") and k not in (bundle.get("fill") or {})},
+                           sort_keys=True), flush=True)
+        for note in fill_notes:
+            print(f"optimize: seed screener fill NOTE: {note}", flush=True)
     seeds, provenance = [], []
     dropped_dead: dict = {}
     for i, ind in enumerate(inds):
@@ -9076,7 +9162,8 @@ def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, pop
         try:
             genes, prov = assemble_individual(
                 space, authored, member_keys, contributions, shared_from=ind.get("shared_from", 0),
-                other_members=ind.get("other_members", "authored"), fill=bundle.get("fill") or {},
+                other_members=ind.get("other_members", "authored"),
+                fill=seed_fill,
                 out_of_range=bundle.get("out_of_range", "clamp"), lattice_anchor=anchor,
                 set_values=ind["set"] if "set" in ind else None)
             opt.encode_params_strict(genes)
@@ -9148,6 +9235,7 @@ def _cmd_optimize(args) -> int:
     _resolve_search_exploration_ranges(getattr(args, "search_exploration_ranges", False), "optimize", args.expert)
     if getattr(args, "screen_preset", None):
         _screener_launch_inputs(args)       # refuse a bad preset combination up front (before any DB work)
+    _screener_universe_restriction(args)    # refuse a restriction flag without --screener / an empty file up front
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -9437,7 +9525,9 @@ def _cmd_optimize(args) -> int:
                 bypass=bool(spec.get("bypass")), surface=_sl.CLI,
                 cap_band=_scap,
                 panel=(os.path.abspath(args.screener_panel) if getattr(args, "screener_panel", None) else None),
-                exclude_uncached=bool(getattr(args, "screener_exclude_uncached", False)))
+                exclude_uncached=bool(getattr(args, "screener_exclude_uncached", False)),
+                universe_restriction=_screener_universe_restriction(args),
+                universe_allow_uncovered=bool(getattr(args, "screener_universe_allow_uncovered", False)))
             try:
                 _prep = _sl.prepare_screener_launch(_sreq)
                 if getattr(args, "print_universe", False):
@@ -9451,6 +9541,11 @@ def _cmd_optimize(args) -> int:
                     print("PRINT-UNIVERSE " + json.dumps({"static_universe_size": len(enabled),
                                                           "intraday_missing_coverage_share": (_cov["missing_coverage_share"] if _cov else None),
                                                           "intraday_no_file": (_cov["no_intraday_file"] if _cov else None),
+                                                          "universe_restriction": (
+                                                              {"symbols": len(_prep.screener_opt["universe_restriction"]["symbols"]),
+                                                               "uncovered": _prep.screener_opt["universe_restriction"]["uncovered"],
+                                                               "sha256": _prep.screener_opt["universe_restriction"]["sha256"]}
+                                                              if "universe_restriction" in _prep.screener_opt else None),
                                                           "uncached": _uncached, "interval": args.interval,
                                                           "rule": _us.RULE_ID,
                                                           "criteria_version": _prep.criteria_version}),
@@ -11513,6 +11608,15 @@ def main(argv: "list | None" = None) -> int:
                          "EXCLUDED from the screen, listed in the output and recorded on the run as "
                          "backtest.excluded_instruments (so the per-decision gate never selects them and "
                          "a re-run reproduces the exclusion).")
+    op.add_argument("--screener-universe-file", default=None,
+                    help="--screener: RESTRICT the screen to the symbols of this file (one per line, '#' comments) BEFORE the "
+                         "max_stocks cut: the static universe, the per-decision gate and every trial pick from this list only "
+                         "(option jobs: the names that have chain data). Recorded on the run (screener_opt.universe_restriction, "
+                         "symbols + sha256) so re-runs, workers and the deploy export carry it; live reads it as the setting "
+                         "screener_symbol_universe. A listed symbol the panel cannot select REFUSES the launch.")
+    op.add_argument("--screener-universe-allow-uncovered", action="store_true",
+                    help="--screener-universe-file: accept (and record) restriction symbols the panel cannot select instead "
+                         "of refusing the launch.")
     op.add_argument("--screener-gate-store", default=None,
                     help="GATE-ONLY screener mode: path to the parquet metric store used PURELY "
                          "as a per-bar entry gate — the run universe stays the static "

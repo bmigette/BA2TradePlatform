@@ -11,8 +11,9 @@ at the decision instant T of D, from stored data only.  Order of operations (ide
   2. volume / RVOL     ALWAYS: no finished bars -> dropped; ``rvol >= rvol_min`` (if > 0), ``avg_volume >= volume_min``,
                        ``avg_volume <= volume_max``
   3. Weinstein         (optional) stage 2 only
-  4. rank              by the cap at the decision price (/quote ``marketCap`` = price now x vendor shares),
-                       descending (ties: symbol ascending)
+  4. rank              by sort_metric, descending: the cap at the decision price (/quote ``marketCap`` = price now x vendor
+                       shares; ties: symbol ascending), or relative_volume / price_drop_pct
+                       (its drop stage runs on EVERY candidate first); these keep the vendor order on ties (live sorts stably)
   5. price drop        walk the ranked list, keep ``drop >= price_drop_pct``, stop after ``max_stocks`` passes
 
 "NOW" AND THE FORMING DAILY BAR.  Live reads FMP's daily history at the scheduled instant T: the history carries the
@@ -270,12 +271,25 @@ def require_complete_settings(settings: Dict[str, Any], *, where: str = "screene
             f"defaults live.")
 
 
+#: The rank keys the simulation reproduces exactly (see ``select_from_columns``).  NOT simulated, and why:
+#: ``volume`` (live ranks on the last finished session's volume ``or`` the vendor's intraday so-far volume when that is 0, a
+#: value the panel does not carry: a hidden fallback that cannot be copied);
+#: ``float_shares`` (live's key exists only when the float stage ran, i.e. a float bound > 0, and is the vendor's LATEST
+#: float table; the panel's float is effective-dated, so the ORDER of two names can differ, not only a threshold test) and
+#: ``composite`` (= cap x volume x float, with ``float or 1`` for an unknown float: the same float gap plus a hidden
+#: fallback that is not copied).  ``universe_superset.SORT_METRIC_CHOICES`` is pinned equal by a test.
+SIMULATED_SORT_METRICS = ("market_cap", "relative_volume", "price_drop_pct")
+
+
 def check_settings(settings: Dict[str, Any], beh: LiveBehaviour) -> None:
     """Refuse (loudly) what the simulation does not reproduce."""
     sm = settings.get("sort_metric") or "market_cap"
-    if sm not in ("market_cap", "relative_volume"):
-        raise SimulationRefusal(f"sort_metric {sm!r} is not simulated (live ranks by it with data the panel "
-                                f"does not carry); supported: market_cap, relative_volume")
+    if sm not in SIMULATED_SORT_METRICS:
+        raise SimulationRefusal(f"sort_metric {sm!r} is not simulated (see SIMULATED_SORT_METRICS); "
+                                f"supported: {', '.join(SIMULATED_SORT_METRICS)}")
+    if sm == "price_drop_pct" and int(_fnum(settings, "price_drop_days")) <= 0:
+        raise SimulationRefusal("sort_metric price_drop_pct needs price_drop_days > 0 (live slices bars[-0:], the whole "
+                                "history, for 0: not simulated)")
     if sm == "relative_volume" and not rvol_stage_runs(beh, _fnum(settings, "relative_volume_min")):
         raise SimulationRefusal("sort_metric relative_volume with relative_volume_min 0 before the fix: "
                                 "live ranks by a relative_volume it never computed there")
@@ -476,22 +490,50 @@ def select_from_columns(*, symbols: np.ndarray, shares: np.ndarray, last_close: 
         return idx
     # rank: the stage-2 refresh replaced the cap by the live /quote cap (post-fix: always)
     sm = settings.get("sort_metric") or "market_cap"
-    if sm == "relative_volume":
-        key = rvol[idx]
-    else:
-        # the refreshed cap = price now x the vendor's shares.  Ranking never DROPS a candidate (only the filters do): a name with no
-        # price at T ranks on its previous-close cap.
-        need_now(drop=False)                                   # the price is read ONCE per decision (a later stage drops/counts)
-        r_lo = lo if lo is not None else np.full(idx.size, np.nan)
-        fac_i = fac[idx] if fac is not None else 1.0
-        key = np.where(np.isfinite(r_lo) & (r_lo > 0), r_lo * shares[idx] * fac_i, mcap_prev[idx])
-    order = np.lexsort((symbols[idx], -key))
-    idx = idx[order]
-    if lo is not None:
-        lo, hi = lo[order], hi[order]
     max_stocks = int(_fnum(settings, "max_stocks"))
     dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
-    if dpct > 0 and ddays > 0:
+    # TIES.  Live sorts with Python's STABLE ``sorted(..., reverse=True)``: equal keys keep the order the candidates arrived in
+    # (the vendor order modelled above: cap descending, ties by symbol).  relative_volume / price_drop_pct (rounded to
+    # 2 decimals) tie constantly, so they keep that order (stable argsort).  market_cap (a continuous key) keeps its symbol tie-break.
+    if sm == "price_drop_pct":
+        # Live (``_screen_impl``): the drop stage runs on EVERY candidate (min_drop = price_drop_pct if > 0 else 0, no early stop),
+        # a candidate without a usable peak / price is skipped, the survivors are sorted by the ROUNDED drop descending.
+        if peak is None:
+            raise SimulationRefusal("sort_metric price_drop_pct but no peak column was supplied")
+        need_now()
+        cur = lo
+        pk = peak[idx]
+        if FORMING_BAR_PRESENT and idx.size:
+            fh = forming_hi(idx) if forming_hi is not None else lo
+            pk = np.fmax(pk, np.where(np.isfinite(fh) & (fh > 0), fh, np.nan))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rd = py_round2((pk - cur) / pk * 100.0)          # round(((peak - current) / peak) * 100, 2), IEEE-identical
+            good = np.isfinite(pk) & (pk > 0) & np.isfinite(cur) & (rd >= max(dpct, 0.0))
+        keep(good)
+        rd = rd[good]
+        dg["price_drop"] = int(idx.size)
+        order = np.argsort(-rd, kind="stable")
+        idx = idx[order]
+        if lo is not None:
+            lo, hi = lo[order], hi[order]
+    else:
+        if sm == "relative_volume":
+            key = np.nan_to_num(rvol[idx], nan=0.0)             # live: a name with no bars has rvol 0.0
+        else:
+            # the refreshed cap = price now x the vendor's shares.  Ranking never DROPS a candidate (only the filters do): a name with no
+            # price at T ranks on its previous-close cap.
+            need_now(drop=False)                                   # the price is read ONCE per decision (a later stage drops/counts)
+            r_lo = lo if lo is not None else np.full(idx.size, np.nan)
+            fac_i = fac[idx] if fac is not None else 1.0
+            key = np.where(np.isfinite(r_lo) & (r_lo > 0), r_lo * shares[idx] * fac_i, mcap_prev[idx])
+        if sm == "market_cap":
+            order = np.lexsort((symbols[idx], -key))
+        else:
+            order = np.argsort(-key, kind="stable")
+        idx = idx[order]
+        if lo is not None:
+            lo, hi = lo[order], hi[order]
+    if sm != "price_drop_pct" and dpct > 0 and ddays > 0:
         if peak is None:
             raise SimulationRefusal("price_drop_pct > 0 but no peak column was supplied")
         need_now()
@@ -623,7 +665,8 @@ class DailyPanel:
         p = self.pos(day)
         cols = self.columns(p)
         dpct, ddays = _fnum(settings, "price_drop_pct"), int(_fnum(settings, "price_drop_days"))
-        peak = self.peak_row(ddays, p) if dpct > 0 and ddays > 0 else None
+        by_drop = (settings.get("sort_metric") or "market_cap") == "price_drop_pct"
+        peak = self.peak_row(ddays, p) if (dpct > 0 or by_drop) and ddays > 0 else None
         dlo, dhi, _v = self.day_bounds(p)
         idx = select_from_columns(**cols, peak=peak, now=now, day_lo=dlo, day_hi=dhi, vol_today=vol_today, settings=settings, beh=beh,
                                   valid=valid, cut=cut, diag=diag,

@@ -103,6 +103,17 @@ class ScreenerDataError(FMPError):
     """
 
 
+#: OPTIONAL restriction of the screen to a fixed symbol list (comma-separated). Absent or "" = no restriction (the whole
+#: vendor universe, as always). Applied to the vendor's candidates BEFORE every filter, rank and cut, exactly where the
+#: backtest's panel gate applies ``universe_restriction`` (``screener_gate.valid_mask``), so a restricted job selects
+#: its ``max_stocks`` from the restricted list, never from the whole market. Used by option jobs, whose chain data and
+#: market-condition manifests exist for a fixed set of names only.
+SYMBOL_UNIVERSE_KEY = "screener_symbol_universe"
+
+
+from ba2_providers.screener.symbol_universe import canonical_symbol, parse_symbol_universe  # noqa: E402,F401
+
+
 class StockScreener:
     """
     Configurable stock screener with screen/enrich/rank pipeline.
@@ -208,6 +219,8 @@ class StockScreener:
                     )
                     self._settings[key] = default
 
+        self._symbol_universe = parse_symbol_universe(settings.get(SYMBOL_UNIVERSE_KEY))
+
         sort_metric = self._settings["screener_sort_metric"]
         if sort_metric not in self._VALID_SORT_METRICS:
             logger.warning(
@@ -299,6 +312,18 @@ class StockScreener:
         if diag is not None:
             self._record_vendor_call(screener, provider_name, filters, candidates, t_call)
             self._record_stage("provider", candidates)
+        if self._symbol_universe is not None:
+            n_before = len(candidates)
+            candidates = [c for c in candidates if canonical_symbol(c.get("symbol")) in self._symbol_universe]
+            stats["dropped_symbol_universe"] = n_before - len(candidates)
+            _msg = (f"StockScreener: {SYMBOL_UNIVERSE_KEY} ({len(self._symbol_universe)} symbols) kept "
+                    f"{len(candidates)} of {n_before} vendor candidates")
+            if candidates:
+                logger.info(_msg)
+            else:
+                logger.warning(_msg + ": NOTHING is left to screen (is the list stale, or the vendor call empty?)")
+        if self._symbol_universe is not None and diag is not None:
+            self._record_stage("symbol_universe", candidates)
         if live:
             # every stage-accounting key always exists on a live run (0 = the stage dropped none),
             # including on the early "no candidates" returns

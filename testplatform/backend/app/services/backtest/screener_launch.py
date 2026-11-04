@@ -23,6 +23,7 @@ This module has no argparse, no HTTP and no FastAPI import.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -38,8 +39,10 @@ API = "api"
 
 _NAMES = {
     CLI: {"store": "--screener-store", "exclude": "--screener-exclude-uncached",
+          "uncovered": "--screener-universe-allow-uncovered",
           "refused": "optimize: --screener REFUSED: ", "plain": "optimize: "},
     API: {"store": "screener_opt.store", "exclude": "screener_opt.exclude_uncached = true",
+          "uncovered": "screener_opt.universe_allow_uncovered = true",
           "refused": "screener optimization REFUSED: ", "plain": "screener optimization: "},
 }
 
@@ -78,6 +81,12 @@ class ScreenerLaunchRequest:
     panel: Optional[str] = None             # an explicit panel directory (absolute, or relative to the cache root)
     exclude_uncached: bool = False
     expect_panel_fingerprint: Optional[str] = None   # a replayed (already stamped) job: the panel it ran on
+    #: OPTION jobs: the fixed candidate list the screen is restricted to BEFORE its max_stocks cut (the symbols the
+    #: option data / market-condition manifests exist for).  None = unrestricted (every other job).
+    universe_restriction: Optional[Sequence[str]] = None
+    #: a restriction symbol the panel cannot select (not in the panel, or on its reviewed exclusion list) REFUSES the
+    #: launch; with this it is accepted and RECORDED (``screener_opt.universe_restriction.uncovered``).
+    universe_allow_uncovered: bool = False
 
 
 @dataclass
@@ -112,6 +121,19 @@ def _print(msg: str) -> None:
     print(msg, flush=True)
 
 
+def stored_restriction_symbols(screener_opt: Dict[str, Any]) -> Optional[List[str]]:
+    """The restriction symbols of a STORED ``screener_opt`` (a replay), None when the job carried none. A stored block
+    that has the key but no usable list (``{}``, ``{"symbols": []}``) is returned as ``[]`` so the launch REFUSES it:
+    it must never be replayed as an unrestricted job."""
+    stored = screener_opt.get("universe_restriction")
+    if stored is None:
+        return None
+    if not isinstance(stored, dict):
+        raise ScreenerLaunchRefused(f"stored universe_restriction is not an object: {stored!r}", plain=True)
+    syms = stored.get("symbols")
+    return list(syms) if isinstance(syms, (list, tuple)) else []
+
+
 def declared_ranges_of(scr_opt: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """``{gene (unprefixed): {min, max}}`` of the searched genes: the ranges the static universe is the superset of."""
     return {k[len("screener_"):] if k.startswith("screener_") else k: {"min": v["min"], "max": v["max"]}
@@ -132,7 +154,26 @@ def prepare_screener_launch(req: ScreenerLaunchRequest, *, emit: Emit = _print) 
     # Cap-band job: the market-cap gene RANGE for the band and a pinned market_cap_max (disjoint universes).
     scr_opt, base = _us.apply_cap_band(req.scr_opt, base, req.cap_band)
     use_sim = not req.bypass
+    if req.bypass and "screener_sort_metric" in scr_opt:
+        # The bypass expert's weekly STORE gate ranks on stored columns (an absent one silently falls back to market_cap) and
+        # is not the live screener: it cannot honour a searched ordering, so the gene is not searched there (said, not silent).
+        scr_opt = {k: v for k, v in scr_opt.items() if k != "screener_sort_metric"}
+        emit("optimize: screener_sort_metric is NOT searched for a bypass expert (its weekly store gate has no live-faithful "
+             "ordering); the base sort_metric applies")
     panel_dir: Optional[str] = None
+    restriction_syms: Optional[List[str]] = None
+    if req.universe_restriction is not None:
+        from ba2_providers.screener.symbol_universe import parse_symbols
+        try:
+            restriction_syms = parse_symbols(list(req.universe_restriction), what="the universe restriction")
+        except ValueError as e:
+            raise ScreenerLaunchRefused(str(e), surface=req.surface, plain=True) from None
+        if not restriction_syms:
+            raise ScreenerLaunchRefused("the universe restriction lists no symbols", surface=req.surface, plain=True)
+        if not use_sim:
+            raise ScreenerLaunchRefused(
+                "a universe restriction needs the daily-panel gate; the bypass expert FactorRanker's weekly store gate "
+                "cannot apply it", surface=req.surface, plain=True)
     if use_sim:
         allk = {**base, **{(k[len("screener_"):] if k.startswith("screener_") else k): True
                            for k, v in scr_opt.items() if v and v.get("optimize")}}
@@ -187,6 +228,28 @@ def prepare_screener_launch(req: ScreenerLaunchRequest, *, emit: Emit = _print) 
         # settings off their OWN expert settings (`_build_daily_trial_config` pushes them each generation).
         "apply_to_expert_settings": bool(req.bypass),
     }
+    if restriction_syms is not None:
+        from app.services.backtest import screener_gate as _sgr
+        _pan = _sgr.get_panel(panel_dir, history_source=req.history_source)
+        _blocked = set(_sgr.ms.EXCLUDED_SYMBOLS) | {str(e["symbol"]).upper() for e in
+                                                    (_pan.manifest.get("excluded_unusable") or [])}
+        _selectable = {str(x).upper() for x in _pan.symbols} - _blocked
+        uncovered = [x for x in restriction_syms if x not in _selectable]
+        if uncovered and not req.universe_allow_uncovered:
+            raise ScreenerLaunchRefused(
+                f"{len(uncovered)} of the {len(restriction_syms)} restriction symbols cannot be selected by the panel "
+                f"{panel_dir} (not in it, or on its reviewed exclusion list): {', '.join(uncovered)}. Rebuild the panel "
+                f"for them, or pass {names['uncovered']} to accept it (recorded on the run).",
+                surface=req.surface, problems=uncovered)
+        if uncovered:
+            emit(f"optimize: universe restriction: {len(uncovered)} symbols the panel cannot select are accepted and "
+                 f"RECORDED: {', '.join(uncovered)}")
+        restriction_stamp = {"symbols": restriction_syms,
+                             "sha256": hashlib.sha256("\n".join(restriction_syms).encode()).hexdigest(),
+                             "uncovered": uncovered}
+        screener_opt["universe_restriction"] = restriction_stamp
+        emit(f"optimize: screener universe restricted to {len(restriction_syms)} symbols "
+             f"(sha256 {restriction_stamp['sha256'][:12]}), applied before the max_stocks cut")
     from app.services.backtest.history_source import load_job_store
     store_df = load_job_store(req.store, {"ohlcv_history_source": req.history_source})
     if store_df.empty:
@@ -199,7 +262,7 @@ def prepare_screener_launch(req: ScreenerLaunchRequest, *, emit: Emit = _print) 
         if use_sim:
             from app.services.backtest import screener_gate as sg   # the SAME function as the gate and the prune
             enabled = sg.static_universe(sg.get_panel(panel_dir, history_source=req.history_source), req.start, req.end, base, ranges,
-                                         intraday=_us.interval_is_intraday(req.interval))
+                                         intraday=_us.interval_is_intraday(req.interval), restrict_to=restriction_syms)
         else:
             enabled = _us.static_universe(store_df, req.start, req.end, base, ranges,
                                           intraday=_us.interval_is_intraday(req.interval))

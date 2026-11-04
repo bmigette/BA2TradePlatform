@@ -225,6 +225,64 @@ def test_simulation_equals_live_screen_end_to_end(seed, monkeypatch):
     test_simulation_equals_live_screen_end_to_end.total = getattr(test_simulation_equals_live_screen_end_to_end, "total", 0) + len(live)
 
 
+def _off_the_cap_edges(st: dict) -> dict:
+    """``random_settings`` draws the cap bounds from the candidates' OWN caps, so a name can sit exactly on a bound, where the vendor's
+    float product and the simulation's can differ in the last ulp (a fixture artefact, orthogonal to ordering): nudge them off."""
+    out = dict(st)
+    out["market_cap_min"] = st["market_cap_min"] * 0.999
+    if st["market_cap_max"]:
+        out["market_cap_max"] = st["market_cap_max"] * 1.001
+    return out
+
+
+@pytest.mark.parametrize("sort_metric", ["relative_volume", "price_drop_pct"])
+@pytest.mark.parametrize("seed", range(60))
+def test_searched_ordering_equals_live_screen_end_to_end(seed, sort_metric, monkeypatch):
+    """The GA-searched orderings (``universe_superset.SORT_METRIC_CHOICES``): the SAME ordered list as StockScreener.screen()
+    with ``screener_sort_metric`` set -- including the price-drop ranking (drop stage on every candidate, then sorted by the
+    rounded drop) and the stable tie order of rvol / drop (rounded to 2 decimals)."""
+    world = World(seed)
+    install_vendor(monkeypatch, world)
+    rng = random.Random(seed * 7 + 1)
+    settings = {**_off_the_cap_edges(random_settings(rng, world)), "sort_metric": sort_metric}
+    if sort_metric == "price_drop_pct":
+        settings["price_drop_pct"] = rng.choice([0, 0, 3.0, 8.0])        # a floor of 0 ranks every candidate with a usable peak
+    live = run_live(world, settings)
+    sim = world.panel().select(DAY, settings, ls.POST_FIX, now=world.now_fn())
+    assert sim == live, f"seed {seed} {sort_metric}: {settings} live {live} sim {sim}"
+
+
+def test_searched_orderings_are_not_vacuous_and_differ_from_market_cap(monkeypatch):
+    seen = {"relative_volume": 0, "price_drop_pct": 0}
+    differs = {"relative_volume": 0, "price_drop_pct": 0}
+    for seed in range(60):
+        world = World(seed)
+        install_vendor(monkeypatch, world)
+        base = {**_off_the_cap_edges(random_settings(random.Random(seed * 7 + 1), world)), "price_drop_pct": 0}
+        cap = world.panel().select(DAY, {**base, "sort_metric": "market_cap"}, ls.POST_FIX, now=world.now_fn())
+        for sm in seen:
+            got = world.panel().select(DAY, {**base, "sort_metric": sm}, ls.POST_FIX, now=world.now_fn())
+            seen[sm] += bool(got)
+            differs[sm] += got != cap
+    assert min(seen.values()) >= 15 and min(differs.values()) >= 5, (seen, differs)
+
+
+def test_ranked_ties_keep_the_vendor_order_like_live_stable_sort():
+    syms = np.array(["Z", "A", "M", "B"])
+    close = np.array([100.0, 100.0, 120.0, 90.0])        # vendor order: M (cap 120), Z, A (tied 100: symbol), B
+    rv = np.array([1.5, 1.5, 1.5, 2.5])
+    sel = ls.select_from_columns(**_cols(4, symbols=syms, last_close=close, rvol=rv), now=close,
+                                 settings={"max_stocks": 10, "sort_metric": "relative_volume"}, beh=ls.POST_FIX)
+    assert [str(syms[i]) for i in sel] == ["B", "M", "A", "Z"]       # B first; the 1.5 tie in vendor order M, A, Z
+
+
+def test_sort_metric_choices_are_exactly_the_simulated_ones():
+    from ba2_providers.screener import universe_superset as us
+    assert tuple(us.SORT_METRIC_CHOICES) == ls.SIMULATED_SORT_METRICS
+    assert us.SCREENER_OPT["screener_sort_metric"]["choices"] == list(us.SORT_METRIC_CHOICES)
+    assert us.SCREENER_OPT["screener_sort_metric"]["choices"][0] == "market_cap"
+
+
 def test_end_to_end_is_not_vacuous(monkeypatch):
     """The random worlds must select something often, or the test above proves nothing."""
     nonempty = 0
@@ -400,7 +458,8 @@ def test_legacy_volume_min_is_the_session_volume_so_far():
 
 def test_unsupported_settings_refuse():
     cols = _cols(2)
-    for bad in ({"sort_metric": "composite"}, {"dollar_volume_min": 1e6}):
+    for bad in ({"sort_metric": "composite"}, {"sort_metric": "volume"}, {"sort_metric": "float_shares"},
+                {"sort_metric": "price_drop_pct", "price_drop_days": 0}, {"dollar_volume_min": 1e6}):
         with pytest.raises(ls.SimulationRefusal):
             ls.select_from_columns(**cols, now=np.full(2, 1.0), settings=bad, beh=ls.POST_FIX)
 

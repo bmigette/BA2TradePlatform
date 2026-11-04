@@ -346,6 +346,11 @@ def _collect_screener(screener_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for name, spec in (screener_cfg or {}).items():
         if not spec or not spec.get("optimize"):
             continue
+        if spec.get("type") == "choice":
+            # Categorical screener gene (screener_sort_metric): an int INDEX into 'choices', decoded to the VALUE.
+            choices = list(spec["choices"])
+            out[f"screener:{name}"] = {"type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1}
+            continue
         is_int = spec.get("type") == "int"
         out[f"screener:{name}"] = _range_entry(spec.get("min"), spec.get("max"),
                                                spec.get("step"), is_int=is_int)

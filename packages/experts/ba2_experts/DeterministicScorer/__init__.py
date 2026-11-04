@@ -122,7 +122,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     # Written with the class default by a deploy whose payload omits them (see
     # ba2_common.core.deploy_parity.explicit_default_settings): an equity payload leaves
     # macro_short_side out, and a "mirror" left by an earlier option deploy must not survive.
-    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("macro_short_side",)
+    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("macro_short_side", "screener_symbol_universe")
 
     def __init__(self, id: int):
         super().__init__(id)

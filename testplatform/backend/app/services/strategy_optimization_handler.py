@@ -2880,6 +2880,16 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
         # restriction so the static run universe is kept byte-identical.
         hoisted["screener_gate_only"] = bool(screener_opt.get("gate_only"))
         hoisted["screener_declared_ranges"] = screener_opt.get("declared_ranges")
+        # OPTION jobs: the screen is restricted to a fixed candidate list BEFORE the max_stocks cut (the panel gate's
+        # valid mask); the symbols are on the run config, so every trial, re-run and worker applies the same list.
+        _restr = screener_opt.get("universe_restriction")
+        if _restr is not None:
+            if not (isinstance(_restr, dict) and _restr.get("symbols")):
+                raise ValueError("screener_opt.universe_restriction must be {'symbols': [non-empty list], ...}")
+            if not (screener_opt.get("criteria_version") or screener_opt.get("panel")):
+                raise ValueError("screener_opt.universe_restriction needs the daily-panel gate (criteria_version/panel): "
+                                 "the legacy weekly store gate cannot apply it")
+            hoisted["screener_universe_restriction"] = [str(x).upper() for x in _restr["symbols"]]
         # LIVE-SIMULATION gate (criteria live-daily-v2): the run carries the criteria version and the daily
         # panel it was launched against.  A panel that does not cover the window, or was built under another
         # definition, REFUSES here -- before any trial -- with the list of what is missing.
@@ -3218,6 +3228,8 @@ def _build_daily_trial_config(
             # below for a non-bypass expert, but threaded through so this gate can never be the one
             # place an excluded symbol slips back in.
             "excluded_symbols": excluded_instruments,
+            **({"universe_restriction": hoisted["screener_universe_restriction"]}
+               if hoisted.get("screener_universe_restriction") else {}),
         }
         # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
         # screen can EVER select over the run's VISIBLE scans (``screened_symbol_union_visible`` with
@@ -3247,7 +3259,8 @@ def _build_daily_trial_config(
                 _union = set(_sg.prune_symbols(
                     _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"],
                                   history_source=_job_hist(backtest_cfg)), _sd, _ed, eff_norm, excluded_instruments,
-                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")),
+                    restrict_to=hoisted.get("screener_universe_restriction")))
             else:
                 from app.services.backtest.history_source import load_job_store
                 _df = load_job_store(hoisted["screener_store"], backtest_cfg)

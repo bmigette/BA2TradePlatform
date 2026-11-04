@@ -576,6 +576,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
 
+    # Settings a deploy writes with their class default when the payload omits them (deploy_parity.explicit_default_settings):
+    # a deploy never deletes, so a restricted option deploy's screener list must be CLEARED by a later unrestricted one.
+    # A subclass that declares its own tuple must repeat these.
+    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("screener_symbol_universe",)
+
     # Set to False in subclasses that manage their own risk (e.g. LiveExpertInterface).
     # When False, the platform's risk manager settings are hidden in the UI.
     uses_risk_manager: bool = True
@@ -1246,6 +1251,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "price above a RISING 30-week SMA (the classic 'only buy in Stage 2' rule). "
                                "Filters out basing (Stage 1), topping (Stage 3) and declining (Stage 4) names. "
                                "Adds an OHLCV history fetch (~250 days) for the candidates."
+                },
+                # Restricts the screen to a fixed list BEFORE every filter/rank/cut. Empty = no restriction.
+                "screener_symbol_universe": {
+                    "type": "str", "required": False, "default": "",
+                    "description": "Restrict the screener to these symbols (comma-separated, empty = none)",
+                    "tooltip": "Only these symbols can be screened: the vendor's candidates are intersected with this list "
+                               "BEFORE the filters, the ranking and the max-stocks cut, so the picks are the best "
+                               "max-stocks OF THIS LIST. Used by option experts, whose chain data exists for a fixed set "
+                               "of names. Leave empty for the whole market."
                 },
 
             }
