@@ -8,7 +8,8 @@ from ..core.models import ExpertInstance, MarketAnalysis
 from ..core.utils import get_expert_instance_from_id
 from ._common import page, require_row, row_dict
 from .accounts import is_secret_setting
-from .errors import NotFound, Unmeasurable
+from ._readonly import readonly_balance_reads
+from .errors import Invalid, NotFound, Unmeasurable
 
 _SCHEDULE_PREFIX = "execution_schedule"
 _RESERVE_KEY = "overalloc_min_res_pct"
@@ -43,7 +44,10 @@ def expert_detail(expert_id: int) -> Dict[str, Any]:
     with get_db() as session:
         out = row_dict(require_row(session, ExpertInstance, expert_id, "expert"))
         out["last_analysis"] = _last_analysis(session, expert_id)
-    expert = get_expert_instance_from_id(expert_id)
+    try:
+        expert = get_expert_instance_from_id(expert_id)
+    except ValueError as e:        # e.g. the stored expert type is not registered
+        raise Invalid(f"Expert {expert_id} cannot be instantiated: {type(e).__name__}: {e}", {"id": expert_id}) from e
     if expert is None:
         raise NotFound(f"No expert instance with id {expert_id}", {"id": expert_id})
     definitions = type(expert).get_merged_settings_definitions()
@@ -55,7 +59,9 @@ def expert_detail(expert_id: int) -> Dict[str, Any]:
     out["schedule"] = {k: v for k, v in settings.items() if k.startswith(_SCHEDULE_PREFIX)}
     # Explicit access: the key is a built-in MarketExpertInterface setting, so a KeyError is a real bug.
     out["overalloc_min_res_pct"] = expert.settings[_RESERVE_KEY]
-    capital = expert.describe_capital_mapping()
+    # A GET must not touch the live buying-power failure memory nor sleep on retries (see _readonly).
+    with readonly_balance_reads():
+        capital = expert.describe_capital_mapping()
     if capital is None or "error" in capital:
         reason = "nothing to describe" if capital is None else capital["error"]
         raise Unmeasurable(f"Expert {expert_id}: capital cannot be measured: {reason}", {"id": expert_id})
