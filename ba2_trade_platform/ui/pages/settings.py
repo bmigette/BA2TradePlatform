@@ -4848,27 +4848,13 @@ class ExpertSettingsTab:
 
         Raises ValueError, which ``_save_expert``'s handler turns into a red notification naming
         the leaf, the field and the setting.
+
+        The check itself is services.experts.check_market_gates, shared with the management API.
         """
-        from ba2_common.core.market_condition_live import (
-            market_condition_fields_in_ruleset,
-            ruleset_rule_contents,
-        )
+        from ...services.experts import check_market_gates
 
-        exit_where = f"open-positions ruleset {open_positions_ruleset_id}"
-        assert_market_rule_actions_live(ruleset_rule_contents(open_positions_ruleset_id),
-                                        exit_where)
-
-        used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
-        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
-        if not used and not on_exit:
-            return          # no market leaf: any profile setting is fine, including empty
-        profiles = parse_profile_setting(
-            self._effective_market_condition_profile(expert_instance_id))
-        if used:
-            assert_fields_served(used, profiles,
-                                 where=f"enter-market ruleset {enter_market_ruleset_id}")
-        if on_exit:
-            assert_fields_served(on_exit, profiles, where=exit_where)
+        check_market_gates(enter_market_ruleset_id, open_positions_ruleset_id,
+                           lambda: self._effective_market_condition_profile(expert_instance_id))
 
     def _validated_priority(self):
         from ...core.ExpertPriority import validate_expert_priority
@@ -5385,14 +5371,9 @@ class ExpertSettingsTab:
         
         logger.debug(f'Saved all expert settings for instance {expert_id}')
         
-        # Refresh scheduled jobs for this expert
-        try:
-            from ...core.JobManager import get_job_manager
-            job_manager = get_job_manager()
-            job_manager.refresh_expert_schedules(expert_id)
-            logger.info(f'Refreshed scheduled analysis jobs for expert {expert_id}')
-        except Exception as e:
-            logger.error(f'Error refreshing scheduled jobs for expert {expert_id}: {e}', exc_info=True)
+        # Refresh scheduled jobs for this expert (shared with the management API)
+        from ...services.experts import refresh_schedules
+        refresh_schedules(expert_id)
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""
