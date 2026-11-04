@@ -103,6 +103,29 @@ class ScreenerDataError(FMPError):
     """
 
 
+#: OPTIONAL restriction of the screen to a fixed symbol list (comma-separated). Absent or "" = no restriction (the whole
+#: vendor universe, as always). Applied to the vendor's candidates BEFORE every filter, rank and cut, exactly where the
+#: backtest's panel gate applies ``universe_restriction`` (``screener_gate.valid_mask``), so a restricted job selects
+#: its ``max_stocks`` from the restricted list, never from the whole market. Used by option jobs, whose chain data and
+#: market-condition manifests exist for a fixed set of names only.
+SYMBOL_UNIVERSE_KEY = "screener_symbol_universe"
+
+
+def parse_symbol_universe(raw: Any) -> Optional[frozenset]:
+    """The restriction as a set of upper-case symbols; None = no restriction. A value that is neither a string nor a
+    list of strings raises (a malformed restriction must not silently become "no restriction")."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = [x.strip().upper() for x in raw.replace(chr(10), ",").split(",")]
+    elif isinstance(raw, (list, tuple, set, frozenset)) and all(isinstance(x, str) for x in raw):
+        parts = [x.strip().upper() for x in raw]
+    else:
+        raise ValueError(f"{SYMBOL_UNIVERSE_KEY} must be a comma-separated string, got {type(raw).__name__}: {raw!r}")
+    syms = frozenset(x for x in parts if x)
+    return syms or None
+
+
 class StockScreener:
     """
     Configurable stock screener with screen/enrich/rank pipeline.
@@ -208,6 +231,8 @@ class StockScreener:
                     )
                     self._settings[key] = default
 
+        self._symbol_universe = parse_symbol_universe(settings.get(SYMBOL_UNIVERSE_KEY))
+
         sort_metric = self._settings["screener_sort_metric"]
         if sort_metric not in self._VALID_SORT_METRICS:
             logger.warning(
@@ -299,6 +324,14 @@ class StockScreener:
         if diag is not None:
             self._record_vendor_call(screener, provider_name, filters, candidates, t_call)
             self._record_stage("provider", candidates)
+        if self._symbol_universe is not None:
+            n_before = len(candidates)
+            candidates = [c for c in candidates if str(c.get("symbol") or "").upper() in self._symbol_universe]
+            stats["dropped_symbol_universe"] = n_before - len(candidates)
+            logger.info(f"StockScreener: {SYMBOL_UNIVERSE_KEY} ({len(self._symbol_universe)} symbols) kept "
+                        f"{len(candidates)} of {n_before} vendor candidates")
+        if self._symbol_universe is not None and diag is not None:
+            self._record_stage("symbol_universe", candidates)
         if live:
             # every stage-accounting key always exists on a live run (0 = the stage dropped none),
             # including on the early "no candidates" returns

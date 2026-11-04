@@ -1247,6 +1247,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "Filters out basing (Stage 1), topping (Stage 3) and declining (Stage 4) names. "
                                "Adds an OHLCV history fetch (~250 days) for the candidates."
                 },
+                # Restricts the screen to a fixed list BEFORE every filter/rank/cut. Empty = no restriction.
+                "screener_symbol_universe": {
+                    "type": "str", "required": False, "default": "",
+                    "description": "Restrict the screener to these symbols (comma-separated, empty = none)",
+                    "tooltip": "Only these symbols can be screened: the vendor's candidates are intersected with this list "
+                               "BEFORE the filters, the ranking and the max-stocks cut, so the picks are the best "
+                               "max-stocks OF THIS LIST. Used by option experts, whose chain data exists for a fixed set "
+                               "of names. Leave empty for the whole market."
+                },
 
             }
 

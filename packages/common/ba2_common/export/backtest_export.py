@@ -162,6 +162,11 @@ def derive_export_payload(
                     if isinstance(k, str) and k.startswith("screener:")
                 } if isinstance(sp, dict) else {}
                 eff_screener = {**(screener_opt.get("base_settings") or {}), **screener_overrides}
+                # An option job's screen is restricted to a fixed candidate list BEFORE the cut; live reads it as
+                # ``screener_symbol_universe`` (StockScreener), so it travels in the same block as the other keys.
+                _restr = screener_opt.get("universe_restriction")
+                if _restr:
+                    eff_screener = {**eff_screener, "screener_symbol_universe": ",".join(_restr["symbols"])}
                 universe = {
                     "mode": "screener",
                     "screener_store": screener_opt["store"],

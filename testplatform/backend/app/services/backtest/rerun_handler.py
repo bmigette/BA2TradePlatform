@@ -122,8 +122,11 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
         new = sg.static_universe(sg.get_panel(_ls.resolve_panel_path(so["panel"]), so["panel_fingerprint"],
                                                   history_source=resolve_job_history_source(bt_block)), str(bt_block["start_date"])[:10],
                                  str(bt_block["end_date"])[:10], so["base_settings"], ranges,
-                                 intraday=us.interval_is_intraday(interval), excluded_symbols=excluded)
+                                 intraday=us.interval_is_intraday(interval), excluded_symbols=excluded,
+                                 restrict_to=((so.get("universe_restriction") or {}).get("symbols") or None))
     else:
+        if so.get("universe_restriction"):
+            raise ValueError(f"--recompute-universe row {row_id}: a universe_restriction needs the daily-panel gate")
         df = load_job_store(so["store"], bt_block)
         new = us.static_universe(df, str(bt_block["start_date"])[:10], str(bt_block["end_date"])[:10],
                                  so["base_settings"], ranges, intraday=us.interval_is_intraday(interval),

@@ -252,6 +252,8 @@ LIVE_SCREENER_SETTINGS = frozenset((
     "screener_price_drop_pct", "screener_price_drop_days",
     "screener_max_stocks", "screener_sort_metric",
     "screener_weinstein_stage2_only",
+    # the option jobs' fixed candidate list (backtest ``screener_opt.universe_restriction``), comma-separated
+    "screener_symbol_universe",
 ))
 
 

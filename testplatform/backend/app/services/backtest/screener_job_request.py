@@ -261,9 +261,13 @@ def apply_screener_request(cfg: Dict[str, Any], screener_opt: Dict[str, Any], *,
         panel=_panel_arg(screener_opt.get("panel"), CACHE_FOLDER),
         # a replayed config that recorded excluded_instruments was launched with the exclusion policy on
         exclude_uncached=bool(screener_opt.get("exclude_uncached") or bt_in.get("excluded_instruments")),
-        expect_panel_fingerprint=screener_opt.get("panel_fingerprint") or None)
+        expect_panel_fingerprint=screener_opt.get("panel_fingerprint") or None,
+        universe_restriction=((screener_opt.get("universe_restriction") or {}).get("symbols") or None),
+        universe_allow_uncovered=bool((screener_opt.get("universe_restriction") or {}).get("uncovered")
+                                      or screener_opt.get("universe_allow_uncovered")))
     key = json.dumps([req.store, req.start, req.end, req.interval, req.history_source, req.base_settings, req.scr_opt, req.cadence_days,
-                      req.bypass, req.cap_band, req.panel, req.exclude_uncached, req.expect_panel_fingerprint],
+                      req.bypass, req.cap_band, req.panel, req.exclude_uncached, req.expect_panel_fingerprint,
+                      req.universe_restriction, req.universe_allow_uncovered],
                      sort_keys=True, default=str)
     launch = (memo or {}).get(key)
     if launch is None:

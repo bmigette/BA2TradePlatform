@@ -60,13 +60,24 @@ def clear_panel_memo() -> None:
     _PANEL_MEMO.clear()
 
 
-def valid_mask(panel: ls.DailyPanel, excluded_symbols: Optional[Iterable[str]]) -> np.ndarray:
-    """Symbols allowed through the gate: everything but the module-level and the per-run exclusions."""
+def valid_mask(panel: ls.DailyPanel, excluded_symbols: Optional[Iterable[str]],
+               restrict_to: Optional[Iterable[str]] = None) -> np.ndarray:
+    """Symbols allowed through the gate: everything but the module-level and the per-run exclusions and, when the job
+    carries a ``universe_restriction`` (``restrict_to``), ONLY those symbols.  The restriction is part of the mask, so it
+    acts BEFORE the max_stocks cut (the picks are the best N OF THE RESTRICTED LIST); live applies the same restriction to
+    the vendor's candidates before its filters (``StockScreener`` setting ``screener_symbol_universe``)."""
     both = (set(ms.EXCLUDED_SYMBOLS) | {str(s).upper() for s in (excluded_symbols or ())}
             | {str(e["symbol"]).upper() for e in (panel.manifest.get("excluded_unusable") or [])})   # the reviewed list
-    if not both:
-        return np.ones(len(panel.symbols), dtype=bool)
-    return ~np.isin(np.char.upper(panel.symbols.astype(str)), np.array(sorted(both)))
+    upper = np.char.upper(panel.symbols.astype(str))
+    ok = np.ones(len(panel.symbols), dtype=bool)
+    if both:
+        ok &= ~np.isin(upper, np.array(sorted(both)))
+    if restrict_to is not None:
+        keep = sorted({str(s).upper() for s in restrict_to})
+        if not keep:
+            raise ScreenerGateRefusal("an empty universe_restriction would select nothing: refusing")
+        ok &= np.isin(upper, np.array(keep))
+    return ok
 
 
 def _iso(d: Any) -> str:
@@ -95,11 +106,11 @@ def next_session(panel: ls.DailyPanel, day: str) -> str:
 
 def prune_symbols(panel: ls.DailyPanel, start_day: str, end_day: str, settings: Dict[str, Any],
                   excluded_symbols: Optional[Iterable[str]], *, intraday: bool,
-                  beh: Optional[ls.LiveBehaviour] = None) -> List[str]:
+                  beh: Optional[ls.LiveBehaviour] = None, restrict_to: Optional[Iterable[str]] = None) -> List[str]:
     """Sorted union, over every morning of the window, of what the gate can return for ``settings`` at ANY decision
     time: the SAME selection as the gate, with "now" = the session's [low, high] and no ``max_stocks`` cut."""
     beh = beh or ls.POST_FIX
-    valid = valid_mask(panel, excluded_symbols)
+    valid = valid_mask(panel, excluded_symbols, restrict_to)
     out: set = set()
     for day in screen_days(panel, start_day, end_day, intraday=intraday):
         out.update(panel.select_bounds(day, settings, beh, cut=False, valid=valid, daily_clock=not intraday))
@@ -109,20 +120,21 @@ def prune_symbols(panel: ls.DailyPanel, start_day: str, end_day: str, settings: 
 def static_universe(panel: ls.DailyPanel, start_day: str, end_day: str, base: Dict[str, Any],
                     ranges: Dict[str, Dict[str, Any]], *, intraday: bool,
                     excluded_symbols: Optional[Iterable[str]] = None,
-                    beh: Optional[ls.LiveBehaviour] = None) -> List[str]:
+                    beh: Optional[ls.LiveBehaviour] = None,
+                    restrict_to: Optional[Iterable[str]] = None) -> List[str]:
     """The job's static superset: ``prune_symbols`` at the loosest value of every searched FILTER gene (and, when a
     drop threshold is enforced at its loosest value, over every searched window length)."""
     from ba2_providers.screener import universe_superset as us
     out: set = set()
     for settings in us.loosest_filter_variants(base, ranges):
         out.update(prune_symbols(panel, start_day, end_day, settings, excluded_symbols,
-                                 intraday=intraday, beh=beh))
+                                 intraday=intraday, beh=beh, restrict_to=restrict_to))
     return sorted(out)
 
 
 class PanelGate:
     """Per-run gate.  ``runtime`` = the engine's ``screener_runtime`` ({"panel", "settings", "excluded_symbols",
-    "criteria_version"}); ``price_source`` supplies "now"."""
+    "criteria_version"[, "universe_restriction"]}); ``price_source`` supplies "now"."""
 
     def __init__(self, runtime: Dict[str, Any], price_source: Any, *, intraday: bool, history_source: str,
                  beh: Optional[ls.LiveBehaviour] = None):
@@ -138,7 +150,7 @@ class PanelGate:
             raise ScreenerGateRefusal(f"panel {runtime['panel']} was built with criteria "
                                       f"{self.panel.manifest.get('criteria_version')!r}, not {ls.CRITERIA_VERSION!r}")
         self.settings = dict(runtime["settings"])
-        self.valid = valid_mask(self.panel, runtime.get("excluded_symbols"))
+        self.valid = valid_mask(self.panel, runtime.get("excluded_symbols"), runtime.get("universe_restriction"))
         self.beh = beh or ls.POST_FIX
         ls.require_complete_settings(self.settings, where="PanelGate")
         self.ps = price_source

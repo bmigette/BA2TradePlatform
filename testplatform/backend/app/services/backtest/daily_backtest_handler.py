@@ -423,6 +423,16 @@ def _resolve_screener_store(universe: Dict[str, Any]) -> str:
     return store
 
 
+def _refuse_symbol_universe(universe: Dict[str, Any]) -> None:
+    """The standalone screener run is gated by the legacy weekly store, which cannot restrict the screen to a fixed list
+    (``screener_symbol_universe``, an option job's candidate list): running it unrestricted would be a different
+    strategy than the one exported, so it REFUSES."""
+    if (universe.get("screener_settings") or {}).get("screener_symbol_universe"):
+        raise ValueError("universe.screener_settings.screener_symbol_universe is set: the standalone screener backtest "
+                         "(legacy weekly store gate) cannot apply it. Re-run the optimization's stored row (rerun_handler) "
+                         "or run the exported expert live.")
+
+
 def _build_screener_runtime(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """For a ``universe.mode=='screener'`` run, build the per-bar gate config the engine reads.
 
@@ -435,6 +445,7 @@ def _build_screener_runtime(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     universe = payload.get("universe") or {}
     if universe.get("mode") != "screener":
         return None
+    _refuse_symbol_universe(universe)
     return {
         "store": _resolve_screener_store(universe),
         "settings": _metric_store_settings(universe.get("screener_settings") or {}),
@@ -670,6 +681,7 @@ def _resolve_enabled_instruments(
         # preloading the full store loads/holds OHLCV for ~800 never-touched symbols (huge memory
         # + load time, and one data-less symbol aborts the run). The per-bar screener_runtime gate
         # still restricts entries each bar; this only bounds what OHLCV gets loaded.
+        _refuse_symbol_universe(universe)
         df = load_job_store(store, payload)  # refuses a store built from the other OHLCV history
         settings = _metric_store_settings(universe.get("screener_settings") or {})
         # The scans the per-decision gate can resolve to (visible_scan_window), not "last scan <= start":
