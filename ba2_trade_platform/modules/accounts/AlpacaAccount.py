@@ -6138,6 +6138,92 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error replacing broker OCO order: {e}", exc_info=True)
             return False
 
+    def _dividends_from_activities(self, raw_activities, raw_nra, symbol=None):
+        """The platform dividend records from the raw DIV and DIVNRA activities (shared by the lenient and the strict
+        read, so the two cannot disagree about the same activities)."""
+        # Build map of tax withholding by (symbol, date)
+        nra_map = {}
+        for nra in raw_nra:
+            nra_symbol = nra.get('symbol')
+            nra_date = nra.get('date') or nra.get('transaction_time')
+            if nra_symbol and nra_date:
+                nra_date_str = str(nra_date)[:10]  # Extract YYYY-MM-DD
+                key = (nra_symbol, nra_date_str)
+                nra_map[key] = nra_map.get(key, 0) + abs(float(nra.get('net_amount', 0) or 0))
+
+        dividends = []
+        for activity in raw_activities:
+            act_symbol = activity.get('symbol')
+            if symbol and act_symbol != symbol:
+                continue
+
+            date_str = activity.get('date') or activity.get('transaction_time')
+            try:
+                date_val = datetime.fromisoformat(str(date_str)) if date_str else None
+            except (ValueError, TypeError):
+                date_val = date_str
+
+            # Look up matching tax withholding
+            date_key = str(date_str)[:10] if date_str else None
+            tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
+
+            gross = float(activity.get('net_amount', 0) or 0)
+            div_record = {
+                # Alpaca stamps an id on every non-trade activity. It is the only
+                # thing that tells two DIV activities for one payer on one date
+                # apart (a special dividend alongside the regular one, a
+                # correction), so get_cash_transfers() keys the income ledger on
+                # it. Netting DIVNRA withholding into `amount` below is a separate
+                # concern and does not make the id any less the broker's.
+                'id': activity.get('id'),
+                'symbol': act_symbol,
+                'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
+                'gross_amount': gross,
+                'date': date_val,
+                'drip_quantity': None,
+                'drip_price': None,
+                'tax_withheld': tax_withheld,
+            }
+            dividends.append(div_record)
+        return dividends
+
+    #: Page size of the activities endpoint (its maximum) and a hard stop on the number of pages read.
+    ACTIVITIES_PAGE_SIZE = 100
+    ACTIVITIES_MAX_PAGES = 200
+
+    def _fetch_activities_strict(self, act_type: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """EVERY activity of one type in the window, paged (page_size 100, page_token = the last id), and RAISING on
+        any failure -- unlike ``_fetch_activities`` (one page, [] on failure). Raises ``RuntimeError`` if the page
+        limit is hit (ValueError), because a silently truncated history is not a history."""
+        query: Dict[str, Any] = dict(params or {})
+        query["page_size"] = self.ACTIVITIES_PAGE_SIZE
+        rows: List[Dict[str, Any]] = []
+        for _ in range(self.ACTIVITIES_MAX_PAGES):
+            raw = self.client.get(f"/account/activities/{act_type}", query)
+            page = raw if isinstance(raw, list) else ([raw] if raw else [])
+            rows.extend(page)
+            if len(page) < self.ACTIVITIES_PAGE_SIZE:
+                return rows
+            query["page_token"] = page[-1]["id"]
+        raise ValueError(f"{act_type} activities exceed {self.ACTIVITIES_MAX_PAGES} pages: the history is truncated")
+
+    def _require_client(self) -> None:
+        if not self._check_authentication():
+            raise ConnectionError(f"AlpacaAccount {self.id}: not authenticated with the broker")
+
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_dividends`` that RAISES instead of answering ``[]`` when the broker cannot be read (not
+        authenticated, DIV or DIVNRA fetch failed, ...) and reads EVERY page of activities. [] means no dividends."""
+        self._require_client()
+        params = {}
+        if start_date:
+            params["after"] = start_date.isoformat() if hasattr(start_date, 'isoformat') else str(start_date)
+        if end_date:
+            params["until"] = end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)
+        raw_activities = self._fetch_activities_strict("DIV", params)
+        raw_nra = self._fetch_activities_strict("DIVNRA", params)
+        return self._dividends_from_activities(raw_activities, raw_nra, symbol)
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
         """Get dividend history from Alpaca activities API."""
         if not self._check_authentication():
@@ -6164,50 +6250,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             except Exception:
                 raw_nra = []
 
-            # Build map of tax withholding by (symbol, date)
-            nra_map = {}
-            for nra in raw_nra:
-                nra_symbol = nra.get('symbol')
-                nra_date = nra.get('date') or nra.get('transaction_time')
-                if nra_symbol and nra_date:
-                    nra_date_str = str(nra_date)[:10]  # Extract YYYY-MM-DD
-                    key = (nra_symbol, nra_date_str)
-                    nra_map[key] = nra_map.get(key, 0) + abs(float(nra.get('net_amount', 0) or 0))
-
-            dividends = []
-            for activity in raw_activities:
-                act_symbol = activity.get('symbol')
-                if symbol and act_symbol != symbol:
-                    continue
-
-                date_str = activity.get('date') or activity.get('transaction_time')
-                try:
-                    date_val = datetime.fromisoformat(str(date_str)) if date_str else None
-                except (ValueError, TypeError):
-                    date_val = date_str
-
-                # Look up matching tax withholding
-                date_key = str(date_str)[:10] if date_str else None
-                tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
-
-                gross = float(activity.get('net_amount', 0) or 0)
-                div_record = {
-                    # Alpaca stamps an id on every non-trade activity. It is the only
-                    # thing that tells two DIV activities for one payer on one date
-                    # apart (a special dividend alongside the regular one, a
-                    # correction), so get_cash_transfers() keys the income ledger on
-                    # it. Netting DIVNRA withholding into `amount` below is a separate
-                    # concern and does not make the id any less the broker's.
-                    'id': activity.get('id'),
-                    'symbol': act_symbol,
-                    'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
-                    'gross_amount': gross,
-                    'date': date_val,
-                    'drip_quantity': None,
-                    'drip_price': None,
-                    'tax_withheld': tax_withheld,
-                }
-                dividends.append(div_record)
+            dividends = self._dividends_from_activities(raw_activities, raw_nra, symbol)
 
             logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend activities")
             return dividends
@@ -6216,83 +6259,97 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"[Account {self.id}] Error fetching dividends: {e}", exc_info=True)
             return []
 
+    def _balance_history_impl(self, start_date, end_date, fetch_activities, strict: bool):
+        """Portfolio history -> snapshots. ``fetch_activities`` reads the CSD/CSW transfers (lenient: one page, []
+        on failure; strict: every page, raising). ``strict`` also refuses a missing equity value instead of
+        reading it as 0."""
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+        params = {"timeframe": "1D", "period": "1A"}
+        if start_date:
+            params["start"] = start_date.strftime("%Y-%m-%d")
+            params.pop("period", None)  # start overrides period
+        if end_date:
+            params["end"] = end_date.strftime("%Y-%m-%d")
+
+        history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
+
+        # Fetch cash transfers (deposits/withdrawals) to compute actual daily P/L.
+        # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
+        # so we need to subtract transfer amounts from equity changes ourselves.
+        transfer_by_date = {}
+        for act_type in ['CSD', 'CSW']:
+            for act in fetch_activities(act_type):
+                act_date = str(act.get('date', ''))[:10]
+                amount = self._safe_float(act.get('net_amount'))
+                if amount is None:
+                    continue
+                transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
+
+        snapshots = []
+        timestamps = getattr(history, 'timestamp', []) or []
+        equity_values = getattr(history, 'equity', []) or []
+
+        # Build list of history dates for T+1 settlement shifting.
+        # Transfers settle T+1: activity on Oct 29 → equity change on Oct 30.
+        all_history_dates = []
+        for ts in timestamps:
+            d_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+            all_history_dates.append(d_obj.strftime('%Y-%m-%d'))
+
+        shifted_transfers = {}
+        for act_date, amount in transfer_by_date.items():
+            shifted = False
+            for hd in all_history_dates:
+                if hd > act_date:
+                    shifted_transfers[hd] = shifted_transfers.get(hd, 0.0) + amount
+                    shifted = True
+                    break
+            if not shifted:
+                shifted_transfers[act_date] = shifted_transfers.get(act_date, 0.0) + amount
+        transfer_by_date = shifted_transfers
+
+        prev_equity = None
+        for i, ts in enumerate(timestamps):
+            if strict and (i >= len(equity_values) or equity_values[i] is None):
+                raise ValueError(f"portfolio history has no equity for {ts}")
+            equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
+            date_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+            date_str = date_obj.strftime('%Y-%m-%d')
+
+            # Compute actual daily market P/L by subtracting transfers
+            if prev_equity is not None:
+                equity_change = equity - prev_equity
+                transfer = transfer_by_date.get(date_str, 0.0)
+                daily_pl = equity_change - transfer
+            else:
+                daily_pl = 0.0
+
+            snapshots.append({
+                'date': date_obj,
+                'net_liquidating_value': equity,
+                'cash_balance': 0.0,
+                'equity_value': equity,
+                'profit_loss': daily_pl,
+            })
+            prev_equity = equity
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
+        return snapshots
+
+    def get_balance_history_strict(self, start_date=None, end_date=None):
+        """``get_balance_history`` that RAISES when the portfolio history or the transfers cannot be read (the
+        lenient one answers [] or a transfer-blind history) and refuses a missing equity value."""
+        self._require_client()
+        return self._balance_history_impl(start_date, end_date, self._fetch_activities_strict, True)
+
     def get_balance_history(self, start_date=None, end_date=None):
         """Get portfolio history from Alpaca portfolio history API."""
         if not self._check_authentication():
             return []
 
         try:
-            from alpaca.trading.requests import GetPortfolioHistoryRequest
-
-            params = {"timeframe": "1D", "period": "1A"}
-            if start_date:
-                params["start"] = start_date.strftime("%Y-%m-%d")
-                params.pop("period", None)  # start overrides period
-            if end_date:
-                params["end"] = end_date.strftime("%Y-%m-%d")
-
-            history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
-
-            # Fetch cash transfers (deposits/withdrawals) to compute actual daily P/L.
-            # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
-            # so we need to subtract transfer amounts from equity changes ourselves.
-            transfer_by_date = {}
-            for act_type in ['CSD', 'CSW']:
-                for act in self._fetch_activities(act_type):
-                    act_date = str(act.get('date', ''))[:10]
-                    amount = self._safe_float(act.get('net_amount'))
-                    if amount is None:
-                        continue
-                    transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
-
-            snapshots = []
-            timestamps = getattr(history, 'timestamp', []) or []
-            equity_values = getattr(history, 'equity', []) or []
-
-            # Build list of history dates for T+1 settlement shifting.
-            # Transfers settle T+1: activity on Oct 29 → equity change on Oct 30.
-            all_history_dates = []
-            for ts in timestamps:
-                d_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
-                all_history_dates.append(d_obj.strftime('%Y-%m-%d'))
-
-            shifted_transfers = {}
-            for act_date, amount in transfer_by_date.items():
-                shifted = False
-                for hd in all_history_dates:
-                    if hd > act_date:
-                        shifted_transfers[hd] = shifted_transfers.get(hd, 0.0) + amount
-                        shifted = True
-                        break
-                if not shifted:
-                    shifted_transfers[act_date] = shifted_transfers.get(act_date, 0.0) + amount
-            transfer_by_date = shifted_transfers
-
-            prev_equity = None
-            for i, ts in enumerate(timestamps):
-                equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
-                date_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
-                date_str = date_obj.strftime('%Y-%m-%d')
-
-                # Compute actual daily market P/L by subtracting transfers
-                if prev_equity is not None:
-                    equity_change = equity - prev_equity
-                    transfer = transfer_by_date.get(date_str, 0.0)
-                    daily_pl = equity_change - transfer
-                else:
-                    daily_pl = 0.0
-
-                snapshots.append({
-                    'date': date_obj,
-                    'net_liquidating_value': equity,
-                    'cash_balance': 0.0,
-                    'equity_value': equity,
-                    'profit_loss': daily_pl,
-                })
-                prev_equity = equity
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
-            return snapshots
+            return self._balance_history_impl(start_date, end_date, self._fetch_activities, False)
 
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
@@ -6366,6 +6423,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             # (the Overview keeps its old rows on a failed fetch).
             logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
             raise
+
+    def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_filled_trades`` that RAISES when not authenticated (the lenient one answers []); a failed orders
+        fetch already raises there."""
+        self._require_client()
+        return self.get_filled_trades(symbol, start_date, end_date)
 
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)

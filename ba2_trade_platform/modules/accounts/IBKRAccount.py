@@ -2484,6 +2484,14 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         except Exception as e:  # noqa: BLE001
             logger.error(f"[Account {self.id}] error fetching filled trades: {e}", exc_info=True)
             return []
+        return self._trades_from_fills(fills, symbol, start_date, end_date)
+
+    def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_filled_trades`` that RAISES when the executions cannot be read (the lenient one answers [])."""
+        fills = self._call(self._read_fills, op="executions", timeout=40.0)
+        return self._trades_from_fills(fills, symbol, start_date, end_date)
+
+    def _trades_from_fills(self, fills, symbol, start_date, end_date):
         if start_date is not None:
             floor = self._utcnow() - timedelta(days=self._EXECUTION_WINDOW_DAYS)
             start = start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc)
@@ -2521,6 +2529,26 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     def get_balance_history(self, start_date=None, end_date=None):
         return self._flex_balance_history(start_date, end_date)
 
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_dividends`` that RAISES when Flex is not configured (``ValueError``) or its fetch fails
+        (``ConnectionError``) or the statement holds no data, instead of answering []."""
+        return flex.dividends_from(self._flex_statements_strict("dividend history"), symbol, start_date, end_date)
+
+    def get_balance_history_strict(self, start_date=None, end_date=None):
+        """``get_balance_history`` that RAISES like ``get_dividends_strict``."""
+        return flex.balance_history_from(self._flex_statements_strict("balance history"), start_date, end_date)
+
+    def _flex_statements_strict(self, what: str) -> List[FlexStatement]:
+        if not self.settings.get("flex_token") or not self.settings.get("flex_query_id"):
+            raise ValueError(f"IBKR {what} needs 'flex_token' and 'flex_query_id' in the account settings")
+        try:
+            statements = self._flex_statements(what, strict=True)
+        except Exception as e:  # noqa: BLE001 -- the Flex client raises its own types: all are "unreachable" here
+            raise ConnectionError(f"IBKR Flex fetch for {what} failed: {type(e).__name__}") from e
+        if not statements:
+            raise ValueError(f"the Flex statement contains no data for account {self._account_id}")
+        return statements
+
     def get_cash_transfers(self, start_date=None, end_date=None):
         return self._flex_cash_transfers(start_date, end_date)
 
@@ -2529,7 +2557,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     _flex_http_get = staticmethod(default_http_get)
     _FLEX_CACHE_SECONDS = 600.0
 
-    def _flex_statements(self, what: str) -> Optional[List[FlexStatement]]:
+    def _flex_statements(self, what: str, strict: bool = False) -> Optional[List[FlexStatement]]:
         """The Flex statement(s) for this account, cached 10 minutes (IBKR rate-limits Flex), or
         ``None`` when Flex is not configured or the fetch failed (both logged)."""
         token, query_id = self.settings.get("flex_token"), self.settings.get("flex_query_id")
@@ -2547,6 +2575,8 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             statements = FlexClient(str(token), str(query_id), http_get=self._flex_http_get).fetch(
                 self._account_id)
         except Exception as e:  # noqa: BLE001 -- a seam without tri-state: log + []
+            if strict:
+                raise
             logger.error(f"[Account {self.id}] IBKR Flex fetch for {what} failed: "
                          f"{type(e).__name__}: {e}", exc_info=True)
             return None
