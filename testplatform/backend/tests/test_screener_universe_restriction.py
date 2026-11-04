@@ -186,15 +186,24 @@ def test_universe_file_flag_refusals(tmp_path):
 
 # ------------------------------------------------------------------------------------------ seed fill
 def _gene_space():
-    return {f"screener:{k}": {"min": v["min"], "max": v["max"], "step": v["step"], "type": v["type"]}
-            for k, v in us.SCREENER_OPT.items()}
+    out = {}
+    for k, v in us.SCREENER_OPT.items():
+        if v["type"] == "choice":      # the GA's space entry of a categorical gene (strategy_param_space._collect_screener)
+            out[f"screener:{k}"] = {"type": "choice", "choices": list(v["choices"]), "min": 0,
+                                    "max": len(v["choices"]) - 1, "step": 1}
+        else:
+            out[f"screener:{k}"] = {"min": v["min"], "max": v["max"], "step": v["step"], "type": v["type"]}
+    return out
 
 
 def test_seed_fill_is_the_loosest_screen_of_each_declared_range():
     space = _gene_space()
     space["model:x"] = {"min": 0, "max": 1, "step": 1, "type": "int"}
     fill, notes = S.L._screener_seed_fill(space)
-    assert set(fill) == {k for k in space if k.startswith("screener:")} and notes == []
+    assert set(fill) == {k for k in space if k.startswith("screener:")}
+    # an ordering has no loosest value: market_cap (today's fixed behaviour), said in a note
+    assert fill["screener:screener_sort_metric"] == "market_cap"
+    assert len(notes) == 1 and "screener_sort_metric" in notes[0] and "market_cap" in notes[0]
     assert fill["screener:screener_relative_volume_min"] == 0 and fill["screener:screener_price_drop_pct"] == 0
     assert fill["screener:screener_weinstein_stage2_only"] == 0
     assert fill["screener:screener_max_stocks"] == 50                 # the LARGEST cut = the loosest
@@ -223,7 +232,8 @@ def test_the_bundles_own_fill_wins_on_an_identical_key_and_on_a_glob():
 
 
 @pytest.mark.parametrize("gene,cfg", [
-    ("screener:screener_sort_metric", {"type": "choice", "choices": ["market_cap", "volume"]}),
+    ("screener:screener_sort_metric", {"type": "choice", "choices": ["relative_volume", "price_drop_pct"]}),   # no market_cap to start at
+    ("screener:screener_other_choice", {"type": "choice", "choices": ["a", "b"]}),
     ("screener:screener_mystery", {"min": 0, "max": 1, "step": 1, "type": "int"}),
     ("screener:screener_market_cap_min", {"min": None, "max": 1, "step": 1, "type": "int"}),
 ])
@@ -245,6 +255,7 @@ def test_seed_fill_end_to_end_through_assemble_seed_population(style_cfg, tmp_pa
         assert g["screener:screener_max_stocks"] == 20                # the bundle's value, not the seed fill's 50
         assert g["screener:screener_relative_volume_min"] == 0 and g["screener:screener_price_drop_pct"] == 0
         assert g["screener:screener_weinstein_stage2_only"] == 0
+        assert g["screener:screener_sort_metric"] == "market_cap"
         assert g["screener:screener_market_cap_min"] == us.SCREENER_OPT["screener_market_cap_min"]["min"]
     assert "screener:screener_relative_volume_min" in prov[0]["fills"]
     out = capsys.readouterr().out
@@ -254,8 +265,8 @@ def test_seed_fill_end_to_end_through_assemble_seed_population(style_cfg, tmp_pa
 def test_seed_fill_end_to_end_refuses_a_categorical_screener_gene(style_cfg, tmp_path, monkeypatch):
     path, space = _bundle(style_cfg, tmp_path, monkeypatch, fill=_fill_for(style_cfg, monkeypatch))
     seen = _space_of(style_cfg, monkeypatch)
-    space2 = {**space, "screener:screener_sort_metric": {"type": "choice", "choices": ["a", "b"], "min": 0, "max": 1, "step": 1}}
-    with pytest.raises(SystemExit, match="screener_sort_metric"):
+    space2 = {**space, "screener:screener_other_choice": {"type": "choice", "choices": ["a", "b"], "min": 0, "max": 1, "step": 1}}
+    with pytest.raises(SystemExit, match="screener_other_choice"):
         S.L._assemble_seed_population(json.loads(path.read_text()), seen["strat"], space2, seen["anchor"], 10)
 
 

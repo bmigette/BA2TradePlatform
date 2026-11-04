@@ -79,7 +79,7 @@ def test_superset_does_not_depend_on_ordering_or_cut_genes(tmp_path):
     for mx in ({"min": 1, "max": 5}, {"min": 10, "max": 500}):
         r = dict(ranges)
         r["screener_max_stocks"] = {**ranges["screener_max_stocks"], **mx}
-        r["screener_sort_metric"] = {"min": 0, "max": 2, "step": 1, "type": "int", "optimize": True}
+        r["screener_sort_metric"] = dict(us.SCREENER_OPT["screener_sort_metric"])
         assert us.static_universe(df, "2023-03-06", "2023-03-24", base, r, intraday=True) == ref
     # and a base-level max_stocks / sort_metric is stripped too
     assert us.static_universe(df, "2023-03-06", "2023-03-24", {**base, "max_stocks": 3, "sort_metric": "x"},
@@ -88,6 +88,10 @@ def test_superset_does_not_depend_on_ordering_or_cut_genes(tmp_path):
 
 def test_unknown_gene_or_unknown_range_refuses_the_launch(tmp_path):
     base, ranges = _mid_job()
+    with pytest.raises(us.ScreenerUniverseError, match="choice gene"):          # the ordering gene is categorical
+        us.loosest_filter_variants(base, {**ranges, "screener_sort_metric": {"min": 0, "max": 2, "step": 1, "type": "int"}})
+    with pytest.raises(us.ScreenerUniverseError, match="not simulated"):
+        us.loosest_filter_variants(base, {**ranges, "screener_sort_metric": {"type": "choice", "choices": ["composite"]}})
     with pytest.raises(us.ScreenerUniverseError, match="no declared role"):
         us.loosest_filter_variants(base, {**ranges, "screener_mystery": {"min": 0, "max": 1}})
     with pytest.raises(us.ScreenerUniverseError, match="no 'max'"):

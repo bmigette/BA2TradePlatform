@@ -979,7 +979,7 @@ def test_the_screener_case_actually_emits_screener_genes():
     m = _M
     _strat, space = _space(m, "O_LC", "FMPRating", screener=True)
     screener_genes = sorted(g for g in space if g.startswith("screener:"))
-    assert len(screener_genes) == len(m._SCREENER_OPT) == 6, screener_genes
+    assert len(screener_genes) == len(m._SCREENER_OPT) == 7, screener_genes
     # ... and the non-screener cases genuinely do NOT carry them (the drivers never pass
     # --screener; they use the separate gate-only --screener-gate-store).
     _s2, plain = _space(m, "O_LC", "FMPRating", screener=False)

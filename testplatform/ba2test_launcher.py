@@ -9068,7 +9068,8 @@ def _screener_seed_fill(space: dict, bundle_fill: "dict | None" = None) -> "tupl
         when the range reaches 0;
       * window selector (price_drop_days): the range minimum (inert while price_drop_pct is 0);
       * max_stocks: the range maximum (the largest cut).
-    A categorical gene (sort_metric ...), an ordering gene other than max_stocks, a gene with no declared role or a
+      * sort_metric (categorical): market_cap (no loosest ordering exists; today's fixed behaviour; a bundle fill overrides);
+    Any other categorical gene, an ordering gene other than max_stocks, a gene with no declared role or a
     malformed range refuses, naming the gene: never a guess, never a KeyError."""
     from fnmatch import fnmatch
     from ba2_providers.screener import universe_superset as _usr
@@ -9082,6 +9083,14 @@ def _screener_seed_fill(space: dict, bundle_fill: "dict | None" = None) -> "tupl
         full = gene if gene.startswith("screener_") else f"screener_{gene}"
         ref = (f"optimize: seed bundle refused: screener gene {key!r} has no loosest-value rule for a seed fill "
                f"({{why}}); state it in the bundle's fill")
+        if full == "screener_sort_metric":
+            # An ORDERING has no "loosest" value; the sensible default is today's fixed behaviour, market_cap.  Stated here, not
+            # guessed: a bundle's own fill (checked above) still wins.
+            if not isinstance(cfg, dict) or "market_cap" not in (cfg.get("choices") or ()):
+                raise SystemExit(ref.format(why="a sort gene without market_cap among its choices"))
+            seed[key] = "market_cap"
+            notes.append(f"{key}: an ordering has no loosest value; seeds start at market_cap (today's fixed behaviour)")
+            continue
         if not isinstance(cfg, dict) or cfg.get("type") == "choice" or cfg.get("min") is None or cfg.get("max") is None:
             raise SystemExit(ref.format(why="categorical or without a numeric min/max range"))
         lo, hi = cfg["min"], cfg["max"]

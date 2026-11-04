@@ -154,6 +154,12 @@ def prepare_screener_launch(req: ScreenerLaunchRequest, *, emit: Emit = _print) 
     # Cap-band job: the market-cap gene RANGE for the band and a pinned market_cap_max (disjoint universes).
     scr_opt, base = _us.apply_cap_band(req.scr_opt, base, req.cap_band)
     use_sim = not req.bypass
+    if req.bypass and "screener_sort_metric" in scr_opt:
+        # The bypass expert's weekly STORE gate ranks on stored columns (an absent one silently falls back to market_cap) and
+        # is not the live screener: it cannot honour a searched ordering, so the gene is not searched there (said, not silent).
+        scr_opt = {k: v for k, v in scr_opt.items() if k != "screener_sort_metric"}
+        emit("optimize: screener_sort_metric is NOT searched for a bypass expert (its weekly store gate has no live-faithful "
+             "ordering); the base sort_metric applies")
     panel_dir: Optional[str] = None
     restriction_syms: Optional[List[str]] = None
     if req.universe_restriction is not None:

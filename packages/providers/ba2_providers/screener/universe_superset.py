@@ -30,6 +30,10 @@ from ba2_providers.screener import metric_store as _ms
 #: identity (checkpoint fingerprint, driver job names): see ``strategy_optimization_handler``.
 RULE_ID = "superset-v1"
 
+#: The orderings the GA may search (``screener_sort_metric``), index 0 = today's fixed behaviour.  EVERY one is simulated
+#: by the backtest gate exactly as ``StockScreener`` ranks (``live_sim.SIMULATED_SORT_METRICS`` is pinned equal by a test).
+SORT_METRIC_CHOICES = ("market_cap", "relative_volume", "price_drop_pct")
+
 #: The screener gene ranges, canonical here so the launcher AND the drivers (which cannot import the
 #: launcher) read ONE definition. The launcher keeps its private names as aliases of these objects.
 SCREENER_OPT = {
@@ -42,6 +46,9 @@ SCREENER_OPT = {
     "screener_price_drop_days": {"min": 2, "max": 30, "step": 1, "type": "int", "optimize": True},
     "screener_max_stocks": {"min": 10, "max": 50, "step": 10, "type": "int", "optimize": True},
     "screener_weinstein_stage2_only": {"min": 0, "max": 1, "step": 1, "type": "int", "optimize": True},
+    # CATEGORICAL (no min/max): the ordering decides which of the passing names the max_stocks cut keeps; it never changes which
+    # names pass, so the static universe ignores it (``_ORDERING``).  Seeds that do not carry it start at market_cap.
+    "screener_sort_metric": {"type": "choice", "choices": list(SORT_METRIC_CHOICES), "optimize": True},
 }
 
 #: Per-cap-band jobs: the market-cap gene RANGE and a fixed ``market_cap_max`` change per band.
@@ -127,6 +134,17 @@ _ORDERING = {"screener_max_stocks": "max_stocks", "screener_sort_metric": "sort_
 ORDERING_KEYS = frozenset(_ORDERING.values())
 
 
+def _check_sort_choices(spec: Dict[str, Any]) -> None:
+    """A searched ``screener_sort_metric`` must be a choice gene whose every choice the gate simulates."""
+    choices = spec.get("choices") if isinstance(spec, dict) else None
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise ScreenerUniverseError(f"screener gene 'screener_sort_metric' must be a choice gene with 'choices', got {spec!r}")
+    bad = [c for c in choices if c not in SORT_METRIC_CHOICES]
+    if bad:
+        raise ScreenerUniverseError(f"screener_sort_metric choices {bad} are not simulated by the backtest gate "
+                                    f"(supported: {list(SORT_METRIC_CHOICES)})")
+
+
 def _num(gene: str, spec: Dict[str, Any], field: str) -> float:
     if not isinstance(spec, dict) or spec.get(field) is None:
         raise ScreenerUniverseError(
@@ -163,6 +181,8 @@ def loosest_filter_variants(base: Dict[str, Any], ranges: Dict[str, Dict[str, An
     y_range: Optional[range] = None
     for gene, spec in ranges.items():
         if gene in _ORDERING:
+            if gene == "screener_sort_metric":
+                _check_sort_choices(spec)
             continue                      # cannot change which names pass
         if gene in _LOWER:
             lo, hi = _num(gene, spec, "min"), _num(gene, spec, "max")
