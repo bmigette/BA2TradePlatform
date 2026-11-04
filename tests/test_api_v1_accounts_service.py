@@ -4,7 +4,7 @@ import pytest
 from ba2_trade_platform.core.db import add_instance
 from ba2_trade_platform.core.models import AccountSetting
 from ba2_trade_platform.services import accounts as svc
-from ba2_trade_platform.services.errors import NotFound, Unmeasurable
+from ba2_trade_platform.services.errors import BrokerUnreachable, NotFound, Unmeasurable
 from tests.api_helpers import FakeAccount
 from tests.factories import create_account_definition
 
@@ -114,3 +114,157 @@ def test_margin_off_reports_null_margin_terms_with_flag(fake):
     snap = svc.account_detail(create_account_definition().id)["snapshot"]
     assert snap["margin_enabled"] is False and snap["headroom"] is None
     assert snap["pending_entries"] == 500.0   # still measured from the order store (see service comment)
+
+
+# --- review fixes: one broker-read helper, honest orders, stale balance, list survives anything -------------
+import time
+
+from ba2_trade_platform.core.types import OrderStatus
+from ba2_trade_platform.services.errors import BrokerRefused, Invalid
+
+
+class APIError(Exception):          # same class NAME as the Alpaca SDK error
+    pass
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (OSError("secret-detail"), BrokerUnreachable),
+    (TimeoutError("secret-detail"), BrokerUnreachable),
+    (ConnectionError("secret-detail"), BrokerUnreachable),
+    (APIError("secret-detail"), BrokerRefused),
+    (ValueError("secret-detail"), Unmeasurable),
+])
+def test_broker_read_maps_exceptions_and_keeps_only_the_class_name(exc, expected):
+    def fn():
+        raise exc
+    with pytest.raises(expected) as ei:
+        svc.broker_read(5, "positions", fn)
+    assert type(exc).__name__ in ei.value.message and "secret-detail" not in ei.value.message
+
+
+def test_broker_read_lets_programming_errors_propagate():
+    def fn():
+        raise KeyError("bug")
+    with pytest.raises(KeyError):
+        svc.broker_read(5, "positions", fn)
+
+
+def test_pending_entries_and_positions_go_through_the_helper(fake):
+    fake.capital["pending_entries"] = None
+
+    def boom(exclude_order_id=None):
+        raise OSError("down")
+    fake._pending_stock_entry_notional = boom
+    d = create_account_definition()
+    with pytest.raises(BrokerUnreachable):
+        svc.account_snapshot(d.id)
+    fake.get_positions = lambda: (_ for _ in ()).throw(TimeoutError("x"))
+    with pytest.raises(BrokerUnreachable):
+        svc.broker_positions(d.id)
+
+
+def test_list_survives_any_single_accounts_exception(monkeypatch):
+    a = create_account_definition(name="ok")
+    b = create_account_definition(name="net")
+    c = create_account_definition(name="bug")
+    good = FakeAccount(a.id)
+
+    def resolver(account_id):
+        if account_id == b.id:
+            raise OSError("down")
+        if account_id == c.id:
+            raise RuntimeError("anything at all")
+        return good
+    monkeypatch.setattr(svc, "get_account_instance_from_id", resolver)
+    by_name = {i["name"]: i for i in svc.list_accounts(limit=10, offset=0)["items"]}
+    assert by_name["ok"]["snapshot"]["equity"] == 10000.0
+    assert by_name["net"]["snapshot"] is None and by_name["net"]["snapshot_error"]["error"] == "broker_unreachable"
+    assert by_name["bug"]["snapshot"] is None and by_name["bug"]["snapshot_error"]["error"] == "internal"
+    assert "anything at all" not in str(by_name["bug"])
+
+
+def test_stale_cached_balance_is_unmeasurable_and_age_is_reported_otherwise(fake):
+    d = create_account_definition()
+    fake._balance_cache = 10000.0
+    fake._balance_cache_time = time.time() - 400
+    with pytest.raises(Unmeasurable) as ei:
+        svc.account_snapshot(d.id)
+    assert "stale" in ei.value.message
+    fake._balance_cache_time = time.time() - 2
+    snap = svc.account_snapshot(d.id)
+    assert 1 <= snap["balance_age_s"] < 60
+
+
+def test_balance_age_is_null_when_the_adapter_exposes_none(fake):
+    assert svc.account_snapshot(create_account_definition().id)["balance_age_s"] is None
+
+
+class FakeAlpaca(FakeAccount):
+    client = object()
+
+    def __init__(self):
+        super().__init__(1)
+        self.raw = ["o1", "o2"]
+        self.error = None
+        self.calls = []
+
+    def _fetch_raw_alpaca_orders(self, status=None, fetch_all=False, full_history=False):
+        self.calls.append((status, fetch_all, full_history))
+        if self.error is not None:
+            raise self.error
+        return self.raw
+
+    def alpaca_order_to_tradingorder(self, raw):
+        return {"id": raw, "status": "filled" if raw == "o1" else "new"}
+
+    def get_orders(self, status=None):
+        raise AssertionError("must use the raising fetch path")
+
+
+def test_alpaca_orders_use_the_raising_fetch_and_report_fetch_ok(monkeypatch):
+    acct = FakeAlpaca()
+    monkeypatch.setattr(svc, "get_account_instance_from_id", lambda i: acct)
+    out = svc.broker_orders(1, None)
+    assert [o["id"] for o in out["items"]] == ["o1", "o2"]
+    assert out["fetch_ok"] is True and out["best_effort"] is False
+    assert acct.calls == [(OrderStatus.ALL, False, True)]       # full_history=True => raises instead of []
+    acct.raw = []
+    assert svc.broker_orders(1, "open")["fetch_ok"] is True      # a verified empty book
+    assert acct.calls[-1][0] == OrderStatus.OPEN
+
+
+def test_alpaca_specific_status_is_filtered_in_the_service(monkeypatch):
+    acct = FakeAlpaca()
+    monkeypatch.setattr(svc, "get_account_instance_from_id", lambda i: acct)
+    out = svc.broker_orders(1, "filled")
+    assert [o["id"] for o in out["items"]] == ["o1"] and acct.calls[-1][0] == OrderStatus.ALL
+
+
+def test_alpaca_fetch_failure_is_an_error_not_an_empty_list(monkeypatch):
+    acct = FakeAlpaca()
+    monkeypatch.setattr(svc, "get_account_instance_from_id", lambda i: acct)
+    acct.error = APIError("rejected")
+    with pytest.raises(BrokerRefused):
+        svc.broker_orders(1, None)
+    acct.error = OSError("dns")
+    with pytest.raises(BrokerUnreachable):
+        svc.broker_orders(1, None)
+    acct.error = None
+    acct.client = None                                          # not authenticated: _fetch returns [] silently
+    with pytest.raises(BrokerUnreachable):
+        svc.broker_orders(1, None)
+
+
+def test_best_effort_adapter_empty_answer_is_not_presented_as_no_orders(fake):
+    d = create_account_definition()
+    fake.orders = []
+    out = svc.broker_orders(d.id, None)
+    assert out["items"] == [] and out["fetch_ok"] is False and out["best_effort"] is True and "note" in out
+    fake.orders = [{"id": "b-1", "status": "new"}]
+    out = svc.broker_orders(d.id, None)
+    assert out["fetch_ok"] is True and out["best_effort"] is True
+
+
+def test_orders_status_is_validated():
+    with pytest.raises(Invalid):
+        svc.broker_orders(1, "bogus")

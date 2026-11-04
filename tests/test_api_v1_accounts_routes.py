@@ -48,3 +48,14 @@ def test_positions_none_means_broker_unreachable_not_flat(fake):
     assert r.status_code == 503 and r.json()["error"] == "broker_unreachable"
     fake.positions = []
     assert v1_client().get(f"/accounts/{d.id}/positions").json()["items"] == []
+
+
+def test_orders_route_validates_status_and_reports_fetch_ok(fake):
+    d = create_account_definition()
+    c = v1_client()
+    assert c.get(f"/accounts/{d.id}/orders?status=bogus").status_code == 422
+    body = c.get(f"/accounts/{d.id}/orders").json()
+    assert body["fetch_ok"] is True and body["best_effort"] is True
+    fake.orders = []
+    body = c.get(f"/accounts/{d.id}/orders").json()
+    assert body["items"] == [] and body["fetch_ok"] is False
