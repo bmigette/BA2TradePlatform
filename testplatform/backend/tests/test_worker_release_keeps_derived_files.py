@@ -438,8 +438,10 @@ def test_option_memory_stats_splits_mapped_columns_from_private_projections(big_
 
     assert st["entries"] == 1
     assert st["shared_mb"] > 0, "the mapped columns must be visible as the HOST's, not this one's"
-    assert st["private_mb"] > 0, "bar_ord_l + the contract lists are this process's own"
-    assert st["private_mb"] < st["shared_mb"], "4 B/row private against ~64 B/row mapped"
+    # Since 2026-11-04 ``bar_ord_l`` is a view over the mapped ``bar_ord``: what stays private
+    # is per CONTRACT (the starts/stops lists), so it rounds to ~0 MB against the mapped rows.
+    assert st["private_mb"] >= 0
+    assert st["private_mb"] < st["shared_mb"] / 10, "per-contract private against ~64 B/row mapped"
 
 
 def test_option_memory_stats_reports_nothing_shared_on_the_private_path(big_store_root,

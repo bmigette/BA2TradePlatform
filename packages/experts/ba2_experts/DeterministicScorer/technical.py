@@ -36,6 +36,7 @@ per date, on real and synthetic data. If you add an indicator here, add it there
 from __future__ import annotations
 
 import math
+import os
 import threading
 import warnings
 from collections import OrderedDict
@@ -429,8 +430,14 @@ def donchian_state(highs: pd.Series, lows: pd.Series, closes: pd.Series,
 # SIZE. One float64 array per indicator per symbol: ~6 x 97 x 3800 x 8B ~ 18 MB
 # for a full GA universe. The LRU cap bounds a long-lived worker that walks many
 # parameter sets across trials.
+#
+# THE CAP MUST EXCEED ~6 x THE UNIVERSE. A daily pass touches ~6 series per symbol,
+# so a cap below that evicts every series before the next bar re-reads it: at the
+# old 1200 (200 symbols) a 748-name option pilot spent 21% of each trial
+# rebuilding them (py-spy, remote227 2026-11-03). 9000 holds 1500 symbols x 6 at
+# ~30 KB a series, ~270 MB per worker (DS bands reach ~1400 names). BA2_DS_SERIES_MEMO_MAX overrides it.
 _SERIES_MEMO: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
-_SERIES_MEMO_MAX = 1200
+_SERIES_MEMO_MAX = max(1, int(os.getenv("BA2_DS_SERIES_MEMO_MAX", "9000")))
 _SERIES_MEMO_LOCK = threading.RLock()
 _SERIES_MEMO_STATS: Dict[str, int] = {"hit": 0, "miss": 0, "evicted": 0}
 

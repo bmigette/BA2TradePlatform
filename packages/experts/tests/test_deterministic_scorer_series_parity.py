@@ -469,8 +469,9 @@ def test_non_monotonic_frame_gets_no_fast_path():
     assert view.position_of_prefix(shuffled.iloc[:300].reset_index(drop=True)) is None
 
 
-def test_memo_is_bounded():
+def test_memo_is_bounded(monkeypatch):
     """A long-lived GA worker walks many parameter sets; the memo must not grow."""
+    monkeypatch.setattr(T, "_SERIES_MEMO_MAX", 60)   # the bound, not the production size
     D.reset_caches()
     _, df = next(iter(_synthetic_frames()))
     view = D.OhlcvView("BOUND", df)
@@ -479,6 +480,27 @@ def test_memo_is_bounded():
                     lambda p=period: T.distance_to_sma_series(view.close_s, p))
     assert len(T._SERIES_MEMO) <= T._SERIES_MEMO_MAX
     assert T.series_memo_stats()["evicted"] > 0
+
+
+def test_memo_default_holds_the_largest_universe():
+    """~6 series per symbol per daily pass: a cap below 6 x the universe evicts every series
+    before the next bar re-reads it (21% of a 748-name trial, 2026-11-03). The DS bands reach
+    ~1400 names, so the default must hold at least 6 x 1400."""
+    if "BA2_DS_SERIES_MEMO_MAX" in os.environ:
+        pytest.skip("an operator override is set")
+    assert T._SERIES_MEMO_MAX >= 6 * 1400
+
+
+def test_memo_cap_env_override_is_read():
+    import subprocess
+    import sys
+
+    env = dict(os.environ, BA2_DS_SERIES_MEMO_MAX="1234")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "from ba2_experts.DeterministicScorer import technical as T; print(T._SERIES_MEMO_MAX)"],
+        env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "1234"
 
 
 # --------------------------------------------------------------------------

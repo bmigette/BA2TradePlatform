@@ -216,7 +216,12 @@ logger = logging.getLogger(__name__)
 #: warns — but the penalty for a reload is now a mmap rather than ~55 ms of parquet, so
 #: lowering it on a memory-tight worker is a cheaper option than it was. The same cap bounds
 #: BOTH the raw cache and the scope-keyed overlay cache.
-_UNDERLYING_CACHE_MAX = int(os.getenv("BT_OPTION_PARQUET_CACHE_MAX", "200"))
+#:
+#: 1000, NOT 200 (2026-11-04): the stage-2 option universe is 748 names, and at 200 every
+#: daily pass over it evicted and re-opened each underlying -- 43-57% of a trial in
+#: ``_load_raw_underlying`` (py-spy, remote227). ``bar_ord_l`` is now a view over the mapped
+#: column, so what an entry still costs privately is per CONTRACT, not per row.
+_UNDERLYING_CACHE_MAX = int(os.getenv("BT_OPTION_PARQUET_CACHE_MAX", "1000"))
 #: Same generosity (and same reasoning) as the sqlite reader's ATM-IV memo: the values are a
 #: float or None, and a GA re-asks the identical (symbol, date) pairs on every trial.
 _ATM_IV_CACHE_MAX = int(os.getenv("BT_OPTION_ATM_IV_CACHE_MAX", "200000"))
@@ -272,6 +277,14 @@ _WORKER_RAW_CACHE: "OrderedDict[Tuple[str, str], _RawUnderlying]" = OrderedDict(
 # same bytes either way, which is why they are a separate cache.
 _WORKER_UNDERLYING_CACHE: "OrderedDict[Tuple[str, str, float, str], _Underlying]" = OrderedDict()
 _WORKER_ATM_IV_CACHE: "OrderedDict[Tuple[str, str, float, str, int], Optional[float]]" = OrderedDict()
+#: The host-shared ATM-IV tables this process has opened (see ``_AtmIvTable``), keyed like the
+#: overlay cache. UNBOUNDED on purpose: an entry is two mapped arrays of one value per calendar
+#: day (~2,200 for a 2020-2025 tree), against the universe-sized working set an IV-rank pass
+#: walks every bar. ``None`` = this process uses no table for the key (an empty underlying, or
+#: ``BA2_SHARED_ARRAYS=0``); ``_PENDING`` = another process held the build lock when asked, so
+#: this trial answers from the scan and ``reset_run_overlays`` lets the next trial ask again.
+_WORKER_ATM_TABLES: Dict[Tuple[str, str, Any, str], Any] = {}
+_PENDING = object()
 
 #: Distinct from None, which is a VALID cached result. See options_provider._MISSING.
 _MISSING = object()
@@ -337,9 +350,7 @@ def memory_stats() -> Dict[str, Any]:
                 shared += n
             else:
                 private += n
-        bol = getattr(raw, "bar_ord_l", None)
-        if bol is not None:
-            private += bol.itemsize * len(bol)
+        # ``bar_ord_l`` is a memoryview over ``bar_ord``'s own bytes, counted with it above.
         for lst in (getattr(raw, "starts_l", None), getattr(raw, "stops_l", None)):
             if lst is not None:
                 private += 8 * len(lst)      # one pointer per entry; the ints themselves are small
@@ -408,6 +419,10 @@ def reset_run_overlays() -> Dict[str, Any]:
         ov._fresh_run_fill()
     atm = len(_WORKER_ATM_IV_CACHE)
     _WORKER_ATM_IV_CACHE.clear()
+    # The opened ATM-IV TABLES stay (they are store data, like the raws); a key another process
+    # was still building is asked for again by the next trial.
+    for k in [k for k, v in _WORKER_ATM_TABLES.items() if v is _PENDING]:
+        del _WORKER_ATM_TABLES[k]
     return {"overlays": len(overlays), "greeks_rows": greeks_rows,
             "bar_memo_entries": bar_memo_entries, "spot_entries": spot_entries,
             "atm_iv_entries": atm}
@@ -418,6 +433,7 @@ def clear_worker_parquet_options_cache() -> None:
     _WORKER_RAW_CACHE.clear()
     _WORKER_UNDERLYING_CACHE.clear()
     _WORKER_ATM_IV_CACHE.clear()
+    _WORKER_ATM_TABLES.clear()
     _underlying_of.cache_clear()
     # The E4 guard's per-underlying index is derived from these raws; it goes with them.
     from .option_basis_guard import clear_basis_guard_cache
@@ -679,9 +695,14 @@ class _RawUnderlying:
             self.bid = np.full(self.n_rows, np.nan)
             self.ask = np.full(self.n_rows, np.nan)
 
-        self.bar_ord_l = _array.array(_BAR_ORD_TYPECODE)
-        self.bar_ord_l.frombytes(
-            np.ascontiguousarray(self.bar_ord, dtype=np.int32).tobytes())
+        # A MEMORYVIEW OVER THE MAPPED COLUMN (2026-11-04), no longer a private ``array('i')``
+        # copy: the bytes are the shared ``bar_ord`` themselves, so the only per-row projection
+        # costs this process nothing and the raw cache can hold the whole universe. ``bisect``
+        # and indexing read it as python ints exactly as before (measured: bisect 0.145 us
+        # against 0.125 us, index 0.038 against 0.034). Cast through 'B' because numpy reports
+        # int32 as 'l' where C long is 4 bytes (Windows).
+        self.bar_ord_l = memoryview(
+            np.ascontiguousarray(self.bar_ord, dtype=np.int32)).cast("B").cast(_BAR_ORD_TYPECODE)
         self.starts_l = self.starts.tolist()
         self.stops_l = self.stops.tolist()
         date_of_ord = {int(o): date.fromordinal(int(o))
@@ -1231,6 +1252,163 @@ def _underlying(root: str, underlying: str, rate: Any, spot_scope: str) -> _Unde
     return hist
 
 
+# -- the shared ATM-IV table ----------------------------------------------------------------
+#
+# WHY IT EXISTS (2026-11-04). ``get_iv_rank`` asks for ~252 trailing ATM IVs per symbol per
+# decision bar. On the 748-name stage-2 pilot that was 72-75% of every trial (py-spy,
+# remote227): a 20-45 DTE scan with a Black-Scholes inversion per contract, recomputed by
+# every worker for every genome although the answer depends on neither. The table is that
+# answer, computed ONCE per host by the same scan, published through the derived array store
+# and mapped by every worker, every trial and every later job over the same inputs.
+#
+# EXACTNESS IS BY CONSTRUCTION, not by tolerance: a cell is ``_atm_iv_scan`` -- the one
+# function the live path also calls -- run on an overlay of the same raw, rate and spot. Its
+# inputs are pinned by the store key: the partition files (the signature), the scan rule
+# (``_ATM_IV_TABLE_VERSION``) and a digest of every spot and rate the scan can read.
+# ``None`` is stored as NaN; a real ATM IV is never NaN (``_f`` maps a NaN greek to None).
+#
+# A CELL THE BUILD COULD NOT ANSWER IS ABSENT, never a value: weekends (no decision is taken
+# on one) and days on which the scan raised ``RiskFreeRateUnavailable`` keep state 0, and a
+# query for such a day -- or outside the table -- takes the scan, which raises or answers
+# exactly as it always did.
+
+#: Bump when ``_atm_iv_scan``'s rule or the table's encoding changes: the key then moves.
+_ATM_IV_TABLE_VERSION = 1
+
+
+def _atm_iv_scan(u: "_Underlying", as_of_ord: int, spot_source) -> Optional[float]:
+    """NEAR-ATM implied volatility as of ``as_of_ord``: the rule ``get_atm_iv`` documents.
+
+    THE ONE IMPLEMENTATION, called by the live path and by the table build alike.
+    """
+    if not u.n_rows:
+        return None
+    lo = as_of_ord + _ATM_DTE_MIN
+    hi = as_of_ord + _ATM_DTE_MAX
+    keep = u.c_is_call & (u.c_expiry_ord >= lo) & (u.c_expiry_ord <= hi)
+    best: Optional[Tuple[Tuple[float, int, float], float]] = None
+    for ci in np.flatnonzero(keep):
+        ci = int(ci)
+        i = u.latest_row_on_or_before(ci, as_of_ord)
+        if i < 0:
+            continue
+        delta, iv = u.delta_iv_of_row(i, ci, spot_source)
+        if delta is None or iv is None:
+            continue
+        key = (abs(abs(delta) - 0.5), u.raw.c_expiry_ord_l[ci], u.raw.c_strike_f[ci])
+        if best is None or key < best[0]:
+            best = (key, float(iv))
+    return best[1] if best is not None else None
+
+
+def _spot_rate_digest(u: "_Underlying", spot_source) -> str:
+    """sha1 of every spot and rate ``_atm_iv_scan`` can read for this underlying.
+
+    The scan reads the spot and the rate of a ROW's own bar date, and every bar date is a key
+    of ``raw.date_of_ord`` (which also holds the expiry dates: hashing those too only makes
+    the key stricter). An absent spot and a rate the series cannot state are both NaN, so a
+    run whose price window or rate coverage differs gets a different table rather than a
+    table built over inputs it does not have.
+    """
+    import hashlib
+
+    from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
+
+    ords = sorted(u.raw.date_of_ord)
+    spots = np.empty(len(ords), dtype="float64")
+    rates = np.empty(len(ords), dtype="float64")
+    for k, o in enumerate(ords):
+        s = spot_source(u.underlying, u.raw.date_of_ord[o])
+        spots[k] = np.nan if s is None else float(s)
+        try:
+            rates[k] = float(u.rate.rate_on(o))
+        except RiskFreeRateUnavailable:
+            rates[k] = np.nan
+    h = hashlib.sha1()
+    h.update(np.asarray(ords, dtype=np.int64).tobytes())
+    h.update(spots.tobytes())
+    h.update(rates.tobytes())
+    return h.hexdigest()
+
+
+def _atm_iv_table_arrays(u: "_Underlying", spot_source) -> Dict[str, np.ndarray]:
+    """The table: one ``_atm_iv_scan`` per WEEKDAY from the first bar date to the last."""
+    from ba2_providers.macro.risk_free_rate import RiskFreeRateUnavailable
+
+    if not u.n_rows:
+        return {"base_ord": np.array([0], dtype=np.int64),
+                "atm_iv": np.empty(0, dtype="float64"), "state": np.empty(0, dtype=np.int8)}
+    first = int(u.bar_ord.min())
+    last = int(u.bar_ord.max())
+    n = last - first + 1
+    atm_iv = np.full(n, np.nan, dtype="float64")
+    state = np.zeros(n, dtype=np.int8)
+    for k in range(n):
+        o = first + k
+        if date.fromordinal(o).weekday() >= 5:
+            continue
+        try:
+            v = _atm_iv_scan(u, o, spot_source)
+        except RiskFreeRateUnavailable:
+            continue
+        state[k] = 1
+        if v is not None:
+            atm_iv[k] = v
+    return {"base_ord": np.array([first], dtype=np.int64), "atm_iv": atm_iv, "state": state}
+
+
+class _AtmIvTable:
+    """One underlying's mapped ATM-IV table. ``lookup`` answers ``_MISSING`` for an absent cell."""
+
+    __slots__ = ("base", "n", "atm_iv", "state")
+
+    def __init__(self, arrays: Dict[str, np.ndarray]):
+        self.base = int(arrays["base_ord"][0])
+        self.atm_iv = arrays["atm_iv"]
+        self.state = arrays["state"]
+        self.n = int(len(self.state))
+
+    def lookup(self, as_of_ord: int):
+        k = as_of_ord - self.base
+        if k < 0 or k >= self.n or not self.state[k]:
+            return _MISSING
+        v = self.atm_iv[k]
+        return None if v != v else float(v)
+
+
+def _open_atm_iv_table(root: str, underlying: str, u: "_Underlying", spot_source):
+    """The mapped table for this overlay's inputs; ``_PENDING`` while another process builds
+    it; None when this process uses none (an empty underlying, or ``BA2_SHARED_ARRAYS=0``,
+    under which a per-process table would cost more than the scans it replaces)."""
+    import time
+
+    from ba2_common.core import shared_arrays as _sa
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    if not _sa.enabled() or not u.n_rows:
+        return None
+    parts = OptionHistoryParquetStore(root=root).partition_paths(underlying)
+    if not parts:
+        return None
+    digest = _spot_rate_digest(u, spot_source)
+    key = f"atmiv_{underlying.upper()}.v{_ATM_IV_TABLE_VERSION}.{digest[:20]}"
+    t0 = time.monotonic()
+    built: List[bool] = []
+
+    def _build() -> Dict[str, np.ndarray]:
+        built.append(True)
+        return _atm_iv_table_arrays(u, spot_source)
+
+    arrays = _sa.DerivedArrayStore(_sa.derived_root_for(root)).open_or_build_nowait(
+        key, parts, _build)
+    if arrays is None:
+        return _PENDING
+    if built:
+        logger.info("[backtest] parquet option store: %s ATM-IV table built (%d days) in %.1fs",
+                    underlying, len(arrays["state"]), time.monotonic() - t0)
+    return _AtmIvTable(arrays)
+
+
 def _as_date(when: Any) -> Optional[date]:
     """A date/datetime/ISO string -> date. The refinement seam is handed all three."""
     if when is None:
@@ -1427,9 +1605,18 @@ class ParquetOptionsProvider:
         Black-Scholes inversion, with no fallback to anything whose date is unknown. See
         ``options_provider.get_atm_iv`` for why that rule (and its divergence from live) is
         what it is — this reader must not answer a DIFFERENT question from the other backend.
+
+        Served from the host-shared ATM-IV table when its cell is present (see "the shared
+        ATM-IV table" above), else by the scan, memoised per process as before.
         """
+        as_of_ord = as_of.toordinal()
+        table = self._atm_table(underlying)
+        if table is not None and table is not _PENDING:
+            v = table.lookup(as_of_ord)
+            if v is not _MISSING:
+                return v
         cache_key = (self.root, underlying, self.risk_free_rate_source.identity,
-                     self.spot_scope, as_of.toordinal())
+                     self.spot_scope, as_of_ord)
         cached = _WORKER_ATM_IV_CACHE.get(cache_key, _MISSING)
         if cached is not _MISSING:
             _WORKER_ATM_IV_CACHE.move_to_end(cache_key)  # LRU: mark most-recently-used
@@ -1506,27 +1693,16 @@ class ParquetOptionsProvider:
         return _underlying(self.root, underlying, self.risk_free_rate_source, self.spot_scope)
 
     def _compute_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:
-        u = self._u(underlying)
-        if not u.n_rows:
-            return None
-        as_of_ord = as_of.toordinal()
-        lo = (as_of + timedelta(days=_ATM_DTE_MIN)).toordinal()
-        hi = (as_of + timedelta(days=_ATM_DTE_MAX)).toordinal()
-        keep = u.c_is_call & (u.c_expiry_ord >= lo) & (u.c_expiry_ord <= hi)
-        spot_source = self.spot_source
-        best: Optional[Tuple[Tuple[float, int, float], float]] = None
-        for ci in np.flatnonzero(keep):
-            ci = int(ci)
-            i = u.latest_row_on_or_before(ci, as_of_ord)
-            if i < 0:
-                continue
-            delta, iv = u.delta_iv_of_row(i, ci, spot_source)
-            if delta is None or iv is None:
-                continue
-            key = (abs(abs(delta) - 0.5), u.raw.c_expiry_ord_l[ci], u.raw.c_strike_f[ci])
-            if best is None or key < best[0]:
-                best = (key, float(iv))
-        return best[1] if best is not None else None
+        return _atm_iv_scan(self._u(underlying), as_of.toordinal(), self.spot_source)
+
+    def _atm_table(self, underlying: str):
+        """This process's shared ATM-IV table for ``underlying`` (or None / ``_PENDING``)."""
+        key = (self.root, underlying, self.risk_free_rate_source.identity, self.spot_scope)
+        t = _WORKER_ATM_TABLES.get(key, _MISSING)
+        if t is _MISSING:
+            t = _open_atm_iv_table(self.root, underlying, self._u(underlying), self.spot_source)
+            _WORKER_ATM_TABLES[key] = t
+        return t
 
 
 @lru_cache(maxsize=1 << 16)
