@@ -132,7 +132,9 @@ def test_chart_stacks_when_the_shown_labels_are_disjoint(nicegui_client, monkeyp
 
 def test_compute_monthly_realized_records_the_per_symbol_detail(monkeypatch):
     import ba2_trade_platform.ui.pages.overview as ov
+    from ba2_trade_platform.services import growth as growth_service    # the label lookup moved there with the monthly maths
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {'AAA': ['SP500', 'expert-8'], 'BBB': []})
+    monkeypatch.setattr(growth_service, 'get_labels_by_symbol', lambda syms: {'AAA': ['SP500', 'expert-8'], 'BBB': []})
     tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
     trades = [{'symbol': 'AAA', 'side': 'BUY', 'qty': 1, 'price': 10, 'date': datetime(2026, 8, 1)},
               {'symbol': 'AAA', 'side': 'SELL', 'qty': 1, 'price': 14, 'date': datetime(2026, 9, 2)}]

@@ -63,7 +63,9 @@ def env(monkeypatch, nicegui_client):  # noqa: F811
     monkeypatch.setattr(ov, '_clock', lambda: clock.t)
     monkeypatch.setattr(ov, 'get_all_instances', lambda m: [SimpleNamespace(id=1, name='A1')])
     monkeypatch.setattr(ov, 'get_account_instance_from_id', lambda i: acct)
+    from ba2_trade_platform.services import growth as growth_service    # the label lookup moved there with the monthly maths
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
+    monkeypatch.setattr(growth_service, 'get_labels_by_symbol', lambda syms: {})
     monkeypatch.setattr(yfinance, 'download', lambda *a, **k: None)
     monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
     for name in ('_render_monthly_profit_by_label_chart', '_render_total_growth_chart',

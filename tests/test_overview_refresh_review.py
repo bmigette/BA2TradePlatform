@@ -79,7 +79,9 @@ def env(monkeypatch):
     monkeypatch.setattr(ov, 'get_selected_account_id', lambda: state.selected)
     monkeypatch.setattr(ov, 'read_range', lambda: 'YTD')
     monkeypatch.setattr(ov, 'write_range', lambda v: True)
+    from ba2_trade_platform.services import growth as growth_service    # the label lookup moved there with the monthly maths
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
+    monkeypatch.setattr(growth_service, 'get_labels_by_symbol', lambda syms: {})
     monkeypatch.setattr(yfinance, 'download', lambda *a, **k: yf_calls.append(k.get('period')))
     monkeypatch.setattr(ov, '_extract_yf_close_prices', lambda h, s: {'2026-09-01': 1.0})
     from nicegui.slot import Slot

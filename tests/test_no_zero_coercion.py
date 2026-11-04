@@ -88,6 +88,9 @@ SCAN_ROOTS = (
     "ba2_trade_platform/core",
     "ba2_trade_platform/modules/accounts",
     "ba2_trade_platform/ui",
+    # the management-API services hold code MOVED out of ui/ (Overview figures): leaving the root out would
+    # have silently exempted that debt the day it moved.
+    "ba2_trade_platform/services",
     "testplatform/backend/app/services",
 )
 
@@ -454,6 +457,8 @@ BASELINE: dict = {
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
+    # moved verbatim out of ui/pages/overview.py (the Account Growth series); same debt, new home.
+    "ba2_trade_platform/services/growth.py": 10,
     # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
     # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
     # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
@@ -463,7 +468,9 @@ BASELINE: dict = {
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
     # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
     # price instead of reading either as 0, which would book a free trade.
-    "ba2_trade_platform/ui/pages/overview.py": 16,
+    # 16 -> 7: ten of the Account Growth series coercions moved with their code into
+    # ba2_trade_platform/services/growth.py (listed below); the page itself keeps 7.
+    "ba2_trade_platform/ui/pages/overview.py": 7,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -506,7 +513,7 @@ BASELINE: dict = {
     # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
     # must never say. Debt paid off leaves the register entirely.
 }
-BASELINE_TOTAL = 165
+BASELINE_TOTAL = 166
 
 
 # =========================================================================== #
