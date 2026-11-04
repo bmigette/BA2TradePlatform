@@ -4,7 +4,7 @@ distribution. The Overview widgets and ``GET /stats/overview`` call these same f
 
 Scoping rule (see ``services/account_scope.py``): ``account_id is None`` is "All accounts" and ONLY that widens a query."""
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from sqlmodel import func, select
@@ -15,7 +15,9 @@ from ..core.db import get_db
 from ..core.models import AccountDefinition, ExpertInstance, Instrument, TradingOrder, Transaction
 from ..core.types import OrderStatus, OrderType, TransactionStatus
 from ..logger import logger
+from ._common import naive_utc, require_row
 from .account_scope import scope_transactions_to_account
+from .errors import Invalid
 
 
 def expert_display_name(expert: ExpertInstance) -> str:
@@ -156,3 +158,61 @@ def position_distribution(positions: Iterable[Dict[str, Any]], grouping_field: s
                 category = 'Uncategorized'
             distribution[category] += abs(market_value)
     return dict(sorted(distribution.items(), key=lambda x: x[1], reverse=True))
+
+
+#: group_by values of ``closed_pnl``.
+CLOSED_PNL_GROUPS = ("day", "month", "expert", "symbol")
+#: Longest window a closed-P&L request may cover (the rows are read into memory to be grouped).
+CLOSED_PNL_MAX_DAYS = 365 * 5
+CLOSED_PNL_DEFAULT_DAYS = 90
+NO_EXPERT = "(no expert)"
+
+
+def closed_pnl(account_id: int, from_: Optional[datetime], to: Optional[datetime], group_by: str,
+               *, limit: int, offset: int) -> Dict[str, Any]:
+    """Realized P&L of the account's closed transactions with ``close_date`` in ``[from_, to]`` (``to`` inclusive,
+    like ``/transactions``), grouped by day / month / expert / symbol. The P&L of one transaction is
+    ``calculate_transaction_pnl`` -- the function the Overview's Trade Performance and Profit-Per-Expert figures use.
+    A closed transaction whose P&L cannot be computed is COUNTED in ``unmeasured`` (per group and in the total) and
+    left out of the sums; it is never added as 0. Groups are paged (newest / largest first)."""
+    if group_by not in CLOSED_PNL_GROUPS:
+        raise Invalid(f"group_by={group_by!r} is not one of {list(CLOSED_PNL_GROUPS)}", {"field": "group_by"})
+    to_n = naive_utc(to) if to is not None else datetime.now(timezone.utc).replace(tzinfo=None)
+    from_n = naive_utc(from_) if from_ is not None else to_n - timedelta(days=CLOSED_PNL_DEFAULT_DAYS)
+    if from_n > to_n:
+        raise Invalid("from is after to", {"from": from_n.isoformat(), "to": to_n.isoformat()})
+    if (to_n - from_n).days > CLOSED_PNL_MAX_DAYS:
+        raise Invalid(f"The window is longer than {CLOSED_PNL_MAX_DAYS} days", {"max_days": CLOSED_PNL_MAX_DAYS})
+    groups: Dict[str, List[Transaction]] = defaultdict(list)
+    with get_db() as session:
+        require_row(session, AccountDefinition, account_id, "account")
+        query = scope_transactions_to_account(select(Transaction), account_id).where(
+            Transaction.status == TransactionStatus.CLOSED, Transaction.close_date.isnot(None),
+            Transaction.close_date >= from_n, Transaction.close_date <= to_n)
+        experts = {e.id: expert_display_name(e) for e in session.exec(select(ExpertInstance)).all()}
+        for tx in session.exec(query).all():
+            if group_by == "day":
+                key = tx.close_date.strftime("%Y-%m-%d")
+            elif group_by == "month":
+                key = tx.close_date.strftime("%Y-%m")
+            elif group_by == "symbol":
+                key = tx.symbol
+            else:
+                key = experts[tx.expert_id] if tx.expert_id in experts else (NO_EXPERT if tx.expert_id is None
+                                                                             else f"expert-{tx.expert_id} (deleted)")
+            groups[key].append(tx)
+    rows = []
+    for key, txs in groups.items():
+        st = _pnl_stats(txs)
+        rows.append({"group": key, "pnl": st["total"], "trades": len(txs), "wins": st["wins"], "losses": st["losses"],
+                     "unmeasured": st["unmeasured"]})
+    if group_by in ("day", "month"):
+        rows.sort(key=lambda r: r["group"], reverse=True)
+    else:
+        rows.sort(key=lambda r: (-r["pnl"], r["group"]))
+    every = [tx for txs in groups.values() for tx in txs]
+    total = _pnl_stats(every)
+    return {"account_id": account_id, "group_by": group_by, "from": from_n.isoformat(), "to": to_n.isoformat(),
+            "total": {"pnl": total["total"], "trades": len(every), "wins": total["wins"], "losses": total["losses"],
+                      "unmeasured": total["unmeasured"]},
+            "items": rows[offset:offset + limit], "groups": len(rows), "limit": limit, "offset": offset}
