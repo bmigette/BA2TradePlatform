@@ -6,8 +6,8 @@
       "note": "Stage-2 job A, MID horizon (docs/plans/2026-09-25-option-stage2-plan.md section 0.2). Member order is precedence, first passing rule wins (user 2026-10-24, confirmed 2026-11-03). DTE centre ranges widened where stage 1 pinned at the bound (BULLCS 60, STRD 55); O_BF keeps its stage-1 band. No price cap: entries are bounded by risk sizing and the option risk manager (user 2026-10-24). Risk block: user 2026-11-03.",
       "price_cap_policy": "none",
       "members": [
-        {"key": "O_STRG", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
-        {"key": "O_STRD", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
+        {"key": "O_STRG", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
+        {"key": "O_STRD", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
         {"key": "O_BULLCS", "action_overrides": {"option_dte_min": 45, "option_dte_max": 75, "option_dte_min_range": 40, "option_dte_max_range": 90, "option_dte_step": 5}},
         {"key": "O_BF"},
         {"key": "O_LC", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}}

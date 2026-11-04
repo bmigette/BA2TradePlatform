@@ -25,6 +25,7 @@ import json as _json
 import logging
 import math as _math
 import random
+import re
 import sys as _sys
 import time as _time
 from datetime import date, datetime
@@ -418,6 +419,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                "max_drawdown": results.get("max_drawdown"),
                **_analysis_failures_field(results),
                **_screener_gate_field(results),
+               **_entry_gate_field(results),
                # The decision-time counter, so the MASTER can warn once per job (see
                # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
                **_decision_time_missing(results),
@@ -1324,6 +1326,36 @@ def _resolve_parallel_individuals(ga: Dict[str, Any]) -> int:
     return 1 if raw is None else int(raw)
 
 
+def split_expert_cfg(expert_cfg: Optional[Dict[str, Any]]):
+    """``ga["expert_params"]`` -> ``(model_cfg, screener_cfg, schedule_cfg)``: the ``screener:``/``schedule:``
+    entries are routed to their own namespace (prefix stripped), the rest is the model space. Shared by the
+    handler and the launcher's seed check so both see the same gene space."""
+    model_cfg = None
+    screener_cfg = None
+    schedule_cfg = None
+    if expert_cfg:
+        model_cfg = {k: v for k, v in expert_cfg.items()
+                     if not k.startswith("screener:") and not k.startswith("schedule:")}
+        screener_cfg = {
+            k[len("screener:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("screener:")
+        } or None
+        schedule_cfg = {
+            k[len("schedule:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("schedule:")
+        } or None
+    return model_cfg, screener_cfg, schedule_cfg
+
+
+def job_param_space(strategy, expert_cfg: Optional[Dict[str, Any]], bypass: bool) -> Dict[str, Any]:
+    """The joint GA gene space a job searches (what the handler stores as ``parameter_ranges``)."""
+    model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
+    return collect_param_space(strategy, expert_cfg=model_cfg, bypass=bypass,
+                               screener_cfg=screener_cfg, schedule_cfg=schedule_cfg)
+
+
 def _resolve_lattice_anchor(ga: Dict[str, Any]) -> str:
     """The GA step-lattice anchor a job runs under (``genetic.LATTICE_ANCHORS``).
 
@@ -1368,6 +1400,14 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     if af and af.get("passes"):
         return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
     return {}
+
+
+def _entry_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"eg": {rule: {"n", "met", "b", "order"}}}`` -- the per-trial entry-gate counts
+    (``results["entry_gate_record"]``, see ``entry_gate_bt``), or ``{}`` when the run recorded none.
+    Summed over a job's trials by ``tools/report_entry_gates.py``."""
+    eg = (results or {}).get("entry_gate_record")
+    return {"eg": eg} if eg else {}
 
 
 def _screener_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
@@ -1787,22 +1827,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # by _collect_expert: the model space gets the remaining keys, and a screener_cfg/
         # schedule_cfg (prefix stripped back to the bare name) is passed alongside so
         # collect_param_space emits the ``screener:<setting>``/``schedule:<day>`` genes.
-        model_cfg = None
-        screener_cfg = None
-        schedule_cfg = None
-        if expert_cfg:
-            model_cfg = {k: v for k, v in expert_cfg.items()
-                        if not k.startswith("screener:") and not k.startswith("schedule:")}
-            screener_cfg = {
-                k[len("screener:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("screener:")
-            } or None
-            schedule_cfg = {
-                k[len("schedule:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("schedule:")
-            } or None
+        model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
 
         # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
         # is known, in addition to the launcher's check -- a hand-written config that bypassed the
@@ -1827,10 +1852,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         # --- Build the joint param space (Task 1) ---
         try:
-            param_space = collect_param_space(
-                strategy, expert_cfg=model_cfg, bypass=bypass_expert,
-                screener_cfg=screener_cfg, schedule_cfg=schedule_cfg,
-            )
+            param_space = job_param_space(strategy, expert_cfg, bypass_expert)
         except ValueError as e:
             return _fail(opt_id, db, str(e))
         opt.parameter_ranges = param_space
@@ -1928,6 +1950,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     **_decision_time_missing(results or {}),
                     **_analysis_failures_field(results or {}),
                     **_screener_gate_field(results or {}),
+                    **_entry_gate_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -2217,6 +2240,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "max_drawdown": out.get("max_drawdown"),
                              **({"af": out["af"]} if out.get("af") else {}),
                              **({"sg": out["sg"]} if out.get("sg") else {}),
+                             **({"eg": out["eg"]} if out.get("eg") else {}),
                              **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
@@ -2320,6 +2344,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             return batch_fitness
 
         start_gen, init_pop, init_fits = 0, None, None
+        n_protected_seeds = 0
         # A brute-force grid has no population to resume or warm-start: never read (or, below,
         # clear) a GA checkpoint for one.
         ckpt = None if is_brute_force else _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
@@ -2370,6 +2395,21 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _record_chain_lineage(db, opt, {
                     "kind": "chain", "optimization_id": int(ga[CHAIN_SEED_KEY]),
                     "name": _src_name, "resumed_from_checkpoint": True})
+        elif not is_brute_force and "seedPopulation" in ga:
+            # Authored seeds (stage 2): complete gene dicts, strict-encoded, padded by the GA's
+            # own seeded RNG. A checkpoint resume (branch above) still wins.
+            if ga.get("warmStartFromOptimizationId") or ga.get(CHAIN_SEED_KEY):
+                return _fail(opt_id, db, "seedPopulation is mutually exclusive with "
+                                         f"warmStartFromOptimizationId and {CHAIN_SEED_KEY}")
+            try:
+                init_pop = _build_seed_population(
+                    ga["seedPopulation"], optimizer, int(ga["populationSize"]))
+            except ValueError as e:
+                return _fail(opt_id, db, f"seedPopulation refused: {e}")
+            n_protected_seeds = len(ga["seedPopulation"])
+            logger.warning(
+                f"strategy_optimization {opt_id}: seeded {n_protected_seeds} of "
+                f"{len(init_pop)} individuals (rest random)")
         elif not is_brute_force and ga.get(CHAIN_SEED_KEY):
             if ga.get("warmStartFromOptimizationId"):
                 return _fail(opt_id, db, f"{CHAIN_SEED_KEY} and warmStartFromOptimizationId are "
@@ -2421,6 +2461,29 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         f"strategy_optimization {opt_id}: warm-started population "
                         f"({len(init_pop)} individuals) from optimization {warm_start_id}"
                     )
+
+        # requireAnEntryRule: generation 0 only (fresh job; a checkpoint resume is untouched).
+        # Absent or False = today's behaviour, no extra RNG draw.
+        if (not is_brute_force and ckpt is None and "requireAnEntryRule" in ga
+                and ga["requireAnEntryRule"] is not False):
+            if ga["requireAnEntryRule"] is not True:
+                return _fail(opt_id, db, f"requireAnEntryRule must be a bool, got "
+                                         f"{ga['requireAnEntryRule']!r}")
+            if "seedPopulation" not in ga and (
+                    ga.get("warmStartFromOptimizationId") or ga.get(CHAIN_SEED_KEY)):
+                return _fail(opt_id, db, "requireAnEntryRule applies to a fresh or seedPopulation "
+                                         "generation 0, not a warm-start or chain-seeded one")
+            try:
+                if init_pop is None:
+                    # Same draw sequence optimize() would make for a fresh generation 0.
+                    init_pop = optimizer._initial_population(int(ga["populationSize"]))
+                n_repaired = _require_an_entry_rule(
+                    init_pop, optimizer.param_names, optimizer._rng, n_protected_seeds)
+            except ValueError as e:
+                return _fail(opt_id, db, f"requireAnEntryRule refused: {e}")
+            logger.warning(
+                f"strategy_optimization {opt_id}: requireAnEntryRule repaired {n_repaired} of "
+                f"{len(init_pop) - n_protected_seeds} non-seed generation-0 individuals")
 
         # MARKET-CONDITION SNAPSHOT, ON THIS MACHINE, ONCE (design section 4.5). The master is
         # also a worker: it runs trials in its own pool and its own in-process re-runs, and until
@@ -3715,6 +3778,11 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     early_stop_min_rel = _resolve_early_stop_min_rel(ga)
     if early_stop_min_rel is not None:
         payload["early_stop_min_rel"] = early_stop_min_rel
+    if "seedPopulation" in ga:
+        # A seeded run is a different experiment from an unseeded (or differently seeded) one with the same
+        # gene space: its generation-0 population differs, so a checkpoint must never cross.
+        payload["seed_population"] = hashlib.sha1(json.dumps(
+            ga["seedPopulation"], sort_keys=True, default=str).encode("utf-8")).hexdigest()
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -3994,6 +4062,42 @@ def _record_chain_lineage(db, opt: StrategyOptimization, lineage: Dict[str, Any]
     """Write the ``seededFrom`` block on the new row (reassigned: JSON columns are not mutation-tracked)."""
     opt.optimization_config = {**(opt.optimization_config or {}), SEEDED_FROM_KEY: lineage}
     db.commit()
+
+
+def _build_seed_population(seeds: Any, optimizer: GeneticOptimizer, target: int) -> list:
+    """Generation 0 from ``ga["seedPopulation"]``: every seed strict-encoded (a ValueError names
+    the seed index and gene), then ``optimizer.seeded_population`` pads with the GA's own seeded
+    RNG and balances stratified genes. Seeds come first, unmodified."""
+    if not isinstance(seeds, list) or not seeds or not all(isinstance(s, dict) for s in seeds):
+        raise ValueError("must be a non-empty list of gene dicts")
+    if len(seeds) > target:
+        raise ValueError(f"{len(seeds)} seeds exceed populationSize {target}")
+    encoded = []
+    for i, seed in enumerate(seeds):
+        try:
+            encoded.append(optimizer.encode_params_strict(seed))
+        except ValueError as e:
+            raise ValueError(f"seed #{i}: {e}") from e
+    return optimizer.seeded_population(encoded, target)
+
+
+_ENTRY_RULE_GENE = re.compile(r"^entry:(?!.*:a\d+:enabled$).+:enabled$")
+
+
+def _require_an_entry_rule(population: list, param_names: list, rng: Any,
+                           n_protected: int = 0) -> int:
+    """In place: every individual after the first ``n_protected`` (the seeds) whose rule-level
+    ``entry:<rid>:enabled`` genes are ALL 0 gets one of them, chosen with ``rng``, set to 1.
+    Returns how many were repaired. Raises ValueError when the space has no such gene."""
+    idx = [i for i, n in enumerate(param_names) if _ENTRY_RULE_GENE.match(n)]
+    if not idx:
+        raise ValueError("the parameter space has no entry:<rule>:enabled gene")
+    repaired = 0
+    for ind in population[n_protected:]:
+        if all(int(round(ind[i])) == 0 for i in idx):
+            ind[rng.choice(idx)] = 1
+            repaired += 1
+    return repaired
 
 
 def _build_warm_start_population(

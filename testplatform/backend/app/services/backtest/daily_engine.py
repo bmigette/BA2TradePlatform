@@ -77,6 +77,7 @@ from ba2_common.core.benchmark_regime import reset_benchmark_regime, set_benchma
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
 
+from app.services.backtest.entry_gate_bt import EntryGateRecord
 from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_cache_indicator_provider
 
 
@@ -650,6 +651,9 @@ class DailyBacktestEngine:
         # the three call sites below are one ``is None`` test each. This is what keeps a
         # profile-less run's blob and counters the ones it has always produced.
         self._mc = market_condition_record
+        # ENTRY-GATE counter (read-only; which leaf blocks entry recommendations). Always on: it only
+        # reads ``evaluator.rule_evaluations`` after the evaluation. None disables it (zero-effect test).
+        self._eg: Optional[EntryGateRecord] = EntryGateRecord()
 
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
@@ -1225,6 +1229,11 @@ class DailyBacktestEngine:
         return {"passes": passes, "failed": failed, "first_error": first,
                 "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
 
+    def entry_gate_record(self) -> Optional[Dict[str, Any]]:
+        """``{rule: {"n", "met", "b": {leaf: first-false count}, "order": [leaf...]}}`` of the ENTRY
+        evaluations, or None when none ran (see ``entry_gate_bt``)."""
+        return self._eg.record() if self._eg is not None else None
+
     def refuse_if_analysis_failing(self) -> None:
         """ONE summary WARNING when any pass failed; RAISE when an expert's failed share exceeds
         ``MAX_FAILED_ANALYSIS_SHARE`` (judged from ``MIN_ANALYSIS_PASSES_FOR_REFUSAL`` passes on).
@@ -1562,6 +1571,14 @@ class DailyBacktestEngine:
                 ruleset_id=ruleset_id,
                 existing_order=None,
             )
+            if self._eg is not None:
+                try:
+                    self._eg.note_rules(evaluator.rule_evaluations)
+                except (TypeError, KeyError, AttributeError, ValueError) as e:
+                    # Telemetry must never cost a real entry: log once, stop counting this run
+                    # (its record is then absent, never partial).
+                    logger.error(f"entry-gate counter disabled for this run: {e}", exc_info=True)
+                    self._eg = None
             if self._mc is not None:
                 # Classify this recommendation's market leaves. NOTE the evaluator's default
                 # ``evaluate_all_conditions=False``: it stops at the FIRST failing condition,

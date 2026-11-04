@@ -7390,7 +7390,9 @@ _STYLE_ASSIGNS_STOCK = {"O_CSP", "O_JL", "O_RS", "O_WHEEL", "O_CBS", "O_PBS", "O
 #: in their exits. Admissible (revision E1), but the option-entry ``action_overrides`` have
 #: nothing to act on for them.
 _STYLE_EQUITY_ENTRY = {"O_CC", "O_PP"}
-_STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note"}
+_STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note", "neutral_entry_mode"}
+#: Values of a member's ``neutral_entry_mode`` (the ``--neutral-entry-mode`` choices).
+_STYLE_NEUTRAL_MODES = ("legacy", "hold", "low_confidence", "joint")
 _STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver", "risk"}
 #: A style's own option risk manager (plan 2026-09-25 §3 items 8-9; job A values user 2026-11-03).
 #: ``risk_manager_mode`` plus every rail, each either ``fixed`` (an expert setting) or searched
@@ -7723,6 +7725,15 @@ def _style_risk(kind: "str | None") -> "dict | None":
     return _STYLE_ACTIVE.get("risk")
 
 
+def _style_member_neutral_mode(mem: dict) -> str:
+    """A style member's neutral entry mode; absent = ``legacy`` (today's behaviour)."""
+    return mem["neutral_entry_mode"] if "neutral_entry_mode" in mem else "legacy"
+
+
+def _style_has_non_legacy_neutral(style: dict) -> bool:
+    return any(_style_member_neutral_mode(m) != "legacy" for m in style["members"])
+
+
 def _validate_style(name: str, style: dict) -> None:
     """Every rule of the style spec, refusing by name (plan Task 3, as revised 2026-09-25)."""
     where = f"style {name!r}"
@@ -7770,10 +7781,27 @@ def _validate_style(name: str, style: dict) -> None:
         keys.append(key)
         if "note" in mem and not isinstance(mem["note"], str):
             raise ValueError(f"{mwhere}: note must be a string")
+        if "neutral_entry_mode" in mem:
+            nmode = mem["neutral_entry_mode"]
+            if nmode not in _STYLE_NEUTRAL_MODES:
+                raise ValueError(f"{mwhere}: neutral_entry_mode must be one of "
+                                 f"{list(_STYLE_NEUTRAL_MODES)}, got {nmode!r}")
+            if key not in _NEUTRAL_ENTRY_MEMBERS:
+                raise ValueError(f"{mwhere}: neutral_entry_mode applies only to the neutral "
+                                 f"members {sorted(_NEUTRAL_ENTRY_MEMBERS)}; {key} is directional")
         if "action_overrides" in mem:
             _validate_style_action_overrides(mwhere, key, mem["action_overrides"])
         if "exit_overrides" in mem:
             _validate_style_exit_overrides(mwhere, mem["exit_overrides"])
+    if _style_has_non_legacy_neutral(style):
+        legacy_neutral = [m["key"] for m in members if m["key"] in _NEUTRAL_ENTRY_MEMBERS
+                          and _style_member_neutral_mode(m) == "legacy"]
+        if legacy_neutral:
+            raise ValueError(
+                f"{where}: member(s) {legacy_neutral} use the legacy neutral gate, but another "
+                f"member sets a non-legacy neutral_entry_mode, which turns "
+                f"evaluate_entry_rules_on_hold on for the whole run and so changes what the "
+                f"legacy gate means; give every neutral member an explicit neutral_entry_mode")
     # Inside a style every member's ids are namespaced (``_style_member_id``), which is what
     # lets O_CSP + O_WHEEL and O_CC + O_PP coexist. What can STILL collide is two members that
     # own the same id prefix (e.g. a group key beside one of its own arms): refused, because
@@ -8185,11 +8213,21 @@ def _build_strategy_style(kind: str):
     id_maps: dict = {}
     owners: dict = {}
     shared: dict = {}
+    style_non_legacy = _style_has_non_legacy_neutral(style)
     for mem in style["members"]:
         key = mem["key"]
         tag = _STYLE_MEMBER_TAGS[key]
         try:
             src = _STRATEGY_BUILDERS[key](key)
+            nmode = _style_member_neutral_mode(mem)
+            if nmode != "legacy":
+                # The member's OWN build, exactly as the single job configures it, so its
+                # entry rule ids and genes are the single job's (o_strd-entry-hold, ...).
+                _configure_neutral_entry(src, key, nmode)
+            elif style_non_legacy and key not in _NEUTRAL_ENTRY_MEMBERS:
+                # evaluate_entry_rules_on_hold lets HOLD reach entry rules; this fixed
+                # leaf (no gene) keeps a directional member's admission what it was.
+                _append_directional_leaf(src, key)
             e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
                                                 mem.get("action_overrides"))
             x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
@@ -8775,6 +8813,22 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
     return _clamp_confidence_genes(strat, expert)
 
 
+def _directional_leaf(kind):
+    """The fixed (gene-less) ``rec_direction != 0`` leaf: the recommendation is not HOLD."""
+    return {"id": f"{kind.lower()}-directional", "field": "rec_direction",
+            "op": "!=", "value": 0}
+
+
+def _append_directional_leaf(strategy, kind):
+    """Append the fixed non-HOLD leaf to each entry rule's root AND list (in place)."""
+    for rule in strategy.entry_rules:
+        root = rule["conditions"]
+        if root.get("type") != "AND":
+            raise ValueError(f"{kind}: entry rule {rule.get('id')!r} root is not an AND, so "
+                             f"the fixed directional leaf cannot be appended")
+        root["conditions"].append(_directional_leaf(kind))
+
+
 def _configure_neutral_entry(strategy, kind, mode):
     """Fixed or joint HOLD/low-confidence experiments; never an impossible AND."""
     if kind not in _NEUTRAL_ENTRY_MEMBERS or mode not in ("hold", "low_confidence", "joint"):
@@ -8803,8 +8857,7 @@ def _configure_neutral_entry(strategy, kind, mode):
         if mode == "low_confidence":
             # Confidence alone also accepts HOLD. Make the directional arm explicit
             # using the existing condition, rather than filtering expert outputs.
-            leaves.append({"id": f"{m}-directional", "field": "rec_direction",
-                           "op": "!=", "value": 0})
+            leaves.append(_directional_leaf(kind))
         if mode == "hold":
             # HOLD has no directional price target. Requiring expected_profit > N
             # would silently make this arm untradeable even after admitting HOLD.
@@ -8821,6 +8874,17 @@ def _configure_neutral_entry(strategy, kind, mode):
                     c["toggle_optimize"] = False
                     c["toggleOptimize"] = False
         rule["conditions"]["conditions"] = leaves
+
+
+def _style_effective_neutral_mode(strategy_key, mode):
+    """The mode ``_apply_neutral_entry_setting`` sees: a style's members own it (spec), so the
+    run-level flag is on iff any member is non-legacy."""
+    if strategy_key == _STYLE_KEY:
+        if mode != "legacy":
+            raise ValueError(f"--neutral-entry-mode cannot be combined with --strategy "
+                             f"{_STYLE_KEY}: the style spec owns it (member 'neutral_entry_mode')")
+        return "joint" if _style_has_non_legacy_neutral(_STYLE_ACTIVE) else "legacy"
+    return mode
 
 
 def _apply_neutral_entry_setting(backtest_block, mode):
@@ -8873,6 +8937,128 @@ def _resolve_chain_seed_source(db, name: str, warm_start_from) -> int:
     return int(rows[0][0])
 
 
+def _style_owned_gene_keys(strat, space: dict) -> dict:
+    """``{member: the space keys that member owns}`` for a built style: a ``cond:``/``entry:``/``exit:`` gene
+    belongs to the member whose id map has its rule/condition id as a VALUE. ``shared-*`` conditions (one gene
+    for every member) and the ``optsel``/``model``/``schedule``/``screener``/``market`` genes are shared and in
+    nobody's list."""
+    maps = strat.style_id_maps
+    owner: dict = {}
+    for member, mp in maps.items():
+        for table in ("entry_rules", "exit_rules", "entry_conds", "exit_conds"):
+            for new in mp[table].values():
+                if new.startswith(_STYLE_SHARED_LEAF_PREFIX):
+                    continue
+                if owner.setdefault(new, member) != member:
+                    raise ValueError(f"id {new!r} belongs to both {owner[new]} and {member}")
+    keys: dict = {m: [] for m in maps}
+    for k in space:
+        ns, _, rest = k.partition(":")
+        if ns in ("cond", "entry", "exit"):
+            ident = rest.partition(":")[0]
+            if ident in owner:
+                keys[owner[ident]].append(k)
+    return keys
+
+
+def _load_seed_bundle(path: str, style_name: str) -> "tuple[dict, str]":
+    """The bundle file and the sha256 of its bytes; refused (SystemExit) when unreadable, malformed or built for
+    another style."""
+    import hashlib
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        bundle = json.loads(raw)
+    except (OSError, ValueError) as e:
+        sys.exit(f"optimize: --seed-population {path}: cannot read the bundle: {e}")
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("individuals"), list) or not bundle["individuals"]:
+        sys.exit(f"optimize: --seed-population {path}: not a seed bundle (no 'individuals')")
+    if bundle.get("style") != style_name:
+        sys.exit(f"optimize: --seed-population {path}: the bundle was built for style "
+                 f"{bundle.get('style')!r}, this job is --style {style_name!r}")
+    return bundle, hashlib.sha256(raw).hexdigest()
+
+
+def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, population: int) -> "tuple[list, list]":
+    """-> ``(seed gene dicts, provenance list)`` for a bundle against the job's own gene space; every
+    refusal is a ``SystemExit`` naming the seed (and the gene, where there is one). Each assembled
+    genome is also checked with the optimizer's ``encode_params_strict`` -- exactly what the handler
+    will do at generation 0, so a seed that passes here cannot fail the job there."""
+    from app.services.genetic import GeneticOptimizer
+    from app.services.strategy_param_space import authored_genome
+    from app.services.style_seeding import SeedRefused, assemble_individual
+
+    inds = bundle["individuals"]
+    if len(inds) > population:
+        sys.exit(f"optimize: seed bundle refused: {len(inds)} seeds exceed --population {population}")
+    try:
+        member_keys = _style_owned_gene_keys(strat, space)
+        authored = authored_genome(strat, space, lattice_anchor=anchor)
+    except ValueError as e:
+        sys.exit(f"optimize: seed bundle refused: authored genome: {e}")
+    opt = GeneticOptimizer(param_ranges=space, population_size=population, n_generations=1,
+                           lattice_anchor=anchor)
+    seeds, provenance = [], []
+    for i, ind in enumerate(inds):
+        contributions = []
+        for c in ind["contributions"]:
+            member = c["member"]
+            if member not in strat.style_id_maps:
+                sys.exit(f"optimize: seed bundle refused: seed #{i}: {member!r} is not a member of the style "
+                         f"({sorted(strat.style_id_maps)})")
+            try:
+                genes = {_style_translate_key(g, strat.style_id_maps[member], member, space): v
+                         for g, v in c["genes"].items()}
+            except ValueError as e:
+                sys.exit(f"optimize: seed bundle refused: seed #{i}: {e}")
+            r = c["resolved"]
+            contributions.append({"member": member, "genes": genes,
+                                  "label": f"opt {r['opt_id']} {r['pick']}"
+                                           + (f" rank {r['rank']}" if r["rank"] else "")})
+        try:
+            genes, prov = assemble_individual(
+                space, authored, member_keys, contributions, shared_from=ind.get("shared_from", 0),
+                other_members=ind.get("other_members", "authored"), fill=bundle.get("fill") or {},
+                out_of_range=bundle.get("out_of_range", "clamp"), lattice_anchor=anchor)
+            opt.encode_params_strict(genes)
+        except (SeedRefused, ValueError) as e:
+            sys.exit(f"optimize: seed bundle refused: seed #{i}: {e}")
+        counts: dict = {}
+        for o in prov["origin"].values():
+            counts[o.split(":")[0]] = counts.get(o.split(":")[0], 0) + 1
+        seeds.append(genes)
+        provenance.append({
+            "index": i, "shared_from": ind.get("shared_from", 0),
+            "other_members": ind.get("other_members", "authored"),
+            "contributions": [{"member": c["member"], "resolved": cc["resolved"]}
+                              for c, cc in zip(contributions, ind["contributions"])],
+            "origin_counts": counts, "clamped": prov["clamped"], "conflicts": prov["conflicts"],
+            "fills": sorted(k for k, o in prov["origin"].items() if o == "fill")})
+    return seeds, provenance
+
+
+def _print_seed_report(provenance: list, space: dict, anchor: str, fill: dict) -> None:
+    nc = sum(len(p["clamped"]) for p in provenance)
+    nx = sum(len(p["conflicts"]) for p in provenance)
+    nf = sum(len(p["fills"]) for p in provenance)
+    print(f"optimize: seed population: {len(provenance)} seeds over {len(space)} genes "
+          f"(lattice anchor {anchor!r}); {nc} clamps, {nx} shared-gene conflicts, {nf} filled genes")
+    for p in provenance:
+        members = ",".join(c["member"] for c in p["contributions"])
+        print(f"  seed #{p['index']}: members={members} other_members={p['other_members']} "
+              f"clamps={len(p['clamped'])} conflicts={len(p['conflicts'])} fills={len(p['fills'])} "
+              f"origins={p['origin_counts']}")
+        for c in p["clamped"]:
+            print(f"    clamp {c['key']}: {c['from']!r} -> {c['to']!r}")
+        for c in p["conflicts"]:
+            print(f"    conflict {c['key']}: values {c['values']!r}, used contribution {c['used']}")
+    filled = sorted({k for p in provenance for k in p["fills"]})
+    if filled:
+        print(f"  filled genes ({len(filled)}), policy fill patterns {json.dumps(fill, sort_keys=True)}:")
+        for k in filled:
+            print(f"    {k}")
+
+
 def _cmd_optimize(args) -> int:
     """Create a Strategy + StrategyOptimization and run a joint genetic optimization headless.
 
@@ -8919,6 +9105,18 @@ def _cmd_optimize(args) -> int:
     # BEFORE the fitness checks and the build: both read the style's members.
     global _STYLE_ACTIVE
     _STYLE_ACTIVE = _resolve_style_args(args, spec, "optimize")
+    seed_path = getattr(args, "seed_population", None)
+    seed_check_only = bool(getattr(args, "seed_check_only", False))
+    seed_bundle = seed_sha = None
+    if seed_check_only and not seed_path:
+        sys.exit("optimize: --seed-check-only needs --seed-population BUNDLE")
+    if seed_path:
+        if args.strategy != _STYLE_KEY:
+            sys.exit(f"optimize: --seed-population applies only to --strategy {_STYLE_KEY}")
+        if getattr(args, "warm_start_from", None) is not None or getattr(args, "chain_seed_from", None):
+            sys.exit("optimize: --seed-population is mutually exclusive with --warm-start-from and "
+                     "--chain-seed-from")
+        seed_bundle, seed_sha = _load_seed_bundle(seed_path, _STYLE_ACTIVE["name"])
     _refuse_unbounded_strategy_request("optimize", [args.strategy])
     _refuse_phase_gated_strategy("optimize", [args.strategy])
     # --rm-toggle-policy (design atr_grid_2027 §3.2). "pinned" (default) is byte-identical to
@@ -9003,7 +9201,7 @@ def _cmd_optimize(args) -> int:
     _refuse_reused_timegene_name(_opt_name, decision_times, "optimize",
                                  split=_decision_times_is_split(getattr(args, "decision_times", None)))
     _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
-    if not getattr(args, "rerun", False):
+    if not getattr(args, "rerun", False) and not seed_check_only:
         _db = SessionLocal()
         try:
             _prior = (_db.query(StrategyOptimization)
@@ -9031,6 +9229,10 @@ def _cmd_optimize(args) -> int:
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
         neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
+        if args.strategy == _STYLE_KEY and neutral_mode != "legacy":
+            sys.exit(f"optimize: --neutral-entry-mode {neutral_mode} cannot be combined with "
+                     f"--strategy {_STYLE_KEY}: the style spec owns it (set "
+                     f"'neutral_entry_mode' on a member)")
         if bypass and neutral_mode != "legacy":
             raise ValueError("Neutral option entry experiments require a ruleset expert")
         try:
@@ -9047,7 +9249,8 @@ def _cmd_optimize(args) -> int:
         # affect it, then thread it into the run config below so the handler's _build_experts (and
         # the optimization handler's _build_daily_trial_config) seed the enter ruleset with it.
         strat_entry_action = getattr(strat, "entry_action", None)
-        db.add(strat); db.commit(); db.refresh(strat)
+        if seed_bundle is None:     # a seeded job writes its Strategy only AFTER the seeds are accepted (below)
+            db.add(strat); db.commit(); db.refresh(strat)
 
         backtest_block = {
             "engine": "daily",
@@ -9137,7 +9340,8 @@ def _cmd_optimize(args) -> int:
         _apply_options_store(args, backtest_block)
         # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
         _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
-        _apply_neutral_entry_setting(backtest_block, neutral_mode)
+        _apply_neutral_entry_setting(
+            backtest_block, _style_effective_neutral_mode(args.strategy, neutral_mode))
         # STAGE 2: the resolved style (content + sha + the path it came from) on the run config.
         # Only style jobs write the key, so every other stored config keeps its shape; the
         # handler carries it into every trial config (_build_daily_trial_config).
@@ -9302,6 +9506,23 @@ def _cmd_optimize(args) -> int:
                 db, args.chain_seed_from, getattr(args, "warm_start_from", None))
         if getattr(args, "persist_final_population", False) or getattr(args, "chain_seed_from", None):
             cfg["requireFinalPopulation"] = True
+        if args.strategy == _STYLE_KEY:
+            # A style's random generation 0 can draw every member's entry toggle off (21 of 28 pilot
+            # genomes made no trade); the handler repairs it. Set for every O_STYLE job, seeded or not.
+            cfg["requireAnEntryRule"] = True
+        if seed_bundle is not None:
+            from app.services.strategy_optimization_handler import _resolve_lattice_anchor, job_param_space
+            _space = job_param_space(strat, cfg["expert_params"], bypass)
+            _anchor = _resolve_lattice_anchor(cfg)
+            _seeds, _prov = _assemble_seed_population(seed_bundle, strat, _space, _anchor, int(args.population))
+            _print_seed_report(_prov, _space, _anchor, seed_bundle.get("fill") or {})
+            cfg["seedPopulation"] = _seeds
+            cfg["seedProvenance"] = _prov
+            backtest_block["seed_bundle_sha256"] = seed_sha
+            if seed_check_only:
+                print("optimize: --seed-check-only: bundle accepted; nothing was written")
+                return 0
+            db.add(strat); db.commit(); db.refresh(strat)
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -10971,6 +11192,15 @@ def main(argv: "list | None" = None) -> int:
                          "(look-ahead); a short population is padded randomly (count logged and "
                          "recorded as optimization_config.seededFrom). Mutually exclusive with "
                          "--warm-start-from.")
+    op.add_argument("--seed-population", default=None, metavar="BUNDLE",
+                    help="O_STYLE only: seed generation 0 from a bundle built by "
+                         "tools/build_style_seed_bundle.py. Every seed is translated into the style's genes, "
+                         "completed (authored defaults, policy fills, clamps), and checked with the GA's own "
+                         "strict encoder at launch; any refusal stops the launch before a row is written. "
+                         "Mutually exclusive with --warm-start-from / --chain-seed-from.")
+    op.add_argument("--seed-check-only", action="store_true",
+                    help="With --seed-population: assemble and check the seeds, print the report and exit 0 "
+                         "without writing a Strategy or StrategyOptimization row.")
     op.add_argument("--persist-final-population", action="store_true",
                     help="Fail the job at completion unless its final evaluated population was "
                          "stored (strategy_optimization_populations). Implied by --chain-seed-from; "
