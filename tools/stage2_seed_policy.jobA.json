@@ -1,5 +1,5 @@
 {
- "note": "DRAFT for user review (2026-11-04): stage-2 job A seed policy. 20 single-member seeds (behaviour-distinct ranks 1-4 of each stage-1 source, other members off) + 4 combined seeds (rank k from all five members, shared genes from O_LC). Fill values are the least restrictive ones; confirm before launch.",
+ "note": "APPROVED by the user 2026-11-04: stage-2 job A seed policy. 20 single-member seeds (behaviour-distinct ranks 1-4 of each stage-1 source, other members off) + 4 combined seeds (rank k from all five members, shared genes from O_LC). Fill values are the least restrictive ones (SPY gates off as in stage 1; RM rails at their loosest).",
  "schema": 1,
  "style": "mid",
  "individuals": [
