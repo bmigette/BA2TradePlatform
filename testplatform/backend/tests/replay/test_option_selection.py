@@ -401,3 +401,15 @@ def test_a_record_without_a_clock_span_is_missing_capture_naming_it(session):
     row = _only(report)
     assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
     assert "clock span" in row.detail
+
+
+def test_the_tape_account_class_is_built_once_per_recorded_class_and_declarations(session):
+    """Building a class per action leaks a subclass of TapeOptionsAccount (and of the options
+    interface) every time; the same recorded class and declarations reuse one."""
+    first = option_selection._account_class("Acct", {"OPTION_GREEKS_SOURCE": "broker"})
+    count = len(TapeOptionsAccount.__subclasses__())
+    for _ in range(5):
+        assert option_selection._account_class("Acct", {"OPTION_GREEKS_SOURCE": "broker"}) is first
+    assert len(TapeOptionsAccount.__subclasses__()) == count
+    assert option_selection._account_class("Acct", {"OPTION_GREEKS_SOURCE": None}) is not first
+    assert option_selection._account_class("Other", {"OPTION_GREEKS_SOURCE": "broker"}) is not first

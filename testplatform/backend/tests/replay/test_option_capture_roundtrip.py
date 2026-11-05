@@ -254,6 +254,36 @@ def test_the_inventory_counts_option_actions_and_names_the_capability_that_repla
     assert "## Option actions" in markdown and "`option_selection` capability" in markdown
 
 
+def test_the_inventory_counts_an_undecodable_option_payload_instead_of_aborting(tmp_path):
+    from app.services.replay import inventory
+
+    recorded = record_session(
+        tmp_path / "store", tmp_path / "export",
+        lambda: (entry_action(RecordingOptionsAccount()).execute(),
+                 entry_action(RecordingOptionsAccount(), rec=recommendation(id=2)).execute()))
+    bundle = load_bundle(recorded["bundle_dir"])
+    objects = {o.payload_object for o in bundle.observations if o.provider == "option_action"}
+    bad = sorted(objects)[0]
+
+    class _Broken:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def decode(self, ref, *a, **k):
+            if ref == bad:
+                raise ValueError("corrupt object")
+            return self._inner.decode(ref, *a, **k)
+
+    counted = inventory._option_actions(_Broken(bundle))
+    assert counted["total"] == 2
+    labels = counted["by_class_and_outcome"]
+    assert labels.get("OpenBullPutSpreadAction/undecodable", 0) >= 1
+    assert sum(labels.values()) == 2
+
+
 # --------------------------------------------------------------------------- recorded read errors
 def _quote_down_account(exc_factory):
     class QuoteDown(RecordingOptionsAccount):

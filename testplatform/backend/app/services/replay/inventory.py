@@ -140,18 +140,21 @@ def _option_actions(bundle) -> Dict[str, Any]:
     from app.services.replay.report import CAPABILITY_OPTION_SELECTION
 
     by_class_outcome: Counter = Counter()
-    action_ids = set()
     for observation in bundle.observations:
         if observation.provider != oar.OPTION_ACTION_PROVIDER:
             continue
-        action_ids.update(observation.analysis_ids)
-        outcome = bundle.decode(observation.payload_object)["outcome"]             if observation.payload_object is not None else None
-        if outcome is None:
+        if observation.payload_object is None:
             label = "payload_missing"
-        elif outcome["status"] == "error":
-            label = "error"
         else:
-            label = "submitted" if outcome["success"] else "refused"
+            try:
+                outcome = bundle.decode(observation.payload_object)["outcome"]
+            except Exception:  # noqa: BLE001 -- one bad payload is a counted gap, not an abort
+                label = "undecodable"
+            else:
+                if outcome["status"] == "error":
+                    label = "error"
+                else:
+                    label = "submitted" if outcome["success"] else "refused"
         by_class_outcome[f"{observation.method}/{label}"] += 1
     rows = {status: 0 for status in STATUS_ORDER}
     for entry in bundle.coverage:

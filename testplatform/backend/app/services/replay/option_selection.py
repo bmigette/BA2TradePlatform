@@ -278,13 +278,26 @@ def _install_refusals(cls) -> None:
 
 _install_refusals(TapeOptionsAccount)
 
+#: One class per (recorded account class name, declarations). ``type(...)`` on every action would
+#: add a new subclass to ``TapeOptionsAccount.__subclasses__()`` each time, and
+#: ``OptionsAccountInterface.__subclasses__`` is walked by the guard tests -- a leak that grows
+#: with the size of the replayed session. Declarations are string tags or ``None``.
+_ACCOUNT_CLASSES: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], type] = {}
+
+
+def _account_class(name: str, declarations: Dict[str, Any]) -> type:
+    key = (name, tuple(sorted(declarations.items())))
+    if key not in _ACCOUNT_CLASSES:
+        _ACCOUNT_CLASSES[key] = type(name, (TapeOptionsAccount,), dict(declarations))
+    return _ACCOUNT_CLASSES[key]
+
+
 def _tape_account(tape: SpanTape, inputs: Dict[str, Any], analysis_id: str) -> TapeOptionsAccount:
     """A tape account named and numbered as the recorded one, with the recorded identity shapes."""
     # Named like the recorded account (the name is part of every recorded identity) and carrying
     # its class-level declarations (e.g. OPTION_GREEKS_SOURCE, without which an entry record
     # cannot be built).
-    account_class = type(inputs["account_class"], (TapeOptionsAccount,),
-                         dict(inputs["account_declarations"]))
+    account_class = _account_class(inputs["account_class"], inputs["account_declarations"])
     quotes = tape.identities(STOCK_PROVIDER, STOCK_QUOTE_METHOD)
     underlying = tape.identities(OPTION_PROVIDER, "get_option_underlying_price")
     return account_class(
@@ -589,11 +602,10 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
         # The action swallowed a miss into some other outcome; the miss is the finding.
         return _missing(_miss_text(tape.misses[0])), next_start
 
-    if produced["status"] == "error" and payload["outcome"]["status"] != "error":
-        statuses, diffs = compare_outcomes(payload["outcome"], produced)
-        return _Outcome(_DIFFERENCE, f"error: {produced['error']}", statuses, diffs), next_start
-
     statuses, diffs = compare_outcomes(payload["outcome"], produced)
+    if produced["status"] == "error" and payload["outcome"]["status"] != "error":
+        # A re-run that raises where live returned: named by its error, not by a stage count.
+        return _Outcome(_DIFFERENCE, f"error: {produced['error']}", statuses, diffs), next_start
     if not diffs:
         return _Outcome(_MATCH, "re-ran to the recorded contracts, limit, quantity, record "
                                 "and outcome", statuses), next_start
