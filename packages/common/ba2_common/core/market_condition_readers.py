@@ -438,11 +438,19 @@ class CapturingMarketConditionReader:
 
     def observe(self, symbol: str, session: date) -> Optional[FeatureRow]:
         entry = self.inner.observe_window(symbol, session)
-        self._record_entry(symbol, session, entry)
+        try:
+            self._record_entry(symbol, session, entry)
+        except Exception as exc:  # noqa: BLE001 -- recording is evidence, not a dependency
+            self._capture.note_failure(f"market-condition window {symbol}@{session} not recorded", exc)
         return None if entry is None else entry.row
 
     def record(self, symbol: str, session: date, row: Any = None) -> None:
-        self._record_entry(symbol, session, self.inner.observe_window(symbol, session))
+        # Called from a gate's evaluation (``ctx.recorder``): recording is evidence, not a
+        # dependency, so a failure here is counted in CaptureHealth and never reaches the gate.
+        try:
+            self._record_entry(symbol, session, self.inner.observe_window(symbol, session))
+        except Exception as exc:  # noqa: BLE001 -- see the comment above
+            self._capture.note_failure(f"market-condition window {symbol}@{session} not recorded", exc)
 
     @staticmethod
     def _dedupe_key(symbol: str, session: date, entry: Optional[ObservedWindow]) -> Tuple:

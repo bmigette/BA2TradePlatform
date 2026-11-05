@@ -1044,3 +1044,40 @@ def test_a_leaf_evaluation_error_in_a_bare_scope_still_raises(dispatcher, instan
         _break_reader(monkeypatch, "raise")
         with pytest.raises(RuntimeError, match="reader exploded"):
             _eval_leaf(ExpertEventType.N_UNDERLYING_ADX, _rec_for(4))
+
+
+# --------------------------------------------------------------------------- recorder failure on exits
+def test_a_capture_reader_failure_in_the_exit_pass_leaves_the_exits_running(
+        world, dispatcher, instances, clock, monkeypatch):
+    """The exit pass opens a REAL capture scope for a gated expert, so ``begin_decision`` reaches
+    ``capturing_reader_for``. When that raises (a recorder defect) the exits still run, the gate is
+    still read from the live reader (status valid, not no_context) and the failure is counted."""
+    import ba2_common.core.market_condition_readers as readers
+    import ba2_common.core.replay as replay_pkg
+    from ba2_common.core.replay.context import CaptureHealth
+
+    submitted = []
+
+    class _Store:
+        health = CaptureHealth()
+
+        def current_session_id(self):
+            return "s1"
+
+        def submit(self, record, objects=None, observations=()):
+            submitted.append(record)
+
+    def _boom(*a, **k):
+        raise RuntimeError("recorder defect")
+
+    monkeypatch.setattr(replay_pkg, "get_replay_store", lambda: _Store())
+    monkeypatch.setattr(readers, "capturing_reader_for", _boom)
+    instances[world["expert_id"]] = "ohlcv-v1"
+    world["recorder"].leaf = _adx_leaf
+
+    result = _run(world["expert_id"])
+
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+    (call,) = world["recorder"].calls
+    assert call["leaf"]["status"] == STATUS_VALID and call["leaf"]["passed"] is True
+    assert submitted and submitted[0].capture_failures   # counted on the pass's record
