@@ -517,3 +517,12 @@ def test_the_export_bound_is_its_own_and_longer_than_the_ga_stall_bound(monkeypa
     assert mod._topn_export_timeout_s() == 14400.0
     monkeypatch.setenv("BT_TOPN_EXPORT_TIMEOUT_S", "900")
     assert mod._topn_export_timeout_s() == 900.0
+
+
+def test_a_remote_attempt_gets_the_remaining_export_budget_not_1800s(monkeypatch):
+    import time as _t
+    seen = {}
+    monkeypatch.setattr(_worker_client, "run_trial_full",
+                        lambda w, tc, fm, timeout=None: seen.setdefault("t", timeout) and {"ok": True})
+    mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe", deadline=_t.monotonic() + 7200)
+    assert 7100 < seen["t"] <= 7200

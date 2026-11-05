@@ -10089,7 +10089,12 @@ def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitnes
             raise TimeoutError(
                 f"export deadline passed before the remote attempt to {worker.get('name')} finished")
         try:
-            return run_trial_full(worker, trial_cfg, fitness_metric)
+            if deadline is None:
+                return run_trial_full(worker, trial_cfg, fitness_metric)
+            # The attempt may use what is left of the export bound, not run_trial_full's fixed
+            # 1800 s: under GA load a TOP-N re-run outlasts 30 min (opt 40 TOP1/TOP3, 2026-11-05).
+            return run_trial_full(worker, trial_cfg, fitness_metric,
+                                  timeout=max(1.0, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
             last_exc = e
             if attempt == 0:
