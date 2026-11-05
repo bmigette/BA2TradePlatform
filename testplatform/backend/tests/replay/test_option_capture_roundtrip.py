@@ -297,3 +297,39 @@ def test_a_third_party_error_class_replays_as_a_difference_never_a_false_match(t
     (row,) = report.results
     assert row.status == ReplayStatus.COVERAGE_DIFFERENCE
     assert "RecordedProviderError" in row.detail and "rate limited" in row.detail
+
+
+# --------------------------------------------------------------------------- nested taps
+class _MovingSnapshotAccount(RecordingOptionsAccount):
+    """Every snapshot read answers a DIFFERENT equity, so a mis-served read cannot match."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def get_account_snapshot(self):
+        from ba2_common.core.account_types import AccountSnapshot
+        self.reads += 1
+        equity = 100_000.0 + self.reads
+        return AccountSnapshot(cash=equity, equity=equity, net_liquidation=equity,
+                               buying_power=equity)
+
+
+def test_a_tapped_read_inside_a_tapped_read_is_recorded_deeper_and_ignored_by_the_tape(tmp_path):
+    def scenario():
+        account = _MovingSnapshotAccount()
+        equity = account.option_capital_equity()          # outer; calls get_account_snapshot inside
+        direct = account.get_account_snapshot()           # a direct read of the same identity
+        return equity, direct.equity
+
+    recorded = record_session(tmp_path / "store", tmp_path / "export", scenario)
+    assert recorded["outcome"] == (100_001.0, 100_002.0)
+    bundle = load_bundle(recorded["bundle_dir"])
+    reads = [(o.method, o.tap_depth) for o in bundle.observations
+             if o.provider == "broker_options"]
+    assert reads == [("get_account_snapshot", 1), ("option_capital_equity", 0),
+                     ("get_account_snapshot", 0)]
+    window = option_selection.action_window(
+        sorted(bundle.observations, key=lambda o: o.invocation_seq), 0, 10 ** 6)
+    assert [(o.method, o.tap_depth) for o in window] == [("option_capital_equity", 0),
+                                                         ("get_account_snapshot", 0)]

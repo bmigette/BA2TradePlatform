@@ -359,6 +359,7 @@ class CaptureContext:
         fetched_at: Optional[datetime] = None,
         published_at: Optional[datetime] = None,
         first_observed_at: Optional[datetime] = None,
+        tap_depth: int = 0,
     ) -> Optional[str]:
         """Record one provider return at its return boundary (cache hits included).
 
@@ -397,6 +398,7 @@ class CaptureContext:
                 published_at=published_at,
                 first_observed_at=first_observed_at,
                 provenance=provenance,
+                tap_depth=tap_depth,
             )
             pending = PendingObservation(observation=observation, payload=freeze(payload))
             with self._lock:

@@ -487,6 +487,22 @@ def _clock_slice(analysis: AnalysisRecord, decision_time: datetime, start: int
     return None, [], []
 
 
+def action_window(observations: Sequence[ProviderObservation], start: int, end: int
+                  ) -> List[ProviderObservation]:
+    """The tape of ONE action: the broker reads it made itself, in recorded order.
+
+    Exactly the observations with ``start <= invocation_seq < end`` (entry of the action to its own
+    record, written at exit), of the two broker providers, and at ``tap_depth == 0``. A read made
+    by another tapped read (``option_capital_equity`` calling ``get_account_snapshot``) is
+    recorded too, but replay serves the OUTER read directly: leaving the inner one on the tape
+    would hand its (older) value to a later direct read of the same identity.
+    """
+    return [o for o in observations
+            if start <= o.invocation_seq < end
+            and o.provider in (OPTION_PROVIDER, STOCK_PROVIDER)
+            and o.tap_depth == 0]
+
+
 def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
                   observation: ProviderObservation, observations: Sequence[ProviderObservation],
                   clock_start: int) -> Tuple[_Outcome, int]:
@@ -506,10 +522,7 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     start = payload["tape_span"]["start"]
     if start is None:
         return _missing("tape_span.start was not captured"), clock_start
-    # Exactly the reads made between the action's entry and its record (written at exit).
-    window = [o for o in observations
-              if start <= o.invocation_seq < observation.invocation_seq
-              and o.provider in (OPTION_PROVIDER, STOCK_PROVIDER)]
+    window = action_window(observations, start, observation.invocation_seq)
 
     decision_time = oar.replay_decision_time(payload)
     index, reads, phases = _clock_slice(analysis, decision_time, clock_start)
