@@ -245,3 +245,98 @@ def test_a_payer_is_not_asked_for_a_third_expiry():
     s = date(2024, 4, 1)
     r = carry_free_spot(s, [(date(2024, 4, 19), 100.0), (date(2024, 5, 17), 99.0)], _PAYER, spot=100.0)
     assert r.linear_confirmed is None and r.spot is not None
+
+
+# ---- VERIFIED add-back: a large dividend is accepted when the same chain shows it priced ------
+S0 = date(2022, 4, 12)
+EX = date(2022, 4, 19)
+LONG_AGO = date(2022, 2, 25)
+
+
+def _chain(spot, ratios):
+    """[(dte, parity/spot)] -> points; dte relative to S0."""
+    return [(S0 + timedelta(days=t), spot * r) for t, r in ratios]
+
+
+def test_a_priced_stla_shaped_dividend_is_verified_and_added_back():
+    # 7.5% dividend: pre-ex expiry (day 5) at 1.0, post-ex expiries at 0.925
+    pts = _chain(100.0, [(5, 1.0), (33, 0.925), (61, 0.925)])
+    res = carry_free_spot(S0, pts, [_div(EX, 7.5, LONG_AGO)], spot=100.0)
+    assert res.veto is None and res.spot is not None
+    assert res.spot / 100.0 == pytest.approx(1.0, abs=0.01)
+
+
+def test_the_real_stla_march_chain_is_verified_with_the_chain_s_own_step():
+    """Measured 2022-03-01: pre-ex 17d 1.0018, post-ex 108d 0.9572 (step 0.67 of the $1.1221):
+    the add-back follows the chain (min(1, step / D)), else it overshoots into 'slopes up'."""
+    s = date(2022, 3, 1)
+    pts = [(s + timedelta(days=17), 16.82 * 1.0018), (s + timedelta(days=108), 16.82 * 0.9572),
+           (s + timedelta(days=199), 16.82 * 0.9438)]
+    res = carry_free_spot(s, pts, [_div(EX, 1.1221, LONG_AGO)], spot=16.82)
+    assert res.veto is None and res.spot / 16.82 == pytest.approx(1.0018, abs=0.01)
+
+
+def test_no_pre_ex_expiry_keeps_the_veto_and_says_why():
+    pts = _chain(100.0, [(10, 0.925), (33, 0.925), (61, 0.925)])        # every expiry after ex
+    res = carry_free_spot(S0, pts, [_div(EX, 7.5, LONG_AGO)], spot=100.0)
+    assert res.spot is None and "> 2.5%" in res.veto and "no usable expiry before" in res.veto
+
+
+def test_an_unpriced_special_is_a_veto_the_step_does_not_match():
+    """ACI-shaped, 25%: OCC adjusts the strikes, so pre-ex and post-ex expiries both sit at 1.0."""
+    pts = _chain(27.5, [(5, 1.0), (33, 1.0), (61, 0.999)])
+    res = carry_free_spot(S0, pts, [_div(EX, 6.85, LONG_AGO)], spot=27.5)
+    assert res.spot is None and "> 2.5%" in res.veto and "not priced" in res.veto
+
+
+@pytest.mark.parametrize("frac", [0.026, 0.03, 0.05, 0.075, 0.25])
+def test_an_unpriced_special_just_above_the_cap_is_still_a_veto(frac):
+    pts = _chain(100.0, [(5, 1.0), (33, 1.0), (61, 1.0)])
+    res = carry_free_spot(S0, pts, [_div(EX, 100.0 * frac, LONG_AGO)], spot=100.0)
+    assert res.spot is None and "not priced" in res.veto
+
+
+def test_a_basis_error_plus_a_priced_dividend_keeps_the_basis_error_visible():
+    pts = _chain(100.0, [(5, 0.93), (33, 0.93 - 0.07), (61, 0.93 - 0.07)])
+    res = carry_free_spot(S0, pts, [_div(EX, 7.0, LONG_AGO)], spot=100.0)
+    assert res.veto is None                                    # the step matches: verified
+    assert res.spot / 100.0 == pytest.approx(0.93, abs=0.01)  # ... and the multiple survives
+    from ba2_common.core.option_carry import MAX_ADDBACK_FRACTION as cap
+    assert res.spot / 100.0 < 1.0 - (0.05 - cap)               # below the guard's CARRY_BAND_LOW
+
+
+def test_a_basis_error_hiding_behind_an_unpriced_special_is_a_veto():
+    pts = _chain(100.0, [(5, 0.93), (33, 0.93), (61, 0.93)])
+    res = carry_free_spot(S0, pts, [_div(EX, 7.0, LONG_AGO)], spot=100.0)
+    assert res.spot is None and "not priced" in res.veto
+
+
+def test_a_verified_large_and_a_small_dividend_are_both_added_back():
+    ex2 = S0 + timedelta(days=45)
+    # day 5 pre; large 7% at ex (day 7) -> day 33 at 0.93; small 1% at day 45 -> day 61 at 0.92
+    pts = _chain(100.0, [(5, 1.0), (33, 0.93), (61, 0.92)])
+    divs = [_div(EX, 7.0, LONG_AGO), _div(ex2, 1.0, LONG_AGO)]
+    res = carry_free_spot(S0, pts, divs, spot=100.0)
+    assert res.veto is None and res.spot / 100.0 == pytest.approx(1.0, abs=0.01)
+
+
+def test_a_large_dividend_declared_after_the_session_is_neither_added_back_nor_verified():
+    pts = _chain(100.0, [(5, 1.0), (33, 0.925), (61, 0.925)])
+    res = carry_free_spot(S0, pts, [_div(EX, 7.5, S0 + timedelta(days=1))], spot=100.0)
+    # not added back (causal), and not verified either: on a payer the unexplained drop is a veto
+    assert res.spot is None and "not explained by the dividend calendar (0.0%)" in res.veto
+
+
+def test_an_undeclared_large_dividend_does_not_verify_a_small_declared_one():
+    """The gap's expected step counts DECLARED rows only, so the not-yet-declared 7% cannot
+    stand in for a priced step: the small row is judged on its own."""
+    pts = _chain(100.0, [(5, 1.0), (33, 0.93), (61, 0.93)])
+    divs = [_div(EX, 7.0, S0 + timedelta(days=1)), _div(EX, 3.0, LONG_AGO)]
+    res = carry_free_spot(S0, pts, divs, spot=100.0)
+    assert res.veto is not None and "not priced" in res.veto
+
+
+def test_a_step_far_above_the_calendar_is_not_verified():
+    pts = _chain(100.0, [(5, 1.0), (33, 0.80), (61, 0.80)])             # 20% step for a 7% row
+    res = carry_free_spot(S0, pts, [_div(EX, 7.0, LONG_AGO)], spot=100.0)
+    assert res.spot is None and "not priced" in res.veto

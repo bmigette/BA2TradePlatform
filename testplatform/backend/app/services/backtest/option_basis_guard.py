@@ -41,10 +41,17 @@ a 5-8% "basis error". When the uncorrected window median is off, the guard consu
   tightened by the most that may be added back unverified (2.5%): 0.975 .. 1.05 today.
   Otherwise the refusal stands.
 * A VETO refuses by name: no dividend calendar, dividends to add back above 2.5% of the spot
-  (unverified -- a special the chain does not price would hide an error of its size), a dividend
-  row of unknown declaration date or amount, a term structure sloping up, and -- on a dividend
-  payer -- a drop between the two expiries that the calendar's dividends do not explain within
-  2.5% of the spot (an uncalendared dividend, not carry).
+  that the session's own chain does not show priced (a special the chain does not price would
+  hide an error of its size; see VERIFIED ADD-BACK), a dividend row of unknown declaration date
+  or amount, a term structure sloping up, and -- on a dividend payer -- a drop between the two
+  expiries that the calendar's dividends do not explain within 2.5% of the spot (an uncalendared
+  dividend, not carry).
+* VERIFIED ADD-BACK: a dividend over the 2.5% cap is added back anyway when an expiry before its
+  ex-date and one on/after it show a step of 0.5-1.5x the declared dividends of that gap
+  (``option_carry.VERIFY_MIN/VERIFY_MAX``): STLA 2022-04 ($1.12, 7.5%, ex 04-19) killed a GA job
+  as an unverified veto, and 116 of the 752 stage-2 names have such a dividend. An OCC-adjusted
+  special shows no step and stays a veto; a basis error stays visible because the carry-free
+  spot keeps the multiple. Residual risks are in the ``option_carry`` docstring.
 
 KNOWN RESIDUAL (measured 2026-09-26 after the unexplained-drop veto; the first item accepted by
 the coordinator the same day, REPAIR_LOG):
@@ -66,7 +73,8 @@ the coordinator the same day, REPAIR_LOG):
   bend the way a fading borrow fee does, and requiring 3 aborted the real AMC on 1 of 10
   sampled runs.
 The stricter design (add a dividend back only when an expiry before the ex-date shows the drop)
-is not built.
+IS built for dividends over the cap (VERIFIED ADD-BACK above); the unverified cap keeps the
+residuals listed here.
 
 There is no look-back to other sessions (a short-dated TIME measure was removed in review
 round 3: a stretch-type basis error that no split marks would let it borrow clean sessions from

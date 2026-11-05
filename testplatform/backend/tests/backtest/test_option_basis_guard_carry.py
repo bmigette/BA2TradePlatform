@@ -556,3 +556,40 @@ def test_the_residual_after_the_veto(monkeypatch, case):
         assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.06, phases=5) ==             ["REFUSE", "PASS", "PASS", "PASS", "PASS"]
         assert _verdicts(monkeypatch, _missing_with_third(0.03, t1=10), [], 1.06, phases=5) ==             ["REFUSE"] * 5
         assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.065, phases=5) ==             ["REFUSE"] * 5
+
+
+# ---- verified add-back at guard level ----------------------------------------------------------
+def _div_table(pre, post, n=12):
+    """12 weekdays, every session with a pre-ex expiry (10d) and post-ex ones (45d, 73d); the
+    ex-date is fixed 30 days after the first session. Ratios are against the RUN's spot 100."""
+    days, d = [], date(2024, 5, 1)
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return {day: (100.0, [(10, pre), (45, post), (73, post)]) for day in days}, \
+        DividendRow(date(2024, 5, 1) + timedelta(days=30), 7.0, date(2024, 4, 1))
+
+
+def test_a_basis_error_plus_a_priced_7_percent_dividend_is_still_refused(monkeypatch):
+    table, row = _div_table(0.93, 0.93 - 0.07)                      # x0.93 basis error + priced div
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
+    first = sorted(table)[0]
+    ratio, _why, veto = guard._carry_ratio(u, "X", first.toordinal())
+    assert veto is None and ratio == pytest.approx(0.93, abs=0.01)   # verified, multiple survives
+    assert ratio < g.CARRY_BAND_LOW                                    # outside the clearing band
+    with pytest.raises(g.OptionSpotBasisMismatch):
+        _run(g, u, guard, sorted(table))
+
+
+def test_a_basis_error_behind_an_unpriced_7_percent_special_is_refused_by_name(monkeypatch):
+    table, row = _div_table(0.93, 0.93)
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
+    with pytest.raises(g.OptionSpotBasisMismatch, match="not priced"):
+        _run(g, u, guard, sorted(table))
+
+
+def test_a_clean_priced_7_percent_dividend_passes_the_guard(monkeypatch):
+    table, row = _div_table(1.0, 0.93)
+    g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
+    _run(g, u, guard, sorted(table))
