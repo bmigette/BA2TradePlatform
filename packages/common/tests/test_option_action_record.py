@@ -436,6 +436,24 @@ def test_the_record_carries_the_observation_position_at_entry_as_its_tape_span()
         _entry(acct).execute()
     payload = _payload(_action_obs(store)[0])
     assert before == 0 and mid == 1
-    assert payload["tape_span"] == {"start": mid}
+    assert payload["tape_span"]["start"] == mid
     own = _action_obs(store)[0].observation.invocation_seq
     assert payload["tape_span"]["start"] <= own
+
+
+def test_the_record_carries_the_clock_read_span_of_the_action():
+    from ba2_common.core.replay.clock import replay_now
+
+    store = _Store()
+    with capture_scope(store, _meta()) as ctx:
+        replay_now()                       # an evaluator read BEFORE the action
+        first = _entry(FakeAccount()).execute()
+        before_second = ctx.clock_read_position
+        second_action = _entry(FakeAccount(), rec=_rec(id=2))
+        second = second_action.execute()
+        replay_now()                       # and one AFTER
+    assert first["success"] and second["success"]
+    spans = [_payload(o)["tape_span"] for o in _action_obs(store)]
+    assert spans[0]["clock_start"] == 1 and spans[0]["clock_end"] == before_second
+    assert spans[1]["clock_start"] == before_second
+    assert spans[1]["clock_end"] > spans[1]["clock_start"]

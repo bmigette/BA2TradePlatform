@@ -32,7 +32,9 @@ actions never leak into each other.
 Payload (``payload``)::
 
     {"version": 1,
-     "tape_span": {"start": <observation position at entry>},
+     "tape_span": {"start": <observation position at entry>,
+                   "clock_start": <clock reads recorded at entry>,
+                   "clock_end": <clock reads recorded at exit>},
      "inputs":   {... enough to rebuild the action, see rebuild_option_action ...},
      "db_rows":  [{"model": "TradingOrder", "row": {...model_dump...}}, ...],
      "outcome":  {"status": "returned"|"error", "error": repr|None, "success": bool|None,
@@ -180,9 +182,11 @@ class _Recorder:
         self._db_rows: Optional[List[Dict[str, Any]]] = None
         self._redacted: List[str] = []
         self._tape_start: Optional[int] = None
+        self._clock_start: Optional[int] = None
 
     def __enter__(self):
         self._tape_start = self.context.observation_position
+        self._clock_start = self.context.clock_read_position    # BEFORE the decision-time read
         current = getattr(_tls, "frame", None)
         if current is not None and current.action is self.action:
             self._inner = True              # covered call -> base execute: one record
@@ -221,7 +225,11 @@ class _Recorder:
             "version": RECORD_VERSION,
             # The action's reads are exactly the observations with start <= invocation_seq < this
             # record's own seq; anything the evaluator read earlier is outside the window.
-            "tape_span": {"start": self._tape_start},
+            # ``clock_start``/``clock_end``: the half-open range of the record's clock reads taken
+            # inside this action's span (the first is the recorder's own decision-time read).
+            "tape_span": {"start": self._tape_start,
+                          "clock_start": self._clock_start,
+                          "clock_end": self.context.clock_read_position},
             "inputs": inputs,
             "db_rows": self._db_rows,
             "outcome": outcome,

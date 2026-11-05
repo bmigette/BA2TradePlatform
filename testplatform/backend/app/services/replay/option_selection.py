@@ -476,15 +476,18 @@ def _miss_text(miss: ReplayMiss) -> str:
     return str(miss)
 
 
-def _clock_slice(analysis: AnalysisRecord, decision_time: datetime, start: int
-                 ) -> Tuple[Optional[int], List[str], List[str]]:
-    """The index of the recorded read equal to ``decision_time`` (from ``start``) and the reads from it on."""
+def _clock_span(analysis: AnalysisRecord, span: Dict[str, Any]
+                ) -> Tuple[List[str], List[str]]:
+    """The record's clock reads (and phases) taken inside ONE action's own span.
+
+    ``[clock_start, clock_end)`` as counted by the recorder at the action's entry and exit. The
+    replay is handed no read beyond them, so an extra ``replay_now()`` call in the re-run is a
+    typed ``ReplayMiss`` (the recorded action did not make it), never the NEXT action's read.
+    """
     reads = list(analysis.clock_reads)
     phases = list(analysis.clock_read_phases)
-    for index in range(start, len(reads)):
-        if datetime.fromisoformat(reads[index]) == decision_time:
-            return index, reads[index:], phases[index:] if len(phases) == len(reads) else []
-    return None, [], []
+    start, end = span["clock_start"], span["clock_end"]
+    return reads[start:end], (phases[start:end] if len(phases) == len(reads) else [])
 
 
 def action_window(observations: Sequence[ProviderObservation], start: int, end: int
@@ -529,12 +532,17 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     window = action_window(observations, start, observation.invocation_seq)
 
     decision_time = oar.replay_decision_time(payload)
-    index, reads, phases = _clock_slice(analysis, decision_time, clock_start)
-    if index is None:
+    span = payload["tape_span"]
+    if span.get("clock_start") is None or span.get("clock_end") is None:
+        return _missing("the action record carries no clock span (tape_span.clock_start/"
+                        "clock_end), so the clock reads that were the action's own cannot be "
+                        "told from the neighbouring actions'"), clock_start
+    reads, phases = _clock_span(analysis, span)
+    if not reads or datetime.fromisoformat(reads[0]) != decision_time:
         return _missing(f"the action's decision clock read {decision_time.isoformat()} is not "
-                        f"among the record's {len(analysis.clock_reads)} recorded clock reads"), \
-            clock_start
-    next_start = index + 1
+                        f"the first of its recorded clock span [{span['clock_start']}, "
+                        f"{span['clock_end']}) of the record's {len(analysis.clock_reads)} reads"),             clock_start
+    next_start = span["clock_end"]
 
     try:
         tape = SpanTape(bundle, analysis, window)

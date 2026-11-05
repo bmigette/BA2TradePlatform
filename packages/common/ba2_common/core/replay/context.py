@@ -467,6 +467,16 @@ class CaptureContext:
             return
         self._phase = phase
 
+    @property
+    def clock_read_position(self) -> int:
+        """How many clock reads this context has recorded so far (a monotonic count).
+
+        An option action stores it at entry and at exit (``tape_span.clock_start`` / ``clock_end``)
+        so its replay is handed exactly the reads of its own span, like the observation window.
+        """
+        with self._lock:
+            return len(self._clock_reads)
+
     def record_clock_read(self, value: datetime) -> None:
         try:
             with self._lock:

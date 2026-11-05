@@ -371,3 +371,33 @@ def test_a_payload_without_tape_span_is_missing_capture_naming_it(session):
     row = _only(report)
     assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
     assert "tape_span" in row.detail
+
+
+def test_a_clock_read_beyond_the_actions_own_span_is_a_miss_not_a_neighbours_read(session):
+    """The replay's clock holds ONLY the reads of the action's span. Shrinking the recorded span by
+    one read makes the re-run's (real) last read an extra one: ReplayMiss -> missing_capture. Before
+    the span the clock ran on to the end of the record and silently served it."""
+    seen = {}
+
+    def edit(payload):
+        span = payload["tape_span"]
+        seen["span"] = dict(span)
+        span["clock_end"] = span["clock_end"] - 1
+
+    with replay_isolation():
+        report = option_selection.run_bundle(_EditedBundle(load_bundle(session), edit))
+    assert seen["span"]["clock_end"] - seen["span"]["clock_start"] >= 2, seen
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "clock" in row.detail
+
+
+def test_a_record_without_a_clock_span_is_missing_capture_naming_it(session):
+    def edit(payload):
+        del payload["tape_span"]["clock_end"]
+
+    with replay_isolation():
+        report = option_selection.run_bundle(_EditedBundle(load_bundle(session), edit))
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "clock span" in row.detail
