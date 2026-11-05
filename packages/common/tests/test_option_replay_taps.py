@@ -268,7 +268,7 @@ def test_identity_failure_returns_the_value_and_counts_one_failure():
     assert store.submitted[0][2] == []
 
 
-def test_wrapped_exception_propagates_untouched_and_unrecorded():
+def test_wrapped_exception_propagates_untouched_and_is_recorded_as_an_error_observation():
     class Boom(_Acct):
         def get_atm_implied_volatility(self, underlying):
             raise RuntimeError("broker down")
@@ -277,7 +277,8 @@ def test_wrapped_exception_propagates_untouched_and_unrecorded():
     with capture_scope(store, _meta()):
         with pytest.raises(RuntimeError, match="broker down"):
             Boom().get_atm_implied_volatility("AAPL")
-    assert store.submitted[0][2] == []
+    (pending,) = store.submitted[0][2]       # option taps record_errors=True (no return value)
+    assert pending.observation.response_class == ReplayStatus.RESPONSE_ERROR
 
 
 def test_subclass_of_a_subclass_does_not_double_wrap():
