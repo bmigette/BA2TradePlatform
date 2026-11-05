@@ -277,9 +277,15 @@ def build_options_run(config: Dict[str, Any], *, price_source: Any, ohlcv_provid
     if "execution_interval" not in config:
         raise ValueError("an OPTIONS run must state 'execution_interval'; it is absent from "
                          "this run config")
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    from .history_source import job_history_cache_dir
     from .option_split_basis import build_run_split_basis
+    # The basis follows the job's OHLCV history (``fmp`` | ``alpaca``): FMP's calendar plus a
+    # proof of the FMP parquet, or the verified split table the alpaca cache was built with.
+    source = resolve_job_history_source(config)
     basis = build_run_split_basis(config.get("enabled_instruments") or [], ohlcv_provider,
-                                  interval=config["execution_interval"])
+                                  interval=config["execution_interval"], history_source=source,
+                                  cache_dir=job_history_cache_dir(config) if source == "alpaca" else None)
     return build_options_provider(config, price_source=price_source, split_basis=basis), basis
 
 
@@ -320,7 +326,44 @@ def build_options_provider(config: Dict[str, Any], *, price_source: Any, split_b
         risk_free_rate=rate,
         spot_scope=spot_scope(config, split_basis),
         basis_guard=split_basis is not None,
-        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis))
+        basis_guard_split_dates=None if split_basis is None else _split_dates_of(split_basis),
+        basis_guard_dividends=None if split_basis is None else _dividends_of(split_basis))
+
+
+#: How far past a session the guard's dividend source looks (the carry separation uses the two
+#: nearest usable expiries, well inside this).
+_DIVIDEND_HORIZON_DAYS = 400
+
+
+def _dividends_of(split_basis: Any):
+    """``(symbol, session) -> [DividendRow(ex-date, amount in the session's as-traded basis or
+    None, declaration date or None)]`` for the guard's carry separation
+    (``option_basis_guard``), or None when the symbol has no cached dividend calendar.
+    ``adjDividend`` is split-adjusted like the FMP close, so it is converted with the run's
+    as-traded factor of the session -- the spot's own conversion. Every row with an ex-date in
+    (session, session + horizon] is served WITH its declaration date: the carry measure reads
+    the calendar as of the session (a row declared later is not added back; one of unknown
+    declaration refuses). Calendars are read once per symbol per run."""
+    from datetime import timedelta
+    from ba2_common.core.option_carry import DividendRow
+    from .option_split_basis import load_cached_dividend_calendar
+
+    cache: Dict[str, Any] = {}
+
+    def dividends(symbol: str, session: date):
+        sym = str(symbol).upper()
+        if sym not in cache:
+            cache[sym] = load_cached_dividend_calendar(sym)
+        cal = cache[sym]
+        if cal is None:
+            return None
+        horizon = session + timedelta(days=_DIVIDEND_HORIZON_DAYS)
+        rows = [r for r in cal if session < r[0] <= horizon]
+        if not rows:
+            return []
+        f = float(split_basis.factor(sym, session))
+        return [DividendRow(d, None if a is None else a * f, decl) for d, a, decl in rows]
+    return dividends
 
 
 def _split_dates_of(split_basis: Any):

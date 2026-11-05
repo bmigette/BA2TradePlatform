@@ -17,6 +17,7 @@ fundamentals) and keeps this test focused on the export wiring rather than
 re-deriving the fundamental calculators' own already-tested math.
 """
 import pandas as pd
+import pytest
 
 from ba2_experts.DeterministicScorer import DeterministicScorer
 from ba2_experts.DeterministicScorer import data as _data
@@ -31,8 +32,23 @@ _DF = pd.DataFrame({
 })
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_macro(monkeypatch):
+    """Hermetic: these tests are about the export wiring, not the macro inputs, and the live
+    path (as_of=None) reads the REAL FRED cache under ba2/common/cache/fred, which a first-release
+    series refuses once its fetch day is before today's New York date ("fetched ... before the
+    decision label") -- a wall-clock/real-file dependence. Same inputs as
+    test_deterministic_scorer_series_parity: VIX only, no series."""
+    monkeypatch.setattr(_data, "fetch_macro_series", lambda *a, **k: {
+        "vix": 16.0, "unrate_series": None, "spread_10y3m_series": None, "oas_series": None})
+
+
 class _FakeOHLCV:
-    def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d"):
+    def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d",
+                       lookback_days=None):
+        # ``lookback_days``: the export bypass instance prices the symbol through
+        # ``LiveProviderBundle.price_at_date`` (end_date=now, lookback_days=7), the same seam
+        # every expert's export price goes through (ExpertDataExportInterface._bypass_instance).
         return _DF
 
 
@@ -82,7 +98,8 @@ def test_export_symbol_data_skip_surfaces_as_a_single_skipped_row():
     'Skipped' row rather than building a garbage technical/fundamental
     breakdown from an unprocessed bundle."""
     class _ShortOHLCV:
-        def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d"):
+        def get_ohlcv_data(self, symbol=None, start_date=None, end_date=None, interval="1d",
+                           lookback_days=None):
             return _DF.iloc[:50].reset_index(drop=True)
 
     def _short_resolver(cat, name, **kw):

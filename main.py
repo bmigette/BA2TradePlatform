@@ -73,6 +73,11 @@ def initialize_system():
     import ba2_trade_platform.config as config
     from ba2_trade_platform.version import APP_VERSION
 
+    # A MAINTENANCE switch of the OHLCV top-up must not be set in a live app's environment.
+    from ba2_common.core.interfaces.MarketDataProviderInterface import live_environment_warnings
+    for _w in live_environment_warnings():
+        logger.warning(_w)
+
     # Print the running build up-front so it's unambiguous which version/instance is
     # live (port + db) — the editable install means a process keeps the code it was
     # started with until restarted, so this is the source of truth for "what's running".
@@ -89,6 +94,16 @@ def initialize_system():
     logger.info("Wiring ba2_common/providers/experts seams...")
     from ba2_trade_platform.core.seam_wiring import wire_all_seams
     wire_all_seams()
+
+    # Cross-interval basis: one line at startup and one per day naming the intraday cache files that are
+    # stale-marked (their reads/writes refuse) or rebased by the repair tool, so a failed chart / tool call that
+    # reads such a file is explained in this log. Daily bars are never affected.
+    try:
+        from ba2_common.core import native_cache as _nc
+        from ba2_common.core.split_basis import start_intraday_state_reporter
+        start_intraday_state_reporter(os.path.join(_nc.CACHE_FOLDER, "FMPOHLCVProvider"), logger.info)
+    except Exception as e:
+        logger.warning(f"intraday cache state reporter not started: {e}")
 
     # Relocate the app/UI (ba2_trade_platform) file logs next to THIS instance's DB — the
     # same <db folder>/logs that wire_all_seams()->configure_db() points ba2_common at — so

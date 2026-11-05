@@ -21,7 +21,8 @@ from app.models.dataset import Dataset, DatasetStatus
 from app.schemas.dataset import DatasetCreate, DatasetResponse, DatasetListResponse, DatasetUpdate, DatasetDuplicate, DatasetRegenerate, BatchRegenerateRequest
 from app.indicators import TechnicalIndicators
 from app.services.fundamentals import FundamentalsService
-from app.services.macro import MacroService
+from app.services.macro import MacroService, MacroCoverageError
+from ba2_providers.macro.fred_series import MacroAvailabilityUnknown
 from app.services.sentiment import SentimentService
 from app.services.indicators import IndicatorService
 from app.services.dataset_handler import (
@@ -31,6 +32,9 @@ from app.services.dataset_handler import (
     INTERVAL_MAP,
     BARS_PER_DAY,
 )
+from app.services.ml_dataset_source import (
+    DAILY_FLAG_COLUMNS, DAILY_KEYS, DAILY_TIMEFRAME, daily_column_prefixes, daily_request_from, fetch_ohlcv_frame,
+    is_alpaca_hist, validate_daily_request, validate_panel_request)
 
 
 def get_ohlcv_provider(provider_name: str = "yfinance"):
@@ -245,10 +249,8 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
         technical_indicators = dataset_config.get('technical_indicators', [])
         sentiment_config = dataset_config.get('sentiment_config', {})
         fundamentals_config = dataset_config.get('fundamentals_config', {})
+        panel_features = dataset_config.get('panel_features') or []
         file_path = Path(db_dataset.file_path)
-
-        # Convert timeframe to interval format
-        interval = INTERVAL_MAP.get(timeframe, "1d")
 
         # Calculate warmup period needed for indicators
         warmup_bars, warmup_days = calculate_warmup_period(technical_indicators, timeframe)
@@ -261,30 +263,18 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
         if warmup_days > 0:
             logger.info(f"[Thread] Warmup: fetching {warmup_days} extra days for {warmup_bars}-bar indicators")
 
-        # Fetch OHLC data
-        provider = get_ohlcv_provider(provider_name)
+        # Fetch OHLC data (alpaca_hist: the local cache panel, with its feature columns)
         logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
-        data_points = provider.get_data(
-            symbol=ticker,
-            start_date=fetch_start_date,
-            end_date=end_date,
-            interval=interval
-        )
+        df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
+                               panel_features, fundamentals_config, daily_request_from(dataset_config))
 
-        if not data_points:
+        if df.empty:
             db_dataset.status = DatasetStatus.ERROR.value
             db_dataset.error_message = f"No data available for {ticker}"
             db.commit()
             logger.error(f"[Thread] No data for {ticker}")
             return
-
-        # Convert to DataFrame
-        df = pd.DataFrame([{
-            'Date': dp.timestamp, 'Open': dp.open, 'High': dp.high,
-            'Low': dp.low, 'Close': dp.close, 'Volume': dp.volume
-        } for dp in data_points])
-        df = df.sort_values('Date').reset_index(drop=True)
 
         # Add time-based features (day_of_week, hour_of_day)
         df = add_time_features(df)
@@ -377,26 +367,16 @@ def _build_dataset_in_background(dataset_id: int, dataset_config: dict):
                         providers=providers, frequency='quarterly'
                     )
                 else:
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        for key, value in fundamentals['current'].items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
 
-                # Macro indicators
-                macro_indicators = fundamentals_config.get('macro_indicators', [])
-                if macro_indicators:
-                    macro_service = MacroService()
-                    df = macro_service.integrate_macro_with_ohlc(df, macro_indicators)
-                    for indicator in macro_indicators:
-                        if indicator in df.columns:
-                            df = df.rename(columns={indicator: f'macro_{indicator}'})
-                            if f'{indicator}_yoy_change' in df.columns:
-                                df = df.rename(columns={f'{indicator}_yoy_change': f'macro_{indicator}_yoy_change'})
-                            if f'{indicator}_days_since' in df.columns:
-                                df = df.rename(columns={f'{indicator}_days_since': f'macro_{indicator}_days_since'})
             except Exception as e:
                 logger.error(f"[Thread] Error fetching fundamentals: {e}")
+
+            # Macro sits OUTSIDE the log-and-continue handler above: a refused series (no cache
+            # file, GDP) must fail the build via the outer handler, not finish without macro columns.
+            macro_indicators = fundamentals_config.get('macro_indicators', [])
+            if macro_indicators:
+                df = MacroService().add_macro_columns(df, macro_indicators)
 
         # Filter out warmup rows - only keep data from the originally requested start date
         if warmup_days > 0:
@@ -477,19 +457,12 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
         # Fetch or load data based on regen_options
         if regen_options.regenerate_ohlcv:
             provider_name = gen_config.get("data_provider", "yfinance")
-            provider = get_ohlcv_provider(provider_name)
             logger.info(f"[Thread] Fetching data from {fetch_start_date.date()} to {end_date.date()} using {provider_name}")
 
-            interval = INTERVAL_MAP.get(timeframe, "1d")
+            df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date, end_date,
+                                   gen_config.get("panel_features"), fundamentals_config, daily_request_from(gen_config))
 
-            data_points = provider.get_data(
-                symbol=ticker,
-                start_date=fetch_start_date,
-                end_date=end_date,
-                interval=interval
-            )
-
-            if not data_points:
+            if df.empty:
                 db_dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
                 if db_dataset:
                     db_dataset.status = DatasetStatus.ERROR.value
@@ -497,15 +470,6 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                     db.commit()
                 return
 
-            df = pd.DataFrame([{
-                'Date': dp.timestamp,
-                'Open': dp.open,
-                'High': dp.high,
-                'Low': dp.low,
-                'Close': dp.close,
-                'Volume': dp.volume
-            } for dp in data_points])
-            df = df.sort_values('Date').reset_index(drop=True)
             df = add_time_features(df)
             logger.info(f"[Thread] Fetched {len(df)} OHLC data points")
         else:
@@ -535,25 +499,11 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                 if data_start_naive >= fetch_start_ts:
                     logger.info(f"[Thread] Fetching warmup OHLCV from {fetch_start_date.date()} to {data_start_naive.date()}")
                     provider_name = gen_config.get("data_provider", "yfinance")
-                    provider = get_ohlcv_provider(provider_name)
-                    interval = INTERVAL_MAP.get(timeframe, "1d")
 
-                    warmup_data = provider.get_data(
-                        symbol=ticker,
-                        start_date=fetch_start_date,
-                        end_date=data_start_naive,
-                        interval=interval
-                    )
+                    warmup_df = fetch_ohlcv_frame(provider_name, ticker, timeframe, fetch_start_date,
+                                                  data_start_naive, [], fundamentals_config)
 
-                    if warmup_data:
-                        warmup_df = pd.DataFrame([{
-                            'Date': dp.timestamp,
-                            'Open': dp.open,
-                            'High': dp.high,
-                            'Low': dp.low,
-                            'Close': dp.close,
-                            'Volume': dp.volume
-                        } for dp in warmup_data])
+                    if not warmup_df.empty:
                         warmup_df['Date'] = pd.to_datetime(warmup_df['Date'])
                         # Normalize timezone - strip tz if present for comparison with existing data
                         if warmup_df['Date'].dt.tz is not None:
@@ -579,14 +529,22 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
 
             # Define column patterns for each regeneration type
             ohlcv_time_cols = {'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'day_of_week', 'hour_of_day'}
+            if daily_request_from(gen_config):
+                ohlcv_time_cols |= set(DAILY_FLAG_COLUMNS)
             sentiment_prefixes = ('news_',)
             fundamental_prefixes = ('bs_', 'is_', 'cf_', 'earn_', 'fundamental_')
             macro_prefixes = ('macro_',)
 
             # Helper to identify column type
+            panel_prefixes = ('t_', 'd_', 'm_', 'f_') if is_alpaca_hist(gen_config.get("data_provider")) else ()
+            if daily_request_from(gen_config):
+                panel_prefixes += daily_column_prefixes()      # the daily store's groups (and their <prefix>missing flags)
+
             def get_column_type(col):
                 if col in ohlcv_time_cols:
                     return 'ohlcv'
+                if col.startswith(panel_prefixes):
+                    return 'ohlcv'  # panel features come with the bars: only a full OHLCV regeneration rebuilds them
                 if col.startswith(sentiment_prefixes):
                     return 'sentiment'
                 if col.startswith(fundamental_prefixes):
@@ -667,34 +625,18 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
                         )
                         logger.info(f"[Thread] Added statement features for: {statement_types}")
 
-                    # Also get current fundamentals
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        current = fundamentals['current']
-                        for key, value in current.items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
-
-                # Fetch macro indicators if configured and regenerate_macro is True
-                macro_indicators = fundamentals_config.get('macro_indicators', [])
-                if macro_indicators and regen_options.regenerate_macro:
-                    logger.info(f"[Thread] Fetching macro indicators: {macro_indicators}")
-                    try:
-                        macro_service = MacroService()
-                        df = macro_service.integrate_macro_with_ohlc(df, macro_indicators)
-                        for indicator in macro_indicators:
-                            if indicator in df.columns:
-                                df = df.rename(columns={indicator: f'macro_{indicator}'})
-                                if f'{indicator}_yoy_change' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_yoy_change': f'macro_{indicator}_yoy_change'})
-                                if f'{indicator}_days_since' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_days_since': f'macro_{indicator}_days_since'})
-                        logger.info(f"[Thread] Added macro columns for: {macro_indicators}")
-                    except Exception as e:
-                        logger.warning(f"[Thread] Error fetching macro data: {e}")
-
+                    # Today's snapshot is NOT point-in-time: only added when explicitly opted in
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
             except Exception as e:
                 logger.error(f"[Thread] Error fetching fundamentals: {e}")
+
+            # Macro sits OUTSIDE the log-and-continue handler above (see the build path): a refused
+            # series fails the regeneration, including a saved config that still lists 'gdp'.
+            macro_indicators = fundamentals_config.get('macro_indicators', [])
+            if macro_indicators and regen_options.regenerate_macro:
+                logger.info(f"[Thread] Fetching macro indicators: {macro_indicators}")
+                df = MacroService().add_macro_columns(df, macro_indicators)
+                logger.info(f"[Thread] Added macro columns for: {macro_indicators}")
 
         # Filter out warmup rows (applies when OHLCV regenerated OR when warmup fetched for TA)
         if warmup_days > 0 and (regen_options.regenerate_ohlcv or regen_options.regenerate_technical):
@@ -763,6 +705,15 @@ def create_dataset(
         Created dataset with BUILDING status (generation runs in background)
     """
     try:
+        panel_features = validate_panel_request(dataset_create.data_provider, dataset_create.timeframe,
+                                                dataset_create.panel_features, dataset_create.fundamentals_config)
+        daily = validate_daily_request(dataset_create.data_provider, dataset_create.timeframe,
+                                       dataset_create.daily_groups, dataset_create.daily_min_share,
+                                       dataset_create.ticker, None)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    try:
         logger.info(f"Creating dataset for {dataset_create.ticker} with timeframe {dataset_create.timeframe}")
 
         # Generate dataset name if not provided
@@ -787,6 +738,8 @@ def create_dataset(
             "original_start_date": dataset_create.start_date,
             "original_end_date": dataset_create.end_date,
             "indicator_collection_id": dataset_create.indicator_collection_id,
+            "panel_features": panel_features,
+            **daily,
             "created_at": datetime.now().isoformat()
         }
 
@@ -827,6 +780,8 @@ def create_dataset(
             'technical_indicators': dataset_create.technical_indicators,
             'sentiment_config': dataset_create.sentiment_config,
             'fundamentals_config': dataset_create.fundamentals_config,
+            'panel_features': panel_features,
+            **daily,
         }
 
         # Submit to background thread pool (non-blocking)
@@ -879,6 +834,18 @@ def create_batch_datasets(
         indicator_collection_id = batch_request.get('indicator_collection_id')
         user_labels = batch_request.get('labels', [])
         batch_name = batch_request.get('name')
+        batch_symbols = list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))
+        if not batch_symbols:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="symbols list holds no symbol")
+        try:
+            panel_features = validate_panel_request(data_provider, timeframe, batch_request.get('panel_features'),
+                                                    fundamentals_config)
+            # the batch is the universe of the daily store's cross-sectional values (group x, the breadth of group m)
+            daily = validate_daily_request(data_provider, timeframe, batch_request.get('daily_groups'),
+                                           batch_request.get('daily_min_share'), batch_symbols[0],
+                                           batch_symbols)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         # Generate batch label
         if not batch_name:
@@ -914,6 +881,8 @@ def create_batch_datasets(
                 "original_start_date": start_date_str,
                 "original_end_date": end_date_str,
                 "indicator_collection_id": indicator_collection_id,
+                "panel_features": panel_features,
+                **daily,
                 "created_at": datetime.now().isoformat(),
                 "batch_name": batch_name
             }
@@ -951,6 +920,8 @@ def create_batch_datasets(
                 'technical_indicators': technical_indicators,
                 'sentiment_config': sentiment_config,
                 'fundamentals_config': fundamentals_config,
+                'panel_features': panel_features,
+                **daily,
             }
 
             _dataset_executor.submit(_build_dataset_in_background, db_dataset.id, dataset_config)
@@ -1511,7 +1482,8 @@ def calculate_prediction_targets_v2(
         target_service = PredictionTargetService()
         results = target_service.calculate_all_targets(
             df, targets,
-            dataset_timeframe=dataset.timeframe
+            dataset_timeframe=dataset.timeframe,
+            panel_source=is_alpaca_hist((dataset.generation_config or {}).get("data_provider"))
         )
 
         return {
@@ -2118,7 +2090,6 @@ def duplicate_dataset(
         # Fetch data using the original generation config
         gen_config = original.generation_config or {}
         provider_name = gen_config.get("data_provider", "yfinance")
-        provider = get_ohlcv_provider(provider_name)
         logger.info(f"Using OHLCV provider: {provider_name}")
 
         # Use original dates from generation_config or dataset
@@ -2133,32 +2104,32 @@ def duplicate_dataset(
         if warmup_days > 0:
             logger.info(f"[Duplicate] Warmup: fetching {warmup_days} extra days for {warmup_bars}-bar indicators")
 
-        # Convert timeframe to interval
-        interval = INTERVAL_MAP.get(original.timeframe, "1d")
+        try:
+            # the duplicate keeps the daily options of the original; a new ticker joins its universe
+            daily = validate_daily_request(provider_name, original.timeframe, gen_config.get("daily_groups"),
+                                           gen_config.get("daily_min_share"), new_ticker,
+                                           gen_config.get("daily_universe"))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        warnings: List[str] = []
+        old_universe = gen_config.get("daily_universe") or []
+        if daily and old_universe and new_ticker not in old_universe and \
+                {"x", "m"} & set(daily["daily_groups"]):
+            warnings.append(
+                f"{new_ticker} joined the daily universe ({len(old_universe)} -> {len(daily['daily_universe'])} tickers): "
+                f"its cross-sectional ranks (x) and market breadth (m) are taken over the larger set and differ from "
+                f"those of the original's datasets, which keep their {len(old_universe)} tickers; regenerate them to "
+                f"compare like with like")
 
-        data_points = provider.get_data(
-            symbol=new_ticker,
-            start_date=fetch_start_date,
-            end_date=end_date,
-            interval=interval
-        )
+        df = fetch_ohlcv_frame(provider_name, new_ticker, original.timeframe, fetch_start_date, end_date,
+                               gen_config.get("panel_features"), original.fundamentals_config,
+                               daily_request_from(daily))
 
-        if not data_points:
+        if df.empty:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"No data available for {new_ticker}"
             )
-
-        # Convert to DataFrame
-        df = pd.DataFrame([{
-            'Date': dp.timestamp,
-            'Open': dp.open,
-            'High': dp.high,
-            'Low': dp.low,
-            'Close': dp.close,
-            'Volume': dp.volume
-        } for dp in data_points])
-        df = df.sort_values('Date').reset_index(drop=True)
 
         # Add time-based features (day_of_week, hour_of_day)
         df = add_time_features(df)
@@ -2189,6 +2160,8 @@ def duplicate_dataset(
             "original_start_date": gen_config.get("original_start_date"),
             "original_end_date": gen_config.get("original_end_date"),
             "indicator_collection_id": gen_config.get("indicator_collection_id"),
+            "panel_features": gen_config.get("panel_features") or [],
+            **daily,
             "duplicated_from": dataset_id,
             "created_at": datetime.now().isoformat()
         }
@@ -2213,6 +2186,7 @@ def duplicate_dataset(
         db.refresh(new_dataset)
 
         logger.info(f"Created duplicate dataset with ID {new_dataset.id}")
+        new_dataset.warnings = warnings          # response only (DatasetResponse.warnings), not a column
         return new_dataset
 
     except HTTPException:
@@ -2328,6 +2302,35 @@ def update_dataset(
                 updates.append(f"data_provider: {old_provider} -> {dataset_update.data_provider}")
             gen_config["data_provider"] = dataset_update.data_provider
 
+        # Panel feature groups belong to the alpaca_hist source: an explicit list is validated, an inherited one
+        # is dropped when the provider is no longer alpaca_hist
+        panel_features = dataset_update.panel_features
+        if panel_features is None and is_alpaca_hist(gen_config.get("data_provider", "yfinance")) \
+                and new_timeframe != DAILY_TIMEFRAME:
+            # an inherited intraday list; at 1d the intraday groups do not exist (the daily store takes daily_groups)
+            panel_features = gen_config.get("panel_features")
+        fundamentals_config = dataset.fundamentals_config
+        # Daily store options (alpaca_hist 1d): an explicit list / threshold is validated, inherited ones are kept while
+        # the dataset stays on that source and dropped when it leaves it
+        on_daily = is_alpaca_hist(gen_config.get("data_provider", "yfinance")) and new_timeframe == DAILY_TIMEFRAME
+        daily_groups = dataset_update.daily_groups
+        daily_min_share = dataset_update.daily_min_share
+        if on_daily and daily_groups is None:
+            daily_groups = gen_config.get("daily_groups")
+        if on_daily and daily_min_share is None:
+            daily_min_share = gen_config.get("daily_min_share")
+        try:
+            gen_config["panel_features"] = validate_panel_request(
+                gen_config.get("data_provider", "yfinance"), new_timeframe, panel_features, fundamentals_config)
+            daily = validate_daily_request(
+                gen_config.get("data_provider", "yfinance"), new_timeframe, daily_groups, daily_min_share, new_ticker,
+                gen_config.get("daily_universe") if on_daily else None)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        for key in DAILY_KEYS:
+            gen_config.pop(key, None)
+        gen_config.update(daily)
+
         # Save updated generation_config with new dates and provider
         dataset.generation_config = gen_config
         dataset_name = dataset.name  # Save for later use
@@ -2351,17 +2354,10 @@ def update_dataset(
 
     # Phase 2: Fetch OHLCV data (NO DB connection held)
     try:
-        provider = get_ohlcv_provider(provider_name)
-        interval = INTERVAL_MAP.get(new_timeframe, "1d")
-
         logger.info(f"Fetching data for {new_ticker} from {start_date.date()} to {end_date.date()} using {provider_name}")
 
-        data_points = provider.get_data(
-            symbol=new_ticker,
-            start_date=start_date,
-            end_date=end_date,
-            interval=interval
-        )
+        df = fetch_ohlcv_frame(provider_name, new_ticker, new_timeframe, start_date, end_date,
+                               gen_config["panel_features"], fundamentals_config, daily_request_from(gen_config))
     except Exception as e:
         # Update status to error with short session
         db = SessionLocal()
@@ -2379,7 +2375,7 @@ def update_dataset(
         )
 
     # Phase 3: Validate OHLCV data (NO DB connection held)
-    if not data_points:
+    if df.empty:
         db = SessionLocal()
         try:
             dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
@@ -2394,19 +2390,8 @@ def update_dataset(
             detail=f"No data available for {new_ticker}"
         )
 
-    # Convert to DataFrame for validation
-    ohlcv_data = [{
-        'Date': dp.timestamp.isoformat() if hasattr(dp.timestamp, 'isoformat') else str(dp.timestamp),
-        'Open': dp.open,
-        'High': dp.high,
-        'Low': dp.low,
-        'Close': dp.close,
-        'Volume': dp.volume
-    } for dp in data_points]
-
-    df = pd.DataFrame(ohlcv_data)
     df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date').reset_index(drop=True)
+    ohlcv_data = df.assign(Date=df['Date'].map(lambda d: d.isoformat())).to_dict('records')
 
     # Add time-based features (day_of_week, hour_of_day)
     df = add_time_features(df)
@@ -2606,9 +2591,9 @@ def calculate_multi_timeframe_indicators(
                 ohlcv_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
                 indicator_cols = [col for col in tf_df_with_indicators.columns if col not in ohlcv_cols]
 
-                # Store indicator data with dates
+                # Store indicator data with dates (and the timeframe it was computed on)
                 for col in indicator_cols:
-                    all_indicators[col] = tf_df_with_indicators[['Date', col]].copy()
+                    all_indicators[col] = (tf, tf_df_with_indicators[['Date', col]].copy())
 
                 logger.info(f"Calculated {len(indicator_cols)} indicators for timeframe {tf}")
 
@@ -2616,21 +2601,21 @@ def calculate_multi_timeframe_indicators(
                 logger.warning(f"Failed to calculate indicators for timeframe {tf}: {e}")
                 continue
 
-        # Merge indicators into main dataset
+        # Merge indicators into main dataset. Each higher-timeframe value is joined only once its
+        # bar has ENDED (bar start + timeframe): reindex(method='ffill') on the bar START gave the
+        # 10:00 hourly bar's close-based value to the 10:00 / 10:15 / 10:30 rows.
+        if not dataset.timeframe:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Dataset has no timeframe; cannot align higher-timeframe indicators without look-ahead"
+            )
         result_df = df.copy()
 
-        for ind_name, ind_df in all_indicators.items():
-            # Merge on Date using forward fill for different timeframe resolutions
-            ind_df = ind_df.rename(columns={ind_name: ind_name})
-            ind_df = ind_df.set_index('Date')
-
-            # Resample to match main dataset timeframe and forward fill
-            result_df = result_df.set_index('Date') if 'Date' not in result_df.index.names else result_df
-
-            # Align indicator data to main dataset dates
-            aligned_indicator = ind_df.reindex(result_df.index, method='ffill')
-            result_df[ind_name] = aligned_indicator[ind_name]
-            result_df = result_df.reset_index()
+        for ind_name, (ind_tf, ind_df) in all_indicators.items():
+            result_df = align_higher_timeframe_features_to_lower(
+                result_df, ind_df, [ind_name],
+                higher_timeframe=ind_tf, lower_timeframe=dataset.timeframe
+            )
 
         # Save updated dataset
         result_df.to_csv(file_path, index=False)
@@ -2816,20 +2801,22 @@ def get_fundamental_data(dataset_id: int, db: Session = Depends(get_db)):
 @router.post("/{dataset_id}/calculate-macro")
 def calculate_macro_features(
     dataset_id: int,
-    indicators: List[str] = None,
-    include_yield_curve: bool = True,
+    indicators: List[str] = Query(None),
+    include_yield_curve: bool = False,
     db: Session = Depends(get_db)
 ):
     """
-    Integrate macro economic data with OHLC dataset using forward-fill.
+    Integrate first-release macro data with an OHLC dataset.
 
-    Fetches macroeconomic indicators (interest rates, GDP, inflation, etc.)
-    and aligns them with the dataset's time series using forward-fill.
+    Each row carries the latest observation FRED had published at that row's decision, read from
+    the local first-release cache (see MacroService). Only the cached series are available: GDP
+    and the 2-year yield (hence the yield curve) have no cache file and are refused with a 400.
 
     Args:
         dataset_id: Dataset ID
-        indicators: List of indicators (default: all available)
-        include_yield_curve: Include yield curve features (default: True)
+        indicators: List of indicators (default: every cached indicator)
+        include_yield_curve: Yield curve features; needs DGS2, which has no cache file, so True
+            is refused (default: False)
         db: Database session
 
     Returns:
@@ -2852,6 +2839,24 @@ def calculate_macro_features(
                 detail=f"Dataset file not found: {file_path}"
             )
 
+        cached = MacroService.cached_indicators()
+        unavailable = [i for i in (indicators or []) if i not in cached]
+        if unavailable:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Macro indicators {unavailable} have no first-release cache series "
+                       f"({[MacroService.MACRO_INDICATORS.get(i, {}).get('series', i) for i in unavailable]}); "
+                       f"available: {cached}"
+            )
+        if include_yield_curve:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The yield curve needs FRED DGS2 (2-year yield), which has no first-release cache "
+                       "series; request include_yield_curve=false"
+            )
+        if not indicators:
+            indicators = cached
+
         df = pd.read_csv(file_path)
         df['Date'] = pd.to_datetime(df['Date'])
 
@@ -2863,10 +2868,6 @@ def calculate_macro_features(
         # Integrate macro data
         result_df = macro_service.integrate_macro_with_ohlc(df, indicators)
 
-        # Add yield curve features if requested
-        if include_yield_curve:
-            result_df = macro_service.create_yield_curve_features(result_df)
-
         # Save updated dataset
         result_df.to_csv(file_path, index=False)
 
@@ -2877,7 +2878,7 @@ def calculate_macro_features(
 
         return {
             "dataset_id": dataset_id,
-            "indicators": indicators or list(MacroService.MACRO_INDICATORS.keys()),
+            "indicators": indicators,
             "include_yield_curve": include_yield_curve,
             "features_added": added_columns,
             "total_columns": len(result_df.columns),
@@ -2887,6 +2888,10 @@ def calculate_macro_features(
 
     except HTTPException:
         raise
+    except (MacroCoverageError, MacroAvailabilityUnknown) as e:
+        # The cache cannot establish these decisions (past its fetch day, before its first vintage,
+        # no file): a conflict with the cache's state, not a server fault. The message says what to do.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         logger.error(f"Error calculating macro features: {e}", exc_info=True)
         raise HTTPException(

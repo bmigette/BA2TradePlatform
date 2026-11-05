@@ -186,6 +186,15 @@ def test_a_market_field_entry_names_the_profile_the_expert_needs(nicegui_client)
     assert not _marked(_entry_card(dialog, CONFIDENCE), TriggerTypePicker.MARKER_ENTRY_PROFILE)
 
 
+def test_the_spy_regime_triggers_are_offered_without_a_profile_note(nicegui_client):
+    """Categorical market triggers whose host supplies the data: offered, but no "needs a profile"
+    warning (nothing to configure), unlike an ordinary market field."""
+    dialog = _open(nicegui_client, _picker(nicegui_client, HAS_POSITION), category='all')
+    for key in ("spy_trend_regime", "spy_vol_regime"):
+        assert key in _entry_keys(dialog)
+        assert not _marked(_entry_card(dialog, key), TriggerTypePicker.MARKER_ENTRY_PROFILE)
+
+
 def test_every_category_chip_carries_its_count(nicegui_client):
     """The count is the reason a chip is a chip and not a tab: it tells the operator whether
     the category is worth opening before it is opened."""
@@ -918,3 +927,24 @@ def test_the_rule_save_passes_the_rules_id_to_the_refusal():
     call = src[src.index('_refuse_market_gates_on_exit_rule('):]
     call = call[:call.index(')') + 1]
     assert 'rule.id' in call, call
+
+
+# =========================================================================================
+# entry_tag (the style-group member tag): offered on exit rules, never on entry rules
+# =========================================================================================
+def test_the_member_tag_is_not_offered_on_an_entry_rule(editor, nicegui_client):
+    """At entry there is no position, so ``entry_tag`` can never match on an enter_market
+    rule -- offering it there is a gate that silently blocks every entry. The chip count
+    follows the rows, and switching the Subtype re-filters the next open."""
+    from ba2_common.core.trigger_catalog import category_counts
+
+    editor.rule_subtype_select.value = 'enter_market'
+    picker = _row(editor, nicegui_client)
+    dialog = _open(nicegui_client, picker, category='all')
+    assert 'entry_tag' not in set(_entry_keys(dialog))
+    assert str(category_counts('enter_market')['all']) in _chip(dialog, 'all').text
+
+    editor.rule_subtype_select.value = 'open_positions'
+    dialog = _open(nicegui_client, picker, category='all')
+    assert 'entry_tag' in set(_entry_keys(dialog))
+    assert str(category_counts('open_positions')['all']) in _chip(dialog, 'all').text

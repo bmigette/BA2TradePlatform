@@ -165,10 +165,14 @@ def _target_version(root: Path, base_sha: str, include_worktree: bool, candidate
             if not (rel.endswith(".py") and semantically_same(_read(root, "HEAD", rel), head)):
                 if head != _read(root, "HEAD", rel):
                     return _lit(root, None, vfile, "PACKAGE_VERSION")
-    log = _git(root, "log", "--format=%H", "--no-renames", f"{base_sha}..HEAD", "--", *candidates)
+    # --first-parent: a merged-in branch counts as ONE change, at the merge commit (its own
+    # commits predate this repo's versioning, so their parent-relative "version before" is
+    # meaningless and made the shipped version resolve to the base's own).
+    log = _git(root, "log", "--first-parent", "--format=%H", "--no-renames", f"{base_sha}..HEAD",
+               "--", *candidates)
     for commit in (log or "").split():
-        names = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames",
-                     "-z", "--root", commit) or ""
+        names = _git(root, "diff-tree", "-m", "--first-parent", "--no-commit-id", "--name-only", "-r",
+                     "--no-renames", "-z", "--root", commit) or ""
         touched = [n for n in names.split("\0") if n in candidates]
         for rel in touched:
             parent_text = _read(root, f"{commit}~1", rel)

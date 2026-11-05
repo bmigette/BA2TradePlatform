@@ -25,13 +25,92 @@ ba2_common-pure: no ba2_providers / ba2_trade_platform imports.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from ba2_common.core.failure_modes import is_never_absorbed
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.position_sizing import sized_on_stop, with_max_loss_stop
-from ba2_common.core.types import AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType
+from ba2_common.core.types import (
+    AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType,
+    get_option_action_values)
 from ba2_common.logger import logger
+
+#: The two ways an entry is executed (see :func:`entry_route`).
+ENTRY_ROUTE_OPTION = "option"
+ENTRY_ROUTE_EQUITY = "equity"
+
+
+#: ``types.is_option_action``'s set, frozen once: the router runs per fired entry, and the list
+#: behind ``is_option_action`` is rebuilt on every call. Compared by VALUE -- a str-Enum member
+#: hashes by its NAME, so an enum would silently miss a set of value strings.
+_OPTION_ACTION_VALUES = frozenset(get_option_action_values())
+
+
+class MixedEntryActionsRefused(ValueError):
+    """An entry rule fired option AND equity actions together: neither path can size both."""
+
+
+def entry_route(action_types: Iterable[Any]) -> str:
+    """HOW the fired entry executes, from the action types its rule produced -- the ONE routing
+    decision both runtimes make (plan 2026-09-25 option-stage2-build, revision Task E1).
+
+    * every action an option action -> ``ENTRY_ROUTE_OPTION``: the option actions size and
+      submit themselves through their shared risk/capacity guards (``execute(submit_to_broker=
+      True)``). They must never reach the equity RM, which would re-label the contracts as
+      shares and stage a STOCK safeguard stop (live 8082, 2026-09-24).
+    * no option action -> ``ENTRY_ROUTE_EQUITY``: staged as a transient candidate for the RM
+      sizing pass (``build_entry_candidate``), the S-family flow.
+    * a MIX -> ``MixedEntryActionsRefused``: the equity RM would stamp a share count onto the
+      option order, and the option path would submit the equity action unsized.
+
+    Decided PER FIRED ENTRY, never per run: a style expert composes equity-entry members
+    (O_CC / O_PP) with option-entry members in one ruleset. Live ``TradeManager`` and the
+    backtest ``daily_engine`` both call this, so the routing cannot drift between them.
+    O(number of actions); a pure function of its argument.
+
+    ``action_types`` are ``ExpertActionType`` members or their string values. An empty list is
+    refused: both callers stop on "no actions" before routing, so reaching here with none is a
+    caller bug, and answering would pick a path for nothing.
+    """
+    types = list(action_types)
+    if not types:
+        raise ValueError("entry_route: the fired entry produced no actions to route")
+    flags = [getattr(t, "value", t) in _OPTION_ACTION_VALUES for t in types]
+    if all(flags):
+        return ENTRY_ROUTE_OPTION
+    if any(flags):
+        raise MixedEntryActionsRefused(
+            f"the entry rule mixes option and equity actions "
+            f"{[getattr(t, 'value', t) for t in types]}: neither the option self-sizing path "
+            f"nor the equity RM can size both halves")
+    return ENTRY_ROUTE_EQUITY
+
+
+def open_or_waiting_position(expert_id: Any, symbol: str, *, session=None) -> Optional[Transaction]:
+    """THE DUPLICATE-POSITION GATE: the expert's OPENED or WAITING transaction on ``symbol``
+    (the lowest id when there are several), or None when the entry may proceed.
+
+    Applied after the enter ruleset fired and before anything executes, by live ``TradeManager``
+    and the backtest ``daily_engine`` alike (plan 2026-09-25 option-stage2-build, Task 8 review
+    I1): ONE position per (expert, symbol). WAITING counts too, so a not-yet-filled entry from
+    an earlier cycle cannot be stacked (a ruleset's ``has_no_position`` leaf sees OPENED only).
+    Keyed on expert and symbol ONLY -- not on a style-group member tag -- so in a style expert
+    one member holds a symbol at a time, which is what keeps the members' exits apart (each
+    exit reads the one position's entry order, ``entry_order.oldest_entry_order``).
+
+    Reads through ``trade_store.transactions_where``: the backtest's in-memory store when it is
+    active, else SQLite (through ``session`` when given, preserving the live session's view).
+    """
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import TransactionStatus
+
+    rows = transactions_where(expert_id=expert_id, symbol=symbol,
+                              statuses=[TransactionStatus.OPENED, TransactionStatus.WAITING],
+                              session=session)
+    if not rows:
+        return None
+    return min(rows, key=lambda t: t.id or 0)
+
 
 # Recommendation directions that open a SHORT (sell-entry); everything else opens a long (buy).
 _SHORT_ENTRY_ACTIONS = (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT)
@@ -112,6 +191,80 @@ def _max_loss_meta(transaction: Transaction, safeguard_sl: Optional[float]):
     if new_meta is None:
         return None, None
     return new_meta, stop
+
+
+def record_level_anchor(transaction_id: Optional[int], **levels) -> bool:
+    """Stamp the price a protective level was COMPUTED FROM on ``Transaction.meta_data``.
+
+    ``levels``: ``stop=<price>`` and/or ``tp=<price>``; a value of None CLEARS that level's anchor
+    (the level now comes from a price of unknown origin, so an older stamp would mislead). Called
+    by whoever sets the level, BEFORE the level reaches the account, so the exit order built from
+    it (live) and the fill-time re-base (live and backtest) read the true anchor
+    (``tpsl_fill_rebase.read_anchor``). A single-column write, same discipline as
+    ``record_max_loss_stop``; never raises (a lost stamp falls back to the legacy reference chain
+    and is logged at ERROR). Returns True when written."""
+    if transaction_id is None or not levels:
+        return False
+    try:
+        from ba2_common.core import trade_store
+        from ba2_common.core.db import _db_write_lock, get_db, get_instance, update_instance
+        from ba2_common.core.tpsl_fill_rebase import ANCHOR_KEY, stamp_anchor
+
+        def _new_meta(txn):
+            new = stamp_anchor(txn.meta_data, **levels)
+            return None if new.get(ANCHOR_KEY) == (txn.meta_data or {}).get(ANCHOR_KEY) else new
+
+        if trade_store.inmem_trades_active():
+            txn = get_instance(Transaction, transaction_id)
+            new_meta = _new_meta(txn)
+            if new_meta is None:
+                return False
+            txn.meta_data = new_meta
+            update_instance(txn)
+            return True
+        with _db_write_lock:
+            with get_db() as session:
+                db_txn = session.get(Transaction, transaction_id)
+                if db_txn is None:
+                    logger.warning(f"Transaction {transaction_id} not found: no level anchor stamped")
+                    return False
+                new_meta = _new_meta(db_txn)
+                if new_meta is None:
+                    return False
+                db_txn.meta_data = new_meta
+                session.commit()
+                return True
+    except Exception as e:  # noqa: BLE001 -- metadata; see the docstring
+        if is_never_absorbed(e):
+            raise
+        logger.error(f"Could not stamp the level anchor {levels} on transaction {transaction_id}: {e}",
+                     exc_info=True)
+        return False
+
+
+def stamp_safeguard_anchor(order: Optional[TradingOrder], ruleset_sl: Optional[float],
+                           safeguard_sl: Optional[float], submit_sl: Optional[float],
+                           anchor_price: Any) -> bool:
+    """Stamp the stop anchor when the stop about to be attached is the RM SAFEGUARD.
+
+    ``submit_sl`` is what ``reconcile_protective_stop`` returned. When it is the safeguard (not the
+    ruleset's own stop, whose anchor its action already stamped), that stop was computed from the
+    price the RM sized on: ``anchor_price`` (a callable returning the then-current price, or the
+    price). Called BEFORE ``submit_order``. No transaction yet (a ruleset without TP/SL creates it
+    inside the submit) -> nothing to stamp; the reference chain then resolves to the recommendation
+    price, which is that same decision price."""
+    if order is None or getattr(order, "transaction_id", None) is None:
+        return False
+    if not submit_sl or not safeguard_sl or submit_sl != safeguard_sl:
+        return False
+    if ruleset_sl and ruleset_sl == submit_sl:
+        return False
+    px = anchor_price() if callable(anchor_price) else anchor_price
+    if not px:
+        logger.warning(f"No current price to stamp as the safeguard-stop anchor of order "
+                       f"{getattr(order, 'id', None)}; the fill-time re-base will use the fallback chain")
+        return False
+    return record_level_anchor(order.transaction_id, stop=float(px))
 
 
 def record_max_loss_stop(order: Optional[TradingOrder], safeguard_sl: Optional[float]) -> Optional[float]:

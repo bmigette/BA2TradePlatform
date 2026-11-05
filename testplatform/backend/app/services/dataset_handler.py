@@ -493,54 +493,36 @@ def handle_dataset_regeneration(task_id: str, payload: Dict[str, Any]) -> Dict[s
                     )
                     logger.info(f"[Task {task_id}] Added {len(statement_cols)} statement feature columns")
                 else:
-                    # Legacy mode
-                    update_dataset_progress(dataset_id, "Fetching current fundamentals...", task_id)
-                    fundamentals = FundamentalsService.get_fundamental_data(ticker)
-                    if fundamentals and fundamentals.get('current'):
-                        current = fundamentals['current']
-                        added_count = 0
-                        for key, value in current.items():
-                            if value is not None:
-                                df[f'fundamental_{key}'] = value
-                                added_count += 1
-                        update_dataset_progress(
-                            dataset_id,
-                            f"Added {added_count} fundamental columns",
-                            task_id
-                        )
-
-                # Fetch macro indicators
-                macro_indicators = fundamentals_config.get('macro_indicators', [])
-                if macro_indicators:
+                    # Legacy mode: today's snapshot is NOT point-in-time (it would be broadcast to
+                    # historical rows), so it is only added when explicitly opted in
+                    n_before = len(df.columns)
+                    df = FundamentalsService.add_live_snapshot_columns(df, ticker, fundamentals_config)
                     update_dataset_progress(
                         dataset_id,
-                        f"Fetching macro indicators ({len(macro_indicators)})...",
+                        f"Added {len(df.columns) - n_before} live-snapshot fundamental columns",
                         task_id
                     )
-                    logger.info(f"[Task {task_id}] Fetching macro indicators: {macro_indicators}")
-
-                    try:
-                        macro_service = MacroService()
-                        df = macro_service.integrate_macro_with_ohlc(df, macro_indicators)
-                        for indicator in macro_indicators:
-                            if indicator in df.columns:
-                                df = df.rename(columns={indicator: f'macro_{indicator}'})
-                                if f'{indicator}_yoy_change' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_yoy_change': f'macro_{indicator}_yoy_change'})
-                                if f'{indicator}_days_since' in df.columns:
-                                    df = df.rename(columns={f'{indicator}_days_since': f'macro_{indicator}_days_since'})
-                        update_dataset_progress(
-                            dataset_id,
-                            f"Added macro indicators: {', '.join(macro_indicators)}",
-                            task_id
-                        )
-                    except Exception as e:
-                        logger.warning(f"[Task {task_id}] Error fetching macro data: {e}")
-                        update_dataset_progress(dataset_id, f"Warning: Macro error: {str(e)[:50]}", task_id)
-
             except Exception as e:
                 logger.error(f"[Task {task_id}] Error fetching fundamentals: {e}")
                 update_dataset_progress(dataset_id, f"Warning: Fundamentals error: {str(e)[:100]}", task_id)
+
+            # Macro indicators sit OUTSIDE the warn-and-continue handler above: a refused series
+            # (no first-release cache file, GDP, a cache that does not cover the dataset) must FAIL
+            # the task, not finish a dataset that silently lacks the macro columns.
+            macro_indicators = fundamentals_config.get('macro_indicators', [])
+            if macro_indicators:
+                update_dataset_progress(
+                    dataset_id,
+                    f"Fetching macro indicators ({len(macro_indicators)})...",
+                    task_id
+                )
+                logger.info(f"[Task {task_id}] Fetching macro indicators: {macro_indicators}")
+                df = MacroService().add_macro_columns(df, macro_indicators)
+                update_dataset_progress(
+                    dataset_id,
+                    f"Added macro indicators: {', '.join(macro_indicators)}",
+                    task_id
+                )
         else:
             update_dataset_progress(dataset_id, "Fundamentals not enabled", task_id)
 

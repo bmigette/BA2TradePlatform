@@ -139,8 +139,10 @@ class TestPositions:
         assert (a.qty, a.side, a.avg_entry_price, a.current_price) == (10, OrderDirection.BUY, 150.0, 165.0)
         assert a.cost_basis == 1500.0 and a.market_value == 1650.0 and a.unrealized_pl == 150.0
         assert a.lastday_price == 160.0 and a.change_today == pytest.approx(5.0 / 160.0)
-        assert m.qty == 4 and m.side == OrderDirection.SELL           # qty is a magnitude
-        assert m.market_value == 1160.0
+        assert m.qty == -4 and m.side == OrderDirection.SELL          # SIGNED: a short is negative
+        assert m.cost_basis == -1200.0 and m.market_value == -1160.0
+        assert account.get_signed_position_quantity("MSFT") == -4.0   # the exposure gate reads a short as one
+        assert account.get_signed_position_quantity("AAPL") == 10.0
         assert a.qty_available == 10                                  # IB publishes no per-order hold
 
     def test_option_rows_are_excluded_from_equity_positions(self, world):

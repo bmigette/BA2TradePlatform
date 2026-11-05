@@ -2241,7 +2241,9 @@ def test_the_account_value_survives_a_base_notional_that_blows_up(monkeypatch,
                             positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
-    monkeypatch.setattr(page, 'compute_base_notional',
+    # The loader moved to services.portfolio (one function, two callers): patch the name where it is looked up.
+    from ba2_trade_platform.services import portfolio as portfolio_svc
+    monkeypatch.setattr(portfolio_svc, 'compute_base_notional',
                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('boom')))
 
     payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
@@ -4320,12 +4322,13 @@ def test_the_swatch_only_ever_takes_a_PARSED_colour(monkeypatch, nicegui_client,
 def test_the_reserve_controls_can_express_a_two_decimal_reserve(nicegui_client,
                                                                 account_id):
     """The slider steps in whole percent because dragging a 10,000-notch track is
-    unusable; the BOX is what makes 12.5 reachable, so its step has to allow it."""
+    unusable; the BOX is what makes 12.5 reachable. ``step=any`` keeps every decimal valid
+    while the browser's spinner arrows move it by a whole 1 (not 0.01)."""
     root = _draw(nicegui_client, account_id, _one_label(account_id))
     slider, number = _reserve_controls(root)
 
     assert slider._props['step'] == 1
-    assert number._props['step'] == 0.01
+    assert number._props['step'] == 'any'
     assert (slider._props['min'], slider._props['max']) == (0, 100)
     assert (number._props['min'], number._props['max']) == (0, 100)
 
@@ -8289,9 +8292,10 @@ def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
     """
     import inspect
     from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_trade_platform.services import portfolio as portfolio_svc
 
     sources = {
-        "portfolio_allocation.py::_load_view_payload": inspect.getsource(page._load_view_payload),
+        "services/portfolio.py::load_view_payload": inspect.getsource(portfolio_svc.load_view_payload),
         "portfolio_allocation_service.py::build_position_states":
             inspect.getsource(svc.build_position_states),
     }

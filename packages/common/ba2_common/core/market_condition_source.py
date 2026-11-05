@@ -51,6 +51,10 @@ from ba2_common.core.market_conditions import (
 
 __all__ = [
     "SOURCE_PROFILE_FMP_DAILY",
+    "SOURCE_PROFILE_ALPACA_DAILY",
+    "SOURCE_PROFILE_BY_HISTORY",
+    "source_profile_for_history",
+    "provider_dir_for_source_profile",
     "FMP_OHLCV_PROVIDER_DIR",
     "FMP_DAILY_COLUMNS",
     "read_fmp_daily_cache",
@@ -84,6 +88,32 @@ __all__ = [
 SOURCE_PROFILE_FMP_DAILY = "fmp-daily-split-adjusted-v1"
 #: The provider's cache directory name under ``CACHE_FOLDER`` (its class name).
 FMP_OHLCV_PROVIDER_DIR = "FMPOHLCVProvider"
+#: The Alpaca-history source profile: daily bars of ``AlpacaHistoryOHLCVProvider`` (same layout), built from raw
+#: SIP bars and our verified split table. A distinct name, so a stored feature key or manifest digest built from
+#: one history can never be mistaken for the other's (the source profile is part of both).
+SOURCE_PROFILE_ALPACA_DAILY = "alpaca-daily-split-verified-v1"
+#: OHLCV history source (``ohlcv_history.HISTORY_SOURCES``) -> market-condition source profile.
+SOURCE_PROFILE_BY_HISTORY = MappingProxyType({
+    "fmp": SOURCE_PROFILE_FMP_DAILY,
+    "alpaca": SOURCE_PROFILE_ALPACA_DAILY,
+})
+
+
+def source_profile_for_history(source: str) -> str:
+    """The market-condition source profile of OHLCV history ``source`` (unknown source refuses)."""
+    from ba2_common.core.ohlcv_history import check_history_source
+    return SOURCE_PROFILE_BY_HISTORY[check_history_source(source)]
+
+
+def provider_dir_for_source_profile(source_profile: str) -> str:
+    """The cache folder (under ``CACHE_FOLDER``) the daily bars of ``source_profile`` live in."""
+    from ba2_common.core.ohlcv_history import history_cache_dirname
+    for source, profile in SOURCE_PROFILE_BY_HISTORY.items():
+        if profile == source_profile:
+            return history_cache_dirname(source)
+    raise ValueError(f"unknown market-condition source profile {source_profile!r}; "
+                     f"known: {sorted(SOURCE_PROFILE_BY_HISTORY.values())}")
+
 #: The provider cache's column layout. The ONE place the live reader and certification take it.
 FMP_DAILY_COLUMNS = ("Date", "Open", "High", "Low", "Close", "Volume")
 
@@ -574,20 +604,21 @@ def certify_split(dates: Any, o: Any, h: Any, l: Any, c: Any, fixture: SplitFixt
         reason=reason)
 
 
-def certify_source_columns(cache_root: str,
-                           splits: Sequence[SplitFixture] = CERTIFICATION_SPLITS) -> CertificationReport:
-    """Certify the FMP daily OHLCV cache under ``cache_root`` (a ``CACHE_FOLDER``) against the
-    split fixtures. A missing parquet is ``unavailable`` and NOT consistent."""
+def certify_source_columns(cache_root: str, splits: Sequence[SplitFixture] = CERTIFICATION_SPLITS, *,
+                           source_profile: str = SOURCE_PROFILE_FMP_DAILY) -> CertificationReport:
+    """Certify the daily OHLCV cache of ``source_profile`` (default the FMP one) under ``cache_root`` (a
+    ``CACHE_FOLDER``) against the split fixtures. A missing parquet is ``unavailable`` and NOT consistent."""
     results = []
     for fx in splits:
-        path = fmp_daily_cache_path(fx.symbol, cache_root)
+        path = fmp_daily_cache_path(fx.symbol, cache_root, source_profile=source_profile)
         if path is None:
             results.append(_unavailable(
-                fx, f"no {fx.symbol} daily cache file under {os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR)}"))
+                fx, f"no {fx.symbol} daily cache file under "
+                    f"{os.path.join(cache_root, provider_dir_for_source_profile(source_profile))}"))
             continue
         dates, o, h, l, c, _v = read_fmp_daily_cache(path)
         results.append(certify_split(dates, o, h, l, c, fx))
-    return CertificationReport(source_profile=SOURCE_PROFILE_FMP_DAILY, cache_root=str(cache_root),
+    return CertificationReport(source_profile=source_profile, cache_root=str(cache_root),
                                symbols=tuple(results))
 
 
@@ -615,8 +646,10 @@ def read_fmp_daily_cache(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
     return (dates, *cols)
 
 
-def fmp_daily_cache_path(symbol: str, cache_root: Optional[str] = None) -> Optional[str]:
-    """The existing FMP daily cache parquet for ``symbol``, or ``None``.
+def fmp_daily_cache_path(symbol: str, cache_root: Optional[str] = None, *,
+                         source_profile: str = SOURCE_PROFILE_FMP_DAILY) -> Optional[str]:
+    """The existing daily cache parquet of ``source_profile`` (default FMP; the Alpaca history has the same
+    layout in its own folder) for ``symbol``, or ``None``.
 
     With ``cache_root`` None or equal to the live ``native_cache.CACHE_FOLDER`` the lookup IS
     ``native_cache.find_timeseries_path`` -- the provider's own resolution, legacy interval
@@ -625,11 +658,12 @@ def fmp_daily_cache_path(symbol: str, cache_root: Optional[str] = None) -> Optio
     """
     from ba2_common.core import native_cache
 
+    provider_dir = provider_dir_for_source_profile(source_profile)
     live_root = native_cache.CACHE_FOLDER
     if cache_root is None or os.path.normcase(os.path.abspath(cache_root)) == \
             os.path.normcase(os.path.abspath(live_root)):
-        return native_cache.find_timeseries_path(FMP_OHLCV_PROVIDER_DIR, symbol, "1d")
-    folder = os.path.join(cache_root, FMP_OHLCV_PROVIDER_DIR)
+        return native_cache.find_timeseries_path(provider_dir, symbol, "1d")
+    folder = os.path.join(cache_root, provider_dir)
     canon = native_cache.normalize_interval("1d")
     for spelling in native_cache._INTERVAL_ALIASES.get(canon, [canon]):
         path = os.path.join(folder, f"{symbol.upper()}_{spelling}.parquet")

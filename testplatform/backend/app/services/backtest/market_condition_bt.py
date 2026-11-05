@@ -62,7 +62,13 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
     """``MarketConditionReader`` over one run's ``AsOfPriceSource``."""
 
     def __init__(self, price_source: Any, profile: str, *, memo_size: int = MEMO_SIZE,
-                 manifest_digest: Optional[str] = None, cache_root: Optional[str] = None):
+                 manifest_digest: Optional[str] = None, cache_root: Optional[str] = None,
+                 source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+        """``source_profile`` = the market-condition source profile of the JOB's OHLCV history
+        (``source_profile_for_history(resolve_job_history_source(config))``). A pinned manifest built from another
+        source profile refuses (``HistorySourceMismatch``): its rows hold numbers the job's history would not
+        reproduce. Without a manifest the reader computes from the run's own price source, which IS the job's."""
+        self.source_profile = source_profile
         mapped = None
         if manifest_digest:
             from ba2_common.core.market_condition_reader import MappedMarketConditionReader
@@ -74,11 +80,28 @@ class BacktestMarketConditionReader(WindowMarketConditionReader):
             # memo_size=0: the WindowMarketConditionReader base memoises the same
             # (symbol, session) key, so a second memo would only double the residency.
             mapped = MappedMarketConditionReader(root, manifest_digest, profile, memo_size=0)
+            built_from = mapped.manifest["source_profile"]
+            if built_from != source_profile:
+                from ba2_common.core.ohlcv_history_stamp import HistorySourceMismatch
+                raise HistorySourceMismatch(
+                    f"market-condition manifest {manifest_digest} (profile {profile!r}) was built from source "
+                    f"profile {built_from!r}, the job runs on {source_profile!r}: a job never reads a snapshot "
+                    f"built from the other OHLCV history (re-warm it for this history, or run the job on the "
+                    f"history the snapshot was built from)")
         super().__init__(profile, memo_size=memo_size, retain_windows=False, mapped=mapped)
         self.manifest_digest = manifest_digest
         self._ps = price_source
 
     def _bars(self, symbol: str, session: date):
+        # DAILY bar stores only: ``window_before`` raises ValueError on an intraday store. A
+        # 5-minute run therefore needs a PINNED MANIFEST (the mapped reader serves every row and
+        # this method is never reached); without one the run is refused here, loudly. The pin must
+        # reach one session BEFORE the run's start (``window_coverage_problems(intraday=True)``).
+        if getattr(self._ps, "is_intraday", False):
+            raise ValueError(
+                f"market-condition features cannot be computed from an intraday bar store ({self._ps.interval!r}); "
+                f"an intraday-clock run must pin a market-condition manifest (mapped reader) that "
+                f"covers the sessions from one before its start_date")
         bars = self._ps.window_before(symbol, session, WINDOW)
         if bars is not None:
             return bars
@@ -104,9 +127,11 @@ class BacktestMarketConditionResolver:
     the live ``DecisionState`` by ``test_market_condition_bt_live_session_parity``.
     """
 
-    def __init__(self, reader: Any, *, source_profile: str = SOURCE_PROFILE_FMP_DAILY):
+    def __init__(self, reader: Any, *, source_profile: Optional[str] = None):
         self.reader = reader
-        self.source_profile = source_profile
+        # ONE answer: the reader's own source profile unless the caller states the job's explicitly
+        self.source_profile = source_profile if source_profile is not None else getattr(
+            reader, "source_profile", SOURCE_PROFILE_FMP_DAILY)
         self._ctx: Optional[MarketConditionContext] = None
         #: The BAR the cached context was built for. Compared instead of ``ctx.session_label``,
         #: which is the NEXT session and never equals the bar.
@@ -116,6 +141,14 @@ class BacktestMarketConditionResolver:
     def __call__(self, account: Any, instrument_name: str,
                  expert_recommendation: Any) -> Optional[MarketConditionContext]:
         bar = account._as_of_date()
+        ps = getattr(account, "_price", None)
+        if getattr(ps, "is_intraday", False):
+            # INTRADAY clock: the gate is a function of the last FINISHED session. The calendar
+            # date of the clock is the decision session itself, whose daily row (close, high,
+            # low, ATR, close_vs_prior_high_20_atr) is unknown until its close; reading it at
+            # 09:30..15:55 is a look-ahead. Same rule as the screener scan day, the regime
+            # calendar and the metric-store ATR (``daily_session_date``). Daily clock: unchanged.
+            bar = ps.daily_session_date(ps.now())
         ctx = self._ctx
         if ctx is not None and self._ctx_bar == bar:
             return ctx
@@ -398,8 +431,16 @@ def _structure_groups(trades: Any) -> Any:
 
 
 def attach_entry_states(trades: Any, entry_states: Any,
-                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS) -> Dict[str, int]:
+                        max_gap_days: int = ENTRY_STATE_MAX_GAP_DAYS,
+                        intraday: bool = False) -> Dict[str, int]:
     """Attach ``entry_state`` to the structures an entry-state record covers.
+
+    ``intraday``: on an INTRADAY clock a decision on bar D reads the row of the last FINISHED
+    session P(D), so a record's ``prior_session`` is P(D) and a same-day fill is ``gap_days >= 1``
+    from it BY DESIGN. There ``same_session`` counts the normal case, "bound to the last finished
+    session before the entry" (no regular session lies between the record's data session and the
+    entry date), and ``with_gap`` only the genuinely older bindings. ``gap_days`` itself and every
+    attached value are unchanged; only the counters' meaning is adjusted.
 
     Returns ``{"attached", "same_session", "with_gap", "ambiguous"}`` -- how many STRUCTURES
     were bound, and how certain each binding was. The counts are of structures throughout:
@@ -477,7 +518,12 @@ def attach_entry_states(trades: Any, entry_states: Any,
             out["ambiguous"] += 1
         head["entry_state"] = state
         out["attached"] += 1
-        out["same_session" if gap == 0 else "with_gap"] += 1
+        if intraday:
+            from ba2_common.core.market_calendar import prior_regular_session
+            normal = prior_regular_session(_date.fromisoformat(entry)).isoformat() == chosen["prior_session"]
+        else:
+            normal = gap == 0
+        out["same_session" if normal else "with_gap"] += 1
     return out
 
 
@@ -491,7 +537,10 @@ def apply_market_condition_block(results: Dict[str, Any], record: Any) -> Dict[s
     """
     if record is None:
         return results
-    record.binding = attach_entry_states(results.get("trades"), record.entry_states())
+    from app.services.backtest.price_source import _is_intraday
+    record.binding = attach_entry_states(
+        results.get("trades"), record.entry_states(),
+        intraday=_is_intraday(results.get("execution_interval") or "1d"))
     block = record.as_dict()
     block["stats"]["structures_with_entry_state"] = record.binding.get("attached", 0)
     results["market_condition"] = block

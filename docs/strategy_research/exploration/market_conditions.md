@@ -135,13 +135,13 @@ Use the existing `tools/warm_market_conditions.py` sequence for each requested p
 # After producing the resolved union file; run from the repository root.
 $research = "reports/strategy_research/goal2020_market_conditions"
 New-Item -ItemType Directory -Force $research | Out-Null
-python tools/warm_market_conditions.py plan --profile ohlcv-v1 `
+python tools/warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp `
   --universe-file "$research/universe.txt" --start 2020-01-01 --end 2025-12-31 `
   --out "$research/ohlcv-v1-plan.json"
-python tools/warm_market_conditions.py build --plan "$research/ohlcv-v1-plan.json" --cache-only
+python tools/warm_market_conditions.py build --plan "$research/ohlcv-v1-plan.json" --cache-only --ohlcv-history-source fmp
 # Repeat plan/build for ta-structure-v1. Retain each returned digest separately.
-python tools/warm_market_conditions.py verify --manifest <digest>
-python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile <profile>
+python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source fmp
+python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile <profile> --ohlcv-history-source fmp
 ```
 
 The placeholders above must be replaced with the actual digest/profile. The union file is created

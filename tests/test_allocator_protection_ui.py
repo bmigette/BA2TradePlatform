@@ -62,7 +62,7 @@ def test_the_shield_colour_per_status(status, color):
 
 def test_every_status_code_has_a_shield_colour_and_a_tooltip():
     codes = [ap.STATUS_OFF, ap.STATUS_NO_POSITION, ap.STATUS_PROTECTED, ap.STATUS_PARTIAL,
-             ap.STATUS_REPLACING, ap.STATUS_UNPROTECTED]
+             ap.STATUS_REPLACING, ap.STATUS_UNPROTECTED, ap.STATUS_CANCEL_UNCONFIRMED]
     for code in codes:
         assert view.protection_icon_color(code) in view.ICON_COLORS
         assert view.protection_icon_color(code, failure_alert=True) == "red"
@@ -467,7 +467,7 @@ def test_slice_rows_hide_cancelled_history():
                            complex_order_id=2, sl_order_id=None, external_tag='t2', gtc_date=datetime(2027, 1, 3), gtc_date_assumed=True,
                            closed_at=None)
     rows = dlg.slice_rows([gone, live])
-    assert [r['n'] for r in rows] == [2] and rows[0]['gtc'] == '2027-01-03*'
+    assert [r['n'] for r in rows] == [2] and rows[0]['gtc'] == '2027-01-03'
 
 
 def test_load_dialog_data_reads_the_broker_and_the_store(monkeypatch):

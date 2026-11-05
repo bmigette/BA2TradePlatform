@@ -4,7 +4,7 @@ TWO BT/LIVE ASYMMETRIES, found 2026-09-28 while wiring the ``weighting`` gene:
 
 1. THE BOOK WAS SIZED ON CASH IN THE BACKTEST. ``FactorPortfolioManager.rebalance`` read
    ``expert.get_virtual_balance()``, i.e. ``account.get_balance()``: EQUITY at Alpaca, CASH on
-   ``BacktestAccount`` (finding 6, left as is for the classic RM). A fully invested $100k book
+   ``BacktestAccount`` (finding 6; the classic RM's balance was moved onto equity too on 2026-10-07). A fully invested $100k book
    therefore looked like the $279 of cash left over, and the SECOND rebalance of every
    FactorRanker backtest sold the whole book; the third bought it back. Live kept the book.
    The same figure priced the protective stop, so every stop priced after the first fill was
@@ -216,7 +216,7 @@ def _state_live_fills(world) -> None:
 
 
 def test_the_rebalance_sees_the_same_equity_in_the_backtest_and_live():
-    """Same $4,000 funding, same 10 x $100 held: the backtest (cash $3,000), a live 1x
+    """Same $4,000 funding, same 10 x $100 held: the backtest (cash $3,000, equity $4,000), a live 1x
     account and a live $2,000-at-2x account all size the book on $4,000."""
     with invested_world() as world:
         # invested_world fills the backtest entry but does not roll its transaction to
@@ -227,9 +227,9 @@ def test_the_rebalance_sees_the_same_equity_in_the_backtest_and_live():
         _state_live_fills(world)
         seen = {arm.name: _rebalance_equity(arm) for arm in world.arms}
         virtual = {arm.name: arm.expert.get_virtual_equity() for arm in world.arms}
-        # The classic figure is untouched: still cash in the backtest (finding 6).
+        # The classic figure is the same equity share now (finding 6, fixed 2026-10-07).
         classic_bt = world.bt.expert.get_virtual_balance()
 
     assert seen == pytest.approx({"BT": 4_000.0, "L1": 4_000.0, "L2": 4_000.0})
     assert virtual == pytest.approx(seen)
-    assert classic_bt == pytest.approx(3_000.0)
+    assert classic_bt == pytest.approx(4_000.0)

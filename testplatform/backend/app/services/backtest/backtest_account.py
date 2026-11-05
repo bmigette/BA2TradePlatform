@@ -62,6 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, Transaction
+from ba2_common.core.knowability import NoDecisionPrice
 from ba2_common.core.types import (
     OrderStatus,
     OrderType,
@@ -78,12 +79,20 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
+from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
 from ba2_common.core import option_spread_model as _osm
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
+from ba2_common.core.assignment_hold import (
+    assigned_stock_entry_data,
+    holds_assigned_stock,
+    resolve_assigned_stock_hold_policy,
+)
+from ba2_common.core.entry_order import entry_order_for_transaction
+from ba2_common.core.entry_tag import order_entry_tag
 
 from .price_source import AsOfPriceSource
 from .options_provider import HistoricalOptionsProvider
@@ -91,6 +100,34 @@ from .options_provider import HistoricalOptionsProvider
 import logging
 
 logger = logging.getLogger(__name__)
+
+# ``TradingOrder.data`` key marking a book-keeping fill that moved no cash commission (option
+# expiry/assignment closes, the assignment-created stock lot, forced stock liquidations).
+# ``get_round_trip_trades`` skips these when charging commission per fill.
+SYNTHETIC_FILL_KEY = "synthetic_fill"
+
+#: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
+#: ``results["fill_rebase"]``. ``no_reference`` = an entry with a stop and NO usable anchor (its stop
+#: kept the pre-fill level): judged by ``DailyBacktestEngine.refuse_if_rebase_unanchored``.
+#: ``fallback_reference`` = the stop carried no stamp and the entry-order chain supplied the anchor.
+FILL_REBASE_COUNTER_KEYS = {
+    "entries_with_levels": 0, "entries_with_stop": 0, "rebased": 0, "stop_rebased": 0,
+    "tp_floored": 0, "fallback_reference": 0, "no_reference": 0,
+}
+
+
+class FillRebaseDisabled(RuntimeError):
+    """The measurement hook ``BacktestAccount._MEASURE_NO_FILL_REBASE`` was on in an optimization or
+    grid. JOB-FATAL: every trial would score a simulation that differs from live."""
+
+
+def assert_fill_rebase_enabled() -> None:
+    """Refuse to run a GA / grid trial with the fill re-base switched off (measurement hook only)."""
+    if BacktestAccount._MEASURE_NO_FILL_REBASE is not False:
+        raise FillRebaseDisabled(
+            "BacktestAccount._MEASURE_NO_FILL_REBASE is on: the fill-time stop/target re-base is "
+            "switched off, which is a measurement-only hook (tools/measure_variant.py +norebase) and "
+            "must never be on in an optimization or grid")
 
 
 class ComboSettlementRefused(RuntimeError):
@@ -104,6 +141,36 @@ class ComboSettlementRefused(RuntimeError):
 _NEVER_HELD_LEG_STATUSES = frozenset({
     OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.REPLACED,
 })
+
+
+#: ``_owner_rank`` tiers (higher wins). See ``BacktestAccount._option_group_bounds``.
+_OWNER_DEAD, _OWNER_CLOSING, _OWNER_PENDING_OPEN, _OWNER_FILLED_OPEN = 0, 1, 2, 3
+
+
+def _owner_rank(order) -> int:
+    """How good a claim ``order`` has to be the order that OPENED a held contract's lot.
+
+    DECIDED BY WHAT WAS FILLED, not by the status the row ended in: an opening order that
+    filled some contracts and was CANCELED afterwards still holds them (a cancel does not
+    un-trade a print), so it outranks every order that filled nothing. Status only orders the
+    rest: dead (never held), closing, still-pending opening."""
+    intent = (getattr(order, "position_intent", None) or "").lower()
+    opening = not intent or "open" in intent
+    raw = getattr(order, "filled_qty", None)
+    try:
+        filled = float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        filled = 0.0
+    if opening and filled > 0:
+        return _OWNER_FILLED_OPEN
+    status = getattr(order, "status", None)
+    if status in _NEVER_HELD_LEG_STATUSES:
+        return _OWNER_DEAD
+    if not opening:
+        return _OWNER_CLOSING
+    if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        return _OWNER_FILLED_OPEN
+    return _OWNER_PENDING_OPEN
 
 
 def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
@@ -369,7 +436,28 @@ def _new_integrity_counters() -> Dict[str, Any]:
             "option_orders_volume_sized": 0,
             "option_orders_volume_refused": 0,
             "option_split_rekeys": 0,
-            "option_split_rekey_refusals": 0}
+            "option_split_rekey_refusals": 0,
+            # Option FILL prints screened by ``_screen_open_print`` / the structure bound
+            # check in ``_fill_multi_leg_parent`` (distinct order-days). ``rejected`` =
+            # replaced + refused; ``unverified`` = a print the screen had no reference to
+            # judge (accepted, but counted so it is never silent).
+            "option_fill_prints_rejected": 0,
+            "option_fill_prints_replaced": 0,
+            "option_fill_prints_refused": 0,
+            "option_fill_prints_unverified": 0,
+            # Orders that actually FILLED at a replaced print (a replaced print may still
+            # fail the limit / liquidity tests and never fill).
+            "option_fills_at_replaced_print": 0,
+            # CLOSING orders repriced from INTRINSIC (no trusted decision-bar iv); closing
+            # STRUCTURES whose net broke the bounds and were repriced instead of refused;
+            # market-type OPENING entries expired after a refused fill.
+            "option_close_prints_fallback": 0,
+            "option_close_structure_fallbacks": 0,
+            "option_close_buyback_last_price": 0,
+            "option_market_entries_expired": 0,
+            "option_fill_print_examples": [],
+            "option_structure_fills_refused": 0,
+            "option_structure_fill_examples": []}
 
 
 def _max_units_within(capacity: float, per_unit: float) -> int:
@@ -440,6 +528,23 @@ _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 #: set FROM those same quotes can miss itself by a float ulp; a broker would fill that. Well
 #: below the $0.01 minimum option tick, so it can never let a genuinely worse net through.
 _NET_LIMIT_TOLERANCE = 1e-9
+
+#: ISOLATED OFF-MARKET OPEN PRINTS (plan: option fill prints, 2026-10-06).
+#: A daily option bar carries no timestamp for its OPEN print, and a thin contract opens on a
+#: stale or garbage trade (LRCX 2022-10-12: the 370 call "opened" at 5.06 inside a 5.06-13.35
+#: day while its neighbour opened at 9.87 -- a bull call spread filled at a NEGATIVE debit).
+#: The next-session open is accepted as a fill reference only while it is consistent with the
+#: contract's OWN session evidence: the open must lie within (``_FILL_PRINT_REL_TOL`` of the
+#: reference, floored at ``_FILL_PRINT_ABS_TOL`` dollars per share) of the interval spanned by
+#: two Black-Scholes references repriced at the UNDERLYING'S OPEN -- one at the iv implied by the
+#: fill day's own close (the session's end), one at the iv of the decision bar (the prior
+#: close). Between those two, any real open is explained by an iv drift across the session;
+#: outside both, it is an isolated print. Measured on 116k contract-days of the 90 stage-1
+#: symbols (DTE 30-60, |K/S-1| <= 12%): 0.27% of opens are rejected at these tolerances,
+#: 0.10% at 75%, 2.2% at 25%/$0.10; a delta-linear reference (no gamma, one iv) rejected 4%
+#: of opens on days the underlying moved over 4% and was dropped for this one.
+_FILL_PRINT_REL_TOL = 0.5
+_FILL_PRINT_ABS_TOL = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +678,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                                 _osm.SOURCE_MODEL: 0}
         # symbol -> signed-position ledger.
         self._positions: Dict[str, _Position] = {}
+        # Exchange suspension / delisting events (set_suspension_events); {} = feature off (FMP source).
+        self._suspension_events: Dict[str, Any] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
         self._equity_snapshots: List[Dict[str, Any]] = []
         # Parallel ascending list of snapshot dates (snapshots are appended in clock order) so
@@ -650,6 +757,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._book_gen: int = 0
         # (book_gen, clock, marked value) memo for _open_positions_mtm.
         self._mtm_memo: Optional[tuple] = None
+        # The same memo for the DECISION-time mark (intraday clock: positions marked at the
+        # decision price, not at the clock bar's close); see _equity_mark_price.
+        self._mtm_memo_decision: Optional[tuple] = None
+        # Counters of the intraday-clock rule (published in results["intraday_clock"]).
+        # undecidable_price_reads: single-symbol price reads that found no knowable price (a basket
+        # member without a decision price is dropped; see MarketExpertInterface._decision_price).
+        self.intraday_counters: Dict[str, int] = {"entries_refused_next_bar_other_session": 0,
+                                                  "undecidable_price_reads": 0}
         # (generation, contract_group, group_bounds) memo for _option_group_bounds.
         self._group_bounds_memo: Optional[tuple] = None
         # contract_symbol -> the order carrying the contract's terms (first row with a strike,
@@ -661,9 +776,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # from an assigned naked short call). Option strategies never manage the resulting
         # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
         # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
-        # Stays EMPTY when the run sets ``hold_assigned_stock`` — read from ``self._cfg`` at
-        # each assignment in _book_assignment_share_leg (assignments are rare; nothing is
-        # gained by caching it, and a cached copy would silently ignore a config change).
+        # Stays EMPTY for an assignment whose stock the run HOLDS -- ``hold_assigned_stock``
+        # (every assignment) or ``hold_assigned_stock_tags`` (only the listed members'; plan
+        # 2026-09-25 stage-2 E2). Decided per assignment by the SHARED
+        # ``assignment_hold.holds_assigned_stock``, reading ``self._cfg`` then (assignments are
+        # rare; nothing is gained by caching it, and a cached copy would silently ignore a
+        # config change). Resolved once HERE too, so a malformed or ambiguous policy is refused
+        # when the run is built, not at its first assignment weeks into the simulation.
+        resolve_assigned_stock_hold_policy(self._cfg)
         self._pending_assignment_sells: Dict[str, float] = {}
         # OPT-L1 exit half: (symbol, reason) pairs the PLEDGED-COVER lock has already
         # explained at ERROR in this run. The lock fires REPEATEDLY by design (a staged
@@ -800,6 +920,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "Only turn it on for a strategy that actually manages stock. "
                                "Defaults to False (exact no-op, pre-2026-08-27 behaviour).",
             },
+            "hold_assigned_stock_tags": {
+                "type": "list",
+                "required": False,
+                "description": "MEMBER-SCOPED form of hold_assigned_stock (plan 2026-09-25 "
+                               "stage-2 E2): the entry tags of the style-expert members "
+                               "whose assigned stock is KEPT (the wheel). Every other "
+                               "member's assignment is liquidated at the next bar's open, as "
+                               "without the setting. Decided per assignment from the entry "
+                               "tag of the option position that was assigned; an untagged "
+                               "assignment in such a run is REFUSED (the run ends). May not "
+                               "be combined with hold_assigned_stock=True. Absent (the "
+                               "default) = hold_assigned_stock alone decides, byte-identical.",
+            },
             "option_spread_min_tick": {
                 "type": "float",
                 "required": False,
@@ -867,8 +1000,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         lot.avg_price = 0.0
         self._touch_book()
 
-    def _open_positions_mtm(self) -> float:
+    def _open_positions_mtm(self, decision: bool = False) -> float:
         """Mark-to-market value of all open positions at the current bar's close — MEMOISED.
+
+        ``decision=True`` (INTRADAY clock only; identical to the default on a daily clock) marks
+        the equity positions at the price KNOWABLE at the decision instant instead of the clock
+        bar's close, which prints a bar later: the value a SIZER may see. The recorded equity
+        curve (``snapshot_equity``) and the final equity keep the bar close.
 
         THE MEMO (2026-09-21). Every entry candidate that reaches the live-parity equity gate
         calls ``has_sufficient_equity_for_trading`` -> ``get_available_balance`` -> this, which
@@ -903,12 +1041,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # memoise -- there is no bar to key on and the un-memoised path is the old behaviour.
         current = getattr(self._price, "current", None)
         clock = current() if current is not None else None
+        decision = bool(decision) and bool(getattr(self._price, "is_intraday", False))
         if clock is None:
-            return self._compute_open_positions_mtm()
-        memo = self._mtm_memo
+            return self._compute_open_positions_mtm(decision)
+        memo = self._mtm_memo_decision if decision else self._mtm_memo
         if memo is not None and memo[0] == self._book_gen and memo[1] == clock:
             if _MTM_AUDIT:
-                fresh = self._compute_open_positions_mtm()
+                fresh = self._compute_open_positions_mtm(decision)
                 if fresh != memo[2]:
                     raise StaleMarkToMarket(
                         f"[backtest] the mark-to-market memo served {memo[2]!r} at book "
@@ -917,11 +1056,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         f"bump the book generation (see BacktestAccount._touch_book)."
                     )
             return memo[2]
-        value = self._compute_open_positions_mtm()
-        self._mtm_memo = (self._book_gen, clock, value)
+        value = self._compute_open_positions_mtm(decision)
+        if decision:
+            self._mtm_memo_decision = (self._book_gen, clock, value)
+        else:
+            self._mtm_memo = (self._book_gen, clock, value)
         return value
 
-    def _compute_open_positions_mtm(self) -> float:
+    def _compute_open_positions_mtm(self, decision: bool = False) -> float:
         """The actual mark — see ``_open_positions_mtm`` (its memoising caller) for the contract.
 
         Signed value (long positions positive, short positions negative). A held symbol
@@ -939,16 +1081,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            px = self._equity_mark_price(p)
+            px = self._equity_mark_price(p, decision=decision)
             if px is not None:
                 total += p.qty * px
         return total + self._option_positions_mtm()
 
-    def _equity_mark_price(self, p: "_Position") -> Optional[float]:
+    def _equity_mark_price(self, p: "_Position", decision: bool = False) -> Optional[float]:
         """The price an equity position is marked at: this bar's close, else the last known
         close (forward-fill), else the entry price for a never-priced symbol. The ONE mark
         both the equity curve (``_compute_open_positions_mtm``) and the short borrow accrual
-        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows."""
+        (``accrue_short_borrow``) use, so a short is charged on the value the curve shows.
+
+        ``decision=True`` on an INTRADAY clock: the decision price (close of the latest bar that
+        has ended at the clock) first, then the last ENDED close however old; raises when none ever
+        ended. Never the clock bar's own close, never the entry price."""
+        if decision and getattr(self._price, "is_intraday", False):
+            px = self._price.decision_price(p.symbol, self._price.now())
+            if px is None:
+                # A HELD symbol with no decidable price: its last KNOWABLE close, however old (never
+                # the clock bar's own close, never the entry price).
+                px = self._price.last_ended_close(p.symbol, self._price.now())
+            if px is None:
+                raise ValueError(
+                    f"cannot mark held position {p.symbol} at {self._price.now()}: no bar has ever "
+                    f"ended for it")
+            return px
         px = self._price.close_at(p.symbol)
         if px is None:
             px = self._price.close_asof(p.symbol)  # forward-fill: last known close
@@ -983,7 +1140,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for one overnight under the no-orphaned-stock policy; charging it would move every
         stored naked-short-call option backtest, which the short-selling plan forbids (no
         behaviour change for current rules). Assigned short stock a run HOLDS
-        (``hold_assigned_stock``) is a real held short and is charged.
+        (``hold_assigned_stock``, or a member listed in ``hold_assigned_stock_tags``) is a real
+        held short and is charged. The member-scoped hold keeps this consistent by
+        construction: the per-assignment decision is what fills (or does not fill)
+        ``_pending_assignment_sells``, so a liquidated member's short stock is exempt and a
+        holding member's is charged, whichever members share the run.
         """
         session = as_of.date() if isinstance(as_of, datetime) else as_of
         if session == self._borrow_session:
@@ -1443,14 +1604,33 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # per-lot rescan below used to re-derive for EVERY held lot: that was O(held x orders)
         # on top of the two passes, and the dominant own-time in the options profile).
         owner_of: Dict[str, Any] = {}
+        owner_key: Dict[str, Tuple[int, float, int]] = {}
         # ONE pass: parent/single strategy+qty, the child legs (their strikes need the completed
         # parent set), and each held contract's owning order.
         for o in orders:
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             cs = getattr(o, "contract_symbol", None)
-            if cs is not None and cs not in owner_of:
-                owner_of[cs] = o
+            if cs is not None:
+                # WHICH ORDER OWNS A HELD CONTRACT. Not the FIRST order that names it: a DAY
+                # entry that expired unfilled leaves its (CANCELED/EXPIRED) legs on the book,
+                # and the engine re-selects the same contract the next day, so the first
+                # order was routinely a dead attempt. The held lot was then attributed to a
+                # parent with no live legs ("0 of 0 opening leg order(s)") and every
+                # defined-risk bound fell back -- 2,713 of 2,713 mark/settle calls on the
+                # stage-1 O_BULLCS winner (bt 79). The owner is the order that OPENED the lot:
+                # the latest FILLED opening order, else a still-pending opening order (the
+                # instant inside a fill), else any live order, else the first.
+                # "Latest" is EXPLICIT, never the order ``get_orders()`` happens to return:
+                # among filled opening orders the one filled last (fill time, then id); among
+                # the rest the lowest id (the earliest claim, as before).
+                rank = _owner_rank(o)
+                stamp = self._fill_stamp(o)
+                oid = o.id if o.id is not None else 0
+                key = (rank, stamp, oid) if rank == _OWNER_FILLED_OPEN else (rank, 0.0, -oid)
+                if cs not in owner_key or key > owner_key[cs]:
+                    owner_of[cs] = o
+                    owner_key[cs] = key
             if o.parent_order_id is None:
                 # multi-leg PARENT (no contract) or a single-leg option order.
                 if o.id is not None and getattr(o, "option_strategy", None):
@@ -1469,7 +1649,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             "strikes": [float(o.strike)] if o.strike is not None else [],
                             "multiplier": float(o.multiplier or 100),
                         }
-            elif getattr(o, "status", None) not in _NEVER_HELD_LEG_STATUSES:
+            elif (getattr(o, "status", None) not in _NEVER_HELD_LEG_STATUSES
+                  or _owner_rank(o) == _OWNER_FILLED_OPEN):
                 # A cancelled / rejected / expired / still-unfilled child leg is not part of
                 # the structure: counting it would make ``leg_orders`` disagree with the legs
                 # that exist and push a healthy group into the width fallback.
@@ -1549,9 +1730,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
-    def equity(self) -> float:
-        """Net liquidating value = cash + mark-to-market of open positions."""
-        return self._cash + self._open_positions_mtm()
+    def equity(self, *, close_mark: bool = False) -> float:
+        """Net liquidating value = cash + mark-to-market of open positions.
+
+        A DECISION-time read by default (what sizing, margin and gates see): on an intraday clock
+        the positions are marked at the decision price. ``close_mark=True`` is the recorded
+        value (the bar's close): the final equity of a run."""
+        return self._cash + self._open_positions_mtm(decision=not close_mark)
 
     def deployed_equity(self) -> float:
         """Equity the SIZER may see: ``min(cap, equity())``. Uncapped when no cap is set.
@@ -1761,6 +1946,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 out.add(cs)
         return out
 
+    def _fill_stamp(self, order) -> float:
+        """When ``order`` filled, as a sortable number (-inf when no fill time is recorded)."""
+        when = self._fill_dates.get(order.id) if order.id is not None else None
+        if when is None:
+            return float("-inf")
+        try:
+            return float(when.timestamp())
+        except (AttributeError, OverflowError, OSError, ValueError):
+            return float("-inf")
+
     def _lot_order(self, contract_symbol: str) -> Optional[TradingOrder]:
         """The option ``TradingOrder`` carrying a held lot's contract terms.
 
@@ -1939,11 +2134,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         o = self._lot_order(lot.contract_symbol)
         if o is None or o.expiry is None:
             return None
-        dte_days = (o.expiry - self._as_of_date()).days
-        price = bs_price(
-            float(spot), float(strike), dte_days, float(lot.last_iv), right,
-            r=self._bs_mark_rate(),
-        )
+        return self._bs_premium_clamped(
+            strike, spot, right, o.expiry, lot.last_iv, self._as_of_date(), self._bs_mark_rate())
+
+    def _bs_premium_clamped(self, strike, spot, right, expiry, iv, on_day, rate) -> Optional[float]:
+        """Black-Scholes premium of one contract on ``on_day`` at ``spot`` and ``iv``, clamped
+        into the no-arbitrage bounds -- THE ONE stage of the price fallback chain
+        (bar close -> BS(last-known iv) -> intrinsic/entry) that prices a contract from an iv.
+
+        Shared by the mark chain (``_bs_fallback_premium``: a held lot with no bar today) and
+        the FILL chain (``_screen_open_print``: an open print rejected as off-market is repriced
+        from the decision bar's iv at the fill day's open), so the two cannot disagree on how a
+        model premium is made. None on any degenerate input (``bs_price``'s contract); the caller
+        falls through to its next stage."""
+        dte_days = (expiry - on_day).days
+        price = bs_price(float(spot), float(strike), dte_days, float(iv), right, r=rate)
         if price is None:
             return None
         return self._clamp_premium_to_no_arb(price, strike, right == OptionRight.CALL, spot)
@@ -2474,9 +2679,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             multiplier=lot.multiplier,
         )
 
-    def _liquidate_stock_position(self, pos: "_Position") -> bool:
-        """Close a stock position at the current close; book cash + realise P&L via the ledger."""
-        px = self._price.close_at(pos.symbol)
+    def _liquidate_stock_position(
+        self, pos: "_Position", price: Optional[float] = None, comment: str = "margin_call_liquidation",
+    ) -> bool:
+        """Close a stock position at the current close (or at ``price``); book cash + realise P&L via the ledger.
+
+        ``price``/``comment`` serve the exchange-suspension close (``liquidate_suspended_positions``): the
+        last exchange close, and the reason the round-trip row carries.  The margin-call caller passes neither."""
+        px = price
+        if px is None:
+            px = self._price.close_at(pos.symbol)
         if px is None:
             px = self._price.close_asof(pos.symbol)
         if px is None:
@@ -2490,12 +2702,65 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Persist a synthetic FILLED closing order (the option-lot path already records one via
         # _record_option_expiry_close) so the equity jump shows up as a trade in
         # get_round_trip_trades/reports instead of an unexplained cash move.
-        self._record_stock_liquidation_close(pos.symbol, closed_qty, was_long, float(px))
-        logger.warning(
-            "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
-            "maintenance margin.", closed_qty, pos.symbol, float(px),
-        )
+        self._record_stock_liquidation_close(pos.symbol, closed_qty, was_long, float(px), comment=comment)
+        if comment == "margin_call_liquidation":
+            logger.warning(
+                "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
+                "maintenance margin.", closed_qty, pos.symbol, float(px),
+            )
         return True
+
+    def set_suspension_events(self, events: Any) -> None:
+        """Install the run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).  Empty (the
+        FMP source, or an Alpaca cache without the file) leaves every path exactly as it was."""
+        self._suspension_events = dict(events)
+
+    def liquidate_suspended_positions(self, as_of: datetime) -> bool:
+        """Close every held STOCK position whose symbol is suspended from its exchange on ``as_of``'s session, and cancel
+        every working order of such a symbol; True when the book changed.
+
+        The Alpaca feed has no bars while a symbol trades OTC (or after a delisting), so a position would be marked at its
+        stale last close for months and jump on relisting.  It is instead CLOSED at the last exchange close (``close_asof``:
+        no bar exists after ``last_session``, so that IS the last real close) on the first bar after the suspension starts,
+        comment ``suspension_liquidation`` (``delisting_liquidation`` when the symbol never comes back), synthetic fill, no
+        commission -- the same book-keeping as a margin-call stock close.  Working orders are cancelled so nothing waits on a
+        bar that never comes (a market entry would otherwise fill at the relisted open).  The rule is
+        ``suspension_events.symbols_to_liquidate`` / ``is_suspended`` (one pure function).  No events -> one truthiness check.
+
+        A held symbol with no close at all raises (a live number is never invented).  Option legs are keyed by contract
+        symbol and are not touched (options run on FMP only)."""
+        events = self._suspension_events
+        if not events:
+            return False
+        session = as_of.date()
+        changed = False
+        held = [p for p in self._positions.values() if p.qty != 0]
+        for sym in symbols_to_liquidate([p.symbol for p in held], session, events):
+            pos = self._positions[sym]
+            dated = self._price.close_asof_dated(sym)
+            if dated is None:
+                raise ValueError(f"[backtest] {sym} is suspended at {as_of} but has no last close to liquidate at")
+            px, bar_day = dated
+            last_session = max(last for last, _r in events[sym] if last < session)
+            if bar_day > last_session:
+                raise ValueError(f"[backtest] {sym} is suspended after {last_session} but the price source has a bar of {bar_day}: "
+                                 f"the suspension table does not match the cache it is run on (rebuild the cache)")
+            gone = any(last < session and resume is None for last, resume in events[sym])   # the event in effect never resumes
+            comment = "delisting_liquidation" if gone else "suspension_liquidation"
+            qty = pos.qty
+            self._liquidate_stock_position(pos, price=float(px), comment=comment)
+            logger.warning(
+                "[backtest] %s: closed STOCK %g x %s @ %.4f (last exchange close) -- suspended from its exchange on %s; "
+                "cash now $%.2f.", comment, qty, sym, float(px), session, self._cash)
+            changed = True
+        for o in list(self._active_orders()):
+            sym = o.symbol
+            if sym in events and is_suspended(sym, session, events):
+                self.cancel_order(o.id)
+                logger.warning("[backtest] suspension: cancelled working order %s (%s %g x %s) -- %s is suspended from its "
+                               "exchange on %s.", o.id, o.side, o.quantity, sym, sym, session)
+                changed = True
+        return changed
 
     def _record_stock_liquidation_close(
         self, symbol: str, qty: float, was_long: bool, px: float,
@@ -2541,6 +2806,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment=comment,
             created_at=as_of,
+            data={SYNTHETIC_FILL_KEY: True},
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -2646,6 +2912,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return self._cash
         return min(self._cash, self.deployed_equity())
 
+    def _plain_balance(self) -> float:
+        """The balance every SIZING / THRESHOLD / CEILING reader starts from: the deployed EQUITY.
+
+        ``ReadOnlyAccountInterface._plain_balance`` answers ``get_balance()``, which is EQUITY at
+        every live broker (a filled purchase leaves it unchanged) but CASH here (``get_balance``
+        above, which stays cash: the fill engine, the buying-power clamp and the cash ledger need
+        it). The expert math then subtracts the open positions again as ``used``
+        (``available = virtual - used``), so the backtest charged an open position TWICE where live
+        charges it once ("finding 6", fixed 2026-10-07: it moved every classic stock backtest).
+
+        This is the ONE seam: ``get_tradable_balance`` (the classic RM, the per-instrument cap, the
+        min-balance thresholds, risk_atr), ``get_option_tradable_balance`` (the option buying-power
+        gate), the margin ceiling and the capital mapping all start here, so the base is the same
+        quantity in both runtimes -- the account's equity (cash + marks), clamped by the equity cap
+        exactly as the snapshot's ``equity`` is. NOT ``true_equity()``: the cap is what may be spent.
+
+        Cash can still never go negative: the expert's actual-available clamp reads the snapshot's
+        ``buying_power`` (= cash, floored at 0), not this figure.
+        """
+        value = float(self.deployed_equity())
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) computed a non-finite "
+                             f"equity ({value!r}); cannot size with it")
+        return value
+
     def true_equity(self) -> Optional[float]:
         """The UNCAPPED equity: ``equity()`` = cash + mark-to-market. Overrides the interface.
 
@@ -2699,9 +2990,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for p in self._positions.values():
             if p.qty == 0:
                 continue
-            cur = self._price.close_at(p.symbol)
-            if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
-                cur = self._price.close_asof(p.symbol)
+            if getattr(self._price, "is_intraday", False):
+                # A decision-time read (rules / conditions read position.current_price): the
+                # price knowable now, not the clock bar's own close.
+                cur = self._price.decision_price(p.symbol, self._price.now())
+                if cur is None:
+                    cur = self._price.last_ended_close(p.symbol, self._price.now())
+                if cur is None:
+                    raise ValueError(
+                        f"cannot read held position {p.symbol} at {self._price.now()}: no bar has "
+                        f"ever ended for it")
+            else:
+                cur = self._price.close_at(p.symbol)
+                if cur is None:  # no exact bar this tick -> last-known close (not None/stale)
+                    cur = self._price.close_asof(p.symbol)
             out.append(
                 _AttrDict(
                     {
@@ -2877,11 +3179,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Single symbol -> float (raises if unavailable, per the live no-fallback rule).
         List -> {symbol: price-or-None}.
         """
+        if getattr(self._price, "is_intraday", False):
+            # INTRADAY clock: the price KNOWABLE at the decision (``AsOfPriceSource.decision_price``:
+            # the close of the latest bar that has ENDED), the same price the experts decide on,
+            # not the clock bar's own close (printed after the decision). Equity valuation reads
+            # ``close_at`` / ``close_asof`` directly and is unaffected.
+            now = self._price.now()
+            if isinstance(symbol_or_symbols, (list, tuple, set)):
+                return {s: self._price.decision_price(s, now) for s in symbol_or_symbols}
+            px = self._price.decision_price(symbol_or_symbols, now)
+            if px is None:
+                self.intraday_counters["undecidable_price_reads"] += 1
+                raise NoDecisionPrice(
+                    f"No backtest price for {symbol_or_symbols} at {now}: no bar has ended in the "
+                    f"current or the last finished session")
+            return px
         if isinstance(symbol_or_symbols, (list, tuple, set)):
             return {s: self._price.close_at(s) for s in symbol_or_symbols}
         px = self._price.close_at(symbol_or_symbols)
         if px is None:
-            raise ValueError(
+            raise NoDecisionPrice(
                 f"No backtest price for {symbol_or_symbols} at {self._price.now()}"
             )
         return px
@@ -3003,6 +3320,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             bar = self._bar_for_fill(o, as_of)
             if bar is None:
                 continue
+            if self._refuse_cross_session_market_entry(o, as_of):
+                filled = True   # the order was terminalised: the engine must roll the transaction
+                continue
             trig_hi, trig_lo = self._trigger_thresholds(o)
             if not (bar["high"] >= trig_hi or bar["low"] <= trig_lo):
                 continue
@@ -3018,7 +3338,37 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             filled = True
         # An option DAY-order expiry changed the book WITHOUT a fill — the engine must still roll
         # transactions (see the Step 0 note above), so report it as a book change too.
-        return filled or book_changed
+        # A market-type entry the fill screen refused is terminalised inside the loop above.
+        return filled or book_changed or self.__dict__.pop("_fill_book_changed", False)
+
+    def _refuse_cross_session_market_entry(self, order, as_of) -> bool:
+        """INTRADAY clock: a MARKET order that OPENS an equity position fills at the open of the
+        next bar after the decision. For a thin symbol that bar can be in a LATER session (a
+        decision on Tuesday from Monday's last print would fill at Friday's open, stamped Tuesday,
+        with its TP/SL then tested on bars before the fill). A broker's DAY order dies at the close;
+        so this terminalises such an entry (EXPIRED, counted in
+        ``intraday_counters["entries_refused_next_bar_other_session"]``) instead of filling it.
+        Closing orders are never refused. Returns True when the order was terminalised."""
+        if not getattr(self._price, "is_intraday", False):
+            return False
+        if order.order_type != OrderType.MARKET or getattr(order, "asset_class", None) == AssetClass.OPTION:
+            return False
+        nxt = self._price.next_bar_date(order.symbol, as_of)
+        if nxt is None or nxt.date() == as_of.date():
+            return False
+        pos = self._positions.get(order.symbol)
+        sign = 1 if order.side == OrderDirection.BUY else -1
+        if pos is not None and pos.qty != 0 and (pos.qty > 0) != (sign > 0):
+            return False                    # reduces an existing position: a closing order
+        order.status = OrderStatus.EXPIRED
+        order.comment = (f"{(order.comment or '')} | day order expired: next bar {nxt} is not in the "
+                         f"decision's session").strip(" |")
+        update_instance(order)
+        self.invalidate_order_cache()
+        self.intraday_counters["entries_refused_next_bar_other_session"] += 1
+        logger.warning("[backtest] equity market entry EXPIRED: %s %s decided %s, its next bar is %s "
+                       "(another session)", order.side, order.symbol, as_of, nxt)
+        return True
 
     def _expire_stale_option_limits(self, as_of) -> bool:
         """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
@@ -3190,7 +3540,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 fill_day, k_fill, underlying, k_decided / k_fill)
         return True
 
-    def _option_fill_price(self, order, as_of) -> Optional[float]:
+    def _option_fill_price(self, order, as_of, _force_fallback: Optional[str] = None) -> Optional[float]:
         """Premium per share for an option order on its fill bar, per ``fill_model``.
 
         The fill BAR is chosen exactly like the equity branch (``_bar_for_fill``): the
@@ -3255,6 +3605,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
                 as_of_bar = self._option_bar(order.contract_symbol, as_of_day)
+        # ISOLATED OFF-MARKET OPEN: the open is the one print a daily bar cannot timestamp, and
+        # a thin contract opens on a stale or garbage trade. Screened against the contract's
+        # own session evidence; a rejected print is repriced through the mark chain's BS stage
+        # or the order is refused -- never filled at it (``_screen_open_print``).
+        if not same_bar:
+            screened = self._screen_open_print(order, px, fill_day, bar, as_of_bar, as_of,
+                                               force_fallback=_force_fallback)
+            if screened is None:
+                self._expire_refused_market_entry(order)
+                return None
+            px = screened
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
@@ -3522,6 +3883,253 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         return None
 
+    def _count_fill_print(self, kind: str, order, fill_day, example: str) -> bool:
+        """Record one screened fill print (``kind``: ``replaced`` / ``refused`` /
+        ``unverified``), once per (order, fill day): an order that retries on the same bar
+        must not count twice. Returns True when this was the first sight. NEVER SILENT: the
+        counters are published in the results, the first three examples are kept, and a
+        rejection is warned."""
+        seen = self.__dict__.setdefault("_fill_print_seen", set())
+        key = (kind, getattr(order, "id", None) or getattr(order, "contract_symbol", None),
+               fill_day)
+        if key in seen:
+            return False
+        seen.add(key)
+        c = self._integrity()
+        c[f"option_fill_prints_{kind}"] += 1
+        if kind == "replaced" and getattr(order, "id", None) is not None:
+            self.__dict__.setdefault("_replaced_print_days", {})[order.id] = fill_day
+        if kind != "unverified":
+            c["option_fill_prints_rejected"] += 1
+            logger.warning("[backtest] option fill print %s: %s", kind.upper(), example)
+            if len(c["option_fill_print_examples"]) < 3:
+                c["option_fill_print_examples"].append(f"{kind}: {example}")
+        return True
+
+    def _screen_open_print(self, order, px: float, fill_day, bar: dict, as_of_bar,
+                           as_of, force_fallback: Optional[str] = None) -> Optional[float]:
+        """The premium an option fill may be priced from, given its OPEN print ``px``.
+
+        ``px`` when it is consistent with the contract's own session evidence; a replacement
+        when it is not; None -- REFUSE, the order does not fill -- when an OPENING order has no
+        defensible replacement. A CLOSING order is never refused here (see below).
+
+        WHY. A daily bar has no timestamp on its open, and a thin contract's open is routinely
+        an isolated trade far from where the contract then traded (LRCX 2022-10-12: the 370 call
+        "opened" at 5.06 inside a 5.06-13.35 session while the 385 opened at 9.87, so the bull
+        call spread filled at a NEGATIVE debit of 4.43; CSCO 2023-12-01: a 50 call opened at 0.10
+        against a prior bid of 0.43 and a session high of 0.44). The fill model prices every leg
+        at its OWN open, so one such print is a free option.
+
+        THE TEST (see ``_FILL_PRINT_REL_TOL`` for the measurement). Two references, both the
+        contract repriced with Black-Scholes at the UNDERLYING'S OPEN on the fill day: one at the
+        iv the fill day's own CLOSE implies (``bar['iv']``), one at the DECISION bar's iv
+        (``as_of_bar['iv']``). A real open sits between them or near them -- the iv drifted across
+        the session -- while an isolated print sits outside both. The print is rejected when it
+        lies further than ``max(REL x reference, ABS)`` outside their interval.
+
+        THE CLOSE-IMPLIED IV IS EVIDENCE FOR THAT DECISION ONLY. It never feeds a price: the
+        replacement below is built from the DECISION bar's iv alone, which is known before the
+        session opens (a fill priced from the session's own close would be look-ahead).
+
+        THE REPLACEMENT is the decision-bar-iv reference (``_bs_premium_clamped``, the mark
+        chain's BS stage), made CONSERVATIVE against the contract's own session range: a BUY
+        never fills below the session's low, a SELL never above its high (``_adverse_clamp``). An
+        OPENING order whose session has no usable [low, high], or that has no trusted decision-bar
+        iv, is refused (a market-type one is expired like a DAY order, once).
+
+        A CLOSING ORDER IS NEVER STUCK. With no trusted decision-bar iv it falls back through the
+        mark chain's next stage, INTRINSIC at the underlying's open (and takes the BS price
+        unclamped when the session range is unusable); counted ``option_close_prints_fallback``.
+        ``force_fallback`` ('bs' | 'intrinsic') is the closing-STRUCTURE path
+        (``_reprice_closing_legs``): the print is not judged, the leg is priced from that stage.
+
+        NOT JUDGED (counted ``unverified``, print accepted): no reference could be built at all.
+        Not applied under ``same_bar_close`` (the caller): the print IS the session's close.
+        """
+        strike = getattr(order, "strike", None)
+        if strike is None:
+            strike = bar.get("strike")
+        right = getattr(order, "option_type", None)
+        if right is None:
+            raw = bar.get("option_type")
+            right = (OptionRight.CALL if str(raw).lower() == "call" else
+                     OptionRight.PUT if str(raw).lower() == "put" else None)
+        expiry = getattr(order, "expiry", None)
+        if expiry is None and bar.get("expiry"):
+            expiry = date.fromisoformat(str(bar["expiry"])[:10])
+        contract = getattr(order, "contract_symbol", None)
+        closing = "close" in str(getattr(order, "position_intent", None) or "").lower()
+        is_buy = getattr(order, "side", None) == OrderDirection.BUY
+        label = (f"{fill_day} {getattr(order, 'side', None)} {contract}: open {px:.2f}")
+        underlying = getattr(order, "underlying_symbol", None) or order.symbol
+        spot_bar = self._price.bar_at(underlying, fill_day)
+        rate_source = self.options_risk_free_rate_source()
+        if (strike is None or right is None or expiry is None or spot_bar is None
+                or rate_source is None):
+            self._count_fill_print("unverified", order, fill_day,
+                                   f"{label} (no terms / underlying open / rate to judge it)")
+            return px
+        spot = self.option_basis_price(underlying, float(spot_bar["open"]), fill_day)
+        rate = rate_source.rate_on(fill_day)
+        as_of_day = as_of.date() if hasattr(as_of, "date") else as_of
+        if as_of_bar is None:
+            as_of_bar = self._option_bar(contract, as_of_day)
+
+        def _trusted_iv(day_bar, day, day_rate) -> Optional[float]:
+            """A bar's iv, but only when it REPRODUCES that bar's own close at the underlying's
+            close of its day (the way a real inversion does). An iv in another share basis (the
+            sqlite store inverts against the split-adjusted FMP close), carried over from a
+            different snapshot, or simply inconsistent with the print cannot be repriced at
+            today's open without making a wrong reference -- it is no evidence, so unused."""
+            if not day_bar or day_bar.get("iv") is None or day_bar.get("close") is None:
+                return None
+            u_bar = self._price.bar_at(underlying, day)
+            if u_bar is None:
+                return None
+            u_close = self.option_basis_price(underlying, float(u_bar["close"]), day)
+            model = self._bs_premium_clamped(strike, u_close, right, expiry, day_bar["iv"],
+                                             day, day_rate)
+            close_px = float(day_bar["close"])
+            if model is None or abs(model - close_px) > max(0.03 * close_px, 0.05):
+                return None
+            return float(day_bar["iv"])
+
+        # EVIDENCE ONLY (accept / reject): the fill day's close-implied iv. NEVER a price.
+        close_iv = _trusted_iv(bar, fill_day, rate)
+        # THE PRICE SOURCE: the decision bar's iv, known before the session opens.
+        prior_iv = _trusted_iv(as_of_bar, as_of_day, rate_source.rate_on(as_of_day))
+        close_ref = prior_ref = None
+        if close_iv is not None:
+            close_ref = self._bs_premium_clamped(strike, spot, right, expiry, close_iv,
+                                                 fill_day, rate)
+        if prior_iv is not None:
+            prior_ref = self._bs_premium_clamped(strike, spot, right, expiry, prior_iv,
+                                                 fill_day, rate)
+        intrinsic = self._no_arb_premium_bounds(strike, right == OptionRight.CALL, spot)[0]
+
+        def _positive(raw) -> Optional[float]:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) and value > 0 else None
+
+        def _fallback(reason: str) -> Optional[float]:
+            """The replacement price per the chain above, or None (refuse an open)."""
+            if force_fallback == "intrinsic":
+                base, source = intrinsic, "intrinsic at the underlying's open"
+            elif prior_ref is None and closing:
+                base, source = intrinsic, "intrinsic at the underlying's open"
+                if is_buy:
+                    # A BUY-BACK of a short must not ignore time value: with no prior-iv BS to
+                    # price it, the adverse stage is the LAST TRADED price (the decision bar's
+                    # close), never below intrinsic.
+                    last = _positive(as_of_bar.get("close")) if as_of_bar else None
+                    if last is not None:
+                        base = max(intrinsic, last)
+                        source = ("last traded price (decision-bar close), never below intrinsic "
+                                  "-- a buy-back keeps its time value")
+                        self._integrity()["option_close_buyback_last_price"] += 1
+            elif prior_ref is not None:
+                base, source = prior_ref, "BS at the decision-bar iv, the underlying's open"
+            else:
+                return None
+            clamped = self._adverse_clamp(base, is_buy, bar)
+            if clamped is None:
+                if not closing:
+                    return None
+                clamped = base            # a close never needs the range to be priced
+            first = self._count_fill_print(
+                "replaced", order, fill_day,
+                f"{reason} -> repriced to {clamped:.2f} ({source}"
+                + ("" if clamped == base else f", clamped into the session range from {base:.2f}")
+                + ")")
+            if closing and first and (prior_ref is None or force_fallback == "intrinsic"):
+                self._integrity()["option_close_prints_fallback"] += 1
+            return clamped
+
+        if force_fallback is not None:
+            return _fallback(f"{label} (closing structure repriced from the {force_fallback} stage)")
+
+        refs = [r for r in (close_ref, prior_ref) if r is not None]
+        if not refs:
+            self._count_fill_print("unverified", order, fill_day,
+                                   f"{label} (no iv on the fill or decision bar to judge it)")
+            return px
+        lo_ref, hi_ref = min(refs), max(refs)
+        close = bar.get("close")
+        scale = max(lo_ref, 0.5 * float(close)) if close is not None else lo_ref
+        tol = max(_FILL_PRINT_REL_TOL * scale, _FILL_PRINT_ABS_TOL)
+        dist = lo_ref - px if px < lo_ref else (px - hi_ref if px > hi_ref else 0.0)
+        if dist <= tol:
+            return px
+        evidence = (f"{label} vs session-consistent range [{lo_ref:.2f}, {hi_ref:.2f}] "
+                    f"(tolerance {tol:.2f}; session low/high {bar.get('low')}/{bar.get('high')}, "
+                    f"close {close})")
+        replacement = _fallback(evidence)
+        if replacement is None:
+            why = ("no trusted decision-bar iv to reprice from" if prior_ref is None
+                   else "no usable session [low, high] to bound the replacement")
+            self._count_fill_print("refused", order, fill_day, f"{evidence} -> {why}; order refused")
+            return None
+        return replacement
+
+    @staticmethod
+    def _adverse_clamp(price: float, is_buy: bool, bar: dict) -> Optional[float]:
+        """``price`` made conservative against the contract's own session: a BUY never fills
+        below the session's low, a SELL never above its high (so a model price outside the range
+        takes the adverse end, and one inside it is untouched). None when the bar carries no
+        usable ``[low, high]`` (missing, non-finite, or low > high)."""
+        low, high = bar.get("low"), bar.get("high")
+        try:
+            low, high = float(low), float(high)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(low) and math.isfinite(high)) or low > high:
+            return None
+        return max(price, low) if is_buy else min(price, high)
+
+    def _expire_refused_market_entry(self, order) -> bool:
+        """A MARKET-type OPENING entry whose fill was refused expires like a DAY order, once.
+
+        The DAY sweep (``_expire_stale_option_limits``) ages limit orders only and a market
+        order is never aged: left alone, a refused one would retry every bar on a decision made
+        sessions ago. The broker would have filled it or rejected it that day; so this
+        terminalises it (and, for a multi-leg parent, its legs), counted
+        ``option_market_entries_expired``. Limit orders are untouched (the sweep owns them);
+        so are closing orders. Returns True when something was expired."""
+        entry = order
+        if getattr(order, "parent_order_id", None) is not None:
+            entry = self.get_order(order.parent_order_id) or order
+        if entry.order_type != OrderType.MARKET:
+            return False
+        if entry.contract_symbol is not None:
+            if "close" in str(getattr(entry, "position_intent", None) or "").lower():
+                return False
+            members = [entry]
+        else:
+            members = [entry] + [o for o in self.get_orders() if o.parent_order_id == entry.id
+                                 and o.status not in OrderStatus.get_terminal_statuses()
+                                 and o.status != OrderStatus.FILLED]
+            if self._multi_leg_is_closing(entry, members[1:]):
+                return False
+        for o in members:
+            if o.status in OrderStatus.get_terminal_statuses() or o.status == OrderStatus.FILLED:
+                continue
+            o.status = OrderStatus.EXPIRED
+            o.comment = f"{(o.comment or '')} | market entry refused by the fill screen".strip(" |")
+            update_instance(o)
+            self._option_order_day.pop(o.id, None)
+        self._integrity()["option_market_entries_expired"] += 1
+        self._fill_book_changed = True
+        self.invalidate_order_cache()
+        self._bump_option_memo()
+        logger.warning("[backtest] market-type option entry EXPIRED after a refused fill: %s %s",
+                       getattr(entry, "option_strategy", None),
+                       getattr(entry, "contract_symbol", None))
+        return True
+
     def _arb_fill_reject_reason(
         self, order, fill_px: float, fill_day, same_bar: bool, bar: dict
     ) -> Optional[str]:
@@ -3537,7 +4145,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             intrinsic = max(0, spot-strike) for a call / max(0, strike-spot) for a put.
             Nobody sells an option below its immediate-exercise value; a lower print is
             stale/indicative junk. (Applies to sell_to_open too — a junk-cheap CREDIT is
-            the same bad data and settles at the real intrinsic later.)
+            the same bad data and settles at the real intrinsic later.) The UPPER bound
+            below binds an ENTRY as well (premium > spot for a call, > strike for a put:
+            a guaranteed loss for a buy, a free gift for a sell).
           * EXIT (closing intent): premium > spot + tol for a CALL (a call can never cost
             more than the stock) or premium > strike + tol for a PUT (a put can never be
             worth more than the strike) — impossible premiums. A below-intrinsic CLOSE is
@@ -3572,7 +4182,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # (``_no_arb_premium_bounds`` with spot=None is exactly the spot-free bound; the
         # bounds themselves live THERE, shared with the mark/settlement clamps.)
         _, upper_spotless = self._no_arb_premium_bounds(strike, is_call, None)
-        if is_close and upper_spotless is not None and fill_px > upper_spotless + _ARB_FILL_TOLERANCE:
+        # The upper bound binds an OPENING fill exactly as it binds a closing one (an entry
+        # premium above the strike for a put, or above the stock for a call below, is as
+        # impossible as an exit at it): a buy filled there is a guaranteed loss, a sell a
+        # free gift -- either way a junk print, not a market.
+        if upper_spotless is not None and fill_px > upper_spotless + _ARB_FILL_TOLERANCE:
             return (
                 f"put premium {fill_px:.4f} exceeds strike {strike:.2f} + tolerance "
                 f"{_ARB_FILL_TOLERANCE} (a put can never be worth more than its strike)"
@@ -3601,6 +4215,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
                 )
             return None
+        if is_call and fill_px > upper + _ARB_FILL_TOLERANCE:
+            return (
+                f"call premium {fill_px:.4f} exceeds spot {spot:.2f} + tolerance "
+                f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
+            )
         if fill_px < intrinsic - _ARB_FILL_TOLERANCE:
             return (
                 f"premium {fill_px:.4f} is below intrinsic {intrinsic:.4f} - tolerance "
@@ -3625,6 +4244,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             and o.status not in terminal
             and o.status != OrderStatus.FILLED
         ]
+
+    def _option_fill_cash(self) -> float:
+        """Cash a DEBIT option fill may spend: the ledger cash LESS the collateral reserved by
+        open credit structures (and the excess reserved by an unbalanced debit one) -- the
+        reserve pool the entry gates already read. Debits paid plus collateral reserved can
+        never exceed the cash the account holds; the fill-time cap read the raw ledger cash and
+        so could spend a cash-secured put's collateral. The pool is a lower bound when one of
+        its rows is unreadable (``reserved_option_buying_power``), which can only over-state
+        the cash."""
+        return self._cash - self.reserved_option_buying_power()
 
     def _cap_single_leg_option_entry(self, order, fill_px: float) -> bool:
         """Cash-secured cap for a lone LONG (debit) single-leg option ENTRY.
@@ -3651,14 +4280,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if per_contract <= 0:
             return True
         cost = qty * fill_px * multiplier + commission
-        if cost <= self._cash + 1e-6:
+        cash = self._option_fill_cash()
+        if cost <= cash + 1e-6:
             return True  # affordable at full size -> no cap
-        affordable = int(self._cash // per_contract)
+        affordable = int(cash // per_contract) if cash > 0 else 0
         if affordable < 1:
             logger.error(
                 "BACKTEST option cash-secured: LONG %s %g @ %.4f (cost $%.2f) exceeds cash "
                 "$%.2f -> entry NOT opened.",
-                order.contract_symbol, qty, fill_px, cost, self._cash,
+                order.contract_symbol, qty, fill_px, cost, cash,
             )
             order.status = OrderStatus.CANCELED
             order.quantity = 0
@@ -3669,7 +4299,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         logger.error(
             "BACKTEST option cash-secured: LONG %s sized %g @ %.4f exceeds cash $%.2f -> "
             "capping to %d contract(s).",
-            order.contract_symbol, qty, fill_px, self._cash, affordable,
+            order.contract_symbol, qty, fill_px, cash, affordable,
         )
         order.quantity = float(affordable)
         self._bump_option_memo()  # in-place quantity mutation: refresh the F6 memos
@@ -3752,6 +4382,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for leg, px in priced:
             ratio = abs(float(leg.quantity or 0.0)) / structures
             net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+        # --- NO-ARBITRAGE BOUNDS OF THE STRUCTURE'S NET --------------------------------
+        # Whatever each leg's own print says, the structure cannot trade outside the value
+        # range of its legs: a debit vertical's debit lies in (0, width), a credit's in
+        # (0, width) the other way. A net outside it (LRCX: a debit of -4.43, i.e. paid to
+        # open) is two inconsistent prints, never a market, and is not filled.
+        bound_reason = self._structure_net_bound_reason(parent, priced, structures, net_per_share)
+        if bound_reason is not None:
+            if self._multi_leg_is_closing(parent, [leg for leg, _ in priced]):
+                # A CLOSE IS NEVER BLOCKED by the bound check: its legs are repriced through
+                # the mark chain (BS at the decision-bar iv, then intrinsic), counted, and the
+                # structure closes at the first stage whose net is inside the bounds.
+                priced = self._reprice_closing_legs(parent, priced, structures, as_of, bound_reason)
+                net_per_share = 0.0
+                for leg, px in priced:
+                    ratio = abs(float(leg.quantity)) / structures
+                    net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+            else:
+                self._count_structure_refusal(parent, as_of, bound_reason)
+                self._expire_refused_market_entry(parent)
+                return
         limit = getattr(parent, "limit_price", None)
         if limit is not None and net_per_share > float(limit) + _NET_LIMIT_TOLERANCE:
             logger.warning(
@@ -3794,8 +4444,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # + per-leg commission for one structure's worth of legs (flat charge per leg fill).
         per_structure_cost = debit_per_structure + commission * len(priced)
         capped = structures
+        fill_cash = self._option_fill_cash()
         if per_structure_cost > 0:
-            affordable = int((self._cash) // per_structure_cost)
+            affordable = int(fill_cash // per_structure_cost) if fill_cash > 0 else 0
             if affordable < structures:
                 if affordable < 1:
                     # Not even one structure affordable -> the combo does NOT open this bar. Cancel
@@ -3803,7 +4454,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     logger.error(
                         "BACKTEST option cash-secured: DEBIT combo %s per-structure cost $%.2f "
                         "exceeds cash $%.2f -> entry NOT opened.",
-                        getattr(parent, "option_strategy", None), per_structure_cost, self._cash,
+                        getattr(parent, "option_strategy", None), per_structure_cost, fill_cash,
                     )
                     for leg, _ in priced:
                         leg.status = OrderStatus.CANCELED
@@ -3818,7 +4469,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "BACKTEST option cash-secured: DEBIT combo %s sized %g structures @ $%.2f "
                     "each exceeds cash $%.2f -> capping to %d.",
                     getattr(parent, "option_strategy", None), structures, per_structure_cost,
-                    self._cash, affordable,
+                    fill_cash, affordable,
                 )
                 capped = float(affordable)
 
@@ -3833,6 +4484,125 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
         self._apply_multi_leg_fill(parent, priced, as_of)
+
+    def _reprice_closing_legs(self, parent, priced, structures: float, as_of, reason: str):
+        """The closing structure's legs repriced because its print net broke the bounds.
+
+        Stage 1: every leg from BS at the decision-bar iv (clamped adverse to its session);
+        stage 2: every leg from INTRINSIC at the underlying's open (whose net is the payoff at
+        the spot, inside the bounds by construction). The first stage whose net is inside the
+        bounds wins; failing both, the last stage still closes (a close is never stuck).
+        Counted once per parent per day in ``option_close_structure_fallbacks``."""
+        legs = [leg for leg, _ in priced]
+        chosen = priced
+        for mode in ("bs", "intrinsic"):
+            attempt = []
+            for leg in legs:
+                px = self._option_fill_price(leg, as_of, _force_fallback=mode)
+                if px is None:
+                    attempt = None
+                    break
+                attempt.append((leg, px))
+            if attempt is None:
+                continue
+            chosen = attempt
+            net = 0.0
+            for leg, px in attempt:
+                ratio = abs(float(leg.quantity)) / structures
+                net += (px if leg.side == OrderDirection.BUY else -px) * ratio
+            if self._structure_net_bound_reason(parent, attempt, structures, net) is None:
+                break
+        day = as_of.date() if hasattr(as_of, "date") else as_of
+        seen = self.__dict__.setdefault("_close_structure_fallback_seen", set())
+        if (getattr(parent, "id", None), day) not in seen:
+            seen.add((getattr(parent, "id", None), day))
+            self._integrity()["option_close_structure_fallbacks"] += 1
+            logger.warning("[backtest] closing %s repriced through the mark chain instead of "
+                           "refused: %s", getattr(parent, "option_strategy", None), reason)
+        return chosen
+
+    #: Dollars of slack when testing a structure's net against its value bounds. An OPENING
+    #: net must lie STRICTLY inside them; a net within this of an edge is on it.
+    _STRUCTURE_BOUND_EPS = 1e-6
+
+    def _structure_net_bound_reason(self, parent, priced, structures: float,
+                                    net_per_share: float) -> Optional[str]:
+        """Why a multi-leg fill's NET per structure breaks the structure's no-arbitrage value
+        range, else None.
+
+        ``net_per_share`` is the engine's one sign convention (+debit / -credit) per structure
+        per share; the range is ``option_payoff.position_value_bounds`` of the traded legs (the
+        SAME function the mark clamp, the expiry clamp and the entry ``max_loss`` stamp read),
+        for ONE structure. An OPENING net must be strictly inside ``(lo, hi)``: at or below
+        ``lo`` it is paid at least the worst the position can ever owe, at or above ``hi`` it
+        pays at least the best it can ever collect. A CLOSE is checked inclusively: a deep
+        in-the-money vertical legitimately closes at its full width with the spread modelled at
+        zero. The range is on the LEGS' own sides, so closing a bought vertical is checked as
+        the sold vertical it is. An unbounded side is no bound.
+
+        Legs that cannot be expressed (no strike / right / size) or that ``validate_legs``
+        refuses leave the net UNVERIFIED -- counted, never guessed."""
+        expiries = {getattr(leg, "expiry", None) for leg, _px in priced}
+        if len(expiries) > 1:
+            # A calendar / diagonal / PMCC roll: the legs' expiry values are not one payoff
+            # (the far leg still carries time value), so there is no single value range to
+            # bound the net by. Counted, not judged.
+            self._count_fill_print("unverified", parent, self._as_of_date(),
+                                   f"{getattr(parent, 'option_strategy', None)}: legs span "
+                                   f"{len(expiries)} expiries")
+            return None
+        legs = []
+        for leg, _px in priced:
+            if (leg.strike is None or leg.option_type not in (OptionRight.CALL, OptionRight.PUT)
+                    or not leg.quantity
+                    or leg.side not in (OrderDirection.BUY, OrderDirection.SELL)):
+                self._count_fill_print("unverified", parent, self._as_of_date(),
+                                       f"{getattr(parent, 'option_strategy', None)}: a leg has "
+                                       f"no strike/right/size; the net cannot be bounded")
+                return None
+            legs.append(PayoffLeg(
+                kind=("call" if leg.option_type == OptionRight.CALL else "put"), side=leg.side,
+                premium=0.0, strike=float(leg.strike),
+                ratio=abs(float(leg.quantity)) / structures,
+                multiplier=float(leg.multiplier or 100)))
+        try:
+            lo, hi = position_value_bounds(legs)
+        except ValueError as e:
+            self._count_fill_print("unverified", parent, self._as_of_date(),
+                                   f"{getattr(parent, 'option_strategy', None)}: {e}")
+            return None
+        net = net_per_share * float(priced[0][0].multiplier or 100)
+        eps = self._STRUCTURE_BOUND_EPS
+        closing = self._multi_leg_is_closing(parent, [leg for leg, _ in priced])
+        below = net < lo - eps if closing else net <= lo + eps
+        above = net > hi + eps if closing else net >= hi - eps
+        if not (below or above):
+            return None
+        rel = ("at or below the worst it can ever be worth" if below
+               else "at or above the best it can ever be worth")
+        return (f"net {net:+.2f} per structure ({net_per_share:+.4f}/share) is {rel}: the "
+                f"structure's value range is [{lo:.2f}, {hi:.2f}] "
+                f"({'closing' if closing else 'opening'}; legs "
+                + ", ".join(f"{leg.side.value if hasattr(leg.side, 'value') else leg.side} "
+                            f"{leg.strike:g}{'C' if leg.option_type == OptionRight.CALL else 'P'}"
+                            f"@{px:.2f}" for leg, px in priced) + ")")
+
+    def _count_structure_refusal(self, parent, as_of, reason: str) -> None:
+        """One multi-leg fill refused for its net (once per parent order per day)."""
+        day = as_of.date() if hasattr(as_of, "date") else as_of
+        seen = self.__dict__.setdefault("_structure_refusal_seen", set())
+        key = (getattr(parent, "id", None), day)
+        if key in seen:
+            return
+        seen.add(key)
+        c = self._integrity()
+        c["option_structure_fills_refused"] += 1
+        text = f"{day} {getattr(parent, 'option_strategy', None)}: {reason}"
+        if len(c["option_structure_fill_examples"]) < 3:
+            c["option_structure_fill_examples"].append(text)
+        logger.warning("[backtest] multi-leg fill REFUSED, the net breaks the structure's "
+                       "no-arbitrage bounds: %s. The order stays pending and retries the next "
+                       "bar.", text)
 
     @staticmethod
     def _multi_leg_is_closing(parent, legs) -> bool:
@@ -4315,7 +5085,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # a scaled/partial exit, a multi-fill open still held at run end -- was undercharged
             # in the trade rows while the equity curve had already paid the real amount. A
             # one-sided error: it can only ever flatter the reported P&L, never penalise it.
-            comm = commission * (len(entries) + len(exits))
+            # ...but ONLY the fills that actually paid one. Settlement / assignment / forced
+            # liquidation records (``_record_option_expiry_close``, ``_open_assigned_stock_
+            # transaction``, ``_record_stock_liquidation_close``) are book-keeping rows written
+            # AFTER cash moved without a commission; they carry ``SYNTHETIC_FILL_KEY`` in
+            # ``order.data``. Charging them overcharged the rows against the cash ledger.
+            comm = commission * sum(
+                1 for o in (*entries, *exits)
+                if not (isinstance(o.data, dict) and o.data.get(SYNTHETIC_FILL_KEY)))
 
             # Options quote premium PER SHARE but a contract controls ``multiplier`` (100)
             # shares, so realised option P&L scales by the contract multiplier. The NULL fallback
@@ -4419,6 +5196,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 row["entry_price"] = entry_px * k
                 row["exit_price"] = exit_px * k
                 row["size"] = size / k
+            # The protective levels as they stood AFTER the entry fill (what the bracket test
+            # enforced) next to the pre-fill ones: equity rows of a transaction that carried
+            # levels at its fill, nothing else (option rows and level-less rows keep their shape).
+            rb = self.__dict__.get("_fill_rebase_records", {}).get(txn_id)
+            if rb is not None and not _is_option_row(opening):
+                row["stop_loss_at_fill"] = rb["stop_loss"]
+                row["take_profit_at_fill"] = rb["take_profit"]
+                row["stop_loss_pre_fill"] = rb["stop_loss_pre_fill"]
+                row["take_profit_pre_fill"] = rb["take_profit_pre_fill"]
+                row["fill_reference_price"] = rb["reference_price"]
             trades.append(row)
             if option_records and _is_option_row(opening):
                 option_carriers[id(row)] = (
@@ -4442,6 +5229,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         EQUITY ROWS ONLY. Option rows read their recorded ``exit_record`` trigger instead: a
         close_option ticket is a limit order with no stop, so this guess labelled every option
         close -- stop-loss and DTE exits included -- ``take_profit``."""
+        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation"):
+            return exit_order.comment                   # the exchange-suspension close names itself
         tp = exit_order.limit_price
         sl = exit_order.stop_price
         if tp is not None and sl is not None:
@@ -4534,6 +5323,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     #: Class default so a double built with ``__new__`` (no ``__init__``) is the identity too.
     _split_basis = None
+    _suspension_events: Dict[str, Any] = {}
     #: Same, for ``records_option_trades``: a ``__new__`` double records fully, like a fixture.
     _option_trade_records = True
 
@@ -5211,6 +6001,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # method left). ``submit_option_order`` is concrete in the base mixin and is NOT
     # overridden; ``get_iv_rank`` IS (see below — the base reads a live-only SQL table).
     # ======================================================================
+    def intraday_volume_so_far(self, symbol: str):
+        """``(applicable, volume)``: the volume traded in the decision's own session so far (the sum
+        of the intraday bars that have ENDED at the clock), for conditions that compare "today"
+        with a baseline of finished sessions. ``(False, None)`` on a daily clock, where the clock
+        bar IS the finished day. A live account has no such method (it reads the forming bar)."""
+        if not getattr(self._price, "is_intraday", False):
+            return False, None
+        return True, self._price.volume_so_far(symbol, self._price.now())
+
     def _as_of_date(self):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
         return self._price.now().date()
@@ -5244,6 +6043,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return {**c,
                 "option_clamp_fallback_examples": list(c["option_clamp_fallback_examples"]),
                 "option_mark_print_examples": list(c["option_mark_print_examples"]),
+                "option_fill_print_examples": list(c["option_fill_print_examples"]),
+                "option_structure_fill_examples": list(c["option_structure_fill_examples"]),
                 "option_ledger_mismatches": {
             "count": c["option_ledger_mismatches"]["count"],
             "examples": [dict(e) for e in c["option_ledger_mismatches"]["examples"]]}}
@@ -5816,6 +6617,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         shares: int = 0,
         share_price: Optional[float] = None,
         trigger: OptionCloseReason,
+        hold_assigned: Optional[bool] = None,
+        assigned_entry_tag: Optional[int] = None,
+        outcome: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Settle a held single-leg option position at expiry (Task 7).
 
@@ -5824,8 +6628,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``exit_record`` and, when this settlement flattens the transaction, is its
         ``close_reason`` -- the same values the live OCC-activity reconciler writes.
 
-        Closes the option leg's OPENED transaction at ``close_premium`` (per-share intrinsic
-        value, or 0 for worthless) and zeroes its lot in the option ledger, then — for an
+        Closes the option leg's OPENED transaction at ``close_premium`` (0 for worthless AND
+        for a physical assignment -- the intrinsic is carried by the share leg at the strike;
+        only a long sell-to-close and a forced liquidation pass a non-zero premium) and zeroes its lot in the option ledger, then — for an
         exercise/assignment — converts to shares in the EQUITY ledger settled at ``share_price``
         (the STRIKE). The option premium paid/collected at entry is already in cash, so the
         conversion only moves cash for the share leg (qty x strike); the resulting equity
@@ -5841,12 +6646,43 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Each leg is settled INDEPENDENTLY here (its own lot -> its own share conversion + its own
         closing fill for round-trip P&L); the shared transaction is closed ONLY once every leg has
         resolved (``_all_legs_resolved``), so settling the first leg does not orphan the second.
+
+        ``hold_assigned`` / ``assigned_entry_tag``: the assignment's disposition, when the caller
+        already decided it; otherwise decided here through ``_assignment_disposition`` -- ONLY
+        when the delivery OPENS a lot (a covered call called away closes the held lot and
+        opens nothing, so there is no stock to hold or liquidate and nothing to decide), and
+        BEFORE any write, so a refused (untagged) assignment leaves the book untouched.
+        ``outcome`` (optional OUT dict): ``{"opening": shares the delivery opened, "hold": the
+        decision or None when nothing opened}`` -- what ``settle_single_leg_expiry`` logs.
         """
         from ba2_common.core.utils import close_transaction_with_logging
 
         txn = self._option_transaction_for_contract(position.contract_symbol)
         if txn is None:
             return False
+        share_leg = share_side is not None and bool(shares) and share_price is not None
+        book_qty = book_px = None
+        if share_leg:
+            # The booked delivery, computed BEFORE any write (read-only: the lot is zeroed in
+            # step 2, the position moves in step 3). THE OPTION -> STOCK BOUNDARY (plan Part
+            # E3): ``shares`` and the strike are AS TRADED (100 x contracts at the contract's
+            # strike); this book is split-ADJUSTED, so book ``shares x k`` at ``strike / k``.
+            # ``k`` is the LOT's basis (Task 1a): a P400 written before a 4:1 split delivers 100
+            # pre-split shares at 400 = 400 adjusted shares at 100, whatever today's factor is.
+            early_lot = self._option_positions.get(position.contract_symbol)
+            lot_k = early_lot.basis_factor if self._lot_has_basis(early_lot) else None
+            k = lot_k if lot_k is not None else self._as_traded_factor(position.underlying)
+            signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
+            book_qty, book_px = signed, float(share_price)
+            if k != 1.0:
+                book_qty, book_px = signed * k, float(share_price) / k
+            opening = self._assignment_split(position.underlying, book_qty)[1]
+            # Stage-2 E2: who keeps the stock is a question only when the delivery OPENS a lot.
+            if opening > 0 and hold_assigned is None:
+                hold_assigned, assigned_entry_tag = self._assignment_disposition(txn)
+            if outcome is not None:
+                outcome["opening"] = opening
+                outcome["hold"] = hold_assigned if opening > 0 else None
 
         # 1. Record a synthetic CLOSING fill on THIS leg at the resolved premium (intrinsic, or 0
         #    for worthless) so round-trip P&L can pair open<->close. This moves NO cash: the option
@@ -5858,9 +6694,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # 2. Remove THIS leg's option lot from the option ledger (its cash was settled at entry; the
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
         lot = self._option_positions.get(position.contract_symbol)
-        # The share basis the contract was traded in, read BEFORE the lot is zeroed: an
-        # assignment delivers shares of THAT basis (Task 1a). None -> the bar's own factor.
-        lot_k = lot.basis_factor if self._lot_has_basis(lot) else None
+        # (The share basis the contract was traded in was read above, BEFORE the lot is
+        # zeroed: an assignment delivers shares of THAT basis -- Task 1a.)
         if lot is not None:
             self._zero_option_lot(lot)
 
@@ -5870,28 +6705,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #    ITM assignment loss is real and PERSISTS. ``_book_assignment_share_leg`` also writes
         #    the delivery to the ORDER/TRANSACTION tables (OPT-B2/F7) — the ledger alone is not the
         #    book.
-        if share_side is not None and shares and share_price is not None:
-            signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
+        if share_leg:
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
-            # THE OPTION -> STOCK BOUNDARY (plan Part E3). ``shares`` and the strike are AS
-            # TRADED (100 x contracts at the contract's strike); this book is split-ADJUSTED.
-            # Book ``shares x k`` at ``strike / k``: the cash above is unchanged (moved at the
-            # as-traded numbers, exactly), and the lot marks against the adjusted closes like
-            # every other share in the book. k == 1 books the originals untouched. ``k`` is the
-            # LOT's basis (Task 1a): a P400 written before a 4:1 split delivers 100 pre-split
-            # shares at 400 = 400 adjusted shares at 100, whatever today's factor is.
-            k = lot_k if lot_k is not None else self._as_traded_factor(position.underlying)
-            book_qty, book_px = signed, float(share_price)
-            if k != 1.0:
-                book_qty, book_px = signed * k, float(share_price) / k
+            # The cash above moved at the AS-TRADED numbers, exactly; the lot is booked at the
+            # split-adjusted ``book_qty`` / ``book_px`` computed before any write, and marks
+            # against the adjusted closes like every other share in the book (k == 1 books the
+            # originals untouched).
             self._book_assignment_share_leg(
-                position.underlying, book_qty, book_px, expert_id=txn.expert_id)
+                position.underlying, book_qty, book_px, expert_id=txn.expert_id,
+                hold=hold_assigned, entry_tag=assigned_entry_tag)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
         #    OPENED until the last leg settles so each leg can still find it in step 1.
         if self._all_legs_resolved(txn):
-            txn.close_price = float(close_premium)
+            close_reason = settlement_close_reason(
+                [trigger] + self._settled_leg_triggers(txn))
+            # An ASSIGNED transaction has no close price, exactly like live (``_close_txn`` on
+            # OPASN passes none): its value moved to the share leg at the strike, and
+            # ``calculate_transaction_pnl`` answers None (unknown) rather than a premium-only P&L.
+            txn.close_price = (None if close_reason == OptionCloseReason.ASSIGNED.value
+                               else float(close_premium))
             if not txn.close_date:
                 txn.close_date = self._price.now()
             close_transaction_with_logging(
@@ -5900,15 +6734,43 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # A structure whose legs settled one by one (a strangle) closes under the
                 # most consequential of its settlements -- the live reconciler's rule
                 # (``settlement_close_reason``); a single leg closes under its own.
-                close_reason=settlement_close_reason(
-                    [trigger] + self._settled_leg_triggers(txn)),
+                close_reason=close_reason,
                 additional_data={"contract_symbol": position.contract_symbol},
             )
             update_instance(txn)
         return True
 
+    def _assignment_disposition(self, txn: Transaction) -> "tuple[bool, Optional[int]]":
+        """``(hold, entry_tag)`` for the assignment of ``txn``'s short leg (stage-2 E2).
+
+        ``entry_tag`` is the member tag on the option position's ENTRY order -- the row the
+        OPEN_POSITIONS pass hands ``EntryTagCondition`` (``_entry_order_for_transaction``, the
+        parent of a multi-leg structure) -- or None. ``hold`` is the SHARED decision
+        (``assignment_hold.holds_assigned_stock``): the run-level ``hold_assigned_stock`` when
+        the run names no member tags (every run before stage 2, byte-identical), else whether
+        the tag is one of ``hold_assigned_stock_tags``; an untagged position in a member-scoped
+        run raises ``UntaggedAssignmentRefused``, which ends the run (``daily_engine``).
+        """
+        entry = self._entry_order_for_transaction(txn)
+        tag = order_entry_tag(entry) if entry is not None else None
+        hold = holds_assigned_stock(
+            resolve_assigned_stock_hold_policy(self._cfg), tag,
+            where=f"[backtest] assignment of option transaction {txn.id} ({txn.symbol})")
+        return hold, tag
+
+    def _assignment_split(self, symbol: str, signed: float) -> "tuple[float, float]":
+        """``(closing, opening)`` of a SIGNED share delivery against what is held now: the part
+        that offsets an existing lot closes it, the rest opens a new lot. Read-only."""
+        pos = self._positions.get(symbol)
+        held = float(pos.qty) if pos is not None else 0.0
+        closing = 0.0
+        if held and (held > 0) != (signed > 0):
+            closing = min(abs(signed), abs(held))
+        return closing, abs(signed) - closing
+
     def _book_assignment_share_leg(
-        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None
+        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None,
+        hold: Optional[bool] = None, entry_tag: Optional[int] = None,
     ) -> None:
         """Apply an assignment's SHARE delivery to the ledger AND to the order/transaction book.
 
@@ -5938,8 +6800,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             the next-bar orphan liquidation — scheduling the full assignment would sell down
             an unrelated lot the strategy still owns.
 
-        ``hold_assigned_stock`` (run setting, DEFAULT OFF) suppresses ONLY that last
-        scheduling step. Everything else about an assignment — the cash at the strike, the
+        ``hold`` (the assignment's disposition, ``_assignment_disposition``: the run setting
+        ``hold_assigned_stock``, DEFAULT OFF, or the member-scoped ``hold_assigned_stock_tags``)
+        suppresses ONLY that last scheduling step. Everything else about an assignment — the cash at the strike, the
         ledger move, the closing fill on an offset lot, the new lot's transaction + entry
         order and its ``origin=csp_assignment`` tag — is identical either way, so a run with
         the switch off is bit-for-bit what it was before the switch existed. It is opt-in
@@ -5947,14 +6810,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         the setting's description in ``get_settings_definitions`` for what holding costs.
 
         Cash has already moved in the caller; this moves no cash of its own.
+
+        ``hold`` None (a caller with no settling transaction at hand) decides through the same
+        shared function from ``entry_tag`` alone -- the run-level flag, or a refusal in a
+        member-scoped run when no tag is given -- and ONLY when the delivery opens a lot
+        (stage-2 E2 review C1: a delivery that only closes a held lot has nothing to decide).
         """
         pos = self._positions.get(symbol)
         held = float(pos.qty) if pos is not None else 0.0
         # The offsetting part (opposite sign to what is held) closes; the rest opens.
-        closing = 0.0
-        if held and (held > 0) != (signed > 0):
-            closing = min(abs(signed), abs(held))
-        opening = abs(signed) - closing
+        closing, opening = self._assignment_split(symbol, signed)
+        if opening > 0 and hold is None:
+            hold = holds_assigned_stock(
+                resolve_assigned_stock_hold_policy(self._cfg), entry_tag,
+                where=f"[backtest] assignment share leg on {symbol}")
 
         self._update_position(symbol, signed, price)
 
@@ -5963,11 +6832,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 symbol, closing, was_long=(held > 0), px=price, comment="option_assignment")
         if opening > 0:
             self._open_assigned_stock_transaction(
-                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id)
+                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id,
+                entry_tag=entry_tag)
             # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar —
-            # unless this run HOLDS assigned stock, in which case the lot is the strategy's
+            # unless this assignment's stock is HELD, in which case the lot is the strategy's
             # to manage (the wheel writes calls against it) and nothing is scheduled.
-            if not self._cfg.get("hold_assigned_stock", False):
+            if not hold:
                 self._pending_assignment_sells[symbol] = (
                     self._pending_assignment_sells.get(symbol, 0.0)
                     + (opening if signed > 0 else -opening)
@@ -5975,7 +6845,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _open_assigned_stock_transaction(
         self, symbol: str, qty: float, *, is_long: bool, price: float,
-        expert_id: Optional[int] = None,
+        expert_id: Optional[int] = None, entry_tag: Optional[int] = None,
     ) -> None:
         """Persist the equity Transaction + FILLED entry order for an assignment-created lot.
 
@@ -5988,6 +6858,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Written as an ENTRY (no ``depends_on_order``): the next-bar liquidation's closing leg
         is what resolves against it, and ``refresh_transactions`` closes the transaction then.
+
+        The entry order INHERITS the assigned option position's member tag
+        (``assignment_hold.assigned_stock_entry_data``, shared with the live reconciler), so a
+        tag-scoped rule still sees whose shares these are -- the wheel's covered-call overlay
+        writes only on its own member's stock. An untagged position writes no ``data``.
         """
         from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
 
@@ -6023,6 +6898,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_assignment",
             created_at=as_of,
+            # The synthetic-fill flag, plus the assigned position's member tag when it has one
+            # (stage-2 E2: the delivered stock inherits the tag).
+            data={SYNTHETIC_FILL_KEY: True, **(assigned_stock_entry_data(entry_tag) or {})},
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -6072,10 +6950,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
             share_side = OrderDirection.SELL if is_call else OrderDirection.BUY
+            # WHO KEEPS THE STOCK is decided inside, per assignment, only when the delivery
+            # opens a lot, and before anything is written (stage-2 E2; ``outcome`` says what
+            # was decided, for the log line below).
+            outcome: Dict[str, Any] = {}
+            # The option leg closes at 0 on a PHYSICAL assignment: the premium is kept in full
+            # and the intrinsic value is not paid in cash -- it is carried by the share leg,
+            # which moves cash AT THE STRIKE and whose lot starts there. Closing the option
+            # row at ``intrinsic`` as well counted the assignment loss twice in the trade
+            # rows (cash/equity were right). This is LIVE's convention
+            # (``AlpacaAccount._record_option_settlement_order``: settlement ``open_price=0.0``,
+            # the equity lot opened at the strike), so sum(row P&L) == the change in equity.
             ok = self.settle_option_expiry(
-                position, close_premium=intrinsic,
+                position, close_premium=0.0,
                 share_side=share_side, shares=shares, share_price=strike,
-                trigger=OptionCloseReason.ASSIGNED,
+                trigger=OptionCloseReason.ASSIGNED, outcome=outcome,
             )
             if ok:
                 # The stock the assignment ORPHANS (long from a short put, short from a naked
@@ -6084,15 +6973,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # opened a new lot. A COVERED call delivers shares the account already held:
                 # that part is booked as a closing fill on the lot's own transaction and there
                 # is nothing left to liquidate (scheduling it would sell down an unrelated lot).
-                # ``hold_assigned_stock`` runs skip the scheduling entirely — say which
+                # A HELD assignment (``hold_assigned_stock``, or its member listed in
+                # ``hold_assigned_stock_tags``) skips the scheduling entirely — say which
                 # happened, or the log reads as a liquidation that never comes.
                 logger.warning(
                     "[backtest] short-%s assignment of %d x %s at strike %.2f — %s "
                     "(cash now $%.2f).",
                     "call" if is_call else "put", shares, position.underlying, strike,
-                    ("HOLDING the assigned stock (hold_assigned_stock is on; the strategy's "
-                     "own rules must manage and exit it)"
-                     if self._cfg.get("hold_assigned_stock", False) else
+                    ("delivered against shares already held (a covered call called away): "
+                     "nothing new to hold or liquidate"
+                     if not outcome.get("opening") else
+                     "HOLDING the assigned stock (the run holds this assignment's stock; the "
+                     "strategy's own rules must manage and exit it)"
+                     if outcome.get("hold") else
                      "scheduling assignment_liquidation of the assigned stock at the next "
                      "bar's open"),
                     self._cash,
@@ -6373,10 +7266,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         The closing side is the opposite of how the leg was opened (a SHORT leg is bought back,
         a LONG leg is sold), the fill quantity is the leg's contract count, and ``open_price`` is
-        the per-share settlement premium (intrinsic, or 0 for worthless). This is a BOOK-KEEPING
-        order only: it records the round-trip close so ``get_round_trip_trades`` pairs the option's
-        open and close with the correct realised premium P&L. It moves NO cash (the premium was
-        settled at entry; the exercise/assignment share leg carries the intrinsic value).
+        the per-share settlement premium (0 for worthless AND for an assigned short, whose intrinsic
+        is carried by the share leg; non-zero only for a long sell-to-close / forced liquidation).
+        This is a BOOK-KEEPING order only: it records the round-trip close so
+        ``get_round_trip_trades`` pairs the option's open and close with the correct realised
+        premium P&L. It moves NO cash and no commission (marked ``SYNTHETIC_FILL_KEY``).
 
         It carries the leg's ``exit_record`` (``option_trade_record.exit_record``) with
         ``trigger`` -- the SAME record every option close writes, so the trade row reads WHY
@@ -6416,7 +7310,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment="option_expiry_close",
             created_at=as_of,
-            data={"exit_record": record},
+            data={"exit_record": record, SYNTHETIC_FILL_KEY: True},
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -6932,6 +7826,116 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Record the SIMULATED fill bar (not wall-clock) so the trade history is deterministic.
         if order.id is not None:
             self._fill_dates[order.id] = as_of
+        # An ENTRY's protective levels were built before the fill; live re-bases them to the real
+        # fill the moment the entry is FILLED (TradeManager). Same function here (see below).
+        if order.depends_on_order is None and order.transaction_id is not None:
+            self._rebase_levels_at_entry_fill(order, fill_px)
+
+    #: MEASUREMENT HOOK ONLY (tools/measure_variant.py ``+norebase``; tests). Never set it in a
+    #: production path: the re-base is part of the simulation, like live's.
+    _MEASURE_NO_FILL_REBASE = False
+
+    def fill_rebase_record(self) -> Dict[str, Any]:
+        """The ``results["fill_rebase"]`` block: whether the re-base was on, and what it did."""
+        return {"enabled": not self._MEASURE_NO_FILL_REBASE,
+                **{k: int(v) for k, v in (self.__dict__.get("fill_rebase_counters")
+                                          or FILL_REBASE_COUNTER_KEYS).items()}}
+
+    def _rebase_levels_at_entry_fill(self, order, fill_px: float) -> None:
+        """Re-base the entry transaction's stop/target to the entry's REAL fill (equity only).
+
+        LIVE does this in ``TradeManager._check_all_waiting_trigger_orders`` when the parent entry
+        reaches FILLED; this calls the SAME pure function (``rebase_levels_at_fill``), with the
+        same inputs:
+
+          * reference = ``resolve_tpsl_reference_price`` of the entry (its limit price, else the
+            recommendation's ``price_at_date``, which in the backtest IS the decision price the
+            levels were built from -- on the intraday clock the close of the latest ended bar, on
+            the daily clock the decision day's close). The live-quote link of that chain is not
+            used: a missing reference skips the stop re-base LOUDLY (warning + counter), exactly
+            like live skips an order with no ``tpsl_reference_price``.
+          * fill = the entry's fill price (slippage included), the next bar's open.
+          * minimum take-profit % = ``resolve_min_take_profit_pct`` of the entry's recommendation.
+
+        Once per transaction, on the FIRST entry fill, and only for the levels that exist at that
+        moment (a level set after the fill was already built from the fill). The bracket test
+        (``_apply_bracket_exits``) reads the transaction, so the re-based levels are the ones tested
+        on every later bar. The pre-fill levels stay on ``transaction.meta_data["fill_rebase"]``.
+        """
+        if self._MEASURE_NO_FILL_REBASE:
+            return
+        from ba2_common.core.tpsl_fill_rebase import (
+            FillRebaseRefused, read_anchor, rebase_levels_at_fill, resolve_tpsl_reference_price,
+            stamp_anchor)
+        done = self.__dict__.setdefault("_fill_rebased_txn_ids", set())
+        txn_id = order.transaction_id
+        if txn_id in done:
+            return
+        txn = get_instance(Transaction, txn_id)
+        if txn is None or txn.side != order.side or txn.status != TransactionStatus.WAITING:
+            return  # a closer, a scale-in on an open position, or a transaction already live
+        done.add(txn_id)
+        tp, sl = txn.take_profit, txn.stop_loss
+        if not tp and not sl:
+            return
+        counters = self.__dict__.setdefault("fill_rebase_counters", dict(FILL_REBASE_COUNTER_KEYS))
+        counters["entries_with_levels"] += 1
+        counters["entries_with_stop"] += int(bool(sl))
+
+        def _rec_price():
+            rec_id = order.expert_recommendation_id
+            if not rec_id:
+                return None
+            from ba2_common.core.models import ExpertRecommendation
+            rec = get_instance(ExpertRecommendation, rec_id)
+            return rec.price_at_date if rec is not None else None
+
+        # The price the stop was COMPUTED FROM, stamped when it was set (TradeActions / the safeguard
+        # tail); the entry-order chain below is only the fallback for a stop that carries no stamp.
+        stamped = read_anchor(txn.meta_data, "stop")
+        ref = resolve_tpsl_reference_price(None, order.limit_price, _rec_price, lambda: None,
+                                           stamped_stop_anchor=stamped)
+        if sl and stamped is None:
+            counters["fallback_reference"] += 1
+        rebase_stop = bool(ref) and ref > 0
+        if sl and not rebase_stop:
+            counters["no_reference"] += 1
+            logger.warning(
+                "[backtest] stop of %s %s NOT re-based to the fill: no stamped anchor and the entry has "
+                "no reference price (no limit price, no recommendation price_at_date); the stop keeps "
+                "its pre-fill level", order.symbol, txn_id)
+        from ba2_common.core.TradeActions import resolve_min_take_profit_pct
+        try:
+            adj = rebase_levels_at_fill(
+                is_long=order.side == OrderDirection.BUY, fill_price=fill_px, reference_price=ref,
+                take_profit=tp, stop_loss=sl, rebase_stop=rebase_stop, apply_tp_floor=bool(tp),
+                min_take_profit_pct=(resolve_min_take_profit_pct(order.expert_recommendation_id)
+                                     if tp else None))
+        except FillRebaseRefused as e:
+            raise RuntimeError(
+                f"[backtest] cannot re-base the protective levels of {order.symbol} "
+                f"(transaction {txn_id}) to its fill: {e}") from e
+        record = {
+            "reference_price": ref, "fill_price": fill_px,
+            "stop_loss_pre_fill": sl, "take_profit_pre_fill": tp,
+            "stop_loss": adj.stop_loss, "take_profit": adj.take_profit,
+            "stop_rebased": adj.stop_rebased, "tp_floored": adj.tp_floored,
+        }
+        self.__dict__.setdefault("_fill_rebase_records", {})[txn_id] = record
+        if not adj.changed:
+            return      # nothing moved: no level rewritten, nothing persisted
+        counters["rebased"] += 1
+        counters["stop_rebased"] += int(adj.stop_rebased)
+        counters["tp_floored"] += int(adj.tp_floored)
+        meta = dict(txn.meta_data) if txn.meta_data else {}
+        meta["fill_rebase"] = record
+        if adj.stop_rebased:
+            # the stop is now measured from the fill: a second pass must see no gap to re-base
+            meta = stamp_anchor(meta, stop=fill_px)
+        txn.meta_data = meta
+        txn.stop_loss = adj.stop_loss
+        txn.take_profit = adj.take_profit
+        update_instance(txn)
 
     def _apply_option_fill(self, order, fill_px: float, as_of: datetime) -> None:
         """Apply a single-leg option fill to cash + option ledger and mark the order FILLED.
@@ -6964,6 +7968,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                      underlying=underlying, fill_day=fill_day)
         if self._split_basis is not None and underlying and order.id is not None:
             self._option_fill_basis[order.id] = self._as_traded_factor(underlying, fill_day)
+        replaced_days = self.__dict__.get("_replaced_print_days")
+        if (replaced_days and order.id in replaced_days
+                and replaced_days[order.id] == self._option_fill_day(order, as_of)):
+            self._integrity()["option_fills_at_replaced_print"] += 1
         order.filled_qty = qty
         order.open_price = fill_px
         order.status = OrderStatus.FILLED
@@ -7036,20 +8044,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # TP/SL/OCO leg helpers
     # ======================================================================
     def _entry_order_for_transaction(self, transaction: Transaction) -> Optional[TradingOrder]:
-        """The market-entry order of a transaction: transaction_id matches + no parent.
+        """The market-entry order of a transaction: its first-written ROOT order.
 
-        (Transaction has no entry_order_id column; the entry order is the one with
-        ``depends_on_order IS NULL``. If several exist — e.g. scaled entries — the oldest
-        is returned so legs depend on the original entry.)
+        (Transaction has no entry_order_id column; the entry order is the oldest one with
+        neither ``depends_on_order`` nor ``parent_order_id`` -- so legs depend on the original
+        entry when there are scaled entries, and a combo's leg children never stand in for
+        its parent.) ONE definition, shared with live (``TradeManager.resolve_entry_order``):
+        ``ba2_common.core.entry_order.entry_order_for_transaction`` -- the row the OPEN_POSITIONS
+        pass hands ``EntryTagCondition`` and the one an assignment reads the member tag from.
         """
-        rows = orders_where(account_id=self.id, transaction_id=transaction.id,
-                            depends_on_order=None)
-        if not rows:
-            return None
-        # Same naive/aware hazard as daily_engine._oldest_entry_order: created_at may be
-        # either shape, and the aware fallback cannot be compared with a naive value.
-        rows.sort(key=lambda o: (as_utc_key(o.created_at, default=datetime.min), o.id or 0))
-        return rows[0]
+        return entry_order_for_transaction(transaction.id)
 
     # NOTE: the WAITING_TRIGGER/OCO leg factory (_replace_leg) + its helper (_existing_legs) were
     # REMOVED — the lean simulator stores TP/SL on the transaction and closes directly via

@@ -109,9 +109,19 @@ class FakeDetails:
         return {"statements": [{"free_cash_flow": 50_000_000.0}]}
 
 
+_CURRENT = {}
+
+
+def _fetch_value(symbols, **kwargs):
+    """What the backtest does: the point-in-time read gets the RUN's OHLCV provider handed in (a fetcher
+    given an ``as_of`` and no provider refuses, rather than default to a history the job did not choose)."""
+    return data.fetch_value_inputs(symbols, ohlcv_provider=_CURRENT["ohlcv"], **kwargs)
+
+
 def _patch_providers(monkeypatch, ohlcv=None, details=None):
     ohlcv = ohlcv or FakeOHLCV()
     details = details or FakeDetails()
+    _CURRENT["ohlcv"] = ohlcv
     monkeypatch.setattr(_ohlcv_module(), "FMPOHLCVProvider", lambda: ohlcv)
     monkeypatch.setattr(_overview_module(), "FMPCompanyOverviewProvider", lambda: FakeOverview())
     monkeypatch.setattr(_details_module(), "FMPCompanyDetailsProvider", lambda: details)
@@ -121,7 +131,7 @@ def _patch_providers(monkeypatch, ohlcv=None, details=None):
 def test_value_inputs_use_as_of_close_not_current_price(monkeypatch):
     """E/P must be computed against the AS_OF close, not the current-snapshot price."""
     _patch_providers(monkeypatch)
-    out = data.fetch_value_inputs(["AAA"], as_of=AS_OF)
+    out = _fetch_value(["AAA"], as_of=AS_OF)
     assert "AAA" in out
     assert out["AAA"]["price"] == ASOF_CLOSE, (
         f"value price must be the as_of close ({ASOF_CLOSE}), not the current "
@@ -134,7 +144,7 @@ def test_value_inputs_market_cap_reconstructed_from_as_of_close_and_shares(monke
     """EV (hence FCF/EV) must use market cap = as_of_close × dated shares, not the
     current-snapshot mktCap."""
     _patch_providers(monkeypatch)
-    out = data.fetch_value_inputs(["AAA"], as_of=AS_OF)
+    out = _fetch_value(["AAA"], as_of=AS_OF)
     ev = out["AAA"]["enterprise_value"]
     expected_mktcap = ASOF_CLOSE * SHARES_OUT  # 1_000_000_000, debt=cash=0 => EV == mktcap
     assert ev == expected_mktcap, (
@@ -147,7 +157,7 @@ def test_value_inputs_market_cap_reconstructed_from_as_of_close_and_shares(monke
 def test_value_inputs_ohlcv_fetched_with_end_date_equal_as_of(monkeypatch):
     """The price source must be anchored at as_of (end_date == as_of)."""
     ohlcv, _ = _patch_providers(monkeypatch)
-    data.fetch_value_inputs(["AAA"], as_of=AS_OF)
+    _fetch_value(["AAA"], as_of=AS_OF)
     assert ohlcv.calls, "OHLCV provider must be used for the as_of price"
     assert all(c["end_date"] == AS_OF for c in ohlcv.calls), ohlcv.calls
 
@@ -156,7 +166,7 @@ def test_value_inputs_drop_symbol_when_shares_unavailable(monkeypatch):
     """No shares outstanding in the dated statements => no as_of market cap can be
     reconstructed => drop the symbol (do NOT fall back to the current snapshot)."""
     _patch_providers(monkeypatch, details=FakeDetails(shares=None))
-    out = data.fetch_value_inputs(["AAA"], as_of=AS_OF)
+    out = _fetch_value(["AAA"], as_of=AS_OF)
     assert "AAA" not in out, "symbol with no as_of shares must be dropped, not look-ahead-filled"
 
 
@@ -167,5 +177,5 @@ def test_value_inputs_drop_symbol_when_no_asof_close(monkeypatch):
             return pd.DataFrame({"Close": []})
 
     _patch_providers(monkeypatch, ohlcv=EmptyOHLCV())
-    out = data.fetch_value_inputs(["AAA"], as_of=AS_OF)
+    out = _fetch_value(["AAA"], as_of=AS_OF)
     assert "AAA" not in out

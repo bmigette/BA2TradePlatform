@@ -86,10 +86,24 @@ def test_single_bt_screener_union_runtime_and_no_lookahead(tmp_path):
     assert rt["cadence_days"] == 7
 
     # (3) NO lookahead: B only qualifies on 2024-02-01, so an early bar must NOT admit it.
-    early = _screened_symbols_for_bar(rt, datetime(2024, 1, 15, tzinfo=timezone.utc))
-    late = _screened_symbols_for_bar(rt, datetime(2024, 2, 15, tzinfo=timezone.utc))
+    early = _screened_symbols_for_bar(rt, datetime(2024, 1, 15, tzinfo=timezone.utc), None, intraday=False)
+    late = _screened_symbols_for_bar(rt, datetime(2024, 2, 15, tzinfo=timezone.utc), None, intraday=False)
     assert "A" in early and "B" not in early   # was admitted by the old static-union (the bug)
     assert "A" in late and "B" in late
+
+    # (3b) The same on the INTRADAY clock, plus its scan-visibility rule: a scan dated S holds the close of
+    # S, so it is visible only once every session dated <= S has FINISHED. B's scan is dated 2024-02-01:
+    # not visible at a 10:00 decision on 02-01 itself (the session is still open), visible the next day.
+    same_day = _screened_symbols_for_bar(rt, datetime(2024, 2, 1, 10, 0, tzinfo=timezone.utc), None, intraday=True)
+    next_day = _screened_symbols_for_bar(rt, datetime(2024, 2, 2, 10, 0, tzinfo=timezone.utc), None, intraday=True)
+    assert "A" in same_day and "B" not in same_day
+    assert "A" in next_day and "B" in next_day
+    # ...and on the DAILY clock the scan dated on the decision day IS visible (unchanged behaviour).
+    daily_same = _screened_symbols_for_bar(rt, datetime(2024, 2, 1, tzinfo=timezone.utc), None, intraday=False)
+    assert "B" in daily_same
+    # early intraday bar (before any B scan): still no lookahead
+    early_i = _screened_symbols_for_bar(rt, datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc), None, intraday=True)
+    assert "B" not in early_i
 
 
 def test_screener_mode_defaults_to_store_dir(tmp_path, monkeypatch):
@@ -156,6 +170,11 @@ def test_per_bar_gate_filters_on_price_max_point_in_time(tmp_path):
           "cadence_days": 7}
     cache = {}
     # Bar between the two scans resolves to the Jan scan (price 120 > 100): gated out.
-    assert _screened_symbols_for_bar(rt, datetime(2024, 1, 15, tzinfo=timezone.utc), cache) == []
+    assert _screened_symbols_for_bar(rt, datetime(2024, 1, 15, tzinfo=timezone.utc), cache, intraday=False) == []
     # Bar after the Feb scan (price 80 <= 100): admitted again.
-    assert _screened_symbols_for_bar(rt, datetime(2024, 2, 15, tzinfo=timezone.utc), cache) == ["A"]
+    assert _screened_symbols_for_bar(rt, datetime(2024, 2, 15, tzinfo=timezone.utc), cache, intraday=False) == ["A"]
+    # INTRADAY clock: the Feb 1 scan (price 80) is not visible during Feb 1 itself, so a 10:00 decision that
+    # day still resolves to the Jan scan (price 120: gated out); the next day it is admitted.
+    icache = {}
+    assert _screened_symbols_for_bar(rt, datetime(2024, 2, 1, 10, 0, tzinfo=timezone.utc), icache, intraday=True) == []
+    assert _screened_symbols_for_bar(rt, datetime(2024, 2, 2, 10, 0, tzinfo=timezone.utc), icache, intraday=True) == ["A"]

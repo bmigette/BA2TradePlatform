@@ -114,9 +114,9 @@ class _Probe:
         self.n = 0
         self._real = acct._compute_open_positions_mtm
 
-        def counted():
+        def counted(*args, **kwargs):          # (decision=...) since the intraday decision-time mark
             self.n += 1
-            return self._real()
+            return self._real(*args, **kwargs)
 
         acct._compute_open_positions_mtm = counted
 
@@ -373,3 +373,49 @@ def test_no_clock_means_no_memo(tmp_path):
         assert acct._mtm_memo is None
     finally:
         ctx.__exit__(None, None, None)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# Two mark FLAVOURS (intraday clock): the decision-price mark and the bar-close mark
+# ---------------------------------------------------------------------------------------------
+def test_the_decision_mark_and_the_close_mark_never_serve_each_others_memo():
+    """The sizer's mark (``decision=True``: the price knowable at the decision) and the equity curve's mark
+    (the clock bar's close) differ on an intraday clock. Each has its OWN memo slot: neither returns the
+    other's value, and alternating between them on an unchanged book does not thrash (one compute each)."""
+    from types import SimpleNamespace
+    from app.services.backtest.backtest_account import BacktestAccount
+
+    acct = BacktestAccount.__new__(BacktestAccount)
+    acct._price = SimpleNamespace(current=lambda: datetime(2024, 3, 5, 10, 0), is_intraday=True)
+    acct._book_gen = 7
+    acct._mtm_memo = None
+    acct._mtm_memo_decision = None
+    computed = []
+
+    def compute(decision=False):
+        computed.append(decision)
+        return 111.0 if decision else 222.0
+
+    acct._compute_open_positions_mtm = compute
+    for _ in range(5):                                   # alternate: neither flavour may evict the other
+        assert acct._open_positions_mtm(decision=True) == 111.0
+        assert acct._open_positions_mtm() == 222.0
+    assert sorted(computed) == [False, True]             # ONE compute per flavour
+    acct._book_gen += 1                                  # a book mutation invalidates BOTH
+    assert acct._open_positions_mtm(decision=True) == 111.0
+    assert acct._open_positions_mtm() == 222.0
+    assert sorted(computed) == [False, False, True, True]
+
+
+def test_on_a_daily_clock_decision_is_the_same_mark_and_shares_the_plain_memo():
+    from types import SimpleNamespace
+    from app.services.backtest.backtest_account import BacktestAccount
+
+    acct = BacktestAccount.__new__(BacktestAccount)
+    acct._price = SimpleNamespace(current=lambda: datetime(2024, 3, 5), is_intraday=False)
+    acct._book_gen, acct._mtm_memo, acct._mtm_memo_decision = 1, None, None
+    calls = []
+    acct._compute_open_positions_mtm = lambda decision=False: calls.append(decision) or 5.0
+    assert acct._open_positions_mtm(decision=True) == 5.0 and acct._open_positions_mtm() == 5.0
+    assert calls == [False]                              # decision is normalised away: one compute

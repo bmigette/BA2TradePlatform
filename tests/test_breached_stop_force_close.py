@@ -1,18 +1,17 @@
 """The live account refresh force-closes a position whose stop was breached but never filled.
 
-WHY THIS EXISTS. Alpaca exits go out as an OCO whose stop leg is a stop-LIMIT: the limit
-sits ``OCO_STOP_LIMIT_CUSHION`` (0.5%) *through* the stop so a normal trigger still fills.
-On a GAP that jumps the stop AND the cushion in one print, the triggered leg becomes a
-limit sell above the market: it rests unfilled and the position is left open with no stop
-under it (prod 2026-09-10: RARE/ENOV). The backtest models every stop as a MARKET stop
-that fills at the stop or at the gap open
-(``backtest_account.py::_gap_stop_fill``), so live and simulated diverge exactly on the
-days that matter most.
+WHY THIS EXISTS. Until APP 2026.09.1261 Alpaca OCO exits had a stop-LIMIT stop leg, its
+limit ``OCO_STOP_LIMIT_CUSHION`` (0.5%) *through* the stop. On a GAP that jumps the stop AND
+the cushion in one print, the triggered leg becomes a limit sell above the market: it rests
+unfilled and the position is left open with no stop under it (prod RARE/ENOV 2026-09-10,
+PLTR 2026-11-03). The backtest models every stop as a MARKET stop that fills at the stop or
+at the gap open (``backtest_account.py::_gap_stop_fill``).
 
-``TradeManager._force_close_breached_stops`` is the reconciliation: on each periodic
-account refresh, any OPENED equity transaction whose price is beyond its stop by more
-than the SAME cushion the OCO leg used is force-closed at market. One constant, two
-readers — the check and the leg cannot drift apart.
+New Alpaca OCO stop legs are PLAIN stops (pinned below), so they fill like the backtest.
+``TradeManager._force_close_breached_stops`` stays as the backstop: on each periodic account
+refresh, any OPENED equity transaction whose price is beyond its stop by more than the
+cushion is force-closed at market (legacy stop-limit legs still resting, IBKR stop-limit
+legs, a stop that is held or missing).
 
 Log assertions record ``TradeManager.logger`` directly: ``ba2_common.logger`` sets
 ``propagate = False``, so ``caplog`` sees nothing and every log pin would pass vacuously.
@@ -303,7 +302,7 @@ def test_other_accounts_positions_are_not_touched():
 # 10: ONE cushion, TWO readers
 # --------------------------------------------------------------------------- #
 
-def test_the_check_and_the_oco_leg_read_the_same_constant():
+def test_the_check_reads_the_alpaca_module_constant():
     # NOTE: `import ...accounts.AlpacaAccount as m` yields the CLASS here — the package
     # __init__ re-exports it under the submodule's own name — so import the name itself.
     from ba2_trade_platform.modules.accounts.AlpacaAccount import (
@@ -314,12 +313,10 @@ def test_the_check_and_the_oco_leg_read_the_same_constant():
     assert OCO_STOP_LIMIT_CUSHION == 0.005
 
 
-@pytest.mark.parametrize("side,factor", [
-    (OrderDirection.SELL, 1.0 - OCO_STOP_LIMIT_CUSHION),  # long exit: limit BELOW the stop
-    (OrderDirection.BUY, 1.0 + OCO_STOP_LIMIT_CUSHION),   # short exit: limit ABOVE the stop
-])
-def test_the_oco_stop_leg_limit_is_the_stop_moved_by_the_cushion(side, factor):
-    """Pins the OTHER reader: the submitted OCO request itself."""
+@pytest.mark.parametrize("side", [OrderDirection.SELL, OrderDirection.BUY])
+def test_the_oco_stop_leg_is_a_plain_stop(side):
+    """The submitted OCO's stop leg carries NO limit price: triggered, it is a market order
+    that fills at the stop or the gap open, like the backtest's _gap_stop_fill."""
     from alpaca.trading.enums import OrderClass
     from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
 
@@ -350,7 +347,8 @@ def test_the_oco_stop_leg_limit_is_the_stop_moved_by_the_cushion(side, factor):
     request = captured[0]
     assert request.order_class == OrderClass.OCO
     assert float(request.stop_loss.stop_price) == STOP
-    assert float(request.stop_loss.limit_price) == round(STOP * factor, 2)
+    assert request.stop_loss.limit_price is None
+    assert request.take_profit.limit_price is not None
 
 
 # --------------------------------------------------------------------------- #

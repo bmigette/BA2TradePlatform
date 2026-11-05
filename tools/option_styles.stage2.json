@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "styles": {
+    "mid": {
+      "status": "approved",
+      "note": "Stage-2 job A, MID horizon (docs/plans/2026-09-25-option-stage2-plan.md section 0.2). Member order is precedence, first passing rule wins (user 2026-10-24, confirmed 2026-11-03). DTE centre ranges widened where stage 1 pinned at the bound (BULLCS 60, STRD 55); O_BF keeps its stage-1 band. No price cap: entries are bounded by risk sizing and the option risk manager (user 2026-10-24). Risk block: user 2026-11-03.",
+      "price_cap_policy": "none",
+      "members": [
+        {"key": "O_STRG", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
+        {"key": "O_STRD", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
+        {"key": "O_BULLCS", "action_overrides": {"option_dte_min": 45, "option_dte_max": 75, "option_dte_min_range": 40, "option_dte_max_range": 90, "option_dte_step": 5}},
+        {"key": "O_BF"},
+        {"key": "O_LC", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}}
+      ],
+      "risk": {
+        "risk_manager_mode": "classic_options",
+        "fixed": {"max_concurrent_structures": 20, "undefined_risk_max_pct": 0},
+        "genes": {
+          "max_deployment_pct": {"min": 30, "max": 80, "step": 10},
+          "circuit_breaker_pct": {"min": 20, "max": 50, "step": 10},
+          "max_notional_leverage": {"min": 2, "max": 10, "step": 2},
+          "max_virtual_equity_per_instrument_percent": {"min": 5, "max": 25, "step": 5}
+        }
+      }
+    },
+    "premium": {
+      "status": "approved",
+      "note": "Stage-2 job P, PREMIUM (credit/carry) structures: every stage-1-profitable credit or carry structure the O_STYLE builder supports (O_CSP, O_BULLPS, O_JL, O_RS, O_WHEEL, O_CC, O_PP, O_IC). Approved by the owner 2026-11-04. Member order is precedence (first passing rule wins; one structure per underlying): WHEEL first (owner 2026-11-04: oversold strong large caps you are happy to own -- the CSP entry that HOLDS its assignment and writes covered calls), CSP (the same put sale, stock sold at the next open; takes the names the wheel gate refuses; owner idea: sell a put after a pullback expecting a rebound -- the pullback gate is seeded ON by the seed policy, never forced here), BULLPS (defined-risk bullish credit), JL and RS (skewed credit), CC and PP (stock + call/put overlay in round lots), IC last (neutral, joint entry mode, only HOLD signals reach it). DTE: every option-entry member searches a centre range 12..30 step 2 around an authored 15..29 window (half-width 7), so the decoded window is centre +/- 7 = 5..37 days and never starts below 5. O_CC/O_PP calls/puts and the wheel's covered call are exit overlays whose DTE (centre 20..60, half-width 10, so min 10) the spec cannot move. Full-notional members (CSP, WHEEL, JL, RS) search option_sizing 5..100 so one contract can use all the cash (budget = min(option_sizing, per-instrument cap)). No price cap. The $20k equity cap is a launch flag. O_VERT left out: debit bear put vertical (stage-1 fitness 0.088), the debit family is job A's. Risk block: undefined_risk_max_pct fixed 100 because a cash-secured put is classed as undefined risk (naked sub-cap) and charges its full strike*100 to it; 0 would refuse every CSP/JL/RS/WHEEL entry. The real limits are the searched max_deployment_pct, the per-instrument cap, and the assignment-cash rail.",
+      "price_cap_policy": "none",
+      "members": [
+        {"key": "O_WHEEL", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_CSP", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_BULLPS", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2}},
+        {"key": "O_JL", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_RS", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2, "option_sizing_min": 5, "option_sizing_max": 100, "option_sizing_step": 5}},
+        {"key": "O_CC"},
+        {"key": "O_PP"},
+        {"key": "O_IC", "neutral_entry_mode": "joint", "action_overrides": {"option_dte_min": 15, "option_dte_max": 29, "option_dte_min_range": 12, "option_dte_max_range": 30, "option_dte_step": 2}}
+      ],
+      "risk": {
+        "risk_manager_mode": "classic_options",
+        "fixed": {"max_concurrent_structures": 20, "undefined_risk_max_pct": 100},
+        "genes": {
+          "max_deployment_pct": {"min": 30, "max": 100, "step": 10},
+          "circuit_breaker_pct": {"min": 20, "max": 50, "step": 10},
+          "max_notional_leverage": {"min": 1, "max": 5, "step": 1},
+          "max_virtual_equity_per_instrument_percent": {"min": 10, "max": 100, "step": 10}
+        }
+      }
+    },
+    "long": {
+      "status": "approved",
+      "note": "Stage-2 job C, LONG horizon (docs/plans/2026-09-25-option-stage2-plan.md section 0.2 C). Approved by the owner 2026-11-04. Expert = DeterministicScorer only; the $20k equity cap is a launch flag; no price cap (entries are bounded by risk sizing and the option risk manager); every condition stays togglable (no gate is forced on here). Members: O_CBS (call backspread, authored DTE 80..140, the shortest horizon of the style), O_LEAP (deep-ITM long call/put LEAPS, stock replacement), O_PMCC (poor man's covered call: LEAPS plus a short call), O_CONVEX (OTM convex call/put lottery). Member order is precedence, first passing rule wins, one structure per underlying. Rationale: CBS first (best stage-1.5 fitness 34.8, defined risk, shortest capital lock); LEAP is the core stock replacement; PMCC third (the LEAP-plus-income variant, takes the names the LEAP gate refuses); CONVEX LAST because it is a lottery arm whose stage-1.5 winners are concentrated (GOOG+PLTR 45-65% of P&L, top-1 trade 25-34%) and must not pre-empt the higher-conviction structures. O_LEAP, O_PMCC and O_CONVEX carry no action_overrides: they are _STYLE_DTE_INVARIANT_MEMBERS (a LEAPS opens at >= 365 DTE against its own exit band), so their authored DTE (380..470, 300..420) stays; O_CBS keeps its authored band too (80..140 sits in the plan's 90-180 range). O_PBS is OUT (its stage-1.5 run failed: no bearish signals on large caps). Risk block = job A's rails (classic_options, 20 concurrent, undefined_risk_max_pct 0: none of these members is an undefined-risk candidate, only short_put/short_strangle are). The per-instrument cap is NOT widened (5..25): the stage-1.5 convex winners are concentrated, and at $20k it also means a deep-ITM LEAPS on a high-priced name may not fit one cap slice and is refused by the sizing rail, which is intended pressure rather than a bug.",
+      "price_cap_policy": "none",
+      "members": [
+        {"key": "O_CBS"},
+        {"key": "O_LEAP"},
+        {"key": "O_PMCC"},
+        {"key": "O_CONVEX"}
+      ],
+      "risk": {
+        "risk_manager_mode": "classic_options",
+        "fixed": {"max_concurrent_structures": 20, "undefined_risk_max_pct": 0},
+        "genes": {
+          "max_deployment_pct": {"min": 30, "max": 80, "step": 10},
+          "circuit_breaker_pct": {"min": 20, "max": 50, "step": 10},
+          "max_notional_leverage": {"min": 2, "max": 10, "step": 2},
+          "max_virtual_equity_per_instrument_percent": {"min": 5, "max": 25, "step": 5}
+        }
+      }
+    }
+  }
+}

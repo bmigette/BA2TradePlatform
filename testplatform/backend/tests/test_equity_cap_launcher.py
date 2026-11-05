@@ -214,7 +214,10 @@ def test_no_strategy_the_launcher_builds_exposes_an_equity_cap_gene():
     # expose an equity_cap gene because it cannot expose ANY gene, and
     # ``test_option_grid_foundations.test_a_phase_gated_key_is_a_KNOWN_key_that_refuses``
     # pins that the refusal is what happens instead.
-    for kind in sorted(set(L._STRATEGY_BUILDERS) - set(L._PHASE_GATED_OPTION_STRATEGIES)):
+    # SPEC-DRIVEN keys (O_STYLE) are built with a style in test_option_style_* (their builder
+    # needs a --style-config spec); the audit builds every candidate style.
+    for kind in sorted(set(L._STRATEGY_BUILDERS) - set(L._PHASE_GATED_OPTION_STRATEGIES)
+                       - set(L._SPEC_DRIVEN_STRATEGIES)):
         strategy = L._build_strategy(kind, f"gene-space-{kind}", "FMPRating")
         space = collect_param_space(strategy)
         assert not any("equity_cap" in k for k in space), \

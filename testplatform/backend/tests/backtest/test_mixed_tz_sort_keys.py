@@ -63,15 +63,30 @@ def test_a_naive_value_is_read_as_utc_not_rejected():
 
 
 def test_the_real_engine_helper_survives_the_mix():
-    """End of the chain: the actual method, not a re-implementation of its key."""
+    """End of the chain: the actual method (now the shared ``entry_order.oldest_entry_order``,
+    the one live TradeManager calls too), over real rows in the backtest's in-memory store."""
     from app.services.backtest.daily_engine import DailyBacktestEngine
-
-    class _Acct:
-        def _entry_order_for_transaction(self, txn):
-            return ("order-for", txn.id)
+    from ba2_common.core import trade_store as ts
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import TradingOrder, Transaction
+    from ba2_common.core.types import (
+        OrderDirection, OrderStatus, OrderType, TransactionStatus)
 
     eng = object.__new__(DailyBacktestEngine)
-    eng.account = _Acct()
-    txns = [_Txn(open_date=NAIVE, ident=1), _Txn(created_at=AWARE, ident=2)]
-    assert eng._oldest_entry_order(txns) == ("order-for", 2)
+    with ts.inmem_trades():
+        txns = []
+        for when in ("naive", "aware"):
+            t = Transaction(symbol="MIX", quantity=1.0, side=OrderDirection.BUY,
+                            status=TransactionStatus.OPENED, expert_id=1)
+            add_instance(t)
+            add_instance(TradingOrder(account_id=1, symbol="MIX", quantity=1.0,
+                                      side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                                      status=OrderStatus.FILLED, transaction_id=t.id,
+                                      data={"which": when}))
+            txns.append(t)
+        # the store strips tzinfo on write (as a SQLite round trip does): re-introduce the mix
+        txns[0].open_date, txns[0].created_at = NAIVE, None
+        txns[1].open_date, txns[1].created_at = None, AWARE          # the EARLIER instant
+        assert eng._oldest_entry_order(txns).data == {"which": "aware"}
+        assert eng._oldest_entry_order(list(reversed(txns))).data == {"which": "aware"}
     assert eng._oldest_entry_order([]) is None

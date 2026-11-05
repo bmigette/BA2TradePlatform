@@ -367,7 +367,9 @@ def test_a_short_put_assigned_across_the_split_books_shares_in_the_equity_basis(
 
         _expire(engine, acct, ps)
 
-        assert _expiry_close(acct, PUT).open_price == pytest.approx(30.0)
+        # Assigned short put: closes at 0 (the intrinsic 30 is the share leg's, at the strike).
+        assert _expiry_close(acct, PUT).open_price == pytest.approx(0.0)
+        assert _expiry_close(acct, PUT).data["exit_record"]["trigger"] == "assigned"
         pos = acct._positions["AAPL"]
         assert pos.qty == pytest.approx(400.0)
         assert pos.avg_price == pytest.approx(102.5)

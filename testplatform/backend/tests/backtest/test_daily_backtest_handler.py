@@ -136,6 +136,15 @@ def test_build_config_assembles_account_settings():
     assert isinstance(cfg["start_date"], datetime)
 
 
+def test_build_config_carries_the_member_scoped_hold_only_when_the_payload_names_it():
+    """Stage-2 E2: ``hold_assigned_stock_tags`` reaches the account settings verbatim (the
+    account validates it at construction); a payload without it keeps the EXACT old shape."""
+    assert "hold_assigned_stock_tags" not in H._build_config(_payload(1))["account_settings"]
+    cfg = H._build_config(_payload(1, hold_assigned_stock_tags=[7]))
+    assert cfg["account_settings"]["hold_assigned_stock_tags"] == [7]
+    assert cfg["account_settings"]["hold_assigned_stock"] is False
+
+
 def test_build_config_rejects_unknown_expert():
     with pytest.raises(ValueError, match="unsupported expert"):
         H._build_config(_payload(1, experts=["NotARealExpert"]))

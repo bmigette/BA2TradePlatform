@@ -202,15 +202,52 @@ def test_the_floating_pl_cards_price_an_option_through_the_same_rule(monkeypatch
 
     monkeypatch.setattr(display, 'open_structure_pnl', fake)
     measured = _FloatingPLWidgetBase._option_transaction_pl(
-        _gild_txn(), [_gild_entry()], object(), 1, {})
+        _gild_txn(), [_gild_entry()], object(), 1, {}, {})
     assert measured == 42.0 and seen == ['GILD']
 
     monkeypatch.setattr(display, 'open_structure_pnl',
                         lambda *a, **k: display.unavailable_pnl(UNAVAILABLE_NO_FILLS))
     assert _FloatingPLWidgetBase._option_transaction_pl(
-        _gild_txn(), [_gild_entry()], object(), 1, {}) == 0.0      # holds nothing: a zero
+        _gild_txn(), [_gild_entry()], object(), 1, {}, {}) == 0.0      # holds nothing: a zero
 
     monkeypatch.setattr(display, 'open_structure_pnl',
                         lambda *a, **k: display.unavailable_pnl(UNAVAILABLE_NO_QUOTE))
     assert _FloatingPLWidgetBase._option_transaction_pl(
-        _gild_txn(), [_gild_entry()], object(), 1, {}) is None     # held but unquoted
+        _gild_txn(), [_gild_entry()], object(), 1, {}, {}) is None     # held but unquoted
+
+
+# ---- broker position marks: display pricing at the broker's own position price -------------
+from ba2_trade_platform.core.option_pnl_display import broker_position_marks, quote_caching_account
+
+
+class _MarkAccount:
+    def __init__(self, positions):
+        self._positions = positions
+
+    def get_positions(self):
+        if isinstance(self._positions, Exception):
+            raise self._positions
+        return self._positions
+
+    def get_option_quote(self, contract_symbol):  # pragma: no cover - must not be reached
+        raise AssertionError("marks mode must not read a bid/ask quote")
+
+
+def test_marks_map_every_priced_position_and_skips_unpriced():
+    acct = _MarkAccount([
+        {'symbol': 'XYZ_C95', 'current_price': 1.5},
+        {'symbol': 'XYZ_C99', 'current_price': None},
+    ])
+    assert broker_position_marks(acct) == {'XYZ_C95': 1.5}
+
+
+def test_failed_position_fetch_marks_nothing_never_flat():
+    assert broker_position_marks(_MarkAccount(None)) == {}
+    assert broker_position_marks(_MarkAccount(RuntimeError('down'))) == {}
+
+
+def test_marks_mode_quotes_at_the_mark_and_unknown_when_unlisted():
+    wrapped = quote_caching_account(_MarkAccount([]), {}, 1, {'XYZ_C95': 2.0})
+    q = wrapped.get_option_quote('XYZ_C95')
+    assert (q.bid, q.ask, q.last) == (2.0, 2.0, 2.0)
+    assert wrapped.get_option_quote('XYZ_C100') is None   # not held per the broker: unknown

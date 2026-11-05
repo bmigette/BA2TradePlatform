@@ -25,10 +25,12 @@ import math
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.share_grid import floor_to_unit, is_whole_grid
 
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.replay import replay_now
 
 
@@ -330,6 +332,7 @@ def synthesize_safeguard_stop(
         return None
     if not risk_per_trade_pct or risk_per_trade_pct <= 0:
         return None
+    require_decision_price(current_price, what="safeguard stop")
     risk_dist = current_price * (risk_per_trade_pct / 100.0)
     candidates = [(SAFEGUARD_CANDIDATE_RISK_PCT, risk_dist)]
     if atr and atr > 0 and atr_multiplier and atr_multiplier > 0:
@@ -498,6 +501,10 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
                 return float(v)
         logger.warning(f"get_latest_atr: no ATR value returned for {symbol}")
         return None
+    except HistoryUnavailable:
+        # a named history refusal (too new, lock timeout, gap, stale corporate actions, failed live fetch) is NOT "no ATR":
+        # falling back to a risk-only stop would trade without the input. The caller refuses the order.
+        raise
     except Exception as e:
         # Let CODE DEFECTS through. This handler previously absorbed a tz naive/aware TypeError
         # and returned None, which is indistinguishable from "this symbol has no ATR" -- so ATR

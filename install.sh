@@ -37,7 +37,8 @@ TRADE_PY="$BOTH_PY"; TEST_PY="$BOTH_PY"
 
 UP=(); [ "$UPGRADE" = "1" ] && UP=(--upgrade)
 
-# torch wheel selection for the TRADE venv. BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
+# torch wheel selection for BOTH venvs (the test venv's requirements.txt holds a bare `torch>=...`:
+# on Windows PyPI only has the CPU wheel). BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
 # auto = install the CUDA build when an NVIDIA GPU responds to nvidia-smi, else CPU-only
 # (a Mac / GPU-less box has no nvidia-smi -> CPU; see CLAUDE.md WinError note for the CPU pin).
 TORCH_VARIANT="${BA2_TORCH_VARIANT:-auto}"
@@ -100,7 +101,7 @@ fi
 if [ "$DO_TEST" = "1" ]; then
   echo "==== TEST venv ===="
   new_app_venv "$VENV_ROOT/test" "$HERE/testplatform" \
-               "$HERE/testplatform/backend/requirements.txt" 0 "ba2_common" "$TEST_PY"
+               "$HERE/testplatform/backend/requirements.txt" 1 "ba2_common" "$TEST_PY"
   # Test-platform frontend (Vite/React UI) deps — so `ba2-test serve` can start the UI.
   FE="$HERE/testplatform/frontend"
   if [ -f "$FE/package.json" ]; then

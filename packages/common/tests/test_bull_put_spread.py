@@ -180,8 +180,9 @@ def test_the_action_type_exists_with_the_canonical_value():
 def test_it_is_classified_as_an_option_action():
     """``is_option_action`` is what routes a rule down the option path in
     ``rule_builders.action_from_rule``, ``ruleset_meta``, the live settings UI and the
-    backtest engine's ``_entry_is_option`` flag. Miss this one registry and the action
-    silently becomes an unknown equity action rather than erroring."""
+    shared per-entry router ``trade_cycle.entry_route`` (backtest engine and live
+    ``TradeManager``). Miss this one registry and the action silently becomes an unknown
+    equity action rather than erroring."""
     assert "open_bull_put_spread" in get_option_action_values()
     assert is_option_action("open_bull_put_spread")
 

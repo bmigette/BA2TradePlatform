@@ -411,6 +411,7 @@ def test_underlying_cache_is_lru_bounded(monkeypatch, store_root):
 
 
 def test_atm_iv_result_is_memoised(monkeypatch, store_root):
+    monkeypatch.setattr(pq, "_open_atm_iv_table", lambda *a, **k: None)  # the MEMO, not the table
     p = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                   spot_scope="test")
     first = p.get_atm_iv(_UNDER, date(2023, 1, 10))
@@ -425,6 +426,7 @@ def test_atm_iv_result_is_memoised(monkeypatch, store_root):
 def test_atm_iv_memo_caches_none_too(monkeypatch, store_root):
     """None is a VALID result ("not measurable today") and re-deriving it is the worst case —
     a symbol absent from the store is scanned in full before returning None."""
+    monkeypatch.setattr(pq, "_open_atm_iv_table", lambda *a, **k: None)  # the MEMO, not the table
     p = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                   spot_scope="test")
     assert p.get_atm_iv(_UNDER, date(2023, 1, 9)) is None
@@ -825,9 +827,10 @@ def test_raw_underlying_round_trips_through_its_array_dict(store_root):
     b = pq._RawUnderlying.from_arrays(_UNDER, arrays)
     _assert_same_raw(a, b)
 
-    # The as-of clamp bisects a C int buffer, not a list of boxed ints: half the private
-    # bytes per process and no transient int-object spike while building it.
-    assert isinstance(b.bar_ord_l, array.array) and b.bar_ord_l.typecode == "i"
+    # The as-of clamp bisects a C int buffer, not a list of boxed ints -- and since 2026-11-04
+    # that buffer IS the (mapped) ``bar_ord`` column, so it costs the process nothing.
+    assert isinstance(b.bar_ord_l, memoryview) and b.bar_ord_l.format == "i"
+    assert isinstance(b.bar_ord_l[0], int)
     assert len(b.bar_ord_l) == b.n_rows
     assert list(b.bar_ord_l) == b.bar_ord.tolist()
 
@@ -1419,10 +1422,12 @@ def _read_everything(p, dates=(date(2023, 1, 3), date(2023, 1, 5), date(2023, 1,
     return out
 
 
-def test_reset_run_overlays_drops_every_run_scoped_fill(provider, store_root):
+def test_reset_run_overlays_drops_every_run_scoped_fill(provider, store_root, monkeypatch):
     """The greeks memo, the bar dicts, the spot memo and the ATM-IV results are all a
     function of THIS run's reads. After a reset the overlay must look exactly as it did
-    before the run touched it."""
+    before the run touched it. (The ATM-IV memo is the scan's: the shared table, which
+    would otherwise answer these reads, is store data and is not run-scoped.)"""
+    monkeypatch.setattr(pq, "_open_atm_iv_table", lambda *a, **k: None)
     _read_everything(provider)
     ov = _overlay(store_root)
     assert ov._g_memo, "the reads filled nothing -- the test would pass vacuously"

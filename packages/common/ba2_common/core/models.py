@@ -257,9 +257,21 @@ class Transaction(SQLModel, table=True):
 
         orders = orders_where(transaction_id=self.id)
         executed = OrderStatus.get_executed_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
         for order in orders:
-            # Only count filled orders
+            # Only count filled orders -- including one CANCELED/EXPIRED after a PARTIAL fill:
+            # those shares traded. 2026-10-28 PRG (dev account 1): stop 809 sold 14 of 15 and
+            # was cancelled by the breached-stop close; skipping it sized close order 1426 at
+            # 15 against the 1 share held, and Alpaca refused it. refresh_transactions already
+            # counts these fills the same way. Only a TERMINAL order's fill is final; a resting
+            # one is still not counted.
             if order.status not in executed:
+                if (order.status in terminal and order.filled_qty
+                        and order.filled_qty > 0):
+                    if order.side == OrderDirection.BUY:
+                        total_qty += order.filled_qty
+                    elif order.side == OrderDirection.SELL:
+                        total_qty -= order.filled_qty
                 continue
             # ONE TRUTHINESS TEST USED TO DO TWO DIFFERENT JOBS. This was
             # ``if order.status in executed and order.filled_qty:``, which collapsed

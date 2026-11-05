@@ -40,3 +40,14 @@ def test_at_file_whitespace_separated_also_works():
         assert mod._parse_symbols_arg(f"@{path}") == ["AAPL", "MSFT", "GOOGL"]
     finally:
         os.unlink(path)
+
+
+def test_relative_symbol_files_resolve_against_the_callers_cwd_not_backend(tmp_path, monkeypatch):
+    """The command chdirs into backend/ first: a relative --symbols-file / @FILE / --allow-stale-symbols @FILE is the caller's."""
+    (tmp_path / "u.txt").write_text("aapl  # note\nmsft\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "_CALLER_CWD", str(tmp_path))
+    other = tmp_path / "backend"
+    other.mkdir()
+    monkeypatch.chdir(other)                                   # the process cwd is elsewhere, as after _enter_backend
+    assert mod._read_symbols_file("u.txt") == ["AAPL", "MSFT"]
+    assert mod._parse_symbols_arg("@u.txt")[:1] == ["AAPL"]

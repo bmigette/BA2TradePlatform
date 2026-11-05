@@ -442,9 +442,9 @@ def test_the_one_wiring_point_guard_would_actually_catch_a_second_one():
 
 
 def test_the_backtest_engine_carries_no_option_risk_manager_of_its_own():
-    """``daily_engine`` bypassed the risk manager for options (``if self._entry_is_option``)
-    and that is still how it stages an option entry — but the DECISION happens inside the
-    shared code. The engine must not grow an implementation beside it.
+    """``daily_engine`` bypasses the equity risk manager for option entries (the shared
+    ``trade_cycle.entry_route`` returns ``ENTRY_ROUTE_OPTION`` per fired entry) and that is
+    still how it stages an option entry — but the DECISION happens inside the shared code. The engine must not grow an implementation beside it.
 
     CALLING the shared risk manager is not carrying one, and since 2026-09-01 the engine
     does exactly that: one call per bar to ``OptionRiskManagement.update_sleeve_breaker``,

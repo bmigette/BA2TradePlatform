@@ -77,3 +77,19 @@ class StrategyOptimization(Base):
             "startedAt": self.started_at.isoformat() if self.started_at else None,
             "completedAt": self.completed_at.isoformat() if self.completed_at else None,
         }
+
+
+class StrategyOptimizationPopulation(Base):
+    """The FINAL evaluated population of a completed GA job (walk-forward chain seeding).
+
+    A table of its own so no reader of ``optimization_config`` (list endpoint, clone, re-run) ever
+    loads it. ``population`` = {generation, gene_names, genes, fitnesses}; ``gene_space_signature``
+    = the ordered gene definitions the genes were bred in (see app.services.chain_seed).
+    Migration 032 mirrors this table."""
+
+    __tablename__ = "strategy_optimization_populations"
+
+    optimization_id = Column(Integer, ForeignKey("strategy_optimizations.id"), primary_key=True)
+    gene_space_signature = Column(JSON, nullable=False)
+    population = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

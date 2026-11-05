@@ -302,7 +302,7 @@ def build_trial_config(db: Any, opt: Any, source_bt: Any, genome: Dict[str, Any]
     decoded = decode_params(strat, genome)
     hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
     trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
-                                          option_trade_records=True)  # a persisted row
+                                          option_trade_records=True, stored_row=True)  # a persisted row
     trial_cfg["name"] = name
     trial_cfg["persist_trading_db"] = True
     return trial_cfg

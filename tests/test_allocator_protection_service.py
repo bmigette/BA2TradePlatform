@@ -42,7 +42,8 @@ def broker():
 
 
 @pytest.fixture
-def acct(broker):
+def acct(broker, monkeypatch):
+    monkeypatch.setattr(aps, "SHRINK_CONFIRM_SECONDS", 0)
     with patch_equity(broker):
         yield make_account(broker)
 
@@ -117,6 +118,22 @@ def test_save_on_a_short_position_is_refused(acct, broker):
     result = _save(acct)
     assert not result.ok and "short" in result.message
     assert broker.place_calls == []
+
+
+def test_a_short_through_the_real_sdk_shape_reads_as_short_whatever_the_sign_convention(acct, broker):
+    # The fake emits the REAL tastytrade shape (absolute quantity + quantity_direction "Short");
+    # the adapter signs it (-10), and the allocator's read must still see a SHORT of 10 shares.
+    broker.positions["ABC"] = Decimal(-10)
+    raw = acct.get_positions()
+    assert [(p.qty, p.side) for p in raw] == [(-10.0, OrderDirection.SELL)]
+    assert aps._read_position(acct, "ABC") == (10.0, False)
+    # an adapter that publishes a magnitude + side (the old IBKR / old Tasty shape) is the same short
+    from types import SimpleNamespace
+    acct.get_positions = lambda: [SimpleNamespace(symbol="ABC", qty=10.0, side=OrderDirection.SELL)]
+    assert aps._read_position(acct, "ABC") == (10.0, False)
+    # and a long stays a long
+    acct.get_positions = lambda: [SimpleNamespace(symbol="ABC", qty=10.0, side=OrderDirection.BUY)]
+    assert aps._read_position(acct, "ABC") == (10.0, True)
 
 
 def test_save_with_an_unreadable_position_is_refused_not_assumed(acct, broker):
@@ -600,6 +617,7 @@ def test_a_shrinking_position_is_resized_automatically_with_a_log_entry(acct, br
     _save(acct)
     old = {s.complex_order_id for s in _slices()}
     broker.positions["ABC"] = Decimal(6)
+    assert aps.reconcile_account(acct).resized == [] and broker.delete_calls == []     # first sighting: wait
     report = aps.reconcile_account(acct)
     assert report.resized == ["ABC"] and set(broker.delete_calls) == old
     assert aps.covered_quantity(_slices()) == 6
@@ -652,6 +670,7 @@ def test_a_failed_automatic_resize_is_loud_and_not_retried(acct, broker, activit
     broker.positions["ABC"] = Decimal(6)
     broker.raise_on_place = TastytradeError("rejected: no")
     p = aps.get_protection(1, "ABC")
+    aps.reconcile_account(acct)                                                  # first sighting of the shrink
     assert aps.reconcile_account(acct).alarms == ["ABC"]
     p = aps.get_protection(1, "ABC")
     assert p.auto_failures == 1 and p.alert_code is not None
@@ -684,6 +703,7 @@ def test_the_growth_path_stops_retrying_after_three_failures_and_alerts(acct, br
 def test_a_position_sold_elsewhere_while_protected_is_resized(acct, broker):
     _save(acct)
     broker.positions["ABC"] = Decimal(4)
+    aps.reconcile_account(acct)                                                  # first sighting
     assert aps.reconcile_account(acct).resized == ["ABC"] and aps.covered_quantity(_slices()) == 4
 
 

@@ -14,6 +14,11 @@ Pins:
   * end-to-end via ``main() --dry-run``: an exclusion changes every printed job name (digest
     suffix appears) even with NONE of the five market-condition flags given, and an ordinary
     invocation (no --exclude-symbols) prints the plain, undigested names.
+
+The decision-time gene is DEFAULT ON in this driver (2026-10-07), which by itself renames every
+classic job (``-timegene-<digest>``). The exclusion tests therefore pass ``--decision-times fixed``
+(the legacy fixed-time naming) so the digest they look for can only come from the exclusion; one
+test per file pins the default (gene ON) naming.
 """
 from __future__ import annotations
 
@@ -106,11 +111,17 @@ def test_job_name_ignores_name_parallel_workers_tokens():
 # fixture/DB setup -- see tools/run_screener_capband_matrix.py's own dry-run/_completed_names
 # docstrings).
 # --------------------------------------------------------------------------- #
+#: the legacy fixed-time naming (the decision-time gene is default-ON in this driver)
+_FIXED_TIME = ["--decision-times", "fixed"]
+
+
 def _run_dry(monkeypatch, capsys, extra_argv):
     d = _driver()
     argv = ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
            "--strategies", "S1",
            "--skip-experts", "FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer",
+           # fmp = the legacy name layout these tests pin (the default alpaca adds a name token)
+           "--ohlcv-history-source", "fmp",
            ] + extra_argv
     monkeypatch.setattr(sys, "argv", argv)
     rc = d.main()
@@ -119,20 +130,44 @@ def _run_dry(monkeypatch, capsys, extra_argv):
 
 
 def test_dry_run_without_the_flag_prints_plain_undigested_names(monkeypatch, capsys):
-    rc, out = _run_dry(monkeypatch, capsys, [])
+    rc, out = _run_dry(monkeypatch, capsys, _FIXED_TIME)
     assert rc == 0
     assert "scr-large-FMPRating-S1" in out
     assert "scr-large-FactorRanker" in out
     assert not _DIGEST_RE.search(out)
 
 
+def test_dry_run_default_decision_time_gene_renames_classic_jobs_only(monkeypatch, capsys):
+    """Default (no --decision-times): the gene is ON, so the classic job carries the
+    ``-timegene-<digest>`` suffix; the exclusion flag is absent so nothing else digests. The
+    FactorRanker bypass job keeps its plain name (it gets no schedule genes)."""
+    rc, out = _run_dry(monkeypatch, capsys, [])
+    assert rc == 0
+    fmp = [ln for ln in out.splitlines() if "scr-large-FMPRating-S1" in ln and "TODO" in ln]
+    # (every --screener job name also carries the static-universe rule token, ``-sup1``)
+    assert len(fmp) == 1 and re.search(r"-timegene-sup1-lds2-d[0-9a-f]{12}\b", fmp[0]), fmp
+    fr = [ln for ln in out.splitlines() if ln.strip().startswith("TODO") and "FactorRanker" in ln]
+    assert len(fr) == 1 and "scr-large-FactorRanker-sup1 " in fr[0] and "timegene" not in fr[0], fr
+
+
 def test_dry_run_with_exclude_symbols_digests_every_job_name(monkeypatch, capsys):
     """Given alone (no market-condition flags), --exclude-symbols must still fold into the
     digest -- this is the case the operator actually runs for goal2027atr (dropping IAC from
     every job, treatment AND the all-off control)."""
-    rc, out = _run_dry(monkeypatch, capsys, ["--exclude-symbols", "IAC"])
+    rc, out = _run_dry(monkeypatch, capsys, _FIXED_TIME + ["--exclude-symbols", "IAC"])
     assert rc == 0
     lines = [ln for ln in out.splitlines() if ln.strip().startswith(("TODO", "DONE"))]
     assert len(lines) == 2  # FMPRating S1 + FactorRanker, per --skip-experts above
     for ln in lines:
         assert _DIGEST_RE.search(ln), f"job line missing exclude-symbols digest suffix: {ln!r}"
+
+
+def test_dry_run_history_source_is_part_of_every_job_name(monkeypatch, capsys):
+    """The OHLCV history source is job identity: default alpaca puts ``-hsalpaca`` in every name (before the
+    digest), fmp keeps the legacy name, so an alpaca job never skips as, or resumes the checkpoint of, an fmp job."""
+    monkeypatch.setattr(sys, "argv", ["run_screener_capband_matrix.py", "--dry-run", "--bands", "large",
+                                      "--strategies", "S1", "--decision-times", "fixed",
+                                      "--skip-experts", "FMPEarningsDrift,FMPInsiderClusterBuy,DeterministicScorer"])
+    assert _driver().main() == 0
+    todo = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip().startswith("TODO")]
+    assert todo and all("-hsalpaca" in ln for ln in todo), todo

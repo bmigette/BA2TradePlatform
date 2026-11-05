@@ -117,6 +117,9 @@ fi
 if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
   MC_PYTHON=/opt/ba2worker/ba2-venvs/test/bin/python
   MC_WARM=tools/warm_market_conditions.py
+  # Option jobs are fmp-only (the launcher refuses an option job stated as alpaca), and the warm tool
+  # has no default vendor: state it.
+  MC_HS=fmp
   MC_PLAN="${MC_PLAN:-/home/debian/ba2-grid/market_conditions_plan.json}"
   MC_UNIVERSE="${MC_UNIVERSE:-tools/options_universe_top100.txt}"
   MC_START="${STAGE1_START:-2020-01-01}"
@@ -169,21 +172,21 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
     if [ "$MC_DRY" = "1" ]; then
       echo "stage1_run.sh: market-condition warm step (profile $MC_PROFILE), run ONCE"
       echo "               before the matrix command below:"
-      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --out $MC_PLAN_P"
-      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --print-digest   # -> the $MC_PROFILE digest"
-      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest>"
-      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE"
+      echo "  $MC_PYTHON $MC_WARM plan --profile $MC_PROFILE --universe-file $MC_UNIVERSE --start $MC_START --end $MC_END --ohlcv-history-source $MC_HS --out $MC_PLAN_P"
+      echo "  $MC_PYTHON $MC_WARM build --plan $MC_PLAN_P --cache-only --ohlcv-history-source $MC_HS --print-digest   # -> the $MC_PROFILE digest"
+      echo "  $MC_PYTHON $MC_WARM verify --manifest <digest> --ohlcv-history-source $MC_HS"
+      echo "  $MC_PYTHON $MC_WARM prepare-host --manifest <digest> --profile $MC_PROFILE --ohlcv-history-source $MC_HS"
       MC_DIGEST="${MC_DIGEST:-DIGEST-FROM-BUILD}"
     else
       if [ -z "$MC_DIGEST" ]; then
         "$MC_PYTHON" "$MC_WARM" plan --profile "$MC_PROFILE" \
-          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --out "$MC_PLAN_P" || {
+          --universe-file "$MC_UNIVERSE" --start "$MC_START" --end "$MC_END" --ohlcv-history-source "$MC_HS" --out "$MC_PLAN_P" || {
           echo "stage1_run.sh: market-condition PLAN is actionable for $MC_PROFILE (missing" >&2
           echo "coverage or a failed source preflight) -- resolve it (re-fetch those symbols, or" >&2
           echo "trim the universe) and re-run. Refusing to launch a gated grid on an incomplete" >&2
           echo "snapshot." >&2
           exit 1; }
-        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only \
+        MC_DIGEST="$("$MC_PYTHON" "$MC_WARM" build --plan "$MC_PLAN_P" --cache-only --ohlcv-history-source "$MC_HS" \
           --print-digest | tail -n 1)" || {
           echo "stage1_run.sh: market-condition BUILD failed for $MC_PROFILE" >&2; exit 1; }
         if [ -z "$MC_DIGEST" ]; then
@@ -193,10 +196,10 @@ if [ "$MARKET_CONDITION_PROFILE" != "none" ]; then
       else
         echo "stage1_run.sh: market-condition profile $MC_PROFILE uses the pre-set manifest $MC_DIGEST (plan/build skipped)"
       fi
-      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" || {
+      "$MC_PYTHON" "$MC_WARM" verify --manifest "$MC_DIGEST" --ohlcv-history-source "$MC_HS" || {
         echo "stage1_run.sh: market-condition VERIFY failed for $MC_DIGEST ($MC_PROFILE)" >&2
         exit 1; }
-      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" \
+      "$MC_PYTHON" "$MC_WARM" prepare-host --manifest "$MC_DIGEST" --ohlcv-history-source "$MC_HS" \
         --profile "$MC_PROFILE" || {
         echo "stage1_run.sh: market-condition PREPARE-HOST failed for $MC_DIGEST ($MC_PROFILE)" >&2
         exit 1; }

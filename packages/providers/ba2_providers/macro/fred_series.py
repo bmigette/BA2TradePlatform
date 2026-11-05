@@ -235,15 +235,55 @@ def _spec(series_id: str) -> Dict[str, Any]:
         ) from None
 
 
+#: Waits between the attempts of one FRED GET. FRED answers 502/503/504 in bursts; one attempt
+#: per fetch turned each burst into a refused 09:30 pass (2026-10-07..20: 8 failed series). The
+#: LAST failure still raises, so a real outage stays loud.
+FRED_RETRY_WAITS_SECONDS = (2.0, 5.0, 15.0)
+
+
+def _sleep(seconds: float) -> None:
+    """The retry wait (a seam for tests)."""
+    time.sleep(seconds)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """A failure worth another attempt: a 5xx / 429 answer, a timeout or a dropped connection.
+    Any other 4xx (a bad key, an unknown series) is final."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        code = getattr(exc.response, "status_code", None)
+        return code is not None and (code == 429 or code >= 500)
+    return False
+
+
+def _get_with_retry(url: str, params: Dict[str, Any], sid: str):
+    """``requests.get`` with ``FRED_RETRY_WAITS_SECONDS`` of retry on a transient failure."""
+    from ba2_providers.fmp_common import record_fmp_request
+
+    attempts = len(FRED_RETRY_WAITS_SECONDS) + 1
+    for attempt in range(attempts):
+        record_fmp_request("fred-observations")
+        try:
+            resp = requests.get(url, params=params, timeout=120)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:  # noqa: BLE001 -- re-raised unless transient and retries remain
+            if attempt == attempts - 1 or not _is_transient(e):
+                raise
+            wait = FRED_RETRY_WAITS_SECONDS[attempt]
+            logger.warning("FRED %s: transient failure on attempt %d/%d (%s); retrying in %.0fs",
+                           sid, attempt + 1, attempts, type(e).__name__, wait)
+            _sleep(wait)
+
+
 def _fred_get(url: str, params: Dict[str, Any], sid: str) -> Dict[str, Any]:
     """One FRED GET, counted in the SAME purpose counters as FMP (spec section 6: requests and
     bytes by endpoint and purpose). A warm that refreshes the macro series is real background
     traffic, and an allowance that could not see it was governing the wrong half."""
-    from ba2_providers.fmp_common import record_fmp_bytes, record_fmp_request
+    from ba2_providers.fmp_common import record_fmp_bytes
 
-    record_fmp_request("fred-observations")
-    resp = requests.get(url, params=params, timeout=120)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params, sid)
     record_fmp_bytes("fred-observations", len(getattr(resp, "content", b"") or b""))
     payload = resp.json()
     if "error_message" in payload:

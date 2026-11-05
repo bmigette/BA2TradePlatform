@@ -21,26 +21,45 @@ Determinism (the Phase-4 core gate):
 The GA must NEVER enqueue a sub-task: ``init_task_queue(max_workers=1)`` (main.py) would
 deadlock. The fitness calls the synchronous runner in-process (confirmed in Replan).
 """
+import json as _json
 import logging
 import math as _math
 import random
+import re
 import sys as _sys
 import time as _time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+from ba2_common.core.ohlcv_history import resolve_job_history_source
+
+
+def _is_intraday_interval(interval: Any) -> bool:
+    """The engine's own split, ONE function (``universe_superset.interval_is_intraday``; the price source and
+    the launcher read the same one).  A missing interval is read as intraday: the safe side of
+    ``entry_times_for`` (it raises)."""
+    from ba2_providers.screener.universe_superset import interval_is_intraday
+    return interval_is_intraday(interval)
+from ba2_common.core.schedule_genes import validate_decision_times
+from ba2_common.core.ohlcv_history import (
+    LEGACY_HISTORY_SOURCE, OHLCV_HISTORY_SOURCE_KEY, check_history_source, resolve_job_history_source)
 from app.models import (
     SessionLocal,
     Strategy as StrategyModel,
     StrategyOptimization,
+    StrategyOptimizationPopulation,
     TaskQueue,
 )
 from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
+from app.services.chain_seed import (  # noqa: E402
+    CHAIN_SEED_KEY, SEEDED_FROM_KEY, ChainSeedError,
+    build_chain_seed_population, final_population_record, stored_record)
 from app.services.task_queue import get_task_queue
-from app.services.strategy_param_space import collect_param_space, decode_params
+from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
 from app.services.sync_client import push_optimization
@@ -228,6 +247,8 @@ _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 # Seconds between ctl-proxy reads on the progress hook. Module-level so tests can drop it to 0;
 # see _cancel_progress_cb for why reading a Manager proxy per call is not acceptable.
 _CANCEL_CHECK_INTERVAL_S = 5.0
+#: Longest traceback carried back in a failed trial's result (master log + /job-status).
+_TRACEBACK_MAX_CHARS = 6000
 
 
 class TrialCancelled(Exception):
@@ -365,7 +386,12 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
     released: Dict[str, Any] = {}
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
+        from app.services.backtest.backtest_account import assert_fill_rebase_enabled
         from app.services.strategy_fitness import compute_fitness
+
+        # A measurement hook that switches the fill re-base off must never reach a grid trial
+        # (raises FillRebaseDisabled, job-fatal by name).
+        assert_fill_rebase_enabled()
 
         # Wall time for THIS individual, measured inside the worker so it is pure compute and
         # excludes dispatch/queue wait. Logged next to the memory numbers because the two rise
@@ -391,6 +417,12 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
                "total_return": results.get("total_return"),
                "max_drawdown": results.get("max_drawdown"),
+               **_analysis_failures_field(results),
+               **_screener_gate_field(results),
+               **_entry_gate_field(results),
+               # The decision-time counter, so the MASTER can warn once per job (see
+               # ``_decision_time_missing``). Only when non-zero: other results keep their shape.
+               **_decision_time_missing(results),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -435,16 +467,26 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         # MacroAvailabilityUnknown (ba2_providers.macro.fred_series): a macro-reading expert's FRED
         # cache is in the old observation-date format, or was fetched before the run's last
         # decision -- again one file every trial reads, so every trial refuses identically.
-        fatal = type(e).__name__ in (
-            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation",
-            "SharedArrayFdExhausted", "SplitBasisRefused", "OptionSpotBasisMismatch",
-            "SpreadModelConfigError", "OptionTradeRecordsFlagMissing",
-            "MarketCalendarUnavailable", "NotARegularSession", "RiskFreeRateUnavailable",
-            "MacroAvailabilityUnknown")
+        fatal = job_fatal(e)
         snap = _trial_memory_snapshot()
         snap["option_overlays"] = released
+        # The traceback TRAVELS with the result (a pool child's own logging is disabled, so the
+        # result dict -- and, for a remote worker, /job-status -- is the only channel the master
+        # has). Bounded: it rides the pickled/JSON payload of every failed trial.
+        import traceback as _tb
+        _tb_text = _tb.format_exc()[-_TRACEBACK_MAX_CHARS:]
+        try:
+            from app.services.backtest import price_source as _ps
+            _ps._worker_log(f"!! trial raised {type(e).__name__}: {e}\n{_tb_text}")
+        except Exception:  # noqa: BLE001 -- the worker log channel must never mask the trial error
+            pass
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal, "mem": snap}
+                "fatal": fatal, "traceback": _tb_text,
+                # The exception TYPE travels with the result (a remote worker's result is a plain
+                # dict over the wire, never the exception object), so the master can classify by
+                # type and not only by the ``fatal`` flag a worker computed from ITS OWN copy of the
+                # set below.
+                "error_type": type(e).__name__, "mem": snap}
     finally:
         # FINALLY, not after the happy return: a failed or CANCELLED trial is when this
         # matters most. The worker is handed another genome immediately and the abandoned
@@ -690,6 +732,79 @@ class MemoryGovernor:
 #: escalating to SIGKILL. Kept short: the worker is already known to be unresponsive, and this delay
 #: sits directly in the recovery path.
 _ABANDON_KILL_GRACE_S = 5.0
+
+
+def _dispatch_with_stall_guard(jobs, pool, worker_fn, metric, stall_s: float, max_retries: int,
+                               clock=None):
+    """Feed ``jobs`` ((idx, flat, key, config)) to ``pool`` keeping every slot busy, YIELDING
+    ``(idx, flat, key, out)`` as each resolves, with a PER-TRIAL stall guard.
+
+    P6 (2026-10-24). The guard used to be one ``wait(timeout=stall_s)`` over the whole in-flight
+    set: when nothing completed for ``stall_s`` EVERY pending trial -- including ones that had
+    started seconds before -- was written off at ``STALLED_SENTINEL``, and the handler memoized
+    that sentinel so the genome was never evaluated again in the job. Now each trial has its own
+    clock (time since it was handed to its slot). One past ``stall_s`` has its slot respawned
+    (``pool.abandon_slot``) and is RE-QUEUED, up to ``max_retries`` times, before it is yielded as
+    ``stalled`` (for that generation only; the handler does not memoize it). Every step is logged
+    at ERROR.
+    """
+    from concurrent.futures import wait as _fwait, FIRST_COMPLETED
+    from collections import deque
+    clock = clock or _time.monotonic
+    jobs = list(jobs)
+    queue = deque(range(len(jobs)))
+    attempts = [0] * len(jobs)
+    pending: dict = {}      # future -> (position in jobs, started_at)
+    while queue or pending:
+        for slot in pool.idle_slots():
+            if not queue:
+                break
+            pos = queue.popleft()
+            attempts[pos] += 1
+            pending[pool.submit(slot, worker_fn, jobs[pos][3], metric)] = (pos, clock())
+        if not pending:
+            break
+        now = clock()
+        timeout = max(0.0, min(st for _, st in pending.values()) + stall_s - now)
+        done, _ = _fwait(list(pending), timeout=timeout, return_when=FIRST_COMPLETED)
+        for fut in done:
+            pos, _st = pending.pop(fut)
+            pool.mark_done(fut)
+            i, flat, key, _cfg = jobs[pos]
+            yield (i, flat, key, fut.result())
+        now = clock()
+        for fut, (pos, st) in list(pending.items()):
+            if fut in done or now - st < stall_s:
+                continue
+            del pending[fut]
+            i, flat, key, _cfg = jobs[pos]
+            slot = pool.abandon_slot(fut)
+            if attempts[pos] <= max_retries:
+                logger.error(
+                    f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no progress "
+                    f"in {stall_s:.0f}s on attempt {attempts[pos]}/{max_retries + 1}; slot {slot} "
+                    f"respawned, trial REQUEUED (attempt {attempts[pos] + 1}/{max_retries + 1})")
+                queue.appendleft(pos)
+                continue
+            from app.services.strategy_fitness import STALLED_SENTINEL
+            logger.error(
+                f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) stalled on all "
+                f"{attempts[pos]} attempt(s) of {stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
+                f"(STALLED) for this generation only (NOT memoized); slot {slot} respawned, "
+                f"job CONTINUES")
+            yield (i, flat, key, {
+                "ok": False,
+                "stalled": True,
+                "fitness": STALLED_SENTINEL,
+                "fitness_raw": STALLED_SENTINEL,
+                "trades": 0,
+                "total_return": 0.0,
+                "max_drawdown": 0.0,
+                "secs": stall_s * attempts[pos],
+                "slot": slot,
+                "attempts": attempts[pos],
+                "error": f"stalled: no progress in {stall_s:.0f}s on {attempts[pos]} attempt(s)",
+            })
 
 
 class _SlotPools:
@@ -1139,10 +1254,27 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     """
     import time
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
+    from app.services.backtest.backtest_account import assert_fill_rebase_enabled
+    assert_fill_rebase_enabled()      # the measurement hook is never legitimate in a persisted re-run
     last_exc: Optional[Exception] = None
     for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
-            return {"ok": True, "results": run_daily_backtest(config)}
+            # HEARTBEAT + CANCEL, exactly like _trial_worker: the engine's throttled progress_cb
+            # publishes ``bars`` on the control block, which /job-status reports. Without it a
+            # remote persist re-run showed bars == 0 for its whole life and the master's
+            # worker_client watchdog cancelled any run past _NEVER_STARTED_GRACE (420 s) as
+            # "accepted but never started" -- a false stall on every long TOP-N re-run. A fresh
+            # callback per attempt (its throttle state is per call). ``None`` for no ctl keeps the
+            # old call byte-identical.
+            _cb = _cancel_progress_cb(ctl)
+            return {"ok": True,
+                    "results": (run_daily_backtest(config) if _cb is None
+                                else run_daily_backtest(config, progress_cb=_cb))}
+        except TrialCancelled:
+            # The master abandoned this re-run: not a defect, and retrying (with backoff) would
+            # only hold the slot for a result nobody collects.
+            return {"ok": False, "error": "cancelled", "cancelled": True, "retryable": True,
+                    "fatal": False}
         except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
             last_exc = e
             if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
@@ -1194,6 +1326,36 @@ def _resolve_parallel_individuals(ga: Dict[str, Any]) -> int:
     return 1 if raw is None else int(raw)
 
 
+def split_expert_cfg(expert_cfg: Optional[Dict[str, Any]]):
+    """``ga["expert_params"]`` -> ``(model_cfg, screener_cfg, schedule_cfg)``: the ``screener:``/``schedule:``
+    entries are routed to their own namespace (prefix stripped), the rest is the model space. Shared by the
+    handler and the launcher's seed check so both see the same gene space."""
+    model_cfg = None
+    screener_cfg = None
+    schedule_cfg = None
+    if expert_cfg:
+        model_cfg = {k: v for k, v in expert_cfg.items()
+                     if not k.startswith("screener:") and not k.startswith("schedule:")}
+        screener_cfg = {
+            k[len("screener:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("screener:")
+        } or None
+        schedule_cfg = {
+            k[len("schedule:"):]: v
+            for k, v in expert_cfg.items()
+            if k.startswith("schedule:")
+        } or None
+    return model_cfg, screener_cfg, schedule_cfg
+
+
+def job_param_space(strategy, expert_cfg: Optional[Dict[str, Any]], bypass: bool) -> Dict[str, Any]:
+    """The joint GA gene space a job searches (what the handler stores as ``parameter_ranges``)."""
+    model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
+    return collect_param_space(strategy, expert_cfg=model_cfg, bypass=bypass,
+                               screener_cfg=screener_cfg, schedule_cfg=schedule_cfg)
+
+
 def _resolve_lattice_anchor(ga: Dict[str, Any]) -> str:
     """The GA step-lattice anchor a job runs under (``genetic.LATTICE_ANCHORS``).
 
@@ -1225,6 +1387,117 @@ def _resolve_early_stop_min_rel(ga: Dict[str, Any]) -> Optional[float]:
     from app.services.genetic import EARLY_STOP_MIN_REL_KEY, validate_early_stop_min_rel
 
     return validate_early_stop_min_rel(ga.get(EARLY_STOP_MIN_REL_KEY))
+
+
+from app.services.job_fatal import JOB_FATAL_ERROR_TYPES, job_fatal  # noqa: E402,F401  (ONE set)
+from ba2_providers.screener.universe_superset import RULE_ID as _SUPERSET_RULE_ID  # noqa: E402
+
+
+def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"af": {"passes": n, "failed": m}}`` for a trial that made analysis passes (a few ints), so the
+    job-level summary can aggregate them. Same shape idea as ``dt_missing``."""
+    af = (results or {}).get("analysis_failures")
+    if af and af.get("passes"):
+        return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
+    return {}
+
+
+def _entry_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"eg": {rule: {"n", "met", "b", "order"}}}`` -- the per-trial entry-gate counts
+    (``results["entry_gate_record"]``, see ``entry_gate_bt``), or ``{}`` when the run recorded none.
+    Summed over a job's trials by ``tools/report_entry_gates.py``."""
+    eg = (results or {}).get("entry_gate_record")
+    return {"eg": eg} if eg else {}
+
+
+def _screener_gate_field(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"sg": {"no_price": n, "outside": m, "symbols": k}}`` for a trial whose screener gate dropped candidates for want of a
+    price (``results["screener_gate"]``), so the persisted per-trial rows and the job-level summary show it (silent otherwise)."""
+    sg = (results or {}).get("screener_gate") or {}
+    np_, out = int(sg.get("no_price_candidate_decisions") or 0), int(sg.get("outside_preload_candidate_decisions") or 0)
+    if np_ or out:
+        return {"sg": {"no_price": np_, "outside": out, "symbols": int(sg.get("no_price_symbol_count") or 0)}}
+    return {}
+
+
+def summarise_screener_gate(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level WARNING aggregating the screener gate's no-price counts over the trials (returned, and each trial's ``sg`` is
+    persisted in ``all_results``)."""
+    rows = [(r["sg"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("sg")]
+    if not rows:
+        return None
+    agg = {"trials": len(rows), "no_price": sum(x["no_price"] for x, _ in rows), "outside": sum(x["outside"] for x, _ in rows),
+           "max_symbols": max(x["symbols"] for x, _ in rows)}
+    logger.warning(f"[{opt_name}] screener gate: candidates without a price in {agg['trials']} trial(s): "
+                   f"{agg['no_price']} loaded-but-unpriced decisions (up to {agg['max_symbols']} symbols in one trial), "
+                   f"{agg['outside']} outside the preloaded set (see each trial's 'sg' in all_results)")
+    return agg
+
+
+def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Dict[str, Any]]:
+    """ONE job-level line aggregating the per-trial analysis-failure counts (below the refusal
+    threshold they would otherwise be visible only inside each trial's results). Returns the aggregate."""
+    rows = [(r["af"], r.get("key")) for r in all_results if isinstance(r, dict) and r.get("af")]
+    if not rows:
+        return None
+    passes = sum(a["passes"] for a, _ in rows)
+    failed = sum(a["failed"] for a, _ in rows)
+    worst_af, worst_key = max(rows, key=lambda x: x[0]["failed"] / max(x[0]["passes"], 1))
+    agg = {"trials": len(rows), "passes": passes, "failed": failed,
+           "worst_share": round(worst_af["failed"] / max(worst_af["passes"], 1), 4), "worst_trial": worst_key}
+    line = (f"[{opt_name}] analysis passes over {len(rows)} trial(s): {passes} total, {failed} failed "
+            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
+    (logger.warning if failed else logger.info)(line)
+    return agg
+
+
+class _TrialErrorTally:
+    """Per-generation record of trials that FAILED (raised, or reported ``ok: False``).
+
+    A failed trial is still scored as a failure (ZERO_TRADE_SENTINEL) -- that is unchanged -- but
+    it is never silent: ``record`` logs each one at ERROR with the genome key/params, where it
+    ran, the exception type, message and traceback; ``summary`` is the one line the generation
+    summary carries (count + types), so a defect that hits many trials reads as a defect and not
+    as a poor population.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.types: Dict[str, int] = {}
+
+    def record(self, out: Dict[str, Any], key: Any, flat: Dict[str, Any], gen: Optional[int] = None,
+               n_gens: Optional[int] = None) -> None:
+        self.n += 1
+        etype = str(out.get("error_type") or "error")
+        self.types[etype] = self.types.get(etype, 0) + 1
+        where = f"gen {gen + 1}/{n_gens} " if gen is not None and n_gens else ""
+        mem = out.get("mem")
+        logger.error(
+            f"TRIAL ERROR {where}[{etype}] on {out.get('origin') or 'unknown origin'}: "
+            f"{out.get('error') or 'no error text'} | key {key} | params "
+            f"{_json.dumps(flat, default=str, sort_keys=True)[:400]}"
+            + (f" | worker mem: {mem}" if mem else "")
+            + (f"\n{out['traceback']}" if out.get("traceback") else ""))
+
+    def summary(self, total: int) -> str:
+        if not self.n:
+            return f"0 trial error(s) of {total}"
+        kinds = ", ".join(f"{t} x{c}" for t, c in sorted(self.types.items()))
+        return f"{self.n} of {total} trial(s) FAILED ({kinds})"
+
+
+def _abort_on_fatal_trial(out: Dict[str, Any], fatal: Dict[str, Any], key: Any, flat: Dict[str, Any]) -> None:
+    """The master's rule for a FAILED trial result: if it is job-fatal (the worker's ``fatal`` flag, or
+    its ``error_type`` in ``JOB_FATAL_ERROR_TYPES``), record the reason (naming the trial that tripped it)
+    and raise ``_FatalTrialError``: no further trial is dispatched, the caller marks the job failed.
+    Anything else returns and the trial is scored at the sentinel as before."""
+    if not (out.get("fatal") or job_fatal(out.get("error_type") or "")):
+        return
+    if fatal["msg"] is None:
+        fatal["msg"] = (f"{out['error']}  [job-fatal {out.get('error_type') or 'error'}; tripped by trial "
+                        f"key {key}, params {_json.dumps(flat, default=str, sort_keys=True)[:300]}]")
+        out["error"] = fatal["msg"]
+    raise _FatalTrialError(fatal["msg"])
 
 
 class _FatalTrialError(RuntimeError):
@@ -1285,7 +1558,14 @@ def mode_anchor_index(strategy) -> Dict[str, Any]:
     return out
 
 
-def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]) -> Dict[str, Any]:
+def market_members_for_space(strategy, space: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The market-profile member map, computed ONLY when the job's space searches ``market:profile`` (every older job
+    skips it and keeps its memo keys untouched)."""
+    return market_profile_members(strategy) if "market:profile" in space else None
+
+
+def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any],
+                           market_members: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The genome AS A PHENOTYPE: an inactive threshold is replaced by its authored anchor.
 
     A leaf whose mode decoded to ``off`` is REMOVED from the tree, so its ``cond:<id>:value`` gene
@@ -1301,6 +1581,15 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     Returns ``decoded_flat`` ITSELF when nothing needs rewriting, which is the whole guard for
     older jobs: no mode leaves, no copy, no change of key.
     """
+    # goal2027 2.1: genes dead under the genome's sizing mode (identity when there is no sizing gene).
+    from app.services.strategy_param_space import neutralise_sizing_genes
+    decoded_flat = neutralise_sizing_genes(decoded_flat)
+    # goal2027 2.8: DS factor genes of an off section / dead detail (identity without the dsfw genes).
+    from app.services.strategy_param_space import neutralise_ds_factor_genes
+    decoded_flat = neutralise_ds_factor_genes(decoded_flat)
+    # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
+    from app.services.strategy_param_space import neutralise_market_profile_genes
+    decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token
@@ -1505,7 +1794,27 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "optimization_config.backtest is required "
                 "(engine/datasets/date-range/initial_capital/...)",
             )
+        # An OPTION optimization on an OHLCV history other than fmp refuses NOW, before any trial (the per-trial
+        # check in _build_daily_trial_config stays as the backstop for option genes decoded later). A UI/API job
+        # that carries the alpaca stamp but names an option strategy / options cache fails here, not mid-GA.
+        from app.services.backtest.daily_backtest_handler import strategy_uses_options as _uses_options
+        from app.services.backtest.history_source import (
+            OptionHistorySourceUnsupported, refuse_option_job_on_unsupported_source as _refuse_option_source)
+        try:
+            _refuse_option_source(
+                {OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(backtest_cfg)},
+                uses_options=bool(backtest_cfg.get("options_cache_db")) or _uses_options(
+                    {"exit_rules": strategy.exit_rules, "entry_rules": strategy.entry_rules,
+                     "entry_action": backtest_cfg.get("entry_action")}),
+                where="handle_strategy_optimization")
+        except (OptionHistorySourceUnsupported, ValueError) as e:  # ValueError: UnknownHistorySource
+            return _fail(opt_id, db, str(e))
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
+        from app.services.backtest.backtest_account import FillRebaseDisabled, assert_fill_rebase_enabled
+        try:
+            assert_fill_rebase_enabled()     # the GA master refuses to start with the hook on
+        except FillRebaseDisabled as e:
+            return _fail(opt_id, db, str(e))
         try:
             lattice_anchor = _resolve_lattice_anchor(ga)
             early_stop_min_rel = _resolve_early_stop_min_rel(ga)
@@ -1518,22 +1827,22 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # by _collect_expert: the model space gets the remaining keys, and a screener_cfg/
         # schedule_cfg (prefix stripped back to the bare name) is passed alongside so
         # collect_param_space emits the ``screener:<setting>``/``schedule:<day>`` genes.
-        model_cfg = None
-        screener_cfg = None
-        schedule_cfg = None
-        if expert_cfg:
-            model_cfg = {k: v for k, v in expert_cfg.items()
-                        if not k.startswith("screener:") and not k.startswith("schedule:")}
-            screener_cfg = {
-                k[len("screener:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("screener:")
-            } or None
-            schedule_cfg = {
-                k[len("schedule:"):]: v
-                for k, v in expert_cfg.items()
-                if k.startswith("schedule:")
-            } or None
+        model_cfg, screener_cfg, schedule_cfg = split_expert_cfg(expert_cfg)
+
+        # DECISION-TIME gene (schedule:time): validated here, where the run's execution interval
+        # is known, in addition to the launcher's check -- a hand-written config that bypassed the
+        # launcher must not reach the GA with a time the engine cannot honour.
+        for _tkey in ("time", "entry_time", "manage_time"):      # entry/manage: goal2027 2.4 split genes
+            _time_spec = (schedule_cfg or {}).get(_tkey)
+            if _time_spec and _time_spec.get("optimize"):
+                try:
+                    _validated = validate_decision_times(
+                        _time_spec["choices"], backtest_cfg.get("execution_interval", "1d"))
+                except ValueError as e:
+                    return _fail(opt_id, db, f"schedule:{_tkey} gene: {e}")
+                if list(_time_spec["choices"]) != _validated:
+                    return _fail(opt_id, db, f"schedule:{_tkey} choices must be sorted ascending, got "
+                                             f"{list(_time_spec['choices'])!r}")
 
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
         # (e.g. FactorRanker) the search space must EXCLUDE tp/sl/cond:*/exit:* and search
@@ -1543,10 +1852,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         # --- Build the joint param space (Task 1) ---
         try:
-            param_space = collect_param_space(
-                strategy, expert_cfg=model_cfg, bypass=bypass_expert,
-                screener_cfg=screener_cfg, schedule_cfg=schedule_cfg,
-            )
+            param_space = job_param_space(strategy, expert_cfg, bypass_expert)
         except ValueError as e:
             return _fail(opt_id, db, str(e))
         opt.parameter_ranges = param_space
@@ -1566,6 +1872,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # template ONCE; ``{}`` for every strategy without mode genes, and then
         # ``canonical_trial_params`` is the identity function and the keys are today's.
         mode_anchors = mode_anchor_index(strategy)
+        market_members = market_members_for_space(strategy, param_space)   # goal2027 2.2: None unless market:profile is searched
 
         # --- DETERMINISM: seed both RNGs (Task 4 / determinism_rule) ---
         seed = int(ga["seed"])
@@ -1619,7 +1926,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
             cached = memo.get(key)
@@ -1640,6 +1947,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "robustness": (results or {}).get("robustness"),
                     "total_return": (results or {}).get("total_return"),
                     "max_drawdown": (results or {}).get("max_drawdown"),
+                    **_decision_time_missing(results or {}),
+                    **_analysis_failures_field(results or {}),
+                    **_screener_gate_field(results or {}),
+                    **_entry_gate_field(results or {}),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1717,7 +2028,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
-            backtest_cfg.get("rm_toggles_unpinned"))
+            backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
+            _screener_identity(backtest_cfg.get("screener_opt")),
+            resolve_job_history_source(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -1747,7 +2060,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "start": str(backtest_cfg.get("start_date")),
                     "end": str(backtest_cfg.get("end_date")),
                     "seed": backtest_cfg.get("seed"),
-                    "params": canonical_trial_params(mode_anchors, decoded_flat),
+                    "params": canonical_trial_params(mode_anchors, decoded_flat, market_members),
                 }
             )
 
@@ -1770,65 +2083,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             recycle happens while that slot is idle and the other slots keep running. There is no
             chunk barrier and no point at which the fleet waits on one slow genome.
             """
-            from concurrent.futures import wait as _fwait, FIRST_COMPLETED
-            # STALL GUARD. If a pool ever wedges again this must abort loudly rather than sit in
-            # wait() forever with no error and no log line (opt 328 sat 2h25m). Sized off the
-            # slowest trial actually observed here (1104s) with a wide margin.
+            # STALL GUARD, PER TRIAL (see _dispatch_with_stall_guard). If a pool ever wedges this
+            # must recover loudly rather than sit in wait() forever (opt 328 sat 2h25m). Sized off
+            # the slowest trial actually observed here (1104s) with a wide margin. A stalled
+            # trial is re-queued BT_LOCAL_STALL_RETRIES times before it is scored as stalled.
             _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
-            jobs = list(jobs)
-            pending: dict = {}      # future -> (idx, flat, key)
-            nxt = 0
-            while nxt < len(jobs) or pending:
-                for slot in _pool.idle_slots():
-                    if nxt >= len(jobs):
-                        break
-                    i, flat, key, cfg = jobs[nxt]
-                    nxt += 1
-                    pending[_pool.submit(slot, _trial_worker, cfg, opt.fitness_metric)] = (
-                        i, flat, key)
-                if not pending:
-                    break
-                done, _ = _fwait(list(pending), timeout=_stall_s,
-                                 return_when=FIRST_COMPLETED)
-                if not done:
-                    # SURGICAL STALL RECOVERY (2026-09-21, operator decision: "a stall should not
-                    # kill grid"). The old behaviour raised TimeoutError, which failed the WHOLE
-                    # job: one wedged genome killed a 16-job matrix at job 1/16 (2026-09-20
-                    # 21:54Z) and cost 7.5h of downtime. Now the wedged individual is scored at
-                    # STALLED_SENTINEL -- a value DISTINCT from the other sentinels so the
-                    # frequency stays countable in all_results -- and its slot is RESPAWNED (the
-                    # wedged worker is terminated, see _SlotPools.abandon_slot) so the next
-                    # generation cannot inherit a dead slot. The job continues.
-                    from app.services.strategy_fitness import STALLED_SENTINEL
-                    n_stalled = len(pending)
-                    for fut in list(pending):
-                        i, flat, key = pending.pop(fut)
-                        slot = _pool.abandon_slot(fut)
-                        logger.error(
-                            f"LOCAL POOL STALLED: individual {i} (key {str(key)[:12]}) made no "
-                            f"progress in {_stall_s:.0f}s -> scored {STALLED_SENTINEL:.0e} "
-                            f"(STALLED), slot {slot} respawned; job CONTINUES")
-                        yield (i, flat, key, {
-                            "ok": False,
-                            "stalled": True,
-                            "fitness": STALLED_SENTINEL,
-                            "fitness_raw": STALLED_SENTINEL,
-                            "trades": 0,
-                            "total_return": 0.0,
-                            "max_drawdown": 0.0,
-                            "secs": _stall_s,
-                            "slot": slot,
-                            "error": f"stalled: no progress in {_stall_s:.0f}s",
-                        })
-                    logger.error(
-                        f"LOCAL POOL STALLED: {n_stalled} individual(s) marked STALLED "
-                        f"({STALLED_SENTINEL:.0e}) after {_stall_s:.0f}s; slots respawned, "
-                        f"job continues")
-                    continue
-                for fut in done:
-                    i, flat, key = pending.pop(fut)
-                    _pool.mark_done(fut)
-                    yield (i, flat, key, fut.result())
+            _stall_retries = int(_os.getenv("BT_LOCAL_STALL_RETRIES", "2"))
+            yield from _dispatch_with_stall_guard(
+                jobs, _pool, _trial_worker, opt.fitness_metric, _stall_s, _stall_retries)
 
         def make_batch_fitness(execute_jobs, brute_force: bool = False):
             """*brute_force* (the exhaustive grid's single batch, see _evaluate_brute_force_batch)
@@ -1849,6 +2111,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
+                tally = _TrialErrorTally()
                 jobs = []  # (idx, decoded_flat, key, config)
                 n_gens = 1 if brute_force else int(ga["generations"])
                 is_last_gen = False if brute_force else gen_state["gen"] == n_gens - 1
@@ -1974,7 +2237,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                              "fitness_raw": out.get("fitness_raw"),
                              "robustness": out.get("robustness"),
                              "total_return": out.get("total_return"),
-                             "max_drawdown": out.get("max_drawdown")}
+                             "max_drawdown": out.get("max_drawdown"),
+                             **({"af": out["af"]} if out.get("af") else {}),
+                             **({"sg": out["sg"]} if out.get("sg") else {}),
+                             **({"eg": out["eg"]} if out.get("eg") else {}),
+                             **({"dt_missing": out["dt_missing"]} if out.get("dt_missing") else {})}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
@@ -1986,17 +2253,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         # of the genome, so a re-selection should re-run it.
                         from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
                         if out.get("stalled"):
-                            # A STALL is not a genome property either, but it IS reproducible
-                            # in-process: this genome wedged once, so re-selecting it would burn
-                            # another _stall_s of the batch -- up to 8-15 generations of it. So:
-                            # score it at the DEDICATED sentinel (distinct, so the frequency is
-                            # COUNTABLE in all_results -- the operator asked to see how often this
-                            # happens), memoize it, and record it. A crash stays un-memoized below.
+                            # A STALL is not a measurement of the genome: it already got
+                            # BT_LOCAL_STALL_RETRIES fresh attempts (_dispatch_with_stall_guard).
+                            # Scored at the DEDICATED sentinel (distinct, so the frequency is
+                            # COUNTABLE in all_results) for THIS generation only. NOT memoized
+                            # (P6, 2026-10-24): a memoized sentinel blocked every later
+                            # generation from ever re-evaluating the genome. NOT reported to the
+                            # GA as an evaluated individual either, so a mid-generation
+                            # checkpoint re-runs it after a restart, like a crash.
                             from app.services.strategy_fitness import STALLED_SENTINEL
                             fit = STALLED_SENTINEL
                             fits[i] = fit
-                            memo.put(key, fit)
-                            _report_trial_result(on_result, i, fit)
                             all_results.append({
                                 "params": flat, "fitness": fit, "key": key, "trades": 0,
                                 "fitness_raw": fit, "robustness": None,
@@ -2009,18 +2276,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                 "status": "stalled",
                                 "stall_reason": out.get("error"),
                                 "stall_secs": out.get("secs"),
-                                "stall_slot": out.get("slot")})
-                            logger.error(f"trial STALLED (scored {fit:.0e}, memoized): "
+                                "stall_slot": out.get("slot"),
+                                "stall_attempts": out.get("attempts")})
+                            logger.error(f"trial STALLED (scored {fit:.0e}, NOT memoized): "
                                          f"{out.get('error')}")
                         else:
                             fit = ZERO_TRADE_SENTINEL
                             fits[i] = fit
-                            if out.get("error"):
-                                mem = out.get("mem")
-                                logger.warning(f"trial failed in worker: {out['error']}"
-                                               + (f" | worker mem: {mem}" if mem else ""))
-                                if out.get("fatal") and fatal["msg"] is None:
-                                    fatal["msg"] = out["error"]
+                            if out.get("error") or out.get("error_type") or out.get("traceback"):
+                                tally.record(out, key, flat, gen=gen, n_gens=n_gens)
+                                # A job-fatal trial (``JOB_FATAL_ERROR_TYPES``, by flag OR by the TYPE the
+                                # worker sent back) ends the JOB at once:
                                     # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
                                     # an incomplete prewarm, a missing OHLCV cache -- so it affects
                                     # every remaining trial identically. Before this, fatal["msg"] was
@@ -2028,7 +2294,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                     # when most trials happened to succeed (the goal2020 OP case) the
                                     # run ground through all 8 generations and reported a confident
                                     # winner chosen partly by which genomes dodged the broken data.
-                                    raise _FatalTrialError(out["error"])
+                                _abort_on_fatal_trial(out, fatal, key, flat)
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
@@ -2069,11 +2335,16 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 # blind and the makespan win is imaginary, which is worth seeing in the log
                 # instead of inferring from wall times months later.
                 _cost_model.report(gen, n_gens)
+                # Per-generation error count, ALWAYS (a zero is information too). WARNING level:
+                # the run installs logging.disable(INFO).
+                (logger.error if tally.n else logger.warning)(
+                    f"Gen {gen + 1}/{n_gens} trial errors: {tally.summary(total_in_batch)}")
                 return fits
 
             return batch_fitness
 
         start_gen, init_pop, init_fits = 0, None, None
+        n_protected_seeds = 0
         # A brute-force grid has no population to resume or warm-start: never read (or, below,
         # clear) a GA checkpoint for one.
         ckpt = None if is_brute_force else _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
@@ -2116,6 +2387,51 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
             # the note this replaces -- see _elite_slice.
             _seed_all_results_from_checkpoint(ckpt, all_results)
+            if ga.get(CHAIN_SEED_KEY):
+                # This relaunch inserted a NEW row, so the lineage of the first launch is not on
+                # it: record what is known (the source), flagged as a checkpoint resume.
+                _src_name = db.query(StrategyOptimization.name).filter(
+                    StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).scalar()
+                _record_chain_lineage(db, opt, {
+                    "kind": "chain", "optimization_id": int(ga[CHAIN_SEED_KEY]),
+                    "name": _src_name, "resumed_from_checkpoint": True})
+        elif not is_brute_force and "seedPopulation" in ga:
+            # Authored seeds (stage 2): complete gene dicts, strict-encoded, padded by the GA's
+            # own seeded RNG. A checkpoint resume (branch above) still wins.
+            if ga.get("warmStartFromOptimizationId") or ga.get(CHAIN_SEED_KEY):
+                return _fail(opt_id, db, "seedPopulation is mutually exclusive with "
+                                         f"warmStartFromOptimizationId and {CHAIN_SEED_KEY}")
+            try:
+                init_pop = _build_seed_population(
+                    ga["seedPopulation"], optimizer, int(ga["populationSize"]))
+            except ValueError as e:
+                return _fail(opt_id, db, f"seedPopulation refused: {e}")
+            n_protected_seeds = len(ga["seedPopulation"])
+            logger.warning(
+                f"strategy_optimization {opt_id}: seeded {n_protected_seeds} of "
+                f"{len(init_pop)} individuals (rest random)")
+        elif not is_brute_force and ga.get(CHAIN_SEED_KEY):
+            if ga.get("warmStartFromOptimizationId"):
+                return _fail(opt_id, db, f"{CHAIN_SEED_KEY} and warmStartFromOptimizationId are "
+                                         f"mutually exclusive")
+            chain_src = db.query(StrategyOptimization).filter(
+                StrategyOptimization.id == int(ga[CHAIN_SEED_KEY])).first()
+            if chain_src is None:
+                return _fail(opt_id, db,
+                             f"chain seed source optimization {ga[CHAIN_SEED_KEY]} not found")
+            try:
+                _end_raw = backtest_cfg.get("end_date")
+                init_pop, _lineage = build_chain_seed_population(
+                    chain_src, stored_record(db.get(StrategyOptimizationPopulation, chain_src.id)),
+                    optimizer, int(ga["populationSize"]),
+                    date.fromisoformat(str(_end_raw)[:10]) if _end_raw else None)
+            except ChainSeedError as e:
+                return _fail(opt_id, db, f"chain seed refused: {e}")
+            _record_chain_lineage(db, opt, _lineage)
+            logger.warning(
+                f"strategy_optimization {opt_id}: chain-seeded population "
+                f"({len(init_pop)} individuals; {_lineage['filled_random']} filled randomly) from "
+                f"optimization {chain_src.id} ({chain_src.name!r})")
         elif not is_brute_force:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -2145,6 +2461,29 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         f"strategy_optimization {opt_id}: warm-started population "
                         f"({len(init_pop)} individuals) from optimization {warm_start_id}"
                     )
+
+        # requireAnEntryRule: generation 0 only (fresh job; a checkpoint resume is untouched).
+        # Absent or False = today's behaviour, no extra RNG draw.
+        if (not is_brute_force and ckpt is None and "requireAnEntryRule" in ga
+                and ga["requireAnEntryRule"] is not False):
+            if ga["requireAnEntryRule"] is not True:
+                return _fail(opt_id, db, f"requireAnEntryRule must be a bool, got "
+                                         f"{ga['requireAnEntryRule']!r}")
+            if "seedPopulation" not in ga and (
+                    ga.get("warmStartFromOptimizationId") or ga.get(CHAIN_SEED_KEY)):
+                return _fail(opt_id, db, "requireAnEntryRule applies to a fresh or seedPopulation "
+                                         "generation 0, not a warm-start or chain-seeded one")
+            try:
+                if init_pop is None:
+                    # Same draw sequence optimize() would make for a fresh generation 0.
+                    init_pop = optimizer._initial_population(int(ga["populationSize"]))
+                n_repaired = _require_an_entry_rule(
+                    init_pop, optimizer.param_names, optimizer._rng, n_protected_seeds)
+            except ValueError as e:
+                return _fail(opt_id, db, f"requireAnEntryRule refused: {e}")
+            logger.warning(
+                f"strategy_optimization {opt_id}: requireAnEntryRule repaired {n_repaired} of "
+                f"{len(init_pop) - n_protected_seeds} non-seed generation-0 individuals")
 
         # MARKET-CONDITION SNAPSHOT, ON THIS MACHINE, ONCE (design section 4.5). The master is
         # also a worker: it runs trials in its own pool and its own in-process re-runs, and until
@@ -2258,6 +2597,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     workers=_workers, master_version=_master_version,
                     required_packages=_master_info.get("required_package_versions"),
                     master_packages=_master_info.get("package_versions"),
+                    history_source=resolve_job_history_source(backtest_cfg),
                     pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,
@@ -2322,6 +2662,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                       f"generation {gen_state['gen'] + 1}/{ga['generations']}")
             logger.error(f"strategy_optimization {opt_id}: ABORTING {_where} — {e}")
             return _fail(opt_id, db, str(e))
+        except Exception as e:  # noqa: BLE001 -- SERIAL path: a job-fatal error aborts the job too
+            if not job_fatal(e):
+                raise
+            logger.error(f"strategy_optimization {opt_id}: ABORTING (serial trial) -- "
+                         f"{type(e).__name__}: {e}")
+            return _fail(opt_id, db, f"{e}  [job-fatal {type(e).__name__}]")
         finally:
             _logging.disable(_prior_disable)
             if _evaluator is not None:
@@ -2369,6 +2715,18 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "config) before trusting any result.",
             )
 
+        _fp = None
+        if not is_brute_force:
+            # The last EVALUATED generation, so a walk-forward chain can seed the next fold from
+            # it (chain_seed.build_chain_seed_population). Reassigned, not mutated: SQLAlchemy
+            # does not see in-place changes to a JSON column.
+            _fp = final_population_record(optimizer.param_ranges, result.get("final_population"))
+            if _fp is None and (ga.get("requireFinalPopulation") or ga.get(CHAIN_SEED_KEY)):
+                # A chain job exists to hand its population on; completing without one would let
+                # the next fold fail (or worse, start cold) hours later. The checkpoint is kept.
+                return _fail(opt_id, db, "this job must persist a final population (walk-forward "
+                                         "chain) but the search produced none")
+
         # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
         # search instead of resuming from the final generation of a completed one. (A brute-force
         # grid never read or wrote one.)
@@ -2380,7 +2738,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.progress = 100.0
         opt.best_params = result["best_params"]
         opt.best_fitness = result["best_fitness"]
+        _warn_decision_time_missing(opt.name, all_results)
+        summarise_analysis_failures(opt.name, all_results)
+        summarise_screener_gate(opt.name, all_results)
         opt.all_results = all_results
+        if _fp is not None:
+            db.merge(StrategyOptimizationPopulation(
+                optimization_id=opt_id, gene_space_signature=_fp["gene_space"],
+                population=_fp["population"]))
         db.commit()
         push_optimization(opt, db)
         logger.info(
@@ -2497,6 +2862,8 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
     if screener_opt:
         from ba2_providers.screener import metric_store as _ms
 
+        from ba2_common.core.ohlcv_history import resolve_job_history_source as _job_history_source
+        _ms.require_store_history_source(screener_opt["store"], _job_history_source(backtest_cfg))
         _ms.load_store(screener_opt["store"])  # warms the per-worker memo
         hoisted["screener_store"] = screener_opt["store"]
         hoisted["screener_base"] = screener_opt.get("base_settings", {})
@@ -2512,6 +2879,38 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
         # per-bar entry gate — _build_daily_trial_config skips its candidate-bound universe
         # restriction so the static run universe is kept byte-identical.
         hoisted["screener_gate_only"] = bool(screener_opt.get("gate_only"))
+        hoisted["screener_declared_ranges"] = screener_opt.get("declared_ranges")
+        # OPTION jobs: the screen is restricted to a fixed candidate list BEFORE the max_stocks cut (the panel gate's
+        # valid mask); the symbols are on the run config, so every trial, re-run and worker applies the same list.
+        _restr = screener_opt.get("universe_restriction")
+        if _restr is not None:
+            if not (isinstance(_restr, dict) and _restr.get("symbols")):
+                raise ValueError("screener_opt.universe_restriction must be {'symbols': [non-empty list], ...}")
+            if not (screener_opt.get("criteria_version") or screener_opt.get("panel")):
+                raise ValueError("screener_opt.universe_restriction needs the daily-panel gate (criteria_version/panel): "
+                                 "the legacy weekly store gate cannot apply it")
+            hoisted["screener_universe_restriction"] = [str(x).upper() for x in _restr["symbols"]]
+        # LIVE-SIMULATION gate (criteria live-daily-v2): the run carries the criteria version and the daily
+        # panel it was launched against.  A panel that does not cover the window, or was built under another
+        # definition, REFUSES here -- before any trial -- with the list of what is missing.
+        if screener_opt.get("criteria_version") or screener_opt.get("panel"):
+            from ba2_providers.screener import live_sim as _ls
+            if screener_opt.get("criteria_version") != _ls.CRITERIA_VERSION:
+                raise ValueError(f"screener_opt.criteria_version {screener_opt.get('criteria_version')!r} != the "
+                                 f"simulated {_ls.CRITERIA_VERSION!r}: a job is only resumed or re-run under the "
+                                 f"definition it was launched with")
+            if screener_opt.get("behaviour") != _ls.POST_FIX.name:
+                raise ValueError(f"screener_opt.behaviour {screener_opt.get('behaviour')!r} != {_ls.POST_FIX.name!r}")
+            # the stored reference is RELATIVE to the cache root: resolve it on THIS machine
+            panel_path = _ls.resolve_panel_path(screener_opt["panel"])
+            _ls.require_panel(panel_path, str(backtest_cfg["start_date"])[:10], str(backtest_cfg["end_date"])[:10],
+                              expect_fp=screener_opt["panel_fingerprint"])
+            from app.services.backtest.screener_gate import get_panel
+            get_panel(panel_path, screener_opt["panel_fingerprint"],
+                      history_source=_job_history_source(backtest_cfg))   # warms the per-worker (memory-mapped) memo
+            hoisted["screener_panel"] = panel_path
+            hoisted["screener_panel_fp"] = screener_opt["panel_fingerprint"]
+            hoisted["screener_criteria"] = screener_opt["criteria_version"]
     return hoisted
 
 
@@ -2573,15 +2972,60 @@ def _market_condition_trial_pins(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]
     return {"market_condition_profiles": profiles, "market_condition_manifests": manifests}
 
 
+def _decision_time_missing(results: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"dt_missing": {"entry": n, "manage": n}}`` when a trial had scheduled sessions with no
+    bar at the scheduled time (e.g. 15:30 on a half day), else ``{}``."""
+    counts = ((results or {}).get("decision_time") or {}).get("sessions_without_decision_bar")
+    if counts and any(counts.values()):
+        return {"dt_missing": {"entry": int(counts["entry"]), "manage": int(counts["manage"])}}
+    return {}
+
+
+def _warn_decision_time_missing(opt_name: str, all_results: list) -> None:
+    """ONE job-level WARNING aggregating the per-trial counters (engines log them at DEBUG)."""
+    hit = [r["dt_missing"] for r in all_results if isinstance(r, dict) and r.get("dt_missing")]
+    if hit:
+        logger.warning(
+            f"[{opt_name}] {len(hit)} of {len(all_results)} trials had scheduled sessions with NO "
+            f"bar at the scheduled decision time (e.g. 15:30 on a 13:00 half day: no decision, "
+            f"no entry): per-trial entry/manage sessions skipped, total "
+            f"{sum(h['entry'] for h in hit)}/{sum(h['manage'] for h in hit)}")
+
+
+def _schedule_times_from_decoded(decoded: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
+    """The ENTRY and the MANAGE schedule's ``times`` a decoded genome stands for (None without a time
+    gene). The ONE place the two are derived: the single ``schedule:time`` gene drives both with one
+    value; the split genes (goal2027 2.4, ``schedule:entry_time`` / ``schedule:manage_time``) give each
+    its own. Nothing else assumes they are equal."""
+    gene_time = decoded.get("schedule_time")
+    entry, manage = decoded.get("schedule_entry_time"), decoded.get("schedule_manage_time")
+    if gene_time and (entry or manage):
+        raise ValueError("schedule:time and the split schedule:entry_time / schedule:manage_time genes "
+                         "are mutually exclusive")
+    if gene_time:
+        return {"entry": [gene_time], "manage": [gene_time]}
+    if entry or manage:
+        if not (entry and manage):
+            raise ValueError("a split decision-time genome needs both entry_time and manage_time")
+        return {"entry": [entry], "manage": [manage]}
+    return None
+
+
 def _build_daily_trial_config(
     backtest_cfg: Dict[str, Any],
     decoded: Dict[str, Any],
     hoisted: Optional[Dict[str, Any]] = None,
     *,
     option_trade_records: bool,
+    stored_row: bool = False,
 ) -> Dict[str, Any]:
     """Assemble the ``run_daily_backtest`` config for one trial from the run-level
     backtest_cfg + the decoded trial params.
+
+    ``stored_row`` (keyword, default False = a NEW run): True when ``backtest_cfg`` is the block of
+    an optimization that was STORED (a re-run, a TOP-N rebuild, an inspection tool). A stored block
+    that states no entry time predates the field and legitimately ran at the legacy first-bar time
+    (``entry_times_for``, which a NEW intraday run without a time refuses instead of guessing).
 
     ``option_trade_records`` (REQUIRED, keyword, no default -- every caller states it): whether
     an OPTION run's trade rows carry the option trade record (entry/exit snapshots, BT/live
@@ -2655,6 +3099,19 @@ def _build_daily_trial_config(
     options_store = resolve_options_store(backtest_cfg)
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db),
                             backtest_options_provider(backtest_cfg))
+    # The OHLCV history this trial reads (fmp | alpaca): the run's stamp, resolved HERE and written
+    # into the trial config below (this dict is a whitelist; a distributed trial ships only the
+    # config). A stored block without the stamp predates the switch and resolves to fmp. An option
+    # trial on any other source refuses before it starts (ThetaData strikes are as-traded and the
+    # split-basis converter reads FMP's calendar).
+    from app.services.backtest.history_source import refuse_option_job_on_unsupported_source
+    history_source = resolve_job_history_source(backtest_cfg)
+    refuse_option_job_on_unsupported_source(
+        {OHLCV_HISTORY_SOURCE_KEY: history_source},
+        uses_options=bool(options_cache_db) or strategy_uses_options(
+            {"exit_rules": decoded.get("exit_rules"), "entry_rules": decoded.get("entry_rules"),
+             "entry_action": entry_action}),
+        where="_build_daily_trial_config")
 
     # BYPASS-expert screener wiring: a bypass expert (e.g. FactorRanker) builds its DYNAMIC
     # universe from the fast metric_store by reading ``universe_source`` / ``screener_store`` /
@@ -2737,6 +3194,7 @@ def _build_daily_trial_config(
     # runs -> the engine's gating is a no-op and the config is byte-identical to before.
     screener_runtime = None
     screener_candidate: Optional[List[str]] = None
+    screener_universe_guard: Optional[str] = None   # None = no per-decision universe guard applies
     if hoisted and hoisted.get("screener_store"):
         from ba2_providers.screener import metric_store as _ms
         from ba2_providers.screener.metric_store import normalize_screener_settings
@@ -2750,32 +3208,70 @@ def _build_daily_trial_config(
         # silently ignored every criterion except ``market_cap_max`` — the screener-settings-opt
         # bug. This makes the optimizer gate apply the SAME criteria as the standalone/UI path.
         eff_norm = normalize_screener_settings(eff)
+        # A genome outside the DECLARED ranges (warm-start seed from another job, stored pin) is refused
+        # BEFORE the run, not discovered as a guard failure mid-job (universe_superset.ScreenerGenomeOutOfRange).
+        from ba2_providers.screener.universe_superset import check_genes_in_declared_ranges
+        if hoisted.get("screener_panel"):
+            from ba2_providers.screener import live_sim as _lsx
+            _lsx.require_complete_settings(eff_norm, where="trial screener settings")
+        check_genes_in_declared_ranges(decoded.get("screener_overrides") or {},
+                                       hoisted.get("screener_declared_ranges"), where="genome")
         screener_runtime = {
             "store": hoisted["screener_store"],
             "settings": eff_norm,
             "cadence_days": hoisted.get("screener_cadence_days", 7),
+            **({"criteria_version": hoisted["screener_criteria"], "panel": hoisted["screener_panel"],
+                "panel_fingerprint": hoisted["screener_panel_fp"]}
+               if hoisted.get("screener_panel") else {}),
             # Defence-in-depth on the classic per-bar gate (daily_engine._screened_symbols_for_bar)
             # — see excluded_instruments above. Redundant with the enabled_instruments intersection
             # below for a non-bypass expert, but threaded through so this gate can never be the one
             # place an excluded symbol slips back in.
             "excluded_symbols": excluded_instruments,
+            **({"universe_restriction": hoisted["screener_universe_restriction"]}
+               if hoisted.get("screener_universe_restriction") else {}),
         }
         # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
-        # screen can EVER select over [start,end] (screened_symbol_union with the trial's own eff
-        # settings), intersected with the band. The per-bar gate already restricts ENTRIES to a
-        # subset of this, so results are IDENTICAL — but the engine no longer preloads/analyses the
-        # whole band (e.g. 814 -> ~150 symbols), the dominant screener-opt memory + CPU cost. Matches
-        # the standalone path's _resolve_enabled_instruments. Bypass experts keep the full band (they
-        # rank the whole universe). Exact per-trial bound — no gene-tightening assumption.
+        # screen can EVER select over the run's VISIBLE scans (``screened_symbol_union_visible`` with
+        # the trial's own eff settings: its own filters, sort AND max_stocks cut), intersected with
+        # the job's static universe. The per-bar gate selects exactly a subset of this, so results
+        # are IDENTICAL to loading the whole static universe -- but the engine preloads and analyses
+        # only what this genome can trade (the dominant screener-opt memory + CPU cost), which is
+        # what keeps the per-trial cost near the old small list's now that the static universe is the
+        # true superset (``ba2_providers.screener.universe_superset``). Exact per-trial bound, no
+        # gene-tightening assumption. Bypass experts keep the full static universe (they rank the
+        # whole screened universe off the store themselves).
+        #
+        # THE INTERSECTION IS WHERE A PICK USED TO VANISH SILENTLY: a symbol the genome's gate
+        # selects that is not in the static universe was dropped here (and again by the engine's
+        # ``entry_universe`` filter) with nothing said. It is now loud: the engine counts every such
+        # gate selection against ``enabled_instruments`` (``results["screener_universe"]``) and, under
+        # the superset rule, REFUSES the run (``ScreenerUniverseRefusal``, job-fatal). A failure to
+        # compute the bound propagates; it never falls back to loading the band.
         if not bypass and not hoisted.get("screener_gate_only"):
-            try:
-                _df = _ms.load_store(hoisted["screener_store"])
-                _sd = str(backtest_cfg["start_date"])[:10]
-                _ed = str(backtest_cfg["end_date"])[:10]
-                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm, excluded_instruments))
-                screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
-            except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
-                screener_candidate = None
+            _sd = str(backtest_cfg["start_date"])[:10]
+            _ed = str(backtest_cfg["end_date"])[:10]
+            if hoisted.get("screener_panel"):
+                # ONE code path with the gate and the static superset (screener_gate): the same selection
+                # function, "now" replaced by the session's [low, high], no max_stocks cut.
+                from app.services.backtest import screener_gate as _sg
+                from ba2_common.core.ohlcv_history import resolve_job_history_source as _job_hist
+                _union = set(_sg.prune_symbols(
+                    _sg.get_panel(hoisted["screener_panel"], hoisted["screener_panel_fp"],
+                                  history_source=_job_hist(backtest_cfg)), _sd, _ed, eff_norm, excluded_instruments,
+                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")),
+                    restrict_to=hoisted.get("screener_universe_restriction")))
+            else:
+                from app.services.backtest.history_source import load_job_store
+                _df = load_job_store(hoisted["screener_store"], backtest_cfg)
+                _union = set(_ms.screened_symbol_union_visible(
+                    _df, _sd, _ed, eff_norm, excluded_instruments,
+                    intraday=_is_intraday_interval(backtest_cfg.get("execution_interval"))))
+            screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
+            # The universe guard (engine): REFUSE under the superset rule; a STORED block from before
+            # the rule keeps its frozen list and only WARNS (counts + log), see rerun_handler.
+            screener_universe_guard = ("refuse" if backtest_cfg.get("screener_universe_rule") == _SUPERSET_RULE_ID
+                                       else "warn")
 
     if not isinstance(option_trade_records, bool):
         raise TypeError(f"option_trade_records must be True or False, got "
@@ -2791,16 +3287,39 @@ def _build_daily_trial_config(
     # static (pulled from the run-level override, unaffected by the genes) since only the day
     # selection is being optimized for now.
     base_run_sched = backtest_cfg.get("run_schedule_override")
-    if decoded.get("schedule_days"):
+    manage_schedule_override = backtest_cfg.get("manage_schedule_override")
+    gene_times = _schedule_times_from_decoded(decoded)
+    if decoded.get("schedule_days") or gene_times:
+        days = decoded.get("schedule_days") or (base_run_sched or {}).get("days")
+        if not days:
+            raise ValueError("a decision-time gene needs the run's entry days (schedule:<day> "
+                             "genes or a run_schedule_override with days): refusing to guess")
         run_schedule_override = {
-            "days": decoded["schedule_days"],
-            "times": (base_run_sched or {}).get("times") or ["09:30"],
+            "days": days,
+            # THE DECISION-TIME GENE wins; else the run-level time when the run states one; else
+            # the shared default decision time (a new run only: stored rows reconstruct through
+            # schedule_genes with their own time).
+            "times": (gene_times["entry"] if gene_times
+                      else entry_times_for((base_run_sched or {}).get("times"), stored_row=stored_row,
+                                           intraday=_is_intraday_interval(backtest_cfg.get("execution_interval")))),
         }
     else:
         run_schedule_override = base_run_sched
+    if gene_times:
+        # The open-positions MANAGE pass is retimed from the same gene (live deploys both
+        # schedules at the one stored time; see tools/import_deploy_payload.py). Days stay the
+        # run's own.
+        if not (manage_schedule_override or {}).get("days"):
+            raise ValueError("a decision-time gene needs backtest.manage_schedule_override with "
+                             "days to retime: refusing to leave the manage pass on another time")
+        manage_schedule_override = {"days": dict(manage_schedule_override["days"]),
+                                    "times": gene_times["manage"]}
 
     return {
         "backtest_id": trial_id,
+        # Which OHLCV history the trial reads (see above). In the whitelist: a key missing here is
+        # silently dropped and the trial would read the legacy history whatever the job says.
+        OHLCV_HISTORY_SOURCE_KEY: history_source,
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
         "start_date": backtest_cfg["start_date"],
         "end_date": backtest_cfg["end_date"],
@@ -2820,7 +3339,7 @@ def _build_daily_trial_config(
         "subtype": backtest_cfg.get("subtype"),
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
         "run_schedule_override": run_schedule_override,
-        "manage_schedule_override": backtest_cfg.get("manage_schedule_override"),
+        "manage_schedule_override": manage_schedule_override,
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
         # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one
         # lucky, non-reproducible mega-winner can't win the search. None = no cap. Carried from
@@ -2880,6 +3399,12 @@ def _build_daily_trial_config(
         # SCREENER seam: the per-individual effective screener settings + store path the engine
         # uses to gate entries to the per-day screened universe. None for non-screener runs.
         "screener_runtime": screener_runtime,
+        # SCREENER UNIVERSE GUARD ("refuse" | "warn" | None): whether the engine REFUSES, only
+        # WARNS, or does not check that every symbol the per-decision gate selects is in this
+        # run's loaded universe. In the whitelist (this dict is rebuilt key by key).
+        "screener_universe_guard": screener_universe_guard,
+        **({"screener_static_universe": list(backtest_cfg["enabled_instruments"])}
+           if screener_universe_guard and screener_candidate is not None else {}),
         # MARKET-CONDITION entry gates (design 2026-09-15 sections 4.1/4.5). Same whitelist reason
         # as stress_spread_bps and robust_fitness above -- this dict rebuilds the trial config key
         # by key, so a knob missing HERE is inert however correctly it was parsed upstream. Both
@@ -2895,6 +3420,19 @@ def _build_daily_trial_config(
         #   Decoded through the ONE reader of both shapes, so a genome persisted before Task 10
         #   (singular ``market_condition_profile``/``_manifest``) re-runs unchanged.
         **_market_condition_trial_pins(backtest_cfg),
+        # STAGE-2 STYLE record (ba2test_launcher, plan 2026-09-25 Task 7): the resolved style
+        # spec (members, overrides, price-cap policy, content sha, source path) a style job was
+        # built from. Same whitelist reason as above: carried so every trial, re-run and top-N
+        # persist of a style job says which style it is. Written ONLY when the run has one, so
+        # every other trial config keeps its exact shape. (Its member-scoped assigned-stock
+        # hold, ``hold_assigned_stock_tags``, rides in ``account_settings``, carried whole.)
+        **({"option_style": backtest_cfg["option_style"]}
+           if "option_style" in backtest_cfg else {}),
+        # SPY regime gates (--benchmark-regime-gates): the run-level opt-in the backtest handler
+        # reads to build and publish the SPY regime calendar. Written ONLY when on, so the trial
+        # config of every existing run stays key-for-key identical. The calendar itself is NOT
+        # shipped: each worker builds it from its own local cache, like StressedCalendar.
+        **({"benchmark_regime_gates": True} if backtest_cfg.get("benchmark_regime_gates") else {}),
         # This config was assembled by the OPTIMIZER (GA trial, re-run, robustness variant or
         # top-N persist), not by the single-backtest path. The market-condition seam reads it to
         # tell "a research run may compute on a miss" from "a search may not".
@@ -3145,7 +3683,8 @@ def _report_trial_result(on_result, idx: int, fitness: float) -> None:
 #: Mapped to the expert's DEFAULT (pinned against get_settings_definitions by test): a value equal
 #: to the default scores exactly like an absent key, so it is not folded -- an explicit "same"
 #: from a UI-built config must not orphan a checkpoint written without the key.
-CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same"}
+#: ``rank_universe`` (MLForecast, strategy MLR): the ranked symbol set; the same genes score differently on another one.
+CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": ""}
 
 
 def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -3163,9 +3702,21 @@ def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[st
     return out
 
 
+def _screener_identity(screener_opt: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``<criteria>/<behaviour>/<panel fingerprint>`` of a live-simulation screener job (None otherwise): what the gate
+    DEFINES and which data it ran on are part of the job's identity."""
+    so = screener_opt or {}
+    if not so.get("criteria_version"):
+        return None
+    return f"{so['criteria_version']}/{so.get('behaviour')}/{so.get('panel_fingerprint')}"
+
+
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            expert_settings: Optional[Dict[str, Any]] = None,
-                           rm_toggles_unpinned: Optional[List[str]] = None) -> str:
+                           rm_toggles_unpinned: Optional[List[str]] = None,
+                           screener_universe_rule: Optional[str] = None,
+                           screener_criteria: Optional[str] = None,
+                           ohlcv_history_source: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3200,6 +3751,20 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
     explicitly so the identity does not rely on that incidental shape and so a checkpoint written
     under one policy can never be resumed into the other even if some future gene space happened
     to coincide.
+
+    ``screener_universe_rule`` (``backtest.screener_universe_rule``, e.g. ``superset-v1``) joins it the
+    same way -- ONLY when stamped, so a job from before the rule keeps its fingerprint byte for byte. The
+    static universe a screener job searches over is part of its identity: a checkpoint (and the
+    population of genomes in it, scored on the OLD cap-ranked top-50 list) must never be resumed into a
+    run on the corrected superset universe, or the other way round.
+
+    ``screener_criteria`` (``backtest.screener_opt.criteria_version``, e.g. ``live-daily-v2``) joins it the
+    same way: the DEFINITION of what the gate selects (live-simulation daily criteria vs the old weekly store
+    gate) is part of the job's identity; a checkpoint scored under one must never be resumed under the other.
+
+    ``ohlcv_history_source`` (``backtest.ohlcv_history_source``) joins it the same way, but ONLY when it is not
+    the legacy ``fmp``: the price history a genome was scored on is part of its identity, so an ``alpaca`` job
+    never resumes an ``fmp`` job's checkpoint, while every job from before the switch keeps its fingerprint.
     """
     import hashlib
     import json
@@ -3214,12 +3779,23 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["expert_settings"] = sorted(expert_settings.items())
     if rm_toggles_unpinned:
         payload["rm_toggles_unpinned"] = sorted(rm_toggles_unpinned)
+    if screener_universe_rule:
+        payload["screener_universe_rule"] = screener_universe_rule
+    if screener_criteria:
+        payload["screener_criteria"] = screener_criteria
+    if ohlcv_history_source is not None and ohlcv_history_source != LEGACY_HISTORY_SOURCE:
+        payload["ohlcv_history_source"] = check_history_source(ohlcv_history_source)
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor
     early_stop_min_rel = _resolve_early_stop_min_rel(ga)
     if early_stop_min_rel is not None:
         payload["early_stop_min_rel"] = early_stop_min_rel
+    if "seedPopulation" in ga:
+        # A seeded run is a different experiment from an unseeded (or differently seeded) one with the same
+        # gene space: its generation-0 population differs, so a checkpoint must never cross.
+        payload["seed_population"] = hashlib.sha1(json.dumps(
+            ga["seedPopulation"], sort_keys=True, default=str).encode("utf-8")).hexdigest()
     blob = json.dumps(payload, sort_keys=False, default=str)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -3479,6 +4055,64 @@ def _load_checkpoint(task_id: str, fingerprint: Optional[str] = None) -> Optiona
         db.close()
 
 
+def assert_population_screener_genes_in_range(optimizer: Any, population: list) -> None:
+    """Refuse, AT JOB SETUP, a warm-start population holding a screener gene outside the declared range the
+    static universe was derived from (the declared ranges are the optimizer's own ``screener:*`` gene ranges).
+    The superset is derived from them, so a seed outside would select names the job never loaded."""
+    from ba2_providers.screener.universe_superset import check_genes_in_declared_ranges
+    declared = {k[len("screener:"):]: {"min": v["min"], "max": v["max"]}
+                for k, v in optimizer.param_ranges.items() if k.startswith("screener:") and v.get("type") != "choice"}
+    if not declared:
+        return
+    names = list(optimizer.param_ranges.keys())
+    for n, ind in enumerate(population):
+        vals = {names[i][len("screener:"):]: ind[i] for i in range(len(names))
+                if names[i].startswith("screener:") and ind[i] is not None}
+        check_genes_in_declared_ranges(vals, declared, where=f"warm-start individual #{n}")
+
+
+def _record_chain_lineage(db, opt: StrategyOptimization, lineage: Dict[str, Any]) -> None:
+    """Write the ``seededFrom`` block on the new row (reassigned: JSON columns are not mutation-tracked)."""
+    opt.optimization_config = {**(opt.optimization_config or {}), SEEDED_FROM_KEY: lineage}
+    db.commit()
+
+
+def _build_seed_population(seeds: Any, optimizer: GeneticOptimizer, target: int) -> list:
+    """Generation 0 from ``ga["seedPopulation"]``: every seed strict-encoded (a ValueError names
+    the seed index and gene), then ``optimizer.seeded_population`` pads with the GA's own seeded
+    RNG and balances stratified genes. Seeds come first, unmodified."""
+    if not isinstance(seeds, list) or not seeds or not all(isinstance(s, dict) for s in seeds):
+        raise ValueError("must be a non-empty list of gene dicts")
+    if len(seeds) > target:
+        raise ValueError(f"{len(seeds)} seeds exceed populationSize {target}")
+    encoded = []
+    for i, seed in enumerate(seeds):
+        try:
+            encoded.append(optimizer.encode_params_strict(seed))
+        except ValueError as e:
+            raise ValueError(f"seed #{i}: {e}") from e
+    return optimizer.seeded_population(encoded, target)
+
+
+_ENTRY_RULE_GENE = re.compile(r"^entry:(?!.*:a\d+:enabled$).+:enabled$")
+
+
+def _require_an_entry_rule(population: list, param_names: list, rng: Any,
+                           n_protected: int = 0) -> int:
+    """In place: every individual after the first ``n_protected`` (the seeds) whose rule-level
+    ``entry:<rid>:enabled`` genes are ALL 0 gets one of them, chosen with ``rng``, set to 1.
+    Returns how many were repaired. Raises ValueError when the space has no such gene."""
+    idx = [i for i, n in enumerate(param_names) if _ENTRY_RULE_GENE.match(n)]
+    if not idx:
+        raise ValueError("the parameter space has no entry:<rule>:enabled gene")
+    repaired = 0
+    for ind in population[n_protected:]:
+        if all(int(round(ind[i])) == 0 for i in idx):
+            ind[rng.choice(idx)] = 1
+            repaired += 1
+    return repaired
+
+
 def _build_warm_start_population(
     source_opt: StrategyOptimization, optimizer: GeneticOptimizer, target_size: int
 ) -> Optional[list]:
@@ -3505,7 +4139,16 @@ def _build_warm_start_population(
     if not results:
         return None
     tail = results[-target_size:] if len(results) > target_size else list(results)
+    has_stratified = any(c.get("stratify") for c in optimizer.param_ranges.values())
+    if has_stratified:
+        # A seed from a job without the decision-time gene must not silently become "the first
+        # time": the missing value is completed so generation 0 is balanced (see
+        # ``GeneticOptimizer.seeded_population``), padding included.
+        return optimizer.seeded_population(
+            [optimizer.encode_params(e.get("params") or {}, allow_missing_stratified=True)
+             for e in tail], target_size)
     population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
+    assert_population_screener_genes_in_range(optimizer, population)
     while len(population) < target_size:
         population.append(optimizer.toolbox.individual())
     return population[:target_size]

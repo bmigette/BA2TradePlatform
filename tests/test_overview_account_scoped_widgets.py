@@ -558,7 +558,9 @@ class _Broker:
 
 def _use_brokers(monkeypatch, brokers):
     """Point the widget's account factory at *brokers* (``{account_id: _Broker}``)."""
-    monkeypatch.setattr(fpl_mod, 'get_account_instance_from_id',
+    # The account factory is resolved by the calculator (services.floating_pl), not by the widget module.
+    import ba2_trade_platform.services.floating_pl as _calc
+    monkeypatch.setattr(_calc, 'get_account_instance_from_id',
                         lambda account_id, session=None: brokers.get(account_id))
 
 

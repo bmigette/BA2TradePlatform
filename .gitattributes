@@ -1,0 +1,4 @@
+# JSON files whose bytes are fingerprinted (split_overrides.json is hashed into the split table; the build refuses a changed one):
+# always LF in the working tree, whatever core.autocrlf says.  The fingerprints also read CRLF as LF (sha256_text_file).
+packages/providers/ba2_providers/ohlcv/alpaca_history/*.json text eol=lf
+packages/providers/ba2_providers/screener/*.json text eol=lf

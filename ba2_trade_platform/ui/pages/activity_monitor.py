@@ -14,7 +14,7 @@ import asyncio
 
 from ...core.db import get_db
 from ...core.models import ActivityLog, ExpertInstance, AccountDefinition
-from ...core.types import ActivityLogSeverity, ActivityLogType
+from ...core.types import ActivityLogSeverity, ActivityLogType, get_activity_type_display_label
 from ...logger import logger
 from ..components.LazyTable import LazyTable, ColumnDef, LazyTableConfig
 from ..utils.perf_logger import PerfLogger
@@ -196,7 +196,7 @@ class ActivityMonitorPage:
                     "timestamp": timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),
                     "timestamp_sort": int(timestamp_utc.timestamp()),  # Unix timestamp for numeric sorting
                     "severity": activity.severity.value,
-                    "type": activity.type.value.replace("_", " ").title(),
+                    "type": get_activity_type_display_label(activity.type),
                     "expert": expert_display,
                     "account": account_display,
                     "description": activity.description,
@@ -289,7 +289,7 @@ class ActivityMonitorPage:
                 with ui.column():
                     ui.label("Activity Type(s)")
                     self.type_select = ui.select(
-                        options={t: t.value.replace("_", " ").title() for t in ActivityLogType},
+                        options={t: get_activity_type_display_label(t) for t in ActivityLogType},
                         value=[],
                         multiple=True,
                         on_change=lambda e: setattr(self, 'filter_types', e.value if e.value else [])

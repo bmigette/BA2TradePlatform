@@ -284,3 +284,251 @@ def test_prune_paths_survives_an_undeletable_file(tmp_path, monkeypatch):
     assert not (tmp_path / "after.parquet").exists()   # the loop continued past the failure
     assert (tmp_path / "locked.parquet").exists()
     assert len(warned) == 1 and "locked.parquet" in warned[0], warned
+
+
+# --------------------------------------------------------------------------------------------
+# History-source scoped pushes
+# --------------------------------------------------------------------------------------------
+def _hist_cache(tmp_path, fmp=True, alpaca=True):
+    if fmp:
+        _write(tmp_path / "FMPOHLCVProvider" / "AAPL_1d.parquet", b"f" * 10)
+    if alpaca:
+        _write(tmp_path / "AlpacaHistoryOHLCVProvider" / "AAPL_1d.parquet", b"a" * 10)
+    _write(tmp_path / "options" / "o.sqlite", b"o")
+    _write(tmp_path / "_derived" / "x" / "a.npy", b"d")
+    return tmp_path
+
+
+def test_exclude_dirnames_is_top_level_only(tmp_path):
+    _write(tmp_path / "FMPOHLCVProvider" / "a.parquet", b"1")
+    _write(tmp_path / "nested" / "FMPOHLCVProvider" / "b.parquet", b"2")
+    man = cache_sync.build_manifest(str(tmp_path), exclude_dirnames=("FMPOHLCVProvider",))
+    assert {f["rel_path"] for f in man["files"]} == {"nested/FMPOHLCVProvider/b.parquet"}
+
+
+def test_history_manifest_alpaca_excludes_fmp_and_derived(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    local = worker_client._history_manifest("alpaca")
+    rels = {f["rel_path"] for f in local["files"]}
+    assert rels == {"AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"}
+
+
+def test_history_manifest_fmp_keeps_fmp_excludes_alpaca(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    rels = {f["rel_path"] for f in worker_client._history_manifest("fmp")["files"]}
+    assert rels == {"FMPOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"}
+
+
+def test_alpaca_push_without_local_alpaca_folder_refuses(tmp_path, monkeypatch):
+    from app.services import worker_client
+    _hist_cache(tmp_path, alpaca=False)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    with pytest.raises(ValueError, match="AlpacaHistoryOHLCVProvider"):
+        worker_client.push_cache({"name": "w", "url": "http://w"}, history_source="alpaca")
+
+
+def test_push_without_a_history_source_refuses():
+    from app.services import worker_client
+    with pytest.raises(TypeError):
+        worker_client.push_cache({"name": "w", "url": "http://w"})
+    with pytest.raises(Exception, match="unknown OHLCV history source"):
+        worker_client.push_cache({"name": "w", "url": "http://w"}, history_source=None)
+
+
+def test_prune_guard_refuses_paths_outside_the_cache_root(tmp_path):
+    with pytest.raises(ValueError):
+        cache_sync.assert_prunable(["../outside.txt"], str(tmp_path))
+    with pytest.raises(ValueError):
+        cache_sync.assert_prunable([str(tmp_path.parent / "abs.txt")], str(tmp_path))
+    cache_sync.assert_prunable(["FMPOHLCVProvider/a.parquet"], str(tmp_path))
+
+
+def test_cli_sync_cache_requires_history_source(monkeypatch, capsys):
+    import ba2test_launcher
+    # the launcher under test is THIS checkout's (the venv's editable install points at the main clone)
+    import os
+    here = os.path.normcase(os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    assert os.path.normcase(os.path.realpath(ba2test_launcher.__file__)).startswith(here)
+    with pytest.raises(SystemExit) as e:
+        ba2test_launcher.main(["sync-cache", "--worker", "w1"])
+    assert e.value.code == 2
+    assert "--ohlcv-history-source" in capsys.readouterr().err
+
+
+def _push_with_remote(monkeypatch, tmp_path, source, remote_rels, with_crc=True):
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    calls = []
+
+    class _R:
+        def __init__(self, p): self.p = p
+        def raise_for_status(self): pass
+        def json(self): return self.p
+
+    class _C:
+        def __init__(self, **_k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, **_k):
+            # a worker that answers hash_dirs: the same content as the master's _hist_cache
+            data = {"AlpacaHistoryOHLCVProvider": b"a" * 10, "FMPOHLCVProvider": b"f" * 10}
+            files = []
+            for r in remote_rels:
+                e = {"rel_path": r, "size": 10}
+                top = r.split("/")[0]
+                if with_crc and top in data:
+                    e["crc32"] = _crc_of(data[top])
+                files.append(e)
+            return _R({"files": files})
+        def post(self, url, **k):
+            calls.append((url, k.get("json")))
+            return _R({"pruned": 1})
+
+    monkeypatch.setattr(worker_client.httpx, "Client", _C)
+    worker_client.push_cache({"name": "w", "url": "http://w"}, history_source=source,
+                             log=lambda _m: None)
+    return [c for c in calls if c[0].endswith("/cache/prune")]
+
+
+@pytest.mark.parametrize("source,other", [("alpaca", "FMPOHLCVProvider"),
+                                          ("fmp", "AlpacaHistoryOHLCVProvider")])
+def test_push_leaves_other_history_untouched_but_prunes_elsewhere(tmp_path, monkeypatch, source, other):
+    own = "AlpacaHistoryOHLCVProvider" if source == "alpaca" else "FMPOHLCVProvider"
+    remote = [f"{own}/AAPL_1d.parquet", "options/o.sqlite", f"{other}/AAPL_1d.parquet",
+              f"{other}/OLD_1d.parquet", "options/old.sqlite"]
+    prunes = _push_with_remote(monkeypatch, tmp_path, source, remote)
+    assert [p[1] for p in prunes] == [{"rel_paths": ["options/old.sqlite"]}]
+
+
+def test_push_with_only_other_history_stale_sends_no_prune(tmp_path, monkeypatch):
+    remote = ["AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite",
+              "FMPOHLCVProvider/AAPL_1d.parquet"]
+    assert _push_with_remote(monkeypatch, tmp_path, "alpaca", remote) == []
+
+
+# --------------------------------------------------------------------------------------------
+# Content check of the history folder (rebuilt in place): crc32 with a per-host cache
+# --------------------------------------------------------------------------------------------
+def _count_crc_reads(monkeypatch):
+    reads = []
+    real = cache_sync._crc32_file
+    monkeypatch.setattr(cache_sync, "_crc32_file", lambda p, *a, **k: reads.append(Path(p).name) or real(p, *a, **k))
+    return reads
+
+
+def test_add_crc32_hashes_only_the_named_top_level_folders(tmp_path):
+    _hist_cache(tmp_path)
+    man = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)),
+                               ("AlpacaHistoryOHLCVProvider",), str(tmp_path))
+    by = {f["rel_path"]: f for f in man["files"]}
+    assert "crc32" in by["AlpacaHistoryOHLCVProvider/AAPL_1d.parquet"]
+    assert "crc32" not in by["FMPOHLCVProvider/AAPL_1d.parquet"]
+    assert "crc32" not in by["options/o.sqlite"]
+
+
+def test_add_crc32_does_not_rehash_an_unchanged_file(tmp_path, monkeypatch):
+    """The crc is computed when the cache CHANGES, not on every push: an unchanged file's crc
+    comes from the per-host cache keyed by (size, mtime)."""
+    _hist_cache(tmp_path)
+    reads = _count_crc_reads(monkeypatch)
+    dirs = ("AlpacaHistoryOHLCVProvider",)
+    first = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)), dirs, str(tmp_path))
+    assert reads == ["AAPL_1d.parquet"]
+    second = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)), dirs, str(tmp_path))
+    assert reads == ["AAPL_1d.parquet"]          # served from the cache
+    assert first["files"] == second["files"]
+
+
+def test_add_crc32_rehashes_a_file_rewritten_at_the_same_size(tmp_path, monkeypatch):
+    import os
+    _hist_cache(tmp_path)
+    dirs = ("AlpacaHistoryOHLCVProvider",)
+    p = tmp_path / "AlpacaHistoryOHLCVProvider" / "AAPL_1d.parquet"
+    before = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)), dirs, str(tmp_path))
+    st = p.stat()
+    p.write_bytes(b"b" * 10)                      # same size, new content
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    after = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)), dirs, str(tmp_path))
+    assert cache_sync.diff_content_mismatch(after["files"], before) == ["AlpacaHistoryOHLCVProvider/AAPL_1d.parquet"]
+
+
+def test_add_crc32_survives_a_corrupt_cache_file(tmp_path, monkeypatch):
+    _hist_cache(tmp_path)
+    (tmp_path / cache_sync.CRC_CACHE_NAME).write_text("{not json")
+    reads = _count_crc_reads(monkeypatch)
+    man = cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)),
+                               ("AlpacaHistoryOHLCVProvider",), str(tmp_path))
+    assert reads == ["AAPL_1d.parquet"]
+    assert all("crc32" in f for f in man["files"] if f["rel_path"].startswith("Alpaca"))
+
+
+def test_add_crc32_keeps_other_folders_cache_entries(tmp_path, monkeypatch):
+    """An fmp push must not evict the alpaca entries (and vice versa): each would re-hash its
+    whole folder on the next push of the other source."""
+    _hist_cache(tmp_path)
+    reads = _count_crc_reads(monkeypatch)
+    for dirs in (("AlpacaHistoryOHLCVProvider",), ("FMPOHLCVProvider",), ("AlpacaHistoryOHLCVProvider",)):
+        cache_sync.add_crc32(cache_sync.build_manifest(str(tmp_path)), dirs, str(tmp_path))
+    assert reads == ["AAPL_1d.parquet", "AAPL_1d.parquet"]   # once per folder, not three times
+
+
+def test_missing_crc32_lists_same_size_files_the_remote_cannot_compare():
+    local = [{"rel_path": "H/a", "size": 3, "crc32": 1}, {"rel_path": "H/b", "size": 3, "crc32": 2},
+             {"rel_path": "H/c", "size": 3, "crc32": 3}, {"rel_path": "other/d", "size": 3}]
+    remote = {"files": [{"rel_path": "H/a", "size": 3},               # no crc -> unverifiable
+                        {"rel_path": "H/b", "size": 4},               # size differs -> diff_missing's
+                        {"rel_path": "H/c", "size": 3, "crc32": 9},   # comparable
+                        {"rel_path": "other/d", "size": 3}]}          # not a hashed folder
+    assert cache_sync.missing_crc32(local, remote, ("H",)) == ["H/a"]
+
+
+def _crc_of(data: bytes) -> int:
+    import zlib
+    return zlib.crc32(data)
+
+
+def test_push_resends_a_history_file_changed_at_the_same_size(tmp_path, monkeypatch):
+    """The 2026-10-22 failure: a rebuilt file at its old size was skipped by the size-only diff."""
+    from app.services import worker_client
+    _hist_cache(tmp_path)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(tmp_path))
+    own = "AlpacaHistoryOHLCVProvider/AAPL_1d.parquet"
+    gets, pushed = [], []
+
+    class _R:
+        def __init__(self, p): self.p = p
+        def raise_for_status(self): pass
+        def json(self): return self.p
+
+    class _C:
+        def __init__(self, **_k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, **k):
+            gets.append(k.get("params"))
+            return _R({"files": [{"rel_path": own, "size": 10, "crc32": _crc_of(b"OLD-STALE!")},
+                                 {"rel_path": "options/o.sqlite", "size": 1}]})
+        def post(self, url, **k):
+            if url.endswith("/cache/push"):
+                import tarfile
+                with tarfile.open(fileobj=io.BytesIO(b"".join(k["content"]))) as t:
+                    pushed.extend(t.getnames())
+            return _R({"extracted": len(pushed), "pruned": 0})
+
+    monkeypatch.setattr(worker_client.httpx, "Client", _C)
+    res = worker_client.push_cache({"name": "w", "url": "http://w"}, history_source="alpaca",
+                                   log=lambda _m: None)
+    assert gets == [{"hash_dirs": "AlpacaHistoryOHLCVProvider"}]
+    assert pushed == [own] and res["pushed"] == 1
+
+
+def test_push_refuses_a_worker_that_reports_no_crc(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="reports no crc32"):
+        _push_with_remote(monkeypatch, tmp_path, "alpaca",
+                          ["AlpacaHistoryOHLCVProvider/AAPL_1d.parquet", "options/o.sqlite"],
+                          with_crc=False)

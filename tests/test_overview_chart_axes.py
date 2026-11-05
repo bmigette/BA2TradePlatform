@@ -191,6 +191,29 @@ def test_label_chart_is_stacked_with_the_same_money_and_a_total(nicegui_client, 
     assert opts['legend']['bottom'] == 0 and opts['legend']['type'] == 'scroll'
 
 
+def test_monthly_income_total_adds_the_forecast_like_the_bar(nicegui_client, monkeypatch):
+    """2026-10-29: Oct showed -330.04 closed, 49.08 paid + 24.44 forecast dividends; Total read
+    -280.96 while the bars added up to -256.52. Total now sums what the bars show ($ mode)."""
+    from nicegui import ui
+    import ba2_trade_platform.ui.pages.overview as ov
+    captured = []
+
+    def fake_echart(options, **k):
+        captured.append(options)
+        return ui.label('chart')
+    monkeypatch.setattr(ov, 'responsive_echart', fake_echart)
+    tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
+    tab._forecast = {'2026-10': {'total': 24.44}, '2026-11': {'total': 60.0}}
+    months = ['2026-09', '2026-10', '2026-11']
+    income = {'2026-09': {'pnl': 10.0, 'div': 5.0}, '2026-10': {'pnl': -330.04, 'div': 49.08}}
+    with nicegui_client.content:
+        tab._render_monthly_realized_income_chart(months, income, {'2026-09': 1000.0, '2026-10': 1000.0})
+    by = {s['name']: s for s in captured[0]['series']}
+    assert by['Total (incl. forecast)']['data'] == [15.0, -256.52, 60.0]
+    assert by['Dividends (forecast, estimated)']['data'] == [None, 24.44, 60.0]
+    assert 'Total (incl. forecast)' in captured[0]['legend']['data']
+
+
 # ---- Growth by Label flags (item 4) ----------------------------------------------------------------------------
 
 def test_dividends_and_invested_default_off_and_saved_choices_win():

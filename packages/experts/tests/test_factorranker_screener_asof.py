@@ -57,3 +57,39 @@ def test_screen_universe_live_as_of_none(monkeypatch):
     monkeypatch.setattr(FRmod, "StockScreener", FakeScreener)
     FactorRanker._screen_universe(_fake_self())  # live path: no as_of
     assert captured["as_of"] is None  # live screen unchanged
+
+
+# ---- ScreenerDataError: live propagates, backtest is untouched --------------------------------
+
+def _raising_screener(exc):
+    class FakeScreener:
+        def __init__(self, settings, as_of=None):
+            pass
+
+        def screen(self):
+            raise exc
+
+    return FakeScreener
+
+
+def test_live_screener_data_error_propagates(monkeypatch):
+    import pytest
+    from ba2_providers.StockScreener import ScreenerDataError
+
+    monkeypatch.setattr(FRmod, "StockScreener",
+                        _raising_screener(ScreenerDataError("FMP history failed for 40/100")))
+    with pytest.raises(ScreenerDataError, match="40/100"):
+        FactorRanker._screen_universe(_fake_self())   # as_of None = live
+
+
+def test_backtest_screener_data_error_still_degrades_to_empty(monkeypatch):
+    from ba2_providers.StockScreener import ScreenerDataError
+
+    monkeypatch.setattr(FRmod, "StockScreener",
+                        _raising_screener(ScreenerDataError("x")))
+    assert FactorRanker._screen_universe(_fake_self(), as_of=AS_OF) == []
+
+
+def test_live_generic_failure_still_degrades_to_empty(monkeypatch):
+    monkeypatch.setattr(FRmod, "StockScreener", _raising_screener(ValueError("boom")))
+    assert FactorRanker._screen_universe(_fake_self()) == []

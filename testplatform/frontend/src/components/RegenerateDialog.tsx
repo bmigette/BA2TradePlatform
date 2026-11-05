@@ -67,7 +67,7 @@ const RegenerateDialog: React.FC<RegenerateDialogProps> = ({
     { key: 'regenerate_technical', label: 'Technical Indicators', sub: 'Recalculate SMA, RSI, MACD, etc.' },
     { key: 'regenerate_sentiment', label: 'News & Sentiment', sub: 'Re-fetch and analyze news articles' },
     { key: 'regenerate_fundamentals', label: 'Fundamentals', sub: 'Re-fetch financial statements & earnings' },
-    { key: 'regenerate_macro', label: 'Macro Economic Data', sub: 'Re-fetch GDP, CPI, interest rates, etc.' },
+    { key: 'regenerate_macro', label: 'Macro Economic Data', sub: 'Re-read first-release CPI, unemployment, rates, VIX, etc.' },
   ];
 
   return (

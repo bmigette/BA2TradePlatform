@@ -372,6 +372,14 @@ class _FakeUI:
 
 
 @pytest.fixture
+def fmp_key():
+    """Adding an account needs a stored FMP key (core/account_creation_guard.py)."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+    add_instance(AppSetting(key="FMP_API_KEY", value_str="test-fmp-key"))
+
+
+@pytest.fixture
 def fake_ui(monkeypatch):
     f = _FakeUI()
     monkeypatch.setattr(settings_page, "ui", f)
@@ -665,7 +673,7 @@ def test_account_save_refuses_a_bad_int_by_name_before_any_write(fake_ui, int_ac
         assert not s.exec(select(AccountDefinition)).all(), "a refused save must write nothing"
 
 
-def test_account_numeric_values_are_resolved_before_the_write(fake_ui, int_account, monkeypatch):
+def test_account_numeric_values_are_resolved_before_the_write(fake_ui, int_account, monkeypatch, fmp_key):
     """A cleared int saves the DECLARED default; a typed one is written as an int."""
     written = {}
     monkeypatch.setattr(int_account, "save_setting",
@@ -901,7 +909,7 @@ def _no_accounts():
 
 
 @pytest.mark.parametrize("key", ["api_key", "api_secret"])
-def test_account_save_allows_an_empty_credential(fake_ui, key):
+def test_account_save_allows_an_empty_credential(fake_ui, key, fmp_key):
     """User decision (2026-09-26): an empty API key/secret is ALLOWED to stay empty -- no
     refusal for empty str settings, required or not."""
     from sqlmodel import select
@@ -1185,6 +1193,16 @@ def test_app_settings_edited_fields_are_written(fake_ui):
     t.openai_input.value = "sk-new"
     t.save_settings()
     assert _app_rows() == [("openai_api_key", "sk-new"), ("worker_count", "3")]
+
+
+def test_app_settings_session_guard_switch_shows_its_declared_default_and_saves_a_flip(fake_ui):
+    t = _app_tab()
+    assert t.session_guard_input.value is True                       # declared default ON
+    _app_tab().save_settings()
+    assert _app_rows() == []                                          # no edit, nothing written
+    t.session_guard_input.value = False
+    t.save_settings()
+    assert _app_rows() == [("scheduled_session_guard_enabled", "false")]
 
 
 def test_runtime_readers_use_the_same_declaration(monkeypatch):

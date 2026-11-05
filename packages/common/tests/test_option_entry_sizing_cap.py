@@ -38,6 +38,10 @@ class _FakeAccount:
         # cash-settled, so the option multiplier is 1.0 anyway).
         return self.get_balance()
 
+    def option_capital_equity(self):
+        # The option entry's sizing base is the account's EQUITY; this double has no positions.
+        return self.get_balance()
+
 
 def _setup_db():
     db_path = os.path.join(tempfile.mkdtemp(), "opt_sizing_cap.sqlite")

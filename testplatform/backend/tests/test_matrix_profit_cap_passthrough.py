@@ -147,17 +147,19 @@ def test_screener_capband_matrix_forwards_early_stop_only_when_given(captured, m
     assert "--early-stop-min-rel" not in captured[0]
 
 
-def test_screener_capband_matrix_forwards_rm_toggle_policy_only_when_given(captured, monkeypatch):
+@pytest.mark.parametrize("policy", ["atr-searched", "atr-regime-searched"])
+def test_screener_capband_matrix_forwards_rm_toggle_policy_only_when_given(captured, monkeypatch,
+                                                                           policy):
     """--rm-toggle-policy (atr_grid_2027 design §3.2 item 5): forwarded to the launcher only
     when given, exactly like --early-stop above -- every existing matrix command is unchanged."""
     monkeypatch.setattr(sys, "argv", [
         "run_screener_capband_matrix.py", "--bands", "large", "--strategies", "S1",
-        "--rm-toggle-policy", "atr-searched",
+        "--rm-toggle-policy", policy,
     ])
     assert run_screener_capband_matrix.main() == 0
     assert captured, "the driver launched no optimize job"
     cmd = captured[0]
-    assert _flag_value(cmd, "--rm-toggle-policy") == "atr-searched"
+    assert _flag_value(cmd, "--rm-toggle-policy") == policy
 
     captured.clear()
     monkeypatch.setattr(sys, "argv", [

@@ -56,13 +56,13 @@ def selection(profile, manifest, mode):
     return profiles, {p: pins[p] for p in profiles}
 
 
-def attach(job, backtest, profiles, pins, mode):
+def attach(job, backtest, profiles, pins, mode, history_source="fmp"):
     """Mutate a new job only: gate opening rules, preserving actions and management trees."""
     if not profiles:
         return
     from ba2_common.core.market_conditions import PROFILES
     from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
-    from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
+    from ba2_common.core.market_condition_source import source_profile_for_history
     from ba2_common.core.market_condition_templates import market_condition_leaves
 
     gene_names = []
@@ -93,7 +93,7 @@ def attach(job, backtest, profiles, pins, mode):
     backtest["market_condition"] = {
         "profiles": list(profiles), "manifests": dict(pins), "mode": mode,
         "calc_versions": {p: PROFILES[p].calc_version for p in profiles},
-        "source_profile": SOURCE_PROFILE_FMP_DAILY,
+        "source_profile": source_profile_for_history(history_source),
         "timing_policy": TIMING_POLICY_PRIOR_SESSION_V1,
         "fields": [f.to_dict() for p in profiles for f in PROFILES[p].fields],
         "genes": sorted(gene_names), "gene_count": len(gene_names),
@@ -289,9 +289,13 @@ def preflight(backtest, cache_root):
     sessions = [decision_data_session(backtest_decision_label(d)) for d in bars]  # == bars, by the rule
     days = np.asarray(sessions, dtype="datetime64[D]")
     symbols = backtest["enabled_instruments"]
+    from ba2_common.core.ohlcv_history import history_cache_dirname, resolve_job_history_source
+    price_dir = Path(cache_root) / history_cache_dirname(resolve_job_history_source(backtest))
     raw_dates = {}
     for symbol in symbols:
-        path = Path(cache_root) / "FMPOHLCVProvider" / f"{symbol}_1d.parquet"
+        path = price_dir / f"{symbol}_1d.parquet"
+        if not path.is_file():
+            raise FileNotFoundError(f"{symbol}: daily bars not found in {price_dir}: {path}")
         dates = pq.read_table(path, columns=["Date"]).column("Date").to_numpy()
         raw_dates[symbol] = np.unique(dates.astype("datetime64[D]"))
         if not len(raw_dates[symbol]) or np.isnat(raw_dates[symbol]).any():

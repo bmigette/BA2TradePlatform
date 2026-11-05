@@ -371,6 +371,8 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+        # Last evaluated generation (genes + fitnesses); see optimize(). None until one ran.
+        self.last_evaluated_population = None
         self._resumed_no_improvement = 0
 
         # Write a partial checkpoint every N completed trials within a generation. Bounds what a
@@ -488,6 +490,35 @@ class GeneticOptimizer:
             individual.append(value)
         return creator.Individual(individual)
 
+    def _initial_population(self, n: int) -> List:
+        """Generation 0: ``n`` random individuals, with every STRATIFIED choice gene balanced.
+
+        A choice gene declared ``"stratify": True`` (the decision-time gene) gets each of its ``k``
+        values at least ``n // k`` times in generation 0 (82 individuals, 7 values: 11 each, the
+        remaining 5 keep their free random draw), instead of whatever the uniform draw gives (a
+        value can start with 4 or 20). Done by overwriting that gene in a random subset of
+        ``k * (n // k)`` individuals, so the other genes stay iid. Fresh generation 0 ONLY: a
+        resumed checkpoint or a warm-start population goes through ``rebuild_population``
+        untouched (a warm start seeds elites from a prior run and must keep them as they are).
+        Without a stratified gene NO extra random draw is made, so every existing job's
+        generation 0 is bit-identical to before.
+        """
+        population = [self._create_individual() for _ in range(n)]
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = n // k
+            if quota == 0:
+                logger.warning(f"choice gene {param_name!r}: population {n} < {k} choices, "
+                               f"generation 0 is not stratified")
+                continue
+            positions = list(range(n))
+            self._rng.shuffle(positions)
+            for slot, pos in enumerate(positions[:k * quota]):
+                population[pos][i] = slot % k
+        return population
+
     def _mutate_individual(self, individual: List, indpb: float = 0.2) -> Tuple[List]:
         """
         Mutate an individual with probability indpb for each gene.
@@ -501,7 +532,16 @@ class GeneticOptimizer:
         """
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
             if self._rng.random() < indpb:
-                if config['type'] == 'choice':
+                if config['type'] == 'choice' and config.get('stratify'):
+                    # A STRATIFIED choice gene (the decision-time gene) is a SPARSE set whose
+                    # neighbouring indices are not neighbours in meaning (10:00 -> 12:00 ->
+                    # 15:30), so a Gaussian index nudge would mean something different at every
+                    # index and could never leave 09:35 for 15:30 in one step. Uniform re-draw
+                    # among the OTHER values. Every other choice gene keeps the nudge below.
+                    n = len(config['choices'])
+                    new = self._rng.randrange(n - 1)
+                    individual[i] = new + 1 if new >= individual[i] else new
+                elif config['type'] == 'choice':
                     # Categorical: nudge the int index, clamped to 0..len-1.
                     n = len(config['choices'])
                     sigma = max(1.0, (n - 1) / 6)
@@ -543,8 +583,16 @@ class GeneticOptimizer:
             value = individual[i]
             if config['type'] == 'choice':
                 # Map the evolved int index back to the categorical VALUE (e.g. the
-                # target_price_type string). Clamp defensively to a valid index.
-                idx = int(np.clip(round(value), 0, len(config['choices']) - 1))
+                # target_price_type string). An index outside the declared list is REFUSED, not
+                # clamped: the operators never produce one, so it means the chromosome came from a
+                # job with a DIFFERENT list (a stale checkpoint / seed) and clamping would silently
+                # evaluate another value than the one the genome stands for.
+                idx = int(round(value))
+                if not 0 <= idx < len(config['choices']):
+                    raise ValueError(
+                        f"choice gene {param_name!r}: index {value!r} is outside its "
+                        f"{len(config['choices'])} declared choices {config['choices']!r} "
+                        f"(a chromosome from a job with a different list?)")
                 value = config['choices'][idx]
             else:
                 # Snap to the step lattice (int or float; see LATTICE_ANCHORS).
@@ -582,7 +630,47 @@ class GeneticOptimizer:
 
         return params
 
-    def encode_params(self, params: Dict) -> List:
+    def seeded_population(self, encoded: List, target_size: int) -> List:
+        """A warm-start generation 0: the ``encoded`` seeds plus random padding up to
+        ``target_size``, with every STRATIFIED choice gene balanced over the WHOLE generation.
+
+        ``encoded`` come from ``encode_params(..., allow_missing_stratified=True)``: a seed whose
+        source job had no such gene carries ``None`` there. Such a seed (and every padding
+        individual) is a FREE slot for that gene; the free slots are filled so each value reaches
+        at least ``target_size // k`` across the generation, counting the seeds that already carry
+        an explicit value. Remaining free slots keep a uniform random value. One INFO line says
+        how many seeds were completed. Without a stratified gene this is exactly
+        ``encoded`` + ``toolbox.individual()`` padding (no extra random draw).
+        """
+        population = [creator.Individual(list(e)) for e in encoded[:target_size]]
+        n_seeds = len(population)
+        while len(population) < target_size:
+            population.append(self._create_individual())
+        for i, (param_name, config) in enumerate(self.param_ranges.items()):
+            if config['type'] != 'choice' or not config.get('stratify'):
+                continue
+            k = len(config['choices'])
+            quota = target_size // k
+            fixed = [ind[i] for ind in population[:n_seeds] if ind[i] is not None]
+            free = [j for j, ind in enumerate(population) if j >= n_seeds or ind[i] is None]
+            missing_seeds = sum(1 for ind in population[:n_seeds] if ind[i] is None)
+            # Water-filling: every free slot goes to the CURRENTLY least-used value (ties drawn
+            # at random), so each value reaches ``quota`` whenever the seeds leave room for it and
+            # the shortfall is spread evenly when they do not.
+            counts = [sum(1 for x in fixed if x == v) for v in range(k)]
+            self._rng.shuffle(free)
+            for slot in free:
+                low = min(counts)
+                v = self._rng.choice([c for c in range(k) if counts[c] == low])
+                population[slot][i] = v
+                counts[v] += 1
+            if missing_seeds:
+                logger.info(f"warm start: {missing_seeds} of {n_seeds} seed(s) carried no "
+                            f"{param_name!r}; completed so generation 0 is spread over its "
+                            f"{k} values (>= {quota} each where seeds allow)")
+        return population
+
+    def encode_params(self, params: Dict, allow_missing_stratified: bool = False) -> List:
         """
         Encode parameter dictionary to individual (chromosome).
 
@@ -623,11 +711,62 @@ class GeneticOptimizer:
                 # param space) falls back to index 0 rather than raising.
                 choices = config['choices']
                 value = expanded_params[param_name]
-                value = choices.index(value) if value in choices else 0
+                if value in choices:
+                    value = choices.index(value)
+                elif config.get('stratify'):
+                    # The decision-time gene: a seed from a job with another time list must not
+                    # silently become "the first time" (every other choice gene keeps the
+                    # historical index-0 fallback above).
+                    raise ValueError(
+                        f"choice gene {param_name!r}: value {value!r} is not in this job's "
+                        f"declared choices {choices!r}")
+                else:
+                    value = 0
             else:
-                value = expanded_params.get(param_name, config['min'])
+                if (config['type'] == 'choice' and config.get('stratify')
+                        and param_name not in expanded_params):
+                    if not allow_missing_stratified:
+                        raise ValueError(f"choice gene {param_name!r} is missing from the params "
+                                         f"being encoded (a source job without it?)")
+                    value = None            # completed by seeded_population
+                else:
+                    value = expanded_params.get(param_name, config['min'])
             individual.append(value)
         return creator.Individual(individual)
+
+    def encode_params_strict(self, params: Dict) -> List:
+        """``encode_params`` for SEEDS (``seedPopulation``): refuse instead of guessing.
+
+        Every gene must be present (no ``min`` fill), no unknown gene, every choice one of its
+        declared values (no index-0 fallback), and every numeric value one the decoder can give
+        back: ``snap_to_lattice(clip(v, min, max)) == v`` under this optimizer's own anchor. That
+        accepts a decode-image value just outside ``min`` on the legacy "zero" lattice (410..500
+        step 15 decodes 410 to 405, so a winner can carry 405) and refuses anything the GA could
+        never reproduce. Raises ValueError naming the gene. The stored gene is the clipped raw
+        value, so ``decode_individual`` returns exactly ``params``. Warm start keeps the lenient
+        ``encode_params``."""
+        missing = [k for k in self.param_names if k not in params]
+        unknown = sorted(set(params) - set(self.param_names))
+        if missing or unknown:
+            raise ValueError(f"seed genome: missing {missing!r}, unknown {unknown!r}")
+        out = []
+        for name in self.param_names:
+            cfg, v = self.param_ranges[name], params[name]
+            if cfg['type'] == 'choice':
+                if v not in cfg['choices']:
+                    raise ValueError(f"seed genome: {name!r}={v!r} is not one of {cfg['choices']!r}")
+                out.append(cfg['choices'].index(v))
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"seed genome: {name!r}={v!r} is not a finite number")
+            clipped = min(max(v, cfg['min']), cfg['max'])
+            back = snap_to_lattice(clipped, cfg, self.lattice_anchor)
+            if abs(back - v) > 1e-9 * max(1.0, abs(v)):
+                raise ValueError(f"seed genome: {name!r}={v!r} cannot be decoded from "
+                                 f"[{cfg['min']}, {cfg['max']}] step {cfg.get('step')} "
+                                 f"(anchor {self.lattice_anchor!r}; nearest {back!r})")
+            out.append(int(clipped) if cfg['type'] == 'int' else float(clipped))
+        return creator.Individual(out)
 
     def resume_from_checkpoint(self, checkpoint: Dict) -> tuple:
         """
@@ -846,6 +985,38 @@ class GeneticOptimizer:
                                         else early_stop_threshold(baseline, min_rel))
         return data
 
+    def _reproduce(self, population: list, gen: int) -> None:
+        """Elitism + selection + crossover + mutation: turn the evaluated ``population`` of
+        generation ``gen`` into the next generation's (in place)."""
+        # ELITISM: Preserve the best individuals unchanged
+        n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
+        elites = tools.selBest(population, n_elite)
+        # Clone elites to preserve them unchanged
+        elites = [self.toolbox.clone(ind) for ind in elites]
+
+        logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
+
+        # Selection and reproduction for the remaining slots
+        n_offspring = len(population) - n_elite
+        offspring = self.toolbox.select(population, n_offspring)
+        offspring = list(map(self.toolbox.clone, offspring))
+
+        # Crossover
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if self._rng.random() < self.crossover_prob:
+                self.toolbox.mate(child1, child2)
+                del child1.fitness.values
+                del child2.fitness.values
+
+        # Mutation
+        for mutant in offspring:
+            if self._rng.random() < self.mutation_prob:
+                self.toolbox.mutate(mutant)
+                del mutant.fitness.values
+
+        # Combine elites (unchanged) with new offspring
+        population[:] = elites + offspring
+
     def optimize(
         self,
         fitness_function: Callable[[Dict], float],
@@ -883,7 +1054,7 @@ class GeneticOptimizer:
                 f"Restored population of {len(population)} individuals "
                 f"({n_valid} already evaluated, {len(population) - n_valid} to run)")
         else:
-            population = self.toolbox.population(n=self.population_size)
+            population = self._initial_population(self.population_size)
 
         # Evaluate fitness function wrapper
         def evaluate(individual):
@@ -892,6 +1063,11 @@ class GeneticOptimizer:
                 fitness = fitness_function(params)
                 return (fitness,)
             except Exception as e:
+                from app.services.job_fatal import job_fatal
+                if job_fatal(e):
+                    # A data / config / code defect (or a look-ahead guard) hit THIS trial and would hit
+                    # every other: the job stops here, it does not score the genome at the sentinel.
+                    raise
                 logger.warning(f"Fitness evaluation failed: {e}")
                 return (FITNESS_EVALUATION_FAILED,)
 
@@ -909,6 +1085,36 @@ class GeneticOptimizer:
 
         # Restore best fitness history from resumed state
         if self.history:
+            best_fitness_history = [h['best_fitness'] for h in self.history]
+
+        # RESUME FROM AN END-OF-GENERATION CHECKPOINT. The checkpoint of generation k is written
+        # after k is evaluated and recorded in ``history`` but BEFORE the best/patience update and
+        # BEFORE reproduction. Starting the loop at k + 1 with that fully evaluated population
+        # used to evaluate nothing, re-record k's best as a phantom generation k + 1 and burn a
+        # patience unit (P5). Finish what the interrupted run was about to do instead: apply the
+        # best update, take the stop decision, then breed. The patience counter / baseline were
+        # already derived from ``history`` (which includes k), so they are not touched here. A
+        # PARTIAL checkpoint has no history entry for its generation, so it is not this case.
+        last_done = self.history[-1]['generation'] if self.history else None
+        if (initial_population and start_generation > 0 and last_done == start_generation - 1
+                and all(ind.fitness.valid for ind in population)):
+            best_ind = tools.selBest(population, 1)[0]
+            best_fit = best_ind.fitness.values[0]
+            if self.best_fitness is None or best_fit > self.best_fitness:
+                self.best_fitness = best_fit
+                self.best_individual = list(best_ind)
+            if no_improvement_count >= self.early_stopping_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}, whose patience "
+                    f"{no_improvement_count}/{self.early_stopping_generations} had already "
+                    f"stopped the run: nothing left to run (best={self.best_fitness:.4f})")
+                start_generation = self.n_generations
+            elif start_generation < self.n_generations:
+                logger.warning(
+                    f"Resumed after generation {last_done}: patience {no_improvement_count}/"
+                    f"{self.early_stopping_generations}; breeding generation {start_generation} "
+                    f"(no phantom re-record of generation {last_done})")
+                self._reproduce(population, last_done)
             best_fitness_history = [h['best_fitness'] for h in self.history]
 
         # Evolution loop
@@ -980,6 +1186,15 @@ class GeneticOptimizer:
                 'stats': record
             })
 
+            # The last EVALUATED population, for chain seeding (walk-forward). Taken here, right
+            # after evaluation: the loop below evolves one more generation whose offspring were
+            # never scored, so the population at loop exit is NOT a result.
+            self.last_evaluated_population = {
+                'generation': gen,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
+
             # Call callback if provided
             if callback:
                 callback(gen, best_fit, best_params)
@@ -1047,34 +1262,16 @@ class GeneticOptimizer:
 
             best_fitness_history.append(best_fit)
 
-            # ELITISM: Preserve the best individuals unchanged
-            n_elite = max(1, int((self.elitism_percent / 100.0) * len(population)))
-            elites = tools.selBest(population, n_elite)
-            # Clone elites to preserve them unchanged
-            elites = [self.toolbox.clone(ind) for ind in elites]
+            self._reproduce(population, gen)
 
-            logger.debug(f"Gen {gen}: Preserving {n_elite} elite individuals (best fitness: {elites[0].fitness.values[0]:.4f})")
-
-            # Selection and reproduction for the remaining slots
-            n_offspring = len(population) - n_elite
-            offspring = self.toolbox.select(population, n_offspring)
-            offspring = list(map(self.toolbox.clone, offspring))
-
-            # Crossover
-            for child1, child2 in zip(offspring[::2], offspring[1::2]):
-                if self._rng.random() < self.crossover_prob:
-                    self.toolbox.mate(child1, child2)
-                    del child1.fitness.values
-                    del child2.fitness.values
-
-            # Mutation
-            for mutant in offspring:
-                if self._rng.random() < self.mutation_prob:
-                    self.toolbox.mutate(mutant)
-                    del mutant.fitness.values
-
-            # Combine elites (unchanged) with new offspring
-            population[:] = elites + offspring
+        if self.last_evaluated_population is None and initial_population and not                 [1 for ind in population if not ind.fitness.valid]:
+            # A resume that starts at (or past) the last generation runs no generation, but the
+            # restored population IS fully evaluated: it is the final population.
+            self.last_evaluated_population = {
+                'generation': start_generation - 1,
+                'genes': [list(ind) for ind in population],
+                'fitnesses': [float(ind.fitness.values[0]) for ind in population],
+            }
 
         # Final best
         best_params = self.decode_individual(self.best_individual)
@@ -1086,7 +1283,9 @@ class GeneticOptimizer:
             'best_params': best_params,
             'best_fitness': self.best_fitness,
             'generations_run': len(self.history),
-            'history': self.history
+            'history': self.history,
+            # None when no generation ran (a resume past the last generation).
+            'final_population': self.last_evaluated_population,
         }
 
     def get_progress(self) -> Dict:

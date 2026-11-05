@@ -18,6 +18,7 @@ from .FactorRanker import FactorRanker
 from .DeterministicScorer import DeterministicScorer
 from .ETFTrend import ETFTrend
 from .PullbackReversion import PullbackReversion
+from .MLForecast import MLForecast
 
 # PremiumSeller was removed 2026-08-31 (operator decision; option-model plan Task 12):
 # its book rails / breaker / lifecycle logic live on in ba2_common.core.option_book and
@@ -25,7 +26,7 @@ from .PullbackReversion import PullbackReversion
 experts = [FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
            FMPInsiderClusterBuy, FMPEarningsDrift, FMPEarningsEvent, PennyMomentumTrader,
            FactorRanker,
-           DeterministicScorer, ETFTrend, PullbackReversion]
+           DeterministicScorer, ETFTrend, PullbackReversion, MLForecast]
 
 
 def get_expert_class(expert_type):

@@ -326,7 +326,10 @@ def build_restart_command() -> List[str]:
       ``python -m ba2test_launcher <subcommand args>`` (cross-platform; Windows console scripts
       are ``.exe`` and can't be run as ``python <script>``);
     * direct ``uvicorn app.main:app ...`` -> ``python -m uvicorn <args>``;
-    * a ``*.py`` script launch -> re-run that script;
+    * a ``*.py`` script launch -> re-run that script by its ABSOLUTE path (``__main__.__file__``):
+      the app changes its working directory after start-up, so the relative ``argv[0]`` of
+      ``python ba2test_launcher.py worker ...`` no longer resolves at restart time (remote150
+      2026-10-22: the self-update re-exec died with "can't open file ...backend\\ba2test_launcher.py");
     * otherwise best-effort re-run of argv under the interpreter.
     """
     argv = sys.argv
@@ -335,8 +338,10 @@ def build_restart_command() -> List[str]:
     base = os.path.basename(argv[0]).lower()
     if "uvicorn" in base:
         return [sys.executable, "-m", "uvicorn", *argv[1:]]
-    if argv[0].endswith(".py") and os.path.isfile(argv[0]):
-        return [sys.executable, *argv]
+    if argv[0].endswith(".py"):
+        main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+        if main_file and os.path.basename(main_file) == os.path.basename(argv[0]):
+            return [sys.executable, os.path.abspath(main_file), *argv[1:]]
     return [sys.executable, *argv]
 
 

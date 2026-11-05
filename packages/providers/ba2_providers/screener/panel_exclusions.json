@@ -1,0 +1,190 @@
+{
+ "_doc": "REVIEWED list of symbols the screener simulation treats specially. Read by the panel build (recorded in the manifest, printed) and by the launch (printed). Never a silent tolerance: every entry needs a symbol, a reason, a date and a reviewer; an entry whose reviewed_by starts with 'pending' REFUSES the launch. kind 'exclude' (default): the symbol's data is knowingly unusable, the gate never selects it. kind 'delisted' (needs last_session = the last session the symbol traded = its last cached daily bar): a KNOWN delisting with sound data; the symbol keeps its history and is a candidate on every morning up to and including last_session, never after; it stops counting as 'stale-listed' (a delisted name the vendor's listing still shows). Delisting entries must match the cached bars exactly or the build refuses. The file's bytes are part of the panel fingerprint.",
+ "entries": [
+  {
+   "symbol": "GORO",
+   "kind": "exclude",
+   "reason": "vendor history unusable: the vendor series is a different / spliced company (profile names Goldgroup Mining; ratio to our cache wanders 0.07-8.2 over time); the cache is frozen at 2026-06-30",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "PARA",
+   "kind": "exclude",
+   "reason": "reused ticker: the vendor splices the old Paramount with Banzai (symbol change 2026-08-07); our cache holds Paramount only, ending 2025-08-08",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "CICC",
+   "kind": "exclude",
+   "reason": "not an equity: a 7.5% baby bond (notes); the vendor has no share count for it",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "DBRG",
+   "kind": "delisted",
+   "last_session": "2026-09-29",
+   "reason": "delisted 2026-09-30; vendor and cache histories identical and both end at the last bar; a valid member of the universe until then",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "IPEXR",
+   "kind": "exclude",
+   "reason": "not a share: a rights issue (right of IPEX), delisted 2026-09-25; excluded from the universe (owner 2026-10-21; was an acknowledged delisting)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPEXU",
+   "kind": "delisted",
+   "last_session": "2026-09-25",
+   "reason": "delisted 2026-09-25 (unit of IPEX); vendor and cache histories identical and both end at the last bar",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "QRVO",
+   "kind": "delisted",
+   "last_session": "2026-10-02",
+   "reason": "delisted 2026-10-06; vendor and cache histories identical and both end at the last bar (2026-10-02); a valid, tradeable member of the universe 2020-2025",
+   "added": "2026-10-12",
+   "reviewed_by": "owner (B. Migette) 2026-10-12"
+  },
+  {
+   "symbol": "BBBY",
+   "kind": "exclude",
+   "reason": "reused ticker: Bed Bath & Beyond (bankrupt 2023) and Beyond Inc (ticker from 2025) under one symbol; the vendor daily series runs unbroken 2011-2026 while the 5-min cache has no 2024 bars and its 2020-2023 closes are off the daily close on 98-100% of days",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "IAC",
+   "kind": "exclude",
+   "reason": "spliced ticker: on 2020-07-01 the IAC symbol passed to the new IAC (Match separation; old IAC became MTCH); raw overnight jump x3.14 with no split or spin-off listed, so one series holds two companies",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "ADEA",
+   "kind": "exclude",
+   "reason": "spliced ticker: Xperi/Adeia separation on 2022-10-03 (ADEAV -> ADEA); raw overnight jump x2.13 with no spin-off listed, so one series holds two companies",
+   "added": "2026-10-20",
+   "reviewed_by": "owner (B. Migette) 2026-10-20"
+  },
+  {
+   "symbol": "GRAF",
+   "kind": "exclude",
+   "reason": "reused ticker: GRAF 2018-10..2024 is an earlier company (SPAC) and the Alpaca name change GRAF->TONT 2026-07-27 belongs to the 2024 listing; one symbol holds two companies (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPOD",
+   "kind": "exclude",
+   "reason": "reused ticker: IPOD 2020-11..2025 is an earlier SPAC; the 2025-06 IPODU->IPOD unit split and the IPOD->CCAQ rename 2026-05-27 belong to a later listing; one symbol holds two companies (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "HLX",
+   "kind": "exclude",
+   "reason": "unclean rename: Helix renamed HLX->HOS 2026-09-02, but the vendor's HOS history is Hornbeck Offshore (2010-2019): the successor ticker is reused, so the company cannot be carried under one ticker (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "SVII",
+   "kind": "exclude",
+   "reason": "unclean rename: SVII->SVIIF (OTC) 2025-10-21 ->NUCL, NUCL starts 2026-02-25 with no overlap: the successor cannot be verified as the same series (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "BBCQ",
+   "kind": "exclude",
+   "reason": "unclean rename: BBCQ->PSQL 2026-08-28 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "COLA",
+   "kind": "exclude",
+   "reason": "unclean rename: COLA->SAIQ 2026-10-02 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "HVII",
+   "kind": "exclude",
+   "reason": "unclean rename: HVII->ONEN 2026-09-24 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPCX",
+   "kind": "exclude",
+   "reason": "unclean rename: IPCX->WATR 2026-08-17 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "IPEX",
+   "kind": "exclude",
+   "reason": "unclean rename: IPEX->GOW 2026-09-28 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "JFB",
+   "kind": "exclude",
+   "reason": "unclean rename: JFB->XTND 2026-09-04 changes CUSIP and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "NHIC",
+   "kind": "exclude",
+   "reason": "unclean rename: NHIC->NWCL 2026-09-22 changes CUSIP (SPAC merger) and price continuity cannot be verified (successor not in the store) (Alpaca corporate actions name_changes; rename audit 2026-10-21)",
+   "added": "2026-10-21",
+   "reviewed_by": "owner (B. Migette) 2026-10-21"
+  },
+  {
+   "symbol": "CCZ",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): Comcast Holdings ZONES (exchangeable notes, not common stock); FMP ipoDate 2020-01-21 after the 2016 series start, five 2017-2018 gaps (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "FRMM",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile Forum Markets (ipoDate 2025-08-18) but Alpaca bars from 2017-06-27 with 2020 gaps: series likely joins two issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "LION",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile Lionsgate Studios (ipoDate 2022-03-01) but Alpaca bars from 2016 (Fidelity Southern used LION until 2019) with a 2019-06-28..2021-12-09 gap: several issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "NATL",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile NCR Atleos (ipoDate 2023-11-30) but Alpaca bars from 2016 with a 2016-11-10..2023-10-17 gap; ipoDate is 6 weeks after the resume so the build cannot prove the reuse (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "NUAI",
+   "kind": "exclude",
+   "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile New Era Energy & Digital (ipoDate 2025-08-13) but Alpaca bars from 2022-01-06 with a 2024-09-10..10-10 gap: series likely joins two issuers (gap/reuse audit 2026-10-22)",
+   "added": "2026-10-22",
+   "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  }
+ ]
+}

@@ -13,9 +13,15 @@ from ba2_common.core.types import (
     ExpertActionType,
     ExpertEventType,
     ReferenceValue,
+    get_option_entry_action_values,
     is_option_action,
 )
-from ba2_common.core.market_conditions import PROFILES
+from ba2_common.core.market_conditions import BENCHMARK_FIELDS, PROFILES
+from ba2_common.core.entry_tag import (
+    ORDER_ENTRY_TAG_KEY,
+    coerce_entry_tag,
+    validate_entry_tag_comparison,
+)
 
 # Strategy condition-tree field -> ExpertEventType for value (N_*) gates. These are the
 # numeric fields an entry/exit condition tree tunes on; an unknown field is skipped (it
@@ -87,6 +93,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # recommendation and every position that did not come from an earnings-event expert.
     "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
     "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
+    # The style-group MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 2): which member of
+    # a composed option expert opened the position, read back off its entry order row. ANDed
+    # into each member's exits; UNEVALUABLE (never fires) on an untagged position.
+    "entry_tag": ExpertEventType.N_ENTRY_TAG,
     # THE DIRECTION CALL AS A NUMBER (SELL -2 .. BUY +2, HOLD 0). MANDATORY here and not
     # merely tidy: the option grid's entry gate is this leaf, and an unmapped field is
     # DROPPED by triggers_from_condition_tree with nothing but a WARNING -- every option
@@ -123,6 +133,17 @@ def register_market_condition_field_events() -> List[str]:
 
 
 register_market_condition_field_events()
+
+
+def register_benchmark_field_events() -> None:
+    """``FIELD_EVENT`` for the SPY benchmark regime fields (``market_conditions.BENCHMARK_FIELDS``,
+    which are not in ``PROFILES``). Without it ``triggers_from_condition_tree`` silently DROPS a
+    gate leaf."""
+    for name in BENCHMARK_FIELDS:
+        FIELD_EVENT[name] = ExpertEventType(name)
+
+
+register_benchmark_field_events()
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
 # (open_positions) rules whose triggers include sentiment / term / risk / rating-change /
@@ -282,6 +303,56 @@ def assert_market_fields_mappable(tree: Any, where: str) -> None:
             f"ruleset.")
 
 
+def _leaf_label(leaf: dict, i: int) -> str:
+    """Stable label of a condition leaf: its ``id``, else ``<field>@<position>``."""
+    return str(leaf.get("id") or f"{leaf.get('field')}@{i}")
+
+
+def _triggers_and_leaf_ids(tree: Any, warn: bool = True):
+    """The ONE walk behind :func:`triggers_from_condition_tree` and :func:`trigger_leaf_ids`:
+    ``(triggers, {trigger_key: leaf label})``. Keys are positional ``cond_{i}`` and a dropped
+    leaf leaves a gap, so the label map must come from this same walk."""
+    triggers: Dict[str, dict] = {}
+    leaf_ids: Dict[str, str] = {}
+    for i, leaf in enumerate(tree_leaves(tree)):
+        field = str(leaf.get("field"))
+        flag_et = FLAG_FIELD_EVENT.get(field)
+        if flag_et is not None:
+            triggers[f"cond_{i}"] = {"event_type": flag_et.value}
+            leaf_ids[f"cond_{i}"] = _leaf_label(leaf, i)
+            continue
+        num_et = FIELD_EVENT.get(field)
+        if num_et is None:
+            if warn:
+                logger.warning(
+                    f"Condition leaf {leaf.get('id') or i!r} names field {field!r}, which has no "
+                    f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
+                    f"and the rule will run without it")
+            continue
+        if field == ORDER_ENTRY_TAG_KEY:
+            raw_op = leaf.get("operator") or leaf.get("op") or leaf.get("comparison")
+            # No operator is REFUSED, not defaulted: _operator_of's ">" fallback would turn an
+            # authoring slip into an ordering comparison on a label.
+            validate_entry_tag_comparison(
+                _operator_of(leaf) if raw_op else None, leaf.get("value"),
+                where=f"condition leaf {leaf.get('id') or i!r}")
+        if leaf.get("value") is None:
+            if warn:
+                logger.warning(
+                    f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
+                    f"the gate is DROPPED and the rule will run without it")
+            continue
+        triggers[f"cond_{i}"] = {
+            "event_type": num_et.value,
+            "operator": _operator_of(leaf),
+            "value": leaf.get("value"),
+        }
+        leaf_ids[f"cond_{i}"] = _leaf_label(leaf, i)
+    return triggers, leaf_ids
+
+
+
+
 def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     """Build an EventAction 'triggers' dict (ANDed) from a condition tree. Flag leaves ->
     value-less {event_type}; numeric leaves -> {event_type, operator, value}. Unknown fields
@@ -294,32 +365,20 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     line in the log; the structural guarantee is
     packages/common/tests/test_condition_registry_coverage.py, which fails if any condition
     in ``TradeConditions.CONDITION_MAP`` lacks a mapping here.
+
+    ONE FIELD IS NEVER DROPPED: ``entry_tag``, the style-group member tag. It is what scopes a
+    member's exit to that member's positions, so a tag leaf with no value (or with an operator
+    or value the engine would refuse) raises ``ValueError`` here instead -- on EVERY conversion
+    path, since they all come through this function. A tree without a tag leaf (every rule that
+    existed before the tag) converts exactly as before.
     """
-    triggers: Dict[str, dict] = {}
-    for i, leaf in enumerate(tree_leaves(tree)):
-        field = str(leaf.get("field"))
-        flag_et = FLAG_FIELD_EVENT.get(field)
-        if flag_et is not None:
-            triggers[f"cond_{i}"] = {"event_type": flag_et.value}
-            continue
-        num_et = FIELD_EVENT.get(field)
-        if num_et is None:
-            logger.warning(
-                f"Condition leaf {leaf.get('id') or i!r} names field {field!r}, which has no "
-                f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
-                f"and the rule will run without it")
-            continue
-        if leaf.get("value") is None:
-            logger.warning(
-                f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
-                f"the gate is DROPPED and the rule will run without it")
-            continue
-        triggers[f"cond_{i}"] = {
-            "event_type": num_et.value,
-            "operator": _operator_of(leaf),
-            "value": leaf.get("value"),
-        }
-    return triggers
+    return _triggers_and_leaf_ids(tree)[0]
+
+
+def trigger_leaf_ids(tree: Any) -> Dict[str, str]:
+    """``{trigger key: leaf id}`` for exactly the triggers :func:`triggers_from_condition_tree`
+    returns for ``tree`` (same walk, same dropped leaves; read-only, used by backtest gate counters)."""
+    return _triggers_and_leaf_ids(tree, warn=False)[1]
 
 
 def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
@@ -329,7 +388,9 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
     (``rules_convert.trade_rules_to_live_export``), so both refuse the same rules.
 
     * The tree has at least one leaf but ZERO triggers came out. Empty triggers are ALWAYS TRUE:
-      an exit rule would close every position on every pass. No author means that.
+      an exit rule would close every position on every pass. No author means that. A style
+      member's ``entry_tag`` leaf does not count on either side: it scopes, it does not gate, so
+      a tagged rule whose AUTHORED leaves all dropped is refused like its single-structure twin.
     * A MARKET-CONDITION leaf was dropped (fewer market triggers than market leaves). The rule
       would run without its gate: a different strategy under the same name.
 
@@ -341,14 +402,32 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
     """
     from ba2_common.core.market_condition_rules import market_condition_fields
 
-    triggers = triggers_from_condition_tree(tree) if tree else {}
+    try:
+        triggers = triggers_from_condition_tree(tree) if tree else {}
+    except ValueError as e:
+        # Name the RULE as well as the leaf (the shared converter only knows the leaf).
+        raise ValueError(f"{where}: {e}") from e
     leaves = list(tree_leaves(tree))
-    if leaves and not triggers:
+    # The style-group MEMBER TAG leaf (``entry_tag``, ANDed into every member exit) is not an
+    # authored condition: it always converts, so counting it here would turn "every authored
+    # leaf dropped" into ``{entry_tag == N}`` -- ALWAYS TRUE for that member's positions, while
+    # the same rule built as a single structure is refused. So the check judges the AUTHORED
+    # leaves and triggers only. A rule without a tag leaf (every rule that predates the tag)
+    # compares exactly the lists it always compared.
+    tag_event = ExpertEventType.N_ENTRY_TAG.value
+    authored_leaves = [leaf for leaf in leaves if leaf.get("field") != ORDER_ENTRY_TAG_KEY]
+    authored_triggers = [t for t in triggers.values() if t.get("event_type") != tag_event]
+    if authored_leaves and not authored_triggers:
         raise ValueError(
-            f"{where}: none of the rule's {len(leaves)} condition leaf/leaves "
-            f"{[leaf.get('id') or leaf.get('field') for leaf in leaves]!r} produced a trigger "
-            f"(unknown field or missing value). A rule with no trigger is ALWAYS TRUE: it would "
-            f"fire on every position. Fix or remove the leaves.")
+            f"{where}: none of the rule's {len(authored_leaves)} condition leaf/leaves "
+            f"{[leaf.get('id') or leaf.get('field') for leaf in authored_leaves]!r} produced a "
+            f"trigger (unknown field or missing value). A rule with no trigger is ALWAYS TRUE: "
+            f"it would fire on every position"
+            + (" of its member (the entry_tag leaf alone scopes, it does not gate)"
+               if len(authored_leaves) < len(leaves) else "")
+            + ". Fix or remove the leaves.")
+    # (A member-tag leaf that cannot be honoured never reaches this point: the shared
+    # ``triggers_from_condition_tree`` above refuses it on every path.)
     fields = market_condition_fields()
     market_leaves = [leaf for leaf in leaves if leaf.get("field") in fields]
     market_triggers = [t for t in triggers.values() if t.get("event_type") in fields]
@@ -410,7 +489,47 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("w_premium", ("option_w_premium",)),
     ("w_iv", ("option_w_iv",)),
     ("w_rvol", ("option_w_rvol",)),
+    # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): which member of a
+    # composed option expert this entry belongs to, stamped on the parent order row and read
+    # back by ``EntryTagCondition`` to scope that member's exits. Absent stays absent --
+    # byte-identical for every existing rule. The bare ``entry_tag`` is ALSO accepted as a
+    # source so a live ruleset round-trips (``_live_action_to_action_cfg`` keeps the live key
+    # verbatim): a tag lost on re-export would leave that member's positions untagged, and
+    # its tag-scoped exits could then never fire. Validated here too (``coerce_entry_tag``),
+    # so a bad tag is refused where the rule is converted, not first at live evaluation.
+    ("entry_tag", ("option_entry_tag", "entry_tag")),
 )
+
+
+#: The actions that WRITE a style-group member tag onto the order row they create: every
+#: option ENTRY (``_OptionEntryAction._submit_option_order``) and the equity ``buy``
+#: (``BuyAction``, the O_CC / O_PP stock entry -- plan 2026-09-25 option-stage2-build, E1).
+_TAG_WRITING_ACTIONS = frozenset(get_option_entry_action_values()) | {ExpertActionType.BUY.value}
+
+
+def checked_entry_tag(action: dict) -> Optional[int]:
+    """The style-group member tag an action config carries (``option_entry_tag`` or the bare
+    ``entry_tag``), validated, or None when it carries none.
+
+    REFUSED (``ValueError`` naming ``entry_tag``): a tag that is not a positive integer, the two
+    spellings disagreeing, and a tag on an action that never writes one (a close, a sell, an
+    adjust, ``stop_processing``, ``close_option``, a roll): the member's exits would look for a
+    label nothing stamps, and so silently never fire.
+    """
+    raw_tag = action.get("option_entry_tag")
+    bare = action.get("entry_tag")
+    if raw_tag is not None and bare is not None and coerce_entry_tag(raw_tag) != coerce_entry_tag(bare):
+        raise ValueError(f"entry_tag: option_entry_tag={raw_tag!r} and entry_tag={bare!r} disagree")
+    tag = coerce_entry_tag(raw_tag if raw_tag is not None else bare)
+    if tag is None:
+        return None
+    at = str(action.get("action_type") or action.get("action") or "")
+    if at not in _TAG_WRITING_ACTIONS:
+        raise ValueError(
+            f"entry_tag={tag} on a {at!r} action: only entry actions (option entries and "
+            f"'buy') write the member tag onto their order, so on {at!r} it would be a label "
+            f"nothing stamps")
+    return tag
 
 
 def _option_action_config(raw: str, rule: dict) -> dict:
@@ -434,6 +553,8 @@ def _option_action_config(raw: str, rule: dict) -> dict:
         for src in source_keys:
             val = rule.get(src)
             if val is not None:
+                if cfg_key == ORDER_ENTRY_TAG_KEY:
+                    val = coerce_entry_tag(val)
                 cfg[cfg_key] = val
                 break
     return cfg
@@ -465,6 +586,9 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
     if rule.get("enabled") is False:
         return None
     raw = rule.get("action_type") or rule.get("action")
+    # A member tag on an action that never writes one is refused here, before any branch (the
+    # option branch keeps the tag it validates; every other branch would drop it silently).
+    checked_entry_tag(rule)
     if is_option_action(str(raw)):
         return {key: _option_action_config(str(raw), rule)}
     spec = EXIT_ACTION.get(str(raw))

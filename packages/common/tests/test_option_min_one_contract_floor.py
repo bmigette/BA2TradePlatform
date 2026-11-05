@@ -41,6 +41,9 @@ class _Acct:
     def get_option_tradable_balance(self):
         return self._balance
 
+    def option_capital_equity(self):
+        return self._balance                  # the sizing base: equity (no positions here)
+
 
 def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=0.0):
     """A BuyCallAction with only what the sizing tail reads. ``cap_pct=None`` means no
@@ -50,6 +53,7 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     a.instrument_name = "TSM"
     a.account = _Acct(balance)
     a.expert_recommendation = None          # _virtual_equity: no instance -> 100%
+    a._capital_headroom = lambda: (balance, ())   # this double holds nothing but its balance
     a.existing_order = None
     a.sizing = sizing
     if floor is not None:
@@ -61,7 +65,7 @@ def _sizer(*, balance=20_000.0, cap_pct=10.0, floor=None, sizing=5.0, committed=
     results, submitted = [], []
     a._result = lambda success, message, data=None: (
         results.append((success, message)) or {"success": success, "message": message})
-    a._submit_option_order = lambda legs, quantity, limit, strategy: (
+    a._submit_option_order = lambda legs, quantity, limit, strategy, **kw: (
         submitted.append(quantity) or {"success": True, "quantity": quantity})
     return a, submitted
 
@@ -244,7 +248,7 @@ def test_the_floored_contract_still_faces_the_buying_power_guard():
     acct.hold(held_short_put(strike=50.0, qty=1, reserve=8_000.0, symbol="OTHER"))
     res = _floored(acct, "sell_cash_secured_put", 80.0, **CSP).execute()
     assert not res["success"]
-    assert "Insufficient buying power" in res["message"], res["message"]
+    assert "broker limit" in res["message"], res["message"]
     assert acct.submitted == []
 
 
@@ -446,6 +450,9 @@ class _RMExpert:
         self.settings = {"risk_manager_mode": "classic_options",
                          "max_virtual_equity_per_instrument_percent": 10.0}
         self._rails = rails
+
+    def get_available_equity_balance_detail(self):
+        return 1e12, ()                     # the capital model is not what these tests exercise
 
     def get_setting_with_interface_default(self, key, log_warning=True):
         if key not in self._rails:

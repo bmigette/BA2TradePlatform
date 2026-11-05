@@ -168,7 +168,7 @@ def _args(d, **over):
 def test_the_launched_command_is_exactly_this():
     """THE ARGV GOLDEN.
 
-      --options-store tastytrade  the store 4d246e16 renamed `parquet` to; `parquet` stays an
+      --options-store thetadata   the 2020 window (owner 2026-10-22: every option grid on thetadata; tastytrade, which 4d246e16 renamed `parquet` to, stays an
                                 accepted CLI alias, so a runbook that spells the old name still
                                 resolves here. Same reasoning as grid 2's driver (history floor).
       --fitness option_convex   design §3/§8: the ONLY fitness this driver may pass.
@@ -182,13 +182,15 @@ def test_the_launched_command_is_exactly_this():
     assert cmd == [
         "/x/ba2-test", "optimize", "--expert", "FMPRating",
         "--universe", "AAPL,MSFT", "--strategy", "O_CONVEX",
-        "--start", "2023-01-01", "--end", "2025-12-31",
+        "--start", "2020-01-01", "--end", "2025-12-31",
         "--interval", "1d", "--population", "40", "--generations", "6",
         "--initial-capital", "20000.0",
-        "--options-store", "tastytrade",
+        "--options-store", "thetadata",
+        "--ohlcv-history-source", "alpaca",
         "--fitness", "option_convex",
         "--run-schedule", "daily", "--name", "convex-FMPRating-O_CONVEX",
         "--parallel", "4",
+        "--early-stop-min-rel", "0.01",
         "--profit-cap-pct", "2000.0", "--profit-share-cap-pct", "25.0",
     ]
 
@@ -316,3 +318,23 @@ def test_the_help_text_no_longer_advertises_a_refusal():
                   if a.dest == "stress_spread_bps")
     assert "REFUSED" not in (action.help or "")
     assert "total_return" in (action.help or "")
+
+
+def test_the_history_source_is_always_stated_and_defaults_to_alpaca():
+    """Option jobs default to fmp in the launcher, so the driver must STATE the source; this grid
+    runs on the alpaca history (owner 2026-10-22), and fmp stays one explicit flag away."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "alpaca"
+    cmd = d.build_cmd(_args(d, ohlcv_history_source="fmp"), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--ohlcv-history-source") + 1] == "fmp"
+
+
+def test_the_early_stop_min_rel_is_always_forwarded_and_defaults_to_one_percent():
+    """Absent, the launcher applies the legacy rule (any strict gain resets the patience); the
+    owner's GA budget is patience 5 + a 1% minimum relative gain, so the driver always states it."""
+    d = _driver()
+    cmd = d.build_cmd(_args(d), "/x/ba2-test", "n", "FMPRating", "O_X", ["AAPL"])
+    assert cmd[cmd.index("--early-stop-min-rel") + 1] == "0.01"
+    with pytest.raises(SystemExit):
+        d.build_parser().parse_args(["--early-stop-min-rel", "0"])

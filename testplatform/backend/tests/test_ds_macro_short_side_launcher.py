@@ -288,7 +288,8 @@ def test_every_option_fixed_setting_is_in_the_checkpoint_identity():
     for name, spec in L._EXPERT_OPT.items():
         for key in spec.get("option_fixed_settings") or {}:
             assert key in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS, (name, key)
-    defs = DeterministicScorer.get_settings_definitions()
+    from ba2_experts.MLForecast import MLForecast
+    defs = {**MLForecast.get_settings_definitions(), **DeterministicScorer.get_settings_definitions()}
     for key, default in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS.items():
         assert defs[key]["default"] == default
 
@@ -307,7 +308,10 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
     src = inspect.getsource(H).replace("\r\n", "\n")
     assert ("checkpoint_fingerprint(\n            param_space, ga, "
             "checkpoint_expert_settings_identity(backtest_cfg),\n"
-            '            backtest_cfg.get("rm_toggles_unpinned"))') in src
+            '            backtest_cfg.get("rm_toggles_unpinned"), '
+            'backtest_cfg.get("screener_universe_rule"),\n'
+            '            _screener_identity(backtest_cfg.get("screener_opt")),\n'
+            '            resolve_job_history_source(backtest_cfg))') in src
 
 
 # --------------------------------------------------------------------------- #
@@ -316,8 +320,8 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
 def test_explicit_default_settings_helper():
     from ba2_common.core.deploy_parity import explicit_default_settings
     from ba2_experts.DeterministicScorer import DeterministicScorer
-    assert explicit_default_settings(DeterministicScorer, {}) == {"macro_short_side": "same"}
-    assert explicit_default_settings(DeterministicScorer, {"macro_short_side": "mirror"}) == {}
+    assert explicit_default_settings(DeterministicScorer, {}) == {"macro_short_side": "same", "screener_symbol_universe": ""}
+    assert explicit_default_settings(DeterministicScorer, {"macro_short_side": "mirror"}) == {"screener_symbol_universe": ""}
 
     class _NoList:
         pass

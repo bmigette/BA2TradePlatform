@@ -766,7 +766,7 @@ def log_transaction_created_activity(
 
 
 def log_trade_action_activity(
-    action_type: str,
+    action_type,
     symbol: str,
     account_id: int,
     expert_id: Optional[int],
@@ -782,23 +782,34 @@ def log_trade_action_activity(
     to ensure consistent activity logging.
     
     Args:
-        action_type: The type of action (buy, sell, close, adjust_take_profit, etc.)
+        action_type: An ``ExpertActionType`` (or its value string, or ``ACTION_ADJUST_TP_SL`` for a
+            merged TP+SL adjustment). Anything else raises ``ValueError`` (a programming error).
         symbol: The instrument symbol
         account_id: The account ID for activity logging
         expert_id: The expert ID that executed the action
         success: Whether the action execution was successful
         message: Status message from execution
-        is_open_position: If True, logs as TRADE_ACTION_OPEN, else TRADE_ACTION_NEW
+        is_open_position: If True, logs as TRADE_ACTION_OPEN (TP/SL adjustments as
+            TP_SL_ADJUSTED), else TRADE_ACTION_NEW
         additional_data: Optional additional data to include in activity log
     """
+    from ba2_common.core.types import (
+        ACTION_ADJUST_TP_SL, ExpertActionType, get_trade_action_display_label)
+    # Outside the try below on purpose: an unknown action is a caller bug and must raise.
+    action_display = get_trade_action_display_label(action_type)
+    action_value = action_type.value if isinstance(action_type, ExpertActionType) else action_type
+    is_tp_sl = action_value in (ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                                ExpertActionType.ADJUST_STOP_LOSS.value, ACTION_ADJUST_TP_SL)
     try:
         from ba2_common.core.db import log_activity
         
         # Determine activity type based on context
-        activity_type = ActivityLogType.TRADE_ACTION_OPEN if is_open_position else ActivityLogType.TRADE_ACTION_NEW
+        if is_open_position:
+            activity_type = ActivityLogType.TP_SL_ADJUSTED if is_tp_sl else ActivityLogType.TRADE_ACTION_OPEN
+        else:
+            activity_type = ActivityLogType.TRADE_ACTION_NEW
         
         # Build description
-        action_display = action_type.replace("_", " ").title()
         status = "✓ Successfully executed" if success else "✗ Failed to execute"
         context = "on open position" if is_open_position else "for new entry"
         description = f"{status} {action_display} for {symbol} {context}"
@@ -806,7 +817,7 @@ def log_trade_action_activity(
         # Build activity data
         activity_data = {
             "symbol": symbol,
-            "action_type": action_type,
+            "action_type": action_value,
             "message": message
         }
         
@@ -930,7 +941,7 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
 
     Returns:
         Tuple of (expert_options_list, expert_id_map)
-        - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'SmartRisk-2']
+        - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'my-alias-2']
         - expert_id_map: Dict mapping display names to expert instance IDs
 
     Example:
@@ -958,8 +969,9 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
         expert_options = ['All']
         expert_map = {'All': 'All'}
         for expert in experts:
-            # Create shortname: use alias, user_description, or fallback to "expert_name-id"
-            shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
+            # "<alias, user_description or expert class>-<id>": the id is always shown, as on the
+            # overview cards, and two experts sharing an alias stay two distinct options
+            shortname = f"{expert.alias or expert.user_description or expert.expert}-{expert.id}"
             expert_options.append(shortname)
             expert_map[shortname] = expert.id
 

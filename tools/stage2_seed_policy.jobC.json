@@ -1,0 +1,920 @@
+{
+ "fill": {
+  "cond:*-spy-trend:mode": "off",
+  "cond:*-spy-vol:mode": "off",
+  "model:circuit_breaker_pct": 50,
+  "model:max_deployment_pct": 80,
+  "model:max_notional_leverage": 10
+ },
+ "individuals": [
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 119,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 117,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 117,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 4
+     }
+    }
+   ],
+   "other_members": "off",
+   "shared_from": 0
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 1
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 1
+     }
+    },
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 1
+     }
+    }
+   ],
+   "other_members": "authored",
+   "shared_from": 3
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 2
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 2
+     }
+    },
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 2
+     }
+    }
+   ],
+   "other_members": "authored",
+   "shared_from": 3
+  },
+  {
+   "contributions": [
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_CBS",
+     "source": {
+      "opt_id": 141,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_LEAP",
+     "source": {
+      "opt_id": 1,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "donor": {
+      "keys": [
+       "model:k_stop",
+       "model:k_target",
+       "model:macro_mode",
+       "model:theta_buy",
+       "model:theta_sell",
+       "model:w_analyst",
+       "model:w_earnings",
+       "model:w_fundamental",
+       "model:w_technical",
+       "cond:shared-gate_confidence:*"
+      ],
+      "source": {
+       "opt_id": 143,
+       "pick": "distinct",
+       "rank": 3
+      }
+     },
+     "drop": [
+      "model:max_analyst_age_months",
+      "model:min_analysts",
+      "model:min_price_targets_per_quarter",
+      "model:price_target_window_days",
+      "model:profit_ratio",
+      "model:target_price_type"
+     ],
+     "member": "O_PMCC",
+     "source": {
+      "opt_id": 136,
+      "pick": "distinct",
+      "rank": 3
+     }
+    },
+    {
+     "member": "O_CONVEX",
+     "source": {
+      "opt_id": 143,
+      "pick": "distinct",
+      "rank": 3
+     }
+    }
+   ],
+   "other_members": "authored",
+   "shared_from": 3
+  }
+ ],
+ "note": "APPROVED by the owner 2026-11-04: stage-2 job C (style long) seed policy. No DeterministicScorer re-run of the stage-1.5 FMPRating jobs (owner 2026-11-02): each of O_CBS (opt 141), O_LEAP (opt 1), O_PMCC (opt 136) is seeded with that FMPRating winner's option/structure genes (behaviour-distinct ranks 1-3) GRAFTED with the DeterministicScorer expert genes (k_stop, k_target, macro_mode, theta_buy, theta_sell, w_*, and the confidence gate shared-gate_confidence, whose scale is expert-specific) of a DS donor; the FMPRating-only model genes (min_analysts, price-target window, profit_ratio, ...) are dropped. Donor: convex-DS opt 143 (same rank), the closest DS long-horizon result; plus one rank-1 variant per member with the stage-1 DS winner of the nearest short-horizon structure (O_LC opt 117 for LEAP/PMCC, O_BULLCS opt 119 for CBS). O_CONVEX is seeded straight from opt 143 (already DS, ranks 1-4). 16 single-member seeds (other members off) + 3 combined seeds (rank k of all four members, shared genes from O_CONVEX's contribution). No gate is seeded ON (the stage-1.5 sources never had SPY gates; fill = off). Fill = least restrictive RM rails. Opt 143 per-instrument cap 30 clamps to the style's 25 (not widened). Opt 143 fitness (20283) is a convex-fitness scale, not comparable with the other sources.",
+ "out_of_range": "clamp",
+ "schema": 1,
+ "style": "long"
+}

@@ -27,6 +27,13 @@ PHASES
      cannot be READ is a preflight error for that symbol: without it nothing can tell an appended
      mixed basis from a clean one, so the symbol is refused rather than warmed on an unproven
      basis.
+   * a source with ``basis_certificate()`` (the Alpaca history cache) is certified by its own gate instead: the
+     certificate must be a PASS for the current build (else a preflight error, nothing is built); the split checks
+     still run and are recorded per symbol, and only an UN-ABSORBED split (``drift`` on the ``unadjusted`` basis: the
+     build claims it, the full raw jump is still there) sets ``refetch_required``; ``undetectable``, ``mixed_basis`` and
+     the ``mixed`` drift are informational there (they ask for a re-fetch, which that cache never does; 54 of the 753
+     stage-2 names on 2026-10-21, every one on FMP's basis across the date; the gate's residual-jump / vendor-ratio /
+     Yahoo checks are what proved its basis).  The certificate is kept in ``certification["gate"]``.
 
 EXCLUSIONS ARE NEVER SILENT. A symbol that ends up unusable (no split calendar, a basis still
 unverifiable after a full re-fetch, no source data at all) blocks the publication: ``build``
@@ -73,6 +80,8 @@ from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions, prior_
     regular_session_close_utc, regular_sessions_ending_at
 from ba2_common.core.market_condition_context import TIMING_POLICY_PRIOR_SESSION_V1
 from ba2_common.core.market_condition_source import (
+    BASIS_UNADJUSTED,
+    SOURCE_PROFILE_BY_HISTORY,
     SOURCE_PROFILE_FMP_DAILY,
     GapFillResult,
     assemble_window,
@@ -103,6 +112,7 @@ from ba2_common.core.market_conditions import (
 from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
 from ba2_common.core.split_basis import (
     REFETCH_VERDICTS,
+    VERDICT_DRIFT,
     CalendarSplit,
     SplitBasisCheck,
     check_split_basis,
@@ -253,6 +263,11 @@ class SymbolInventory:
             items.append({"symbol": self.symbol, "kind": "refetch_required",
                           "splits": [c for c in self.split_checks if c["verdict"] in REFETCH_VERDICTS]})
         return items
+
+
+def _blocks_gate_certified(check) -> bool:
+    """On a gate-certified source: only a split the build claims but the series does not absorb blocks (module docstring)."""
+    return check.verdict == VERDICT_DRIFT and check.basis == BASIS_UNADJUSTED
 
 
 @dataclass
@@ -423,9 +438,10 @@ def _apply_gap_fill_to_inventory(inv: SymbolInventory, fstats: GapFillResult) ->
                                   if fstats.unfilled_hole_at_start is not None else None)
 
 
-def _read_snapshot(cache_root: str, symbol: str) -> Tuple[Optional[_Snapshot], int]:
-    """(snapshot | None when there is no cache file, retries used)."""
-    path = fmp_daily_cache_path(symbol, cache_root)
+def _read_snapshot(cache_root: str, symbol: str,
+                   source_profile: str = SOURCE_PROFILE_FMP_DAILY) -> Tuple[Optional[_Snapshot], int]:
+    """(snapshot | None when there is no cache file, retries used), read from ``source_profile``'s cache."""
+    path = fmp_daily_cache_path(symbol, cache_root, source_profile=source_profile)
     if path is None:
         return None, 0
     for attempt in range(SNAPSHOT_RETRIES + 1):
@@ -502,8 +518,10 @@ class _ManifestIndex:
     entries of the plan's own symbols are kept, instead of re-reading every manifest for every
     symbol and retaining an ``ObjectEntry`` for every object of every manifest ever published."""
 
-    def __init__(self, store: MarketConditionStore, profile: str, universe: Iterable[str]):
+    def __init__(self, store: MarketConditionStore, profile: str, universe: Iterable[str],
+                 source_profile: Optional[str] = None):
         self.store, self.profile = store, profile
+        self.source_profile = source_profile
         self.universe = {s.upper() for s in universe}
         spec = PROFILES[profile]
         self.calc_version = spec.calc_version
@@ -512,6 +530,12 @@ class _ManifestIndex:
         self._lock = threading.Lock()
 
     def compatible(self, manifest: Mapping[str, Any]) -> bool:
+        # A row is reused only inside ONE price source: objects are content-addressed, so two sources
+        # can never overwrite each other, but a candidate from another vendor's manifest must not be
+        # offered either (its window digest matching would be a coincidence of identical bars, and the
+        # manifest we publish must be explainable from its own source profile alone).
+        if self.source_profile is not None and manifest.get("source_profile") != self.source_profile:
+            return False
         return (manifest.get("calc_version") == self.calc_version
                 and manifest.get("schema_version") == SCHEMA_VERSION
                 and list(manifest.get("fields", ())) == self.fields)
@@ -695,8 +719,9 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     validate_gap_fill(gap_fill)
     if profile not in PROFILES or profile not in COMPUTE_BY_PROFILE:
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
-    if source_profile != SOURCE_PROFILE_FMP_DAILY:
-        raise WarmupConfigError(f"unsupported source profile {source_profile!r}; only {SOURCE_PROFILE_FMP_DAILY!r}")
+    if source_profile not in SOURCE_PROFILE_BY_HISTORY.values():
+        raise WarmupConfigError(f"unsupported source profile {source_profile!r}; "
+                                f"known: {sorted(SOURCE_PROFILE_BY_HISTORY.values())}")
     if end < start:
         raise WarmupConfigError(f"end {end} is before start {start}")
     if cache_root is None:
@@ -724,27 +749,38 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     first_row, last_row = prior_regular_session(decisions[0]), decisions[-1]
     n_rows = len(decisions) + 1
     cal = _calendar_span(first_row, last_row, n_rows)
+    if source is None and source_profile != SOURCE_PROFILE_FMP_DAILY:
+        raise WarmupConfigError(
+            f"source profile {source_profile!r} has no default WarmupSource (the FMP one would fetch FMP "
+            f"splits and bars into the wrong tree): pass the source that serves it")
     if source is None:
         from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
         source = FMPWarmupSource(cache_root)
     calls0, bytes0 = source.calls, source.bytes
 
     preflight: List[str] = []
-    cert = certify_source_columns(cache_root)
+    cert = certify_source_columns(cache_root, source_profile=source_profile)
     cert_dict = {"source_profile": cert.source_profile, "consistent": cert.consistent,
                  "symbols": [{"symbol": s.symbol, "split_date": s.split_date.isoformat(), "basis": s.basis,
                               "consistent": s.consistent, "reason": s.reason} for s in cert.symbols]}
     if not cert.consistent:
         bad = [f"{s.symbol} {s.split_date}: {s.basis} ({s.reason})" for s in cert.symbols if not s.consistent]
         preflight.append(f"source certification failed for {source_profile}: {bad}")
+    gate_certified = hasattr(source, "basis_certificate")
+    if gate_certified:
+        try:
+            cert_dict["gate"] = source.basis_certificate()
+        except WarmupConfigError as e:     # no PASS certificate for this build: refused, never warmed on an unproven basis
+            cert_dict["gate"] = None
+            preflight.append(f"gate certificate: {e}")
 
     store = MarketConditionStore(cache_root)
-    index = _ManifestIndex(store, profile, symbols)
+    index = _ManifestIndex(store, profile, symbols, source_profile)
     fields = [f.name for f in PROFILES[profile].fields]
     inventories = []
     for sym in symbols:
         inv = SymbolInventory(symbol=sym)
-        snap, _retries = _read_snapshot(cache_root, sym)
+        snap, _retries = _read_snapshot(cache_root, sym, source_profile)
         fill_snap = None
         if gap_fill is not None and snap is not None and len(snap.days):
             try:
@@ -760,7 +796,8 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
             inv.split_events = [[e.date.isoformat(), float(e.ratio)] for e in events]
             checks = _split_checks_for(snap, events, sym)
             inv.split_checks = [c.to_dict() for c in checks]
-            inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
+            inv.refetch_required = any(_blocks_gate_certified(c) if gate_certified else c.verdict in REFETCH_VERDICTS
+                                       for c in checks)
         except Exception as e:  # noqa: BLE001 -- a preflight error for this symbol, never a note
             inv.split_calendar_error = f"{type(e).__name__}: {e}"
             preflight.append(inv.split_calendar_preflight_message())
@@ -981,6 +1018,75 @@ def _fetch_phase(plan_: MarketConditionWarmPlan, source: WarmupSource, concurren
     return errors
 
 
+def _recheck_refetched(plan_: MarketConditionWarmPlan) -> Dict[str, List[Dict[str, Any]]]:
+    """Re-run the split-basis check of every ``refetch_required`` symbol on its file as it is
+    NOW (after the fetch phase), update the plan in place, and return ``{symbol: checks}`` for
+    the ones still not verifiably on one basis."""
+    still: Dict[str, List[Dict[str, Any]]] = {}
+    for inv in plan_.symbols:
+        if inv.refetch_required:
+            snap, _ = _read_snapshot(plan_.cache_root, inv.symbol, plan_.source_profile)
+            events = [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in inv.split_events]
+            checks = _split_checks_for(snap, events, inv.symbol)
+            inv.split_checks = [c.to_dict() for c in checks]
+            inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
+            if inv.refetch_required:
+                still[inv.symbol] = inv.split_checks
+    return still
+
+
+def repair(plan_: MarketConditionWarmPlan, *, source: Optional[WarmupSource] = None, concurrency: int = 4,
+           log: Callable[[str], None] = _log_noop) -> Dict[str, Any]:
+    """The FMP repair step ALONE (stage-2 data repair, 2026-09-26): the fetch phase ``build``
+    runs with ``fetch_missing`` -- a FULL re-fetch of every ``refetch_required`` symbol, a range
+    fetch of missing coverage -- then the same split-basis re-check. Nothing is built or
+    published, so it can run before the other data steps and the manifests are built later,
+    cache-only, from the repaired files.
+
+    Returns a JSON-able report; ``ok`` is False when a fetch failed or a symbol is still not
+    verifiably on one basis (``still_refused``: its checks). Those need a human decision: a
+    split-basis override with anchors, a vendor re-try (``keep_newer_cached_tail`` for a vendor
+    file that ends early), or an exclusion. A symbol whose split calendar cannot be read is
+    listed under ``split_calendar_errors`` and is not fetched."""
+    t0 = time.monotonic()
+    fatal = plan_.fatal_preflight_errors()
+    if fatal:
+        # Like ``build``: a failed source certification means nothing here can be trusted to fix
+        # it -- fetch nothing.
+        log(f"repair refused: preflight failed: {fatal}")
+        return {"ok": False, "profile": plan_.profile, "fatal_preflight_errors": fatal,
+                "refetched": [], "range_fetched": [], "fetch_errors": {}, "still_refused": {},
+                "split_calendar_errors": {}, "kept_tails": {}, "provider_calls": 0,
+                "provider_bytes": 0, "elapsed_s": round(time.monotonic() - t0, 3)}
+    if source is None:
+        from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
+        source = FMPWarmupSource(plan_.cache_root)
+    calls0, bytes0 = source.calls, source.bytes
+    counters = _Counters()
+    kinds = {inv.symbol: ("full" if inv.refetch_required else "range" if inv.fetch_needed else None)
+             for inv in plan_.symbols}
+    fetch_errors = _fetch_phase(plan_, source, concurrency, counters, log)
+    still = _recheck_refetched(plan_)
+    cal_errors = {inv.symbol: inv.split_calendar_error for inv in plan_.symbols if inv.split_calendar_error}
+    report = {
+        "ok": not fetch_errors and not still and not cal_errors,
+        "profile": plan_.profile,
+        "refetched": sorted(s for s, k in kinds.items() if k == "full" and s not in fetch_errors),
+        "range_fetched": sorted(s for s, k in kinds.items() if k == "range" and s not in fetch_errors),
+        "fetch_errors": dict(sorted(fetch_errors.items())),
+        "still_refused": dict(sorted(still.items())),
+        "split_calendar_errors": dict(sorted(cal_errors.items())),
+        "fatal_preflight_errors": [],
+        "kept_tails": dict(sorted((getattr(source, "kept_tails", None) or {}).items())),
+        "provider_calls": int(source.calls - calls0),
+        "provider_bytes": int(source.bytes - bytes0),
+        "elapsed_s": round(time.monotonic() - t0, 3),
+    }
+    log(f"repair: {len(report['refetched'])} re-fetched, {len(report['range_fetched'])} topped up, "
+        f"{len(fetch_errors)} failed, {len(still)} still refused")
+    return report
+
+
 @dataclass
 class _SymbolResult:
     symbol: str
@@ -1113,7 +1219,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     sym = inv.symbol
     n_rows = plan_.row_sessions
 
-    snap, retries = _read_snapshot(plan_.cache_root, sym)
+    snap, retries = _read_snapshot(plan_.cache_root, sym, plan_.source_profile)
     counters.add("snapshot_retries", retries)
     if snap is None or not len(snap.days):
         counters.add("symbols_excluded")
@@ -1255,6 +1361,10 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     if plan_.profile not in PROFILES or PROFILES[plan_.profile].calc_version != plan_.calc_version:
         raise WarmupConfigError(f"plan profile {plan_.profile!r} at {plan_.calc_version!r} is not registered "
                                 f"(registered: {[(p, s.calc_version) for p, s in PROFILES.items()]})")
+    if fetch_missing and plan_.source_profile != SOURCE_PROFILE_FMP_DAILY:
+        raise WarmupConfigError(
+            f"source profile {plan_.source_profile!r} cannot be fetched by a warmup: its cache is built only "
+            f"by tools/prepare_history.py (build with --cache-only)")
     fatal = plan_.fatal_preflight_errors()
     if fatal:
         report.errors = fatal
@@ -1293,15 +1403,8 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     excluded: Dict[str, List[Dict[str, Any]]] = {}
     if blocking and fetch_missing:
         fetch_errors = _fetch_phase(plan_, source, concurrency, counters, log)
-        for inv in plan_.symbols:
-            if inv.refetch_required:
-                snap, _ = _read_snapshot(plan_.cache_root, inv.symbol)
-                events = [CalendarSplit(date.fromisoformat(d), float(r)) for d, r in inv.split_events]
-                checks = _split_checks_for(snap, events, inv.symbol)
-                inv.split_checks = [c.to_dict() for c in checks]
-                inv.refetch_required = any(c.verdict in REFETCH_VERDICTS for c in checks)
-                if inv.refetch_required:
-                    excluded[inv.symbol] = [{"kind": "split_basis_unverified", "checks": inv.split_checks}]
+        for sym, checks in _recheck_refetched(plan_).items():
+            excluded[sym] = [{"kind": "split_basis_unverified", "checks": checks}]
     for inv in plan_.symbols:
         if inv.split_calendar_error:
             excluded[inv.symbol] = [{"kind": "split_calendar_unavailable", "error": inv.split_calendar_error}]
@@ -1312,7 +1415,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     # -- build
     t_build = time.monotonic()
     store = MarketConditionStore(plan_.cache_root)
-    index = _ManifestIndex(store, plan_.profile, plan_.universe)
+    index = _ManifestIndex(store, plan_.profile, plan_.universe, plan_.source_profile)
     results: Dict[str, _SymbolResult] = {}
     errors: List[str] = []
     waited: List[str] = []

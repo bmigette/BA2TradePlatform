@@ -15,6 +15,7 @@ from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, OptionCloseReason, AssetClass,
     get_option_action_values,
     get_option_entry_action_values,
+    ACTION_ADJUST_TP_SL,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
@@ -22,6 +23,7 @@ from sqlmodel import select
 import enum
 import datetime
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.entry_tag import order_entry_tag
 
 
 # Canonical option action-type sets, derived from get_option_action_values() so a new
@@ -37,6 +39,10 @@ _ALL_OPTION_ACTION_TYPES = frozenset(ExpertActionType(v) for v in get_option_act
 #: on the order row, so a param forwarded to it would be a knob nothing reads.
 _OPTION_ENTRY_ACTION_TYPES = frozenset(
     ExpertActionType(v) for v in get_option_entry_action_values())
+#: The option entries written as an OVERLAY on a held position by an OPEN_POSITIONS rule: they
+#: inherit that position's style-member tag (see ``_create_trade_action``).
+_OVERLAY_ACTION_TYPES = frozenset({
+    ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PROTECTIVE_PUT})
 
 # Selection-param keys forwarded from an option action config to the _OptionEntryAction
 # ctor. ``wing_width_pct`` is required by the 4-/3-leg structures (iron condor, jade
@@ -68,6 +74,13 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # byte. w_profit/w_rr are deliberately not forwarded until a builder supplies the
     # structure_fn they need -- see _OptionEntryAction.__init__.
     'w_premium', 'w_iv', 'w_rvol',
+    # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): stamped by
+    # _submit_option_order onto the parent order row, read back by EntryTagCondition. Absent
+    # on every rule not emitted by a style expert, and then never forwarded (only keys present
+    # in the config are), so the ctor keeps its None default -- byte-identical. Not a user
+    # knob: the live rule editor deliberately offers no widget for it (see
+    # tests/test_option_ui_param_reachability.py).
+    'entry_tag',
 )
 
 
@@ -658,7 +671,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,
@@ -860,6 +873,14 @@ class TradeActionEvaluator:
                                     sl_to_send = None if sl_kept else sl_price
                                     logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}"
                                                 + (f" (kept: {sl_reason}; ruleset asked ${requested_sl:.2f})" if sl_kept else ""))
+                                    # Stamp where each level was computed from BEFORE the account
+                                    # builds anything from them (a kept stop keeps its anchor).
+                                    from ba2_common.core.trade_cycle import record_level_anchor
+                                    _anchors = {"tp": last_tp_action.last_anchor_price}
+                                    if sl_to_send is not None:
+                                        _anchors["stop"] = last_sl_action.last_anchor_price
+                                    record_level_anchor(transaction.id, **_anchors)
+                                    transaction = get_instance(Transaction, transaction.id) or transaction
                                     success = self.account.adjust_tp_sl(transaction, tp_price, sl_to_send, source="ruleset")
                                     if sl_kept:
                                         desc = (f"Adjusted TP=${tp_price:.2f} for {self.instrument_name}; "
@@ -876,7 +897,9 @@ class TradeActionEvaluator:
                                     }
                                     action_results.append(result_dict)
                                     log_trade_action_activity(
-                                        action_type=str(ExpertActionType.ADJUST_TAKE_PROFIT),
+                                        # Log what was actually adjusted: a kept stop means only the TP moved.
+                                        action_type=(ExpertActionType.ADJUST_TAKE_PROFIT if sl_kept
+                                                     else ACTION_ADJUST_TP_SL),
                                         symbol=self.instrument_name,
                                         account_id=self.account.id,
                                         expert_id=expert_id,
@@ -925,7 +948,7 @@ class TradeActionEvaluator:
                                 }
                                 action_results.append(result_dict)
                                 log_trade_action_activity(
-                                    action_type=str(action_type),
+                                    action_type=action_type,
                                     symbol=self.instrument_name,
                                     account_id=self.account.id,
                                     expert_id=expert_id,
@@ -969,7 +992,7 @@ class TradeActionEvaluator:
                     from ba2_common.core.utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
-                        action_type=str(action_type),
+                        action_type=action_type,
                         symbol=self.instrument_name,
                         account_id=self.account.id,
                         expert_id=expert_id,
@@ -1383,6 +1406,11 @@ class TradeActionEvaluator:
                 # strategies whose contracts cover 100 shares each).
                 if 'lot_size' in action_config and action_config.get('lot_size'):
                     kwargs['lot_size'] = action_config.get('lot_size')
+                # The style-group MEMBER TAG of an equity-entry member (O_CC / O_PP, plan
+                # 2026-09-25 option-stage2-build E1): only when the rule carries one, so every
+                # existing BUY is built exactly as before.
+                if action_config.get('entry_tag') is not None:
+                    kwargs['entry_tag'] = action_config.get('entry_tag')
             elif action_type == ExpertActionType.ADJUST_TAKE_PROFIT:
                 # Extract reference_value and percent (value) for TP calculation
                 kwargs['reference_value'] = action_config.get('reference_value')
@@ -1422,6 +1450,19 @@ class TradeActionEvaluator:
                 for opt_key in _OPTION_ENTRY_PARAM_KEYS:
                     if opt_key in action_config:
                         kwargs[opt_key] = action_config.get(opt_key)
+                # An OVERLAY (covered call / protective put, written by an OPEN_POSITIONS rule
+                # on a held position) authors no member tag: it INHERITS the tag of the
+                # position it is written on -- the evaluated ``existing_order``, the row the
+                # rule's own ``entry_tag`` leaf was scoped by (stage-2 E2 review C1). So a
+                # wheel member's covered call carries the wheel's tag and that member's own
+                # tag-scoped exits can see it. Untagged position -> nothing inherited
+                # (byte-identical); an authored tag wins. Shared by both runtimes: the live
+                # open-positions pass builds its actions through this same evaluator.
+                if (action_type in _OVERLAY_ACTION_TYPES and kwargs.get('entry_tag') is None
+                        and existing_order is not None):
+                    inherited = order_entry_tag(existing_order)
+                    if inherited is not None:
+                        kwargs['entry_tag'] = inherited
 
             # Create action using factory function, passing expert_recommendation
             action = create_action(

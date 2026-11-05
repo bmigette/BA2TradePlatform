@@ -9,7 +9,8 @@ testplatform/backend/tests/test_export_payload_golden.py.
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ba2_common.core.deploy_parity import (
-    BacktestRunFacts, backtest_only_settings, forced_expert_settings,
+    BacktestRunFacts, backtest_only_settings, forced_expert_settings, member_hold_tags_fact,
+    refuse_undeployable,
 )
 from ba2_common.core.factor_ranker_topn import repair_fr_top_n_below_pool
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
@@ -17,7 +18,7 @@ from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved, assert_market_rule_actions,
 )
 from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
-from ba2_common.core.schedule_genes import schedule_override_from_genes
+from ba2_common.core.schedule_genes import schedule_override_from_genes, split_times_from_genes
 from ba2_common.logger import logger
 
 EXPORT_KINDS = ("expert_settings", "ruleset")
@@ -117,6 +118,14 @@ def derive_export_payload(
              if isinstance(k, str) and k.startswith("model:")}
             if isinstance(sp, dict) else {}
         )
+        # goal2027 2.8: the backtest ran the CANONICAL DeterministicScorer factor genome (a section with no usable
+        # sub-weights is off, dead sub-genes absent); the deploy payload carries that phenotype, not the raw genes.
+        # Identity (the same dict) for every row without those genes.
+        from ba2_common.core.ds_factor_genes import neutralise_ds_factor_genes
+        _flat_model = {"model:" + k: v for k, v in model_overrides.items()}
+        _canon_model = neutralise_ds_factor_genes(_flat_model)
+        if _canon_model is not _flat_model:
+            model_overrides = {k[len("model:"):]: v for k, v in _canon_model.items()}
         # Fixed (non-GA-tunable) settings _persist_top_backtests stashed directly onto this
         # Backtest's strategy_params at persist time (e.g. sizing_mode=risk_atr) -- the durable
         # floor layer that survives even if the source StrategyOptimization row is later pruned
@@ -153,6 +162,21 @@ def derive_export_payload(
                     if isinstance(k, str) and k.startswith("screener:")
                 } if isinstance(sp, dict) else {}
                 eff_screener = {**(screener_opt.get("base_settings") or {}), **screener_overrides}
+                # BACKTEST-ONLY (owner 2026-11-04): an option job's screen is restricted to the names the
+                # backtest has option data for (``screener_opt.universe_restriction``). Live screens WITHOUT
+                # that restriction -- it has real chains for every name -- so the list is never exported, and
+                # the deploy writes ``screener_symbol_universe`` = "" (DEPLOY_EXPLICIT_DEFAULT_SETTINGS), which
+                # clears any list on the instance. A deliberate, logged BT/live difference: live may pick names
+                # the backtest could not.
+                _restr = screener_opt.get("universe_restriction")
+                if _restr is not None:
+                    if not isinstance(_restr, dict) or not isinstance(_restr.get("symbols"), list) or not _restr["symbols"]:
+                        raise ExportRefused(f"screener_opt.universe_restriction is malformed: {_restr!r}")
+                    logger.warning(
+                        f"backtest {backtest.id}: its screener was restricted to {len(_restr['symbols'])} symbols "
+                        f"(backtest-only universe_restriction); the live instance screens WITHOUT it "
+                        f"(screener_symbol_universe cleared by the deploy), so live may pick names this backtest "
+                        f"could not")
                 universe = {
                     "mode": "screener",
                     "screener_store": screener_opt["store"],
@@ -291,14 +315,27 @@ def derive_export_payload(
                                f"spelling; exporting it OFF, as every run on record was")
                 return False
 
+        # SPLIT decision-time genes (goal2027 2.4): the entry time rode ``run_schedule_override`` above; the
+        # MANAGE time travels as ``manage_times`` so the deploy writes it to the open-positions schedule.
+        # Added ONLY for a split genome: every other payload stays byte-identical.
+        _split_times = split_times_from_genes(sp)
+        if _split_times is not None:
+            execution = {**execution, "manage_times": [_split_times[1]]}
+
         facts = BacktestRunFacts(
             enable_short=bool(execution.get("enable_short")),
             hold_assigned_stock=bool((acct if bt_block is not None else {}).get(
                 "hold_assigned_stock")),
+            hold_assigned_stock_tags=member_hold_tags_fact(
+                (acct if bt_block is not None else {}).get("hold_assigned_stock_tags")),
             entry_action=(bt_block.get("entry_action") if bt_block is not None else None),
             use_atr_stop=_executed_toggle("use_atr_stop"),
             regime_overlay_enabled=_executed_toggle("regime_overlay_enabled"),
         )
+        # A run live cannot reproduce has no honest deploy payload (stage-2 E2 review I1):
+        # refused by name (``UndeployableRunRefused``, the caller's 409), never exported with a
+        # field that describes a different run.
+        refuse_undeployable(facts)
         expert_params = {**expert_params, **forced_expert_settings(facts)}
         payload = {
             "backtest_id": backtest.id,
@@ -332,6 +369,12 @@ def derive_export_payload(
         # fixture, stays byte-identical.
         if fr_top_n_repaired:
             payload["fr_top_n_repaired"] = True
+        # Only a run gated on the SPY regime says where its SPY series came from (live reads FMP;
+        # the importer warns on a different source). Absent for every other run.
+        from ba2_common.core.benchmark_regime import benchmark_deploy_block
+        _bench = benchmark_deploy_block(bt_block)
+        if _bench is not None:
+            payload["benchmark_regime"] = _bench
         return payload
 
     if kind == "ruleset":

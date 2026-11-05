@@ -624,6 +624,20 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
     if expert_class == "DeterministicScorer":
         from ba2_experts.DeterministicScorer import data as ds_data
 
+        # OLD-RECORDING PRICE SOURCE (replay only). Before 2026-10 DeterministicScorer priced from its own
+        # frame's last close and never asked the account, so recordings made then hold NO broker quote on
+        # the tape. New recordings do (the live gather calls ``_decision_price`` -> the account quote).
+        # For a recording without one, the replay reproduces the ORIGINAL decision: the price is the
+        # recorded frame's last close, applied after the gather (see ``apply_legacy_price_source``) and
+        # reported as "legacy price source". Never in live, never in a backtest.
+        # A recording is LEGACY iff it has no broker quote AND no new-format marker: a NEW-format
+        # recording missing its quote must stay a tape miss (isolation), not be papered over.
+        expert._legacy_price_source = (
+            not tape.has("broker", "get_instrument_current_price")
+            and DS_PRICE_SOURCE_FLAG not in analysis.branch_flags)
+        if expert._legacy_price_source:
+            expert._get_current_price = lambda symbol: None
+
         expert._gather_w_analyst = float(_setting(settings, "w_analyst", analysis) or 0.0)
         expert._gather_w_earnings = float(_setting(settings, "w_earnings", analysis) or 0.0)
         expert._gather_index_symbol = str(_setting(settings, "index_symbol", analysis))
@@ -671,6 +685,24 @@ def _fmp_symbol_fetch(tape: ReplayTape, method: str) -> Callable[[str], Any]:
 # --------------------------------------------------------------------------- #
 # One analysis
 # --------------------------------------------------------------------------- #
+#: Branch flag the live DeterministicScorer gather records (see ``DeterministicScorer._gather``): present
+#: = a new-format capture whose decision price came from the account quote.
+DS_PRICE_SOURCE_FLAG = "ds_decision_price_source"
+
+
+def apply_legacy_price_source(expert, produced):
+    """``(bundle, used)``: for a DeterministicScorer recording made BEFORE the decision-price seam (no
+    broker quote on the tape), the price is the recorded frame's last close, exactly what the original
+    gather used. A bundle that already carries a price is left alone; so is any other expert."""
+    if not getattr(expert, "_legacy_price_source", False) or not isinstance(produced, dict):
+        return produced, False
+    frame = produced.get("ohlcv")
+    if produced.get("current_price") is not None or frame is None or getattr(frame, "empty", True) \
+            or "Close" not in frame.columns:
+        return produced, False
+    return {**produced, "current_price": float(frame["Close"].iloc[-1])}, True
+
+
 def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisResult:
     def result(status: str, detail: str = "",
                field_diffs: Sequence[Tuple[str, str, str]] = ()) -> AnalysisResult:
@@ -706,6 +738,7 @@ def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisRe
                                  analysis, stack)
             with use_capture_context(replay_context(analysis, ReplayStatus.PHASE_GATHER)):
                 produced = expert._gather(providers, as_of=None)
+                produced, legacy_price = apply_legacy_price_source(expert, produced)
     except ReplayMiss as miss:
         return result(ReplayStatus.COVERAGE_MISSING_CAPTURE, str(miss))
     except Exception as exc:
@@ -723,7 +756,8 @@ def replay_gather(bundle: SessionBundle, analysis: AnalysisRecord) -> AnalysisRe
         return result(ReplayStatus.COVERAGE_MISSING_CAPTURE,
                       f"the comparison could not run: {type(exc).__name__}: {exc}")
     if not diffs:
-        return result(ReplayStatus.COVERAGE_MATCH, "gather reproduced the recorded bundle")
+        return result(ReplayStatus.COVERAGE_MATCH, "gather reproduced the recorded bundle"
+                      + (" [price_source=legacy_frame_close]" if legacy_price else ""))
     changed = ", ".join(name for name, _r, _p in diffs[:5])
     return result(ReplayStatus.COVERAGE_DIFFERENCE,
                   f"{len(diffs)} bundle field(s) differ: {changed}", diffs)

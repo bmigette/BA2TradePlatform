@@ -70,7 +70,7 @@ from ba2_common.core.market_condition_rules import (  # noqa: E402
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
     SCREENER_UNIVERSE_SETTING, explicit_default_settings, live_settings_from_universe,
-    unmapped_screener_keys,
+    reportable_backtest_only, unmapped_screener_keys,
 )
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
@@ -160,8 +160,104 @@ def _apply_rm_toggles(expert_params: dict, enabled: dict, *, label: str) -> None
             print("  " + "!" * 74)
 
 
+_SHIFT_DAILY_FLAG = "--shift-daily-clock-weekdays"
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday")
+
+
+def _clock_kind(execution_interval) -> str:
+    """``"intraday"`` | ``"daily"`` | ``"other"`` for a payload's ``execution_interval``.
+
+    Same split as the engine's ``price_source._is_intraday`` (m / h / min suffix = intraday);
+    ``1d`` is the daily clock; anything else (1wk, 1mo, unknown spelling) is ``"other"``. A
+    missing interval raises: the clock decides what a weekday MEANS, so it must never be guessed.
+    """
+    if execution_interval is None or not str(execution_interval).strip():
+        raise ValueError(
+            "the payload carries no execution_interval, so the clock its entry weekdays were "
+            "scored on is unknown; refusing to copy a weekday schedule to live without it")
+    iv = str(execution_interval).strip().lower()
+    if iv.endswith("m") or iv.endswith("h") or iv.endswith("min"):
+        return "intraday"
+    if iv in ("1d", "d", "1day", "daily"):
+        return "daily"
+    return "other"
+
+
+def live_entry_days(days: dict, execution_interval, *, shift_daily_clock: bool = False
+                    ) -> tuple[dict, str]:
+    """The LIVE entry weekdays equivalent to a backtest's, and a one-line note saying what was done.
+
+    The entry weekday of a backtest is a CLOCK-DEPENDENT statement:
+
+    * INTRADAY clock (the 5-minute clock every stored classic row ran on): the decision bar is
+      09:30 of the weekday itself. Live fires at 09:30 of the same weekday. Copied unchanged.
+    * DAILY clock (``1d``): the bar stamped D decides on D's CLOSE and fills at D+1's open, which
+      is what live does when it fires at 09:30 of the NEXT trading day (reading data through D's
+      close). A backtest "Monday" is therefore a live TUESDAY, "Friday" a live MONDAY. Copying
+      the gene unchanged runs the strategy one session early with data one session older.
+
+    A daily-clock schedule is REFUSED unless ``shift_daily_clock`` is passed, in which case each
+    enabled weekday moves to the next trading weekday (Fri -> Mon). Refusing by default is the
+    point: a deploy that silently misaligns looks exactly like one that is correct.
+    """
+    kind = _clock_kind(execution_interval)
+    if kind == "intraday":
+        return dict(days), f"execution_interval {execution_interval!r} is intraday: weekdays copied unchanged"
+    if kind != "daily":
+        raise ValueError(
+            f"execution_interval {execution_interval!r} is neither intraday nor the 1d daily "
+            f"clock; the live weekday equivalent is not defined, refusing to copy the schedule")
+    if not shift_daily_clock:
+        raise ValueError(
+            f"this backtest ran on the DAILY clock ({execution_interval!r}): its entry weekday "
+            f"decides on that day's close and fills the next session, so the live equivalent is "
+            f"the NEXT trading weekday (backtest Monday = live Tuesday 09:30). Copying the "
+            f"weekday unchanged would misalign the instance with its backtest. Re-run with "
+            f"{_SHIFT_DAILY_FLAG} to deploy the shifted schedule (Mon->Tue ... Fri->Mon).")
+    out = {d: False for d in days}
+    for d, on in days.items():
+        if not on:
+            continue
+        if d not in _WEEKDAY_NAMES:
+            raise ValueError(
+                f"entry day {d!r} is enabled but a daily clock has no {d} bars; refusing to shift "
+                f"a weekday the backtest could not have evaluated")
+        out[_WEEKDAY_NAMES[(_WEEKDAY_NAMES.index(d) + 1) % len(_WEEKDAY_NAMES)]] = True
+    return out, (f"execution_interval {execution_interval!r} is the DAILY clock: entry weekdays "
+                 f"shifted to the next trading weekday ({_SHIFT_DAILY_FLAG})")
+
+
+#: The live decision time of a DAILY-clock deploy (owner 2026-11-02). A daily-clock backtest decides
+#: on D's close and fills at D+1's open, so it has no intraday decision time and the stored "09:30"
+#: is nominal. Live fires after the opening minutes instead: at 09:30-09:34 option chains came back
+#: empty (APH 2026-10-15/20, BHP 2026-10-20 on 8082) and the opening spread is the day's widest,
+#: which a live entry pays at the touch. The same reason moved the stock grids to 09:45/10:00.
+DAILY_CLOCK_LIVE_TIME = "09:45"
+
+
+def live_decision_times(times, execution_interval) -> tuple[list, str]:
+    """The LIVE decision time(s) for a backtest's stored ``times``, and a one-line note.
+
+    INTRADAY clock: the backtest decided at those bars, so live fires at the same times (copied).
+    DAILY clock: no intraday time exists to copy; live fires at ``DAILY_CLOCK_LIVE_TIME``.
+    Any other clock is refused, like ``live_entry_days``."""
+    kind = _clock_kind(execution_interval)
+    if kind == "intraday":
+        return list(times), f"decision time(s) {list(times)} copied (intraday clock)"
+    if kind != "daily":
+        raise ValueError(
+            f"execution_interval {execution_interval!r} is neither intraday nor the 1d daily "
+            f"clock; the live decision time is not defined, refusing to copy the schedule")
+    return [DAILY_CLOCK_LIVE_TIME], (
+        f"daily clock: stored time(s) {list(times)} are nominal; live fires at "
+        f"{DAILY_CLOCK_LIVE_TIME} (DAILY_CLOCK_LIVE_TIME, after the opening minutes)")
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:]]
+    shift_daily_clock = _SHIFT_DAILY_FLAG in argv
+    if shift_daily_clock:
+        argv.remove(_SHIFT_DAILY_FLAG)
     enabled = {s: False for s in _PINNED_RM_TOGGLES}
     for setting, flag in _PINNED_RM_TOGGLES.items():
         if flag in argv:
@@ -169,7 +265,7 @@ def main() -> int:
             argv.remove(flag)
     if not argv:
         raise SystemExit(
-            "usage: import_deploy_payload.py <payload.json> "
+            "usage: import_deploy_payload.py <payload.json> [--shift-daily-clock-weekdays] "
             + " ".join(f"[{f}]" for f in _PINNED_RM_TOGGLES.values()))
     payload_path = argv[0]
     with open(payload_path) as f:
@@ -226,9 +322,55 @@ def main() -> int:
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1
+        # SPY regime gates: live reads SPY from FMP. A backtest on another source is a WARNING, not
+        # a refusal (the gate itself is served by the host, no profile needed).
+        from ba2_common.core.benchmark_regime import benchmark_import_warnings
+        for _w in benchmark_import_warnings(entry["settings"].get("benchmark_regime"),
+                                            entry_rules, exit_rules):
+            print(f"WARNING: {label}: {_w}")
         if mc_profiles:
             print(f"market-condition profile(s): {list(mc_profiles)} (every market gate in the "
                   f"entry and exit rules is served)")
+
+        # THE ENTRY WEEKDAYS MEAN SOMETHING DIFFERENT PER CLOCK -- resolved HERE, before any write,
+        # for the same reason as the market-condition check above. See ``live_entry_days``.
+        sched_pre = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
+        live_days = None
+        if sched_pre.get("days"):
+            if not sched_pre.get("times"):
+                print(f"FATAL: {label}: the stored schedule carries days but NO decision time; "
+                      f"refusing to guess one (live must fire at the time the backtest decided at)")
+                return 1
+            from ba2_common.core.schedule_genes import live_deploy_time_refusal, normalise_hhmm
+            sched_pre["times"][:] = [normalise_hhmm(t) for t in sched_pre["times"]]   # '9:30' -> '09:30'
+            # goal2027 2.4: a split-gene payload carries the MANAGE time(s) separately (execution.manage_times);
+            # absent -> the manage schedule uses the entry times, as before. BOTH lists face the same refusal.
+            _manage_pre = (entry["settings"].get("execution") or {}).get("manage_times")
+            if _manage_pre is not None:
+                if not _manage_pre:
+                    print(f"FATAL: {label}: execution.manage_times is present but empty; refusing to guess "
+                          f"the open-positions time")
+                    return 1
+                _manage_pre[:] = [normalise_hhmm(t) for t in _manage_pre]
+            _late = [m for m in (live_deploy_time_refusal(t)
+                                 for t in list(sched_pre["times"]) + list(_manage_pre or [])) if m]
+            if _late:
+                print(f"FATAL: {label}: {_late[0]}")
+                return 1
+            try:
+                live_days, clock_note = live_entry_days(
+                    {d: bool(v) for d, v in sched_pre["days"].items()},
+                    entry["settings"].get("execution_interval"),
+                    shift_daily_clock=shift_daily_clock)
+            except ValueError as e:
+                print(f"FATAL: {label}: {e}")
+                return 1
+            print(f"entry weekday clock: {clock_note}")
+            _interval = entry["settings"].get("execution_interval")
+            live_times, time_note = live_decision_times(sched_pre["times"], _interval)
+            live_manage_times = (None if _manage_pre is None
+                                 else live_decision_times(_manage_pre, _interval)[0])
+            print(f"decision time: {time_note}")
 
         created = False
         if inst_id is None:
@@ -315,6 +457,10 @@ def main() -> int:
             # The universe is part of WHAT WAS SCORED, so it wins over the run's base settings
             # for the same reason the forced gates do.
             expert_params = {**expert_params, **universe_params}
+            # NOTHING is left to StockScreener's defaults (price_min 20, volume_min 500,000, float_min 10M ...):
+            # every selection key is written explicitly (the "off" value for a bound the backtest never stated)
+            from ba2_common.core.deploy_parity import complete_screener_settings
+            expert_params = {**expert_params, **complete_screener_settings(expert_params)}   # None resolved to the table value, never written
             print(f"universe: {len(universe_params)} screener setting(s) carried into "
                   f"expert_params ({SCREENER_UNIVERSE_SETTING}="
                   f"{universe_params[SCREENER_UNIVERSE_SETTING]!r})")
@@ -386,8 +532,13 @@ def main() -> int:
         # and silently keeping a stale one is the failure being closed here.
         sched = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
         if sched.get("days"):
-            days = {d: bool(v) for d, v in sched["days"].items()}
-            times = sched.get("times") or ["09:30"]
+            days = dict(live_days)   # clock-resolved above (identity on the intraday clock)
+            # The deployment fires at the backtest's OWN decision time (a strategy optimized at
+            # 09:40 is deployed at 09:40): copied from the stored schedule, never defaulted. A
+            # DAILY-clock backtest has no intraday time, so it fires at DAILY_CLOCK_LIVE_TIME
+            # (``live_decision_times``). Resolved before any write (the entry-weekday block above).
+            times = list(live_times)
+            manage_times = list(live_manage_times or times)
             prior = (expert.get_setting_with_interface_default(
                 "execution_schedule_enter_market", log_warning=False) or {}).get("days") or {}
             expert_params["execution_schedule_enter_market"] = {
@@ -398,7 +549,7 @@ def main() -> int:
             # leave live positions unmanaged for the rest of the week.
             expert_params["execution_schedule_open_positions"] = {
                 "days": {d: d not in ("saturday", "sunday") for d in days},
-                "times": times, "time_basis": "market"}
+                "times": manage_times, "time_basis": "market"}
             on = sorted(d for d, v in days.items() if v)
             was = sorted(d for d, v in prior.items() if v)
             if was and was != on:
@@ -415,7 +566,9 @@ def main() -> int:
               + ("  (incl. allow_automated_trade_opening)" if created else ""))
         # Behaviours the backtest derived that live has no analogue for. NOT applied -- a
         # deploy that differs from its backtest must SAY so (review V4/V5).
-        for k, v in (entry["settings"].get("backtest_only") or {}).items():
+        # A None row the table marks silent_when_none states nothing (e.g.
+        # hold_assigned_stock_tags on every deployable run) and is omitted.
+        for k, v in reportable_backtest_only(entry["settings"].get("backtest_only")).items():
             print(f"  BACKTEST-ONLY, not applied: {k}={v!r}")
 
     print("\n=== deploy complete ===")

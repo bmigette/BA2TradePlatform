@@ -10,6 +10,7 @@ Provides:
 import pytest
 from unittest.mock import patch, MagicMock
 from sqlmodel import SQLModel, Session, create_engine
+from sqlalchemy.pool import StaticPool
 from datetime import datetime, timezone
 
 # Import models to register them with SQLModel metadata
@@ -40,12 +41,42 @@ from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExper
 @pytest.fixture(scope="session")
 def test_engine():
     """Create an in-memory SQLite engine shared across the entire test session."""
+    # SQLite ``:memory:`` is served by SQLAlchemy's SingletonThreadPool: ONE connection (= one private
+    # in-memory database) PER THREAD, and the pool keeps at most ``pool_size`` (default 5) of them,
+    # closing arbitrary ones beyond that. A test run that touches the DB from more than five threads
+    # (worker queues, schedulers, warm workers) can therefore close the MAIN thread's connection; its
+    # next use opens a brand-new EMPTY database and fails with "no such table: expertsetting" /
+    # "no such table: tradingorder" -- sporadic, order-dependent, and never in the test's own code.
+    # A pool this large is never evicted from within a session.
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
+        pool_size=4096,
     )
     SQLModel.metadata.create_all(engine)
     return engine
+
+
+#: Thread-name fragments of the long-lived managers a test must stop (APScheduler, the trade manager's
+#: refresh, the worker queue, the warm service). A thread of this kind still alive after its test is
+#: REPORTED (a warning naming the test), so the culprit of a cross-test DB / timing interference is
+#: named instead of discovered by bisecting a 30-minute run.
+_MANAGER_THREAD_MARKERS = ("APScheduler", "TradeManager", "WorkerQueue", "worker_queue", "warm",
+                           "JobManager", "account-refresh", "dgs3mo")
+
+
+@pytest.fixture(autouse=True)
+def _report_leaked_manager_threads(request):
+    import threading
+    import warnings
+    before = {t.ident for t in threading.enumerate()}
+    yield
+    leaked = [t.name for t in threading.enumerate()
+              if t.ident not in before and t.is_alive()
+              and any(m.lower() in t.name.lower() for m in _MANAGER_THREAD_MARKERS)]
+    if leaked:
+        warnings.warn(f"{request.node.nodeid} left manager thread(s) running: {sorted(set(leaked))}",
+                      RuntimeWarning, stacklevel=1)
 
 
 @pytest.fixture(autouse=True)
@@ -165,6 +196,21 @@ def _wire_package_seams_for_tests():
 
 
 _wire_package_seams_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def history_source_seams_unwired():
+    """The per-account history-source seams (wire_all_seams step 4b) resolve an expert's ACCOUNT in the DB; most tests use stub
+    experts / ``MockAccount`` rows that no real resolver can classify. Every test starts with them unwired (the pre-feature
+    behaviour); the tests of the feature wire them explicitly."""
+    from ba2_common.core import TradeRiskManagement as rm_module
+    from ba2_common.core import backtest_context as bc
+    before = (bc.get_live_history_resolver(), rm_module.get_indicator_provider_resolver())
+    bc.set_live_history_resolver(None)
+    rm_module.set_indicator_provider_resolver(None)
+    yield
+    bc.set_live_history_resolver(before[0])
+    rm_module.set_indicator_provider_resolver(before[1])
 
 
 @pytest.fixture(autouse=True)
@@ -508,3 +554,55 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     from ba2_common.core.interfaces.OptionsAccountInterface import (
         OptionsAccountInterface as _OAI)
     monkeypatch.setattr(_OAI, "OPTION_GREEKS_SOURCE", "test_fake")
+
+
+@pytest.fixture(autouse=True)
+def _buying_power_failure_memory_starts_empty():
+    """The buying-power read remembers a failed read per ACCOUNT ID for a few seconds
+    (``MarketExpertInterface._BP_FAILED_READS``); fake accounts here reuse small ids, so a failure
+    pinned by one test must never leak into the next."""
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+    MarketExpertInterface._BP_FAILED_READS.clear()
+    yield
+    MarketExpertInterface._BP_FAILED_READS.clear()
+
+
+@pytest.fixture
+def _mock_expert_is_resolvable(monkeypatch):
+    """An option entry now reads its expert's capital (``get_available_equity_balance_detail``)
+    through the instance resolver, so an ``ExpertInstance`` row named ``MockExpert`` must resolve to
+    the ``MockExpert`` double here (the production registry knows only real expert classes)."""
+    import ba2_trade_platform.core.utils as _utils
+    real = _utils.get_expert_class
+    monkeypatch.setattr(_utils, "get_expert_class",
+                        lambda name: MockExpert if name == "MockExpert" else real(name))
+    real_account = _utils.get_account_class
+    monkeypatch.setattr(_utils, "get_account_class",
+                        lambda name: MockAccount if name == "MockAccount" else real_account(name))
+
+
+@pytest.fixture(autouse=True)
+def api_threadsafe_db(request, patch_db_engine, monkeypatch):
+    """Management-API tests only (``pytestmark = pytest.mark.api_db``): serve the DB from ONE shared
+    connection. ``test_engine`` is a per-thread ``:memory:`` pool, and a ``TestClient`` request runs in another
+    thread than the test, so it would see an empty database ("no such table: appsetting")."""
+    if request.node.get_closest_marker("api_db") is None:
+        yield
+        return
+    import ba2_common.core.db as _pkg_db
+    from sqlalchemy.pool import StaticPool
+    # the API's short-lived broker-read caches key on small account ids that every test reuses
+    from ba2_trade_platform.services import _positions_cache
+    _positions_cache.clear()
+    # log_activity hands the row to a background writer thread that outlives the test; letting it write to (or
+    # worse, race the teardown of) the per-test shared engine segfaulted sqlite on Windows. Audit tests assert on
+    # the call itself, so a no-op default here loses nothing.
+    monkeypatch.setattr("ba2_trade_platform.api.audit.log_activity", lambda *a, **k: None)
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    saved = _pkg_db._engine
+    _pkg_db._engine = engine
+    try:
+        yield
+    finally:
+        _pkg_db._engine = saved      # no dispose(): a straggler thread may still hold the connection

@@ -50,12 +50,12 @@ fixing either would move historical backtest results. They are pinned here as
 ``xfail(strict=True)`` -- so the day someone corrects the contract, the pin XPASSes and
 FAILS the suite, forcing the change to be acknowledged rather than absorbed:
 
-  * FINDING 6 -- STILL OPEN. ``BacktestAccount.get_balance()`` is CASH while a live
-    account's is EQUITY, so after a $1,000 purchase from $4,000 the shared expert math
-    charges the position twice in the backtest ($3,000 virtual / $2,000 free) and once
-    live ($4,000 / $3,000). Flat state is identical; the divergence begins at the first
-    fill. Its companion NON-xfail test records the current backtest number, so the
-    divergence is documented in both directions and a silent drift in either fails.
+  * FINDING 6 -- FIXED 2026-10-07 (owner decision; it moved every classic stock backtest).
+    ``BacktestAccount.get_balance()`` is CASH while a live account's is EQUITY, so after a
+    $1,000 purchase from $4,000 the shared expert math charged the position twice in the
+    backtest ($3,000 virtual / $2,000 free) and once live ($4,000 / $3,000). The backtest's
+    sizing balance (``_plain_balance``) is now its deployed equity;
+    ``test_backtest_and_live_agree_after_the_first_entry`` is the contract.
 
   * FINDING 4 -- CORRECTED 2026-09-16, and the mechanism above is exactly how it was
     noticed: the pin XPASSed. The classic RM's per-instrument ceiling was
@@ -760,47 +760,16 @@ def test_after_the_first_entry_the_two_live_fundings_still_agree():
     assert unlevered["quantity"] == pytest.approx(30.0)
 
 
-def test_the_backtest_charges_the_position_twice_TODAY():
-    """COMPANION PIN to the strict xfail below -- the CURRENT backtest numbers, asserted
-    positively so the divergence is recorded from both ends.
-
-    ``BacktestAccount.get_balance()`` returns CASH. The shared expert math then subtracts
-    the position AGAIN as "used balance", so a $1,000 purchase costs the backtest expert
-    $2,000 of headroom. Live, ``get_balance()`` is EQUITY and the position is charged once.
-
-    If this test starts failing, the capital contract was changed: that is a deliberate,
-    separately versioned correction (it moves every backtest result) and the xfail below
-    will have flipped to XPASS in the same run.
-    """
-    with invested_world() as world:
-        backtest = measure(world.bt, sizing_mode="notional")
-
-    assert backtest["virtual"] == pytest.approx(3_000.0)     # cash, not equity
-    assert backtest["available"] == pytest.approx(2_000.0)   # cash minus the position again
-    # 20 = the $3,000 cash-"virtual" ceiling less the $1,000 held. Live reaches 30 from a
-    # $4,000 sleeve, so the cash/equity divergence this test exists for is untouched: only
-    # the DENOMINATOR of the ceiling changed on 2026-09-16 (finding 4), for both arms.
-    assert backtest["quantity"] == pytest.approx(20.0)       # vs 30 live
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "finding 6: BacktestAccount.get_balance() is cash, live is equity; shared expert math "
-    "charges the position twice in the backtest ($3,000/$2,000 vs $4,000/$3,000). "
-    "Deliberately NOT fixed in the leverage feature: changing it moves every backtest "
-    "result and is a separately versioned correction. See "
-    "docs/plans/2026-09-09-margin-live-backtest-parity.md section 6."), raises=AssertionError)
 def test_backtest_and_live_agree_after_the_first_entry():
-    """THE PINNED BLOCKER (plan §6, finding 6).
+    """FINDING 6, FIXED 2026-10-07 (was the strict xfail below this docstring's predecessor).
 
-    Flat, the three arms are identical (tests above). The moment a position exists they
-    are not, and the cause is the pre-existing cash-vs-equity contract, not leverage --
-    L1 and L2 (both live-shaped) still agree exactly.
-
-    The assertion is stated as PARITY plus the LIVE reference numbers, deliberately NOT
-    as the current backtest numbers: pinning $3,000/$2,000 in here would make the test
-    keep xfailing after a fix (failing on the first assert instead of the second), and
-    the strict xfail would then never fire. Written this way it XPASSes -- and so FAILS
-    the suite -- on the day the contract is corrected.
+    Flat, the three arms were always identical. After a fill they were not: ``BacktestAccount.
+    get_balance()`` is CASH while a live account's is EQUITY, so the shared expert math (``available =
+    virtual - used``) charged the position twice in the backtest ($3,000 virtual / $2,000 free) and
+    once live ($4,000 / $3,000). The backtest's SIZING balance (``BacktestAccount._plain_balance``)
+    is now its deployed equity -- the same quantity -- so a $1,000 purchase out of $4,000 leaves
+    $4,000 virtual / $3,000 free / room for 30 more shares in every arm. (This moved every classic
+    stock backtest: the owner accepted that.)
     """
     with invested_world() as world:
         backtest = measure(world.bt, sizing_mode="notional")
@@ -808,9 +777,19 @@ def test_backtest_and_live_agree_after_the_first_entry():
 
     assert live["virtual"] == pytest.approx(4_000.0)
     assert live["available"] == pytest.approx(3_000.0)
+    assert live["quantity"] == pytest.approx(30.0)
     assert backtest["virtual"] == pytest.approx(live["virtual"])
     assert backtest["available"] == pytest.approx(live["available"])
     assert backtest["quantity"] == pytest.approx(live["quantity"])
+
+
+def test_the_backtest_cash_ledger_still_pays_for_the_shares_once():
+    """The fix changes the SIZING base only: the cash ledger (``get_balance``) is untouched and the
+    buying-power clamp still reads it, so cash cannot go negative."""
+    with invested_world() as world:
+        assert world.bt.account.get_balance() == pytest.approx(3_000.0)        # cash after the buy
+        assert world.bt.account.get_account_snapshot().buying_power == pytest.approx(3_000.0)
+        assert world.bt.expert.get_virtual_balance() == pytest.approx(4_000.0)  # the equity share
 
 
 # --------------------------------------------------------------------------- #

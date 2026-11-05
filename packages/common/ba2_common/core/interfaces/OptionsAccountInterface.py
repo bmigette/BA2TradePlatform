@@ -11,7 +11,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
 from ba2_common.core.option_lifecycle import PMCC_ROLL_STRATEGY
@@ -99,6 +99,11 @@ class ReservePool:
     """
     total: float
     unmeasurable: Tuple[str, ...] = ()
+    #: ``(transaction_id, reserve)`` per transaction the counted orders belong to (None for an
+    #: order not yet linked to one), summed in the same order as ``total``. Read by the equity
+    #: RM's budget (``option_collateral_budget.rm_equity_budget``), which charges each
+    #: reserving POSITION its own collateral.
+    by_transaction: Tuple[Tuple[Optional[int], float], ...] = ()
 
     @property
     def is_measurable(self) -> bool:
@@ -1288,6 +1293,13 @@ class OptionsAccountInterface(ABC):
             current = self.get_atm_implied_volatility(underlying)
         return self._iv_rank_from_series(series, current, min_samples)
 
+    def iv_rank_unavailable_reason(self, underlying: str) -> Optional[str]:
+        """WHY the most recent ``get_iv_rank(underlying)`` returned None, for display only
+        (the rule-evaluation dialog). Default None = no reason known (the backtest account
+        keeps this default, so its decisions and records are unchanged). Never used in a
+        decision."""
+        return None
+
     # --- Cash / buying-power reserve (short-premium defense-in-depth) -------
     #: Reg-T / CBOE naked-option initial-margin fraction of the underlying notional.
     #: A NAKED short option is NOT cash-secured (only an assigned cash-secured PUT is);
@@ -1411,6 +1423,30 @@ class OptionsAccountInterface(ABC):
     #: account-wide across every expert, until the order was closed by hand. It failed
     #: CLOSED — no capital was at risk — and it told the operator to repair a reserve that
     #: should never have existed.
+    #: ``order.data`` key a debit entry's builder stamps with the cash ONE contract of it
+    #: commits (``ResolvedStructure.cost_per_contract``), so a working entry that carries no
+    #: limit price (a market-type order) can still be valued by the expert capital calculation
+    #: (``MarketExpertInterface.used_balance_for_transactions``).
+    ENTRY_DEBIT_PER_CONTRACT_KEY = "entry_debit_per_contract"
+
+    def option_capital_equity(self) -> float:
+        """The equity the option book is bounded by: the account's EQUITY (cash plus marked
+        positions) from ``get_account_snapshot().equity`` -- the figure that is the same in a
+        backtest (its deployed equity) and at every live broker, which ``get_balance()`` is not
+        (CASH in a backtest, equity live). NO margin factor: options are cash-settled and the
+        option leverage is 1.0 at every supported broker, so a stock margin multiplier can never
+        let the option book use more than 100 % of equity. Raises ``ValueError`` when unpublished
+        or non-finite (unknown is never the cash figure)."""
+        snapshot = self.get_account_snapshot()
+        raw = None if snapshot is None else getattr(snapshot, "equity", None)
+        if raw is None:
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published no equity")
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"account {self.id} ({type(self).__name__}) published a "
+                             f"non-finite equity ({raw!r}); cannot bound the option book by it")
+        return value
+
     ZERO_RESERVE_STRATEGIES = frozenset({
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
@@ -2554,8 +2590,13 @@ class OptionsAccountInterface(ABC):
         # already on its way out is the direction that uncovers a call.
         return int(math.ceil(round(total, 6)))
 
-    def reserved_option_buying_power_detail(self) -> "ReservePool":
+    def reserved_option_buying_power_detail(
+            self, transaction_ids: "Optional[Any]" = None) -> "ReservePool":
         """The reserve pool WITH its unknowns named — the honest form of the answer.
+
+        ``transaction_ids`` (stage-2 E1b): restrict the pool to the orders of those
+        transactions -- one expert's open option positions, for the equity RM's budget. None
+        (every existing caller) is the whole book, computed exactly as before.
 
         A reserve belongs to the POSITION, not to the order row that created it: the broker
         frees the margin/cash the moment the structure is flattened, so this must too.
@@ -2613,7 +2654,11 @@ class OptionsAccountInterface(ABC):
         terminal = OrderStatus.get_terminal_statuses()
         total = 0.0
         blind: List[str] = []
+        per_txn: Dict[Optional[int], float] = {}
+        wanted = None if transaction_ids is None else frozenset(transaction_ids)
         for o in self.open_option_orders_book_wide():
+            if wanted is not None and getattr(o, "transaction_id", None) not in wanted:
+                continue
             strategy = getattr(o, "option_strategy", None)
             raw = (o.data or {}).get("option_reserve") if isinstance(o.data, dict) else None
             reserve = None
@@ -2636,17 +2681,22 @@ class OptionsAccountInterface(ABC):
                         f"frees buying power that is already committed)")
                     continue
                 total += reserve
+                tid = getattr(o, "transaction_id", None)
+                per_txn[tid] = per_txn.get(tid, 0.0) + reserve
             elif reserve is not None and reserve > 0:
                 # Not a priced reserving name, but it recorded a reserve anyway. Honour
                 # it: the money is spoken for whatever the row calls itself.
                 total += reserve
+                tid = getattr(o, "transaction_id", None)
+                per_txn[tid] = per_txn.get(tid, 0.0) + reserve
         if blind:
             logger.error(
                 f"Account {self.id}: {len(blind)} open option order(s) have an "
                 f"unreadable buying-power reserve, so available option buying power is "
                 f"UNKNOWN and every buying-power gate will refuse until it is repaired. "
                 + "; ".join(blind))
-        return ReservePool(total=total, unmeasurable=tuple(blind))
+        return ReservePool(total=total, unmeasurable=tuple(blind),
+                           by_transaction=tuple(per_txn.items()))
 
     def reserved_option_buying_power(self) -> float:
         """Sum of the reserves this account can actually READ, as a plain float.
@@ -2735,6 +2785,9 @@ class OptionsAccountInterface(ABC):
 
         Netting is per contract symbol over EXECUTED orders (BUY ``+``, SELL ``−``), the
         same netting the close paths perform, so a short bought back stops counting.
+        A held LONG put of the same underlying and expiry then covers a held short down
+        to the wing width (``netted_put_assignment_cost``; operator decision 2026-10-15),
+        so a put vertical or condor owes its width here, not its short strike.
         A submitted-but-unfilled SELL is added on top without netting: it can fill at any
         moment and can only ever ADD an obligation, whereas an unfilled BUY-to-close has
         closed nothing and must not hand capacity back early.
@@ -2755,7 +2808,8 @@ class OptionsAccountInterface(ABC):
         assigned. The remaining contract nets like any fill (so a buy-to-close relieves
         it) and grows no in-flight remainder, because nothing of that order is working.
         """
-        from ba2_common.core.option_lifecycle import put_assignment_cost
+        from ba2_common.core.option_lifecycle import (netted_put_assignment_cost,
+                                                      put_assignment_cost)
         from ba2_common.core.types import OrderDirection, OrderStatus
 
         executed = OrderStatus.get_executed_statuses()
@@ -2828,21 +2882,49 @@ class OptionsAccountInterface(ABC):
 
         cost = 0.0
         contracts = 0.0
+        # Held shorts and held longs, grouped by (underlying, expiry, multiplier): a held long
+        # put of the same expiry covers a held short down to the wing width
+        # (``netted_put_assignment_cost``, operator decision 2026-10-15). A short whose
+        # underlying or expiry is unrecorded cannot be matched, so it gets a group of its
+        # own and pays its full strike; a long with either unrecorded covers nothing. Both
+        # only ever OVERSTATE the bill, the safe direction.
+        groups: dict = {}
         for contract in sorted(net):
             held = net[contract]
-            if held >= -_ASSIGNMENT_EPS:      # flat, or net LONG: nothing can be put to us
-                continue
             o = meta[contract]
-            leg = put_assignment_cost(o.strike, abs(held), getattr(o, "multiplier", None))
+            mult = getattr(o, "multiplier", None)
+            underlying = getattr(o, "underlying_symbol", None)
+            expiry = getattr(o, "expiry", None)
+            if held > _ASSIGNMENT_EPS:          # net LONG put: may cover a short
+                if underlying is not None and expiry is not None and o.strike is not None:
+                    groups.setdefault((underlying, expiry, mult), ([], []))[1].append(
+                        (o.strike, held))
+                continue
+            if held >= -_ASSIGNMENT_EPS:        # flat: nothing can be put to us
+                continue
+            leg = put_assignment_cost(o.strike, abs(held), mult)
             if leg is None:
                 blind.append(
                     f"order {getattr(o, 'id', '?')} ({contract}) is a held SHORT PUT but "
                     f"its strike ({o.strike!r}) / contract count ({held!r}) / multiplier "
-                    f"({getattr(o, 'multiplier', None)!r}) cannot price delivery — the "
+                    f"({mult!r}) cannot price delivery — the "
                     f"cash it would take to accept assignment is unmeasurable")
                 continue
-            cost += leg
+            key = ((underlying, expiry, mult) if underlying is not None and expiry is not None
+                   else ("unmatched", contract, mult))
+            groups.setdefault(key, ([], []))[0].append((o.strike, abs(held)))
             contracts += abs(held)
+        for key in sorted(groups, key=str):
+            shorts, longs = groups[key]
+            if not shorts:
+                continue
+            group_cost = netted_put_assignment_cost(shorts, longs, key[2])
+            if group_cost is None:
+                blind.append(
+                    f"held puts {key!r} cannot be priced for delivery net of their long "
+                    f"wings — the cash it would take to accept assignment is unmeasurable")
+                continue
+            cost += group_cost
 
         for o, qty in pending_shorts:
             leg = put_assignment_cost(o.strike, qty, getattr(o, "multiplier", None))
@@ -2985,6 +3067,7 @@ class OptionsAccountInterface(ABC):
     def check_short_put_assignment_capacity(
         self, *, strike: Optional[float], contracts: Optional[float],
         multiplier: Optional[int] = 100,
+        long_puts: Sequence[Tuple[Optional[float], Optional[float]]] = (),
     ) -> "AssignmentCapacity":
         """Capacity verdict for a CANDIDATE short put, priced from its LEG facts.
 
@@ -2999,10 +3082,18 @@ class OptionsAccountInterface(ABC):
         A candidate that cannot be priced REFUSES and says which field was missing. A
         structure whose delivery cost we cannot compute is not a structure that costs
         nothing.
+
+        ``long_puts`` are the candidate's OWN long put legs of the same expiry, as
+        ``(strike, contracts)`` for the whole order: they net the short down to the wing
+        width (``netted_put_assignment_cost``, operator decision 2026-10-15), the same
+        rule ``short_put_assignment_exposure`` applies once the structure is held.
         """
-        from ba2_common.core.option_lifecycle import put_assignment_cost
+        from ba2_common.core.option_lifecycle import (netted_put_assignment_cost,
+                                                      put_assignment_cost)
 
         cost = put_assignment_cost(strike, contracts, multiplier)
+        if cost is not None and long_puts:
+            cost = netted_put_assignment_cost([(strike, contracts)], long_puts, multiplier)
         if cost is None:
             return AssignmentCapacity(
                 False,

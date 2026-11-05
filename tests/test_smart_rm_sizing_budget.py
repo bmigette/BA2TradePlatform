@@ -41,7 +41,7 @@ class _StubExpert:
     def get_setting_with_interface_default(self, key, log_warning=True):
         return self._settings[key]
 
-    def _available_balance_breakdown(self, exclude_transaction_id=None):
+    def _available_balance_breakdown(self, exclude_transaction_id=None, failure=None):
         """The sizing paths take ONE balance pass and reuse it for equity, the available
         cap and the capital-mapping log line (plan step 5). This stub answers it with the
         figures its two accessors above publish, so the arithmetic under test is
@@ -162,3 +162,21 @@ def test_auto_size_splits_budget_for_size_from_distance_gene_for_stop():
     assert result["implied_sl"] == 95.0, "STOP DISTANCE must come from the 5% risk_per_trade_pct gene"
     assert result["risk_dollars"] == 90.0
     assert result["risk_per_share"] == 5.0
+
+
+def test_auto_size_names_the_unreadable_option_row_and_the_repair():
+    """An option-holding expert whose option row cannot be valued: the SmartRM sizing REFUSES
+    (unknown is never zero) and the reason names the row and says how to repair it."""
+    from ba2_common.core.interfaces.MarketExpertInterface import CAPITAL_REPAIR_HINT
+    tk = _make_toolkit()
+
+    def breakdown(exclude_transaction_id=None, failure=None):
+        failure.append("transaction 42 (cash_secured_put on LEGACY) must reserve capital but no "
+                       "order carries a readable option_reserve")
+        return None
+
+    tk.expert._available_balance_breakdown = breakdown
+    result = tk._auto_size_by_risk("NEW", OrderDirection.BUY, sl_price=95.0)
+    assert result["quantity"] == 0
+    assert "transaction 42" in result["reason"] and "LEGACY" in result["reason"]
+    assert CAPITAL_REPAIR_HINT in result["reason"]

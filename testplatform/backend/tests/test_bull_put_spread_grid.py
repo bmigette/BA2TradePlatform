@@ -234,13 +234,14 @@ def test_this_key_is_not_a_duplicate_of_an_existing_one():
 
 
 def test_the_engine_routes_it_down_the_option_entry_path():
-    """``daily_engine._entry_is_option`` keys off ``is_option_action`` on the entry
-    action; a value missing from ``get_option_action_values`` silently becomes an equity
-    entry."""
-    from ba2_common.core.types import is_option_action
+    """Every fired entry is routed by the SHARED ``trade_cycle.entry_route`` (the backtest
+    engine AND live ``TradeManager``), which classifies each action type through the frozen
+    ``is_option_action`` set; a value missing from ``get_option_action_values`` would send
+    this structure to the equity RM as a share count."""
+    from ba2_common.core.trade_cycle import ENTRY_ROUTE_OPTION, entry_route
 
     ea = getattr(mod._build_strategy(KIND, KIND, "FMPRating"), "entry_action")
-    assert is_option_action(str(ea["action_type"]))
+    assert entry_route([str(ea["action_type"])]) == ENTRY_ROUTE_OPTION
 
 
 def test_the_rule_builder_forwards_its_selection_params():

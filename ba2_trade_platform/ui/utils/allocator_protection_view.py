@@ -8,7 +8,7 @@ The page (``ui/pages/portfolio_allocation.py``) and the dialog
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ...core.allocator_protection import (
-    STATUS_NO_POSITION, STATUS_OFF, STATUS_PARTIAL, STATUS_PROTECTED, STATUS_REPLACING,
+    STATUS_CANCEL_UNCONFIRMED, STATUS_NO_POSITION, STATUS_OFF, STATUS_PARTIAL, STATUS_PROTECTED, STATUS_REPLACING,
     STATUS_UNPROTECTED, WARNING_CODES, ProtectionStatus, TpTarget,
 )
 
@@ -21,7 +21,8 @@ STATUS_HEX = {"grey": "#94a3b8", "positive": "#4ade80", "warning": "#fbbf24",
 #: green = every whole share covered, amber = partly covered / size mismatch / re-placing, red = unprotected.
 ICON_COLORS = {"grey": "#94a3b8", "green": "#4ade80", "amber": "#fbbf24", "red": "#f87171"}
 _STATUS_ICON = {STATUS_OFF: "grey", STATUS_NO_POSITION: "grey", STATUS_PROTECTED: "green",
-                STATUS_PARTIAL: "amber", STATUS_REPLACING: "amber", STATUS_UNPROTECTED: "red"}
+                STATUS_PARTIAL: "amber", STATUS_REPLACING: "amber", STATUS_UNPROTECTED: "red",
+                STATUS_CANCEL_UNCONFIRMED: "amber"}
 #: The exclusion eye: orange when excluded, muted grey when included.
 EXCLUDED_HEX = "#fb923c"
 INCLUDED_HEX = "#94a3b8"

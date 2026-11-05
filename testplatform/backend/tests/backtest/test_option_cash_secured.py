@@ -111,23 +111,26 @@ def _submit_butterfly(acct, qty):
 def test_butterfly_fill_debit_capped_to_cash(tmp_path):
     """Sized 20 structures but the FILL debit per structure is huge -> the number that fills is
     capped so cash never goes negative; the combo stays balanced (leg ratio 1:2:1 preserved)."""
-    # Analysis-time quotes were cheap; the FILL premiums (2024-03-06 open) are absurdly high:
-    # per-structure debit = low(90) + high(30) - 2*body(20) = 90 + 30 - 40 = 80 /share -> $8000.
+    # Analysis-time quotes were cheap; the FILL premiums (2024-03-06 open) are high: per-structure
+    # debit = low(14) + high(8) - 2*body(7) = 8 /share -> $800 of a $1000 max value (a butterfly
+    # can never cost more than its wing: the structure bound refuses a dearer fill). The account
+    # holds $1,000 so that ONE structure is affordable.
     chain = [_c(_LOW, 170.0), _c(_BODY, 180.0), _c(_HIGH, 190.0)]
     # Bar volume sized so the 10% volume-participation cap admits the whole 20-structure
     # entry (the ratio-2 body leg needs 40 contracts) — this test exercises the CASH cap.
     bars = [
-        _bar(_LOW, "2024-03-06", 90.0, 170.0, v=1000),
-        _bar(_BODY, "2024-03-06", 20.0, 180.0, v=1000),
-        _bar(_HIGH, "2024-03-06", 30.0, 190.0, v=1000),
+        _bar(_LOW, "2024-03-06", 14.0, 170.0, v=1000),
+        _bar(_BODY, "2024-03-06", 7.0, 180.0, v=1000),
+        _bar(_HIGH, "2024-03-06", 8.0, 190.0, v=1000),
     ]
     acct, ps, ctx = _base_account(tmp_path, chain, bars)
     try:
-        _submit_butterfly(acct, 20)  # 20 structures = $160k debit on a $10k account
+        acct._cash = 1_000.0
+        _submit_butterfly(acct, 20)  # 20 structures = $16k debit on a $1k account
         acct.refresh_orders()
         acct.refresh_transactions()
 
-        # $10k / $8000 per structure -> only 1 structure affordable.
+        # $1k / $800 per structure -> only 1 structure affordable.
         assert acct._cash >= 0.0
         low_lot = acct._option_positions.get(_LOW)
         body_lot = acct._option_positions.get(_BODY)
@@ -135,28 +138,29 @@ def test_butterfly_fill_debit_capped_to_cash(tmp_path):
         assert low_lot is not None and low_lot.qty == 1      # 1 structure * ratio 1
         assert body_lot is not None and body_lot.qty == -2   # 1 structure * ratio 2 (short)
         assert high_lot is not None and high_lot.qty == 1    # balanced combo
-        # cash = 10000 - 8000 = 2000
-        assert acct._cash == pytest.approx(2000.0, abs=1.0)
+        # cash = 1000 - 800 = 200
+        assert acct._cash == pytest.approx(200.0, abs=1.0)
     finally:
         ctx.__exit__(None, None, None)
 
 
 def test_butterfly_unaffordable_does_not_open(tmp_path):
     """If not even ONE structure is affordable, the entry does not open (no lots, cash intact)."""
-    # per-structure debit = low(150) + high(50) - 2*body(20) = 160 /share -> $16000 > $10k.
+    # per-structure debit = low(14) + high(8) - 2*body(7) = 8 /share -> $800 > the $500 held.
     chain = [_c(_LOW, 170.0), _c(_BODY, 180.0), _c(_HIGH, 190.0)]
     bars = [
-        _bar(_LOW, "2024-03-06", 150.0, 170.0),
-        _bar(_BODY, "2024-03-06", 20.0, 180.0),
-        _bar(_HIGH, "2024-03-06", 50.0, 190.0),
+        _bar(_LOW, "2024-03-06", 14.0, 170.0),
+        _bar(_BODY, "2024-03-06", 7.0, 180.0),
+        _bar(_HIGH, "2024-03-06", 8.0, 190.0),
     ]
     acct, ps, ctx = _base_account(tmp_path, chain, bars)
     try:
+        acct._cash = 500.0
         _submit_butterfly(acct, 5)
         acct.refresh_orders()
         acct.refresh_transactions()
 
-        assert acct._cash == pytest.approx(10_000.0, abs=1e-6)   # untouched
+        assert acct._cash == pytest.approx(500.0, abs=1e-6)   # untouched
         assert all(l.qty == 0 for l in acct._option_positions.values())
         assert acct.get_option_positions() == []
     finally:

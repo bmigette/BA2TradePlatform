@@ -36,6 +36,10 @@ class _Account:
         self.option_tradable_calls += 1
         return self._option_tradable
 
+    def option_capital_equity(self):
+        self.option_equity_calls = getattr(self, "option_equity_calls", 0) + 1
+        return self._balance                      # the account's equity (no positions here)
+
     def get_account_info(self):
         return {"buying_power": self._bp}
 
@@ -160,17 +164,17 @@ def _option_entry_action(account, expert_recommendation=None):
     return action
 
 
-def test_option_entry_virtual_equity_is_the_option_tradable_balance_times_pct():
-    """An option entry sizes off the OPTION tradable balance, not the stock one: long
-    options are cash-settled, so with the stock factor at 1.8 (18k) and the option
-    multiplier at 1.0 the sleeve is still the plain 10k. Reading the stock figure here
-    would size every option entry 1.8x too big."""
+def test_option_entry_virtual_equity_is_the_accounts_equity_times_pct():
+    """An option entry sizes off the account's EQUITY (``option_capital_equity``) -- the same base
+    the option capital limit is measured against and the same in backtest and live -- not the stock
+    tradable balance (18k with the stock factor at 1.8: options are cash-settled and take no
+    margin) and not ``get_balance()`` (cash in a backtest, equity live)."""
     account = _Account(1, balance=10_000.0, tradable=18_000.0, buying_power=20_000.0,
                        option_tradable=10_000.0)
     action = _option_entry_action(account)  # no recommendation -> pct defaults to 100
 
     assert action._virtual_equity() == 10_000.0
-    assert account.option_tradable_calls == 1
+    assert account.option_equity_calls == 1
     assert account.tradable_calls == 0, "the stock tradable balance is not the option base"
 
 
@@ -178,8 +182,8 @@ def test_trade_action_virtual_equity_is_none_not_a_number_when_tradable_raises()
     """An account that cannot say what it may deploy in options yields None -- never the
     unlevered balance, which would silently disagree with the expert's own sizing."""
     class _Broken(_Account):
-        def get_option_tradable_balance(self):
-            raise ValueError("account published no buying power")
+        def option_capital_equity(self):
+            raise ValueError("account published no equity")
 
     action = _option_entry_action(
         _Broken(1, balance=10_000.0, tradable=None, buying_power=None))
@@ -194,7 +198,7 @@ def test_trade_action_virtual_equity_propagates_a_NON_benign_error(monkeypatch):
     monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
 
     class _Defective(_Account):
-        def get_option_tradable_balance(self):
+        def option_capital_equity(self):
             raise TypeError("defect")
 
     action = _option_entry_action(

@@ -18,6 +18,7 @@ from sqlmodel import select
 from ...logger import logger
 from ...core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ...core.models import Position, TradingOrder, Transaction
+from ...core.pending_cancel import mark_pending_cancel
 from ...core.types import BrokerOrderErrorReason, OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
@@ -206,6 +207,10 @@ class TastyTradeAccount(AccountInterface):
             logger.error(f"TastyTradeAccount {self.id}: Not authenticated - {self._authentication_error}")
             return False
         return True
+
+    def _require_session(self) -> None:
+        if not self._check_authentication():
+            raise ConnectionError(f"TastyTradeAccount {self.id}: not authenticated with the broker")
 
     # ------------------------------------------------------------------
     # EMPTY BROKER ERRORS
@@ -560,22 +565,44 @@ class TastyTradeAccount(AccountInterface):
             else:
                 current = avg_price
 
+            # DIRECTION. TastyTrade publishes ``quantity`` as an ABSOLUTE number and the direction in
+            # ``quantity_direction`` ("Long" / "Short"). The platform's Position contract (Alpaca's, and
+            # what ``get_signed_position_quantity``, the exposure gate and the breach sweep read) is
+            # SIGNED: a short has a NEGATIVE qty, cost basis and market value, and an unrealized P/L that
+            # is positive when the price FALLS. Reading the absolute figures as they came made a short
+            # look like a long of the same size. An unknown direction on a held row is an unreadable
+            # book, never a guess.
+            direction = str(getattr(pos, "quantity_direction", None) or "").strip().lower()
+            if direction == "long":
+                sign = 1.0
+            elif direction == "short":
+                sign = -1.0
+            else:
+                logger.error(
+                    f"[Account {self.id}] position {pos.symbol} has quantity {pos.quantity} but "
+                    f"quantity_direction={getattr(pos, 'quantity_direction', None)!r} (expected "
+                    f"'Long' or 'Short'); reporting the whole book as UNREADABLE (None) rather than "
+                    f"guessing a direction")
+                return None
+
             abs_qty = abs(qty)
-            cost_basis = avg_price * abs_qty * multiplier
-            market_val = current * abs_qty * multiplier
+            signed_qty = sign * abs_qty
+            cost_basis = sign * avg_price * abs_qty * multiplier
+            market_val = sign * current * abs_qty * multiplier
+            # signed market value - signed cost basis: a short that fell is a gain.
             unrealized_pl = market_val - cost_basis
-            unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis else 0.0
+            unrealized_plpc = (unrealized_pl / abs(cost_basis)) if cost_basis else 0.0
 
             # INTRADAY = move since the previous close, on the position still OPEN.
             # (`realized_day_gain` is CLOSED-out P&L for the day -- a different number,
             # and what this used to report.)
             lastday_price = close_price if close_price is not None else current
             change_today = ((current - lastday_price) / lastday_price) if lastday_price else 0.0
-            intraday_pl = (current - lastday_price) * abs_qty * multiplier
+            intraday_pl = (current - lastday_price) * signed_qty * multiplier
             lastday_value = lastday_price * abs_qty * multiplier
             intraday_plpc = (intraday_pl / lastday_value) if lastday_value else 0.0
 
-            side = OrderDirection.BUY if pos.quantity_direction == "Long" else OrderDirection.SELL
+            side = OrderDirection.BUY if sign > 0 else OrderDirection.SELL
 
             positions.append(Position(
                 asset_class="Equity",
@@ -587,8 +614,8 @@ class TastyTradeAccount(AccountInterface):
                 exchange="",
                 lastday_price=lastday_price,
                 market_value=market_val,
-                qty=abs_qty,
-                qty_available=abs_qty,
+                qty=signed_qty,
+                qty_available=signed_qty,
                 side=side,
                 swap_rate=None,
                 symbol=pos.symbol,
@@ -1388,7 +1415,7 @@ class TastyTradeAccount(AccountInterface):
         # refresh_orders promotes it once the broker confirms and the qty is actually
         # released -- same rule as AlpacaAccount.cancel_order.
         fresh_order = get_instance(TradingOrder, db_order.id)
-        fresh_order.status = OrderStatus.PENDING_CANCEL
+        mark_pending_cancel(fresh_order)
         update_instance(fresh_order)
         logger.info(
             f"[Account {self.id}] Requested cancel of TastyTrade order "
@@ -1617,6 +1644,30 @@ class TastyTradeAccount(AccountInterface):
             return ProtectiveDryRun(False, change, text, is_margin_refusal(text))
         return ProtectiveDryRun(True, change, "")
 
+    def _check_protective_vs_market(self, symbol: str, sl_price: float, tp_price=None) -> None:
+        """Last line of defence: a stop at or above the market SELLS at once, a target at or below it fills at
+        once. Reads the price straight from the broker through ``_get_instrument_current_price_impl``: the
+        public ``get_instrument_current_price`` sits behind a 60 s cache that validation already used, so it
+        could not catch a move since. 'mark' is the broker's consolidated live price (the one net liquidation
+        is struck at); outside regular hours it is the broker's last mark and may lag the true quote, which
+        cannot be verified offline. An unreadable price refuses (never assumed)."""
+        from ...core.allocator_protection import ProtectionRefused
+        try:
+            fetched = self._get_instrument_current_price_impl([symbol], "mark")
+            last = fetched.get(symbol) if isinstance(fetched, dict) else fetched
+        except Exception as e:  # noqa: BLE001 -- refused, with the reason
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the current price could not be read ({e}); "
+                                    f"protective orders are not placed blind") from e
+        if last is None or float(last) <= 0:
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: no current price; protective orders are "
+                                    f"not placed blind")
+        if float(sl_price) >= float(last):
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the stop {sl_price:g} is at or above the "
+                                    f"market ({float(last):g}) and would sell at once")
+        if tp_price is not None and float(tp_price) <= float(last):
+            raise ProtectionRefused(f"[Account {self.id}] {symbol}: the take-profit {tp_price:g} is at or below "
+                                    f"the market ({float(last):g}) and would fill at once")
+
     def place_protective_oco(self, symbol: str, quantity: int, tp_price: float,
                              sl_price: float, tag: str) -> "ProtectiveOcoResult":
         """Place ONE GTC OCO: sell ``quantity`` whole shares at a limit ``tp_price`` OR as a
@@ -1658,6 +1709,7 @@ class TastyTradeAccount(AccountInterface):
             raise ProtectionRefused(
                 f"[Account {self.id}] {symbol}: need 0 < stop ({sl_price}) < take-profit ({tp_price})")
         qty = qty.quantize(Decimal(1))
+        self._check_protective_vs_market(symbol, sl_price, tp_price)
 
         try:
             equity = self._run_async(Equity.get(self._session, symbol))
@@ -1870,6 +1922,7 @@ class TastyTradeAccount(AccountInterface):
         if not sl_price > 0:
             raise ProtectionRefused(f"[Account {self.id}] {symbol}: the stop ({sl_price}) must be > 0")
         qty = qty.quantize(Decimal(1))
+        self._check_protective_vs_market(symbol, sl_price)
 
         try:
             equity = self._run_async(Equity.get(self._session, symbol))
@@ -2357,6 +2410,90 @@ class TastyTradeAccount(AccountInterface):
                         'yield': num(getattr(m, 'dividend_yield', None))}
         return out
 
+    def _dividends_impl(self, symbol, start_date, end_date, strict: bool):
+        def _range(p):
+            if start_date:
+                p["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
+            if end_date:
+                p["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+            if symbol:
+                p["symbol"] = symbol
+            return p
+
+        # DRIP share-receipt legs (enrichment only): Receive Deliver / Dividend.
+        drip_map = {}  # (symbol, date) -> (qty, price)
+        try:
+            rd_txns = self._run_async(self._account.get_history(
+                self._session, **_range({"types": ["Receive Deliver"],
+                                         "sub_types": ["Dividend"], "sort": "Asc",
+                                         "page_offset": None})))
+            for txn in rd_txns:
+                sym = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
+                d = getattr(txn, 'transaction_date', None)
+                qty = float(getattr(txn, 'quantity', 0) or 0)
+                if sym and d and qty > 0:
+                    drip_map[(sym, d)] = (qty, float(getattr(txn, 'price', 0) or 0))
+        except Exception as e:
+            if strict:        # a missing DRIP leg would book a reinvested dividend as cash
+                raise
+            logger.warning(
+                f"[Account {self.id}] DRIP share-receipt fetch failed: "
+                f"{self._describe_broker_error(e, 'the DRIP share-receipt fetch')}")
+
+        # Cash dividends + tax: Money Movement transactions, sub_type "Dividend"
+        # only (excludes the "Withdrawal" reinvest leg, ACH deposits, fee
+        # adjustments, etc.). Positive net = gross, negative net = tax.
+        gross_map = {}  # (symbol, date) -> gross dividend
+        tax_map = {}    # (symbol, date) -> tax withheld (positive)
+        mm_txns = self._run_async(self._account.get_history(
+            self._session, **_range({"types": ["Money Movement"], "sort": "Asc",
+                                     "page_offset": None})))
+        for mm in mm_txns:
+            if getattr(mm, 'transaction_sub_type', None) != 'Dividend':
+                continue
+            sym = getattr(mm, 'underlying_symbol', None) or getattr(mm, 'symbol', None)
+            d = getattr(mm, 'transaction_date', None)
+            if not sym or not d:
+                continue
+            net_val = float(getattr(mm, 'net_value', 0) or 0)
+            key = (sym, d)
+            if net_val > 0:
+                gross_map[key] = gross_map.get(key, 0.0) + net_val
+            elif net_val < 0:
+                tax_map[key] = tax_map.get(key, 0.0) + abs(net_val)
+
+        # Anchor on the GROSS dividend keys (one positive cash dividend per
+        # symbol+date). Tax is linked back by the SAME (symbol, date) key, so
+        # withholding only ever reduces its own symbol's dividend -- an
+        # unrelated/orphan tax line (no matching gross) is never emitted as a
+        # phantom negative dividend.
+        dividends = []
+        for key in sorted(gross_map, key=lambda k: (str(k[1]), str(k[0]))):
+            sym, d = key
+            gross = round(gross_map.get(key, 0.0), 2)
+            tax = round(tax_map.get(key, 0.0), 2)
+            drip_qty, drip_price = drip_map.get(key, (None, None))
+            dividends.append({
+                'symbol': sym,
+                # NET dividend (income kept). Same helper get_cash_transfers uses,
+                # so the two seams cannot disagree about the same history.
+                'amount': self._net_dividend(gross, tax),
+                'gross_amount': gross,
+                'tax_withheld': tax,
+                'date': d,
+                'drip_quantity': drip_qty,
+                'drip_price': drip_price,
+            })
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend records")
+        return dividends
+
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
+        """``get_dividends`` that RAISES instead of answering ``[]`` when the broker cannot be read (also when the
+        DRIP enrichment fails: without it a reinvested dividend would read as cash). [] means no dividends."""
+        self._require_session()
+        return self._dividends_impl(symbol, start_date, end_date, True)
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
         """Return one record per dividend the account received.
 
@@ -2382,80 +2519,7 @@ class TastyTradeAccount(AccountInterface):
         if not self._check_authentication():
             return []
         try:
-            def _range(p):
-                if start_date:
-                    p["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
-                if end_date:
-                    p["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
-                if symbol:
-                    p["symbol"] = symbol
-                return p
-
-            # DRIP share-receipt legs (enrichment only): Receive Deliver / Dividend.
-            drip_map = {}  # (symbol, date) -> (qty, price)
-            try:
-                rd_txns = self._run_async(self._account.get_history(
-                    self._session, **_range({"types": ["Receive Deliver"],
-                                             "sub_types": ["Dividend"], "sort": "Asc",
-                                             "page_offset": None})))
-                for txn in rd_txns:
-                    sym = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
-                    d = getattr(txn, 'transaction_date', None)
-                    qty = float(getattr(txn, 'quantity', 0) or 0)
-                    if sym and d and qty > 0:
-                        drip_map[(sym, d)] = (qty, float(getattr(txn, 'price', 0) or 0))
-            except Exception as e:
-                logger.warning(
-                    f"[Account {self.id}] DRIP share-receipt fetch failed: "
-                    f"{self._describe_broker_error(e, 'the DRIP share-receipt fetch')}")
-
-            # Cash dividends + tax: Money Movement transactions, sub_type "Dividend"
-            # only (excludes the "Withdrawal" reinvest leg, ACH deposits, fee
-            # adjustments, etc.). Positive net = gross, negative net = tax.
-            gross_map = {}  # (symbol, date) -> gross dividend
-            tax_map = {}    # (symbol, date) -> tax withheld (positive)
-            mm_txns = self._run_async(self._account.get_history(
-                self._session, **_range({"types": ["Money Movement"], "sort": "Asc",
-                                         "page_offset": None})))
-            for mm in mm_txns:
-                if getattr(mm, 'transaction_sub_type', None) != 'Dividend':
-                    continue
-                sym = getattr(mm, 'underlying_symbol', None) or getattr(mm, 'symbol', None)
-                d = getattr(mm, 'transaction_date', None)
-                if not sym or not d:
-                    continue
-                net_val = float(getattr(mm, 'net_value', 0) or 0)
-                key = (sym, d)
-                if net_val > 0:
-                    gross_map[key] = gross_map.get(key, 0.0) + net_val
-                elif net_val < 0:
-                    tax_map[key] = tax_map.get(key, 0.0) + abs(net_val)
-
-            # Anchor on the GROSS dividend keys (one positive cash dividend per
-            # symbol+date). Tax is linked back by the SAME (symbol, date) key, so
-            # withholding only ever reduces its own symbol's dividend -- an
-            # unrelated/orphan tax line (no matching gross) is never emitted as a
-            # phantom negative dividend.
-            dividends = []
-            for key in sorted(gross_map, key=lambda k: (str(k[1]), str(k[0]))):
-                sym, d = key
-                gross = round(gross_map.get(key, 0.0), 2)
-                tax = round(tax_map.get(key, 0.0), 2)
-                drip_qty, drip_price = drip_map.get(key, (None, None))
-                dividends.append({
-                    'symbol': sym,
-                    # NET dividend (income kept). Same helper get_cash_transfers uses,
-                    # so the two seams cannot disagree about the same history.
-                    'amount': self._net_dividend(gross, tax),
-                    'gross_amount': gross,
-                    'tax_withheld': tax,
-                    'date': d,
-                    'drip_quantity': drip_qty,
-                    'drip_price': drip_price,
-                })
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend records")
-            return dividends
+            return self._dividends_impl(symbol, start_date, end_date, False)
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching dividends: "
                 f"{self._describe_broker_error(e, 'the dividend fetch')}", exc_info=True)
@@ -3177,46 +3241,110 @@ class TastyTradeAccount(AccountInterface):
             as_of=now,
         )
 
+    def _balance_history_impl(self, start_date, end_date, strict: bool):
+        # TastyTrade requires start_date to return daily snapshots;
+        # without it, only a few snapshots are returned.
+        if start_date:
+            sd = start_date.date() if isinstance(start_date, datetime) else start_date
+        else:
+            sd = date.today() - timedelta(days=365)
+
+        params = {"start_date": sd}
+        if end_date:
+            params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+
+        snapshots = self._run_async(self._account.get_balance_snapshots(
+            self._session,
+            page_offset=None,  # Get all pages
+            **params
+        ))
+
+        result = []
+        for snap in snapshots:
+            # In the SDK both are REQUIRED Decimal fields (AccountBalanceSnapshot): a margin or an empty account reports
+            # Decimal('0'), never None, so None means a malformed snapshot -- refused, not skipped.
+            if strict and (snap.cash_balance is None or snap.net_liquidating_value is None):
+                raise ValueError(f"balance snapshot {getattr(snap, 'snapshot_date', None)} has no cash / NLV")
+            cash = float(snap.cash_balance) if snap.cash_balance else 0.0
+            nlv = float(snap.net_liquidating_value) if snap.net_liquidating_value else 0.0
+            equity = nlv - cash
+
+            result.append({
+                'date': snap.snapshot_date if hasattr(snap, 'snapshot_date') else None,
+                'net_liquidating_value': nlv,
+                'cash_balance': cash,
+                'equity_value': equity,
+            })
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(result)} balance history snapshots")
+        return result
+
+    def get_balance_history_strict(self, start_date=None, end_date=None) -> List[Dict]:
+        """``get_balance_history`` that RAISES when the broker cannot be read and refuses a snapshot with no cash / NLV
+        (the lenient one reads it as 0)."""
+        self._require_session()
+        return self._balance_history_impl(start_date, end_date, True)
+
     def get_balance_history(self, start_date=None, end_date=None) -> List[Dict]:
         if not self._check_authentication():
             return []
         try:
-            # TastyTrade requires start_date to return daily snapshots;
-            # without it, only a few snapshots are returned.
-            if start_date:
-                sd = start_date.date() if isinstance(start_date, datetime) else start_date
-            else:
-                sd = date.today() - timedelta(days=365)
-
-            params = {"start_date": sd}
-            if end_date:
-                params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
-
-            snapshots = self._run_async(self._account.get_balance_snapshots(
-                self._session,
-                page_offset=None,  # Get all pages
-                **params
-            ))
-
-            result = []
-            for snap in snapshots:
-                cash = float(snap.cash_balance) if snap.cash_balance else 0.0
-                nlv = float(snap.net_liquidating_value) if snap.net_liquidating_value else 0.0
-                equity = nlv - cash
-
-                result.append({
-                    'date': snap.snapshot_date if hasattr(snap, 'snapshot_date') else None,
-                    'net_liquidating_value': nlv,
-                    'cash_balance': cash,
-                    'equity_value': equity,
-                })
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(result)} balance history snapshots")
-            return result
+            return self._balance_history_impl(start_date, end_date, False)
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching balance history: "
                 f"{self._describe_broker_error(e, 'the balance-history fetch')}", exc_info=True)
             return []
+
+    def _filled_trades_impl(self, symbol, start_date, end_date):
+        params = {
+            "types": ["Trade"],
+            "sort": "Asc",
+            # page_offset=None -> all pages; the default of 0 caps history at 250 rows.
+            "page_offset": None,
+        }
+        if symbol:
+            params["symbol"] = symbol
+        if start_date:
+            params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
+        if end_date:
+            params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+
+        transactions = self._run_async(self._account.get_history(self._session, **params))
+
+        trades = []
+        for txn in transactions:
+            txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
+            txn_qty = float(getattr(txn, 'quantity', 0) or 0)
+            if txn_qty <= 0:
+                continue
+
+            txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
+            txn_price = float(getattr(txn, 'price', 0) or 0)
+
+            # Determine side from action field
+            action = str(getattr(txn, 'action', '') or '').lower()
+            if 'buy' in action:
+                side = 'BUY'
+            elif 'sell' in action:
+                side = 'SELL'
+            else:
+                continue
+
+            trades.append({
+                'symbol': txn_symbol,
+                'qty': txn_qty,
+                'side': side,
+                'date': txn_date,
+                'price': txn_price,
+            })
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(trades)} filled trades")
+        return trades
+
+    def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
+        """``get_filled_trades`` that RAISES instead of answering ``[]`` when the broker cannot be read."""
+        self._require_session()
+        return self._filled_trades_impl(symbol, start_date, end_date)
 
     def get_filled_trades(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
         """Get filled trade history from TastyTrade transaction history."""
@@ -3224,51 +3352,7 @@ class TastyTradeAccount(AccountInterface):
             return []
 
         try:
-            params = {
-                "types": ["Trade"],
-                "sort": "Asc",
-                # page_offset=None -> all pages; the default of 0 caps history at 250 rows.
-                "page_offset": None,
-            }
-            if symbol:
-                params["symbol"] = symbol
-            if start_date:
-                params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
-            if end_date:
-                params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
-
-            transactions = self._run_async(self._account.get_history(self._session, **params))
-
-            trades = []
-            for txn in transactions:
-                txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
-                txn_qty = float(getattr(txn, 'quantity', 0) or 0)
-                if txn_qty <= 0:
-                    continue
-
-                txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
-                txn_price = float(getattr(txn, 'price', 0) or 0)
-
-                # Determine side from action field
-                action = str(getattr(txn, 'action', '') or '').lower()
-                if 'buy' in action:
-                    side = 'BUY'
-                elif 'sell' in action:
-                    side = 'SELL'
-                else:
-                    continue
-
-                trades.append({
-                    'symbol': txn_symbol,
-                    'qty': txn_qty,
-                    'side': side,
-                    'date': txn_date,
-                    'price': txn_price,
-                })
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(trades)} filled trades")
-            return trades
-
+            return self._filled_trades_impl(symbol, start_date, end_date)
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching filled trades: "
                 f"{self._describe_broker_error(e, 'the filled-trade fetch')}", exc_info=True)

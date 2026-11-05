@@ -21,6 +21,7 @@ to an empty section that then compares as a plausible bundle.
 """
 from __future__ import annotations
 
+import inspect
 import itertools
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -29,10 +30,13 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from ba2_common.core.backtest_context import knowable_daily_end
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.interfaces.MarketDataProviderInterface import ohlcv_identity
 from ba2_common.core.replay import (
     ReplayMiss,
     ReplayStatus,
+    current_capture,
     record_observation,
     replay_now,
 )
@@ -48,6 +52,11 @@ _OHLCV_CACHE = TTLCache(_TTL_SECONDS)
 # requested window), which TTLCache's key/value shape cannot express -- so the
 # frames live here as {key: (covered_from, df)} instead.
 _OHLCV_COVERAGE: dict = {}
+# LIVE ONLY (as_of None): key -> the New York session date on which the cached frame was fetched.
+# A live frame is "history up to the last final session"; ``need_from`` only moves FORWARD with the
+# wall clock, so the coverage test alone would serve the first frame of the process for its whole life.
+# A new NY session date refetches (backtest reads are keyed by coverage only, as before).
+_OHLCV_LIVE_DAY: dict = {}
 # One OhlcvView per cached frame (same keys as _OHLCV_COVERAGE): the parsed
 # dates + column arrays + the fingerprint the technical series memo keys on.
 _OHLCV_VIEWS: dict = {}
@@ -81,6 +90,7 @@ def reset_caches() -> None:
     reset under its own lock.
     """
     _OHLCV_COVERAGE.clear()
+    _OHLCV_LIVE_DAY.clear()
     _OHLCV_VIEWS.clear()
     _INDEX_CLOSES_MEMO.clear()
     # The technical series memo is keyed on an OhlcvView fingerprint, so dropping
@@ -230,6 +240,45 @@ def _slice_to_as_of(df: pd.DataFrame, as_of: Optional[datetime],
     return df[dates <= cutoff]
 
 
+def _live_session_day(now) -> object:
+    """The New York calendar date of ``now`` (naive values are read as UTC): the refresh key of a
+    LIVE frame."""
+    ts = pd.Timestamp(now)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    return ts.tz_convert("America/New_York").date()
+
+
+def _capturing() -> bool:
+    """A LIVE capture is active (not a replay, where nothing may be recorded and no clock read consumed)."""
+    context = current_capture()
+    return context is not None and not context.is_replay
+
+
+def _record_memoised_ohlcv(providers, symbol: str, need_from, now, frame) -> None:
+    """Record, against the analysis being captured, the OHLCV read that a process memo answered.
+
+    The frame of a symbol (and the index's) is fetched once per process and session day and then served
+    from memory to every later analysis of the pass. Such an analysis reached no provider, so the tap on
+    ``get_ohlcv_data`` recorded nothing for it -- yet its bundle holds that frame, and a replay of its gather
+    asks the tape for it (the replay has no memo). The read is therefore recorded HERE, under the identity
+    the tap would have written for the request ``fetch_ohlcv`` makes, with the frame the memo holds (the
+    very frame the provider returned). Same pattern as ``fetch_macro_series`` for the FRED memo. Capture
+    only: a no-op when nothing is being captured, and the memo keeps serving exactly as before.
+
+    The identity is built from the provider method's own signature (defaults applied), never restated.
+    """
+    if not _capturing():
+        return
+    provider = providers.ohlcv()
+    bound = inspect.signature(provider.get_ohlcv_data).bind(
+        symbol=symbol, start_date=need_from, end_date=now, interval="1d")
+    bound.apply_defaults()
+    record_observation(
+        provider="market_data", method="get_ohlcv_data",
+        identity=ohlcv_identity({"self": provider, **bound.arguments}),
+        payload=frame, provenance=ReplayStatus.PROVENANCE_MEMO_CACHE)
+
+
 def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
                 lookback_days: int = OHLCV_LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
     """Daily OHLCV ascending by date, sliced to <= as_of (causal).
@@ -254,10 +303,17 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     need_from = ((as_of or now) - timedelta(days=lookback_days)).replace(tzinfo=None)
     key = _ohlcv_key(symbol, lookback_days)
     covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
-    if df is None or (covered_from is not None and need_from < covered_from):
+    live_day = _live_session_day(now) if as_of is None else None
+    stale_live = as_of is None and df is not None and _OHLCV_LIVE_DAY.get(key) != live_day
+    if df is None or stale_live or (covered_from is not None and need_from < covered_from):
         try:
-            df = providers.ohlcv().get_ohlcv_data(
-                symbol=symbol, start_date=need_from, end_date=now, interval="1d")
+            ohlcv = providers.ohlcv()
+            # This reader caches the whole series for the run and slices it per decision through
+            # ``knowable_daily_end`` below, so on a backtest provider it asks for the UNSLICED series
+            # explicitly (every other daily read is clamped to the knowable history by default).
+            # Live providers have no such method and are read as before.
+            fetch = getattr(ohlcv, "get_ohlcv_data_unsliced", None) or ohlcv.get_ohlcv_data
+            df = fetch(symbol=symbol, start_date=need_from, end_date=now, interval="1d")
         except ReplayMiss:
             raise
         except ReplayMiss:
@@ -269,12 +325,23 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
         if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
             return None
         _OHLCV_COVERAGE[key] = (need_from, df)
+        if as_of is None:
+            _OHLCV_LIVE_DAY[key] = live_day
+        else:
+            _OHLCV_LIVE_DAY.pop(key, None)
         # A NEW payload means a NEW view and a new epoch in its fingerprint, so
         # nothing memoised against the previous frame can be served for it.
         _OHLCV_VIEWS[key] = _build_view(symbol, df)
+    elif as_of is None:
+        # Served from the process memo: no provider was reached, so say what the request WAS (capture only).
+        _record_memoised_ohlcv(providers, symbol, need_from, now, df)
     if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
         return None
-    out = _slice_to_as_of(df, as_of, _OHLCV_VIEWS.get(key))
+    # Slice to what is KNOWABLE at the decision, not to the decision's own stamp: on an intraday
+    # backtest clock the decision session's daily bar is not finished at 09:30 (live holds only
+    # the prior session's). The cutoff comes from the clock owner via the OHLCV provider; it is
+    # ``as_of`` itself live and on a daily clock.
+    out = _slice_to_as_of(df, knowable_daily_end(providers, as_of), _OHLCV_VIEWS.get(key))
     if out is None or out.empty:
         return None
     return out.reset_index(drop=True)
@@ -449,6 +516,13 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
         current = _OHLCV_VIEWS.get(view_key)
         if current is not None and current.fingerprint == fingerprint:
             _INDEX_CLOSES_MEMO.move_to_end(key)
+            if as_of is None and _capturing():
+                # The memo spares the slice, not the READ: this analysis still read the index frame (and the
+                # clock for its window), so record both exactly where ``fetch_ohlcv`` would have.
+                now = replay_now(None)
+                need_from = (now - timedelta(days=OHLCV_LOOKBACK_DAYS)).replace(tzinfo=None)
+                _record_memoised_ohlcv(providers, index_symbol, need_from, now,
+                                       _OHLCV_COVERAGE[view_key][1])   # view and frame are cached together
             return closes
         del _INDEX_CLOSES_MEMO[key]
     df = fetch_ohlcv(providers, index_symbol, as_of)

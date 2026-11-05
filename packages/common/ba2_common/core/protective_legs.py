@@ -101,15 +101,17 @@ class ProtectiveLegsMixin:
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
 
-    def _tpsl_reference_price(self, entry_order: TradingOrder):
-        """Best pre-fill anchor the TP/SL were computed against (fill, limit, recommendation
-        snapshot, then the live price), so a pending OCO can be re-based to the actual fill."""
-        if entry_order.open_price:
-            return entry_order.open_price
-        if entry_order.limit_price:
-            return entry_order.limit_price
-        rec_id = getattr(entry_order, "expert_recommendation_id", None)
-        if rec_id:
+    def _tpsl_reference_price(self, entry_order: TradingOrder, transaction=None):
+        """The pre-fill anchor the stop was computed against, so a pending OCO can be re-based to
+        the actual fill: the shared ``resolve_tpsl_reference_price`` chain (fill, the STAMPED
+        anchor, limit, recommendation snapshot, live price), the same one live Alpaca and the
+        backtest use."""
+        from ba2_common.core.tpsl_fill_rebase import read_anchor, resolve_tpsl_reference_price
+
+        def _rec_price():
+            rec_id = getattr(entry_order, "expert_recommendation_id", None)
+            if not rec_id:
+                return None
             try:
                 from ba2_common.core.models import ExpertRecommendation
                 rec = get_instance(ExpertRecommendation, rec_id)
@@ -117,10 +119,17 @@ class ProtectiveLegsMixin:
                     return rec.price_at_date
             except Exception:  # noqa: BLE001 -- falls through to the live price
                 pass
-        try:
-            return self.get_instrument_current_price(entry_order.symbol)
-        except Exception:  # noqa: BLE001
             return None
+
+        def _live_price():
+            try:
+                return self.get_instrument_current_price(entry_order.symbol)
+            except Exception:  # noqa: BLE001
+                return None
+
+        return resolve_tpsl_reference_price(
+            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price,
+            stamped_stop_anchor=read_anchor(getattr(transaction, "meta_data", None), "stop"))
 
     @staticmethod
     def _target_exit_spec(transaction: Transaction, entry_order: TradingOrder):
@@ -152,7 +161,7 @@ class ProtectiveLegsMixin:
             data["tp_percent_target"] = self._calculate_tp_percent(entry_order, tp_price)
         if sl_price:
             data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
-        ref_price = self._tpsl_reference_price(entry_order)
+        ref_price = self._tpsl_reference_price(entry_order, transaction)
         if ref_price:
             data["tpsl_reference_price"] = ref_price
         return TradingOrder(
@@ -513,7 +522,7 @@ class ProtectiveLegsMixin:
         if sl_price:
             data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
         if order_type == CoreOrderType.OCO:
-            data["tpsl_reference_price"] = self._tpsl_reference_price(entry_order)
+            data["tpsl_reference_price"] = self._tpsl_reference_price(entry_order, transaction)
         row = TradingOrder(
             account_id=self.id, symbol=entry_order.symbol, quantity=quantity, side=exit_side,
             order_type=order_type, limit_price=tp_price, stop_price=sl_price,

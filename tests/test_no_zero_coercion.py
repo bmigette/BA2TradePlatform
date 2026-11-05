@@ -88,6 +88,9 @@ SCAN_ROOTS = (
     "ba2_trade_platform/core",
     "ba2_trade_platform/modules/accounts",
     "ba2_trade_platform/ui",
+    # the management-API services hold code MOVED out of ui/ (Overview figures): leaving the root out would
+    # have silently exempted that debt the day it moved.
+    "ba2_trade_platform/services",
     "testplatform/backend/app/services",
 )
 
@@ -454,6 +457,13 @@ BASELINE: dict = {
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
+    # moved verbatim out of ui/pages/overview.py (the Account Growth series); same debt, new home. The page kept
+    # its display behaviour (a golden number would shift). The API path never reaches these sites with a missing
+    # field: services/account_growth.py validates every broker row first and SKIPS + COUNTS a bad one
+    # (partial: true, skipped_rows), so no missing balance / quantity / price is read as 0 there.
+    # (Net effect on the register: overview.py was ALREADY one over its old baseline of 16 -- it scanned 17 before
+    # the move -- so 17 = 7 kept + 10 moved; the +1 in BASELINE_TOTAL is that pre-existing site, now counted.)
+    "ba2_trade_platform/services/growth.py": 10,
     # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
     # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
     # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
@@ -463,7 +473,9 @@ BASELINE: dict = {
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
     # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
     # price instead of reading either as 0, which would book a free trade.
-    "ba2_trade_platform/ui/pages/overview.py": 16,
+    # 16 -> 7: ten of the Account Growth series coercions moved with their code into
+    # ba2_trade_platform/services/growth.py (listed below); the page itself keeps 7.
+    "ba2_trade_platform/ui/pages/overview.py": 7,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -481,7 +493,7 @@ BASELINE: dict = {
     # growing a second copy of it. The two coercions travelled verbatim.
     "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
-    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
+    "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 2,
     # The three PROMOTED sleeve-reader coercions, moved verbatim out of
     # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
     # filled/ordered quantity, a transaction quantity and the contract multiplier, each

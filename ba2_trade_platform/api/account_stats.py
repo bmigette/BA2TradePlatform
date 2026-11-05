@@ -1,0 +1,42 @@
+"""Per-account figures of the Overview: growth (total, by label, by position), closed P&L, dividends."""
+from datetime import date, datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from ..services import account_growth as growth_svc
+from ..services import dividends as dividends_svc
+from ..services import stats as stats_svc
+from .common import Paging, paging
+
+router = APIRouter(prefix="/accounts", tags=["account stats"])
+
+
+@router.get("/{account_id}/growth")
+def account_growth(account_id: int, from_: Optional[date] = Query(None, alias="from"), to: Optional[date] = None):
+    return growth_svc.account_growth(account_id, from_, to)
+
+
+@router.get("/{account_id}/growth/labels")
+def growth_by_label(account_id: int, labels: Optional[str] = None,
+                    from_: Optional[date] = Query(None, alias="from"), to: Optional[date] = None):
+    wanted = [x.strip() for x in labels.split(",") if x.strip()] if labels else None
+    return growth_svc.growth_by_label(account_id, wanted, from_, to)
+
+
+@router.get("/{account_id}/growth/labels/{label}/positions")
+def growth_by_position(account_id: int, label: str, from_: Optional[date] = Query(None, alias="from"),
+                       to: Optional[date] = None):
+    return growth_svc.growth_by_position(account_id, label, from_, to)
+
+
+@router.get("/{account_id}/pnl/closed")
+def closed_pnl(account_id: int, from_: Optional[datetime] = Query(None, alias="from"), to: Optional[datetime] = None,
+               group_by: str = "day", p: Paging = Depends(paging)):
+    return stats_svc.closed_pnl(account_id, from_, to, group_by, limit=p.limit, offset=p.offset)
+
+
+@router.get("/{account_id}/dividends")
+def account_dividends(account_id: int, from_: Optional[date] = Query(None, alias="from"), to: Optional[date] = None,
+                      symbol: Optional[str] = None, p: Paging = Depends(paging)):
+    return dividends_svc.account_dividends(account_id, from_, to, symbol, limit=p.limit, offset=p.offset)

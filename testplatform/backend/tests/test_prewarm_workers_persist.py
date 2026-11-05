@@ -218,7 +218,9 @@ def _prewarm_args(**over):
     # command refresh the fractional-share map first; under this file's network-refusing
     # fixture that fetch fails and is reported non-fatally, which is its contract.
     args = {"symbols": "AAA", "experts": "FMPRating", "workers": 1, "end": "2026-09-10",
-            "start": None, "fractionable_max_age_hours": 24.0}
+            "start": None, "fractionable_max_age_hours": 24.0,
+            # added by the screener-live-sim branch (--screener-panel / --screener-store)
+            "screener_panel": False, "screener_store": None}
     args.update(over)
     return argparse.Namespace(**args)
 

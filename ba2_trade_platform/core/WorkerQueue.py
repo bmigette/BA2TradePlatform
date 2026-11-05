@@ -979,6 +979,13 @@ class WorkerQueue:
                     logger.debug(f"Analysis task '{task.id}' skipped due to symbol price/balance constraints in {execution_time:.2f}s")
                     return
 
+            # Derived ATM-IV history (live-only): for an expert whose ruleset for this use case has an
+            # iv_rank condition, bring this symbol's series up to the last completed session HERE,
+            # blocking on this task's own worker thread, so it is fresh before the rule is evaluated
+            # (get_iv_rank only reads the store). Experts without such a rule pay one cached check.
+            from ..modules.dataproviders.options.atm_iv_task_hook import ensure_for_analysis_task
+            ensure_for_analysis_task(task.expert_instance_id, task.symbol, task.subtype, batch_id=task.batch_id)
+
             # Create or reuse MarketAnalysis record
             if task.market_analysis_id:
                 # Reusing existing MarketAnalysis for retry
@@ -1129,6 +1136,16 @@ class WorkerQueue:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")
+
+                        # ONE pass-level ERROR when most of the pass's symbols could not be priced
+                        # (a broker outage); observation only, never changes what is traded.
+                        try:
+                            from ba2_common.core import pass_price_health
+                            pass_price_health.summarise_pass(
+                                task.expert_instance_id, total_jobs,
+                                account_id=locals().get("batch_account_id"), batch_id=task.batch_id)
+                        except Exception as e:
+                            logger.warning(f"Price-health summary failed for {task.batch_id}: {e}")
 
                         # Lifecycle step 3 (spec section 6): as each batch finishes,
                         # queue only the historical dependencies its analyses newly
@@ -1518,6 +1535,7 @@ class WorkerQueue:
             expert_instance_id: The expert instance ID to check
             use_case: The analysis use case (ENTER_MARKET or OPEN_POSITIONS)
         """
+        gate_reports = []
         try:
             logger.debug(f"[RISK_MGR_TRIGGER] ===== START _check_and_process_expert_recommendations for expert {expert_instance_id}, use_case={use_case.value} =====")
 
@@ -1552,6 +1570,15 @@ class WorkerQueue:
                     return
                 
                 logger.info(f"[RISK_MGR_TRIGGER] No pending {use_case.value} tasks for expert {expert_instance_id}, proceeding with risk manager check")
+
+                if use_case == AnalysisUseCase.ENTER_MARKET:
+                    # Memory-only pop under the lock; the log + Activity Log write happens in the
+                    # ``finally`` below, OUTSIDE ``_risk_manager_lock``.
+                    try:
+                        from ..modules.dataproviders.options.atm_iv_task_hook import pop_gate_reports
+                        gate_reports = pop_gate_reports(expert_instance_id)
+                    except Exception as e:
+                        logger.error(f"IV gate summary unavailable for expert {expert_instance_id}: {e}", exc_info=True)
                 
                 if not has_pending:
                     # Mark this expert as being processed
@@ -1758,6 +1785,13 @@ class WorkerQueue:
         except Exception as e:
             logger.error(f"[RISK_MGR_TRIGGER] ✗ Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (exception) =====")
+        finally:
+            if gate_reports:
+                try:
+                    from ..modules.dataproviders.options.atm_iv_task_hook import emit_gate_reports
+                    emit_gate_reports(gate_reports)
+                except Exception as e:
+                    logger.error(f"IV gate summary failed for expert {expert_instance_id}: {e}", exc_info=True)
     
     def has_existing_transactions(self, expert_id: int, symbol: str) -> bool:
         """

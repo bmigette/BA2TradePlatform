@@ -10,12 +10,13 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, date, timedelta
 
+from ba2_common.core.knowability import require_decision_price
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, TradeActionResult
 from ba2_common.core.types import (
     OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
-    OptionRight, AssetClass, TransactionStatus, OptionCloseReason,
+    OptionRight, AssetClass, TransactionStatus, OptionCloseReason, CAPITAL_HOLDING_TRANSACTION_STATUSES,
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_economics import (
@@ -46,6 +47,7 @@ from ba2_common.core.OptionRiskManagement import (
     admit_option_entry, option_risk_manager_enabled, record_submitted,
 )
 from ba2_common.core.earnings_stamp import ORDER_EVENT_DATE_KEY, stamped_event_date
+from ba2_common.core.entry_tag import ORDER_ENTRY_TAG_KEY, coerce_entry_tag
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wired_weights
@@ -128,12 +130,17 @@ class TradeAction(ABC):
             Current price or None if unavailable
         """
         try:
-            return self.account.get_instrument_current_price(self.instrument_name)
+            price = self.account.get_instrument_current_price(self.instrument_name)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error getting current price for {self.instrument_name}: {e}", exc_info=True)
             return None
-    
+        # every TP/SL/reference level and share count a TradeAction builds anchors on THIS price:
+        # on an intraday clock it must be the decision price (guard outside the try: it must raise)
+        if price is not None:
+            require_decision_price(price, what="TradeAction anchor", symbol=self.instrument_name)
+        return price
+
     def get_current_position(self) -> Optional[float]:
         """
         Get current position quantity for the instrument.
@@ -890,7 +897,8 @@ class BuyAction(TradeAction):
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
                  expert_recommendation: Optional[ExpertRecommendation] = None,
-                 lot_size: Optional[int] = None, percent: Optional[float] = None):
+                 lot_size: Optional[int] = None, percent: Optional[float] = None,
+                 entry_tag: Any = None):
         super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
         self.close_percent = percent
         # Optional round-lot constraint: the risk manager sizes the order in
@@ -898,6 +906,14 @@ class BuyAction(TradeAction):
         # Used by option-overlay strategies (covered call / protective put) that
         # need 100-share equity blocks per contract.
         self.lot_size = lot_size
+        # The style-group MEMBER TAG of an equity-entry member (O_CC / O_PP; plan 2026-09-25
+        # option-stage2-build, E1), written into the entry order's data at creation -- the row
+        # that member's tag-scoped exits read. None on every existing rule: nothing written.
+        # Stamped ONLY on the entry path (flat or long: a new long or an add to it). A buy that
+        # COVERS this expert's short is an exit of the position the short's own entry opened: its
+        # close order is not an entry row, so it carries no member tag (the tag names who OPENED
+        # a position, and EntryTagCondition reads it off the entry row only).
+        self.entry_tag = coerce_entry_tag(entry_tag)
 
     def _equity_lot_size(self) -> int:
         """The round lot IN THE EQUITY BOOK'S UNIT.
@@ -966,11 +982,14 @@ class BuyAction(TradeAction):
                 )
             
             # Create PENDING order record (not submitted to broker yet)
+            extra_data = {"lot_size": self._equity_lot_size()} if self.lot_size else {}
+            if self.entry_tag is not None:
+                extra_data[ORDER_ENTRY_TAG_KEY] = self.entry_tag
             order_id = self.create_order_record(
                 side="buy",
                 quantity=quantity,
                 order_type="market",
-                extra_data={"lot_size": self._equity_lot_size()} if self.lot_size else None
+                extra_data=extra_data or None
             )
             
             if not order_id:
@@ -1202,24 +1221,8 @@ def resolve_min_take_profit_pct(expert_recommendation_id: Optional[int]) -> floa
     return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
 
 
-def compute_tp_floor_price(
-    target_price: float, entry_price: float, min_pct: float, is_long: bool
-) -> Optional[float]:
-    """If `target_price` is closer to `entry_price` than `min_pct`% allows, return the
-    floor-enforced price; otherwise None (no adjustment needed). Pure, no I/O -- shared by the
-    pre-fill Phase-2 enforcement (AdjustTakeProfitAction._enforce_minimum_distance / compute_price)
-    and TradeManager's post-fill re-check of the same floor against the REAL fill price."""
-    if not entry_price:
-        return None
-    if is_long:
-        actual_pct = ((target_price - entry_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 + min_pct / 100)
-    else:
-        actual_pct = ((entry_price - target_price) / entry_price) * 100
-        if actual_pct < min_pct:
-            return entry_price * (1 - min_pct / 100)
-    return None
+# compute_tp_floor_price now lives in tpsl_fill_rebase (pure; shared with the fill-time re-base).
+from ba2_common.core.tpsl_fill_rebase import compute_tp_floor_price  # noqa: E402,F401
 
 
 class _AdjustPriceLevelAction(TradeAction):
@@ -1351,6 +1354,9 @@ class _AdjustPriceLevelAction(TradeAction):
                     data={}
                 )
 
+            # The price the level is computed from (stamped below, before it reaches the account).
+            # None = a literal target price of unknown origin.
+            anchor_price = None
             # Calculate price if not directly provided
             if self.target_price is None:
                 if self.reference_value is None or self.percent is None:
@@ -1411,6 +1417,7 @@ class _AdjustPriceLevelAction(TradeAction):
                         if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                             base_price = expert_rec.price_at_date
                             expected_profit = expert_rec.expected_profit_percent
+                            anchor_price = base_price
 
                             logger.info(f"{self._label} Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
 
@@ -1453,6 +1460,8 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                if anchor_price is None:
+                    anchor_price = reference_price
                 # Determine position direction: the POSITION's side (see _position_is_long)
                 is_long_position, direction_source = self._position_is_long()
                 if is_long_position is not None:
@@ -1510,6 +1519,13 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                # Stamp the anchor BEFORE the account builds anything from the level.
+                from ba2_common.core.trade_cycle import record_level_anchor
+                record_level_anchor(transaction.id, **{self._anchor_level: anchor_price})
+                # Re-read: the account persists the object it is handed, and the copy loaded before
+                # the stamp would write the stamp's meta_data back out (stale-copy overwrite).
+                transaction = get_instance(Transaction, transaction.id) or transaction
+
                 logger.debug(f"Calling {self._label.lower()} adjustment for transaction {transaction.id} with price ${self.target_price:.2f}")
                 success = self._call_broker(transaction)
 
@@ -1565,8 +1581,17 @@ class _AdjustPriceLevelAction(TradeAction):
                 data={"order_id": self.existing_order.id if self.existing_order else None}
             )
 
+    #: "stop" / "tp": which ``tpsl_anchor`` slot this action's level lives in.
+    @property
+    def _anchor_level(self) -> str:
+        return "stop" if self._price_key_prefix == "sl" else "tp"
+
+    #: The price the last ``compute_price`` result was computed from (None = literal target).
+    last_anchor_price: Optional[float] = None
+
     def compute_price(self, order: "TradingOrder") -> Optional[float]:
         """Calculate the price for the given order without submitting to broker."""
+        self.last_anchor_price = None
         if self.target_price is not None:
             return self.target_price
 
@@ -1590,6 +1615,7 @@ class _AdjustPriceLevelAction(TradeAction):
                 if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                     base_price = expert_rec.price_at_date
                     expected_profit = expert_rec.expected_profit_percent
+                    self.last_anchor_price = base_price
                     if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                         reference_price = base_price * (1 + expected_profit / 100)
                     elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
@@ -1597,6 +1623,8 @@ class _AdjustPriceLevelAction(TradeAction):
 
         if reference_price is None:
             return None
+        if self.last_anchor_price is None:
+            self.last_anchor_price = reference_price
 
         is_long, _source = self._position_is_long(order)
         if is_long is None:
@@ -2775,6 +2803,10 @@ class _OptionEntryAction(TradeAction):
     _min_one_contract_note: Optional[str] = None
     #: True when the latest sizing's quantity came from the floor (recorded on the result).
     _min_one_contract_applied: bool = False
+    #: The style-group MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1), None unless a
+    #: rule carries one. Class-level for the same reason as ``min_one_contract``: an action
+    #: built without the ctor reads it as absent, like every config written before it existed.
+    entry_tag: Optional[int] = None
 
     def __init__(self, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation,
@@ -2795,6 +2827,7 @@ class _OptionEntryAction(TradeAction):
                  w_iv: Optional[float] = None,
                  w_rvol: Optional[float] = None,
                  min_one_contract: Any = None,
+                 entry_tag: Any = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -2857,6 +2890,13 @@ class _OptionEntryAction(TradeAction):
         # no-zero-coercion audit pins allowlisted sites by file:line.)
         from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
         self.min_one_contract = False if min_one_contract is None else coerce_bool(min_one_contract)
+        # STYLE-GROUP MEMBER TAG (plan 2026-09-25 option-stage2-build, Task 1): which member of
+        # a composed option expert this entry belongs to. Stamped onto the PARENT order row at
+        # submit (see ``_submit_option_order``) and read back by ``EntryTagCondition`` to scope
+        # that member's exits. None (absent) on every rule not emitted by a style expert, and
+        # then nothing is stamped -- byte-identical. Anything but a positive integer is REFUSED
+        # here: the tag decides which exits may close the position, so it is never guessed at.
+        self.entry_tag = coerce_entry_tag(entry_tag)
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2968,6 +3008,33 @@ class _OptionEntryAction(TradeAction):
         return self.account.get_option_chain(
             self.instrument_name, expiry_min, expiry_max, option_type)
 
+    def _select_call_put_pair_one_expiry(self, call_chain, put_chain, *, param, spot, liq,
+                                         label, method="percent_otm", role="short"):
+        """Pick a call and a put (two-leg or two-short structures) on ONE expiry.
+
+        The call is chosen first; the put is then chosen from the put chain restricted to
+        the call's expiry (the OpenShortStrangleAction rule). Two independent
+        ``select_single`` calls can land on different expiries, which the account layer
+        rejects with an uncaught "single expiry" ValueError. No put on that expiry means a
+        refusal, never a different expiry. ``role`` ("short"/"long") only words the refusal.
+        Returns ``(call, put, refusal)``; ``refusal`` is a result dict or ``None``.
+        """
+        sc = select_single(call_chain, method=method, strike_param=param, spot=spot,
+                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), policy=self.selection_policy, **liq)
+        if sc is None:
+            return None, None, self._result(
+                False, f"No liquid {role} legs for {label} on {self.instrument_name}")
+        sp = select_single([c for c in put_chain if c.expiry == sc.expiry],
+                           method=method, strike_param=param, spot=spot,
+                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), policy=self.selection_policy, **liq)
+        if sp is None:
+            return None, None, self._result(
+                False, f"No liquid {role} put on the call's expiry ({sc.expiry}); "
+                       f"{label} legs must share one expiry on {self.instrument_name}")
+        return sc, sp, None
+
     def _liq(self, *chains: List[OptionContract]) -> Dict[str, Any]:
         """The liquidity gates EVERY leg of this structure must be selected under.
 
@@ -3049,13 +3116,13 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """OPTION tradable balance * virtual_equity_pct/100 (the whole option tradable
-        balance when the pct is unknown). Option entries are sized from the option
-        leverage, which is 1.0 at every supported broker today, so with the stock factor
-        at 1.8 this stays at the plain balance -- long options cannot be bought on
-        margin. None when the account cannot answer, never a guess."""
+        """The account's EQUITY (``option_capital_equity``) * virtual_equity_pct/100 -- the SAME
+        base the option capital limit is measured against, and the same in backtest and live
+        (``get_balance()`` is cash in a backtest and equity live, so a budget taken from it
+        differed after capital was deployed). Option leverage is 1.0 at every supported broker, so
+        no margin factor applies. None when the account cannot answer, never a guess."""
         try:
-            balance = self.account.get_option_tradable_balance()
+            balance = self.account.option_capital_equity()
         except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
             # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
             # signal the tradable-balance path raises. Anything else is a defect, and
@@ -3219,7 +3286,7 @@ class _OptionEntryAction(TradeAction):
         """``(dollars this expert already has committed to self.instrument_name, None)``, or
         ``(None, why)`` when any part of it cannot be measured.
 
-        WHAT IS COUNTED -- every WAITING or OPENED transaction of this expert on the symbol
+        WHAT IS COUNTED -- every WAITING, OPENED or CLOSING transaction of this expert on the symbol
         (the same set the classic equity RM's ``_get_existing_allocations`` reads, through the
         same dual-path ``transactions_where``, so a backtest reads its in-memory store):
 
@@ -3252,7 +3319,7 @@ class _OptionEntryAction(TradeAction):
         total = 0.0
         for txn in transactions_where(
                 expert_id=instance_id, symbol=self.instrument_name,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED]):
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)):
             orders = orders_where(transaction_id=txn.id)
             fallback = next((p for o in orders
                              for p in (o.limit_price, o.open_price, o.stop_price) if p), None)
@@ -3419,6 +3486,7 @@ class _OptionEntryAction(TradeAction):
                                        strike: Optional[float],
                                        quantity: Optional[int],
                                        contracts_per_unit: int = 1,
+                                       long_puts_per_unit: "Tuple[Tuple[float, int], ...]" = (),
                                        ) -> "Tuple[Optional[int], Optional[Dict[str, Any]]]":
         """ENFORCING assignment-capacity gate. Returns ``(admitted_quantity, refusal)``.
 
@@ -3450,26 +3518,36 @@ class _OptionEntryAction(TradeAction):
         extended to say the downsize was attempted), and every UNMEASURABLE verdict
         (no room figure exists to clamp to; unknown is still not 'fine').
 
+        ``long_puts_per_unit`` are the structure's own long put legs of the same expiry,
+        ``(strike, contracts per unit)``: they net the short down to the wing width
+        (operator decision 2026-10-15), so a condor or put vertical owes its width here,
+        the same figure the backtest settles it at and the held-book view charges it.
+
         Placed AFTER ``check_option_buying_power`` deliberately: an entry that the
         pre-existing gate already refuses keeps the message it has always had, so no
         decline already on record is re-labelled. A downsized entry needs LESS buying
         power than the full size that already passed, so the earlier BP verdict holds a
         fortiori (callers re-derive the reserve for the clamped size).
         """
+        def _longs(units):
+            return tuple((k, n * units) for k, n in long_puts_per_unit)
+
         total = None
         if quantity is not None and contracts_per_unit:
             total = contracts_per_unit * quantity
         verdict = self.account.check_short_put_assignment_capacity(
-            strike=strike, contracts=total)
+            strike=strike, contracts=total,
+            long_puts=_longs(quantity) if quantity is not None else ())
         if verdict.ok:
             return quantity, None
         downsize_attempted = False
         if (verdict.held_cost is not None and verdict.cash is not None
                 and verdict.candidate_cost is not None
                 and quantity is not None and quantity >= 1):
-            from ba2_common.core.option_lifecycle import put_assignment_cost
+            from ba2_common.core.option_lifecycle import netted_put_assignment_cost
 
-            per_unit = put_assignment_cost(strike, contracts_per_unit, 100)
+            per_unit = netted_put_assignment_cost(
+                [(strike, contracts_per_unit)], _longs(1), 100)
             if per_unit is not None and per_unit > 0:
                 downsize_attempted = True
                 room = verdict.cash - verdict.held_cost
@@ -3483,7 +3561,8 @@ class _OptionEntryAction(TradeAction):
                     if units < 1:
                         break
                     clamped = self.account.check_short_put_assignment_capacity(
-                        strike=strike, contracts=contracts_per_unit * units)
+                        strike=strike, contracts=contracts_per_unit * units,
+                        long_puts=_longs(units))
                     if clamped.ok:
                         logger.warning(
                             f"{self._action_type_value()} for {self.instrument_name}: "
@@ -3704,7 +3783,8 @@ class _OptionEntryAction(TradeAction):
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None,
                              stock_cover_price: Optional[float] = None,
-                             extra_entry_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                             extra_entry_facts: Optional[Dict[str, Any]] = None,
+                             sizing_note: Optional[str] = None) -> Dict[str, Any]:
         """Submit (or defer) the assembled option order, honoring submit_to_broker.
 
         ``extra_entry_facts`` is a builder-specific fact set that must ride the ORDER ROW,
@@ -3794,6 +3874,10 @@ class _OptionEntryAction(TradeAction):
             data["min_one_contract_floor"] = True
         if extra_entry_facts:
             data.update(extra_entry_facts)
+        # WHY THE SIZE IS WHAT IT IS, when the capital headroom cut it: on the result message,
+        # the result data and (below) the order comment, like every other sizing reason.
+        if sizing_note:
+            data["capital_headroom_cut"] = sizing_note
         # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
         # option_reserve so the loss_pct_of_max_loss exit can read it BACK -- no leg
         # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
@@ -3962,17 +4046,47 @@ class _OptionEntryAction(TradeAction):
             entry_facts["entry_record"] = data["entry_record"]
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)
-        if entry_facts and order_id is not None:
+        # The style-group MEMBER TAG rides the row by NAME too (never via the whitelist tuple
+        # above -- the trap that comment describes): EntryTagCondition reads it back off this
+        # row to scope the member's exits. Only when the rule carried one, so every untagged
+        # entry's row -- every existing run and every live rule -- is byte-identical.
+        if self.entry_tag is not None:
+            entry_facts[ORDER_ENTRY_TAG_KEY] = self.entry_tag
+        # A TAGGED entry whose tag cannot reach its row is NOT a success: the order is on the
+        # wire, but the member's tag-scoped exits read only the row, so they could never close
+        # it. Every path that would otherwise skip or swallow the write (no order id, no row,
+        # InstanceNotFound or any absorbed error) raises this instead. Untagged entries keep
+        # today's log-and-continue behaviour exactly.
+        tag_lost = None
+        if (entry_facts or sizing_note) and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
                     stored.data = {**(stored.data or {}), **entry_facts}
+                    if sizing_note:
+                        stored.comment = (f"{stored.comment}; {sizing_note}" if stored.comment
+                                          else sizing_note)
                     update_instance(stored)
+                elif self.entry_tag is not None:
+                    tag_lost = f"order row {order_id} does not exist"
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
                 logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
                              f"order {order_id}: {e}", exc_info=True)
-        return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
+                if self.entry_tag is not None:
+                    tag_lost = f"{type(e).__name__}: {e}"
+        elif self.entry_tag is not None:
+            tag_lost = "the broker returned no order id"
+        if tag_lost is not None:
+            raise RuntimeError(
+                f"ENTRY_TAG_NOT_STAMPED: {option_strategy} for {self.instrument_name} was "
+                f"submitted (order {order_id}) but entry_tag={self.entry_tag} could not be "
+                f"written to its order row ({tag_lost}); the member's tag-scoped exits can "
+                f"never close this position")
+        message = f"Submitted {option_strategy} for {self.instrument_name}"
+        if sizing_note:
+            message += f"; {sizing_note}"
+        return self._result(True, message, data)
 
     def _entry_record_or_refusal(self, legs: List[OptionLeg], *, quantity: int,
                                  limit_price: float, option_strategy: str,
@@ -4135,6 +4249,105 @@ class _OptionEntryAction(TradeAction):
         """
         return (expiry - self._today()).days
 
+    def _capital_headroom(self):
+        """``(headroom, unmeasurable names)``: what this entry's EXPERT may still commit.
+
+        THE STOCK PATH'S "money left to spend", read for options and the same in backtest and live:
+        ``MarketExpertInterface.get_available_equity_balance_detail`` (the expert's
+        ``virtual_equity_pct`` slice of the account's equity, less what its stocks AND options have
+        committed -- debit premium, credit collateral, working entries -- clamped by the broker's
+        remaining buying power and the account's exposure headroom exactly as the stock path's is).
+        An entry that belongs to no expert reads the account's own 100 % slice
+        (``account_available_equity_detail``). ``(None, names)`` is UNKNOWN: every name is a row to
+        repair, and no gate may read it as room."""
+        rec = self.expert_recommendation
+        instance_id = rec.instance_id if rec else None
+        if instance_id:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+            if expert is None:
+                return None, (f"expert instance {instance_id} could not be resolved",)
+            return expert.get_available_equity_balance_detail()
+        from ba2_common.core.interfaces.MarketExpertInterface import account_available_equity_detail
+        return account_available_equity_detail(self.account)
+
+    def _reserve_refusal(self, required: float) -> Optional[str]:
+        """None if a ``required`` reserve fits, else WHICH gate refused it and by how much.
+
+        Two gates, in order: the account's own reserve gate (``check_option_buying_power``, an
+        outer check) and this expert's capital headroom (``_capital_headroom``). The headroom
+        counts pending debit entries, open stock positions and every other structure's
+        collateral, so a credit structure is refused when any of them has spoken for the capital
+        -- wider than the debit arm it was added for, and the same in backtest and live.
+
+        The reason names the binding gate because the two mean different things to an operator:
+        the BROKER being out of option buying power is an account problem, while the EXPERT's
+        slice (its ``virtual_equity_pct`` of equity, less what it has committed) being spent is
+        the sizing rule working as designed. A single "Insufficient buying power" for both sent
+        the 2026-10-22 investigation to the broker when the expert's slice was what refused."""
+        if required <= 0:
+            return None
+        if not self.account.check_option_buying_power(required):
+            return (f"the account's option buying power cannot reserve {required:,.2f} "
+                    f"(broker limit, check_option_buying_power)")
+        headroom, names = self._capital_headroom()
+        if headroom is None:
+            reason = (f"reserve {required:,.2f} cannot be checked, the expert's capital headroom "
+                      f"is unmeasurable: " + "; ".join(names))
+            logger.warning(f"{self.instrument_name}: {reason}")
+            return reason
+        if required <= headroom:
+            return None
+        return (f"reserve {required:,.2f} exceeds the expert's capital headroom {headroom:,.2f} "
+                f"(its equity slice less what its open and pending positions commit)")
+
+    def _fit_debit_to_capital(self, quantity: int, commit_per_contract: float,
+                              option_strategy: str
+                              ) -> "Tuple[int, Optional[Dict[str, Any]], Optional[str]]":
+        """``(quantity that fits, None, note)`` or ``(quantity, refusal, None)`` for a
+        premium-sized entry. ``note`` is non-None exactly when the size was CUT, and says why
+        ("sized 12 -> 7 contracts: option capital headroom $X ..."); ``_size_and_submit`` carries it
+        into the result message, the result data and the order comment.
+
+        THE CAPITAL LIMIT OF THE OPTION BOOK (owner rule, 2026-10-06): an expert's stocks and options
+        together never commit more than 100 % of its equity share, "like with stocks". The number is
+        ``_capital_headroom`` -- the stock path's own remaining-balance calculation, per EXPERT,
+        identical in backtest and live. The size is CUT to what fits; REFUSED when not even one
+        contract fits, or when the headroom cannot be measured -- and then the refusal NAMES every
+        row that could not be read, so it can be repaired. Unknown never reads as room.
+
+        NO FAIL-OPEN: an expert with no capital model, or a non-numeric headroom, is a defect and
+        raises (``AttributeError`` / ``TypeError``). Test doubles carry the model.
+        """
+        headroom, names = self._capital_headroom()
+        if headroom is None:
+            culprits = "; ".join(names)
+            logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: the option "
+                           f"capital headroom is unmeasurable: {culprits}")
+            return quantity, self._result(
+                False, f"{option_strategy} on {self.instrument_name} refused: the option capital "
+                       f"headroom cannot be measured: {culprits}"), None
+        if isinstance(headroom, bool) or not isinstance(headroom, (int, float)):
+            raise TypeError(f"the capital headroom must be a number or None, got {headroom!r}")
+        fits = int(math.floor(headroom / commit_per_contract)) if headroom > 0 else 0
+        # The same float comparison the fill makes: never one contract past the room.
+        while fits > 0 and fits * commit_per_contract > headroom:
+            fits -= 1
+        if fits >= quantity:
+            return quantity, None, None
+        if fits < 1:
+            logger.warning(f"{option_strategy} on {self.instrument_name} REFUSED: one contract "
+                           f"commits {commit_per_contract:.2f} but only {headroom:.2f} of option "
+                           f"capital is uncommitted")
+            return quantity, self._result(
+                False, f"Insufficient option capital for {option_strategy} on "
+                       f"{self.instrument_name}: one contract commits {commit_per_contract:.2f}, "
+                       f"{headroom:.2f} is uncommitted"), None
+        note = (f"sized {quantity} -> {fits} contract(s): option capital headroom "
+                f"${headroom:,.2f} ({commit_per_contract:,.2f} per contract)")
+        logger.warning(f"{option_strategy} on {self.instrument_name} DOWNSIZED: {note}")
+        return fits, None, note
+
     def _size_and_submit(self, resolved) -> Dict[str, Any]:
         """Size ``resolved`` and submit it. The former tail of every ``_build_and_submit``.
 
@@ -4161,18 +4374,33 @@ class _OptionEntryAction(TradeAction):
             cost = risk.risk_per_contract
             extra_per_contract = risk.extra_beyond_outlay
         quantity = self._size_by_cost(cost, self.sizing)
+        sizing_note = None
+        if quantity >= 1 and resolved.sizing_basis == "premium":
+            # A DEBIT entry spends cash the account must still hold: what it pays (and, for a
+            # structure that can lose more than its debit, the excess it reserves -- ``cost``
+            # is that whole commitment per contract) cannot exceed the headroom left after the
+            # collateral reserved by credit structures and the debit entries still in flight.
+            quantity, refusal, sizing_note = self._fit_debit_to_capital(
+                quantity, cost, resolved.option_strategy)
+            if refusal is not None:
+                return refusal
+        # What ONE contract of this entry pays (the debit), recorded on the order so a working
+        # entry with no limit price can still be valued by the capital headroom.
+        entry_facts = ({OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY: resolved.cost_per_contract}
+                       if resolved.sizing_basis == "premium" else None)
         if quantity >= 1 and extra_per_contract > 0.0:
             # The loss beyond the debit is NOT paid at the fill, so it is reserved (the debit is
             # already out of the account). Honoured by ``reserved_option_buying_power_detail``
             # for any strategy that records a positive ``option_reserve``.
             reserve = extra_per_contract * quantity
-            if not self.account.check_option_buying_power(reserve):
+            refused = self._reserve_refusal(reserve)
+            if refused is not None:
                 return self._result(
-                    False, f"Insufficient BP for {resolved.option_strategy} on "
-                           f"{self.instrument_name} (loss beyond its debit: reserve {reserve})")
+                    False, f"{resolved.option_strategy} on {self.instrument_name} NOT PLACED: "
+                           f"{refused}")
             return self._submit_option_order(
                 resolved.legs, quantity, resolved.limit_price, resolved.option_strategy,
-                option_reserve=reserve)
+                option_reserve=reserve, extra_entry_facts=entry_facts, sizing_note=sizing_note)
         if quantity < 1:
             # The structure's OWN historical wording, not a uniform one. These strings are
             # persisted to TradeActionResult.message and rendered in the UI as the reason an
@@ -4183,7 +4411,8 @@ class _OptionEntryAction(TradeAction):
                 or (f"Insufficient budget to size {resolved.option_strategy} for "
                     f"{self.instrument_name}"))
         return self._submit_option_order(
-            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
+            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy,
+            extra_entry_facts=entry_facts, sizing_note=sizing_note)
 
     def execute(self) -> "TradeActionResult":
         # One execute, one decision: the spot the record reuses is THIS run's, never a
@@ -4676,11 +4905,10 @@ class SellCashSecuredPutAction(_OptionEntryAction):
                 f"Insufficient budget to size cash_secured_put for {self.instrument_name} "
                 f"(strike={contract.strike})")
         reserve = self.account.option_reserve_required("cash_secured_put", quantity, strike=contract.strike)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False,
-                                f"Insufficient buying power to reserve {reserve} for cash_secured_put "
-                                f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"cash_secured_put on {self.instrument_name} NOT PLACED: {refused}")
         # ONE short put, `quantity` contracts, at contract.strike.
         quantity, refusal = self._downsize_to_delivery_capacity(
             "cash_secured_put", strike=contract.strike, quantity=quantity)
@@ -4763,11 +4991,10 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
                 f"(max_loss={per_spread_reserve})")
         reserve = self.account.option_reserve_required(
             "bear_call_spread", quantity, spread_width=width, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False,
-                                f"Insufficient buying power to reserve {reserve} for bear_call_spread "
-                                f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"bear_call_spread on {self.instrument_name} NOT PLACED: {refused}")
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying, quote=short_c)
@@ -4794,9 +5021,9 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
     as buying power. Bullish/neutral: it pays while the underlying stays ABOVE the short
     strike.
 
-    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
-    is charged the full short strike by ``_downsize_to_delivery_capacity``. The long
-    wing nets NOTHING off that bill — see the comment at the gate below.
+    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it.
+    ``_downsize_to_delivery_capacity`` charges it the spread width: the long wing of the
+    same expiry nets the short strike down (see the comment at the gate below).
     """
 
     OPTION_TYPE = OptionRight.PUT
@@ -4867,18 +5094,17 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
                 f"(max_loss={per_spread_reserve})")
         reserve = self.account.option_reserve_required(
             "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False,
-                                f"Insufficient buying power to reserve {reserve} for bull_put_spread "
-                                f"on {self.instrument_name} (available="
-                                f"{self.account.available_option_buying_power()})")
-        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, charged at its FULL
-        # strike. The long put wing nets NOTHING off: the short leg can be assigned
-        # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
-        # after the shares have already been paid for. Netting the width here would price
-        # a $9,500 obligation at $500 and wave every entry through.
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"bull_put_spread on {self.instrument_name} NOT PLACED: {refused}")
+        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, netted by the long
+        # put wing down to the spread width (operator decision 2026-10-15, superseding the
+        # full-strike charge): what a broker margins a put vertical at, and what the
+        # backtest settles it at (``settle_defined_risk_combo_expiry``).
         quantity, refusal = self._downsize_to_delivery_capacity(
-            "bull_put_spread", strike=short_c.strike, quantity=quantity)
+            "bull_put_spread", strike=short_c.strike, quantity=quantity,
+            long_puts_per_unit=((long_c.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5014,20 +5240,11 @@ class OpenStrangleAction(_OptionEntryAction):
         method = str(self.strike_method or "percent_otm")
         default_param = self.DEFAULT_DELTA if method == "delta" else self.DEFAULT_OTM_PCT
         width = self.strike_param if self.strike_param is not None else default_param
-        call_c = select_single(
-            call_chain, method=method, strike_param=width, spot=spot,
-            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), target_price=None,
-            policy=self.selection_policy, **liq)
-        if call_c is None:
-            return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
-        put_c = select_single(
-            put_chain, method=method, strike_param=width, spot=spot,
-            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), target_price=None,
-            policy=self.selection_policy, **liq)
-        if put_c is None:
-            return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
+        call_c, put_c, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=width, spot=spot, liq=liq, label="strangle",
+            method=method, role="long")
+        if refusal is not None:
+            return refusal
         if call_c.ask is None or put_c.ask is None:
             return self._result(False, f"Missing ask quote for strangle legs on {self.instrument_name}")
         net_debit = round(call_c.ask + put_c.ask, 4)        # buy both at ASK
@@ -5119,8 +5336,10 @@ class OpenShortStraddleAction(_OptionEntryAction):
         reserve = self.account.option_reserve_required(
             "short_straddle", quantity, strike=call_c.strike, spot=spot,
             put_premium=put_c.bid, call_premium=call_c.bid)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"short straddle on {self.instrument_name} NOT PLACED: {refused}")
         # ONE short put leg (put_c), `quantity` contracts. The short CALL at the same
         # strike consumes no PUT-assignment capacity: assigned, it delivers shares and
         # pays cash IN.
@@ -5211,8 +5430,10 @@ class OpenShortStrangleAction(_OptionEntryAction):
         reserve = self.account.option_reserve_required(
             "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
             put_premium=put_c.bid, call_premium=call_c.bid)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"short strangle on {self.instrument_name} NOT PLACED: {refused}")
         # ONE short put leg (put_c, the lower strike), `quantity` contracts. The short
         # OTM call is not put-assignment capacity.
         quantity, refusal = self._downsize_to_delivery_capacity(
@@ -5256,14 +5477,10 @@ class OpenIronCondorAction(_OptionEntryAction):
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
-        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
-                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), policy=self.selection_policy, **liq)
-        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
-                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), policy=self.selection_policy, **liq)
-        if sc is None or sp is None:
-            return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
+        sc, sp, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=otm, spot=spot, liq=liq, label="iron condor")
+        if refusal is not None:
+            return refusal
         # Wings farther OTM, same expiry as the matching short leg.
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
@@ -5294,15 +5511,18 @@ class OpenIronCondorAction(_OptionEntryAction):
             return self._budget_refusal(f"Insufficient budget to size iron condor for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "iron_condor", quantity, spread_width=width, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False, f"Insufficient BP for iron condor on {self.instrument_name}")
-        # The SHORT PUT leg (sp), `quantity` contracts. The long put WING (lp) nets
-        # NOTHING off: the short leg can be assigned tonight, while exercising our own
-        # put is a choice we make LATER — after the shares have already been paid for.
-        # A condor is sized off its wing width, which is why it is the structure this
-        # gate bites hardest.
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"iron condor on {self.instrument_name} NOT PLACED: {refused}")
+        # The SHORT PUT leg (sp), `quantity` contracts, netted by the long put WING (lp)
+        # down to the put-side width (operator decision 2026-10-15). Charging the full
+        # short strike capped a $20k account at about one condor and bounded the whole
+        # structure's search to ~2%/yr; the backtest settles a condor at its net payoff
+        # and never delivers shares, so the full strike guarded an event it cannot model.
         quantity, refusal = self._downsize_to_delivery_capacity(
-            "iron_condor", strike=sp.strike, quantity=quantity)
+            "iron_condor", strike=sp.strike, quantity=quantity,
+            long_puts_per_unit=((lp.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5345,14 +5565,10 @@ class OpenJadeLizardAction(_OptionEntryAction):
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
-        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
-                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), policy=self.selection_policy, **liq)
-        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
-                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), policy=self.selection_policy, **liq)
-        if sc is None or sp is None:
-            return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
+        sc, sp, refusal = self._select_call_put_pair_one_expiry(
+            call_chain, put_chain, param=otm, spot=spot, liq=liq, label="jade lizard")
+        if refusal is not None:
+            return refusal
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sc.expiry,
@@ -5386,8 +5602,10 @@ class OpenJadeLizardAction(_OptionEntryAction):
             return self._budget_refusal(f"Insufficient budget to size jade lizard for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"jade lizard on {self.instrument_name} NOT PLACED: {refused}")
         # The NAKED short put leg (sp), `quantity` contracts. The other two legs are the
         # call credit spread, which owes shares rather than cash.
         quantity, refusal = self._downsize_to_delivery_capacity(
@@ -5555,14 +5773,16 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
             return self._budget_refusal(f"Insufficient budget to size ratio spread for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
             "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
-            return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
-        # TWO short puts per structure (`ratio_qty=2` on the short leg below), so the
-        # delivery bill is 2 x quantity contracts at the SHORT strike. The single long
-        # put at the higher strike nets nothing off, same as the condor's wing.
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
+            return self._result(
+                False, f"ratio spread on {self.instrument_name} NOT PLACED: {refused}")
+        # TWO short puts per structure (`ratio_qty=2` on the short leg below). The single
+        # long put at the HIGHER strike covers one of them in full (operator decision
+        # 2026-10-15); the other is naked and owes its full short strike.
         quantity, refusal = self._downsize_to_delivery_capacity(
             "put_ratio_spread", strike=short_p.strike, quantity=quantity,
-            contracts_per_unit=2)
+            contracts_per_unit=2, long_puts_per_unit=((long_p.strike, 1),))
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5736,12 +5956,11 @@ class _BackspreadAction(_OptionEntryAction):
         net_credit = round(-net, 4)
         reserve = self.account.option_reserve_required(
             self.OPTION_STRATEGY, quantity, spread_width=width, net_credit=net_credit)
-        if not self.account.check_option_buying_power(reserve):
+        refused = self._reserve_refusal(reserve)
+        if refused is not None:
             return self._result(
-                False, f"Insufficient buying power to reserve {reserve} for "
-                       f"{self.OPTION_STRATEGY} on {self.instrument_name} (available="
-                       f"{self.account.available_option_buying_power()})")
-        quantity, refusal = self._assignment_capacity(short_c, quantity)
+                False, f"{self.OPTION_STRATEGY} on {self.instrument_name} NOT PLACED: {refused}")
+        quantity, refusal = self._assignment_capacity(short_c, quantity, long_c)
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
@@ -5749,7 +5968,7 @@ class _BackspreadAction(_OptionEntryAction):
         return self._submit_option_order(legs, quantity, net, self.OPTION_STRATEGY,
                                          option_reserve=reserve)
 
-    def _assignment_capacity(self, short_c, quantity):
+    def _assignment_capacity(self, short_c, quantity, long_c):
         """The short-put delivery gate, for the right that has one. ``(quantity, refusal)``.
 
         Overridden by the PUT subclass. A CALL backspread's short leg is a CALL: assignment
@@ -5793,18 +6012,18 @@ class OpenPutBackspreadAction(_BackspreadAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_PUT_BACKSPREAD.value
 
-    def _assignment_capacity(self, short_c, quantity):
+    def _assignment_capacity(self, short_c, quantity, long_c):
         """CHARGED, exactly like every other builder carrying a short put.
 
-        One short put per unit (``BACKSPREAD_SHORT_RATIO``), and the two long puts net
-        NOTHING off the delivery bill -- the same fact the bull put spread's wing is pinned
-        on: a long put is OUR right, exercisable on a LATER day, after the shares have
-        already been paid for at the short strike tonight. So the bill is
-        ``short strike x 100 x units`` and the gate downsizes to what the cash can deliver.
+        One short put per unit (``BACKSPREAD_SHORT_RATIO``), netted by the lower-strike
+        long puts of the same expiry down to the width (operator decision 2026-10-15, the
+        same rule as the bull put spread's wing). The gate downsizes to what the cash can
+        deliver on that net bill.
         """
         return self._downsize_to_delivery_capacity(
             self.OPTION_STRATEGY, strike=short_c.strike, quantity=quantity,
-            contracts_per_unit=BACKSPREAD_SHORT_RATIO)
+            contracts_per_unit=BACKSPREAD_SHORT_RATIO,
+            long_puts_per_unit=((long_c.strike, BACKSPREAD_LONG_RATIO),))
 
     def get_description(self) -> str:
         return f"Open put backspread on {self.instrument_name}"

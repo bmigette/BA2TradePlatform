@@ -1,14 +1,19 @@
+import dataclasses
 import math
+import threading
+import time
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, NamedTuple, Optional, Protocol, Tuple, runtime_checkable
 from sqlmodel import Session, select
 from ba2_common.logger import logger
 from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
-from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, TransactionStatus,
+                                   OrderDirection, Recommendation)
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
+from ba2_common.core.account_types import AccountSnapshot
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
@@ -125,6 +130,10 @@ class ExpertBalance(NamedTuple):
     virtual: float      # tradable balance x virtual_equity_pct
     used: float         # what this expert's own open transactions have committed
     available: float    # virtual - used, then clamped to broker BP and account headroom
+    #: ``(transaction_id, used charge)`` for each open OPTION transaction counted in ``used``
+    #: (stage-2 E1b): what the equity RM's budget (``option_collateral_budget``) needs to charge
+    #: a reserving position its collateral instead. Empty when no option position is open.
+    option_used: Tuple[Tuple[int, float], ...] = ()
 
 
 def enabled_instruments_config(settings: Dict[str, Any]) -> Dict[str, Dict]:
@@ -144,9 +153,433 @@ def enabled_instruments_config(settings: Dict[str, Any]) -> Dict[str, Dict]:
     return {}
 
 
+#: Appended to every refusal caused by an unreadable option row, so the operator knows the repair.
+CAPITAL_REPAIR_HINT = (
+    "Repair: an open cash-secured / credit structure must carry data['option_reserve'] on its order, "
+    "a working debit entry needs a limit price (or entry_debit_per_contract), and an open option "
+    "transaction needs its open_price and strategy; fix or close the named row.")
+
+
+class CapitalUnmeasurable(ValueError):
+    """The capital an expert's open or working positions commit could not be read.
+
+    ``names`` lists every transaction / order that could not be valued (id, strategy, symbol,
+    why), so the refusal that follows can say WHICH row to repair. Unknown is never zero."""
+
+    def __init__(self, names):
+        self.names = tuple(names)
+        super().__init__("; ".join(self.names))
+
+
+def _readable_positive(raw) -> Optional[float]:
+    """``raw`` as a finite number > 0, else None (never a default)."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def capital_transactions(expert_id: int) -> List[Any]:
+    """The transactions that hold an expert's capital, as the shared used-balance reads them.
+
+    WAITING, OPENED and CLOSING, for every asset class (``CAPITAL_HOLDING_TRANSACTION_STATUSES``): a
+    resting close -- on a stock, a cash-secured put or a spread -- has not released the shares, the
+    collateral or the premium it holds until it FILLS, so the capital stays committed until the
+    transaction is actually CLOSED. (A CLOSING STOCK row used to be dropped here, so its capital
+    could be spent a second time while the position was still held; fixed 2026-10-07.)"""
+    from ba2_common.core.trade_store import transactions_where
+    return list(transactions_where(
+        expert_id=expert_id, statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)))
+
+
+def _order_float(raw) -> float:
+    try:
+        return float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _working_entry_value(transaction: Any, orders: List[Any], *, include_filled: bool,
+                         strategy: Optional[str], unmeasurable: List[str]) -> float:
+    """Cash the DEBIT entry orders of ``transaction`` have paid or still have to pay.
+
+    ``include_filled=False`` (the transaction is OPENED/CLOSING: its position cost already carries
+    what filled): only the UNFILLED REMAINDER of orders still working -- a 20-contract limit buy that
+    filled 8 has 12 working, and those 12 are committed. ``include_filled=True`` (the transaction is
+    still WAITING, so no position cost exists yet): filled part at its fill price (the limit when no
+    fill price is recorded) plus the remainder. A market-type order is valued by the per-contract
+    debit its builder stamped on the row. Reserving (credit) structures contribute nothing here: their
+    collateral is the recorded ``option_reserve``, stamped for the ORDERED quantity, so a partial fill
+    never shrinks it. Everything unreadable is named in ``unmeasurable``; nothing is defaulted."""
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.types import OrderStatus
+
+    if strategy in OptionsAccountInterface.RESERVING_STRATEGIES:
+        return 0.0
+    working = OrderStatus.get_active_statuses()
+    total = 0.0
+    for o in orders:
+        if (getattr(o, "parent_order_id", None) or getattr(o, "side", None) != OrderDirection.BUY):
+            continue
+        intent = str(getattr(o, "position_intent", None) or "").lower()
+        if "close" in intent or str(getattr(o, "option_strategy", None) or "") == "close":
+            continue
+        filled = max(_order_float(getattr(o, "filled_qty", None)), 0.0)
+        is_working = getattr(o, "status", None) in working
+        if not is_working and not (include_filled and filled > 0):
+            continue
+        olabel = f"order {o.id} ({strategy or 'single leg'} on {o.symbol})"
+        quantity = _readable_positive(getattr(o, "quantity", None))
+        if quantity is None:
+            unmeasurable.append(f"{olabel} is a debit entry with an unreadable quantity "
+                                f"({getattr(o, 'quantity', None)!r})")
+            continue
+        remaining = max(quantity - filled, 0.0) if is_working else 0.0
+        counted_filled = filled if include_filled else 0.0
+        if remaining <= 0 and counted_filled <= 0:
+            continue
+        limit = _readable_positive(getattr(o, "limit_price", None))
+        multiplier = _readable_positive(getattr(o, "multiplier", None))
+        data = getattr(o, "data", None)
+        stamped = _readable_positive(
+            data.get(OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY)
+            if isinstance(data, dict) else None)
+        if limit is not None and multiplier is None:
+            unmeasurable.append(f"{olabel} is a debit entry with an unreadable multiplier "
+                                f"({getattr(o, 'multiplier', None)!r})")
+            continue
+        unit = limit * multiplier if limit is not None else stamped
+        if unit is None:
+            unmeasurable.append(
+                f"{olabel} is a debit entry with no readable limit price "
+                f"({getattr(o, 'limit_price', None)!r}) and no recorded "
+                f"{OptionsAccountInterface.ENTRY_DEBIT_PER_CONTRACT_KEY}, so its cost is UNKNOWN")
+            continue
+        total += unit * remaining
+        if counted_filled > 0:
+            fill = _readable_positive(getattr(o, "open_price", None))
+            fill_unit = (fill * multiplier) if (fill is not None and multiplier is not None) else unit
+            total += fill_unit * counted_filled
+    return total
+
+
+def option_transaction_commitment(account: Any, transaction: Any, *, loss_adjusted: bool,
+                                  unmeasurable: List[str]) -> float:
+    """Capital one OPTION transaction commits -- THE option arm of ``used_balance_for_transactions``.
+
+    * a DEBIT (side BUY, positive price, not a reserving structure): the premium paid, ``open_price
+      x quantity x multiplier`` (with ``loss_adjusted`` the stock path's cost-plus-loss, marked off
+      the option's own quote), PLUS the unfilled remainder of any entry order still working (a
+      PARTIALLY_FILLED 20-lot that filled 8 holds the 12 still resting);
+    * a CREDIT / reserving structure (cash-secured put, credit spreads, condors, ...): its
+      COLLATERAL, the ``option_reserve`` its builder recorded on its orders (for the ORDERED size, so
+      a partial fill does not shrink it) -- the premium it collected is not capital spent;
+    * a structure that can lose more than its debit (an unbalanced fly) records the EXCESS as a
+      reserve: debit and reserve both;
+    * a covered call and the other zero-reserve short legs commit nothing beyond a recorded reserve;
+    * a short option with NO strategy recorded (a legacy row) and no recorded reserve is
+      UNMEASURABLE and named: counting its premium would treat collateral as if it were spent;
+    * a WORKING (WAITING) entry has no position yet: the filled part at its fill price plus the
+      unfilled remainder at its limit (a market-type order: the per-contract debit its builder
+      stamped), a reserving structure its reserve;
+    * a CLOSING transaction (a resting close) still holds everything it held: it is counted as open.
+
+    Every field that cannot be read is NAMED in ``unmeasurable`` (order / transaction id, strategy,
+    symbol, why) and contributes nothing -- the caller refuses on a non-empty list.
+    """
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.trade_store import orders_where
+    from ba2_common.core.types import OrderStatus
+
+    strategy = getattr(transaction, "option_strategy", None)
+    label = (f"transaction {transaction.id} ({strategy or 'option'} on {transaction.symbol})")
+    reserving = strategy in OptionsAccountInterface.RESERVING_STRATEGIES
+    orders = orders_where(transaction_id=transaction.id)
+
+    reserve = 0.0
+    has_reserve = False
+    for o in orders:
+        data = getattr(o, "data", None)
+        raw = data.get("option_reserve") if isinstance(data, dict) else None
+        value = _readable_positive(raw)
+        if value is not None:
+            reserve += value
+            has_reserve = True
+    order_ids = ", ".join(str(o.id) for o in orders) or "none"
+    # Only a GENUINELY OPEN row can be the cause: an OPENED / CLOSING position, or a WAITING one
+    # with an order still working. A WAITING row whose orders are all terminal is a dead attempt
+    # that the next roll closes -- it commits nothing and is not an unknown.
+    working_now = any(getattr(o, "status", None) in OrderStatus.get_active_statuses()
+                      for o in orders)
+    genuinely_open = (transaction.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING)
+                      or (transaction.status == TransactionStatus.WAITING and working_now))
+    if reserving and not has_reserve and genuinely_open:
+        unmeasurable.append(f"{label} (orders {order_ids}) must reserve capital but no order "
+                            f"carries a readable option_reserve")
+
+    if transaction.status == TransactionStatus.WAITING:
+        return reserve + _working_entry_value(
+            transaction, orders, include_filled=True, strategy=strategy, unmeasurable=unmeasurable)
+
+    # OPENED / CLOSING: the position, plus what its entry orders still have working
+    remainder = _working_entry_value(
+        transaction, orders, include_filled=False, strategy=strategy, unmeasurable=unmeasurable)
+    if reserving:
+        return reserve + remainder
+    if transaction.open_price is None:
+        unmeasurable.append(f"{label} is open with no open_price, so its cost is UNKNOWN")
+        return reserve + remainder
+    debit = transaction.side == OrderDirection.BUY and transaction.open_price > 0
+    if not debit:
+        if strategy in OptionsAccountInterface.ZERO_RESERVE_STRATEGIES or has_reserve:
+            return reserve + remainder      # a covered call and the like: the shares are collateral
+        unmeasurable.append(f"{label} is a short option with no strategy and no recorded reserve, so "
+                            f"the collateral it holds is UNKNOWN (orders {order_ids})")
+        return remainder
+    multiplier = float(transaction.multiplier) if transaction.multiplier else 100.0
+    price = abs(transaction.open_price)
+    cost = price * transaction.quantity * multiplier
+    if loss_adjusted:
+        quote = MarketExpertInterface._used_balance_option_price(account, transaction)
+        current = price if quote is None else quote
+        pl = (current - price) * transaction.quantity * multiplier
+        if pl < 0:
+            cost += abs(pl)
+    return cost + reserve + remainder
+
+
+def used_balance_for_transactions(account: Any, transactions: List[Any], *,
+                                  loss_adjusted: bool = True,
+                                  option_used_out: Optional[Dict[int, float]] = None) -> float:
+    """The capital ``transactions`` have committed, priced the way the stock path prices it.
+
+    THE ONE used-balance function: ``MarketExpertInterface._calculate_used_balance`` -- the classic
+    RM's ``available = virtual - used`` AND the option entry path (the expert's remaining
+    spendable balance, see ``MarketExpertInterface.get_available_equity_balance_detail``) -- call it,
+    so what an open position "uses" is defined once, for stocks and options together.
+
+    Per STOCK transaction: cost = ``open_price x quantity``; ``loss_adjusted`` (the stock path's
+    convention, the default) charges a LOSING one its cost PLUS the loss -- the maximum potential
+    loss, for a virtual-equity bookkeeping whose base does not move with marks. A caller whose base
+    IS equity (marks included) passes ``False``: the loss is already out of the base, and charging
+    it again would count it twice. OPTION transactions go through ``option_transaction_commitment``
+    (debit premium, credit collateral, pending entries).
+
+    ``option_used_out``, when given, is filled with ``{transaction id: its used charge}`` for every
+    OPTION transaction counted (stage-2 E1b, ``ExpertBalance.option_used``). Recording only: the
+    total is computed exactly as without it.
+
+    Bulk price fetch for the stock rows. Raises ``CapitalUnmeasurable`` (naming every row) when an
+    option row cannot be valued; any other failure raises as it was raised.
+    """
+    used_balance = 0.0
+    if not transactions:
+        return used_balance
+    stock_rows = [t for t in transactions if not _is_option_transaction(t)]
+    symbol_prices = None
+    if loss_adjusted and stock_rows:
+        all_symbols = list(set(t.symbol for t in stock_rows))
+        logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for used balance calculation")
+        symbol_prices = account.get_instrument_current_price(all_symbols)
+    unmeasurable: List[str] = []
+
+    for transaction in transactions:
+        if _is_option_transaction(transaction):
+            commitment = option_transaction_commitment(
+                account, transaction, loss_adjusted=loss_adjusted, unmeasurable=unmeasurable)
+            used_balance += commitment
+            if option_used_out is not None:
+                option_used_out[transaction.id] = commitment
+            continue
+        if transaction.open_price is None or transaction.quantity is None:
+            logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
+            continue
+        multiplier = 1.0
+        if not loss_adjusted:
+            used_balance += transaction.open_price * transaction.quantity
+            continue
+        current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
+        if current_price is None:
+            logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
+            current_price = transaction.open_price
+
+        # Calculate profit/loss based on side field
+        # BUY = LONG, SELL = SHORT
+        if transaction.side == OrderDirection.BUY:  # Long position
+            profit_loss = (current_price - transaction.open_price) * transaction.quantity * multiplier
+        else:  # Short position
+            profit_loss = (transaction.open_price - current_price) * transaction.quantity * multiplier
+
+        # Calculate used balance for this transaction
+        if profit_loss >= 0:
+            # Transaction is profitable, use open_price
+            transaction_used = transaction.open_price * transaction.quantity * multiplier
+        else:
+            # Transaction is losing money, use open_price + loss
+            loss_amount = abs(profit_loss)
+            transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
+
+        used_balance += transaction_used
+
+        logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
+                     f"Open=${transaction.open_price}, Current=${current_price}, "
+                     f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
+
+    if unmeasurable:
+        raise CapitalUnmeasurable(unmeasurable)
+    return used_balance
+
+
+def _is_option_transaction(transaction: Any) -> bool:
+    """Option row: the asset class says so (or, for a row written before the column, a contract
+    multiplier other than 1)."""
+    asset = getattr(transaction, "asset_class", None)
+    if asset is not None and str(getattr(asset, "value", asset)).lower() == "option":
+        return True
+    return bool(transaction.multiplier and transaction.multiplier != 1)
+
+
+def account_available_equity_detail(account: Any, *, exclude_transaction_id: Optional[int] = None):
+    """``(available, unmeasurable names)`` for an entry that belongs to NO expert: the account's own
+    option capital (``option_capital_equity``) less everything every expert on it commits, clamped to
+    the broker's remaining spendable balance exactly as an expert's is. The expert-less form of
+    ``MarketExpertInterface.get_available_equity_balance_detail`` (one 100 % slice of the account)."""
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import ExpertInstance
+    from ba2_common.core.trade_store import transactions_where
+    try:
+        virtual = account.option_capital_equity()
+        rows = []
+        for expert in get_all_instances(ExpertInstance):
+            if getattr(expert, "account_id", None) != account.id:
+                continue
+            rows.extend(capital_transactions(expert.id))
+        if exclude_transaction_id is not None:
+            rows = [t for t in rows if t.id != exclude_transaction_id]
+        used = used_balance_for_transactions(account, rows, loss_adjusted=False)
+    except CapitalUnmeasurable as e:
+        return None, e.names
+    except ValueError as e:
+        return None, (f"account {account.id} capital unreadable: {e}",)
+    available = virtual - used
+    try:
+        actual = MarketExpertInterface._get_actual_available_balance(account)
+    except _PROGRAMMING_ERRORS:
+        raise                                   # a defect is never a "reason"; it must be seen and fixed
+    except Exception as e:
+        # A non-OSError error escaping the buying-power read (an SDK error class from a third-party
+        # adapter; the live adapters swallow theirs). This path serves ONE expert-less option entry, and
+        # ``(None, names)`` is the contract every caller already treats as "unknown: REFUSE this entry"
+        # (``_capital_headroom`` -> ``_fit_debit_to_capital`` / ``_reserve_refusal``). Refusing that one
+        # entry loudly is right: an uncaught exception would instead abort the caller's whole pass, and
+        # sizing without the broker's real figure would be guessing.
+        reason = f"account {account.id} buying power unreadable ({type(e).__name__}: {e})"
+        logger.error(f"Option entry (no expert) REFUSED: {reason}", exc_info=True)
+        return None, (reason,)
+    if actual is not None:
+        try:
+            actual -= overalloc_reserved_by_others(account, exclude_expert_id=None, equity_base=True)
+        except CapitalUnmeasurable as e:
+            return None, e.names
+        except ValueError as e:
+            return None, (f"account {account.id} over-allocation reserve unreadable: {e}",)
+    if actual is not None and actual < available:
+        available = actual
+    return available, ()
+
+
+#: Expert setting: the share of the ACCOUNT (%) kept for this expert when the experts on the
+#: account are over-allocated (their virtual_equity_pct sum past 100 %). 0 = no reserve.
+OVERALLOC_MIN_RES_PCT = "overalloc_min_res_pct"
+
+
+def overalloc_reserved_by_others(account: Any, *, exclude_expert_id: Optional[int],
+                                 equity_base: bool) -> float:
+    """The capital the OTHER enabled experts on ``account`` hold in reserve, which an entry by
+    ``exclude_expert_id`` (``None``: an expert-less entry, every expert counts) may not spend.
+
+    Per expert E with ``overalloc_min_res_pct`` r > 0:
+    ``max(0, min(r, E.virtual_equity_pct) / 100 x account figure - E.used)`` -- the part of its
+    reserve E has not deployed yet. The account figure and the used convention are the caller's
+    path's (``equity_base``: option capital equity, no loss adjustment; else the tradable balance,
+    loss-adjusted), so the reserve is measured the way E's own available balance is.
+
+    Applied to the ACCOUNT'S real spendable balance, never to an expert's virtual bookkeeping: it only
+    binds when the account cannot fund every expert's slice, i.e. when it is over-allocated. With no
+    reserving expert (every backtest: one expert per account) it is 0.0 and reads no account figure.
+
+    Raises ``ValueError`` on a reserve outside [0, 100] or an unreadable account figure, and
+    ``CapitalUnmeasurable`` when a reserving expert's commitment cannot be valued: unknown never reads
+    as room.
+    """
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.instance_resolver import get_instance_resolver
+    reserving = []
+    for row in get_all_instances(ExpertInstance):
+        if row.account_id != account.id or not row.enabled or row.id == exclude_expert_id:
+            continue
+        pct = get_instance_resolver().get_expert_instance(row.id).settings[OVERALLOC_MIN_RES_PCT]
+        pct = 0.0 if pct is None else float(pct)
+        if not 0.0 <= pct <= 100.0:
+            raise ValueError(f"expert {row.id} {OVERALLOC_MIN_RES_PCT}={pct} is outside [0, 100]")
+        if pct > 0.0:
+            reserving.append((row, pct))
+    if not reserving:
+        return 0.0
+    figure = account.option_capital_equity() if equity_base else account.get_tradable_balance()
+    reserved = 0.0
+    for row, pct in reserving:
+        cap = figure * min(pct, row.virtual_equity_pct) / 100.0
+        used = used_balance_for_transactions(account, capital_transactions(row.id),
+                                             loss_adjusted=not equity_base)
+        if cap > used:
+            reserved += cap - used
+        logger.debug(f"Account {account.id}: expert {row.id} reserves {pct}% (${cap:,.2f}), "
+                     f"uses ${used:,.2f}, still held back ${max(0.0, cap - used):,.2f}")
+    return reserved
+
+
+#: The programming errors that no handler turns into a "reason" (they are bugs, not broker conditions).
+_PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, ImportError, ZeroDivisionError,
+                       AssertionError, SyntaxError)
+
+_BP_FIGURE = "figure"
+_BP_UNREADABLE = "unreadable"
+_BP_NOT_PUBLISHED = "not_published"
+
+
+def _bp_label(account: Any, expert_id: Optional[int]) -> str:
+    """``Account 3 (expert 7)`` / ``Account 3`` for a log line about the buying-power read."""
+    base = f"Account {getattr(account, 'id', '?')}"
+    return f"{base} (expert {expert_id})" if expert_id is not None else base
+
+
+def _snapshot_is_empty(snap: Any) -> bool:
+    """True when an ``AccountSnapshot`` (or snapshot-shaped object) carries NO figure at all: the
+    value every adapter returns when its broker read failed (``AccountSnapshot()``). A snapshot with
+    any number set -- equity, cash, ... -- was a real answer, whatever it lacks."""
+    if snap is None:
+        return True
+    if dataclasses.is_dataclass(snap):
+        values = [getattr(snap, f.name) for f in dataclasses.fields(snap)]
+    elif hasattr(snap, "__dict__"):
+        values = list(vars(snap).values())
+    else:
+        values = [getattr(snap, "buying_power", None)]
+    return all(v is None or isinstance(v, bool) or (isinstance(v, dict) and not v) for v in values)
+
+
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
+
+    # Settings a deploy writes with their class default when the payload omits them (deploy_parity.explicit_default_settings):
+    # a deploy never deletes, so a restricted option deploy's screener list must be CLEARED by a later unrestricted one.
+    # A subclass that declares its own tuple must repeat these.
+    DEPLOY_EXPLICIT_DEFAULT_SETTINGS = ("screener_symbol_universe",)
 
     # Set to False in subclasses that manage their own risk (e.g. LiveExpertInterface).
     # When False, the platform's risk manager settings are hidden in the UI.
@@ -305,6 +738,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "float", "required": False, "default": 10.0,
                     "description": "Minimum available balance percentage required to enter new market positions (%)",
                     "tooltip": "Minimum percentage of virtual balance that must remain available before the expert stops opening new positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management."
+                },
+                "overalloc_min_res_pct": {
+                    "type": "float", "required": False, "default": 0.0,
+                    "description": "Account share reserved for this expert when the account is over-allocated (%)",
+                    "tooltip": "When the experts on this account are given more than 100% of it in total (virtual equity % summed), the other experts may not spend the part of this reserve this expert has not deployed yet. E.g. 15 keeps 15% of the account for this expert (capped at its own virtual equity %). It never limits this expert itself. 0 (default) = no reserve."
                 },
                 # Risk Management Settings
                 "max_virtual_equity_per_instrument_percent": {
@@ -732,12 +1170,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_volume_min": {
                     "type": "int", "required": False, "default": 500000,
                     "description": "Min avg volume (0 = disabled)",
-                    "tooltip": "Minimum average daily volume. Set to 0 to disable this filter."
+                    "tooltip": "Minimum AVERAGE daily volume: the mean volume of the last 20 finished trading sessions "
+                               "(daily bars, including the most recent finished session). Applied by the platform, not "
+                               "by the data vendor, so it does not depend on the time of day. Set to 0 to disable."
                 },
                 "screener_volume_max": {
                     "type": "int", "required": False, "default": 0,
                     "description": "Max avg volume (0 = disabled)",
-                    "tooltip": "Maximum average daily volume. Set to 0 to disable this filter."
+                    "tooltip": "Maximum AVERAGE daily volume: the mean volume of the last 20 finished trading sessions "
+                               "(daily bars, including the most recent finished session). Set to 0 to disable."
                 },
                 # Added 2026-08-07. ``dollar_volume_min`` entered the metric_store's
                 # METRIC_STORE_KEYS on 2026-08-05 (47c4b26, the dollar-volume floor that keeps
@@ -755,12 +1196,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_float_min": {
                     "type": "int", "required": False, "default": 10000000,
                     "description": "Min share float (0 = disabled)",
-                    "tooltip": "Minimum share float (shares available for trading). Set to 0 to disable this filter."
+                    "tooltip": "Minimum share float (shares available for trading), from the data vendor's daily float "
+                               "table (latest SEC filing). A symbol with no float data passes. Costs one cached vendor "
+                               "call per 6 hours. Set to 0 to disable this filter."
                 },
                 "screener_float_max": {
                     "type": "int", "required": False, "default": 0,
                     "description": "Max share float (0 = disabled)",
-                    "tooltip": "Maximum share float. Set to 0 to disable this filter."
+                    "tooltip": "Maximum share float, from the data vendor's daily float table (latest SEC filing). "
+                               "A symbol with no float data passes. Set to 0 to disable this filter."
                 },
                 "screener_price_min": {
                     "type": "float", "required": False, "default": 20.0,
@@ -775,7 +1219,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_relative_volume_min": {
                     "type": "float", "required": False, "default": 1.05,
                     "description": "Min relative volume (0 = disabled)",
-                    "tooltip": "Minimum relative volume (today's volume / avg volume). 1.05 means 5% above average. Set to 0 to disable. Enabling triggers extra API calls to fetch live quotes."
+                    "tooltip": "Minimum relative volume = the last FINISHED session's volume / the mean volume of the last 20 finished sessions "
+                               "(including that session). 1.05 means 5% above average. Set to 0 to disable this filter only; the "
+                               "volume/price/market-cap refresh of the screening stage always runs."
                 },
                 "screener_price_drop_pct": {
                     "type": "float", "required": False, "default": 15.0,
@@ -806,6 +1252,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "Filters out basing (Stage 1), topping (Stage 3) and declining (Stage 4) names. "
                                "Adds an OHLCV history fetch (~250 days) for the candidates."
                 },
+                # Restricts the screen to a fixed list BEFORE every filter/rank/cut. Empty = no restriction.
+                "screener_symbol_universe": {
+                    "type": "str", "required": False, "default": "",
+                    "description": "Restrict the screener to these symbols (comma-separated, empty = none)",
+                    "tooltip": "Only these symbols can be screened: the vendor's candidates are intersected with this list "
+                               "BEFORE the filters, the ranking and the max-stocks cut, so the picks are the best "
+                               "max-stocks OF THIS LIST. Used by option experts, whose chain data exists for a fixed set "
+                               "of names. Leave empty for the whole market."
+                },
 
             }
 
@@ -831,8 +1286,86 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return account.get_instrument_current_price(symbol)
 
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            # WARNING per symbol (a broker outage would otherwise print one ERROR + traceback per symbol);
+            # the pass-level ERROR is ``pass_price_health.summarise_pass``.
+            from ba2_common.core import pass_price_health
+            pass_price_health.note_error(getattr(self, "id", None), str(symbol), e)
+            logger.warning(f"Error getting current price for {symbol}: {e}")
+            logger.debug(f"Error getting current price for {symbol}", exc_info=True)
             return None
+
+    def _decision_price(self, providers: "ProviderBundle", symbol: str,
+                        as_of: Optional[datetime]) -> Optional[float]:
+        """THE current price an expert decides on (the owner's rule: never a daily bar).
+
+        ONE seam for live and backtest: ``as_of`` None (live) -> the account quote
+        (``_get_current_price``); ``as_of`` set (backtest) -> ``providers.price_at_date``, which
+        the backtest host answers from the engine's decision-price function (the close of the
+        latest ENDED intraday bar on an intraday clock, the as_of close on a daily clock).
+        Daily frames are HISTORY (indicators, ATR magnitude, returns), not the anchor price:
+        an expert reading ``df["Close"].iloc[-1]`` as 'now' reads a bar that is, in the
+        backtest, the previous session's close and, live, a cached (possibly partial) bar."""
+        # ONE PATH, live and backtest: the ACCOUNT interface. Live -> the broker quote; backtest ->
+        # ``BacktestAccount.get_instrument_current_price`` = the decision price of the run's price
+        # source (a DecisionPrice on an intraday clock). The expert cannot tell them apart, and a bar
+        # read anywhere else cannot become "the price now" (see CLAUDE.md "Prices in decision code").
+        if as_of is None:
+            return self._get_current_price(symbol)
+        from ba2_common.core.knowability import intraday_decision_clock
+        if not intraday_decision_clock():
+            # A backtest on a DAILY clock (and the replay tool): EXACTLY the pre-existing read, the
+            # bundle's last daily close <= as_of (forward-filled, as before). The account path below
+            # exists for the intraday clock, where the decision price is the latest ENDED bar; it is
+            # not entered here, so a daily run is bit-identical to what it was.
+            daily_price = providers.price_at_date(symbol, as_of)
+            return daily_price
+        account = self._decision_account(providers)
+        if account is not None:
+            # A symbol with no knowable price at this tick is NOT decidable: None, the same value a
+            # live account quote that could not be read gives (``_get_current_price`` -> None), so every
+            # caller's "no price -> skip this symbol" rule applies identically live and in a backtest.
+            # (The account counts it: ``undecidable_price_reads``.) Raising here would abort a whole
+            # BASKET analysis for one thin member.
+            from ba2_common.core.knowability import NoDecisionPrice
+            try:
+                return account.get_instrument_current_price(symbol)
+            except NoDecisionPrice:
+                return None
+        # No account behind this bundle: ONLY the historical-replay tool (a recorded decision
+        # re-run against the cache, no live account exists). Everything that trades has an account.
+        return providers.price_at_date(symbol, as_of)
+
+    def _decision_account(self, providers: "ProviderBundle"):
+        """The account behind a backtest bundle, resolved ONCE per bundle (the bundle outlives a run;
+        a per-symbol DB lookup would be a hot-path cost) -- None when it has none."""
+        cached = getattr(self, "_decision_account_cache", None)
+        if cached is not None and cached[0] is providers:
+            return cached[1]
+        account = None
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            instance = get_instance(ExpertInstance, self.id)
+            if instance is not None:
+                account = get_instance_resolver().get_account_instance(instance.account_id)
+        except Exception as e:  # noqa: BLE001 -- not resolvable -> the replay fallback, said once
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                # An intraday BACKTEST must never price from the replay fallback (a plain float the
+                # anchor guard would refuse -- and a silent reduced run if the engine swallowed it):
+                # no account behind the decision price is a wiring defect. End the run loudly.
+                raise RuntimeError(
+                    f"decision account for expert {self.id} is not resolvable on an intraday clock "
+                    f"({type(e).__name__}: {e}); refusing to fall back to a bundle price") from e
+            logger.warning(f"decision account for expert {self.id} not resolvable ({type(e).__name__}: {e})")
+        if account is None:
+            from ba2_common.core.knowability import intraday_decision_clock
+            if intraday_decision_clock():
+                raise RuntimeError(
+                    f"expert {self.id} has no account behind its decision price on an intraday clock; "
+                    f"refusing to fall back to a bundle price")
+        self._decision_account_cache = (providers, account)
+        return account
 
     # ---- Backtest contract (Phase 1) ---------------------------------
     def _gather(self, providers: "ProviderBundle", as_of: Optional[datetime]) -> Dict[str, Any]:
@@ -1044,9 +1577,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         startup. For the Phase-1 golden harness the test injects get_provider via
         the same seam. Used by every expert's live run_analysis to feed _gather.
         """
-        from ba2_common.core.backtest_context import LiveProviderBundle
+        from ba2_common.core.backtest_context import LiveProviderBundle, live_history_spec
         from ba2_common.core.TradeConditions import _get_provider
-        return LiveProviderBundle(lambda category, name, **kw: _get_provider(category, name, **kw))
+        # The OHLCV history is the expert's ACCOUNT's choice (fmp | alpaca); a backtest host resolver returns the run's own
+        # provider whatever is named here.
+        ohlcv_name, ohlcv_kwargs = live_history_spec(self.id)
+        return LiveProviderBundle(lambda category, name, **kw: _get_provider(category, name, **kw),
+                                  ohlcv_name=ohlcv_name, ohlcv_kwargs=ohlcv_kwargs)
 
     @classmethod
     @abstractmethod
@@ -1181,6 +1718,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
         For example, if the account's tradable balance is $10,000 and virtual_equity_pct
         is 10, the virtual balance would be $1,000 (10% of the tradable balance).
+
+        The base is the account's EQUITY in both runtimes (live ``get_balance()`` is equity; the
+        backtest account publishes its deployed equity as its sizing balance), so
+        ``available = virtual - used`` charges an open position once everywhere.
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
@@ -1192,11 +1733,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """This expert's virtual_equity_pct slice of the account's EQUITY (cash plus marked
         positions, ``get_tradable_equity``), for sizing a TARGET BOOK.
 
-        ``get_virtual_balance`` answers from ``get_balance()``, which is equity live and
-        CASH in a backtest (finding 6, unchanged for the classic RM). A rebalancer that
-        sized on it read its own fully invested book as nearly empty in the backtest only,
-        and sold it. This is the same figure in both runtimes; live it equals
-        ``get_virtual_balance`` exactly.
+        ``get_virtual_balance`` is the same figure: both runtimes start from the account's EQUITY
+        (live ``get_balance()`` is equity; the backtest account's sizing balance,
+        ``BacktestAccount._plain_balance``, is its deployed equity -- finding 6, fixed 2026-10-07,
+        when it was CASH there and the classic RM charged open positions twice). This one reads the
+        snapshot's equity directly, so it also stays right for an account whose ``get_balance`` is not
+        equity; live it equals ``get_virtual_balance`` exactly.
 
         Returns:
             Optional[float]: the virtual equity, None exactly where get_virtual_balance
@@ -1206,7 +1748,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                    "tradable equity", "equity")
 
     def _virtual_share(self, read_account_figure, figure_label: str,
-                       result_label: str) -> Optional[float]:
+                       result_label: str, failure: Optional[List[str]] = None) -> Optional[float]:
         """``read_account_figure(account) x virtual_equity_pct / 100`` for this expert's account.
 
         The shared body of get_virtual_balance / get_virtual_equity -- they differ ONLY in
@@ -1266,11 +1808,55 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # would size every entry this expert makes off a silent None instead of
             # surfacing it.
             absorb_if_benign(e, ValueError)
+            if failure is not None:
+                failure.append(f"expert {self.id}: the account's {figure_label} is unreadable ({e})")
             logger.error(
                 f"Error calculating virtual {result_label} for expert {self.id} "
                 f"(account {account_id}): {e}", exc_info=True)
             return None
     
+    def get_available_equity_balance_detail(self, exclude_transaction_id: Optional[int] = None):
+        """``(available, unmeasurable names)``: what this expert may still COMMIT to an OPTION entry.
+
+        THE STOCK PATH'S NUMBER, read for options: ``available = virtual - used`` clamped to the
+        broker's remaining buying power and the account's exposure headroom
+        (``_available_balance_breakdown`` -- the clamps are untouched and options pass through them
+        too), with two differences that make it the same in a backtest and live:
+
+          * ``virtual`` is this expert's ``virtual_equity_pct`` slice of the account's EQUITY
+            (``option_capital_equity``, no margin factor); the classic stock path now starts from the
+            same equity base in both runtimes (finding 6); so the option book is bounded by 100 % of the expert's
+            equity share whatever a stock margin multiplier or the broker's buying power says. The
+            option SIZING budget (``TradeActions._virtual_equity``) is the same slice;
+          * ``used`` (``used_balance_for_transactions``, loss adjustment off because the base already
+            carries the marks) counts the premium of open debit options (and the unfilled remainder
+            of a partly filled entry), the collateral of credit and cash-secured structures (also
+            while a close is resting), the entries still working, and the stock the expert holds.
+
+        BEHAVIOUR OF AN EQUITY BASE MINUS COST (documented, deliberate):
+          * an UNREALISED LOSS counts twice relative to cash: it is already out of the equity and the
+            position's cost still counts in full, so headroom is lower than the cash left
+            (conservative; the expert cannot re-deploy capital it has marked down);
+          * an UNREALISED GAIN raises the headroom: the equity carries it and the cost does not;
+          * NEGATIVE headroom means over-committed: every gate treats it as a refusal (never a
+            negative or absurd quantity).
+
+        KNOWN LIMIT: positions that belong to NO expert (manual or foreign trades) are invisible to
+        ``used`` -- it is the sum of THIS expert's transactions, exactly as the stock path's is -- so
+        they raise nothing here unless the broker's remaining buying power (the outer clamp) sees them.
+
+        ``(None, names)`` when anything could not be read: each named row (order / transaction id,
+        strategy, symbol, why) or the failed figure's cause is what to repair; unknown never reads as
+        room. The reasons travel in the RETURN VALUE (never on this cached instance).
+        """
+        failure: List[str] = []
+        breakdown = self._available_balance_breakdown(
+            exclude_transaction_id, equity_base=True, failure=failure)
+        if breakdown is None:
+            return None, tuple(failure) or (f"expert {self.id} available balance unreadable "
+                                            f"(see the log)",)
+        return breakdown.available, ()
+
     def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:
         """
         Get the available balance for this expert by calculating virtual balance minus used balance.
@@ -1291,8 +1877,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         breakdown = self._available_balance_breakdown(exclude_transaction_id)
         return None if breakdown is None else breakdown.available
 
-    def _available_balance_breakdown(self, exclude_transaction_id: Optional[int] = None
-                                     ) -> Optional["ExpertBalance"]:
+    def _available_balance_breakdown(self, exclude_transaction_id: Optional[int] = None,
+                                     equity_base: bool = False,
+                                     failure: Optional[List[str]] = None) -> Optional["ExpertBalance"]:
         """``get_available_balance``'s body, keeping the two intermediates it computes.
 
         Split out for ``describe_capital_mapping``, which must report virtual, used AND
@@ -1306,9 +1893,16 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         that only wants the available balance must not be able to tell the difference.
         """
         try:
-            # Get virtual balance first
-            virtual_balance = self.get_virtual_balance()
+            # Get virtual balance first. ``equity_base`` (the OPTION entry path): this expert's
+            # slice of the account's EQUITY with no margin factor -- the same figure in a
+            # backtest and live (``get_virtual_balance`` is equity in both since finding 6).
+            virtual_balance = (self._virtual_share(lambda account: account.option_capital_equity(),
+                                                   "option capital equity", "equity",
+                                                   failure=failure)
+                               if equity_base else self.get_virtual_balance())
             if virtual_balance is None:
+                if failure is not None and not failure:
+                    failure.append(f"expert {self.id}: its virtual balance could not be read")
                 return None
 
             # Get expert instance and account instance to fetch current prices
@@ -1326,7 +1920,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 return None
 
             # Calculate used balance from open transactions
-            used_balance = self._calculate_used_balance(account, exclude_transaction_id=exclude_transaction_id)
+            option_used: Dict[int, float] = {}
+            used_balance = self._calculate_used_balance(
+                account, exclude_transaction_id=exclude_transaction_id,
+                loss_adjusted=not equity_base, failure=failure, option_used_out=option_used)
             if used_balance is None:
                 return None
             
@@ -1340,7 +1937,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # this expert's own math never learns about, so its virtual number can overstate what
             # the account can actually spend. Cap it at the broker's real available balance so an
             # expert is never told it can afford more than the account actually has.
-            actual_available = self._get_actual_available_balance(account)
+            actual_available = self._get_actual_available_balance(account, expert_id=self.id)
+            reserved = 0.0
+            if actual_available is not None:
+                # The undeployed reserve of the OTHER experts (overalloc_min_res_pct) is not this
+                # expert's to spend: on an over-allocated account the reserving expert keeps it.
+                try:
+                    reserved = overalloc_reserved_by_others(account, exclude_expert_id=self.id,
+                                                            equity_base=equity_base)
+                except CapitalUnmeasurable as e:
+                    if failure is not None:
+                        failure.extend(e.names)
+                    logger.error(f"Expert {self.id}: another expert's reserve is unmeasurable: {e}")
+                    return None
+                if reserved > 0.0:
+                    logger.debug(f"Expert {self.id}: account available=${actual_available} less "
+                                 f"${reserved:,.2f} reserved by other experts")
+                    actual_available -= reserved
             if actual_available is not None and actual_available < available_balance:
                 logger.debug(f"Expert {self.id}: virtual available=${available_balance} exceeds "
                             f"actual account available=${actual_available} (oversubscription or "
@@ -1393,6 +2006,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     logger.warning(message)
             else:
                 headroom = headroom_reader()
+                if headroom is not None and reserved > 0.0 and not equity_base:
+                    # The other experts' undeployed reserve binds the ceiling too, not only the
+                    # broker's buying power: on a margin account buying power exceeds the
+                    # ceiling, so without this an expert could fill the ceiling up to the last
+                    # dollar of another expert's reserve. Both figures are tradable-balance dollars.
+                    headroom -= reserved
                 if headroom is not None and headroom < available_balance:
                     # DEBUG, not INFO (2026-09-10 review, finding 4): this fires on EVERY
                     # balance read -- 353 times in one production session -- and the clamp
@@ -1410,9 +2029,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
 
             return ExpertBalance(virtual=virtual_balance, used=used_balance,
-                                 available=available_balance)
+                                 available=available_balance,
+                                 option_used=tuple(option_used.items()))
 
         except Exception as e:
+            if failure is not None:
+                failure.append(f"expert {self.id} available balance unreadable "
+                               f"({type(e).__name__}: {e})")
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
 
@@ -1519,60 +2142,248 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         return mapping
 
     @staticmethod
-    def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
-        """The account's REAL spendable balance, straight from the broker — not this expert's
+    def _get_actual_available_balance(account: AccountInterface,
+                                      expert_id: Optional[int] = None) -> Optional[float]:
+        """The account's REAL spendable balance, straight from the broker -- not this expert's
         virtual-equity slice. Reads ``get_account_snapshot().buying_power`` first (the adapter's
         REMAINING stock buying power), then ``get_account_info()``'s buying-power-style fields (the
         true "can I actually place this order" figure); different account implementations name it
         differently (Alpaca/backtest: ``buying_power``; IBKR: ``buying_power``; TastyTrade:
         ``equity_buying_power`` or ``cash_balance``), so several known names are tried in order.
-        Falls back to ``get_balance()`` (equity) if none are present — a real, if less precise,
-        cap; still catches an account whose overall value has genuinely dropped. None (never a
-        fabricated number) if nothing is available."""
-        # The broker-agnostic snapshot FIRST: ``AccountSnapshot.buying_power`` is each
-        # adapter's REMAINING stock buying power (Alpaca: regt_buying_power; TastyTrade:
-        # equity_buying_power; backtest/IBKR: the same figure get_account_info() carries).
-        # Probing the raw ``get_account_info()`` object first read Alpaca's TradeAccount
-        # .buying_power -- the "effective" figure, larger than the Reg-T power the account
-        # can actually hold overnight -- so this clamp and the BP the UI shows disagreed.
-        # The raw probe below stays as the fallback for adapters/fakes without a snapshot.
-        if getattr(account, "buying_power_is_mandatory", False) is True:
+
+        THREE outcomes, told apart on purpose (``_read_actual_buying_power``):
+
+        * a figure -> returned;
+        * the broker COULD NOT BE READ -> retried (``_ACTUAL_BP_ATTEMPTS`` tries, the
+          ``_ACTUAL_BP_BACKOFFS_S`` pauses, 0.75 s in all because the caller holds the per-account
+          submit lock), then ONE ERROR and ``None`` ("no clamp"; the broker's own order check is the
+          remaining guard). "Could not be read" means the call raised a network/OS error OR the
+          adapter returned its failure value: every live adapter SWALLOWS a failed read and returns
+          an EMPTY answer (an all-None ``AccountSnapshot``; ``None`` or ``{}`` for the info), so an
+          exception-only retry never fired on a real adapter;
+        * the broker ANSWERED and this account publishes no buying power -> NOT retried (asking
+          again cannot change an answer), one ERROR saying exactly that, ``None``. No live adapter
+          does this (Alpaca, TastyTrade and IBKR all publish one); it is reachable for a third-party
+          ``AccountInterface`` only.
+
+        There is NO equity (``get_balance()``) substitute -- equity is not buying power. A backtest
+        account's read always carries a figure, so it takes the first attempt and never sleeps.
+
+        EXCEPTION POLICY (enforce mode, the project rule that a broad handler names what it absorbs):
+        an ``OSError``-family error (ConnectionError, TimeoutError, ``requests`` errors ...) or an EMPTY
+        answer is "could not be read" -> retried -> clamp skipped with the ERROR. Anything else PROPAGATES:
+        a programming error, and also an SDK error class escaping a third-party adapter (alpaca-py
+        ``APIError``, ``TastytradeError``, httpx errors, ``IBKRError``, ib_async ``RequestError`` are all
+        plain ``Exception`` subclasses, NOT OSError). The three live adapters swallow their own SDK errors
+        and return empty answers, so none of those reaches this code from them. Where a propagated error
+        lands: ``get_available_balance`` -> the broad handler of ``_available_balance_breakdown`` ->
+        "cannot size" (None, with its ERROR); ``account_available_equity_detail`` -> ``(None, (reason,))``,
+        one refused entry with one ERROR (see there).
+
+        FAILURE MEMORY: a failed read (after its retries) is remembered per ACCOUNT ID for
+        ``_ACTUAL_BP_FAILURE_MEMORY_S`` seconds, so the sizing calls that follow in the same outage (one
+        per candidate per expert) neither re-read the broker nor sleep: each takes the same outcome at
+        once. Every such decision still logs its OWN ERROR (no silent failure), saying it used the
+        remembered failure. A successful read clears the memory; a backtest read never fails, so it never
+        writes it."""
+        label = _bp_label(account, expert_id)
+        mandatory = getattr(account, "buying_power_is_mandatory", False) is True
+        attempts = MarketExpertInterface._ACTUAL_BP_ATTEMPTS
+        account_key = getattr(account, "id", None)
+        remembered = MarketExpertInterface._remembered_bp_failure(account_key)
+        if remembered is not None:
+            age, made_before, detail = remembered
+            if mandatory:
+                raise ValueError(
+                    f"{label} publishes no usable buying power and declares it mandatory "
+                    f"(buying_power_is_mandatory) -- the broker could not be read {age:.1f}s ago "
+                    f"({made_before} attempts; not re-read within the "
+                    f"{MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:g}s failure window): refusing "
+                    f"to size from cash or net liquidation instead")
+            logger.error(
+                f"{label}: buying power COULD NOT BE READ from the broker (remembered failure from "
+                f"{age:.1f}s ago after {made_before} attempts, {detail}; not re-read within the "
+                f"{MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:g}s failure window). The "
+                f"available-balance clamp is SKIPPED for this sizing call; the broker's own order check "
+                f"is the remaining guard.")
+            return None
+        outcome = (_BP_UNREADABLE, None, None)
+        made = 0
+        for attempt in range(1, attempts + 1):
+            made = attempt
+            outcome = MarketExpertInterface._read_actual_buying_power(account, snapshot_only=mandatory)
+            status, figure, error = outcome
+            if status != _BP_UNREADABLE:
+                break
+            if attempt < attempts:
+                pause = MarketExpertInterface._ACTUAL_BP_BACKOFFS_S[attempt - 1]
+                why = f"{type(error).__name__}: {error}" if error is not None else "empty answer"
+                logger.warning(
+                    f"{label}: buying power could not be read (attempt {attempt}/{attempts}: {why}); "
+                    f"retrying in {pause:.2f}s")
+                MarketExpertInterface._ACTUAL_BP_SLEEP(pause)
+        status, figure, error = outcome
+        if status == _BP_FIGURE:
+            MarketExpertInterface._clear_bp_failure(account_key)
+            return figure
+        if status == _BP_UNREADABLE:
+            MarketExpertInterface._remember_bp_failure(
+                account_key, made,
+                f"last error {type(error).__name__}: {error}" if error is not None
+                else "every attempt returned the adapter's empty failure answer")
+        if mandatory:
             # An adapter that DECLARES its buying power mandatory (IBKR): no cash / net-liquidation
             # fallback. A missing figure raises, and the caller's own handler turns that into the loud
             # "cannot size" refusal (``None``) -- never a quietly larger number.
-            snap_bp = getattr(account.get_account_snapshot(), "buying_power", None)
-            try:
-                mandatory = float(snap_bp) if snap_bp is not None else None
-            except (TypeError, ValueError):
-                mandatory = None
-            if mandatory is None or not math.isfinite(mandatory):
-                raise ValueError(
-                    f"Account {getattr(account, 'id', '?')} publishes no usable buying power "
-                    f"({snap_bp!r}) and declares it mandatory (buying_power_is_mandatory): refusing to size "
-                    f"from cash or net liquidation instead")
-            return mandatory
+            if status == _BP_UNREADABLE:
+                what = "the broker could not be read"
+            elif error is not None:
+                what = f"the broker answered with an unusable figure ({error})"
+            else:
+                what = "the broker answered without one"
+            raise ValueError(
+                f"{label} publishes no usable buying power and declares it mandatory "
+                f"(buying_power_is_mandatory) -- {what} after {made} attempt(s): refusing to size "
+                f"from cash or net liquidation instead")
+        if status == _BP_UNREADABLE:
+            detail = (f"last error {type(error).__name__}: {error}" if error is not None
+                      else "every attempt returned the adapter's empty failure answer")
+            logger.error(
+                f"{label}: buying power COULD NOT BE READ from the broker after {made} attempts "
+                f"({detail}). The available-balance clamp is SKIPPED for this sizing call; the broker's "
+                f"own order check is the remaining guard.")
+        else:
+            logger.error(
+                f"{label}: the broker ANSWERED but this account publishes no buying power "
+                f"(neither the snapshot nor get_account_info() carries one; asked {made} time(s), not "
+                f"retried: the answer cannot change). The available-balance clamp is SKIPPED for this "
+                f"sizing call; the broker's own order check is the remaining guard.")
+        return None
+
+    #: Total tries (first read included) and the pauses BETWEEN them for the buying-power read. The
+    #: caller (``AccountInterface.submit_order`` -> ``_validate_expert_available_balance``) holds the
+    #: per-account submit lock, so the total added delay is kept at 0.75 s (<= 1 s).
+    _ACTUAL_BP_ATTEMPTS = 3
+    _ACTUAL_BP_BACKOFFS_S = (0.25, 0.5)
+    _ACTUAL_BP_SLEEP = staticmethod(time.sleep)
+
+    #: How long a failed buying-power read (after its retries) is remembered per account id, so a
+    #: burst of sizing calls in one outage costs ONE read cycle, not one per candidate. Five seconds:
+    #: longer than a whole sizing pass over a basket, short enough that a recovered broker is read again
+    #: within the next scheduling tick.
+    _ACTUAL_BP_FAILURE_MEMORY_S = 5.0
+    _ACTUAL_BP_CLOCK = staticmethod(time.monotonic)
+    _BP_FAILED_READS: Dict[Any, Tuple[float, int, str]] = {}   # account id -> (clock, attempts, detail)
+    _BP_FAILED_READS_LOCK = threading.Lock()
+
+    @staticmethod
+    def _remembered_bp_failure(account_key: Any) -> Optional[Tuple[float, int, str]]:
+        """``(age_s, attempts, detail)`` of an unexpired remembered failure for the account, else None."""
+        if account_key is None:
+            return None
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            entry = MarketExpertInterface._BP_FAILED_READS.get(account_key)
+            if entry is None:
+                return None
+            age = MarketExpertInterface._ACTUAL_BP_CLOCK() - entry[0]
+            if age >= MarketExpertInterface._ACTUAL_BP_FAILURE_MEMORY_S:
+                del MarketExpertInterface._BP_FAILED_READS[account_key]
+                return None
+            return age, entry[1], entry[2]
+
+    @staticmethod
+    def _remember_bp_failure(account_key: Any, attempts: int, detail: str) -> None:
+        if account_key is None:
+            return
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            MarketExpertInterface._BP_FAILED_READS[account_key] = (
+                MarketExpertInterface._ACTUAL_BP_CLOCK(), attempts, detail)
+
+    @staticmethod
+    def _clear_bp_failure(account_key: Any) -> None:
+        if account_key is None:
+            return
+        with MarketExpertInterface._BP_FAILED_READS_LOCK:
+            MarketExpertInterface._BP_FAILED_READS.pop(account_key, None)
+
+    @staticmethod
+    def _read_actual_buying_power(account: AccountInterface, snapshot_only: bool = False):
+        """One attempt at the buying-power figure: ``(status, figure, error)``.
+
+        ``status`` is ``_BP_FIGURE`` (``figure`` set), ``_BP_UNREADABLE`` (a source raised a
+        network/OS error or returned the adapter's empty failure answer, and no source gave a figure;
+        ``error`` is the last exception, or None for a pure empty answer) or ``_BP_NOT_PUBLISHED``
+        (every source ANSWERED and none carries a buying power). ``snapshot_only``: the snapshot is the
+        only source (an adapter that declares buying power mandatory).
+        """
+        label = _bp_label(account, None)
+        error: Optional[BaseException] = None
+        unusable: Optional[BaseException] = None   # snapshot-only mode: a figure was published but is unusable
+        answered = failed = 0
+        snapshot_failure_value = False
 
         snap_fn = getattr(account, "get_account_snapshot", None)
         if callable(snap_fn):
+            snap = None
             try:
-                snap_bp = getattr(snap_fn(), "buying_power", None)
-            except Exception:  # noqa: BLE001 — same contract as the info probe: never block sizing
-                snap_bp = None
-            if snap_bp is not None:
-                try:
-                    snap_num = float(snap_bp)
-                except (TypeError, ValueError):
-                    snap_num = None
-                if snap_num is not None and math.isfinite(snap_num):
-                    return snap_num
-                logger.warning(
-                    f"Account {getattr(account, 'id', '?')}: unusable snapshot buying_power "
-                    f"({snap_bp!r}); falling back to get_account_info() for the clamp")
+                snap = snap_fn()
+            except Exception as e:
+                absorb_if_benign(e)     # OSError family only; anything else is a defect and propagates
+                error = e
+                failed += 1
+            else:
+                if _snapshot_is_empty(snap):
+                    failed += 1         # the adapter's "I could not read the broker" value
+                    # only the real failure VALUE (an all-None AccountSnapshot) licenses skipping the
+                    # info probe below; a snapshot-shaped stub is just "no figure here"
+                    snapshot_failure_value = isinstance(snap, AccountSnapshot)
+                else:
+                    answered += 1
+                    snap_bp = getattr(snap, "buying_power", None)
+                    if snap_bp is not None:
+                        try:
+                            snap_num = float(snap_bp)
+                        except (TypeError, ValueError):
+                            snap_num = None
+                        if snap_num is not None and math.isfinite(snap_num):
+                            return _BP_FIGURE, snap_num, None
+                        if snapshot_only:
+                            # no fallback exists in this mode: say what is true
+                            unusable = ValueError(f"unusable snapshot buying_power {snap_bp!r}")
+                        else:
+                            logger.warning(
+                                f"{label}: unusable snapshot buying_power ({snap_bp!r}); "
+                                f"falling back to get_account_info() for the clamp")
+        if snapshot_only:
+            if answered and not failed:
+                return _BP_NOT_PUBLISHED, None, unusable
+            return _BP_UNREADABLE, None, error
+        if (snapshot_failure_value and failed and not answered and error is None
+                and getattr(account, "snapshot_is_derived_from_account_info", False) is True):
+            # The snapshot came back EMPTY (no raise) and this adapter builds it from the very read
+            # get_account_info() would make again: a second probe repeats the failed call (and its
+            # adapter ERROR) for nothing. Only a snapshot that ANSWERED without a figure falls through.
+            return _BP_UNREADABLE, None, None
 
-        try:
-            info = account.get_account_info()
-        except Exception:  # noqa: BLE001 — a broker hiccup here must not block the virtual figure
-            info = None
+        info = None
+        info_fn = getattr(account, "get_account_info", None)
+        if not callable(info_fn):
+            # An account (a duck-typed double, a third-party adapter) with no info source at all: this
+            # source does not exist, which is neither an answer nor a failure -- the snapshot (answered
+            # or failed above) decides alone. Same as dev, where the missing method was swallowed.
+            pass
+        else:
+            try:
+                info = info_fn()
+            except Exception as e:
+                absorb_if_benign(e)
+                error = e
+                failed += 1
+            else:
+                if info is None or (hasattr(info, "__len__") and len(info) == 0):
+                    failed += 1             # None (Alpaca) / {} (TastyTrade, IBKR): a failed read
+                else:
+                    answered += 1
 
         def _field(obj: Any, name: str) -> Optional[float]:
             val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
@@ -1588,7 +2399,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # same as a non-numeric value: say so and fall through to the next candidate name.
             if not math.isfinite(num):
                 logger.warning(
-                    f"Account {getattr(account, 'id', '?')}: non-finite {name} ({val!r}) in "
+                    f"{label}: non-finite {name} ({val!r}) in "
                     f"get_account_info(); ignoring it for the available-balance clamp")
                 return None
             return num
@@ -1597,13 +2408,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             for name in ("buying_power", "cash", "cash_balance", "equity_buying_power"):
                 val = _field(info, name)
                 if val is not None:
-                    return val
+                    return _BP_FIGURE, val, None
 
-        try:
-            return account.get_balance()
-        except Exception:  # noqa: BLE001 — best-effort; None means "couldn't determine, don't clamp"
-            return None
-    
+        # No figure. NOT get_balance(): equity is not spendable power and substituting it hid a
+        # missing figure behind a plausible number. A source that failed makes the whole read
+        # "could not be read" (retry); only an all-answered, figure-less read is "not published".
+        if failed or not answered:
+            return _BP_UNREADABLE, None, error
+        return _BP_NOT_PUBLISHED, None, None
+
     def has_sufficient_equity_for_trading(self) -> tuple[bool, str]:
         """
         Check if expert has sufficient available equity to create new positions.
@@ -1662,7 +2475,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return False, f"Error checking equity: {str(e)}"
     
     def _calculate_used_balance(self, account: AccountInterface,
-                                 exclude_transaction_id: Optional[int] = None) -> Optional[float]:
+                                 exclude_transaction_id: Optional[int] = None,
+                                 loss_adjusted: bool = True,
+                                 failure: Optional[List[str]] = None,
+                                 option_used_out: Optional[Dict[int, float]] = None
+                                 ) -> Optional[float]:
         """
         Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
 
@@ -1670,82 +2487,33 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             account: The account instance to get current prices
             exclude_transaction_id: Optional transaction ID to exclude from the calculation,
                 e.g. the WAITING transaction created for the order currently being validated.
+            option_used_out: Optional dict filled with ``{transaction id: its used charge}`` for
+                every OPTION transaction counted (stage-2 E1b). Recording only: the returned
+                total is computed exactly as without it.
 
         Returns:
             Optional[float]: The total used balance, None if error occurred
         """
         try:
-            used_balance = 0.0
-
             # Get all open transactions for this expert (dual-path: the in-memory store in a
             # backtest, SQLite in live — same rows either way).
-            from ba2_common.core.trade_store import transactions_where
-            transactions = transactions_where(
-                expert_id=self.id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+            transactions = capital_transactions(self.id)
             if exclude_transaction_id is not None:
                 transactions = [t for t in transactions if t.id != exclude_transaction_id]
-
-            if not transactions:
-                return used_balance
-            
-            # Fetch all prices at once (bulk fetching)
-            all_symbols = list(set(t.symbol for t in transactions))
-            logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for used balance calculation")
-            symbol_prices = account.get_instrument_current_price(all_symbols)
-            
-            for transaction in transactions:
-                if transaction.open_price is None or transaction.quantity is None:
-                    logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
-                    continue
-
-                is_option = bool(transaction.multiplier and transaction.multiplier != 1)
-                multiplier = float(transaction.multiplier) if is_option else 1.0
-
-                if is_option:
-                    # transaction.symbol is the UNDERLYING ticker for options (see
-                    # OptionsAccountInterface.submit_option_order) -- the bulk-fetched
-                    # symbol_prices above are the underlying's STOCK price, off by roughly the
-                    # option's leverage ratio. Price the option off its OWN quote instead (long
-                    # marks at bid, short at ask, last as fallback -- same convention as
-                    # TradeConditions._get_option_pnl_via_transaction).
-                    current_price = self._used_balance_option_price(account, transaction)
-                    if current_price is None:
-                        logger.warning(f"No option quote for transaction {transaction.id} "
-                                       f"({transaction.symbol}) — using open_price")
-                        current_price = transaction.open_price
-                else:
-                    # Get current price from bulk-fetched prices
-                    current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
-                    if current_price is None:
-                        logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
-                        current_price = transaction.open_price
-
-                # Calculate profit/loss based on side field
-                # BUY = LONG, SELL = SHORT
-                if transaction.side == OrderDirection.BUY:  # Long position
-                    profit_loss = (current_price - transaction.open_price) * transaction.quantity * multiplier
-                else:  # Short position
-                    profit_loss = (transaction.open_price - current_price) * transaction.quantity * multiplier
-
-                # Calculate used balance for this transaction
-                if profit_loss >= 0:
-                    # Transaction is profitable, use open_price
-                    transaction_used = transaction.open_price * transaction.quantity * multiplier
-                else:
-                    # Transaction is losing money, use open_price + loss
-                    loss_amount = abs(profit_loss)
-                    transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
-
-                used_balance += transaction_used
-
-                logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
-                           f"Open=${transaction.open_price}, Current=${current_price}, "
-                           f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
-            
-            return used_balance
-
+            return used_balance_for_transactions(account, transactions,
+                                                 loss_adjusted=loss_adjusted,
+                                                 option_used_out=option_used_out)
+        except CapitalUnmeasurable as e:
+            # Named IN THE CALL RESULT (``failure``, the caller's own list), never on this cached
+            # expert instance: the refusal that follows says which row to repair.
+            if failure is not None:
+                failure.extend(e.names)
+            logger.error(f"Expert {self.id}: capital commitment unreadable: {e}")
+            return None
         except Exception as e:
+            if failure is not None:
+                failure.append(f"expert {self.id} used balance unreadable "
+                               f"({type(e).__name__}: {e})")
             logger.error(f"Error calculating used balance for expert {self.id}: {e}", exc_info=True)
             return None
 

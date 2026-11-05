@@ -1,0 +1,267 @@
+"""Balance usage per expert (Overview "Balance Usage Per Expert" chart), UI-free: each enabled expert's virtual balance
+(its sleeve of the account's TRADABLE balance) against what is filled and pending, plus the account-level totals.
+The chart and ``GET /stats/overview`` call these same functions. Broker reads (tradable balance, buying power, bid
+prices) go through the account instances; an account whose tradable balance cannot be read is left out of the rows
+(never given an invented denominator)."""
+from typing import Dict, Optional
+
+from sqlmodel import select
+
+from ..core.db import get_db
+from ..core.models import ExpertInstance, TradingOrder, Transaction
+from ..core.types import OrderStatus
+from ..logger import logger
+from .stats import expert_ids_for_account
+
+
+def balance_usage_per_expert(account_id: Optional[int]) -> Dict[str, Dict[str, float]]:
+    """
+    Calculate balance breakdown for each expert: used (pending + filled) and available.
+
+    Returns:
+        Dict mapping expert names to their balance breakdown:
+        {
+            'expert_name': {
+                'pending': float,
+                'filled': float,
+                'available': float,
+                'total': float (virtual balance)
+            }
+        }
+    """
+    from collections import defaultdict
+    balance_data = {}
+
+    account_expert_ids = expert_ids_for_account(account_id)
+
+    with get_db() as session:
+        from ..core.types import TransactionStatus, OrderType
+        from ..core.utils import get_account_instance_from_id
+
+        # Get all active expert instances (with account filter)
+        expert_query = select(ExpertInstance).where(ExpertInstance.enabled == True)
+        if account_expert_ids is not None:
+            if account_expert_ids:
+                expert_query = expert_query.where(ExpertInstance.id.in_(account_expert_ids))
+            else:
+                return {}
+
+        experts = session.exec(expert_query).all()
+        expert_by_id = {e.id: e for e in experts}
+
+        def _expert_name(e):
+            return f"{e.alias or e.expert}-{e.id}"
+
+        # Account-instance cache shared across this calculation.
+        account_cache: Dict[int, object] = {}
+
+        def _get_account(acc_id):
+            if acc_id is None:
+                return None
+            if acc_id not in account_cache:
+                account_cache[acc_id] = get_account_instance_from_id(acc_id, session=session)
+            return account_cache[acc_id]
+
+        # Virtual balance = account TRADABLE balance * virtual_equity_pct (same
+        # base as get_virtual_balance, so a margin account is not painted as
+        # over-allocated). Fetch each account's balance once instead of calling the
+        # per-expert get_virtual_balance (which re-fetches balance every time).
+        balance_by_account: Dict[int, Optional[float]] = {}
+        bp_by_account: Dict[int, Optional[float]] = {}
+        for expert in experts:
+            acc_id = expert.account_id
+            if acc_id not in balance_by_account:
+                acct = _get_account(acc_id)
+                try:
+                    balance_by_account[acc_id] = acct.get_tradable_balance() if acct else None
+                except Exception as e:
+                    # A chart must not invent a denominator: the account is skipped
+                    # (below) and the operator gets the reason in the log.
+                    logger.error(f"Tradable balance unavailable for account {acc_id}: {e}", exc_info=True)
+                    balance_by_account[acc_id] = None
+            account_balance = balance_by_account[acc_id]
+            if account_balance is None:
+                continue
+            if acc_id not in bp_by_account:
+                # The broker's REMAINING buying power: the real ceiling on what can still
+                # be deployed. None when unpublished -- shown as unknown, never guessed.
+                acct = _get_account(acc_id)
+                try:
+                    bp_by_account[acc_id] = acct.get_buying_power() if acct else None
+                except Exception as e:
+                    logger.error(f"Broker buying power unavailable for account {acc_id}: {e}", exc_info=True)
+                    bp_by_account[acc_id] = None
+            # NO ``or 100.0``: virtual_equity_pct is NOT NULL with a 100.0 default,
+            # so that only ever fired on a real 0% allocation and drew the sleeve as
+            # owning the whole account. Same coercion as
+            # MarketExpertInterface.get_virtual_balance; what the operator sees must
+            # agree with what the sizing code does.
+            virtual_balance = account_balance * (expert.virtual_equity_pct / 100.0)
+            balance_data[_expert_name(expert)] = {
+                'pending': 0.0,
+                'filled': 0.0,
+                'available': 0.0,  # Will be computed as total - filled - pending
+                'total': virtual_balance,
+                # The account this SLEEVE draws on, carried per row so the footer
+                # can total the TRADABLE capital ONCE per account -- levered by the
+                # margin factor when margin is on, which is the same base the sleeve
+                # above is a percent of. Sleeves are routinely oversubscribed on
+                # purpose (six experts at 60% of one account is deliberate here), so
+                # summing 'total' across rows counts the same dollars up to six
+                # times -- see summarize_capital.
+                'account_id': acc_id,
+                'account_total': account_balance,
+                'broker_bp': bp_by_account[acc_id],
+                # Symbols of this expert's open/waiting trades the account gave no price for: their value is
+                # MISSING from 'filled'/'pending', so a reader (the API) can say the figure is understated.
+                'unpriced_symbols': [],
+            }
+
+        # Now calculate used balance from transactions
+        query = (
+            select(Transaction)
+            .where(Transaction.expert_id.isnot(None))
+            .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING, TransactionStatus.CLOSING]))
+        )
+
+        if account_expert_ids is not None:
+            if account_expert_ids:
+                query = query.where(Transaction.expert_id.in_(account_expert_ids))
+            else:
+                return balance_data
+
+        transactions = session.exec(query).all()
+        if not transactions:
+            for name, data in balance_data.items():
+                data['available'] = max(0, data['total'] - data['filled'] - data['pending'])
+            return dict(sorted(balance_data.items(), key=lambda x: x[1]['total'], reverse=True))
+
+        # Map each transaction to its account via a SINGLE orders query
+        # (avoids a per-transaction "first order" lookup — the old N+1).
+        txn_ids = [t.id for t in transactions]
+        account_by_txn: Dict[int, int] = {}
+        order_rows = session.exec(
+            select(TradingOrder.transaction_id, TradingOrder.account_id)
+            .where(TradingOrder.transaction_id.in_(txn_ids))
+        ).all()
+        for tid, acc_id in order_rows:
+            if acc_id is not None and tid not in account_by_txn:
+                account_by_txn[tid] = acc_id
+
+        # Bulk-prefetch bid prices grouped by account (one API call per account,
+        # not one per transaction — the main slowdown in the "All accounts" view).
+        symbols_by_account = defaultdict(set)
+        for t in transactions:
+            acc_id = account_by_txn.get(t.id)
+            if acc_id is not None:
+                symbols_by_account[acc_id].add(t.symbol)
+        prices_by_account: Dict[int, Dict[str, float]] = {}
+        for acc_id, syms in symbols_by_account.items():
+            acct = _get_account(acc_id)
+            if not acct:
+                continue
+            try:
+                prices_by_account[acc_id] = acct.get_instrument_current_price(list(syms), price_type='bid') or {}
+            except Exception as e:
+                logger.warning(f"Failed to prefetch prices for account {acc_id}: {e}")
+                prices_by_account[acc_id] = {}
+
+        for transaction in transactions:
+            try:
+                expert = expert_by_id.get(transaction.expert_id)
+                if not expert:
+                    continue
+
+                expert_name = _expert_name(expert)
+                if expert_name not in balance_data:
+                    continue
+
+                acc_id = account_by_txn.get(transaction.id)
+                market_price = prices_by_account.get(acc_id, {}).get(transaction.symbol) if acc_id is not None else None
+                if not market_price:
+                    if transaction.symbol not in balance_data[expert_name]['unpriced_symbols']:
+                        balance_data[expert_name]['unpriced_symbols'].append(transaction.symbol)
+                    continue
+
+                if transaction.status in [TransactionStatus.OPENED, TransactionStatus.CLOSING]:
+                    equity = abs(transaction.quantity) * market_price
+                    balance_data[expert_name]['filled'] += equity
+
+                elif transaction.status == TransactionStatus.WAITING:
+                    market_orders = session.exec(
+                        select(TradingOrder)
+                        .where(TradingOrder.transaction_id == transaction.id)
+                        .where(TradingOrder.order_type == OrderType.MARKET)
+                    ).all()
+
+                    for order in market_orders:
+                        if order.status in OrderStatus.get_unfilled_statuses():
+                            remaining_qty = order.quantity
+                            if order.filled_qty:
+                                remaining_qty -= order.filled_qty
+
+                            if remaining_qty > 0:
+                                equity = abs(remaining_qty) * market_price
+                                balance_data[expert_name]['pending'] += equity
+
+            except Exception as e:
+                logger.error(f"Error calculating balance usage for transaction {transaction.id}: {e}")
+                continue
+
+        # Compute available = total - filled - pending (ensures stack adds up)
+        for name, data in balance_data.items():
+            data['available'] = max(0, data['total'] - data['filled'] - data['pending'])
+
+        # Sort by total balance (highest to lowest)
+        balance_data = dict(sorted(
+            balance_data.items(),
+            key=lambda x: x[1]['total'],
+            reverse=True
+        ))
+
+    return balance_data
+
+
+def summarize_capital(balance_data: Dict[str, Dict[str, float]]) -> Dict[str, Optional[float]]:
+    """Account-level totals for the footer.
+
+    THE DEFECT THIS EXISTS FOR: the footer used to sum every sleeve's virtual balance
+    and label it "Total". Sleeves are shares of an account, not additions to it, and
+    several experts on one account may each be allocated 60% -- so six 60% sleeves on a
+    $1,712 account reported $6,162 of capital and an equally imaginary $6,162 available.
+    Oversubscription is a deliberate configuration (competing entries simply get
+    discarded when the cash runs out), so the number must be SHOWN, not summed away.
+
+    - ``capital``   the TRADABLE capital -- each account's ``get_tradable_balance()``
+      (balance x the margin factor with margin on, the plain balance with it off)
+      counted ONCE, the same base each sleeve above is a percent of
+    - ``allocated`` the sum of the sleeves, which may legitimately exceed ``capital``
+    - ``filled`` / ``pending`` real dollars in real positions; a transaction belongs to
+      exactly one expert, so these do not double-count and are summed across rows
+    - ``available`` tradable capital minus what is actually committed
+    - ``allocated_pct`` None when there is no capital to divide by
+    """
+    filled = sum(d['filled'] for d in balance_data.values())
+    pending = sum(d['pending'] for d in balance_data.values())
+    allocated = sum(d['total'] for d in balance_data.values())
+    capital = sum({d['account_id']: d['account_total']
+                   for d in balance_data.values()}.values())
+    # Broker remaining buying power, once per account. ``available`` is capped at it:
+    # tradable capital minus positions is a margin-factor figure, while the broker only
+    # lends what its own multiplier and current positions allow (2026-10-01: the widget
+    # showed $2,789 available against ~$500 of real buying power). Unknown when any
+    # account did not publish one -- then the uncapped figure stands and says so.
+    bp_per_account = {d['account_id']: d.get('broker_bp') for d in balance_data.values()}
+    broker_bp = (None if any(v is None for v in bp_per_account.values())
+                 else sum(bp_per_account.values()))
+    available = max(0.0, capital - filled - pending)
+    return {
+        'filled': filled,
+        'pending': pending,
+        'allocated': allocated,
+        'capital': capital,
+        'available': available if broker_bp is None else min(available, max(0.0, broker_bp)),
+        'available_uncapped': available,
+        'broker_bp': broker_bp,
+        'allocated_pct': (allocated / capital * 100.0) if capital else None,
+    }

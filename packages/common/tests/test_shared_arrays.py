@@ -70,6 +70,43 @@ def test_build_then_open_returns_equal_arrays_not_memmap_subclass(tmp_path):
     np.testing.assert_array_equal(got2["close"], _arrays()["close"])
 
 
+def test_open_or_build_nowait_builds_opens_and_never_waits(tmp_path):
+    """The no-wait variant: builds when the lock is free, opens what is published, and answers
+    None -- immediately -- while another process holds the build lock."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _arrays()
+
+    sig = store.signature([src])
+    lock = store.key_dir("K") / (sig + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(os.getpid()))                    # a live builder holds it
+    t0 = time.monotonic()
+    assert store.open_or_build_nowait("K", [src], build) is None
+    assert time.monotonic() - t0 < 5 and calls == []
+    lock.unlink()
+
+    got = store.open_or_build_nowait("K", [src], build)
+    assert calls == [1]
+    np.testing.assert_array_equal(got["close"], _arrays()["close"])
+    assert not lock.exists(), "the lock is released after the build"
+    again = store.open_or_build_nowait("K", [src], build)
+    assert calls == [1]
+    np.testing.assert_array_equal(again["bar_ord"], _arrays()["bar_ord"])
+
+
+def test_open_or_build_nowait_escape_hatch_is_a_private_build(tmp_path, monkeypatch):
+    monkeypatch.setenv("BA2_SHARED_ARRAYS", "0")
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    got = store.open_or_build_nowait("K", [_src(tmp_path)], _arrays)
+    assert got["close"].flags.writeable
+    assert not (tmp_path / "_derived").exists() or not any((tmp_path / "_derived").rglob("*.npy"))
+
+
 def test_opened_arrays_are_file_backed_and_read_only(tmp_path):
     store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
     got = store.build_or_open("AAPL", [_src(tmp_path)], _arrays)

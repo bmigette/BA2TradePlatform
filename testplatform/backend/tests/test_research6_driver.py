@@ -147,7 +147,7 @@ def test_preview_never_opens_db_or_launches(monkeypatch, tmp_path):
         pytest.fail("Preview attempted execution or DB access")
     monkeypatch.setattr(sqlite3, "connect", forbidden)
     monkeypatch.setattr(D.subprocess, "run", forbidden)
-    assert D.main(["--dry-run", "--output-dir", str(tmp_path)]) == 0
+    assert D.main(["--ohlcv-history-source", "fmp", "--dry-run", "--output-dir", str(tmp_path)]) == 0
     assert len(json.loads((tmp_path / "manifest.json").read_text())["jobs"]) == 35
 
 
@@ -168,7 +168,8 @@ def test_sequential_driver_stops_on_first_child_failure(monkeypatch, tmp_path):
         calls.append(command)
         return SimpleNamespace(returncode=9)
     monkeypatch.setattr(D.subprocess, "run", fail)
-    args = SimpleNamespace(db_file=tmp_path / "test.sqlite", cache_dir=tmp_path, resume=False)
+    args = SimpleNamespace(db_file=tmp_path / "test.sqlite", cache_dir=tmp_path, resume=False,
+                           ohlcv_history_source="fmp")
     assert D.run_jobs(P.build_manifest()["jobs"][:2], tmp_path, args) == 9
     assert len(calls) == 1
 
@@ -202,6 +203,8 @@ def test_stalled_rows_never_rank():
 
 
 def test_preflight_reads_actual_screen_and_refuses_missing_files(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "FMPOHLCVProvider"
+    tmp_path.mkdir()
     import pandas as pd
     from ba2_providers.screener import metric_store as ms
     job = one("large_ds", "control")

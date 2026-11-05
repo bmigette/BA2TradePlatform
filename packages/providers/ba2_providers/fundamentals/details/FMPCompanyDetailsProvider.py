@@ -13,6 +13,7 @@ import fmpsdk
 import requests
 
 from ba2_common.core.interfaces import CompanyFundamentalsDetailsInterface
+from ba2_common.core.knowability import earnings_visible_from, intraday_decision_clock
 from ba2_common.core.provider_utils import validate_date_range, statement_effective_date
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.config import get_app_setting
@@ -818,9 +819,22 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             # Filter by end_date. Descending order means every row after the cut is a
             # contiguous prefix, so skipping it is the same set the old row-by-row
             # ``if earning_date > end_date_cmp: continue`` produced, in the same order.
+            #
+            # INTRADAY backtest clock: a row is visible from the first decision that can know
+            # its RESULT, not from its date. An ``amc`` report dated D is published after D's
+            # close (live at D 09:30 receives that row with its EPS still null), so it is
+            # visible from the next session; only ``bmo`` is visible on D. ``--`` / a missing
+            # slot is not confirmed, so it takes the conservative reading too. Shifting every
+            # row by at most one day keeps the newest-first order, so the prefix cut still holds.
             start = 0
-            while start < len(parsed) and parsed[start][0] > end_date_cmp:
-                start += 1
+            if intraday_decision_clock():
+                while (start < len(parsed)
+                       and earnings_visible_from(parsed[start][0], parsed[start][1].get("time"))
+                       > end_date_cmp):
+                    start += 1
+            else:
+                while start < len(parsed) and parsed[start][0] > end_date_cmp:
+                    start += 1
 
             # Apply lookback_periods limit -- the same slice as before, so a 0 or a
             # negative lookback still means what it always did.

@@ -6,7 +6,8 @@ option action through the EQUITY funded-entry flow. The option action had alread
 2 contracts, then the equity risk manager re-labelled the entry "9 shares", rewrote the transaction
 quantity 2 -> 9 and staged a STOCK safeguard stop (SELL 9 GILD @ 138.56) that went live at the
 broker against a position that holds no shares. Only a HOLD-admitting expert took the option path;
-the backtest (``daily_engine._entry_is_option``) routes every option entry there regardless of HOLD.
+the backtest routes every option entry there regardless of HOLD. Both runtimes now route each
+fired entry through the one shared ``trade_cycle.entry_route``.
 
 Pinned here with the real evaluator/actions and a mock broker:
 * a BUY-signal option entry never reaches the equity risk manager, and its orders and transaction

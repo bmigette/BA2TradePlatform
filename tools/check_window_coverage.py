@@ -33,12 +33,21 @@ import random
 import sys
 from datetime import datetime, timedelta
 
+from ba2_common.config import CACHE_FOLDER
+from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES, history_cache_dirname
+
 
 def _first_bar(path: str):
+    span = _bar_span(path)
+    return span[0] if span else None
+
+
+def _bar_span(path: str):
+    """(first bar, last bar) as naive datetimes, or None when unreadable. Reads only the Date column."""
     import pandas as pd
     try:
-        d = pd.read_parquet(path, columns=["Date"])["Date"]
-        return pd.to_datetime(d, utc=True).min().tz_localize(None).to_pydatetime()
+        d = pd.to_datetime(pd.read_parquet(path, columns=["Date"])["Date"], utc=True)
+        return (d.min().tz_localize(None).to_pydatetime(), d.max().tz_localize(None).to_pydatetime())
     except Exception:
         return None
 
@@ -48,8 +57,16 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--interval", default="5min", help="Bar interval the GRID will run (not 1d unless it is).")
     ap.add_argument("--start", required=True, help="Grid window start, ISO.")
+    ap.add_argument("--end", default=None,
+                    help="Grid window end, ISO (optional). Also checks the LAST --probe-days: a symbol passes "
+                         "if its last bar is on/after end - probe-days; one whose existence-interval file also "
+                         "stops before that is delisted and excluded (goal2027: data must reach the end too)."),
+    ap.add_argument("--source", choices=sorted(HISTORY_SOURCES), default=DEFAULT_BT_HISTORY_SOURCE,
+                    help="OHLCV history source whose cache folder is checked (default "
+                         f"{DEFAULT_BT_HISTORY_SOURCE}): fmp -> CACHE_FOLDER/FMPOHLCVProvider, "
+                         "alpaca -> CACHE_FOLDER/AlpacaHistoryOHLCVProvider.")
     ap.add_argument("--cache-dir", default=None,
-                    help="Provider cache dir (default CACHE_FOLDER/FMPOHLCVProvider).")
+                    help="Provider cache dir; overrides --source (default CACHE_FOLDER/<source folder>).")
     ap.add_argument("--symbols", default=None,
                     help="Comma-separated list or @file. Default: sample the whole cache.")
     ap.add_argument("--sample", type=int, default=40, help="Symbols to sample (default 40).")
@@ -66,14 +83,18 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1337, help="Sampling seed, so a run is reproducible.")
     args = ap.parse_args()
 
-    cache_dir = args.cache_dir or os.path.join(
-        os.path.expanduser("~"), "Documents", "ba2", "common", "cache", "FMPOHLCVProvider")
+    cache_dir = args.cache_dir or os.path.join(CACHE_FOLDER, history_cache_dirname(args.source))
     if not os.path.isdir(cache_dir):
         print(f"coverage: FATAL cache dir not found: {cache_dir}")
         return 2
 
     start = datetime.fromisoformat(args.start)
     cutoff = start + timedelta(days=args.probe_days)
+    end = datetime.fromisoformat(args.end) if args.end else None
+    if end is not None and end <= start:
+        print(f"coverage: FATAL --end {end.date()} is not after --start {start.date()}")
+        return 2
+    end_cutoff = end - timedelta(days=args.probe_days) if end is not None else None
 
     if args.symbols:
         raw = args.symbols
@@ -101,12 +122,24 @@ def main() -> int:
     sample = files if len(files) <= args.sample else rng.sample(files, args.sample)
 
     missing, ok, unreadable, not_listed = [], 0, 0, 0
+    end_missing, end_ok, delisted = [], 0, 0
     for p in sample:
         sym = os.path.basename(p)[: -len(f"_{args.interval}.parquet")]
-        first = _first_bar(p)
-        if first is None:
+        span = _bar_span(p)
+        if span is None:
             unreadable += 1
             continue
+        first, last = span
+        if end_cutoff is not None:
+            if last >= end_cutoff:
+                end_ok += 1
+            else:
+                dpath = os.path.join(cache_dir, f"{sym}_{args.existence_interval}.parquet")
+                dspan = _bar_span(dpath) if os.path.isfile(dpath) else None
+                if args.interval != args.existence_interval and dspan is not None and dspan[1] < end_cutoff:
+                    delisted += 1          # stopped trading: nothing to fetch, ever
+                else:
+                    end_missing.append((sym, last.date()))
         if first <= cutoff:
             ok += 1
             continue
@@ -139,6 +172,23 @@ def main() -> int:
     if len(missing) > 12:
         print(f"          ... and {len(missing) - 12} more")
 
+    end_fail = False
+    if end_cutoff is not None:
+        end_eligible = end_ok + len(end_missing)
+        end_pct = 100.0 * end_ok / max(1, end_eligible)
+        print(f"coverage: end={end.date()} (a symbol passes if its last bar is on/after {end_cutoff.date()}): "
+              f"{end_ok} covered, {len(end_missing)} missing, {delisted} delisted before the end (excluded)")
+        print(f"coverage: {end_pct:.0f}% of the {end_eligible} ELIGIBLE symbols reach the end "
+              f"(need >= {args.min_covered_pct:.0f}%)")
+        for sym, d in end_missing[:12]:
+            print(f"          {sym:<8} last bar {d}")
+        if len(end_missing) > 12:
+            print(f"          ... and {len(end_missing) - 12} more")
+        if end_pct < args.min_covered_pct:
+            print(f"coverage: FAIL -- the cache stops before the window end for too many symbols; the end of "
+                  f"the run would trade a reduced universe.")
+            end_fail = True
+
     if covered_pct < args.min_covered_pct:
         print(f"coverage: FAIL -- {covered_pct:.0f}% covered is under the "
               f"{args.min_covered_pct:.0f}% bar.")
@@ -147,6 +197,8 @@ def main() -> int:
         print(f"coverage:   of the window and its results would not mean what the window says.")
         print(f"coverage:   Backfill: ba2-test fetch-cache --provider fmp "
               f"--timeframes {args.interval} --start {start.date()} --end <end> --symbols @<file>")
+        return 1
+    if end_fail:
         return 1
     print("coverage: PASS")
     return 0

@@ -564,7 +564,7 @@ prefix, an unconfirmed pivot). If the refusal names a symbol with "no usable obs
 anywhere", that symbol belongs out of the universe (as SPCX now is) or needs its source history
 repaired. If a future universe change reintroduces uncovered symbols, the two ways forward are
 the same: re-fetch
-(`warm_market_conditions.py build --plan <plan> --fetch-missing`, a real provider bill — size it
+(`warm_market_conditions.py build --plan <plan> --fetch-missing --ohlcv-history-source fmp`, a real provider bill — size it
 with `plan` first), then re-publish and re-pin; or trim the universe to the covered set and pass
 that file to the driver.
 
@@ -586,13 +586,13 @@ MARKET_CONDITION_PROFILE=ohlcv-v1 tools/stage1_run.sh --dry-run    # prints the 
 resolved window and universe. Run those four, in order, on the master:
 
 ```bash
-$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 \
+$PY tools/warm_market_conditions.py plan  --profile ohlcv-v1 --ohlcv-history-source fmp \
       --universe-file tools/options_universe_top100.txt \
       --start 2020-01-01 --end 2025-12-31 --out market_conditions_plan.json
-$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json \
+$PY tools/warm_market_conditions.py build --plan market_conditions_plan.json --ohlcv-history-source fmp \
       --cache-only --print-digest          # stdout = the digest; the JSON report is on stderr
-$PY tools/warm_market_conditions.py verify       --manifest <digest>
-$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+$PY tools/warm_market_conditions.py verify       --manifest <digest> --ohlcv-history-source fmp
+$PY tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1 --ohlcv-history-source fmp
 ```
 
 * `plan` is an inventory plus a source preflight; a plan that reports missing coverage is
@@ -682,7 +682,7 @@ pinning it, and renew it as dates advance.
   as such.
 * **Live refresh reports split-basis drift; it does not automatically replace history.** The
   automatic repair was reversed by operator decision. Inventory the live universe with
-  `warm_market_conditions.py plan`, then use the explicit warmup `--fetch-missing` repair path
+  `warm_market_conditions.py plan --ohlcv-history-source fmp`, then use the explicit warmup `--fetch-missing` repair path
   when required. That path can call `force_full_refetch`; the earlier option-universe repair
   involved 13 symbols. Do not assume restarting the platform repairs the source cache.
 * Market leaves are refused on open-positions / exit rulesets, and an unresolved mode gene is

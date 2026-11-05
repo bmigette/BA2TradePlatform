@@ -1,6 +1,7 @@
 from datetime import date
 from types import SimpleNamespace
 import pytest
+from unittest.mock import MagicMock
 
 from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
 from ba2_trade_platform.core.interfaces import OptionsAccountInterface
@@ -342,6 +343,68 @@ def test_build_multi_leg_mleg_request():
     assert len(req.legs) == 2
     syms = {l.symbol for l in req.legs}
     assert syms == {"AAPL260116C00150000", "AAPL260116C00160000"}
+
+
+@pytest.mark.parametrize("side,limit,expected", [
+    (OrderDirection.BUY, 16.149, 16.15),    # indicative-feed ask with 3 decimals (8082 order 22)
+    (OrderDirection.BUY, 5.2, 5.2),         # already a cent: no float drift up to 5.21
+    (OrderDirection.BUY, 0.333, 0.34),      # below $1 options are still cents (not the equity 4dp rule)
+    (OrderDirection.SELL, 16.149, 16.14),   # a seller concedes by quoting LOWER
+    (OrderDirection.SELL, 0.339, 0.33),
+    (OrderDirection.BUY, 0.1 + 0.2, 0.3),   # float residue 0.30000000000000004 is not a cent up
+    (OrderDirection.SELL, 1.2 - 0.1, 1.1),  # 1.0999999999999999 is not a cent down
+])
+def test_single_leg_limit_rounded_to_cent_towards_the_fill(side, limit, expected):
+    """Alpaca rejects option limits with more than 2 decimals (42210000)."""
+    acct = _make_alpaca()
+    order = _opt_order(limit_price=limit, side=side,
+                       order_type=OrderType.BUY_LIMIT if side == OrderDirection.BUY else OrderType.SELL_LIMIT)
+    leg = OptionLeg(contract_symbol="AAPL260116C00150000", side=side,
+                    position_intent="buy_to_open" if side == OrderDirection.BUY else "sell_to_close")
+    req = acct._build_option_order_request(order, [leg])
+    assert float(req.limit_price) == expected
+
+
+@pytest.mark.parametrize("net,expected", [
+    (4.0001, 4.01),     # debit: pay up to the next cent
+    (4.0, 4.0),
+    (-1.234, -1.23),    # credit: take slightly less credit (the net goes UP, as for a debit)
+])
+def test_mleg_net_limit_rounded_up_to_cent(net, expected):
+    acct = _make_alpaca()
+    order = _opt_order(quantity=1, limit_price=net, contract_symbol=None)
+    legs = [
+        OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                  position_intent="buy_to_open"),
+        OptionLeg(contract_symbol="AAPL260116C00160000", side=OrderDirection.SELL,
+                  position_intent="sell_to_open"),
+    ]
+    req = acct._build_option_order_request(order, legs)
+    assert float(req.limit_price) == expected
+
+
+@pytest.mark.parametrize("price,up", [
+    (-0.005, True),     # a sub-cent MLEG credit would become a 0.00 limit
+    (0.004, False),     # a sub-cent single-leg sell would become 0.00
+])
+def test_sub_cent_option_limit_is_refused_not_zeroed(price, up):
+    with pytest.raises(ValueError, match="below one cent"):
+        AlpacaAccount._round_option_limit(price, up=up)
+
+
+@pytest.mark.parametrize("side,contract,limit,expected", [
+    (OrderDirection.BUY, "AAPL260116C00150000", 0.333, 0.34),    # not the equity 4dp tier
+    (OrderDirection.SELL, "AAPL260116C00150000", 0.339, 0.33),
+    (OrderDirection.SELL, None, -1.234, -1.23),                  # MLEG net rounds up
+])
+def test_modify_order_rounds_option_limit_to_cent(side, contract, limit, expected):
+    acct = _make_alpaca()
+    acct.client = MagicMock()
+    acct.alpaca_order_to_tradingorder = MagicMock(return_value="ok")
+    order = _opt_order(side=side, limit_price=limit, contract_symbol=contract)
+    assert acct.modify_order("broker-1", order) == "ok"
+    req = acct.client.replace_order_by_id.call_args.kwargs["order_data"]
+    assert float(req.limit_price) == expected
 
 
 def test_submit_option_order_impl_writeback(mock_account_def):

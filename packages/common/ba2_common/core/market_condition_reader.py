@@ -1000,7 +1000,8 @@ def clear_window_coverage_cache() -> None:
         _window_cache.clear()
 
 
-def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -> List[str]:
+def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any,
+                             intraday: bool = False) -> List[str]:
     """Why this snapshot does not serve the rows a run over ``[start, end]`` will ask for.
 
     Empty list = it does. Each string is one symbol's (or the pin's) fault, phrased for an
@@ -1013,6 +1014,14 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
     :func:`missing_coverage`'s answer, and reporting it twice would name the same symbol in two
     different refusals. Memoised by (cache root, profile, digest, universe, window): a batch asks
     the identical question once per job and a GA once per trial.
+
+    ``intraday``: the run is on an INTRADAY clock. Bar D then reads the row of the last FINISHED
+    session P(D), never D's own (not final until the close), so the rows required are
+    P(first bar)..P(last bar): one session BEFORE ``start`` is needed and the run's last session
+    is not. The warmup writes rows for ``[prior(first bar), last bar]``, so a snapshot warmed for
+    exactly ``start..end`` DOES hold P(first bar) and is accepted; one built under an older row
+    rule (rows for ``first..last`` only) lacks it and is refused here instead of silently reading
+    missing_session on the run's first day. The pin's declared window is still compared in BARS.
     """
     if mapped is None:
         return []
@@ -1021,13 +1030,13 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
         return []
     first, last = _as_date(start), _as_date(end)
     key = (str(getattr(mapped, "cache_root", "")), str(getattr(mapped, "profile", "")),
-           _bare(str(getattr(mapped, "manifest_digest", ""))), wanted, first, last)
+           _bare(str(getattr(mapped, "manifest_digest", ""))), wanted, first, last, bool(intraday))
     with _window_cache_lock:
         hit = _window_cache.get(key)
         if hit is not None:
             _window_cache.move_to_end(key)
             return list(hit)
-    problems = tuple(_window_coverage_problems(mapped, wanted, first, last))
+    problems = tuple(_window_coverage_problems(mapped, wanted, first, last, bool(intraday)))
     with _window_cache_lock:
         _window_cache[key] = problems
         _window_cache.move_to_end(key)
@@ -1037,7 +1046,7 @@ def window_coverage_problems(mapped: Any, universe: Any, start: Any, end: Any) -
 
 
 def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
-                              first: date, last: date) -> List[str]:
+                              first: date, last: date, intraday: bool = False) -> List[str]:
     from ba2_common.core.market_calendar import (
         backtest_decision_label, decision_data_session, regular_session_dates,
     )
@@ -1057,6 +1066,11 @@ def _window_coverage_problems(mapped: Any, wanted: Tuple[str, ...],
     # The row each end bar reads, through the ONE decision-session rule (== the bar itself).
     want_first = decision_data_session(backtest_decision_label(bars[0]))
     want_last = decision_data_session(backtest_decision_label(bars[-1]))
+    if intraday:
+        # P(D): the last session finished before bar D (see ``window_coverage_problems``).
+        from ba2_common.core.market_calendar import prior_regular_session
+        want_first = prior_regular_session(bars[0])
+        want_last = bars[-2] if len(bars) > 1 else want_first
     required = regular_session_dates(want_first, want_last)
 
     problems: List[str] = []

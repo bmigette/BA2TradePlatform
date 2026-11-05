@@ -17,6 +17,11 @@ GA_NEUTRAL_GLOBS = [
     "packages/common/ba2_common/core/ibkr_*.py",
     "packages/common/ba2_common/core/protective_legs.py",
     "packages/common/tests/test_ibkr_*.py",
+    # PennyMomentumTrader live price fetch (vendor_live_price=fmp): intraday live trader, never run by GA/backtest.
+    "packages/experts/ba2_experts/PennyMomentumTrader/data_gathering.py",
+    # (Alpaca history live_fetch / live_topup / corporate_actions are deliberately NOT listed: GA-relevant
+    # AlpacaHistoryOHLCVProvider and live_backfill import them, even if lazily and keyless-unreachable; the
+    # entry-point guard test_package_versions_entry_points forbids a neutral module behind a GA entry point.)
     # Tests, docs and READMEs never ship to GA code paths.
     "packages/*/tests/*",
     "packages/*/test_files/*",

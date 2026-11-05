@@ -41,6 +41,22 @@ def market_condition_leaves(prefix: str, profiles) -> list:
     return leaves
 
 
+def benchmark_regime_leaves(prefix: str) -> list:
+    """The SPY benchmark entry gates, ``[spy-trend, spy-vol]``: one categorical mode gene each
+    (``off`` plus the field's modes in code order). No profile is involved: the regime is
+    market-wide and the host publishes it (``benchmark_regime``).
+
+    The leaf shape is the one :func:`market_condition_leaves` emits for a categorical field
+    (``field_type`` "numeric", ``mode_optimize``, ``op`` "=="); no ``value`` / ``optimize`` /
+    ``toggle_optimize``: the GA decode writes the chosen mode's code onto the leaf."""
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, field_codes
+    from ba2_common.core.rule_models import MODE_OFF
+
+    return [{"id": f"{prefix}-{spec.short}", "field": spec.name, "field_type": "numeric",
+             "mode_optimize": True, "op": "==", "mode_choices": [MODE_OFF, *field_codes(spec.name)]}
+            for spec in BENCHMARK_FIELDS.values()]
+
+
 #: The kinds :func:`market_exit_rules` can build, in emission order.
 MARKET_EXIT_KINDS = ("exit", "stop", "tp")
 _DIRECTIONS = ("long", "short")

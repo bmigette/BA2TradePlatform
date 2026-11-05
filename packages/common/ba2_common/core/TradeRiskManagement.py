@@ -10,12 +10,15 @@ import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
+from ba2_common.core.knowability import require_decision_price
+from ba2_common.core.ohlcv_history import HistoryUnavailable
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from ba2_common.core.interfaces.ExtendableSettingsInterface import trading_permission, coerce_bool
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
-from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
+from ba2_common.core.types import (CAPITAL_HOLDING_TRANSACTION_STATUSES, OrderStatus, OrderDirection,
+                                   TransactionStatus)
 from ba2_common.core.db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
 from ba2_common.core.failure_modes import absorb_if_benign
@@ -144,6 +147,20 @@ def apply_lot_size(order_data: dict, quantity: int) -> int | None:
     return (int(quantity) // lot) * lot
 
 
+#: Host seam: ``fn(expert_id) -> indicator provider | None`` (plan 2026-10-24-history-source-task11: ATR follows the
+#: account's history source; None = the default stack). Unwired = always the injected provider.
+_indicator_provider_resolver = None
+
+
+def set_indicator_provider_resolver(fn) -> None:
+    global _indicator_provider_resolver
+    _indicator_provider_resolver = fn
+
+
+def get_indicator_provider_resolver():
+    return _indicator_provider_resolver
+
+
 class TradeRiskManagement:
     """
     Risk management system for automated trading orders.
@@ -177,6 +194,15 @@ class TradeRiskManagement:
         self.logger = logger
         self.indicator_provider = indicator_provider
         self.as_of = as_of
+
+    def _indicator_provider_for(self, expert):
+        """The ATR indicator provider for ``expert``'s orders. LIVE only (``as_of`` None): the host seam may name a
+        provider built on the expert's account history source (an ``alpaca`` account); None (an ``fmp`` account, no seam)
+        keeps the injected default, exactly as before. A backtest (``as_of`` given) always uses its injected provider."""
+        if self.as_of is not None or _indicator_provider_resolver is None:
+            return self.indicator_provider
+        override = _indicator_provider_resolver(expert.id)
+        return override if override is not None else self.indicator_provider
     
     def review_and_prioritize_pending_orders(self, expert_instance_id: int) -> List[TradingOrder]:
         """
@@ -413,11 +439,37 @@ class TradeRiskManagement:
         # the capital-mapping line below reports. Asking for those separately would run
         # the whole pass -- a transactions query and a bulk price fetch -- a second time,
         # and would explain a DIFFERENT instant than the one this sizing decision used.
-        balances = expert._available_balance_breakdown()
+        from ba2_common.core.interfaces.MarketExpertInterface import CAPITAL_REPAIR_HINT
+        capital_failure: List[str] = []
+        balances = expert._available_balance_breakdown(failure=capital_failure)
         if balances is None:
+            # An expert that HOLDS OPTIONS can reach this because one of its option rows cannot be
+            # valued (``used_balance_for_transactions`` refuses: unknown is never zero). Name it,
+            # and say how to repair it. A stock-only expert has no option row to be unreadable.
             error_msg = f"Could not get available balance for expert {expert_instance_id}"
+            if capital_failure:
+                error_msg += ": " + "; ".join(capital_failure) + ". " + CAPITAL_REPAIR_HINT
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
+        # ...net of the collateral this expert's open option positions reserve (stage-2 E1b):
+        # a cash-secured put's used charge is only its premium, so without this a style run
+        # holding a CSP member and a stock-buying member spent the put's collateral on stock.
+        # The SHARED budget both runtimes size from; the same ``balances`` object (nothing
+        # read) when no option position is open. Only the expert's own term is charged, so a
+        # broker figure that already nets the collateral (live Alpaca Reg-T) is not charged
+        # twice -- see option_collateral_budget.
+        if balances.option_used:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            from ba2_common.core.option_collateral_budget import rm_equity_budget
+            try:
+                balances = rm_equity_budget(
+                    balances,
+                    get_instance_resolver().get_account_instance(expert_instance.account_id))
+            except ValueError as e:
+                error_msg = (f"Could not state the equity budget for expert "
+                             f"{expert_instance_id}: {e}")
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg) from e
         available_balance = balances.available
         total_virtual_balance = available_balance
         # THE PER-INSTRUMENT CEILING IS A SHARE OF THE SLEEVE, NOT OF WHAT IS LEFT IN IT.
@@ -1232,11 +1284,12 @@ class TradeRiskManagement:
         try:
             from ba2_common.core.trade_store import transactions_where, orders_where, inmem_trades_active
 
-            # Get existing transactions for this expert that are still open (dual-path: the
+            # Get existing transactions for this expert that still HOLD capital -- WAITING, OPENED and
+            # CLOSING (a resting close has not released the position; dual-path: the
             # in-memory store in a backtest, SQLite in live — same rows either way).
             transactions = transactions_where(
                 expert_id=expert_instance_id,
-                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+                statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES))
 
             for transaction in transactions:
                 symbol = transaction.symbol
@@ -1419,6 +1472,9 @@ class TradeRiskManagement:
                                      balance_after=remaining_balance)
                     updated_orders.append(order)
                     continue
+                # the anchor of the size (budget / price) and of the safeguard stop below: on an
+                # intraday clock it must be the decision price, never a daily bar
+                require_decision_price(current_price, what="position size", symbol=symbol)
                 self._trace_note(trace, price=current_price)
 
                 # THE GRID for this symbol: 1.0 (whole shares) unless the expert opted in AND
@@ -1463,28 +1519,37 @@ class TradeRiskManagement:
                     updated_orders.append(order)
                     continue
 
-                # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
-                # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
-                sized_by_risk = False
-                quantity = 0
-                if sizing_mode == 'risk_atr':
-                    sized_by_risk = True
-                    quantity = self._risk_atr_quantity(
-                        order, symbol, current_price, expert,
-                        max_position_value=available_for_instrument,
-                        available_balance=remaining_balance,
-                        account=account,
-                        trace=trace,
-                        context=context,
-                        quantity_unit=unit,
-                    )
-                else:
-                    # notional mode still sizes purely by equity/balance below (unaffected), but
-                    # a strategy whose exit conditions set NO stop-loss must not trade fully
-                    # unprotected just because it isn't in risk_atr mode -- attach the same
-                    # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
-                    # existing bracket mechanism creates a protective SL leg).
-                    self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
+                try:
+                    # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
+                    # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
+                    sized_by_risk = False
+                    quantity = 0
+                    if sizing_mode == 'risk_atr':
+                        sized_by_risk = True
+                        quantity = self._risk_atr_quantity(
+                            order, symbol, current_price, expert,
+                            max_position_value=available_for_instrument,
+                            available_balance=remaining_balance,
+                            account=account,
+                            trace=trace,
+                            context=context,
+                            quantity_unit=unit,
+                        )
+                    else:
+                        # notional mode still sizes purely by equity/balance below (unaffected), but
+                        # a strategy whose exit conditions set NO stop-loss must not trade fully
+                        # unprotected just because it isn't in risk_atr mode -- attach the same
+                        # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
+                        # existing bracket mechanism creates a protective SL leg).
+                        self._ensure_safeguard_stop(order, symbol, current_price, expert, trace=trace)
+                except HistoryUnavailable as e:
+                    # the history the stop / size depends on is not usable (lock timeout, gap, stale corporate actions, a symbol too new for
+                    # the window): the order is REFUSED loudly, never sized or protected on a silently missing ATR
+                    self.logger.error(f"  Order {order.id} ({symbol}) REFUSED: history unavailable ({type(e).__name__}: {e})")
+                    order.quantity = 0
+                    self._trace_note(trace, binding="history_unavailable", quantity=0, balance_after=remaining_balance)
+                    updated_orders.append(order)
+                    continue
 
                 if not sized_by_risk:
                     # Calculate maximum affordable quantity based on available equity per instrument
@@ -1830,7 +1895,7 @@ class TradeRiskManagement:
         sl_atr = None
         if use_atr_stop:
             sl_atr = get_latest_atr(
-                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+                symbol, self._indicator_provider_for(expert), period=atr_period, end_date=self.as_of)
         _synth_trace: Dict[str, Any] = {}
         sl = synthesize_safeguard_stop(
             current_price, order.side == OrderDirection.BUY, risk_pct,

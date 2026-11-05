@@ -24,6 +24,7 @@ import pytest
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation
 from ba2_common.core.types import Recommendation
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 
 
 # 5 daily bars; AAPL rises 100 -> 140 close over the window.
@@ -153,7 +154,8 @@ def _build_run(account_id=1, expert_id=1, cfg=None):
         experts=[(expert, expert_id, {}, ruleset_id)],
         price_source=ps,
         config=config,
-        indicator_provider=None,  # notional sizing -> ATR not needed
+        # The no-ATR stub: None would make run() build the REAL FMP-backed provider.
+        indicator_provider=NoAtrIndicatorProvider(),
     )
     return engine, account, expert, ctx, ps
 
@@ -163,10 +165,9 @@ def test_engine_opens_one_position_and_records_equity():
 
     engine, account, expert, ctx, ps = _build_run()
     try:
-        # None: _ensure_safeguard_stop now always attempts an ATR lookup (regardless of
-        # sizing_mode) when use_atr_stop is on (default True) -- get_latest_atr's
-        # `if indicator_provider is None: return None` is its documented no-ATR-available path.
-        engine._indicator_provider = None
+        # _ensure_safeguard_stop always attempts an ATR lookup (regardless of sizing_mode) when
+        # use_atr_stop is on (default True); the engine was built with the no-ATR stub, which
+        # answers it offline with get_latest_atr's no-ATR-available path.
         results = engine.run()
 
         # (b) one equity snapshot per simulated bar.
@@ -212,7 +213,6 @@ def test_engine_busts_price_cache_each_bar():
             seen_prices.append(account.get_instrument_current_price("AAPL"))
 
         ps.set_clock = _spy  # type: ignore[assignment]
-        engine._indicator_provider = None
         engine.run()
 
         # The per-bar price equals each bar's close, strictly increasing across the window.
@@ -231,7 +231,6 @@ def test_engine_stops_early_on_account_wipeout():
     real equity-destroying trade sequence."""
     engine, account, expert, ctx, ps = _build_run(account_id=3, expert_id=3)
     try:
-        engine._indicator_provider = None
         orig_snapshot = account.snapshot_equity
         calls = {"n": 0}
 

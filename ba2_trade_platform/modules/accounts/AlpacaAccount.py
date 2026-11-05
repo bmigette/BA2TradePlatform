@@ -6,14 +6,19 @@ from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
 import re
 import time
 import threading
 import functools
 
+from ...core.fmp_live_price import fetch_fmp_last_prices, FMPPriceError
+from ba2_providers.fmp_common import FMPHermeticViolation, redact
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
+from ...core.pending_cancel import (
+    mark_pending_cancel, get_pending_cancel_since, PENDING_CANCEL_SINCE_KEY)
 from ...core.types import (
     OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus,
     # Aliased: the module-level `AssetClass` imported above from alpaca.trading.enums is
@@ -30,6 +35,8 @@ from ...core.account_types import (
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance, InstanceNotFound
+from ba2_common.core.assignment_hold import assigned_stock_entry_data
+from ba2_common.core.entry_tag import order_entry_tag
 from sqlmodel import Session, select, or_
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
@@ -43,16 +50,15 @@ _DIVIDEND_KEY_PREFIX = "DIV:"
 # Calendar.__init__ with strptime("%Y-%m-%d %H:%M") (alpaca/trading/models.py:374-388).
 _MARKET_TZ = pytz.timezone("America/New_York")
 
-# How far THROUGH its stop price the OCO stop leg's limit price is placed, so that a
-# normally-triggered stop still fills (a stop-LIMIT with limit == stop rests unfilled the
-# moment the market ticks past it).
+# How far past its stop the price must be before TradeManager._force_close_breached_stops
+# treats a still-held position as "stop breached without filling" and closes it at market.
 #
-# THIS NUMBER HAS TWO READERS AND MUST STAY ONE CONSTANT. The other is
-# TradeManager._force_close_breached_stops: on a gap that jumps the stop AND this cushion
-# in a single print, the triggered leg becomes a limit order on the wrong side of the
-# market and never fills, leaving the position open and unprotected (prod 2026-09-10:
-# RARE/ENOV). That safety net force-closes exactly the positions this cushion could not
-# protect, so it has to measure the breach with the very same number.
+# Until APP 2026.09.1261 this was also the OCO stop leg's limit offset (the leg was a
+# stop-LIMIT, which rests unfilled once a gap clears stop AND cushion: prod RARE/ENOV
+# 2026-09-10, PLTR 2026-11-03). Alpaca stop legs are now PLAIN stops, so the safety net only
+# catches what should not happen any more: a legacy stop-limit leg still resting at the
+# broker, or a stop that is held/missing. The name is kept because IBKR's protective legs
+# (ba2_common.core.protective_legs) pin the same value for their own stop-limit leg.
 OCO_STOP_LIMIT_CUSHION = 0.005
 
 # PENDING_CANCEL lifetime. A cancel is a WAIT for the broker's confirmation, and a wait
@@ -451,10 +457,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             "data_feed": {
                 "type": "str",
                 "required": False,
-                "default": "delayed_sip",
-                "description": "Alpaca market data feed",
-                "valid_values": ["delayed_sip", "sip", "iex", "otc"],
-                "tooltip": "delayed_sip = 15-min delayed (free tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
+                "default": "fmp",
+                "description": "Live stock price source",
+                "valid_values": ["fmp", "delayed_sip", "sip", "iex", "otc"],
+                "tooltip": "fmp = real-time FMP quote (last price; needs the FMP API key; never falls back to Alpaca; no bid/ask). delayed_sip = 15 min late (free Alpaca tier). iex = real-time IEX-only prints, free. sip = real-time consolidated, paid. otc = OTC data.",
             },
             "options_feed": {"type": "str", "required": False, "default": "indicative",
                              "valid_values": ["indicative", "opra"],
@@ -1614,13 +1620,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Round prices using Alpaca pricing rules
                 rounded_tp_price = self._round_price(trading_order.limit_price, trading_order.symbol)
                 rounded_sl_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
-                # Stop-loss limit price should be slightly worse than stop price to ensure execution
-                rounded_sl_limit_price = self._round_price(
-                    rounded_sl_stop_price * (1.0 - OCO_STOP_LIMIT_CUSHION) if side == OrderSide.SELL
-                    else rounded_sl_stop_price * (1.0 + OCO_STOP_LIMIT_CUSHION),
-                    trading_order.symbol
-                )
-                
+                # The stop leg is a PLAIN stop (no limit_price): triggered, it becomes a market
+                # order and fills at the stop or at the gap open, exactly what the backtest
+                # models (_gap_stop_fill). A stop-LIMIT leg rests unfilled once a gap clears its
+                # limit (prod PLTR 2026-11-03, RARE/ENOV 2026-09-10). Alpaca accepts an OCO whose
+                # stop_loss has no limit_price (paper test 2026-11-03: leg stored as type "stop").
+
                 # Validate order has ID before submission
                 if not trading_order.id:
                     raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
@@ -1633,10 +1638,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     time_in_force=time_in_force,
                     order_class=OrderClass.OCO,
                     take_profit=TakeProfitRequest(limit_price=rounded_tp_price),
-                    stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price, limit_price=rounded_sl_limit_price),
+                    stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price),
                     client_order_id=str(trading_order.id)
                 )
-                logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} limit=${rounded_sl_limit_price:.4f}")
+                logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} (market on trigger)")
                 
             else:
                 raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
@@ -1832,9 +1837,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             TradingOrder: The modified order if successful, None if an error occurs.
         """
         try:
-            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
-            limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
-            stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
+            # Round price fields to Alpaca's grid: an option contract is on the cent grid at every
+            # price (42210000), an equity keeps 4 decimals below $1.
+            if getattr(trading_order, 'asset_class', None) == CoreAssetClass.OPTION:
+                # Same direction rule as submission: an MLEG net (no contract) rounds up.
+                up = (not getattr(trading_order, 'contract_symbol', None)
+                      or trading_order.side == OrderDirection.BUY)
+                limit_price = self._round_option_limit(trading_order.limit_price, up=up) if trading_order.limit_price is not None else None
+                stop_price = self._round_option_limit(trading_order.stop_price, up=up) if trading_order.stop_price is not None else None
+            else:
+                limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
+                stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
             
             # Map good_for to TimeInForce enum if provided
             time_in_force = None
@@ -1958,7 +1971,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if db_order_id:
                 db_order = get_instance(TradingOrder, db_order_id)
                 if db_order:
-                    db_order.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(db_order)   # status + the moment the cancel was SENT
                     update_instance(db_order)
 
             return True
@@ -2717,6 +2730,53 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return raw
         return [raw] if raw else []
 
+    #: Pages of 100 FILL activities read at most when looking for an external close: enough for
+    #: months of this platform's trading, and a hard stop so a lookup can never loop.
+    CLOSING_FILL_MAX_PAGES = 20
+
+    def get_closing_fill(self, symbol: str, side, quantity: float,
+                         since: Optional[datetime]) -> Optional[Tuple[float, datetime]]:
+        """The Alpaca FILL activities on ``side`` that closed ``quantity`` of ``symbol`` after
+        ``since``: ``(quantity-weighted average price, time of the last fill)``, or None.
+
+        Fills are taken oldest first from ``since`` (the transaction's open) until they cover
+        ``quantity``: the first closing fills after the entry are the ones that closed it, and
+        partial fills of one order arrive as separate activities. None when they never cover
+        the quantity, or when the activities cannot be read (logged at ERROR); a partly matched
+        close is not a price."""
+        from ba2_common.core.types import OrderDirection
+        sides = {"sell", "sell_short"} if side == OrderDirection.SELL else {"buy"}
+        params: Dict[str, Any] = {"direction": "asc", "page_size": 100}
+        if since is not None:
+            params["after"] = since.astimezone(timezone.utc).isoformat()
+        qty = value = 0.0
+        last_time = None
+        for _ in range(self.CLOSING_FILL_MAX_PAGES):
+            try:
+                page = self.client.get("/account/activities/FILL", params)
+            except Exception as e:  # noqa: BLE001 -- the REST client raises its own types
+                logger.error(f"[Account {self.id}] Could not read FILL activities for "
+                             f"{symbol}: {e}", exc_info=True)
+                return None
+            page = page if isinstance(page, list) else ([page] if page else [])
+            for act in page:
+                if act.get("symbol") != symbol or act.get("side") not in sides:
+                    continue
+                q = float(act["qty"])
+                take = min(q, quantity - qty)
+                qty += take
+                value += take * float(act["price"])
+                last_time = datetime.fromisoformat(
+                    str(act["transaction_time"]).replace("Z", "+00:00"))
+                if qty >= quantity - 1e-9:
+                    return value / qty, last_time
+            if len(page) < params["page_size"]:
+                return None
+            params["page_token"] = page[-1]["id"]
+        logger.error(f"[Account {self.id}] Closing fill for {symbol} not found within "
+                     f"{self.CLOSING_FILL_MAX_PAGES} pages of FILL activities after {since}")
+        return None
+
     def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
         """Deposits, withdrawals and dividends over a window, from the activities API.
 
@@ -2886,6 +2946,32 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         
         return results
 
+    def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
+        """The cached price read (base class), with ONE cache entry per symbol on the fmp feed: FMP
+        /quote has a last price only, so 'bid'/'mid'/'mark'/... are the same figure and must not each
+        cost an FMP request. 'ask' keeps its own key and is refused by the implementation."""
+        if price_type != 'ask' and (self.settings.get("data_feed") or "fmp").lower() == "fmp":
+            price_type = 'bid'
+        return super().get_instrument_current_price(symbol_or_symbols, price_type=price_type)
+
+    def _fmp_current_price(self, symbol_or_symbols):
+        """FMP last price(s); None for any symbol FMP did not price (never another source)."""
+        single = isinstance(symbol_or_symbols, str)
+        symbols = [symbol_or_symbols] if single else list(symbol_or_symbols)
+        try:
+            prices = fetch_fmp_last_prices(symbols)
+        except FMPHermeticViolation:
+            raise
+        except FMPPriceError as e:
+            logger.error(f"[Account {self.id}] FMP price feed unavailable: {e}")
+            prices = {}
+        except Exception as e:
+            logger.error(f"[Account {self.id}] FMP price feed failed for {symbols}: {redact(e)}")
+            prices = {}
+        if single:
+            return prices.get(symbol_or_symbols)
+        return {s: prices.get(s) for s in symbols}
+
     @alpaca_api_retry
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """
@@ -2906,6 +2992,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 - If symbol_or_symbols is str: Returns Optional[float] (single price or None)
                 - If symbol_or_symbols is List[str]: Returns Dict[str, Optional[float]] (symbol -> price mapping)
         """
+        feed_setting = (self.settings.get("data_feed") or "fmp").lower()
+        feed_names = ("fmp", "delayed_sip", "sip", "iex", "otc")
+        if feed_setting not in feed_names:
+            raise ValueError(
+                f"Unknown Alpaca data_feed {feed_setting!r} (account {self.id}); "
+                f"valid values: {', '.join(feed_names)}")
+
+        if feed_setting == "fmp":
+            # Real-time FMP /quote LAST price. FMP /quote carries no bid/ask. 'bid' is the
+            # interface DEFAULT price_type (every plain get_instrument_current_price(sym) call
+            # arrives as 'bid' and means "the price"), so it cannot be refused: it is the last
+            # price, like mid/avg/mark/trade. An explicit 'ask' is a quote SIDE we do not have:
+            # refused loudly, never answered with a last price or an Alpaca quote.
+            if price_type == "ask":
+                raise ValueError(
+                    f"data_feed 'fmp' cannot serve price_type 'ask': FMP /quote has no ask "
+                    f"(account {self.id}). Use the default/'mid'/'mark' for a last price, or "
+                    f"switch the account's data_feed to an Alpaca feed.")
+            return self._fmp_current_price(symbol_or_symbols)
+
         if not self._check_authentication():
             # Return appropriate type based on input
             if isinstance(symbol_or_symbols, str):
@@ -2927,14 +3033,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             is_single_symbol = isinstance(symbol_or_symbols, str)
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
 
-            feed_setting = (self.settings.get("data_feed") or "delayed_sip").lower()
             feed_map = {
                 "delayed_sip": DataFeed.DELAYED_SIP,
                 "sip": DataFeed.SIP,
                 "iex": DataFeed.IEX,
                 "otc": DataFeed.OTC,
             }
-            feed = feed_map.get(feed_setting, DataFeed.DELAYED_SIP)
+            feed = feed_map[feed_setting]
 
             # Fetch last trade prices — these match what the Alpaca broker displays and are
             # reliable even for thinly traded stocks where bid/ask can be stale.
@@ -3114,7 +3219,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 )
             ).all()
             pending = [
-                (r.id, r.broker_order_id, r.symbol, r.created_at) for r in rows
+                (r.id, r.broker_order_id, r.symbol, dict(r.data) if r.data else None) for r in rows
                 if r.broker_order_id is None or r.broker_order_id not in covered
             ]
             skipped_free = len(rows) - len(pending)
@@ -3134,6 +3239,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         def _oldest_first(row):
             age = self._order_age_hours(row[3])
             return (age is None, -age if age is not None else 0.0)
+
+        # LEGACY ROWS: PENDING_CANCEL with no recorded cancel moment (written before the
+        # stamp existed). Their true start is unknown; created_at is NOT it (it made every
+        # cancelled leg of a long-held position look 24 h old at once). Start the clock NOW:
+        # never reset on this pass, and say so once (the stamp ends the repetition).
+        # A failure on ONE row (corrupt stamp, DB write) must not abort the others: that row
+        # is treated as starting now, so it is never reset on this pass.
+        for idx, (order_id, broker_order_id, symbol, raw_data) in enumerate(pending):
+            try:
+                since = get_pending_cancel_since(raw_data)
+                if since is None:
+                    since = self._stamp_legacy_pending_cancel(order_id, symbol)
+            except Exception as e:
+                logger.error(
+                    f"Order {order_id} ({symbol}): cannot read/record pending_cancel_since "
+                    f"({type(e).__name__}: {e}); treating the cancel as starting now so the "
+                    f"order is not reset on this pass", exc_info=True)
+                since = datetime.now(timezone.utc)
+            pending[idx] = (order_id, broker_order_id, symbol, since)
 
         pending.sort(key=_oldest_first)
         if len(pending) > _PENDING_CANCEL_LOOKUP_BUDGET:
@@ -3222,6 +3346,24 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return resolved_count
 
+    @staticmethod
+    def _stamp_legacy_pending_cancel(order_id: int, symbol) -> datetime:
+        """Record 'now' as the cancel moment of a PENDING_CANCEL row that has none."""
+        now = datetime.now(timezone.utc)
+        fresh = get_instance(TradingOrder, order_id)
+        if fresh is not None and fresh.status == OrderStatus.PENDING_CANCEL:
+            data = dict(fresh.data) if fresh.data else {}
+            if get_pending_cancel_since(data) is None:
+                data[PENDING_CANCEL_SINCE_KEY] = now.isoformat()
+                fresh.data = data
+                update_instance(fresh)
+                logger.warning(
+                    f"Order {order_id} ({symbol}) is PENDING_CANCEL with no pending_cancel_since "
+                    f"(legacy row): its true cancel time is unknown, so the "
+                    f"{_PENDING_CANCEL_MAX_AGE_HOURS}h timeout now starts from this moment "
+                    f"instead of from created_at")
+        return now
+
     def _write_pending_cancel_result(self, order_id: int, new_status, broker_order) -> bool:
         """Persist the broker's answer onto a PENDING_CANCEL order. Returns True if written.
 
@@ -3236,6 +3378,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"not overwriting")
             return False
         fresh.status = new_status
+        if new_status != OrderStatus.PENDING_CANCEL and fresh.data and PENDING_CANCEL_SINCE_KEY in fresh.data:
+            fresh.data = {k: v for k, v in fresh.data.items() if k != PENDING_CANCEL_SINCE_KEY}
         if broker_order is not None:
             if broker_order.filled_qty is not None:
                 fresh.filled_qty = float(broker_order.filled_qty)
@@ -4764,7 +4908,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     data={
                         "tp_percent_target": self._calculate_tp_percent(entry_order, transaction.take_profit) if transaction.take_profit else 0,
                         "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0,
-                        "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                        "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                     },
                     created_at=datetime.now(timezone.utc)
                 )
@@ -5089,7 +5233,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # Keep one existing DB-only WAITING_TRIGGER order if it already has the
         # target type (update prices in place); cancel everything else.
         keep: TradingOrder | None = None
+        terminal = OrderStatus.get_terminal_statuses()
         for order in all_orders:
+            if (order.parent_order_id == entry_order.id and order.broker_order_id
+                    and order.status not in terminal):
+                # A leg of the entry's OWN complex order (the OTO/bracket of the wash-trade
+                # escape). Cancelling it cancels the unfilled entry at Alpaca: 2026-10-29 RAPP
+                # entry 1438 had filled 34 of 35 shares when its stop leg was cancelled here,
+                # and the order died with the 34 shares untracked. The leg stays; once the
+                # entry fills, TradeManager cancels it and submits the exit staged below.
+                logger.info(f"Keeping leg {order.id} of entry {entry_order.id}'s own complex order "
+                            f"until the entry fills")
+                continue
             if (spec and keep is None
                     and order.order_type == spec[0]
                     and order.status == OrderStatus.WAITING_TRIGGER
@@ -5412,7 +5567,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_tp.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_tp)
                 session.add(existing_tp)
                 
                 # Create new pending order with correct type
@@ -5429,7 +5584,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_tp.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"TP order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_tp.id})",
-                    data=existing_tp.data.copy() if existing_tp.data else {},
+                    data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_tp)
@@ -5453,7 +5608,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace TP order {existing_tp.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_tp.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_tp)
                     session.add(existing_tp)
                     
                     # Create new pending TP order to replace it
@@ -5470,7 +5625,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_tp.id,  # Depends on old order being cancelled
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"TP order (pending cancel of {existing_tp.id})",
-                        data=existing_tp.data.copy() if existing_tp.data else {},
+                        data={k: v for k, v in (existing_tp.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_tp)
@@ -5508,20 +5663,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
 
-    def _tpsl_reference_price(self, entry_order: TradingOrder):
+    def _tpsl_reference_price(self, entry_order: TradingOrder, transaction=None):
         """Best pre-fill anchor the TP/SL were computed against, so a pending OCO can be
         re-based to the entry's ACTUAL fill on trigger.
 
         Prefers the realized fill if present, else the limit price, else the originating
         recommendation's snapshot price (what the rule's order_open_price/current-price
         reference resolved to for a not-yet-filled market order), else the live price.
+        The preference order is the shared ``resolve_tpsl_reference_price`` (the backtest
+        resolves the same anchor through it); only the two lookups are live-specific.
         """
-        if entry_order.open_price:
-            return entry_order.open_price
-        if entry_order.limit_price:
-            return entry_order.limit_price
-        rec_id = getattr(entry_order, "expert_recommendation_id", None)
-        if rec_id:
+        from ba2_common.core.tpsl_fill_rebase import resolve_tpsl_reference_price
+
+        def _rec_price():
+            rec_id = getattr(entry_order, "expert_recommendation_id", None)
+            if not rec_id:
+                return None
             try:
                 from ...core.db import get_instance
                 from ...core.models import ExpertRecommendation
@@ -5530,10 +5687,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     return rec.price_at_date
             except Exception:
                 pass
-        try:
-            return self.get_instrument_current_price(entry_order.symbol)
-        except Exception:
             return None
+
+        def _live_price():
+            try:
+                return self.get_instrument_current_price(entry_order.symbol)
+            except Exception:
+                return None
+
+        from ba2_common.core.tpsl_fill_rebase import read_anchor
+        return resolve_tpsl_reference_price(
+            entry_order.open_price, entry_order.limit_price, _rec_price, _live_price,
+            stamped_stop_anchor=read_anchor(getattr(transaction, "meta_data", None), "stop"))
 
     def _target_exit_spec(self, transaction: Transaction, entry_order: TradingOrder):
         """Decide which exit-order structure a transaction needs at the broker.
@@ -5584,7 +5749,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             data["tp_percent_target"] = self._calculate_tp_percent(entry_order, tp_price)
         if sl_price:
             data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
-        ref_price = self._tpsl_reference_price(entry_order)
+        ref_price = self._tpsl_reference_price(entry_order, transaction)
         if ref_price:
             data["tpsl_reference_price"] = ref_price
         return TradingOrder(
@@ -5644,7 +5809,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 data={
                     "tp_percent_target": self._calculate_tp_percent(entry_order, tp_price),
                     "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price),
-                    "tpsl_reference_price": self._tpsl_reference_price(entry_order)
+                    "tpsl_reference_price": self._tpsl_reference_price(entry_order, transaction)
                 },
                 created_at=datetime.now(timezone.utc)
             )
@@ -5796,7 +5961,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
-                existing_sl.status = OrderStatus.PENDING_CANCEL
+                mark_pending_cancel(existing_sl)
                 session.add(existing_sl)
                 
                 # Create new pending order with correct type
@@ -5813,7 +5978,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     depends_on_order=existing_sl.id,
                     open_type=OrderOpenType.AUTOMATIC,
                     comment=f"SL order (type change: {old_order_type}→{new_order_type.value}, pending cancel of {existing_sl.id})",
-                    data=existing_sl.data.copy() if existing_sl.data else {},
+                    data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(new_sl)
@@ -5835,7 +6000,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 if "cannot replace order" in error_msg or "42210000" in error_msg:
                     logger.warning(f"Cannot replace SL order {existing_sl.id} (error: {e}), creating PENDING_CANCEL order")
                     
-                    existing_sl.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_sl)
                     session.add(existing_sl)
                     
                     new_sl = TradingOrder(
@@ -5851,7 +6016,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         depends_on_order=existing_sl.id,
                         open_type=OrderOpenType.AUTOMATIC,
                         comment=f"SL order (pending cancel of {existing_sl.id})",
-                        data=existing_sl.data.copy() if existing_sl.data else {},
+                        data={k: v for k, v in (existing_sl.data or {}).items() if k != PENDING_CANCEL_SINCE_KEY},
                         created_at=datetime.now(timezone.utc)
                     )
                     session.add(new_sl)
@@ -5927,7 +6092,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     logger.warning(f"Cannot replace OCO order {existing_oco.id} (error: {e}), creating PENDING_CANCEL order")
                     
                     # Mark existing order as PENDING_CANCEL
-                    existing_oco.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(existing_oco)
                     session.add(existing_oco)
                     
                     # Validate TP/SL prices before creating replacement OCO order
@@ -5973,6 +6138,92 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error replacing broker OCO order: {e}", exc_info=True)
             return False
 
+    def _dividends_from_activities(self, raw_activities, raw_nra, symbol=None):
+        """The platform dividend records from the raw DIV and DIVNRA activities (shared by the lenient and the strict
+        read, so the two cannot disagree about the same activities)."""
+        # Build map of tax withholding by (symbol, date)
+        nra_map = {}
+        for nra in raw_nra:
+            nra_symbol = nra.get('symbol')
+            nra_date = nra.get('date') or nra.get('transaction_time')
+            if nra_symbol and nra_date:
+                nra_date_str = str(nra_date)[:10]  # Extract YYYY-MM-DD
+                key = (nra_symbol, nra_date_str)
+                nra_map[key] = nra_map.get(key, 0) + abs(float(nra.get('net_amount', 0) or 0))
+
+        dividends = []
+        for activity in raw_activities:
+            act_symbol = activity.get('symbol')
+            if symbol and act_symbol != symbol:
+                continue
+
+            date_str = activity.get('date') or activity.get('transaction_time')
+            try:
+                date_val = datetime.fromisoformat(str(date_str)) if date_str else None
+            except (ValueError, TypeError):
+                date_val = date_str
+
+            # Look up matching tax withholding
+            date_key = str(date_str)[:10] if date_str else None
+            tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
+
+            gross = float(activity.get('net_amount', 0) or 0)
+            div_record = {
+                # Alpaca stamps an id on every non-trade activity. It is the only
+                # thing that tells two DIV activities for one payer on one date
+                # apart (a special dividend alongside the regular one, a
+                # correction), so get_cash_transfers() keys the income ledger on
+                # it. Netting DIVNRA withholding into `amount` below is a separate
+                # concern and does not make the id any less the broker's.
+                'id': activity.get('id'),
+                'symbol': act_symbol,
+                'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
+                'gross_amount': gross,
+                'date': date_val,
+                'drip_quantity': None,
+                'drip_price': None,
+                'tax_withheld': tax_withheld,
+            }
+            dividends.append(div_record)
+        return dividends
+
+    #: Page size of the activities endpoint (its maximum) and a hard stop on the number of pages read.
+    ACTIVITIES_PAGE_SIZE = 100
+    ACTIVITIES_MAX_PAGES = 200
+
+    def _fetch_activities_strict(self, act_type: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """EVERY activity of one type in the window, paged (page_size 100, page_token = the last id), and RAISING on
+        any failure -- unlike ``_fetch_activities`` (one page, [] on failure). Raises ``RuntimeError`` if the page
+        limit is hit (ValueError), because a silently truncated history is not a history."""
+        query: Dict[str, Any] = dict(params or {})
+        query["page_size"] = self.ACTIVITIES_PAGE_SIZE
+        rows: List[Dict[str, Any]] = []
+        for _ in range(self.ACTIVITIES_MAX_PAGES):
+            raw = self.client.get(f"/account/activities/{act_type}", query)
+            page = raw if isinstance(raw, list) else ([raw] if raw else [])
+            rows.extend(page)
+            if len(page) < self.ACTIVITIES_PAGE_SIZE:
+                return rows
+            query["page_token"] = page[-1]["id"]
+        raise ValueError(f"{act_type} activities exceed {self.ACTIVITIES_MAX_PAGES} pages: the history is truncated")
+
+    def _require_client(self) -> None:
+        if not self._check_authentication():
+            raise ConnectionError(f"AlpacaAccount {self.id}: not authenticated with the broker")
+
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_dividends`` that RAISES instead of answering ``[]`` when the broker cannot be read (not
+        authenticated, DIV or DIVNRA fetch failed, ...) and reads EVERY page of activities. [] means no dividends."""
+        self._require_client()
+        params = {}
+        if start_date:
+            params["after"] = start_date.isoformat() if hasattr(start_date, 'isoformat') else str(start_date)
+        if end_date:
+            params["until"] = end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)
+        raw_activities = self._fetch_activities_strict("DIV", params)
+        raw_nra = self._fetch_activities_strict("DIVNRA", params)
+        return self._dividends_from_activities(raw_activities, raw_nra, symbol)
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
         """Get dividend history from Alpaca activities API."""
         if not self._check_authentication():
@@ -5999,50 +6250,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             except Exception:
                 raw_nra = []
 
-            # Build map of tax withholding by (symbol, date)
-            nra_map = {}
-            for nra in raw_nra:
-                nra_symbol = nra.get('symbol')
-                nra_date = nra.get('date') or nra.get('transaction_time')
-                if nra_symbol and nra_date:
-                    nra_date_str = str(nra_date)[:10]  # Extract YYYY-MM-DD
-                    key = (nra_symbol, nra_date_str)
-                    nra_map[key] = nra_map.get(key, 0) + abs(float(nra.get('net_amount', 0) or 0))
-
-            dividends = []
-            for activity in raw_activities:
-                act_symbol = activity.get('symbol')
-                if symbol and act_symbol != symbol:
-                    continue
-
-                date_str = activity.get('date') or activity.get('transaction_time')
-                try:
-                    date_val = datetime.fromisoformat(str(date_str)) if date_str else None
-                except (ValueError, TypeError):
-                    date_val = date_str
-
-                # Look up matching tax withholding
-                date_key = str(date_str)[:10] if date_str else None
-                tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
-
-                gross = float(activity.get('net_amount', 0) or 0)
-                div_record = {
-                    # Alpaca stamps an id on every non-trade activity. It is the only
-                    # thing that tells two DIV activities for one payer on one date
-                    # apart (a special dividend alongside the regular one, a
-                    # correction), so get_cash_transfers() keys the income ledger on
-                    # it. Netting DIVNRA withholding into `amount` below is a separate
-                    # concern and does not make the id any less the broker's.
-                    'id': activity.get('id'),
-                    'symbol': act_symbol,
-                    'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
-                    'gross_amount': gross,
-                    'date': date_val,
-                    'drip_quantity': None,
-                    'drip_price': None,
-                    'tax_withheld': tax_withheld,
-                }
-                dividends.append(div_record)
+            dividends = self._dividends_from_activities(raw_activities, raw_nra, symbol)
 
             logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend activities")
             return dividends
@@ -6051,83 +6259,97 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"[Account {self.id}] Error fetching dividends: {e}", exc_info=True)
             return []
 
+    def _balance_history_impl(self, start_date, end_date, fetch_activities, strict: bool):
+        """Portfolio history -> snapshots. ``fetch_activities`` reads the CSD/CSW transfers (lenient: one page, []
+        on failure; strict: every page, raising). ``strict`` also refuses a missing equity value instead of
+        reading it as 0."""
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+        params = {"timeframe": "1D", "period": "1A"}
+        if start_date:
+            params["start"] = start_date.strftime("%Y-%m-%d")
+            params.pop("period", None)  # start overrides period
+        if end_date:
+            params["end"] = end_date.strftime("%Y-%m-%d")
+
+        history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
+
+        # Fetch cash transfers (deposits/withdrawals) to compute actual daily P/L.
+        # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
+        # so we need to subtract transfer amounts from equity changes ourselves.
+        transfer_by_date = {}
+        for act_type in ['CSD', 'CSW']:
+            for act in fetch_activities(act_type):
+                act_date = str(act.get('date', ''))[:10]
+                amount = self._safe_float(act.get('net_amount'))
+                if amount is None:
+                    continue
+                transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
+
+        snapshots = []
+        timestamps = getattr(history, 'timestamp', []) or []
+        equity_values = getattr(history, 'equity', []) or []
+
+        # Build list of history dates for T+1 settlement shifting.
+        # Transfers settle T+1: activity on Oct 29 → equity change on Oct 30.
+        all_history_dates = []
+        for ts in timestamps:
+            d_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+            all_history_dates.append(d_obj.strftime('%Y-%m-%d'))
+
+        shifted_transfers = {}
+        for act_date, amount in transfer_by_date.items():
+            shifted = False
+            for hd in all_history_dates:
+                if hd > act_date:
+                    shifted_transfers[hd] = shifted_transfers.get(hd, 0.0) + amount
+                    shifted = True
+                    break
+            if not shifted:
+                shifted_transfers[act_date] = shifted_transfers.get(act_date, 0.0) + amount
+        transfer_by_date = shifted_transfers
+
+        prev_equity = None
+        for i, ts in enumerate(timestamps):
+            if strict and (i >= len(equity_values) or equity_values[i] is None):
+                raise ValueError(f"portfolio history has no equity for {ts}")
+            equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
+            date_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+            date_str = date_obj.strftime('%Y-%m-%d')
+
+            # Compute actual daily market P/L by subtracting transfers
+            if prev_equity is not None:
+                equity_change = equity - prev_equity
+                transfer = transfer_by_date.get(date_str, 0.0)
+                daily_pl = equity_change - transfer
+            else:
+                daily_pl = 0.0
+
+            snapshots.append({
+                'date': date_obj,
+                'net_liquidating_value': equity,
+                'cash_balance': 0.0,
+                'equity_value': equity,
+                'profit_loss': daily_pl,
+            })
+            prev_equity = equity
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
+        return snapshots
+
+    def get_balance_history_strict(self, start_date=None, end_date=None):
+        """``get_balance_history`` that RAISES when the portfolio history or the transfers cannot be read (the
+        lenient one answers [] or a transfer-blind history) and refuses a missing equity value."""
+        self._require_client()
+        return self._balance_history_impl(start_date, end_date, self._fetch_activities_strict, True)
+
     def get_balance_history(self, start_date=None, end_date=None):
         """Get portfolio history from Alpaca portfolio history API."""
         if not self._check_authentication():
             return []
 
         try:
-            from alpaca.trading.requests import GetPortfolioHistoryRequest
-
-            params = {"timeframe": "1D", "period": "1A"}
-            if start_date:
-                params["start"] = start_date.strftime("%Y-%m-%d")
-                params.pop("period", None)  # start overrides period
-            if end_date:
-                params["end"] = end_date.strftime("%Y-%m-%d")
-
-            history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
-
-            # Fetch cash transfers (deposits/withdrawals) to compute actual daily P/L.
-            # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
-            # so we need to subtract transfer amounts from equity changes ourselves.
-            transfer_by_date = {}
-            for act_type in ['CSD', 'CSW']:
-                for act in self._fetch_activities(act_type):
-                    act_date = str(act.get('date', ''))[:10]
-                    amount = self._safe_float(act.get('net_amount'))
-                    if amount is None:
-                        continue
-                    transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
-
-            snapshots = []
-            timestamps = getattr(history, 'timestamp', []) or []
-            equity_values = getattr(history, 'equity', []) or []
-
-            # Build list of history dates for T+1 settlement shifting.
-            # Transfers settle T+1: activity on Oct 29 → equity change on Oct 30.
-            all_history_dates = []
-            for ts in timestamps:
-                d_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
-                all_history_dates.append(d_obj.strftime('%Y-%m-%d'))
-
-            shifted_transfers = {}
-            for act_date, amount in transfer_by_date.items():
-                shifted = False
-                for hd in all_history_dates:
-                    if hd > act_date:
-                        shifted_transfers[hd] = shifted_transfers.get(hd, 0.0) + amount
-                        shifted = True
-                        break
-                if not shifted:
-                    shifted_transfers[act_date] = shifted_transfers.get(act_date, 0.0) + amount
-            transfer_by_date = shifted_transfers
-
-            prev_equity = None
-            for i, ts in enumerate(timestamps):
-                equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
-                date_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
-                date_str = date_obj.strftime('%Y-%m-%d')
-
-                # Compute actual daily market P/L by subtracting transfers
-                if prev_equity is not None:
-                    equity_change = equity - prev_equity
-                    transfer = transfer_by_date.get(date_str, 0.0)
-                    daily_pl = equity_change - transfer
-                else:
-                    daily_pl = 0.0
-
-                snapshots.append({
-                    'date': date_obj,
-                    'net_liquidating_value': equity,
-                    'cash_balance': 0.0,
-                    'equity_value': equity,
-                    'profit_loss': daily_pl,
-                })
-                prev_equity = equity
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
-            return snapshots
+            return self._balance_history_impl(start_date, end_date, self._fetch_activities, False)
 
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
@@ -6201,6 +6423,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             # (the Overview keeps its old rows on a failed fetch).
             logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
             raise
+
+    def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_filled_trades`` that RAISES when not authenticated (the lenient one answers []); a failed orders
+        fetch already raises there."""
+        self._require_client()
+        return self.get_filled_trades(symbol, start_date, end_date)
 
     # ======================================================================
     # OptionsAccountInterface — market data (chain / quote / ATM-IV)
@@ -6580,6 +6808,159 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return nearest.implied_volatility
 
     # ======================================================================
+    # IV rank from DERIVED ATM-IV history (BT/live statistic parity)
+    #
+    # ``OptionsAccountInterface._iv_series`` / ``get_iv_rank`` read the ~daily 16:30
+    # ``option_iv_snapshot`` rows (Alpaca snapshot IV, calls+puts nearest strike), a different
+    # statistic from the backtest's and with only days of history. Here the series comes from
+    # ``AtmIvHistoryProvider`` (Alpaca daily option bars inverted with the backtest's own
+    # Black-Scholes and ATM selection). Overridden HERE, not in the shared interface, so no
+    # package changes; see ``modules/dataproviders/options/atm_iv_history.py``.
+    # ======================================================================
+    #: minimum share of the window's sessions that must carry a value before a rank is served
+    IV_RANK_MIN_COVERAGE = 0.80
+
+    def _atm_iv_history(self):
+        p = getattr(self, "_atm_iv_history_provider", None)
+        if p is None:
+            from ..dataproviders.options.atm_iv_history import get_provider_for_credentials
+            from ba2_common.core.ohlcv_history import account_history_source
+            p = get_provider_for_credentials(self.settings["api_key"], self.settings["api_secret"],
+                                             bool(self.settings["paper_account"]),
+                                             history_source=account_history_source(self.settings))
+            self._atm_iv_history_provider = p
+        return p
+
+    def _snapshot_iv_by_session(self, underlying: str, start, end) -> Dict[Any, float]:
+        """The 16:30 snapshot rows as {New York session date: atm_iv} (latest row of a day)."""
+        from ba2_common.core.models import OptionIVSnapshot
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        lo = datetime(start.year, start.month, start.day, tzinfo=timezone.utc) - timedelta(days=1)
+        with get_db() as session:
+            rows = session.exec(
+                select(OptionIVSnapshot).where(
+                    OptionIVSnapshot.account_id == self.id,
+                    OptionIVSnapshot.underlying == underlying,
+                    OptionIVSnapshot.recorded_at >= lo)
+                .order_by(OptionIVSnapshot.recorded_at)).all()
+            pairs = [(r.recorded_at, r.atm_iv) for r in rows]
+        out: Dict[Any, float] = {}
+        for ts, iv in pairs:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            d = ts.astimezone(ny).date()
+            if start <= d <= end:
+                out[d] = iv
+        return out
+
+    def _iv_rank_state(self, underlying: str, lookback_days: Optional[int]) -> Dict[str, Any]:
+        """Series + current for the rank, from the STORE ONLY: this never calls the API. The
+        cache is filled earlier, inside the symbol's analysis task (``atm_iv_task_hook``).
+
+        Keys: ok (series complete), series (values strictly before the last completed session
+        L), current (derived IV of L), n/m (coverage of the series), status, provenance, reason."""
+        import math as _math
+        from ..dataproviders.options.atm_iv_history import STATUS_COMPLETE, merge_snapshots
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
+        state: Dict[str, Any] = {"ok": False, "series": [], "current": None, "n": 0, "m": 0,
+                                 "status": "unavailable", "provenance": {}, "reason": None,
+                                 "L": None, "resolved": 0, "need": 0}
+        try:
+            prov = self._atm_iv_history()
+            L = prov.last_completed_session()
+            res = prov.peek(underlying, L, lookback_days)
+            df = prov.read_store(underlying)
+            # a 'no_spot' row means "could not derive" -- a snapshot MAY fill that date; a bar
+            # tombstone (thin day) is a derived outcome and may not be back-filled
+            stored = ({ts.date() for ts, why in zip(df["session_date"], df["reason"]) if why != "no_spot"}
+                      if len(df) else set())
+            snaps = (self._snapshot_iv_by_session(underlying, res.window_start, L)
+                     if res.window_start is not None else {})
+            merged, provenance = merge_snapshots(res, snaps, stored)
+            series = {d: v for d, v in merged.items() if d < L}
+            tomb = [d for d in res.tombstone_days if d < L and d not in series]
+            m = max(res.expected - 1, 0)
+            resolved = len(series) + len(tomb)
+            state.update(status=res.status, reason=res.reason, series=list(series.values()),
+                         current=res.values.get(L), n=len(series), m=m, resolved=resolved,
+                         need=_math.ceil(self.IV_RANK_MIN_COVERAGE * m),
+                         provenance=provenance, L=L, ok=res.status == STATUS_COMPLETE)
+        except Exception as e:  # noqa: BLE001 -- fail closed, loudly (a gate reading None stays shut)
+            state["reason"] = f"{type(e).__name__}: {e}"
+            logger.warning(f"ATM-IV history unavailable for {underlying}: {state['reason']}")
+        return state
+
+    def _iv_series(self, underlying: str, lookback_days: Optional[int] = None):
+        """Trailing ATM-IV samples strictly before the last completed session: derived rows
+        first, 16:30 snapshots only for dates with no derived row. Empty unless the derived
+        series is complete (a filling series must not look like a short real one)."""
+        st = self._iv_rank_state(underlying, lookback_days)
+        return list(st["series"]) if st["ok"] else []
+
+    def iv_sample_count(self, underlying: str, lookback_days: Optional[int] = None) -> int:
+        """Readiness count from the STORE ONLY (the startup report must not start fills or
+        spend API calls). 0 unless ``get_iv_rank`` could actually serve a rank now (series
+        complete, resolved coverage met, a derived value for the last session), so the report
+        never says ARMED for a gate that cannot fire."""
+        st = self._iv_rank_state(underlying, lookback_days)
+        if not st["ok"] or st["resolved"] < st["need"] or st["current"] is None:
+            return 0
+        return int(st["n"])
+
+    #: symbol -> reason the latest ``get_iv_rank`` returned None (display only; one source with
+    #: the 'IV rank for X unavailable: ...' warning). Class-level dict shared by design: the
+    #: condition reads it right after the call on the same account object.
+    _iv_rank_reasons: Dict[str, str] = {}
+
+    def iv_rank_unavailable_reason(self, underlying: str) -> Optional[str]:
+        return self._iv_rank_reasons.get(underlying)
+
+    def get_iv_rank(self, underlying: str, lookback_days: Optional[int] = None,
+                    min_samples: int = 20, current: Optional[float] = None) -> Optional[float]:
+        """IV percentile of the LAST COMPLETED SESSION's derived ATM IV against the trailing
+        derived series (backtest parity: the BT ranks the as-of bar's IV against the sessions
+        before it). ``current`` may be supplied by a caller that holds one; it is NOT fetched
+        from the live snapshot any more.
+
+        None (gate false, exactly as 'IV rank unavailable') while the series is filling or
+        unavailable, when RESOLVED coverage (values + tombstones) is below 80% of the window's
+        sessions, when the last session has no derived value, or when fewer than ``min_samples``
+        usable values exist (the backtest's rule). Never a partial number. One warning per
+        symbol per day."""
+        import math as _m
+        from datetime import date as _date
+        from ..dataproviders.options.atm_iv_history import _warn_once_per_day
+        st = self._iv_rank_state(underlying, lookback_days)
+        today = _date.today()
+
+        self._iv_rank_reasons.pop(underlying, None)
+
+        def _none(why: str):
+            self._iv_rank_reasons[underlying] = why
+            _warn_once_per_day(f"ivrank:{self.id}:{underlying}",
+                               f"IV rank for {underlying} unavailable: {why}", today)
+            return None
+
+        if not st["ok"]:
+            if st["status"] == "filling":
+                return _none(f"ATM-IV history filling {st['n']}/{st['m']} (filled by the symbol's analysis task)")
+            return _none(f"ATM-IV history {st['status']} ({st['reason']})")
+        # RESOLVED coverage (value or tombstone) gates 'complete'; the sample floor is then the
+        # backtest's own: ``_iv_rank_from_series(min_samples)`` over the usable values.
+        if st["resolved"] < st["need"]:
+            return _none(f"resolved coverage {st['resolved']}/{st['m']} below the required {st['need']}")
+        cur = current if current is not None else st["current"]
+        if cur is None:
+            return _none(f"no derived ATM IV for the last completed session {st['L']}")
+        rank = self._iv_rank_from_series(st["series"], cur, min_samples)
+        if rank is None:
+            return _none(f"fewer than {min_samples} usable samples ({st['n']}/{st['m']}) or an "
+                         f"implausible current value")
+        return rank
+
+    # ======================================================================
     # OptionsAccountInterface — TEMPORARY stubs (replaced in later tasks)
     # ======================================================================
     @staticmethod
@@ -6728,7 +7109,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 req_kwargs["position_intent"] = intent
             if is_market:
                 return MarketOrderRequest(**req_kwargs)
-            return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+            return LimitOrderRequest(
+                limit_price=self._round_option_limit(trading_order.limit_price,
+                                                     up=leg.side == OrderDirection.BUY),
+                **req_kwargs)
 
         # Multi-leg (2-4 legs) -> MLEG
         leg_requests = [
@@ -6749,7 +7133,33 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         )
         if is_market:
             return MarketOrderRequest(**req_kwargs)
-        return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+        # +debit / -credit: conceding (paying more debit or taking less credit) is always UP.
+        return LimitOrderRequest(
+            limit_price=self._round_option_limit(trading_order.limit_price, up=True), **req_kwargs)
+
+    @staticmethod
+    def _round_option_limit(price, up: bool) -> float:
+        """An option limit on the cent grid Alpaca accepts (42210000 rejects 3+ decimals).
+
+        The indicative feed sometimes quotes 3 decimals (16.149), and the builders quote at
+        that touch. Rounding is towards the fill (``up`` for a buy or an MLEG net, down for a
+        single-leg sell) so the order keeps the touch it was quoted at, at most a cent away.
+        Unlike the equity ``_round_price`` there is no sub-penny tier below $1.
+
+        The price is first cut to 8 decimals: limits built by float arithmetic carry binary
+        residue (0.1 + 0.2 = 0.30000000000000004) that a ceiling would otherwise push a whole
+        cent away (0.31). A non-zero limit that would round to 0.00 (a sub-cent premium or
+        credit) is refused: a zero limit is a different order, not a rounding of this one.
+        """
+        if price is None:
+            raise ValueError("Option limit order has no limit price")
+        rounding = ROUND_CEILING if up else ROUND_FLOOR
+        rounded = float(Decimal(repr(round(price, 8))).quantize(Decimal("0.01"), rounding=rounding))
+        if rounded == 0.0 and price != 0.0:
+            raise ValueError(f"Option limit {price} is below one cent; refusing a 0.00 limit")
+        if rounded != price:
+            logger.info(f"Option limit {price} rounded {'up' if up else 'down'} to {rounded}")
+        return rounded
 
     @alpaca_api_retry
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
@@ -6764,6 +7174,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Genuine errors are allowed to propagate.
         """
         req = self._build_option_order_request(trading_order, legs)
+        if getattr(req, "limit_price", None) is not None:
+            trading_order.limit_price = float(req.limit_price)   # record the cent-rounded limit sent
         alpaca_order = self.client.submit_order(req)
         logger.info(
             f"Successfully submitted option order to Alpaca: "
@@ -7175,6 +7587,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if right == OptionRight.PUT and is_short:
                 # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
                 share_qty = 100.0 * contracts
+                # The delivered stock INHERITS the put's style-member tag (stage-2 E2), read
+                # BEFORE any ledger write, so a corrupt stored tag refuses the whole activity
+                # as a RETRYABLE ``unhandled:`` result (applied on a later pass once the row is
+                # repaired). Same fact, same shared stamp as the backtest's assignment
+                # (BacktestAccount._open_assigned_stock_transaction). Untagged -> no data.
+                stock_entry_data, refusal = self._member_tag_entry_data(opt_txn, "assigned put")
+                if refusal is not None:
+                    return refusal
                 now = datetime.now(timezone.utc)
                 equity_txn = Transaction(
                     symbol=underlying,
@@ -7197,7 +7617,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     transaction_id=equity_txn_id, symbol=underlying,
                     side=OrderDirection.BUY, shares=share_qty, price=strike,
                     contract=symbol, activity_id=activity_id, created_at=now,
-                    origin=TXN_ORIGIN_CSP_ASSIGNMENT)
+                    origin=TXN_ORIGIN_CSP_ASSIGNMENT, data=stock_entry_data)
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
                     close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
@@ -7212,6 +7632,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # SPLIT when it is bigger than the assignment (see _settle_called_away),
                 # never erased.
                 held = self._find_open_equity_long(underlying, expert_id)
+                # A partial call-away leaves a remainder lot that keeps the held lot's member
+                # tag (stage-2 E2). Read HERE, before the option leg or the lot is touched, so
+                # a corrupt stored tag is a retryable refusal rather than a half-applied split.
+                remainder_entry_data = None
+                if held is not None:
+                    remainder_entry_data, refusal = self._member_tag_entry_data(
+                        held, "called-away lot")
+                    if refusal is not None:
+                        return refusal
                 leg_note = self._settle_option_leg(
                     opt_txn, contract=symbol, contracts=contracts,
                     close_reason=OptionCloseReason.ASSIGNED.value, activity_id=activity_id,
@@ -7222,7 +7651,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     return self._settle_called_away(
                         held=held, underlying=underlying, contracts=contracts,
                         strike=strike, contract=symbol, activity_id=activity_id,
-                        leg_note=leg_note)
+                        leg_note=leg_note, remainder_entry_data=remainder_entry_data)
                 logger.warning(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
                     f"equity long found for {underlying} (expert {expert_id}).")
@@ -7464,7 +7893,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
     def _settle_called_away(self, *, held, underlying: str, contracts: float,
                             strike: float, contract: str, activity_id: str,
-                            leg_note: str = "closed short call txn") -> str:
+                            leg_note: str = "closed short call txn",
+                            remainder_entry_data: "Optional[dict]" = None) -> str:
         """Take the called-away shares off ONE equity lot, SPLITTING it when the lot is
         larger than the assignment.
 
@@ -7549,7 +7979,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if remainder_qty > 0.0:
             remainder_id = self._open_called_away_remainder(
                 held=held, underlying=underlying, remainder_qty=remainder_qty,
-                exit_qty=exit_qty, contract=contract, activity_id=activity_id)
+                exit_qty=exit_qty, contract=contract, activity_id=activity_id,
+                entry_data=remainder_entry_data)
             # The original row now describes ONLY the shares that left. Persisted by the
             # _close_txn below (update_instance writes the whole object).
             held.quantity = exit_qty
@@ -7580,7 +8011,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
     def _open_called_away_remainder(self, *, held, underlying: str, remainder_qty: float,
                                     exit_qty: float, contract: str,
-                                    activity_id: str) -> "Optional[int]":
+                                    activity_id: str,
+                                    entry_data: "Optional[dict]" = None) -> "Optional[int]":
         """Open the transaction that holds the shares a partial called-away LEFT BEHIND.
 
         It is the same position as before, only smaller: same symbol, side, cost basis,
@@ -7594,6 +8026,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         lot's own ``open_date``: this row stands in for the part of the original purchase
         that is still held, so ``DaysOpenedCondition``'s order-level fallback lands on the
         same date as the transaction's ``open_date``.
+
+        ``entry_data``: the lot's style-member tag for the remainder's entry row (stage-2 E2),
+        read by the caller BEFORE the split starts (``_member_tag_entry_data``). None -> no data,
+        as before.
         """
         from ...core.types import TransactionStatus
 
@@ -7624,7 +8060,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             comment=(f"called_away_remainder: {remainder_qty:g} of {held.symbol} kept "
                      f"after {exit_qty:g} were called away by {contract} (broker activity "
                      f"{activity_id}) — the un-called part of transaction {held.id}, "
-                     f"synthetic fill, no broker order exists"))
+                     f"synthetic fill, no broker order exists"),
+            data=entry_data)
         if entry_id is None:
             # Without the order row the remaining shares exist only as a Transaction, and
             # every share count in the platform reads orders. Say so: the split is still
@@ -7644,7 +8081,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     def _record_assignment_equity_order(self, *, transaction_id, symbol: str, side,
                                         shares: float, price, contract: str,
                                         activity_id: str, created_at, origin: str,
-                                        comment: "Optional[str]" = None) -> "Optional[int]":
+                                        comment: "Optional[str]" = None,
+                                        data: "Optional[dict]" = None) -> "Optional[int]":
         """Persist the equity ``TradingOrder`` that an option ASSIGNMENT produced.
 
         WHY THIS ROW MUST EXIST. Almost nothing in the platform reads share counts off
@@ -7655,11 +8093,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             input to covered-call / protective-put sizing. Assigned stock with no order
             row sizes to 0 contracts, so the wheel's second leg never gets written.
           * ``TradeManager``'s open-positions pass resolves ``existing_order`` as the
-            oldest FILLED order on the transaction matching its side, and hands it to
-            every condition. With no such order ``DaysOpenedCondition`` /
-            ``ProfitLossAmountCondition`` / ``ProfitLossPercentCondition`` all return
-            False unconditionally, and ``CloseAction`` falls through to its legacy
-            broker-position branch, whose order is NOT linked to the transaction — so
+            transaction's first-written root order (``entry_order.oldest_entry_order``,
+            shared with the backtest) and hands it to every condition. With no such
+            order the pass refuses the symbol (``EntryOrderUnresolved``): evaluated
+            against None, ``DaysOpenedCondition`` / ``ProfitLossAmountCondition`` /
+            ``ProfitLossPercentCondition`` would all return False unconditionally, and
+            ``CloseAction`` would fall through to its legacy broker-position branch,
+            whose order is NOT linked to the transaction — so
             ``has_pending_closing_order`` never sees it and a close is re-submitted every
             cycle.
 
@@ -7694,6 +8134,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         The closing (called-away) side additionally carries ``depends_on_order`` = the
         transaction's entry order, so it can never be mistaken for the entry by the
         oldest-first resolution in ``TradeManager`` / ``has_pending_closing_order``.
+
+        ``data``: an ENTRY row's facts -- the style-member tag the delivered stock inherits
+        (``assignment_hold.assigned_stock_entry_data``, stage-2 E2). None (every untagged
+        position, i.e. every row on record) writes no data, exactly as before.
 
         IDEMPOTENCY is the caller's: this runs inside ``reconcile_option_assignments``'s
         ``OptionActivity(account_id, activity_id)`` guard, so a repeated 7-day-lookback
@@ -7731,12 +8175,47 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                          f"{price} (broker activity {activity_id}) — synthetic fill, "
                          f"no broker order exists"),
                 created_at=created_at,
+                data=data,
             ))
         except Exception as e:
             logger.error(
                 f"[Account {self.id}] Failed to record {origin} equity order for "
                 f"{symbol} (activity {activity_id}): {e}", exc_info=True)
             return None
+
+    def _member_tag_entry_data(self, transaction, what: str) -> "tuple":
+        """``(entry data, None)`` carrying ``transaction``'s style-member tag for an assignment's
+        stock entry row -- or ``(None, refusal)`` when the stored tag is corrupt.
+
+        The refusal is an ``unhandled: ...`` result WITHOUT the ``exception:`` prefix, which
+        ``reconcile_option_assignments`` retries on a later pass: the caller returns it before
+        any ledger write, so nothing is half-applied and the activity is re-tried once the
+        order row is repaired (stage-2 E2 review M1)."""
+        try:
+            return assigned_stock_entry_data(self._position_entry_tag(transaction)), None
+        except ValueError as e:
+            logger.error(
+                f"[Account {self.id}] {what} (transaction {getattr(transaction, 'id', None)}): "
+                f"its entry order carries an unreadable style-member entry_tag ({e}); refusing "
+                f"the activity before any ledger write -- it is retried once the row is fixed.")
+            return None, f"unhandled: unreadable entry_tag on the {what}: {e}"
+
+    def _position_entry_tag(self, transaction) -> "Optional[int]":
+        """The style-member tag of ``transaction``'s position, or None (stage-2 E2).
+
+        Read off the row the live OPEN_POSITIONS pass hands ``EntryTagCondition`` as
+        ``existing_order`` (``TradeManager.resolve_entry_order``), so the tag an assignment
+        passes on is by construction the one that position's rules were scoped by. A stored
+        value no entry could have written raises (``order_entry_tag``) instead of reading as
+        untagged.
+        """
+        if transaction is None:
+            return None
+        from ...core.TradeManager import resolve_entry_order
+
+        with get_db() as session:
+            entry = resolve_entry_order(session, transaction)
+            return order_entry_tag(entry) if entry is not None else None
 
     def _entry_order_id_for_transaction(self, transaction_id: int) -> "Optional[int]":
         """Id of the transaction's oldest entry-level order (``depends_on_order IS NULL``)."""

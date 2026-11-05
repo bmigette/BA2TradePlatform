@@ -196,12 +196,24 @@ def test_screen_stocks_empty_response(mock_get, provider):
 
 @patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_api_error(mock_get, provider):
-    """API errors should return empty list, not raise."""
+    """A vendor outage must raise ScreenerDataError naming the cause, never read as 0 candidates."""
+    from ba2_providers.StockScreener import ScreenerDataError
     mock_get.side_effect = requests.RequestException("Connection error")
 
-    results = provider.screen_stocks({"price_min": 1.0})
+    with pytest.raises(ScreenerDataError, match="RequestException.*Connection error"):
+        provider.screen_stocks({"price_min": 1.0})
 
-    assert results == []
+
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
+def test_screen_stocks_non_list_body_raises(mock_get, provider):
+    """FMP answers a rate limit / plan error with HTTP 200 and a dict body."""
+    from ba2_providers.StockScreener import ScreenerDataError
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"Error Message": "Limit Reach."}
+    mock_get.return_value = mock_response
+
+    with pytest.raises(ScreenerDataError, match="Limit Reach"):
+        provider.screen_stocks({"price_min": 1.0})
 
 
 @patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
@@ -237,15 +249,17 @@ def test_screen_stocks_market_cap_filters(mock_get, provider):
     params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
     assert params["marketCapMoreThan"] == 10000000
     assert params["marketCapLowerThan"] == 500000000
-    assert params["volumeMoreThan"] == 1000000
+    assert params["avgVolumeMoreThan"] == 1000000   # AVERAGE volume, not the session-so-far volumeMoreThan
+    assert "volumeMoreThan" not in params
 
 
 def test_screen_stocks_no_api_key():
-    """Screening without API key should return empty list."""
+    """Screening without an API key must raise, not return an empty list."""
     with patch(
         "ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.get_app_setting",
         return_value=None,
     ):
         p = FMPScreenerProvider()
-        results = p.screen_stocks({"price_min": 1.0})
-        assert results == []
+        from ba2_providers.StockScreener import ScreenerDataError
+        with pytest.raises(ScreenerDataError, match="FMP_API_KEY"):
+            p.screen_stocks({"price_min": 1.0})

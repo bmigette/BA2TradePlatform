@@ -31,6 +31,7 @@ Run from the backend dir:
 from __future__ import annotations
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 import importlib.util
 import os
 import sys
@@ -296,7 +297,7 @@ def _harness(*, entry_rules, exit_rules, entry_action, account_id):
               "seed": 42, "entry_action": entry_action, "hold_assigned_stock": True}
     engine = DailyBacktestEngine(
         account=account, experts=[(expert, account_id, expert.settings, enter_id)],
-        price_source=ps, config=config, indicator_provider=None)
+        price_source=ps, config=config, indicator_provider=NoAtrIndicatorProvider())
     return engine, account, ctx
 
 

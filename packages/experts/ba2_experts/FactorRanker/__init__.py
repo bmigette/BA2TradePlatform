@@ -18,7 +18,9 @@ from ba2_common.core.interfaces.ExpertDataExportInterface import (
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
-from ba2_providers.StockScreener import StockScreener
+from ba2_common.core.knowability import scan_cutoff_date
+from ba2_providers.StockScreener import ScreenerDataError, StockScreener
+from ba2_providers.screener.metric_store import MetricStoreStaleError
 from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
 from ba2_common.logger import get_expert_logger
@@ -438,7 +440,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         Default (``screener_store`` unset): runs the configured ``StockScreener``,
         reading the expert's ``screener_*`` settings (part of the base interface) and
         returning the matched symbols (uppercased). Failures degrade to an empty
-        universe rather than raising, so one bad screen doesn't crash the rebalance.
+        universe rather than raising, so one bad screen doesn't crash the rebalance --
+        EXCEPT a LIVE (as_of None) ``ScreenerDataError`` (FMP data could not be fetched),
+        which propagates so the analysis fails with the reason.
 
         ``as_of`` is threaded into both paths so the BACKTEST screens the point-in-time
         universe for that date (the store resolves to the latest scan date <= as_of;
@@ -460,7 +464,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             try:
                 from ba2_providers.screener import metric_store as ms  # local import (opt-in)
                 df = ms.load_store(store)
-                day = (as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+                # the scan VISIBLE at the decision (an intraday backtest clock: every session dated
+                # <= the scan finished at it; live / daily clock: the as_of date, unchanged)
+                day = scan_cutoff_date(as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
                 # PER-RUN exclusion (not a persisted expert setting -- pushed onto this trial's
                 # settings dict by strategy_optimization_handler._build_daily_trial_config from
                 # the launcher's --exclude-symbols / optimization_config.backtest.
@@ -483,6 +489,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                     f"(store={store}, as_of={day})"
                 )
                 return syms
+            except MetricStoreStaleError:
+                raise  # a window past the store's end must fail loudly, never fall back silently
             except Exception as e:
                 self.logger.warning(
                     f"FactorRanker: metric_store universe resolution failed ({e}); "
@@ -508,6 +516,11 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             raise
         except Exception as e:
             self.logger.error(f"FactorRanker: screener universe resolution failed: {e}", exc_info=True)
+            if as_of is None and isinstance(e, ScreenerDataError):
+                # LIVE ONLY: a data-fetch failure is not "the filters matched nothing". Let the
+                # analysis fail visibly with the reason instead of a silent empty universe.
+                # Backtests (as_of set) keep the degrade-to-empty behaviour byte-for-byte.
+                raise
             return []
 
     def _resolve_universe_source(self) -> str:
@@ -685,7 +698,10 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             import pandas as pd
             from ba2_providers.screener import metric_store as ms
             df = ms.load_store(store)
-            rows = ms.metrics_as_of(df, as_of.strftime("%Y-%m-%d"), ["momentum_12_1", "close"])
+            rows = ms.metrics_as_of(df, scan_cutoff_date(as_of).strftime("%Y-%m-%d"),
+                                  ["momentum_12_1", "close"])
+        except MetricStoreStaleError:
+            raise  # stale store: fail loudly (the OHLCV fallback would hide it)
         except Exception:  # noqa: BLE001 — any store issue -> safe OHLCV fallback
             return None, None
         if not rows or not all(s in rows for s in universe):
@@ -722,7 +738,7 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         # Thread it into every OHLCV-using fetcher so the daily closes are sliced from
         # memory instead of re-reading + re-parsing the parquet on every analysis bar.
         # On the LIVE path ``providers.ohlcv()`` is the plain FMP provider, so behaviour
-        # is unchanged; the fetchers fall back to ``FMPOHLCVProvider()`` if it is None.
+        # is unchanged; the fetchers fall back to the live registry provider if it is None (refused with an as_of).
         ohlcv_provider = providers.ohlcv()
 
         universe = self._resolve_universe(as_of)

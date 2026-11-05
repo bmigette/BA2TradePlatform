@@ -1,0 +1,333 @@
+# Option Grid Stage 2: 2-3 Style Experts on the Full Large-Cap Universe (Plan)
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or subagent-driven-development)
+> to implement the build tasks task-by-task. Nothing here launches until the user says so.
+
+**Goal:** 2-3 deployable option experts, each a composition of the structures of ONE trading style.
+Each expert is searched on the FULL large-cap universe with the market-condition gates on, and seeded
+from the stage-1 (and LEAPS-grid) winners.
+
+**Status (2026-09-25):**
+
+- **Configured, not built.** Stage 1 (`-st1fix`, relaunched 2026-09-25 04:32Z on dev `3b3465c8`) is
+  running on the 97-name universe.
+- **Seeding is decided after stage 1:** the user will adjust it once the stage-1 results are in.
+- **Design source:** `docs/superpowers/specs/2026-08-27-option-ga-grid-design.md` §5 "Stage 2 ·
+  Composition" and §7 / §7.1 (the build list and what does not exist yet). This plan layers the
+  decisions taken since then on top of that spec.
+
+---
+
+## 0. Stage-1 review and the stage-2 job set (user-approved 2026-10-24)
+
+Evidence: `reports/stage1_review_2026-10-24/` holds three reports.
+- `A_genome_convergence.md`: which genes converged.
+- `B_trades_regimes.md`: trades, SPY regimes, correlations and blends.
+- `C_ruleset_capabilities.md`: what the ruleset layer and `O_STYLE` can express.
+
+All of it comes from the stage-1 `-st1fix` TOP1 rows in the local test DB (opt 117-133 since the
+2026-10-24 merge; DeterministicScorer, 97 names, 2020-2025, $20k).
+
+### 0.1 What stage 1 says
+
+1. **Five return engines; the rest is carry.**
+
+   | Structure | CAR | Max DD | Where it earns |
+   |---|---|---|---|
+   | O_LC | 109% | -41% | calm uptrend; 2022: -28% |
+   | O_BULLCS | 66% | -34% | uptrend and pullback; 2022: +3% |
+   | O_STRG | 66% | -39% | DOWN, PULLBACK and vol shocks; 2020 crash +129%, 2022 +31% |
+   | O_BF | 53% | -29% | uptrend with expanding vol |
+   | O_STRD | 42% | -25% | DOWN and PULLBACK; 2022 +38% |
+
+   CSP, WHEEL, CC, PP, RS, JL, IC, BULLPS and VERT make 4-32%/yr. WHEEL, CC and PP track SPY
+   (daily correlation 0.80, 0.75 and 0.36). The PP option legs lose money.
+2. **Regime switching is justified.**
+   - No pair of TOP1 monthly-return series correlates above 0.57.
+   - An equal-weight daily blend of LC+BULLCS+BF+STRG gives about 84%/yr at -15% DD, against
+     LC alone at 109% / -41%. That blend is not a shared-capital expert, but it bounds what
+     regime routing can gain.
+3. **Entries are decided by market-condition gates, not by the DS signal.** Only O_LC needs DS
+   bullishness.
+   - The most used gate is the 5d/20d realised-vol ratio: calm (< 1.25-1.5) for LC, BULLPS,
+     RS and STRD; expanding (> 1 for BF, > 1.5 for STRG).
+   - Then 50d slope, swing structure, distance to support/resistance and ADX: IC < 15,
+     STRD > 30.
+   - **Every gate reads the underlying only. Nothing reads the market (SPY)**, yet the SPY
+     trend x vol regime is what separates the engines (B §2).
+4. **All of stage 1 is mid-term.**
+   - Median hold is 17-56 days and p90 is at most 67; nothing goes past 90 days.
+   - DTE genes were pinned at the range maximum for BULLCS (60), STRD (55) and JL (50), and at
+     the minimum (20) for the WHEEL put.
+   - There is no short-term evidence. The long term needs stage 1.5: O_LEAP (opt 1) is at 75%
+     with best 19.19, against O_LC's 25.5.
+5. **Caveats.**
+   - **Compounding:** O_LC's +8,160% is mostly size growth (88% of its dollar P&L comes from
+     2024-25). Its best trade is +$151k on 40 cheap LRCX calls, with liquidity not modelled.
+   - **Concentration:** the top-5 underlyings make 41-75% of P&L in every strategy.
+   - **Assignment cost:** stock taken on assignment and sold 3 days later costs 70% of the JL
+     credit.
+   - **Dead genes everywhere:** `k_stop`, `k_target`, `atr_*`, `min_stop_loss_pct`,
+     `regime_*`, `risk_per_trade_pct` and the weekend `schedule:*` genes.
+
+### 0.2 The stage-2 job set (one style expert per HORIZON, members routed by regime)
+
+Each job is an `O_STYLE` expert (§3 item 1). Members are ordered (first passing rule wins) and
+their regime gates are disjoint. That is required: a refused action does NOT fall through to the
+next member (`TradeActionEvaluator.py:446-500`). One job per horizon also avoids the "same
+structure key twice" limit of the style loader.
+
+**A. MID: 30-90 DTE, about 3-8 week holds. The main job, built first.** Members in priority order:
+
+| # | Member | Regime (gates) | Structure / exits (seed from stage 1) |
+|---|---|---|---|
+| 1 | O_STRG, then O_STRD | vol shock or down market: stock 5d/20d RV > about 1.5, OR SPY below SMA200 with SMA50 falling | long strangle / straddle, 30-60 DTE |
+| 2 | O_BULLCS | pullback in an uptrend: SPY above SMA200, stock slope > 0, near support, iv_rank < 30 | debit call spread, 45-90 DTE, TP +100-125% |
+| 3 | O_BF | uptrend, vol expanding: bull swing structure, RV ratio > 1 | call butterfly, 25-45 DTE, TP +100% |
+| 4 | O_LC | calm uptrend with a bullish DS: confidence > 50, RV ratio < 1.25, SPY trend UP | long call, 30-60 DTE, TP +75% |
+
+The GA searches each member's thresholds and toggles, seeded from the stage-1 TOP genomes. The
+seeding rule is still a §5 decision.
+
+**B. SHORT: 7-21 DTE. Pilot first, no evidence yet.**
+- Single-structure jobs O_LC, O_BULLCS and O_STRG at DTE 7-21, with fast exits: time exit after
+  5-10 days, TP +50-100%.
+- A short style expert only if those hold up.
+- The fill model is weakest here: daily bars, constant parquet spreads, no real quotes.
+
+**C. LONG: 90-365+ DTE. After stage 1.5.** Members are O_LEAP, O_PMCC, O_CONVEX and O_BULLCS at
+90-180 DTE; membership is settled from the 1.5 results.
+
+**Premium / carry styles are dropped from stage 2** (user goal: high risk/reward). They are low CAR
+and partly SPY beta. They may return later as a separate low-DD carry job.
+
+### 0.3 Changes common to every stage-2 job
+
+1. **A SPY (benchmark) regime gate**: SPY trend (above/below SMA200, SMA50 slope) and SPY
+   realised vol, read point-in-time from the prior session. Today's gates only observe the
+   instrument (C §3). It is built on its own branch (2026-10-24 go: "implement spy regime if
+   needed") and merged at a job boundary.
+2. No stock-price caps; sizing on worst-case risk; the option RM on (§3 item 9). Per-instrument
+   cap ranges per §3 item 8.
+3. Widen the DTE ranges that pinned at their bound (per horizon above). Drop the dead genes of
+   0.1 item 5.
+4. Fitness with an equity cap (`--equity-cap`), so compounding into illiquid sizes is not rewarded.
+5. The 753-name universe (the §1 table and the universe decision); measure the cost in the §4
+   pilot.
+6. **Live decision time 09:45** (user 2026-11-02, "9h45 or 50"). Option grids run on the daily
+   clock (decide on D's close, fill at D+1's open), so the GA has no time gene; the deployed
+   instances fire at 09:45, not 09:30, for both entry and position management. Reason: at
+   09:30-09:34 option chains came back empty (8082: APH 10-15/10-20, BHP 10-20) and the opening
+   spread is the day's widest. `tools/import_deploy_payload.py` writes 09:45 for every daily-clock
+   payload (`DAILY_CLOCK_LIVE_TIME`, branch `fix/option-live-0945`); the 8082 instances 3-11 were
+   moved to 09:45 the same day.
+7. **Seeding job C** (user 2026-11-02): no DeterministicScorer re-runs of the stage-1.5 FMPRating
+   jobs (O_LEAP/O_PMCC/O_CBS). Seed with each FMPRating winner's structure genes plus the DS expert
+   genes of the closest DS result (convex-DS opt 143, or stage-1 DS O_LC/O_BULLCS); the GA
+   re-optimizes everything. The seeding tool must support that graft.
+
+### 0.4 Order (user 2026-10-24)
+
+1. Now: this section; the SPY regime gate on a branch (TDD).
+2. **Wait for stage 1.5 to finish**, then finalize the member lists (C needs it) and implement
+   the drivers (§3 items 2-3: seeding and `--profile style`).
+3. Pilots: B's single-structure short jobs, plus A's cost and option-RM pilot (§4, §3 item 9).
+4. Launch A, then B's style if the pilots hold up, then C.
+
+---
+
+## 1. Decisions already taken (do not re-litigate)
+
+| Topic | Decision | Source |
+|---|---|---|
+| Shape | **2-3 STYLE experts, NOT one composition** (user, 2026-09-25, overriding spec §5's single `OS_ALL` job). Each expert is a composition of the structures of one style, e.g. **short-term** directional, **mid-term**, **LEAPS / convex**, **pure premium** (credit/income). The final grouping is decided after stage 1 AND the LEAPS grid. Within an expert there is no survival gate: every structure of that style is a member, and stage-1 results only seed it. | user 2026-09-25; spec §5 |
+| Universe | **Full large-cap universe, `tools/options_universe_large_cap.txt` (820 names)**, not the 97-name `options_universe_top100.txt`. Stage 1 finds the structures on 97 names; stage 2 composes them on everything. | user, 2026-09-25 |
+| Market conditions | ON, both profiles (`ohlcv-v1,ta-structure-v1`), pinned manifests REBUILT for the 820-name universe. | user, 2026-09-23 ("keep in stage 1, we'll see at the end") + 2026-09-25 |
+| Engine | dev `3b3465c8` or later: split-basis lots + re-key, daily stepping while holding, fixed DD refinement, structure-level concentration, ledger checks, close by transaction id. | engine-fix plan 2026-09-24 |
+| Stage-1 option flags, carried over | `option_size_within_fill_volume` ON; `option_min_one_contract` ON for every cost-sized structure except O_CONVEX*; `option_entry_cross` gene 0.75-1.0; `rel_volume` gene ≤ 1.5; debit IV/RV floor ≥ 1.0; DeterministicScorer `macro_short_side="mirror"` on option jobs. | user decisions 2026-09-24 |
+| Fitness | `option_car_target_soft30`, robust ON (concentration on structures, share lots joined with overlays). | stage 1 |
+| Expert | **DeterministicScorer only** (user 2026-11-02: FMPRating has no bearish signal on large caps; the stage-1.5 FMPRating O_PBS was stopped and its convex arm dropped). | stage 1; user 2026-11-02 |
+| Bearish members | O_LP / O_BEARCS stay members like everything else (no survival gate). The stage-1 "hold puts if no viable genome by ~gen 10" rule governs STAGE 1 only. | user, 2026-09-24 |
+| Window | 2020-01-01..2025-12-31 (the same as stage 1). | stage 1 |
+| Capital | $20k account, virtual equity 100%. | spec §6 |
+| Deploy / forward test | The 8082 forward test keeps running until a better setting exists. Tag every deployed backtest `ForwardTest`. Check concentration (top1/top5) before any deploy. | user; memory |
+
+## 2. Data prerequisites (check before building the manifests)
+
+Measured 2026-09-25:
+
+- **ThetaData option cache:** 819 of the 820 names locally AND on remote227
+  (`/home/debian/ba2-grid/home/common/cache/ThetaDataOptionsProvider`, 18 GB). Expiries run
+  2020-01-03 .. 2026-09-11. Identify the one missing symbol, then fetch it or drop it.
+- **FMP daily OHLCV:** 820 of 820 locally and on remote227.
+- **Still to check:**
+  1. **Split-basis preflight across all 820.** The stage-1 repairs (CRWD refetch, META←FB root,
+     HON/NVS/SCCO overrides) covered only the 97 names. Run the split-calendar preflight and the
+     `option_basis_guard` sample over all 820. Repair (refetch/override) or explicitly exclude every
+     name the guard refuses. Never exclude silently: record the reason per name.
+  2. **DeterministicScorer inputs for 820:** the fundamentals, statements and macro inputs the DS
+     sections read, as-of and cache-only, 2020-2025. Count the misses per section.
+  3. **Screener gate store** (`--screener-gate-store`, the metric_store) covers the 820 names over the
+     window.
+  4. **Dead chains:** SHEL, TTE, SAN, SMFG, MUFG and UBS had empty or illiquid chains in stage 1
+     (O_LP diagnosis). Measure chain liquidity per name over 820. Keep them (the gates and the
+     fill-volume sizing handle illiquidity), but report the count.
+- **Market-condition manifests for 820:** `tools/warm_market_conditions.py plan/build/verify/
+  prepare-host`, per profile, for the 820-name universe and the stage window.
+  - Build on the LOCAL box and sync to remote227 (user, 2026-09-23: fetch/build locally, sync).
+  - Record both new digests here.
+  - The 97-name digests `ca4d65d4…` / `2b6e8ca8…` stay for stage 1.
+  - **DONE 2026-09-26: built and verified for the 753-name stage-2 universe**, and both synced to
+    remote227. The universe is 820 names minus 67 recorded exclusions (user decision).
+    - `ohlcv-v1`: `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd`
+    - `ta-structure-v1`: `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e`
+
+## 3. What has to be built (from spec §7 / §7.1, still open)
+
+1. **Style groups, 2-3 of them** (e.g. `OS_SHORT`, `OS_MID`, `OS_LONG` for LEAPS/convex,
+   `OS_PREMIUM`), each carrying the structures of one style; the membership is decided after stage 1
+   and the LEAPS grid. Candidate split, to confirm then:
+   - **short-term directional (debit):** O_LC, O_LP, O_VERT, O_BULLCS, O_BF, at short DTE;
+   - **mid-term:** the same directional families at longer DTE, O_STRD/O_STRG;
+   - **LEAPS / convex:** O_LEAPC, O_LEAPP, O_PMCC, O_CONVEX*;
+   - **pure premium (credit / income):** O_CSP, O_BULLPS, O_BEARCS, O_IC, O_JL, O_RS, O_WHEEL, O_CC.
+
+   What spec §7.1 says about `OS_ALL` applies to each style group:
+   - It must inherit `hold_assigned_stock` (the wheel member).
+   - Per-member exits: today exit condition ids (`tp`, `td`, `dte`, `sl`) are unprefixed, so
+     per-member exits cannot be expressed, and `_option_exit_rules(kind)` would give DEBIT members
+     CREDIT bands because it keys on the group.
+   - Fix/replace the two live tests that assert the opposite (e.g. O_CSP/O_JL/O_RS in no group).
+   - Measure each group's real genome with `collect_param_space` first. The spec's ~240 was for ALL
+     structures; each style group is smaller.
+2. **Multi-source cross-job seeding:** `warmStartFromOptimizationId` is a single int. Stage 2 needs
+   N sources merged.
+   - `genetic.py` fills absent genes with `config['min']`, so an `enabled` toggle would seed to 0
+     and the seeded individual would trade nothing. Seeding must set each seeded member's toggle
+     ON and leave un-seeded members at their authored defaults.
+   - The key translation per member (`cond:o_lc-…` → the member-prefixed id in OS_ALL, and the
+     `shared-*` ids) must be explicit. `encode_params` drops unknown keys silently.
+   - **Seeding policy is decided after stage 1 (user).** Build the mechanism with the policy as
+     input: which jobs, which ranks (distinct TOP-N), per-member or per-job, narrowing ranges
+     around seeds (spec §8.1).
+3. **Stage-2 driver entry:** `run_options_matrix.py --profile composition` (or a
+   `tools/stage2_run.sh` mirroring `stage1_run.sh`).
+   - It carries every stage-1 flag in §1, the 820-name universe file, the new manifests, and the
+     seeds.
+   - The job name digest covers the universe, the manifests, the flags and the seed set, so a
+     re-run can never resume a different configuration.
+4. **Wheel / overlay composition checks** in the premium group: the covered-call guard, the assigned-stock
+   hold, and the share-lot + overlay concentration grouping.
+5. **Per-year and concentration report** at the end: per-year returns (2020 and 2022 especially) and
+   top1/top5 concentration on structures. The soft30 consistency floor is ×0.25, so a single good
+   year can carry a score.
+6. **Asymmetric iron condor** (user, 2026-10-15). `OpenIronCondorAction` places the put and call
+   short strikes at the SAME `option_strike_param` %OTM, with the SAME `option_wing_width_pct`. That
+   is a simplification: put skew makes the put side richer, so the best condor often sits farther
+   out on the put side than on the call side.
+   - Add separate put/call genes (`option_strike_param_put` / `_call`, and the same split for the
+     wing): 2 more genes per condor member.
+   - Keep the symmetric pair as the default, so a stage-1 O_IC seed still decodes.
+   - Mirror the split in the live builder (one shared action, BT = live) and in `option_reserve_required` /
+     `_downsize_to_delivery_capacity`: the width is the wider of the two wings.
+   - Stage 1 (`-joint-rules1` O_IC, relaunched 2026-10-15) stays symmetric. Do not change a running
+     job.
+7. **Neutral entry arms share their gate genes** (accepted for stage 1, 2026-10-15; revisit here).
+   Under `--neutral-entry-modes joint`, O_IC/O_STRD/O_STRG carry two entry rules: a HOLD arm (no
+   expected-profit gate, since a HOLD's expected profit is 0) and a low-confidence arm. They share
+   every other gate id (`iv_rank`, `iv_rv`, `rel_volume`, market-condition gates): only `signal` and
+   `low_confidence` are split. That is sound while the gates describe the premium environment
+   (the same question whichever signal fired). If a stage-1 winner keeps BOTH arms on, consider
+   per-arm gate ids in stage 2 so each arm can learn its own thresholds.
+8. **Per-instrument cap ranges** (user, 2026-10-13: "leave as is for phase 1 but remember to adjust
+   for phase 2"). Before launch, narrow `_OPTION_RM_OVERRIDE`
+   (`max_virtual_equity_per_instrument_percent`, 5..50 step 5 in stage 1) per structure:
+   - debit structures (long call/put, verticals, butterfly, straddle/strangle): about 5..25;
+   - keep 50 only for the full-collateral ones (wheel, CSP, jade lizard, ratio spread).
+
+   Stage 1 picked 45-50 because a high cap costs the fitness nothing, and one-contract entries
+   reached 36% of equity (TSLA 2020-07). Also owed: the cap checks only the NEW ticket
+   (`_size_by_cost`), not the exposure already open on the same underlying. Propose the ranges to
+   the user; do not change the stage-1 jobs or the 8082 instances.
+9. **No stock-price caps; bound by risk only** (user, 2026-10-24: "for stage 2 we need to remove this
+   and stick on the risk. For example it's ok to buy more expensive stock on long calls because we
+   just risk premium paid"). Stage 1 gated entries with the screener `price_max` per strategy
+   (`screener_gate_base` in `_OPTION_STRATS`, `testplatform/ba2test_launcher.py`): $100 for O_CSP,
+   O_WHEEL, O_JL and O_RS, $300 for O_SSTG/O_SSTD, none for the rest. Stage 2 drops every
+   `price_max` and lets sizing decide. A $500 stock is fine for a long call (the risk is the
+   premium) and is refused for a cash-secured put only when one contract's risk does not fit.
+   Before launch, check that each structure's sizing cost is its real worst-case risk:
+   - debit structures: the premium paid (already so);
+   - credit spreads / condors: the wing width minus the credit;
+   - CSP / wheel / ratio spread / jade lizard: the assignment notional (strike x 100 minus the
+     credit), not the premium. Otherwise an uncapped $500 name would size as if it were cheap.
+
+   `_size_by_cost` (`ba2_common/core/TradeActions.py`) sizes `floor(min(sizing budget,
+   per-instrument cap) / cost_per_contract)`. The `min_one_contract` floor still needs the
+   per-instrument cap and the room left on that underlying. So with the §3.8 cap ranges this is
+   the risk bound. Test it: one contract of a high-priced name is refused when its risk is
+   above the cap, and taken when it fits. Live parity: deployed full-collateral instances then
+   need no `screener_price_max` either.
+
+   **Turn the option risk manager on** (user, 2026-10-24). Set `risk_manager_mode =
+   classic_options` (`ba2_common/core/OptionRiskManagement.py`, one implementation for live and
+   backtest) on the stage-2 expert specs. A spec key, `risk_manager_mode`, is plumbed by the
+   launcher but selected by no shipped spec. Stage 1 never ran with it, so its rails become the
+   portfolio-level risk bound that the price cap used to approximate:
+   - `max_deployment_pct`: share of sleeve equity committed;
+   - `max_notional_leverage`;
+   - `undefined_risk_max_pct`: sub-cap on undefined-risk structures;
+   - `max_concurrent_structures`, plus one structure per underlying;
+   - `circuit_breaker_pct`: sleeve drawdown breaker; its latch gates entries in both runtimes.
+
+   Every required rail must be declared (an expert missing one is refused). Fix them first, then
+   search at most a few (e.g. `max_deployment_pct`, `circuit_breaker_pct`). The rest is not worth
+   their population cost.
+   - Update `test_no_shipped_expert_spec_selects_a_risk_manager_mode` deliberately.
+   - PILOT it in the §4 pilot: count the entries the RM refuses, and check that it does not
+     strangle the book (zero trades scores 0 and the GA can't tell why).
+   - Compare one stage-1 winner re-run with the RM on and off before trusting the rails.
+   - Deploying a stage-2 winner then needs the same rails on the 8082 instance.
+
+**Assignment-capacity rule changed mid stage 1 (dev 5a3fcc5c, 2026-10-15).** A long put of the same
+expiry now nets a short put down to the wing width; before, the full short strike was charged.
+O_BULLPS (opt 20) and every earlier stage-1 put-spread result ran under the OLD rule. Re-run them
+before using them as stage-2 seeds, or seed only from jobs run on `2183554d` or later.
+
+## 4. Cost estimate (to be MEASURED in a pilot before launch)
+
+- **Stage 1 on 97 names:** about 110-130 min/generation at 28 slots on remote227. Gen 1 of `-st1fix`
+  O_LC took about 130 min.
+- **Per-trial cost scales with symbols:** chain reads and IV/greeks are 40-75% of a trial. So 820
+  names are roughly 8× per trial, before the composition's extra members.
+- **Rough order** (pop ~300, gens ≤80, patience 10): about 11 batches of 28 per generation × ~20+ min
+  = several hours per generation, so **1-3 weeks per style job**. The 2-3 jobs run one after another
+  on remote227, or split across hosts. That is feasible, but it must be measured.
+- **The pilot:** 1 generation, pop 28, 2023-2025 window, on remote227 while stage 1 runs (or at a
+  stage-1 job boundary). Measure trial time, peak RSS per slot, and the shared-array/preload
+  footprint for 820 names.
+  - The 2020 ThetaData tree OOM'd at 20 slots for 98 names on 2026-09-14 before the shared arrays
+    landed. Size `--parallel` from the measured RSS.
+- **If it is infeasible, the fallback (user decides):** the 200-300 most option-liquid names from
+  the 820, or stage 2 on the 97 names plus validation of the winner on all 820.
+
+## 5. Open decisions (for the user, after stage 1)
+
+1. **Seeding policy:** which stage-1 jobs/ranks seed which members, and whether to narrow gene
+   ranges around seeds.
+2. **Style grouping and membership** (after stage 1 + the LEAPS grid), then the population and
+   generations per group after measuring each genome (spec reference for all structures: 300 / 80 /
+   patience 10).
+3. **Experts:** DECIDED 2026-11-02: DeterministicScorer only (see §1).
+4. **Universe fallback** if the pilot says 820 is too slow.
+5. **Deploy route** for the stage-2 winner (8082 forward test first).
+
+## 6. Order of work
+
+1. Now, in parallel with stage 1, on the local box: §2 data preflight (split basis, DS inputs,
+   screener store, the missing ThetaData name) and the 820-name market-condition manifests (build
+   locally, sync, record the digests).
+2. Now, in a worktree: the §3 builds 1-4 with TDD, including the seeding MECHANISM with the policy
+   as input.
+3. At a stage-1 job boundary: the §4 pilot on remote227.
+4. After stage 1: the user sets the seeding policy and the §5 decisions, then launch.

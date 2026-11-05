@@ -102,3 +102,48 @@ def test_happy_path_layers_persisted_fixed_settings_under_live_optimization_sett
         assert params["profit_ratio"] == 1.2
     finally:
         db.close()
+
+
+def _opt_linked(db, account_settings):
+    strat = Strategy(name=f"export-member-hold-{len(account_settings)}", entry_rules=[],
+                     exit_rules=[])
+    db.add(strat); db.commit(); db.refresh(strat)
+    opt = StrategyOptimization(
+        strategy_id=strat.id, name="export-member-hold-opt",
+        fitness_metric="sharpe", optimization_type="genetic",
+        optimization_config={"backtest": {
+            "backtest_id": 1, "enabled_instruments": ["AAPL"],
+            "experts": [{"class": "FMPRating", "settings": {}}],
+            "account_settings": account_settings, "warmup_days": 30, "seed": 42}},
+        all_results=[], best_params={}, best_fitness=1.0, status="completed",
+    )
+    db.add(opt); db.commit(); db.refresh(opt)
+    return _backtest(optimization_id=opt.id, strategy_params={"model:profit_ratio": 1.2})
+
+
+def test_a_member_scoped_hold_run_is_REFUSED_for_export_not_stated_as_False():
+    """Stage-2 E2 review I1: live cannot express a per-member hold (it never sells assigned
+    stock), so exporting ``hold_assigned_stock: False`` for such a run would describe a
+    different run. The export refuses, naming the setting."""
+    from fastapi import HTTPException
+
+    db = SessionLocal()
+    try:
+        bt = _opt_linked(db, {"hold_assigned_stock": False, "hold_assigned_stock_tags": [7]})
+        with pytest.raises(HTTPException) as exc:
+            _derive_export_payload(bt, "expert_settings", db=db)
+        assert exc.value.status_code == 409
+        assert "hold_assigned_stock_tags" in str(exc.value.detail)
+    finally:
+        db.close()
+
+
+def test_a_run_without_the_member_scoped_hold_exports_it_as_None():
+    db = SessionLocal()
+    try:
+        bt = _opt_linked(db, {"hold_assigned_stock": True})
+        payload = _derive_export_payload(bt, "expert_settings", db=db)
+        assert payload["backtest_only"]["hold_assigned_stock"] is True
+        assert payload["backtest_only"]["hold_assigned_stock_tags"] is None
+    finally:
+        db.close()

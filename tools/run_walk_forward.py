@@ -22,6 +22,8 @@ The optimize args go after ``--`` and must NOT contain --start/--end/--name:
   --dry-run            print the plan, the exact commands and names; run nothing
   --only-fold K        run fold K only (no overall verdict)
   --skip-train         the train jobs must already be completed; steps 2-4 only
+  --chain-seed         fold k+1 starts from fold k's final population (stored GA state)
+  --pass-require-fold Y   test year Y's fold winner must pass (repeatable)
   --test-parallel P    out-of-sample re-runs at a time (default 1; ~14 GB RAM each)
   --min-trade-rows / --min-return-rel-pct / --min-dd-pts / --min-trades-rel-pct
                        the persist_distinct_topn selection knobs (same defaults as that tool)
@@ -108,6 +110,36 @@ class RealRunner:
                 f"(or use a new --prefix) so exactly one remains.")
         return bool(rows) and rows[0][1] == "completed"
 
+    def seed_lineage(self, name: str) -> Optional[str]:
+        """The seed source this job RECORDED (``optimization_config.seededFrom.name``), or None for
+        a cold start. Read back so the chain can prove a seed was applied, not just requested."""
+        self._tool()
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
+        try:
+            rows = db.query(SO.optimization_config).filter(SO.name == name).all()
+        finally:
+            db.close()
+        if len(rows) != 1:
+            raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
+        return ((rows[0][0] or {}).get("seededFrom") or {}).get("name")
+
+    def train_identity(self, name: str) -> dict:
+        """Optimization id + completion time of the (single) job of this name: a stored fold report
+        is only trusted while these still match (a retrained job gets a new id/time)."""
+        rows = self._opts_named(name)
+        if len(rows) != 1:
+            raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
+        try:
+            done = db.query(SO.completed_at).filter(SO.id == rows[0][0]).scalar()
+        finally:
+            db.close()
+        return {"id": rows[0][0], "completed_at": done.isoformat() if done else None}
+
     def run_train(self, cmd: List[str], name: str) -> None:
         stale = self._opts_named(name)
         if stale:
@@ -169,17 +201,17 @@ class RealRunner:
         return WF.OosMetrics(backtest_id=row[0], total_return=row[6], max_drawdown=row[7],
                              trades=row[8], reused=reused)
 
-    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         # Standalone re-runs bypass the GA's logging suppression (10x+ slower), as in
         # tools/run_genome_once.py. The caller's level is restored afterwards.
         prior = logging.root.manager.disable
         logging.disable(logging.WARNING)
         try:
-            return self._run_oos(train_name, fold, picks, name_prefix, labels, parallel)
+            return self._run_oos(train_name, fold, picks, name_prefix, labels, parallel, data_args)
         finally:
             logging.disable(prior)
 
-    def _run_oos(self, train_name, fold, picks, name_prefix, labels, parallel):
+    def _run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
         P = self._tool()
         L = self._launcher
         from app.models.database import SessionLocal
@@ -217,12 +249,15 @@ class RealRunner:
             except P.Refused as e:
                 raise WF.WalkForwardError(str(e)) from e
         self._rerun_chunks(todo, parallel, L, opt_id, expert, name_prefix, labels, window,
-                           names, train_name, out)
+                           names, train_name, out, data_args=data_args)
         return out
 
     def _rerun_chunks(self, todo, parallel, L, opt_id, expert, name_prefix, labels, window,
-                      names, train_name, out):
+                      names, train_name, out, data_args=None):
+        """``data_args``: the CURRENT optimize command (two-phase walk-forward) -- its data choices
+        replace the train job's stored ones for the test (``_rebase_run_data``); None keeps them."""
         from app.models.database import SessionLocal
+        rebase = L._data_rebase_from_optimize_args(data_args) if data_args else None
         for i in range(0, len(todo), parallel):
             chunk = todo[i:i + parallel]
             ids: List[tuple] = []
@@ -230,7 +265,7 @@ class RealRunner:
                 opt_id, expert, n=len(chunk), parallel=parallel,
                 candidates=[(p.params, p.key, p.fitness) for p in chunk],
                 ranks=[p.rank for p in chunk], name_prefix=name_prefix, extra_labels=list(labels),
-                use_remote_workers=False, persisted_ids=ids, window=window)
+                use_remote_workers=False, persisted_ids=ids, window=window, data_rebase=rebase)
             db = SessionLocal()
             try:
                 got = {rank: bid for rank, bid in ids}
@@ -274,8 +309,18 @@ def _parse(argv: Sequence[str]):
     ap.add_argument("--pass-min-oos-return", type=float, required=True,
                     help="percent: the fold's TOTAL out-of-sample return over its test window "
                          "(NOT annualised; mind the window length)")
+    ap.add_argument("--pass-min-oos-return-exclusive", action="store_true",
+                    help="strict: a fold passes only if its OOS return is ABOVE the threshold "
+                         "(default: at or above)")
     ap.add_argument("--pass-max-dd-mult", type=float, required=True)
     ap.add_argument("--pass-min-folds", type=int, required=True)
+    ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
+                    help="A test year whose fold winner MUST pass (repeatable), on top of "
+                         "--pass-min-folds.")
+    ap.add_argument("--chain-seed", action="store_true",
+                    help="Seed fold k+1 from fold k's FINAL population (ba2-test optimize "
+                         "--chain-seed-from <previous fold's job>); refused on a gene-space "
+                         "mismatch or look-ahead. Off by default: each fold is a cold start.")
     ap.add_argument("--test-parallel", type=_positive_int, default=1)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--only-fold", type=_positive_int)
@@ -330,7 +375,8 @@ def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
             a.prefix, _folds_from_args(a), opt_args, _launcher_path(a), a.top_n,
             WF.Thresholds(a.pass_min_oos_return, a.pass_max_dd_mult, a.pass_min_folds),
             test_parallel=a.test_parallel, skip_train=a.skip_train, only_fold=a.only_fold,
-            embargo_days=a.embargo_days, selection=selection)
+            embargo_days=a.embargo_days, selection=selection, seed_chain=a.chain_seed,
+            require_test_years=a.pass_require_fold, exclusive_return=a.pass_min_oos_return_exclusive)
         runner = runner or RealRunner(a)
         # Option-holdout rail, REUSED unchanged: refuse a fold whose TRAIN window reaches 2026
         # for a pure-option strategy BEFORE any run (the launcher would refuse it mid-run).

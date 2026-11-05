@@ -39,6 +39,7 @@ Run from the backend dir:
 from __future__ import annotations
 
 from tests.backtest._spread_cfg import LEGACY_ZERO_SPREAD as _LEGACY_ZERO_SPREAD
+from tests.backtest._no_atr import NoAtrIndicatorProvider
 import importlib.util
 import os
 import sys
@@ -260,11 +261,11 @@ def _harness(*, entry_rules, exit_rules, account_id):
               "seed": 42}
     engine = DailyBacktestEngine(
         account=account, experts=[(expert, account_id, expert.settings, enter_id)],
-        # None, not object(): this run goes through the CLASSIC RM (an equity entry), and
-        # ``_ensure_safeguard_stop`` always attempts an ATR lookup with ``use_atr_stop`` on.
-        # ``get_latest_atr`` treats None as the documented no-ATR-available path; a bare
-        # ``object()`` raises inside the sizing pass and every candidate is silently dropped.
-        price_source=ps, config=config, indicator_provider=None)
+        # The no-ATR stub, not object() and not None: this run goes through the CLASSIC RM (an
+        # equity entry), and ``_ensure_safeguard_stop`` always attempts an ATR lookup with
+        # ``use_atr_stop`` on. A bare ``object()`` raises inside the sizing pass (every candidate
+        # silently dropped); None makes the engine build the REAL FMP-backed provider.
+        price_source=ps, config=config, indicator_provider=NoAtrIndicatorProvider())
     return engine, account, ctx
 
 

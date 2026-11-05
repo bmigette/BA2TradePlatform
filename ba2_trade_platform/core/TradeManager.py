@@ -30,7 +30,29 @@ _REFRESH_LOCK = threading.Lock()
 # TradeManager._publish_market_regime). SPY: the classifier in ba2_common.core.market_regime was
 # measured on it, and the backtest uses the same symbol so live and simulated agree.
 _REGIME_BENCHMARK = "SPY"
-_LIVE_REGIME_CACHE = {"day": None, "stressed": None}
+_LIVE_REGIME_CACHE = {"day": None, "stressed": None, "retry_after": None, "failures": 0}
+
+# How long a FAILED classification waits before the next attempt. A failure is never cached for
+# the day: until 2026-10-07 one failed SPY fetch (a single WARNING) left every overlay-enabled
+# expert trading at neutral scales until the next calendar day. The data provider already retries
+# the HTTP call itself; this spaces the attempts of a refresh loop that runs many times a day.
+_REGIME_RETRY_SECONDS = 300
+
+# SPY benchmark regime for the ``spy-trend`` / ``spy-vol`` entry gates (TradeManager._publish_benchmark_regime).
+# ``session`` is the newest FINISHED session whose regime is cached (NOT a calendar day: after the 16:00
+# close the key changes and the new close is picked up the same evening); ``retry_after``/``failures``
+# mirror _LIVE_REGIME_CACHE; ``failure`` is the reason the last attempt published nothing usable;
+# ``feed_warned_day`` is the day the source-consistency WARNING last fired.
+_BENCHMARK_REGIME_CACHE = {"session": None, "regime": None, "retry_after": None, "failures": 0,
+                           "failure": None, "feed_warned_day": None}
+#: Calendar days of SPY daily history to fetch (~825 sessions, above the 524 the vol axis needs).
+_BENCHMARK_LOOKBACK_DAYS = 1200
+
+
+def _reset_benchmark_regime_cache() -> None:
+    """Forget the cached regime / failure / warning day (tests, and a clean start)."""
+    _BENCHMARK_REGIME_CACHE.update({"session": None, "regime": None, "retry_after": None,
+                                    "failures": 0, "failure": None, "feed_warned_day": None})
 
 # Wash-trade lock lifetime. A lock is a WAIT, and a wait that outlives its signal is a
 # deadlock: an entry blocked by a protective stop on an open position can never clear on
@@ -51,9 +73,9 @@ _WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
 _STRANDED_ENTRY_GRACE_MINUTES = 5.0
 
 
-def classify_waiting_trigger(parent_status, trigger_status):
+def classify_waiting_trigger(parent_status, trigger_status, parent_filled_qty=None):
     """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
-    status and the configured trigger status.
+    status, the configured trigger status and how much the parent filled.
 
     Returns one of:
         "submit" - parent reached the trigger status; submit the dependent now
@@ -93,6 +115,13 @@ def classify_waiting_trigger(parent_status, trigger_status):
     # auto-submit was ever intended (see test_no_trigger_status_waits), and this branch must
     # not quietly override that contract.
     if trigger_status is not None and parent_status == OrderStatus.FILLED:
+        return "submit"
+    # A parent that ended CANCELED/EXPIRED after a PARTIAL fill still traded those shares, and
+    # its fill-triggered exit is what protects them. 2026-10-29 RAPP (dev account 1): entry
+    # 1438 filled 34 of 35 and was cancelled; its staged OCO was cancelled with it and the 34
+    # shares sat with no stop. The caller sizes the exit to the filled quantity.
+    if (trigger_status == OrderStatus.FILLED and parent_filled_qty
+            and parent_filled_qty > 0 and parent_status in OrderStatus.get_terminal_statuses()):
         return "submit"
     if parent_status in OrderStatus.get_terminal_statuses():
         return "cancel"
@@ -177,50 +206,38 @@ def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> b
     return available_qty < required_qty
 
 
-def rebase_price_to_fill(target_price, reference_price, fill_price):
-    """Re-scale a TP/SL target that was computed off a pre-fill reference so it keeps
-    the same proportional distance from the order's ACTUAL fill.
-
-    new = fill * (target / reference)
-
-    Sign-agnostic (works for stops below and targets above) and a no-op when the
-    reference already equals the fill. Returns target_price unchanged if any input
-    is missing or the reference is non-positive.
-    """
-    if not target_price or not reference_price or not fill_price or reference_price <= 0:
-        return target_price
-    return round(fill_price * (target_price / reference_price), 4)
+# The re-base rules live in ba2_common (shared with the backtest). rebase_price_to_fill is
+# re-exported here because it has long been importable from TradeManager.
+from ba2_common.core.tpsl_fill_rebase import (  # noqa: E402,F401
+    read_anchor, rebase_levels_at_fill, rebase_price_to_fill, stamp_anchor)
 
 
 def resolve_entry_order(session, transaction):
-    """The transaction's ENTRY order: its oldest FILLED order on the transaction's own side.
+    """The transaction's ENTRY order: its first-written ROOT order (no ``depends_on_order``,
+    no ``parent_order_id``), by UTC ``created_at`` then id, any status.
 
-    This single row is what the open-positions pass hands to every condition as
-    ``existing_order``, and a surprising amount hangs off it being found:
-    ``DaysOpenedCondition``, ``ProfitLossAmountCondition`` and
-    ``ProfitLossPercentCondition`` each return False unconditionally without one, and
-    ``CloseAction`` only takes its ``close_transaction()`` path (the one that links the
-    close back to the transaction, so ``has_pending_closing_order`` can see it) when the
-    order carries a ``transaction_id``. A position whose shares arrived without an order
-    row — an option assignment used to be exactly that — is therefore unmanageable and
-    silently so. Extracted from ``process_open_positions_recommendations`` so that
-    property is directly testable.
+    ONE definition, shared with the backtest (``BacktestAccount._entry_order_for_transaction``):
+    ``ba2_common.core.entry_order.entry_order_for_transaction`` (plan 2026-09-25
+    option-stage2-build, Task 8 review I1). It is the row every entry path writes its facts and
+    its style-member tag onto (a combo's PARENT, never a leg child), so the tag an assignment
+    passes on (``AlpacaAccount._position_entry_tag``) and the tag the exits compare
+    (``entry_order.oldest_entry_order``) are read off the same row. It replaced "the oldest
+    FILLED order on the transaction's side", which is the same row on every normal position.
+
+    A surprising amount hangs off this row being found: ``DaysOpenedCondition``,
+    ``ProfitLossAmountCondition`` and ``ProfitLossPercentCondition`` each return False
+    unconditionally without one, and ``CloseAction`` only takes its ``close_transaction()``
+    path (the one that links the close back to the transaction, so
+    ``has_pending_closing_order`` can see it) when the order carries a ``transaction_id``. A
+    position whose shares arrived without an order row — an option assignment used to be
+    exactly that — is therefore unmanageable; the open-positions pass refuses it by name
+    (``EntryOrderUnresolved``).
     """
-    from sqlmodel import select
+    from ba2_common.core.entry_order import entry_order_for_transaction
 
     if transaction is None:
         return None
-    stmt = (
-        select(TradingOrder)
-        .where(
-            TradingOrder.transaction_id == transaction.id,
-            TradingOrder.side == transaction.side,
-            TradingOrder.status == OrderStatus.FILLED
-        )
-        .order_by(TradingOrder.created_at.asc())
-        .limit(1)
-    )
-    return session.exec(stmt).first()
+    return entry_order_for_transaction(transaction.id, session=session)
 
 
 class TradeManager:
@@ -254,43 +271,237 @@ class TradeManager:
         overlay-enabled genome behaves identically in a backtest and in production — the whole
         point of keeping the classifier in ``ba2_common``.
 
-        Cached per day because the classifier's inputs are DAILY closes: re-fetching 3 years of
-        SPY on every refresh (which runs many times a day) would buy nothing.
+        A SUCCESSFUL classification is cached for the day, because its inputs are DAILY closes:
+        re-fetching 3 years of SPY on every refresh (which runs many times a day) buys nothing.
 
-        A failure publishes ``None`` = "unclassified" = neutral scales, i.e. exactly today's
-        behaviour. That is safe in LIVE (never trade off a guessed regime); the loud-failure
-        stance belongs in the backtest, where a silently-neutral overlay would waste a grid.
+        A FAILED one is NOT cached. It publishes ``None`` = "unclassified" = neutral scales (never
+        trade off a guessed regime), logs an ERROR -- an overlay-enabled expert is then sizing
+        without its regime scale, which is not the strategy that was backtested -- and is retried
+        on the next refresh once ``_REGIME_RETRY_SECONDS`` have passed, until it succeeds.
+        "Failed" covers an exception, no bars, and a classifier that could not answer (too few
+        closes): the last used to read as "not stressed" with no trace at all.
         """
         from datetime import datetime, timedelta, timezone
 
-        from ba2_common.core.market_regime import is_stressed
+        from ba2_common.core.market_regime import STRESSED, classify_volatility_regime
         from ba2_common.core.regime_overlay import set_stressed
 
-        today = datetime.now(timezone.utc).date()
-        if _LIVE_REGIME_CACHE["day"] != today:
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        retry_after = _LIVE_REGIME_CACHE["retry_after"]
+        if _LIVE_REGIME_CACHE["day"] != today and (retry_after is None or now >= retry_after):
             stressed = None
+            failure = None
             try:
                 from ba2_providers import get_provider
                 # 1200 calendar days ~= 825 sessions, comfortably above the 524 daily closes
                 # (20 vol window + 504 rank lookback) the classifier needs before it will answer.
                 df = get_provider("ohlcv", "fmp").get_ohlcv_data(
                     _REGIME_BENCHMARK,
-                    start_date=datetime.now(timezone.utc) - timedelta(days=1200),
-                    end_date=datetime.now(timezone.utc),
+                    start_date=now - timedelta(days=1200),
+                    end_date=now,
                     interval="1d",
                 )
-                if df is not None and len(df):
-                    stressed = is_stressed([c for c in df["Close"].tolist() if c is not None])
+                if df is None or not len(df):
+                    failure = f"no {_REGIME_BENCHMARK} daily bars returned"
                 else:
-                    self.logger.warning(
-                        f"Market regime: no {_REGIME_BENCHMARK} daily bars returned")
-            except Exception as e:  # noqa: BLE001 -- regime is advisory; never block a refresh
-                self.logger.warning(f"Market regime unavailable ({type(e).__name__}: {e})")
-            _LIVE_REGIME_CACHE["day"] = today
-            _LIVE_REGIME_CACHE["stressed"] = stressed
-            self.logger.info(f"Market regime for {today}: stressed={stressed}")
+                    closes = [c for c in df["Close"].tolist() if c is not None]
+                    verdict = classify_volatility_regime(closes)
+                    if verdict["regime"] is None:
+                        failure = (f"classifier could not answer on {len(closes)} "
+                                   f"{_REGIME_BENCHMARK} closes ({verdict['reason']})")
+                    else:
+                        stressed = verdict["regime"] == STRESSED
+            except Exception as e:  # noqa: BLE001 -- the regime must never block a refresh
+                failure = f"{type(e).__name__}: {e}"
+                self.logger.error(f"Market regime fetch failed: {failure}", exc_info=True)
+
+            if failure is None:
+                _LIVE_REGIME_CACHE.update(
+                    {"day": today, "stressed": stressed, "retry_after": None, "failures": 0})
+                self.logger.info(f"Market regime for {today}: stressed={stressed}")
+            else:
+                _LIVE_REGIME_CACHE["failures"] += 1
+                _LIVE_REGIME_CACHE["stressed"] = None
+                _LIVE_REGIME_CACHE["retry_after"] = now + timedelta(seconds=_REGIME_RETRY_SECONDS)
+                self.logger.error(
+                    f"Market regime for {today} is UNCLASSIFIED (attempt "
+                    f"{_LIVE_REGIME_CACHE['failures']}: {failure}). Experts with the regime "
+                    f"overlay enabled trade at NEUTRAL scales until it is classified; retrying "
+                    f"in {_REGIME_RETRY_SECONDS}s.")
 
         set_stressed(_LIVE_REGIME_CACHE["stressed"])
+
+    def _benchmark_regime_needed(self) -> bool:
+        """True when some ENABLED expert's entry or exit ruleset carries a ``spy_trend_regime`` /
+        ``spy_vol_regime`` leaf. A platform with no gated ruleset makes no SPY provider call."""
+        from ba2_common.core.market_condition_live import benchmark_leaves_in_ruleset
+
+        for expert in get_all_instances(ExpertInstance):
+            if not expert.enabled:
+                continue
+            for ruleset_id in (expert.enter_market_ruleset_id, expert.open_positions_ruleset_id):
+                if ruleset_id is not None and benchmark_leaves_in_ruleset(ruleset_id):
+                    return True
+        return False
+
+    def _fetch_benchmark_daily(self, now):
+        """``(dates, closes)`` of SPY DAILY bars up to ``now`` from the history provider.
+
+        FMP, deliberately: owner decision 2026-10-24 -- the SPY regime reads the same source as the
+        stock price, which is FMP on all three live instances. (The provider may include a partial
+        TODAY bar after the open; ``knowable_closes`` drops it.)"""
+        from datetime import timedelta
+
+        import pandas as pd
+        from ba2_providers import get_provider
+
+        df = get_provider("ohlcv", "fmp").get_ohlcv_data(
+            _REGIME_BENCHMARK,
+            start_date=now - timedelta(days=_BENCHMARK_LOOKBACK_DAYS),
+            end_date=now,
+            interval="1d",
+        )
+        if df is None or not len(df):
+            return [], []
+        return ([pd.Timestamp(d).date() for d in df["Date"].tolist()],
+                [None if pd.isna(c) else float(c) for c in df["Close"].tolist()])
+
+    def _warn_benchmark_source_mismatch(self, today) -> None:
+        """WARNING (never a refusal), once per day: the SPY regime reads FMP, so an Alpaca account that
+        trades with a stored ``data_feed`` other than ``fmp`` prices its stocks from a different source
+        than the regime the gate decides on. Unset = the declared default (``delayed_sip``)."""
+        if _BENCHMARK_REGIME_CACHE["feed_warned_day"] == today:
+            return
+        from sqlmodel import select
+
+        from .db import get_db
+        from .models import AccountDefinition, AccountSetting
+
+        from ..modules.accounts.AlpacaAccount import AlpacaAccount
+
+        default_feed = AlpacaAccount.get_settings_definitions()["data_feed"]["default"]
+        with get_db() as session:
+            feeds = {s.account_id: s.value_str for s in session.exec(
+                select(AccountSetting).where(AccountSetting.key == "data_feed")).all()}
+        trading_accounts = {e.account_id for e in get_all_instances(ExpertInstance) if e.enabled}
+        mismatched = []
+        for account in get_all_instances(AccountDefinition):
+            if account.provider != "AlpacaAccount" or account.id not in trading_accounts:
+                continue
+            feed = (feeds.get(account.id) or default_feed).lower()
+            if feed != "fmp":
+                mismatched.append(f"{account.name} (id {account.id}) prices from {feed}")
+        _BENCHMARK_REGIME_CACHE["feed_warned_day"] = today
+        if mismatched:
+            self.logger.warning(
+                "SPY regime reads FMP but " + "; ".join(mismatched) + ". The SPY regime gates classify FMP "
+                "daily closes while these accounts price stocks from another feed; set the account's "
+                "data_feed to fmp so live decides on the data the backtest assumed.")
+
+    def _publish_benchmark_regime(self, now=None) -> None:
+        """Publish the SPY trend/vol regime from FINISHED sessions on the ``benchmark_regime`` seam.
+
+        Live counterpart of the backtest engine's per-bar ``set_benchmark_regime(calendar.at(...))``: the
+        SAME ``classify_benchmark_regime`` the calendar is asserted equal to, fed the closes of finished
+        sessions only (``knowable_closes`` drops a partial TODAY bar), so a live decision sees exactly
+        the last close the backtest's decision at that instant would.
+
+        Cached under the newest FINISHED session (not the calendar day) on success only. A FAILURE
+        (exception, no bars, nothing finished, calendar outage, data more than one session stale)
+        publishes NOTHING usable -- ``None`` plus a reason the gate reports -- logs an ERROR, and is
+        retried once ``_REGIME_RETRY_SECONDS`` have passed. The gate then reads ``no_regime`` and never
+        passes, which is loud, not silent. Never raises into the caller: an entry/exit pass must go on.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from ba2_common.core import benchmark_regime as br
+        from ba2_common.core.market_calendar import regular_session_close_utc, regular_session_dates
+
+        cache = _BENCHMARK_REGIME_CACHE
+        now = datetime.now(timezone.utc) if now is None else now
+        try:
+            if not self._benchmark_regime_needed():
+                br.reset_benchmark_regime()
+                return
+        except Exception as e:  # noqa: BLE001 -- detection must never block a pass
+            self.logger.error(f"Benchmark regime: could not tell whether a ruleset needs it ({e}); "
+                              f"publishing nothing", exc_info=True)
+            br.set_benchmark_regime(None)
+            br.set_benchmark_regime_failure(f"{type(e).__name__}: {e}")
+            return
+        try:
+            self._warn_benchmark_source_mismatch(now.date())
+        except Exception as e:  # noqa: BLE001 -- a diagnostic, never a blocker
+            self.logger.warning(f"Benchmark regime: source-consistency check failed: {e}")
+
+        failure = None
+        lagged = False
+        regime = None
+        newest = None
+        try:
+            sessions = regular_session_dates(now.date() - timedelta(days=12), now.date())
+            finished = [d for d in sessions if regular_session_close_utc(d) <= now]
+            if len(finished) < 2:
+                raise RuntimeError(f"no finished NYSE session found before {now.isoformat()}")
+            newest, previous = finished[-1], finished[-2]
+
+            if cache["session"] == newest and cache["regime"] is not None:
+                br.set_benchmark_regime(cache["regime"])
+                br.set_benchmark_regime_failure(None)
+                return
+            if cache["retry_after"] is not None and now < cache["retry_after"]:
+                # inside the retry window: no fetch; republish what the last attempt left (a lagged
+                # regime stays published; a failure stays None plus its reason)
+                br.set_benchmark_regime(cache["regime"] if cache["failure"] is None else None)
+                br.set_benchmark_regime_failure(cache["failure"])
+                return
+
+            dates, closes = self._fetch_benchmark_daily(now)
+            if not len(dates):
+                failure = f"no {_REGIME_BENCHMARK} daily bars returned"
+            else:
+                dates, closes = br.knowable_closes(dates, closes, now)
+                if not len(dates):
+                    failure = f"no finished {_REGIME_BENCHMARK} session among the returned bars"
+                elif dates[-1] < previous:
+                    failure = (f"stale {_REGIME_BENCHMARK} data: newest finished bar is {dates[-1]}, "
+                               f"expected {newest} (at most one session of lag is tolerated)")
+                else:
+                    regime = br.classify_benchmark_regime(closes, session=dates[-1])
+                    lagged = dates[-1] < newest
+        except Exception as e:  # noqa: BLE001 -- the regime must never block an entry/exit pass
+            failure = f"{type(e).__name__}: {e}"
+            self.logger.error(f"Benchmark regime fetch failed: {failure}", exc_info=True)
+
+        if failure is not None:
+            cache["failures"] += 1
+            cache.update({"session": None, "regime": None, "failure": failure,
+                          "retry_after": now + timedelta(seconds=_REGIME_RETRY_SECONDS)})
+            br.set_benchmark_regime(None)
+            br.set_benchmark_regime_failure(failure)
+            self.logger.error(
+                f"Benchmark regime is UNCLASSIFIED (attempt {cache['failures']}: {failure}). The "
+                f"spy-trend / spy-vol gates read no_regime and will NOT pass until it is classified; "
+                f"retrying in {_REGIME_RETRY_SECONDS}s.")
+            return
+
+        cache["failures"] = 0
+        cache["failure"] = None
+        cache["regime"] = regime
+        if lagged:
+            # published, but not cached: the missing session may arrive within minutes
+            cache["session"] = None
+            cache["retry_after"] = now + timedelta(seconds=_REGIME_RETRY_SECONDS)
+            self.logger.warning(
+                f"Benchmark regime uses {regime.session}, one session behind {newest} (provider lag); "
+                f"retrying in {_REGIME_RETRY_SECONDS}s.")
+        else:
+            cache["session"] = newest
+            cache["retry_after"] = None
+            self.logger.info(f"Benchmark regime as of {regime.session}: trend={regime.trend} vol={regime.vol}")
+        br.set_benchmark_regime(regime)
+        br.set_benchmark_regime_failure(None)
 
     def refresh_accounts(self):
         """
@@ -312,6 +523,7 @@ class TradeManager:
             # backtest engine's per-bar set_stressed(); cached per calendar day (the classifier
             # reads DAILY benchmark closes, so it cannot change intraday).
             self._publish_market_regime()
+            self._publish_benchmark_regime()
 
             from .models import AccountDefinition
             from ..modules.accounts import get_account_class
@@ -471,16 +683,15 @@ class TradeManager:
         backtest engine never calls this refresh path. It exists precisely to make live
         agree with the backtest:
 
-        WHY. Alpaca exits go out as an OCO whose stop leg is a stop-LIMIT, with the limit
-        placed ``OCO_STOP_LIMIT_CUSHION`` through the stop so an ordinary trigger still
-        fills (``AlpacaAccount._submit_order_impl``). When a gap clears BOTH the stop and
-        that cushion in one print, the triggered leg becomes a limit order on the wrong
-        side of the market: it rests unfilled, the OCO stays working, and the position is
-        open with no stop beneath it. Prod saw exactly this on 2026-09-10 (RARE, ENOV).
-        The backtest, by contrast, models every stop as a MARKET stop that fills at the
-        stop or at the gap open (``backtest_account._gap_stop_fill``), so the two diverge
-        on the days that hurt most. This closes that gap rather than widening the cushion,
-        which would only move the cliff.
+        WHY. Until APP 2026.09.1261 Alpaca OCO exits had a stop-LIMIT stop leg, its limit
+        ``OCO_STOP_LIMIT_CUSHION`` through the stop. When a gap cleared BOTH the stop and
+        that cushion in one print, the triggered leg became a limit order on the wrong side
+        of the market: it rested unfilled and the position stayed open with no stop beneath
+        it (prod RARE/ENOV 2026-09-10, PLTR 2026-11-03). The backtest models every stop as a
+        MARKET stop that fills at the stop or at the gap open
+        (``backtest_account._gap_stop_fill``). New Alpaca stop legs are plain stops, so they
+        match it; this sweep remains the backstop for legacy stop-limit legs still resting
+        at the broker, for IBKR's stop-limit legs, and for a stop that is held or missing.
 
         THE RULE. For each OPENED **equity** transaction of ``account`` carrying a
         ``stop_loss``, breached means the price is past the stop by more than the cushion:
@@ -616,7 +827,7 @@ class TradeManager:
                     f"[Account {account.id}] STOP BREACHED WITHOUT FILLING: {symbol} "
                     f"{side.value if hasattr(side, 'value') else side} transaction {txn_id}, "
                     f"stop={stop}, price={price}, cushion={OCO_STOP_LIMIT_CUSHION:.3%}. The "
-                    f"stop-limit exit leg cannot fill from here — force-closing at market."
+                    f"stop exit did not fill — force-closing at market."
                 )
 
                 result = account.close_transaction(txn_id)
@@ -1634,6 +1845,11 @@ class TradeManager:
         for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
             try:
                 submit_sl = self._entry_submit_stop(order, sl_price)
+                from ba2_common.core.trade_cycle import stamp_safeguard_anchor
+                _txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                stamp_safeguard_anchor(
+                    order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
+                    lambda: account.get_instrument_current_price(order.symbol))
                 submitted = account.submit_order(order, sl_price=submit_sl)
             except Exception as e:  # noqa: BLE001 — classified immediately below
                 if "database is locked" not in str(e).lower():
@@ -1655,6 +1871,11 @@ class TradeManager:
                 if submitted:
                     from ba2_common.core.trade_cycle import record_max_loss_stop
                     record_max_loss_stop(order, sl_price)
+                    # the transaction may only exist since the submit; the fill-time re-base reads
+                    # the stamp from it either way (idempotent when already stamped before)
+                    stamp_safeguard_anchor(
+                        order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
+                        lambda: account.get_instrument_current_price(order.symbol))
                 return submitted
         self.logger.error(
             f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
@@ -1662,6 +1883,54 @@ class TradeManager:
             f"and it never reached the broker; order {order.id} is left PENDING with no broker id.",
             exc_info=True)
         return None
+
+    def _rechain_behind_entry_legs(self, account, dependent_order, parent_order_id) -> bool:
+        """Chain an exit that fires on its ENTRY's fill behind the cancellation of that entry's
+        own live OTO/bracket legs (the wash-trade escape path), and cancel those legs.
+
+        Submitted while the legs still hold the shares, the exit is refused (2026-10-22 DY /
+        APLD: 40310000 insufficient qty) and the position keeps only the leg. Returns True when
+        the exit was re-chained (it then waits for the newest leg's CANCELED, the ordinary
+        cancel-and-replace path, qty gate included)."""
+        trig = getattr(dependent_order.depends_order_status_trigger, "value",
+                       dependent_order.depends_order_status_trigger)
+        if str(trig).lower() != OrderStatus.FILLED.value:
+            return False
+        from sqlmodel import select
+        from .db import get_db
+        terminal = OrderStatus.get_terminal_statuses()
+        with get_db() as session:
+            legs = [o for o in session.exec(select(TradingOrder).where(
+                        TradingOrder.parent_order_id == parent_order_id,
+                        TradingOrder.broker_order_id.isnot(None))).all()
+                    if o.status not in terminal and o.id != dependent_order.id]
+        if not legs:
+            return False
+        legs.sort(key=lambda o: o.id, reverse=True)
+        dependent_order.depends_on_order = legs[0].id
+        dependent_order.depends_order_status_trigger = OrderStatus.CANCELED
+        dependent_order.comment = (f"{dependent_order.comment or ''} "
+                                   f"(chained on cancel of entry leg {legs[0].id})")
+        update_instance(dependent_order)
+        failed = []
+        for leg in legs:
+            try:
+                ok = account.cancel_order(leg.id)
+            except Exception as e:  # noqa: BLE001 -- reported below
+                ok = False
+                self.logger.error(f"Failed to cancel entry leg {leg.id}: {e}", exc_info=True)
+            if not ok:
+                failed.append(leg.id)
+        if failed:
+            self.logger.error(
+                f"Exit {dependent_order.id} ({dependent_order.symbol}) waits on entry leg "
+                f"{legs[0].id}, but the broker did not accept the cancel of leg(s) {failed}: "
+                f"the leg keeps protecting the position and the exit is not submitted")
+        else:
+            self.logger.info(
+                f"Exit {dependent_order.id} ({dependent_order.symbol}) chained on the cancel of "
+                f"entry {parent_order_id}'s leg(s) {[leg.id for leg in legs]}, which hold the shares")
+        return True
 
     def _check_all_waiting_trigger_orders(self):
         """
@@ -1729,7 +1998,17 @@ class TradeManager:
                         # Decide: submit (parent reached trigger), cancel (parent hit a
                         # different terminal status), or wait (still in flight, incl. the
                         # explicit PARTIALLY_FILLED no-op).
-                        action = classify_waiting_trigger(current_status, trigger_status)
+                        action = classify_waiting_trigger(current_status, trigger_status,
+                                                          parent_order.filled_qty)
+                        if action == "submit" and current_status != trigger_status \
+                                and current_status != OrderStatus.FILLED:
+                            # Partial fill, then cancelled: protect what filled, not what was ordered.
+                            self.logger.warning(
+                                f"Parent order {parent_order_id} ended {current_status} after filling "
+                                f"{parent_order.filled_qty} of {parent_order.quantity}; submitting dependent "
+                                f"order {dependent_order.id} for the filled {parent_order.filled_qty} "
+                                f"(was {dependent_order.quantity})")
+                            dependent_order.quantity = parent_order.filled_qty
                         if action == "submit":
                             self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
                             
@@ -1757,161 +2036,142 @@ class TradeManager:
                                     status_updates[dependent_order.id] = OrderStatus.ERROR
                                     continue
                             
-                            # ===== Re-base the STOP-LOSS to the parent's actual fill =====
-                            # Market entries compute TP/SL at enter time off a PRE-FILL
-                            # reference (the market order has no fill yet), so a fill that
-                            # differs from that reference leaves the stop at the wrong
-                            # distance. Re-scale the SL proportionally against the real fill
-                            # using the reference anchor stored on the order. The TP
-                            # (limit_price) is intentionally left untouched.
+                            # ===== Fill-time adjustment of the protective levels =====
+                            # The rules (stop re-based to the real fill, take-profit minimum-distance
+                            # floor from the real fill, legacy percent recalc) live in ONE pure
+                            # function shared with the backtest: ba2_common.core.tpsl_fill_rebase.
+                            # This block only gathers its inputs, calls it, and writes the result to
+                            # the order row / Transaction.
                             transaction_updated = False
                             try:
-                                ref_price = (dependent_order.data or {}).get("tpsl_reference_price") \
-                                    if isinstance(dependent_order.data, dict) else None
-                                if ref_price and parent_order.open_price and dependent_order.stop_price:
-                                    new_sl = rebase_price_to_fill(
-                                        dependent_order.stop_price, ref_price, parent_order.open_price)
-                                    if new_sl and abs(new_sl - dependent_order.stop_price) > 1e-9:
+                                fill_px = parent_order.open_price
+                                data_dict = dependent_order.data if isinstance(dependent_order.data, dict) else None
+                                if fill_px:
+                                    # -- reference anchor for the stop (recorded when the exit order was built)
+                                    ref_val = None
+                                    ref_raw = data_dict.get("tpsl_reference_price") if data_dict else None
+                                    # The price the stop was actually COMPUTED FROM, stamped on the
+                                    # transaction when the stop was set, beats the anchor recorded on
+                                    # the exit order at build time (which a later stop update never
+                                    # refreshed) and the legacy reference chain behind it.
+                                    anchor_txn = (session.get(Transaction, dependent_order.transaction_id)
+                                                  if dependent_order.transaction_id else None)
+                                    stamped_anchor = read_anchor(
+                                        anchor_txn.meta_data if anchor_txn else None, "stop")
+                                    if stamped_anchor:
+                                        ref_raw = stamped_anchor
+                                    if ref_raw:
+                                        try:
+                                            ref_val = float(ref_raw)
+                                        except (TypeError, ValueError) as rebase_err:
+                                            self.logger.warning(
+                                                f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+                                    rebase_stop = bool(ref_val is not None and ref_val > 0)
+                                    if dependent_order.stop_price and not rebase_stop:
+                                        self.logger.warning(
+                                            f"SL of order {dependent_order.id} NOT re-based to the parent fill: "
+                                            f"no usable tpsl_reference_price on the order "
+                                            f"(data value {ref_raw!r}); the stop keeps its pre-fill level")
+                                    # -- take-profit floor inputs
+                                    side_str = str(parent_order.side.value if hasattr(parent_order.side, "value")
+                                                   else parent_order.side).upper()
+                                    is_long = side_str == "BUY"
+                                    apply_floor = bool(data_dict is not None and "tp_percent_target" in data_dict
+                                                       and dependent_order.limit_price)
+                                    min_pct = None
+                                    if apply_floor:
+                                        from ba2_common.core.TradeActions import resolve_min_take_profit_pct
+                                        min_pct = resolve_min_take_profit_pct(parent_order.expert_recommendation_id)
+                                    # -- legacy percent fields
+                                    legacy_tp = legacy_sl = None
+                                    tpsl_data = data_dict.get("TP_SL") if data_dict else None
+                                    if isinstance(tpsl_data, dict):
+                                        try:
+                                            if "tp_percent" in tpsl_data:
+                                                legacy_tp = float(tpsl_data.get("tp_percent"))
+                                            elif "sl_percent" in tpsl_data:
+                                                legacy_sl = float(tpsl_data.get("sl_percent"))
+                                        except (KeyError, TypeError, ValueError) as data_error:
+                                            self.logger.warning(
+                                                f"Could not recalculate TP/SL price for order {dependent_order.id} "
+                                                f"from data field: {data_error}")
+                                    adj = rebase_levels_at_fill(
+                                        is_long=is_long, fill_price=fill_px, reference_price=ref_val,
+                                        take_profit=dependent_order.limit_price, stop_loss=dependent_order.stop_price,
+                                        rebase_stop=rebase_stop, apply_tp_floor=apply_floor,
+                                        min_take_profit_pct=min_pct,
+                                        legacy_tp_percent=legacy_tp, legacy_sl_percent=legacy_sl)
+                                    txn = None
+                                    if (adj.stop_rebased or adj.tp_floored) and dependent_order.transaction_id:
+                                        txn = session.get(Transaction, dependent_order.transaction_id)
+
+                                    if adj.stop_rebased:
                                         old_sl = dependent_order.stop_price
+                                        new_sl = adj.stop_loss
                                         dependent_order.stop_price = new_sl
                                         self.logger.info(
                                             f"Re-based SL for order {dependent_order.id} to parent fill: "
                                             f"${old_sl:.4f} -> ${new_sl:.4f} "
-                                            f"(ref ${ref_price:.4f}, fill ${parent_order.open_price:.4f})"
+                                            f"(ref ${ref_val:.4f}, fill ${fill_px:.4f})"
                                         )
-                                        txn = session.get(Transaction, dependent_order.transaction_id) \
-                                            if dependent_order.transaction_id else None
                                         if txn:
                                             txn.stop_loss = new_sl
+                                            # measured from the fill now: a later pass finds nothing to re-base
+                                            txn.meta_data = stamp_anchor(txn.meta_data, stop=fill_px)
                                             session.add(txn)
                                             transaction_field_updates = True
-                                        if isinstance(dependent_order.data, dict):
+                                        if data_dict is not None:
                                             dependent_order.data["sl_rebased_to_fill"] = True
-                                            dependent_order.data["parent_filled_price"] = parent_order.open_price
-                            except (KeyError, TypeError, ValueError) as rebase_err:
-                                self.logger.warning(
-                                    f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+                                            dependent_order.data["parent_filled_price"] = fill_px
 
-                            # ===== Re-check the TAKE-PROFIT floor against the parent's actual fill =====
-                            # AdjustTakeProfitAction._enforce_minimum_distance() enforces
-                            # min_take_profit_percent against the "real fill price" — but for a
-                            # MARKET-order entry it runs in Phase 2, before the order is even
-                            # submitted, so limit_price/open_price are both still None and it can
-                            # only fall back to a live quote snapshot, not the actual fill. Re-run
-                            # that same floor check now that the real fill is known, and bump the
-                            # TP up (never down) if it's under-floor. Unlike SL this is a re-check
-                            # of an existing safety floor, not a full proportional rebase: a TP
-                            # that already clears the floor is left untouched, in keeping with TP
-                            # being "intentionally left untouched" for anything that isn't a floor
-                            # violation.
-                            try:
-                                if (isinstance(dependent_order.data, dict)
-                                        and "tp_percent_target" in dependent_order.data
-                                        and parent_order.open_price and dependent_order.limit_price):
-                                    from ba2_common.core.TradeActions import (
-                                        compute_tp_floor_price, resolve_min_take_profit_pct)
-                                    min_pct = resolve_min_take_profit_pct(parent_order.expert_recommendation_id)
-                                    side_str = str(parent_order.side.value if hasattr(parent_order.side, "value")
-                                                   else parent_order.side).upper()
-                                    is_long = side_str == "BUY"
-                                    floor_price = compute_tp_floor_price(
-                                        dependent_order.limit_price, parent_order.open_price, min_pct, is_long)
-                                    if floor_price is not None:
+                                    if adj.tp_floored:
                                         old_tp = dependent_order.limit_price
-                                        dependent_order.limit_price = floor_price
+                                        dependent_order.limit_price = adj.take_profit
                                         self.logger.warning(
                                             f"TP floor re-check against real fill: order {dependent_order.id} "
                                             f"was ${old_tp:.4f} (pre-fill), below the {min_pct}% minimum from "
-                                            f"the real fill ${parent_order.open_price:.4f}. Adjusted to "
-                                            f"${floor_price:.4f}"
+                                            f"the real fill ${fill_px:.4f}. Adjusted to "
+                                            f"${adj.take_profit:.4f}"
                                         )
-                                        txn = session.get(Transaction, dependent_order.transaction_id) \
-                                            if dependent_order.transaction_id else None
                                         if txn:
-                                            txn.take_profit = floor_price
+                                            txn.take_profit = adj.take_profit
                                             session.add(txn)
                                             transaction_field_updates = True
                                         dependent_order.data["tp_floor_rechecked_at_fill"] = True
-                            except (KeyError, TypeError, ValueError) as tp_floor_err:
-                                self.logger.warning(
-                                    f"Could not re-check TP floor for order {dependent_order.id}: {tp_floor_err}")
 
-                            # ===== Legacy: percent-based recalc (kept as fallback) =====
-                            # This ensures TP/SL prices use the parent's filled price, not stale market data
-                            # If percent is not stored, it will be calculated and stored as a fallback
-                            if dependent_order.data and isinstance(dependent_order.data, dict):
-                                try:
-                                    # Check if this is a TP order (has tp_percent in data)
-                                    if dependent_order.data and "TP_SL" in dependent_order.data and "tp_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
-                                        tp_percent = dependent_order.data["TP_SL"].get("tp_percent")
+                                    # ===== Legacy: percent-based recalc (rule 3 of the shared function) =====
+                                    # Overrides the two adjustments above, exactly as it always did.
+                                    if adj.legacy_tp_applied:
                                         old_limit_price = dependent_order.limit_price
-                                        
-                                        # Recalculate TP price from parent's filled price: price = filled_price * (1 + percent/100)
-                                        new_limit_price = parent_order.open_price * (1 + tp_percent / 100)
-                                        
-                                        # Round price to 4 decimal places (standard for forex/stocks)
-                                        new_limit_price = round(new_limit_price, 4)
-                                        
-                                        # Update the limit price
-                                        dependent_order.limit_price = new_limit_price
-                                        
+                                        dependent_order.limit_price = adj.take_profit
                                         self.logger.info(
                                             f"Recalculated TP price for order {dependent_order.id}: "
-                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {tp_percent:.2f}%) "
-                                            f"= ${new_limit_price:.2f} (was ${old_limit_price:.2f})"
+                                            f"parent filled ${fill_px:.2f} * (1 + {legacy_tp:.2f}%) "
+                                            f"= ${adj.take_profit:.2f} (was ${old_limit_price:.2f})"
                                         )
-                                        
-                                        # Update data field to record when recalculation happened
-                                        dependent_order.data["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["parent_filled_price"] = fill_px
                                         dependent_order.data["recalculated_at_trigger"] = True
-                                        
-                                        # Mark transaction for update with new TP price
                                         transaction_updated = True
-                                    
-                                    # Check if this is an SL order (has sl_percent in data)
-                                    elif dependent_order.data and "TP_SL" in dependent_order.data and "sl_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
-                                        sl_percent = dependent_order.data["TP_SL"].get("sl_percent")
+                                    elif adj.legacy_sl_applied:
                                         old_stop_price = dependent_order.stop_price
-                                        
-                                        # Recalculate SL price from parent's filled price: price = filled_price * (1 + percent/100)
-                                        # For SL, percent is typically negative, so 1 + (-5/100) = 0.95 for a 5% loss
-                                        new_stop_price = parent_order.open_price * (1 + sl_percent / 100)
-                                        
-                                        # Round price to 4 decimal places
-                                        new_stop_price = round(new_stop_price, 4)
-                                        
-                                        # Update the stop price
-                                        dependent_order.stop_price = new_stop_price
-                                        
+                                        dependent_order.stop_price = adj.stop_loss
                                         self.logger.info(
                                             f"Recalculated SL price for order {dependent_order.id}: "
-                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {sl_percent:.2f}%) "
-                                            f"= ${new_stop_price:.2f} (was ${old_stop_price:.2f})"
+                                            f"parent filled ${fill_px:.2f} * (1 + {legacy_sl:.2f}%) "
+                                            f"= ${adj.stop_loss:.2f} (was ${old_stop_price:.2f})"
                                         )
-                                        
-                                        # Update data field to record when recalculation happened
-                                        if "TP_SL" not in dependent_order.data:
-                                            dependent_order.data["TP_SL"] = {}
-                                        dependent_order.data["TP_SL"]["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["TP_SL"]["parent_filled_price"] = fill_px
                                         dependent_order.data["TP_SL"]["recalculated_at_trigger"] = True
-                                        
-                                        # Mark transaction for update with new SL price
                                         transaction_updated = True
-                                    
+                                    elif data_dict is None:
+                                        # No data field yet - will be populated when account submits the order
+                                        self.logger.debug(f"No data field in order {dependent_order.id}, will ensure percent is calculated during submission")
                                     else:
-                                        # No tp_percent or sl_percent in data - try to calculate as fallback
-                                        # This handles cases where TP/SL orders were created before percent storage was implemented
                                         self.logger.debug(f"No TP/SL percent found in order {dependent_order.id}.data, attempting fallback calculation")
-                                        # Note: We can't call AccountInterface method here, but the calculation will happen
-                                        # when the account's submit_order is called in PHASE 2 below
-                                
-                                except (KeyError, TypeError, ValueError) as data_error:
-                                    self.logger.warning(
-                                        f"Could not recalculate TP/SL price for order {dependent_order.id} from data field: {data_error}"
-                                    )
-                            else:
-                                # No data field yet - will be populated when account submits the order
-                                self.logger.debug(f"No data field in order {dependent_order.id}, will ensure percent is calculated during submission")
+                            except (KeyError, TypeError, ValueError) as adjust_err:
+                                self.logger.warning(
+                                    f"Could not adjust the protective levels of order {dependent_order.id} "
+                                    f"to the parent fill (left as they were): {adjust_err}")
                             # ===== END: Price recalculation =====
                             
                             # Update the associated Transaction if TP/SL price was recalculated
@@ -2042,6 +2302,9 @@ class TradeManager:
                         self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        continue
+
+                    if self._rechain_behind_entry_legs(account, dependent_order, parent_order_id):
                         continue
 
                     # Gate cancel-and-replace orders (e.g. a trailing-stop OCO swap): only
@@ -2491,6 +2754,45 @@ class TradeManager:
             with market_condition_decision_scope(expert_instance_id=expert_instance_id):
                 return self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
 
+    #: The per-expert processing locks, in the fixed order ``hold_expert_locks`` takes them.
+    _PROCESSING_USE_CASES = ("enter_market", "open_positions")
+
+    def _processing_lock(self, expert_instance_id: int, use_case: str) -> threading.Lock:
+        lock_key = f"expert_{expert_instance_id}_usecase_{use_case}"
+        with self._locks_dict_lock:
+            if lock_key not in self._processing_locks:
+                self._processing_locks[lock_key] = threading.Lock()
+            return self._processing_locks[lock_key]
+
+    def hold_expert_locks(self, expert_instance_id: int, timeout: float, use_cases=None):
+        """Context manager for a MANAGEMENT-API write: holds the per-expert processing locks named by
+        ``use_cases`` (default BOTH: the ones the enter_market and open_positions passes take) so the write cannot
+        interleave with a pass. Waits up to ``timeout`` seconds in total; yields True when all were taken, False
+        (holding none) otherwise.
+        Passes use a 0.5 s try-lock and skip when busy, so a held write makes them skip, never deadlock."""
+        import time
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _hold():
+            deadline = time.monotonic() + timeout
+            held = []
+            wanted = self._PROCESSING_USE_CASES if use_cases is None else [
+                u for u in self._PROCESSING_USE_CASES if u in use_cases]
+            try:
+                for use_case in wanted:      # fixed order: two writers cannot deadlock
+                    lock = self._processing_lock(expert_instance_id, use_case)
+                    if not lock.acquire(blocking=True, timeout=max(0.0, deadline - time.monotonic())):
+                        yield False
+                        return
+                    held.append(lock)
+                yield True
+            finally:
+                for lock in reversed(held):
+                    lock.release()
+
+        return _hold()
+
     def _process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations after all market analysis jobs for enter_market are completed.
@@ -2540,6 +2842,9 @@ class TradeManager:
 
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
+            # The SPY regime the spy-trend / spy-vol entry gates read, from FINISHED sessions, BEFORE any
+            # rule is evaluated (the pass can run outside a refresh).
+            self._publish_benchmark_regime()
             
             from sqlmodel import select
             from .db import get_db
@@ -2596,7 +2901,6 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             from ba2_common.core.hold_entry import evaluate_hold_entries
-            from ba2_common.core.types import is_option_action
             allow_hold = evaluate_hold_entries(expert.settings)
 
             # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
@@ -2720,13 +3024,11 @@ class TradeManager:
                         self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
                         
                         # SAFETY CHECK: For enter_market, check if there's already an open/waiting transaction
-                        # for this symbol and expert to prevent duplicate positions
-                        existing_txn_statement = select(Transaction).where(
-                            Transaction.expert_id == expert_instance_id,
-                            Transaction.symbol == recommendation.symbol,
-                            Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING])
-                        )
-                        existing_txn = session.exec(existing_txn_statement).first()
+                        # for this symbol and expert to prevent duplicate positions. The SHARED gate
+                        # the backtest engine applies too (trade_cycle.open_or_waiting_position).
+                        from .trade_cycle import open_or_waiting_position
+                        existing_txn = open_or_waiting_position(
+                            expert_instance_id, recommendation.symbol, session=session)
                         
                         if existing_txn:
                             self.logger.warning(
@@ -2746,23 +3048,28 @@ class TradeManager:
                             )
                             continue
                         
-                        option_flags = [is_option_action(s['action_type']) for s in action_summaries]
-                        if any(option_flags) and not all(option_flags):
+                        # PER-ENTRY ROUTING through the SHARED router the backtest engine calls
+                        # too (trade_cycle.entry_route; plan 2026-09-25 option-stage2-build E1),
+                        # so the two runtimes cannot route the same fired rule differently.
+                        from .trade_cycle import (ENTRY_ROUTE_OPTION, MixedEntryActionsRefused,
+                                                  entry_route)
+                        try:
+                            route = entry_route(s['action_type'] for s in action_summaries)
+                        except MixedEntryActionsRefused as mixed:
                             # Neither path can size both halves: the equity RM would stamp a
                             # share count + stock stop onto the option order, and the option
                             # path would submit the equity action unsized. Refuse loudly.
                             self.logger.error(
                                 f"Refusing recommendation {recommendation.id} for {recommendation.symbol}: "
-                                f"its entry rule mixes option and equity actions "
-                                f"{[s['action_type'] for s in action_summaries]}")
+                                f"{mixed}")
                             continue
-                        if all(option_flags):
+                        if route == ENTRY_ROUTE_OPTION:
                             # Option actions size and submit themselves through their shared
-                            # risk/capacity guards, matching the backtest option path
-                            # (daily_engine._entry_is_option), whatever the signal. They must
-                            # never reach the equity RM below: it re-labels the contracts as
-                            # shares and stages a STOCK safeguard stop at the broker (8082,
-                            # 2026-09-24: SELL 9 GILD @ 138.56 behind a 2-contract call).
+                            # risk/capacity guards, exactly like the backtest option path,
+                            # whatever the signal. They must never reach the equity RM below:
+                            # it re-labels the contracts as shares and stages a STOCK safeguard
+                            # stop at the broker (8082, 2026-09-24: SELL 9 GILD @ 138.56 behind
+                            # a 2-contract call).
                             option_results = evaluator.execute(submit_to_broker=True)
                             for result in option_results:
                                 if result.get("success"):
@@ -3377,6 +3684,8 @@ class TradeManager:
         
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (open_positions)")
+            # Exit rules may read the SPY regime too: publish before they are evaluated.
+            self._publish_benchmark_regime()
             
             from sqlmodel import select
             from .db import get_db
@@ -3493,39 +3802,36 @@ class TradeManager:
                 # Process each recommendation through the open_positions ruleset
                 for recommendation in recommendations:
                     try:
-                        # Check if this symbol has existing transactions for THIS expert only
+                        # THE BOOK this symbol's exits are evaluated against: THIS expert's OPENED
+                        # transactions, minus any with a closing order already WORKING (else each
+                        # cycle could submit ANOTHER close for the same position; see
+                        # ReadOnlyAccountInterface.has_pending_closing_order). The SAME filter the
+                        # backtest engine applies (entry_order.positions_to_manage, plan 2026-09-25
+                        # option-stage2-build Task 8 review asymmetry (a)). WAITING transactions
+                        # are NOT positions to exit: evaluated in the filled-but-not-promoted
+                        # window with existing_order=None, a close rule needing no entry order took
+                        # CloseAction's legacy broker-position branch and closed the broker
+                        # position without linking the close to the transaction.
+                        from ba2_common.core.entry_order import positions_to_manage
                         statement = select(Transaction).where(
                             Transaction.symbol == recommendation.symbol,
-                            Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED]),
+                            Transaction.status == TransactionStatus.OPENED,
                             Transaction.expert_id == expert_instance_id
                         )
-                        existing_transactions = session.exec(statement).all()
-
-                        # Skip a transaction that already has a closing order WORKING
-                        # (submitted on an earlier cycle, not yet filled/canceled) — otherwise
-                        # this loop re-evaluates exit rules and can submit ANOTHER closing
-                        # order for the same position on every subsequent cycle until the
-                        # first one resolves. Shared with the backtest engine's equivalent
-                        # guard (found investigating the 2026-07-21 options-grid equity
-                        # runaway); see ReadOnlyAccountInterface.has_pending_closing_order.
-                        # A resting TP/SL (OCO legs, brackets) is protection, not a pending
-                        # close, and does not skip the transaction. Each skip is logged: a
-                        # silent skip here hid 13 prod positions' exit rules for weeks.
-                        pending_close_ids = {
-                            t.id for t in existing_transactions
-                            if account.has_pending_closing_order(t.id)
-                        }
-                        for t in existing_transactions:
-                            if t.id in pending_close_ids:
+                        all_transactions = session.exec(statement).all()
+                        existing_transactions = positions_to_manage(all_transactions, account)
+                        # An OPENED transaction left out has a closing order still WORKING
+                        # (positions_to_manage). Each skip is logged: a silent skip here hid 13
+                        # prod positions' exit rules for weeks.
+                        managed_ids = {t.id for t in existing_transactions}
+                        for t in all_transactions:
+                            if t.status == TransactionStatus.OPENED and t.id not in managed_ids:
                                 self.logger.info(
                                     f"Skipping exit-rule evaluation of transaction {t.id} "
                                     f"({t.symbol}): a closing order is still working")
-                        existing_transactions = [
-                            t for t in existing_transactions if t.id not in pending_close_ids
-                        ]
 
                         if not existing_transactions:
-                            self.logger.debug(f"No existing transactions for {recommendation.symbol}, skipping recommendation {recommendation.id}")
+                            self.logger.debug(f"No OPENED transaction to manage for {recommendation.symbol}, skipping recommendation {recommendation.id}")
                             continue
                         
                         # Create TradeActionEvaluator with existing transactions for open_positions use case
@@ -3535,19 +3841,24 @@ class TradeManager:
                             existing_transactions=existing_transactions
                         )
 
-                        # Resolve the primary (entry) order from the oldest open transaction
-                        # This is needed for conditions like DaysOpenedCondition that use order.created_at
-                        oldest_transaction = min(existing_transactions, key=lambda t: t.open_date or t.created_at)
-                        existing_order = resolve_entry_order(session, oldest_transaction)
-                        if existing_order:
-                            self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
-                        else:
-                            # Not benign: every P&L / days-opened condition on this symbol will
-                            # now evaluate False and CloseAction loses its transaction link.
-                            self.logger.warning(
-                                f"No FILLED {oldest_transaction.side} order on transaction "
-                                f"{oldest_transaction.id} ({recommendation.symbol}) — exit "
-                                f"conditions needing an entry order cannot evaluate")
+                        # The entry order every condition reads (DaysOpened, P&L, the style-member
+                        # entry_tag): the entry order of the oldest OPENED transaction, by the ONE
+                        # definition the backtest engine uses too (entry_order.oldest_entry_order,
+                        # plan 2026-09-25 option-stage2-build Task 8 review I1). An OPENED position
+                        # with no entry order row is REFUSED by name: evaluated against None, every
+                        # P&L / days-opened / entry_tag condition would read False and CloseAction
+                        # would lose its transaction link.
+                        from ba2_common.core.entry_order import (EntryOrderUnresolved,
+                                                                 oldest_entry_order)
+                        try:
+                            existing_order = oldest_entry_order(existing_transactions,
+                                                                session=session)
+                        except EntryOrderUnresolved as e:
+                            self.logger.error(
+                                f"Skipping open_positions evaluation of recommendation "
+                                f"{recommendation.id} for {recommendation.symbol}: {e}")
+                            continue
+                        self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
 
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")

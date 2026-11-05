@@ -18,6 +18,7 @@ from ba2_common.core.db import get_db
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core import benchmark_regime as _br
 # The established vocabulary for "the broker's position fetch FAILED" — reused rather
 # than re-invented so the engine, the live service, the UI and the conditions all raise
 # and catch the same class. See its docstring for the 2026-07-03 incident.
@@ -29,6 +30,9 @@ from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
 )
+# The style-group member tag (plan 2026-09-25 option-stage2-build): stamped on the entry order
+# row by TradeActions, read back by EntryTagCondition below.
+from ba2_common.core.entry_tag import order_entry_tag, validate_entry_tag_comparison
 # Market-condition entry gates (design 2026-09-15 option-market-condition-genes): the profile
 # registry the condition classes are GENERATED from, and the evaluation-scoped context type.
 from ba2_common.core.market_conditions import (
@@ -2751,7 +2755,11 @@ class IVRankCondition(CompareCondition):
     # account default so a rank is available early in an instrument's history.
     IV_RANK_MIN_SAMPLES = 5
 
+    #: Display-only reason the rank is unavailable (None when a rank exists or no reason is known).
+    unavailable_reason: Optional[str] = None
+
     def evaluate(self) -> bool:
+        self.unavailable_reason = None
         try:
             from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 
@@ -2760,6 +2768,7 @@ class IVRankCondition(CompareCondition):
                     f"Account does not support options; cannot compute IV rank for "
                     f"{self.instrument_name}")
                 self.calculated_value = None
+                self.unavailable_reason = "account does not support options"
                 return False
 
             rank = self.account.get_iv_rank(
@@ -2767,6 +2776,12 @@ class IVRankCondition(CompareCondition):
             if rank is None:
                 logger.warning(f"IV rank unavailable for {self.instrument_name}")
                 self.calculated_value = None
+                try:
+                    self.unavailable_reason = self.account.iv_rank_unavailable_reason(
+                        self.instrument_name)
+                except Exception as reason_err:  # display-only; must never break evaluation
+                    logger.debug(f"iv_rank_unavailable_reason failed: {reason_err}")
+                    self.unavailable_reason = None
                 return False
 
             self.calculated_value = rank
@@ -2787,6 +2802,8 @@ class IVRankCondition(CompareCondition):
 
     def get_actual_value_display(self) -> Optional[str]:
         if self.calculated_value is None:
+            if self.unavailable_reason:
+                return f"unavailable: {self.unavailable_reason}"
             return None
         return f"{self.calculated_value:.1f}"
 
@@ -2842,17 +2859,37 @@ class RelativeVolumeCondition(CompareCondition):
                 return False
 
             volumes = df["Volume"]
-            # W baseline bars PLUS the current one. A shorter history is UNKNOWN: averaging
-            # whatever is there would compare a spike against two quiet days and call it 10x.
-            if len(volumes) < self.BASELINE_WINDOW + 1:
-                logger.warning(
-                    f"Only {len(volumes)} bars for {self.instrument_name}; "
-                    f"relative volume needs {self.BASELINE_WINDOW + 1}")
-                self.calculated_value = None
-                return False
-
-            current = volumes.iloc[-1]
-            baseline = list(volumes.iloc[-(self.BASELINE_WINDOW + 1):-1])
+            # INTRADAY BACKTEST CLOCK: the daily history is the FINISHED sessions only (the memoized
+            # provider clamps it), so "the current bar" is not in it. Today's volume is what has
+            # traded so far (the sum of the intraday bars ended at the decision), the baseline is
+            # the last W finished sessions. Live reads today's forming daily bar the same way.
+            # A daily clock / live keeps the as-of bar = last bar of the series.
+            so_far = getattr(self.account, "intraday_volume_so_far", None)
+            applicable, so_far_volume = so_far(self.instrument_name) if callable(so_far) else (False, None)
+            if applicable:
+                if so_far_volume is None:
+                    logger.warning(f"No intraday volume so far for {self.instrument_name}")
+                    self.calculated_value = None
+                    return False
+                if len(volumes) < self.BASELINE_WINDOW:
+                    logger.warning(
+                        f"Only {len(volumes)} finished sessions for {self.instrument_name}; "
+                        f"relative volume needs {self.BASELINE_WINDOW}")
+                    self.calculated_value = None
+                    return False
+                current = so_far_volume
+                baseline = list(volumes.iloc[-self.BASELINE_WINDOW:])
+            else:
+                # W baseline bars PLUS the current one. A shorter history is UNKNOWN: averaging
+                # whatever is there would compare a spike against two quiet days and call it 10x.
+                if len(volumes) < self.BASELINE_WINDOW + 1:
+                    logger.warning(
+                        f"Only {len(volumes)} bars for {self.instrument_name}; "
+                        f"relative volume needs {self.BASELINE_WINDOW + 1}")
+                    self.calculated_value = None
+                    return False
+                current = volumes.iloc[-1]
+                baseline = list(volumes.iloc[-(self.BASELINE_WINDOW + 1):-1])
             # A NaN anywhere in the window is UNKNOWN, not something to skip past: pandas'
             # mean() drops NaNs silently, so a window with 18 of 20 bars missing would average
             # the surviving two and report a confident ratio against them.
@@ -3377,6 +3414,67 @@ class DaysAfterEventCondition(CompareCondition):
         if self.calculated_value is None:
             return None
         return f"{int(self.calculated_value)}d after event"
+
+
+class EntryTagCondition(CompareCondition):
+    """Which style-group MEMBER opened the evaluated position (``entry_tag`` on its entry order).
+
+    ANDed into every exit rule a style expert emits (ba2test_launcher O_STYLE, plan 2026-09-25
+    option-stage2-build), so one OPEN_POSITIONS ruleset carries each member's OWN exits. The
+    tag is read BACK off the entry order row (``entry_tag.order_entry_tag``), where
+    ``_OptionEntryAction._submit_option_order`` stamped it -- the same read-back-never-
+    reconstruct seam as ``days_after_event``. Shared by live and backtest.
+
+    UNKNOWN NEVER FIRES: no order, no row data or no tag -> ``calculated_value`` None and False
+    for EVERY operator (``!=`` included). That is safe by construction -- an untagged position
+    is not a style position, so no member's exit may close it. The wheel's stock phase is
+    scoped like every other exit: the assigned stock lot inherits the assigned put's member
+    tag (``assignment_hold.assigned_stock_entry_data``) and a covered-call / protective-put
+    overlay inherits the covered position's, so a member's stock-phase and overlay rules only
+    ever see that member's own shares.
+
+    A LABEL, NOT A QUANTITY. Only ``==`` / ``!=`` (``ENTRY_TAG_OPERATORS``), and the rule value
+    must itself be a tag (a positive integer): an ordering operator or a value like ``2.5``
+    would be a gate that can never mean what it says, so both are REFUSED at construction
+    rather than evaluated to a permanent, quiet False. A corrupted STORED tag raises from the
+    read-back and propagates (a ValueError is not a benign type under BA2_ERROR_MODE=enforce).
+    """
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        # The SAME check the rule converter runs (rule_builders.triggers_from_condition_tree),
+        # so a comparison that converted is one the engine accepts, and vice versa.
+        tag = validate_entry_tag_comparison(operator_str, value,
+                                            where=f"entry_tag condition on {instrument_name}")
+        super().__init__(account, instrument_name, expert_recommendation, operator_str,
+                         float(tag), existing_order)
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+            tag = order_entry_tag(self.existing_order)
+            if tag is None:
+                self.calculated_value = None
+                return False
+            self.calculated_value = float(tag)
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating entry_tag condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the style-group member that opened {self.instrument_name}'s "
+                f"position (entry_tag) is {self.operator_str} {int(self.value)}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"member tag {int(self.calculated_value)}"
 
 
 class DaysToExpiryCondition(CompareCondition):
@@ -4434,6 +4532,86 @@ RATING_CHANGE_CONDITIONS: Dict[ExpertEventType, tuple] = {
 # every entry here must have a rule_builders.FIELD_EVENT / FLAG_FIELD_EVENT mapping or a
 # rule leaf naming it is silently dropped before the engine ever sees it. That invariant is
 # enforced by tests/test_condition_registry_coverage.py.
+class BenchmarkRegimeCompare(CompareCondition):
+    """Base of the SPY benchmark regime gates (``SpyTrendRegimeCondition``/``SpyVolRegimeCondition``).
+    Plan 2026-10-24-spy-regime-gate.
+
+    ONE set-membership leaf: ``field == mode code`` (the code a ``benchmark_regime`` mode table
+    names; ``above_200`` accepts both ``up`` and ``pullback``). It reads the regime the host
+    published through ``benchmark_regime.set_benchmark_regime`` -- the backtest from its
+    precomputed calendar, live from FINISHED SPY sessions -- never a per-instrument feature row,
+    so there is no context, reader or recorder here.
+
+    UNKNOWN NEVER PASSES and says why: nothing published (``no_regime``, with the host's failure
+    reason when it set one) or this axis unclassifiable (``insufficient_history``, the axis
+    reason). A stale mode code raises at construction, not at the first evaluation.
+    """
+
+    #: Canonical field name (== ExpertEventType value). Set by the subclass.
+    FIELD: str = ""
+    #: Axis word used in the description. Set by the subclass.
+    AXIS: str = ""
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str, value,
+                         existing_order)
+        if not self.FIELD:
+            raise TypeError(f"{type(self).__name__} has no FIELD: use SpyTrendRegimeCondition or "
+                            f"SpyVolRegimeCondition")
+        if operator_str != "==":
+            raise ValueError(f"{self.FIELD} (categorical) accepts only ['=='], got {operator_str!r}")
+        self.mode = _br.mode_for_code(self.FIELD, value)   # ValueError on an unknown code
+        self.state: Optional[str] = None
+        self.last_status: Optional[str] = None
+        self.last_reason: str = ""
+
+    def _unknown(self, status: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.state = None
+        self.last_status = status
+        self.last_reason = reason
+        logger.debug("Benchmark regime %s for %s is unknown (%s): %s",
+                     self.FIELD, self.instrument_name, status, reason)
+        return False
+
+    def evaluate(self) -> bool:
+        regime = _br.get_benchmark_regime()
+        if regime is None:
+            why = _br.get_benchmark_regime_failure() or "the host published none for this decision"
+            return self._unknown("no_regime", f"no benchmark regime is published for this decision: {why}")
+        axis = "trend" if self.FIELD == _br.TREND_FIELD else "vol"
+        state = getattr(regime, axis)
+        if state is None:
+            return self._unknown("insufficient_history",
+                                 getattr(regime, f"{axis}_reason") or f"{self.FIELD} is unknown")
+        self.state = state
+        self.calculated_value = float(_br.CODES_BY_FIELD[self.FIELD][state])
+        self.last_status = "valid"
+        self.last_reason = ""
+        return _br.state_matches(self.FIELD, self.value, state)
+
+    def get_description(self) -> str:
+        members = ", ".join(sorted(_br.MODE_STATES[self.FIELD][self.mode]))
+        return f"Check if the SPY {self.AXIS} regime is {self.mode} ({members})"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.state is not None:
+            return self.state
+        return f"unknown ({self.last_status})" if self.last_status else None
+
+
+class SpyTrendRegimeCondition(BenchmarkRegimeCompare):
+    FIELD = _br.TREND_FIELD
+    AXIS = "trend"
+
+
+class SpyVolRegimeCondition(BenchmarkRegimeCompare):
+    FIELD = _br.VOL_FIELD
+    AXIS = "volatility"
+
+
 CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_BEARISH: BearishCondition,
     ExpertEventType.F_BULLISH: BullishCondition,
@@ -4485,6 +4663,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
     ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
+    ExpertEventType.N_ENTRY_TAG: EntryTagCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
     ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY: CoveredCallDaysToExpiryCondition,
@@ -4494,6 +4673,9 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
     ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
+    # Not generated from PROFILES (the benchmark fields are no profile); see BenchmarkRegimeCompare.
+    ExpertEventType.N_SPY_TREND_REGIME: SpyTrendRegimeCondition,
+    ExpertEventType.N_SPY_VOL_REGIME: SpyVolRegimeCondition,
 }
 
 

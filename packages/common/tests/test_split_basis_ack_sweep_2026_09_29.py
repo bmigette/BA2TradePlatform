@@ -63,7 +63,13 @@ STILL_REFUSES = ("IAC",)
 #: "consistent" or "refetched" once its jump is acknowledged) -- kept as an explicit, documented
 #: escape hatch rather than a silent pass: a future re-fetch that changes this must show up here,
 #: named, not vanish into a blanket "allow failures" flag.
-KNOWN_LEFTOVERS = {}
+#: 2026-10-20 (merge of data/stage2-universe-repair): that branch widened the mixed-basis scan to
+#: split-sized one-day moves up to 365 days from a split (split_basis.MIXED_BASIS_FAR_WINDOW_DAYS).
+#: The sweep acknowledged only the moves the 30-day window found, so two symbols now show EXTRA
+#: unacknowledged split-sized moves and stay refused (loud, never silently priced): BMNR 2012-02-24
+#: 2:1 (x0.5/x2 moves 2012-08..11) and GOAI 2025-02-11 1:4 (x3.96/x0.25 alternating 2024-04..06,
+#: bad prints rather than gaps). Acknowledging them is an operator decision, not made here.
+KNOWN_LEFTOVERS = {"BMNR": ("2012-02-24",), "GOAI": ("2025-02-11",)}
 
 CACHE_ROOT = cfg.CACHE_FOLDER
 

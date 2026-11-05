@@ -20,6 +20,7 @@ import pytest
 from ba2_common.core.TradeActions import create_action
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+from tests._capital_double import EquityFromBalance
 from ba2_common.core.types import ExpertActionType, OptionRight
 
 AS_OF = date(2024, 6, 1)
@@ -35,7 +36,7 @@ def _own_db(tmp_path):
     yield
 
 
-class _TwoExpiryAccount(OptionsAccountInterface):
+class _TwoExpiryAccount(EquityFromBalance, OptionsAccountInterface):
     """The shape the real cache has: the SAME strikes listed in more than one in-window
     expiry. Premium is convex in strike (intrinsic + decaying time value) so a long
     butterfly comes out as a net debit, as it must."""

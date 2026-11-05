@@ -38,7 +38,9 @@ Write-Host ">> venv root     : $VenvRoot"
 Write-Host ">> trade python  : $TradePy"
 Write-Host ">> test  python  : $TestPy"
 
-# torch wheel selection for the TRADE venv. $env:BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
+# torch wheel selection for BOTH venvs. $env:BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
+# The test venv needs it too: its requirements.txt holds a bare `torch>=...`, and PyPI's Windows
+# torch wheel is CPU-only, so without this pre-install a GPU worker silently ran on CPU (/health gpu null).
 # auto = install the CUDA build when an NVIDIA GPU responds to nvidia-smi, else CPU-only (see
 # CLAUDE.md WinError 1114 note for the CPU pin rationale).
 $TorchVariant   = if ($env:BA2_TORCH_VARIANT) { $env:BA2_TORCH_VARIANT } else { "auto" }
@@ -142,7 +144,7 @@ if ($doTest) {
   New-AppVenv -Venv (Join-Path $VenvRoot "test") `
               -AppDir (Join-Path $Here "testplatform") `
               -ReqPath (Join-Path $Here "testplatform\backend\requirements.txt") `
-              -TorchCpu $false -VerifyImport "ba2_common" -BasePy $TestPy
+              -TorchCpu $true -VerifyImport "ba2_common" -BasePy $TestPy
   # Test-platform frontend (Vite/React UI) deps — so `ba2-test serve` can start the UI.
   $fe = Join-Path $Here "testplatform\frontend"
   if (Test-Path (Join-Path $fe "package.json")) {

@@ -674,7 +674,7 @@ class TaskQueueService:
                     if db_task and db_task.status == 'running':
                         # Subprocess crashed without updating status
                         db_task.status = TaskStatus.FAILED.value
-                        db_task.error_message = f"Worker process crashed (exit code {exit_code}): {stderr[-200:]}"
+                        db_task.error_message = f"Worker process crashed (exit code {exit_code}) (output discarded; see the task log)"
                         db_task.completed_at = datetime.now()
                         db.commit()
                 finally:

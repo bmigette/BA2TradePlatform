@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ba2_common.core.instance_resolver import (
     set_instance_resolver,
@@ -189,6 +189,26 @@ def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
     """Install (or clear, with None) the per-run OHLCV provider the resolver hands experts.
     Thread-local — only affects the calling thread's backtest."""
     _ohlcv_override_tl.provider = provider
+
+
+# The OHLCV HISTORY SOURCE of the run in this thread (``fmp`` | ``alpaca``; ba2_common.core.
+# ohlcv_history). Set by run_daily_backtest next to the override above. It exists for the moments
+# the override is NOT installed (before it is set, or after a caller cleared it): an ("ohlcv", *)
+# request then resolves to THIS run's history provider, never to the hard-coded "fmp" the expert
+# bundle asks for (``LiveProviderBundle.ohlcv``). Thread-local for the same reason as the override.
+_history_source_tl = threading.local()
+
+
+def _current_history_source() -> Optional[str]:
+    return getattr(_history_source_tl, "source", None)
+
+
+def set_backtest_history_source(source: Optional[str]) -> None:
+    """Install (or clear, with None) this thread's run history source; an unknown name refuses."""
+    if source is not None:
+        from ba2_common.core.ohlcv_history import check_history_source
+        check_history_source(source)
+    _history_source_tl.source = source
 
 
 # Market-condition entry gates (design 2026-09-15 section 4.1). OPT-IN per run: only a config
@@ -443,6 +463,11 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
     # and nothing anywhere would say so. So an optimizer-assembled config (``_ga_trial``: GA trial,
     # re-run, robustness variant and top-N persist alike -- see
     # strategy_optimization_handler._build_daily_trial_config) is REFUSED here instead.
+    # The market-condition source profile of THIS job's OHLCV history (fmp | alpaca): the reader refuses a
+    # pinned manifest built from the other one, and the context carries it.
+    from ba2_common.core.market_condition_source import source_profile_for_history
+    from ba2_common.core.ohlcv_history import resolve_job_history_source
+    job_source_profile = source_profile_for_history(resolve_job_history_source(config))
     readers = []
     for profile in profiles:
         digest = manifests.get(profile)
@@ -455,14 +480,16 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
                     f"every digest into every trial; computing 128-session indicators per trial "
                     f"is not a fallback this path takes.")
             warn_research_mode(profile, "backtest reader")
-        reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest)
+        reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest,
+                                           source_profile=job_source_profile)
         # PER PROFILE: each snapshot was warmed separately and can cover a different set of
         # symbols (and a different window), so "is this run served" is a question with one answer
         # per profile -- both halves of it.
         check_market_condition_coverage(config, reader)
         check_market_condition_window(config, reader)
         readers.append(reader)
-    resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers))
+    resolver = BacktestMarketConditionResolver(market_condition_reader_for(readers),
+                                                source_profile=job_source_profile)
     if TradeConditions.get_market_condition_context_resolver() is not _dispatch_market_condition_context:
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver
@@ -560,7 +587,11 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
             f"coverage was checked; the sessions were not.")
         return []
     universe = market_condition_universe(config)
-    problems = window_coverage_problems(mapped, universe, start, end)
+    from app.services.backtest.price_source import _is_intraday
+    # An intraday run reads the row of the last FINISHED session: the snapshot must reach back one
+    # session before ``start`` (see window_coverage_problems).
+    intraday = _is_intraday(config.get("execution_interval") or "1d")
+    problems = window_coverage_problems(mapped, universe, start, end, intraday=intraday)
     if not problems:
         return []
     message = (
@@ -575,6 +606,37 @@ def check_market_condition_window(config: Dict[str, Any], reader: Any) -> List[s
     return problems
 
 
+def named_field_leaves_in(config: Any, names: Any, path: str = "config") -> List[Tuple[str, str]]:
+    """``(label, field)`` for every condition leaf anywhere in ``config`` whose ``field`` is one of
+    ``names``. Walks dicts, lists and JSON-encoded rule trees held as strings; a string that names
+    a field but does not parse yields ``(path, "")`` so callers refuse rather than walk past it."""
+    import json
+
+    names = set(names)
+    hits: List[Tuple[str, str]] = []
+
+    def walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            field = node.get("field")
+            if isinstance(field, str) and field in names:
+                hits.append(((str(node["id"]) if node.get("id") else path), field))
+            for key, value in node.items():
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, (list, tuple)):
+            for i, value in enumerate(node):
+                walk(value, f"{path}[{i}]")
+        elif isinstance(node, str) and node[:1] in ("{", "[") and any(f in node for f in names):
+            try:
+                decoded = json.loads(node)
+            except ValueError:
+                hits.append((path, ""))  # names a field, unparseable: refuse it too
+                return
+            walk(decoded, path)
+
+    walk(config, path)
+    return hits
+
+
 def market_condition_leaf_fields_in(config: Any, path: str = "config"
                                    ) -> List[Tuple[str, str]]:
     """``(label, field)`` for every condition leaf anywhere in ``config`` whose ``field`` is a
@@ -582,36 +644,13 @@ def market_condition_leaf_fields_in(config: Any, path: str = "config"
     has none. Walks dicts and lists, and JSON-encoded rule trees held as strings (expert
     settings store trees that way).
 
-    A string that NAMES a market field but does not parse as a tree yields ``(path, "")`` -- an
-    unservable field name, so every caller refuses it rather than walking past something it
+    A string that NAMES a market field but does not parse as a tree yields ``(path, "")`` --
+    an unservable field name, so every caller refuses it rather than walking past something it
     could not read."""
-    import json
-
     from ba2_common.core.market_conditions import PROFILES
 
-    fields = {f.name for prof in PROFILES.values() for f in prof.fields}
-    hits: List[Tuple[str, str]] = []
-
-    def walk(node: Any, path: str) -> None:
-        if isinstance(node, dict):
-            field = node.get("field")
-            if isinstance(field, str) and field in fields:
-                hits.append(((str(node["id"]) if node.get("id") else path), field))
-            for key, value in node.items():
-                walk(value, f"{path}.{key}")
-        elif isinstance(node, (list, tuple)):
-            for i, value in enumerate(node):
-                walk(value, f"{path}[{i}]")
-        elif isinstance(node, str) and node[:1] in ("{", "[") and any(f in node for f in fields):
-            try:
-                decoded = json.loads(node)
-            except ValueError:
-                hits.append((path, ""))  # names a market field, unparseable: refuse it too
-                return
-            walk(decoded, path)
-
-    walk(config, path)
-    return hits
+    return named_field_leaves_in(
+        config, {f.name for prof in PROFILES.values() for f in prof.fields}, path)
 
 
 def market_condition_leaves_in(config: Any) -> List[str]:
@@ -702,6 +741,13 @@ def _wire_provider_resolver() -> None:
         override = _current_ohlcv_override()
         if category == "ohlcv" and override is not None:
             return override
+        if category == "ohlcv":
+            # A backtest never reads a history other than its own: the name an expert's bundle
+            # asks for ("fmp") is the LIVE registry key and is not honoured while a run is active.
+            source = _current_history_source()
+            if source is not None:
+                from ba2_common.core.ohlcv_history import history_registry_key
+                return get_provider(category, history_registry_key(source), **kwargs)
         return get_provider(category, name, **kwargs)
 
     TradeConditions.set_provider_resolver(_resolve)
@@ -718,13 +764,19 @@ def make_indicator_provider(ohlcv_provider: Any = None) -> Any:
 
     Args:
         ohlcv_provider: the OHLCV provider to back the indicator calc. If omitted, the
-            default ohlcv/"fmp" provider is constructed. The backtest engine passes its
+            default provider is constructed (the running backtest's history source, else ohlcv/"fmp"). The backtest engine passes its
             as_of-aware OHLCV provider so ATR is computed against the backtest cache.
     """
     from ba2_providers import get_provider
 
     if ohlcv_provider is None:
-        ohlcv_provider = get_provider("ohlcv", "fmp")
+        # The running backtest's history when there is one, else the live default (fmp).
+        source = _current_history_source()
+        if source is None:
+            ohlcv_provider = get_provider("ohlcv", "fmp")
+        else:
+            from ba2_common.core.ohlcv_history import history_registry_key
+            ohlcv_provider = get_provider("ohlcv", history_registry_key(source))
     return get_provider("indicators", "pandas", ohlcv_provider=ohlcv_provider)
 
 
@@ -746,8 +798,13 @@ class MetricStoreATRProvider:
     repeated construction is cheap.
     """
 
-    def __init__(self, store_dir: str):
+    def __init__(self, store_dir: str, session_date_fn: Optional[Callable[[Any], Any]] = None):
         self._store_dir = store_dir
+        # ``AsOfPriceSource.daily_session_date``: the newest session whose daily data is knowable
+        # at the decision instant ``end_date``. The store's row for day S holds ATR from S's
+        # FINISHED bar, so an intraday 09:30 decision on S must read the prior session's row.
+        # None (unit tests) = the date of ``end_date`` itself, the daily-clock reading.
+        self._session_date_fn = session_date_fn
 
     def get_indicator(self, symbol: str, indicator: str, start_date: Any = None,
                       end_date: Any = None, lookback_days: Any = None, interval: str = "1d",
@@ -760,11 +817,18 @@ class MetricStoreATRProvider:
         if end_date is None:
             return empty  # never fall back to wall-clock here — see class docstring
         col = f"atr_{int(period)}"
+        # The session date comes from the clock owner / the calendar OUTSIDE the store guard: a calendar
+        # failure is a defect and must propagate, never read as "no ATR for this symbol".
+        if self._session_date_fn is not None:
+            day = self._session_date_fn(end_date).strftime("%Y-%m-%d")
+        else:
+            day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
         try:
             df = ms.load_store(self._store_dir)
-            day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
             rows = ms.metrics_as_of(df, day, [col])
-        except Exception:  # noqa: BLE001 — any store issue -> safe empty (caller's no-ATR fallback)
+        except ms.MetricStoreStaleError:
+            raise  # a stale store must fail the run loudly, not size without ATR
+        except Exception:  # noqa: BLE001 — a STORE issue -> safe empty (caller's no-ATR fallback)
             return empty
         row = rows.get(symbol.upper()) or rows.get(symbol)
         if not row:
@@ -780,10 +844,12 @@ class MetricStoreATRProvider:
             return empty
 
 
-def make_atr_cache_indicator_provider(screener_store: Optional[str]) -> Optional[Any]:
+def make_atr_cache_indicator_provider(screener_store: Optional[str],
+                                      session_date_fn: Optional[Callable[[Any], Any]] = None
+                                      ) -> Optional[Any]:
     """``MetricStoreATRProvider`` bound to ``screener_store``, or ``None`` when no store is
     configured for this run (caller falls back to ``make_indicator_provider()``, the existing
     — currently non-hermetic in the GA path — live provider)."""
     if not screener_store:
         return None
-    return MetricStoreATRProvider(screener_store)
+    return MetricStoreATRProvider(screener_store, session_date_fn=session_date_fn)

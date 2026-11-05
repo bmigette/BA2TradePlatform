@@ -39,6 +39,7 @@ from ...core.db import InstanceNotFound, add_instance, get_db, get_instance, upd
 from ...core.interfaces import AccountInterface
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.models import Position, TradingOrder, Transaction
+from ...core.pending_cancel import mark_pending_cancel
 from ...core.types import (
     AssetClass as CoreAssetClass, BrokerOrderErrorReason, OrderDirection, OrderOpenType,
     OrderStatus)
@@ -208,6 +209,8 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     #: An expert may not size from cash / net liquidation when IBKR's buying power cannot be derived
     #: (``AvailableFunds`` is far below net liquidation on a margin account): sizing is refused instead.
     buying_power_is_mandatory = True
+    #: IBKR's snapshot (``_snapshot_inputs``) and info (``_account_numbers``) are separate reads.
+    snapshot_is_derived_from_account_info = False
 
     #: Overridable in tests with a fake; the runtime builds the IB object ON its loop thread.
     _ib_factory = staticmethod(IB)
@@ -741,22 +744,27 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             return None
         positions = []
         for row in rows:
+            # SIGNED, like Alpaca and TastyTrade (the platform's one Position convention): a short has
+            # a NEGATIVE qty, cost basis and market value. A magnitude here made
+            # get_signed_position_quantity / the exposure gate read an IBKR short as a long.
+            sign = 1.0 if row["qty"] > 0 else -1.0
             qty = abs(row["qty"])
-            cost_basis = row["avg_cost"] * qty
-            market_value = abs(row["market_value"])
+            signed_qty = sign * qty
+            cost_basis = sign * row["avg_cost"] * qty
+            market_value = sign * abs(row["market_value"])
             last_day = row["prev_close"] if row["prev_close"] else row["mark"]
-            intraday_pl = (row["mark"] - last_day) * qty * (1 if row["qty"] > 0 else -1)
+            intraday_pl = (row["mark"] - last_day) * signed_qty
             positions.append(Position(
                 asset_class="Equity", avg_entry_price=row["avg_cost"], avg_entry_swap_rate=None,
                 change_today=((row["mark"] - last_day) / last_day) if last_day else 0.0,
                 cost_basis=cost_basis, current_price=row["mark"], exchange=row["exchange"],
-                lastday_price=last_day, market_value=market_value, qty=qty, qty_available=qty,
+                lastday_price=last_day, market_value=market_value, qty=signed_qty, qty_available=signed_qty,
                 side=OrderDirection.BUY if row["qty"] > 0 else OrderDirection.SELL,
                 swap_rate=None, symbol=row["symbol"],
                 unrealized_intraday_pl=intraday_pl,
                 unrealized_intraday_plpc=(intraday_pl / (last_day * qty)) if last_day and qty else 0.0,
                 unrealized_pl=row["unrealized"],
-                unrealized_plpc=(row["unrealized"] / cost_basis) if cost_basis else 0.0))
+                unrealized_plpc=(row["unrealized"] / abs(cost_basis)) if cost_basis else 0.0))
         return positions
 
     def refresh_positions(self) -> bool:
@@ -1885,7 +1893,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             for target in targets:
                 if results.get(target.broker_order_id):
                     fresh = get_instance(TradingOrder, target.id)
-                    fresh.status = OrderStatus.PENDING_CANCEL
+                    mark_pending_cancel(fresh)
                     update_instance(fresh)
             if ok:
                 logger.info(f"[Account {self.id}] requested cancel of IBKR order "
@@ -2476,6 +2484,21 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
         except Exception as e:  # noqa: BLE001
             logger.error(f"[Account {self.id}] error fetching filled trades: {e}", exc_info=True)
             return []
+        return self._trades_from_fills(fills, symbol, start_date, end_date)
+
+    def get_filled_trades_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_filled_trades`` that RAISES when the executions cannot be read (the lenient one answers []) AND when
+        the window asked for is longer than the ~``_EXECUTION_WINDOW_DAYS`` days the IBKR API keeps (a missing or older
+        ``start_date`` would otherwise hand back a truncated history as if it were complete): ``ValueError``."""
+        floor = self._utcnow() - timedelta(days=self._EXECUTION_WINDOW_DAYS)
+        start = None if start_date is None else (start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc))
+        if start is None or start < floor:
+            raise ValueError(f"IBKR keeps only the last {self._EXECUTION_WINDOW_DAYS} days of executions; "
+                             f"a complete history older than that is not available through the API")
+        fills = self._call(self._read_fills, op="executions", timeout=40.0)
+        return self._trades_from_fills(fills, symbol, start_date, end_date)
+
+    def _trades_from_fills(self, fills, symbol, start_date, end_date):
         if start_date is not None:
             floor = self._utcnow() - timedelta(days=self._EXECUTION_WINDOW_DAYS)
             start = start_date if start_date.tzinfo else start_date.replace(tzinfo=timezone.utc)
@@ -2513,6 +2536,26 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     def get_balance_history(self, start_date=None, end_date=None):
         return self._flex_balance_history(start_date, end_date)
 
+    def get_dividends_strict(self, symbol=None, start_date=None, end_date=None):
+        """``get_dividends`` that RAISES when Flex is not configured (``ValueError``) or its fetch fails
+        (``ConnectionError``) or the statement holds no data, instead of answering []."""
+        return flex.dividends_from(self._flex_statements_strict("dividend history"), symbol, start_date, end_date)
+
+    def get_balance_history_strict(self, start_date=None, end_date=None):
+        """``get_balance_history`` that RAISES like ``get_dividends_strict``."""
+        return flex.balance_history_from(self._flex_statements_strict("balance history"), start_date, end_date)
+
+    def _flex_statements_strict(self, what: str) -> List[FlexStatement]:
+        if not self.settings.get("flex_token") or not self.settings.get("flex_query_id"):
+            raise ValueError(f"IBKR {what} needs 'flex_token' and 'flex_query_id' in the account settings")
+        try:
+            statements = self._flex_statements(what, strict=True)
+        except Exception as e:  # noqa: BLE001 -- the Flex client raises its own types: all are "unreachable" here
+            raise ConnectionError(f"IBKR Flex fetch for {what} failed: {type(e).__name__}") from e
+        if not statements:
+            raise ValueError(f"the Flex statement contains no data for account {self._account_id}")
+        return statements
+
     def get_cash_transfers(self, start_date=None, end_date=None):
         return self._flex_cash_transfers(start_date, end_date)
 
@@ -2521,7 +2564,7 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
     _flex_http_get = staticmethod(default_http_get)
     _FLEX_CACHE_SECONDS = 600.0
 
-    def _flex_statements(self, what: str) -> Optional[List[FlexStatement]]:
+    def _flex_statements(self, what: str, strict: bool = False) -> Optional[List[FlexStatement]]:
         """The Flex statement(s) for this account, cached 10 minutes (IBKR rate-limits Flex), or
         ``None`` when Flex is not configured or the fetch failed (both logged)."""
         token, query_id = self.settings.get("flex_token"), self.settings.get("flex_query_id")
@@ -2539,6 +2582,8 @@ class IBKRAccount(ProtectiveLegsMixin, IBKROptionsMixin, AccountInterface, Optio
             statements = FlexClient(str(token), str(query_id), http_get=self._flex_http_get).fetch(
                 self._account_id)
         except Exception as e:  # noqa: BLE001 -- a seam without tri-state: log + []
+            if strict:
+                raise
             logger.error(f"[Account {self.id}] IBKR Flex fetch for {what} failed: "
                          f"{type(e).__name__}: {e}", exc_info=True)
             return None

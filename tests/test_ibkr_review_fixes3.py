@@ -329,10 +329,13 @@ class TestClampBuyingPowerMandatory:
         assert MarketExpertInterface._get_actual_available_balance(account) == 160000.0
 
     @pytest.mark.parametrize("cls_name", ["AlpacaAccount", "TastyTradeAccount"])
-    def test_alpaca_and_tastytrade_keep_the_existing_fallback_chain_byte_for_byte(self, cls_name):
-        """Legacy chain: snapshot.buying_power -> info[buying_power|cash|cash_balance|equity_buying_power]
-        -> get_balance() -> None. None of it may change for a broker that does not opt in."""
+    def test_alpaca_and_tastytrade_keep_the_existing_fallback_chain(self, cls_name, monkeypatch):
+        """Chain: snapshot.buying_power -> info[buying_power|cash|cash_balance|equity_buying_power] -> None.
+        The get_balance() (equity) substitute was REMOVED 2026-10-07 (audit item 19): equity is not
+        buying power, a missing figure is retried then reported at ERROR, and the clamp is skipped."""
         import importlib
+        from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface as _M
+        monkeypatch.setattr(_M, "_ACTUAL_BP_SLEEP", staticmethod(lambda s: None))
         from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
         cls = getattr(importlib.import_module(f"ba2_trade_platform.modules.accounts.{cls_name}"), cls_name)
         clamp = MarketExpertInterface._get_actual_available_balance
@@ -342,12 +345,12 @@ class TestClampBuyingPowerMandatory:
 
             def snap():
                 if snap_raises:
-                    raise RuntimeError("snap")
+                    raise ConnectionError("snap")
                 return SimpleNamespace(buying_power=snap_bp)
 
             def get_info():
                 if info_raises:
-                    raise RuntimeError("info")
+                    raise ConnectionError("info")
                 return info
 
             def get_balance():
@@ -359,11 +362,24 @@ class TestClampBuyingPowerMandatory:
         assert clamp(build(1234.5, {"buying_power": 9.0}, 7.0)) == 1234.5            # snapshot first
         assert clamp(build(None, {"buying_power": 55.0, "cash": 9.0}, 7.0)) == 55.0   # then info
         assert clamp(build(None, {"cash": 42.0}, 7.0)) == 42.0                        # then cash
-        assert clamp(build(None, {}, 7.0)) == 7.0                                     # then get_balance
-        assert clamp(build(None, None, 7.0, info_raises=True)) == 7.0                 # a failing info -> balance
+        assert clamp(build(None, {}, 7.0)) is None                                    # no figure: no clamp (was: equity)
+        assert clamp(build(None, None, 7.0, info_raises=True)) is None                # failing info: retried, no clamp
         assert clamp(build(None, {}, None, balance_raises=True)) is None              # nothing: None
         assert clamp(build(None, {"equity_buying_power": 11.0}, 7.0, snap_raises=True)) == 11.0
         assert clamp(build(float("nan"), {"cash": 5.0}, 7.0)) == 5.0                  # NaN snapshot is unusable
+        # Counterpart of the cases above, which raise ConnectionError (an OSError: retried, then skipped):
+        # a NON-OSError (here RuntimeError) is no longer absorbed -- it propagates, unretried.
+        class _Sdk(Exception):
+            pass
+
+        sdk_acct = build(None, {"cash": 5.0}, 7.0)
+        sdk_acct.get_account_snapshot = lambda: (_ for _ in ()).throw(_Sdk("snap"))
+        with pytest.raises(_Sdk):
+            clamp(sdk_acct)
+        sdk_acct = build(None, {}, 7.0)
+        sdk_acct.get_account_info = lambda: (_ for _ in ()).throw(_Sdk("info"))
+        with pytest.raises(_Sdk):
+            clamp(sdk_acct)
 
 
 # ======================================================================= 6 / 7  nonce noise, refused re-submission

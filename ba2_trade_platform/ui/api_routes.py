@@ -10,15 +10,23 @@ and re-read from the DB, without a full process restart) and a
 manual schedule trigger (the API equivalent of the Scheduled Jobs page's "Run Now" button,
 for restarting a job that's already fired today -- e.g. a screener scan that returned nothing
 because of a since-fixed data bug -- without waiting for its next scheduled occurrence).
+
+Also served under /api/v1 (see ba2_trade_platform/api/maintenance.py); these paths are the legacy aliases.
 """
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..api.audit import AuditedRoute
+from ..api.auth import require_access
 from ..logger import logger
 
-router = APIRouter(prefix="/api", tags=["reload"])
+# Legacy /api/* paths: aliases of the /api/v1 maintenance endpoints (api/maintenance.py registers the same
+# functions). Behind the same access rule as /api/v1 -- non-local callers need api_allow_remote, and with no
+# api_token set the writes answer 403.
+router = APIRouter(prefix="/api", tags=["reload"], route_class=AuditedRoute,
+                   dependencies=[Depends(require_access)])
 
 
 class ReloadRequest(BaseModel):
@@ -46,6 +54,12 @@ def reload_from_db(body: ReloadRequest = ReloadRequest()):
     from ..core.ExpertInstanceCache import ExpertInstanceCache
     from ..core.instance_registry import drop_market_condition_resolver
     from ..core.JobManager import get_job_manager
+
+    try:      # the iv_rank gate answer of the ATM-IV analysis-task hook is cached 5 min
+        from ..modules.dataproviders.options.atm_iv_task_hook import invalidate_gate_cache
+        invalidate_gate_cache()
+    except Exception as e:  # noqa: BLE001 - never block a reload
+        logger.warning(f"atm_iv_task_hook.invalidate_gate_cache failed: {e}")
 
     if body.expert_instance_id is None and body.account_id is None:
         experts_reloaded = ExpertInstanceCache.get_cache_stats()["expert_instance_ids"]
@@ -91,8 +105,7 @@ class RunScheduleRequest(BaseModel):
     subtype: str
 
 
-@router.post("/run-schedule")
-def run_schedule_now(body: RunScheduleRequest):
+def run_schedule(expert_instance_id: int, subtype_text: str, dry_run: bool = False):
     """Manually fire a currently-registered scheduled analysis job right now -- the API
     equivalent of the Scheduled Jobs page's "Run Now" button. Restarting a job normally
     means waiting for its next cron occurrence (e.g. next Monday 09:30 ET); this lets an
@@ -111,11 +124,11 @@ def run_schedule_now(body: RunScheduleRequest):
     from ..core.types import AnalysisUseCase
 
     try:
-        subtype = AnalysisUseCase(body.subtype)
+        subtype = AnalysisUseCase(subtype_text)
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid subtype {body.subtype!r}; expected one of "
+            detail=f"Invalid subtype {subtype_text!r}; expected one of "
                    f"{[m.value for m in AnalysisUseCase]}",
         )
 
@@ -123,7 +136,7 @@ def run_schedule_now(body: RunScheduleRequest):
     match = None
     for job in jm._scheduled_jobs.values():
         args = getattr(job, "args", None) or []
-        if len(args) >= 3 and args[0] == body.expert_instance_id and args[2] == subtype:
+        if len(args) >= 3 and args[0] == expert_instance_id and args[2] == subtype:
             match = args
             break
 
@@ -131,11 +144,19 @@ def run_schedule_now(body: RunScheduleRequest):
         raise HTTPException(
             status_code=404,
             detail=f"No currently-scheduled job found for expert_instance_id="
-                   f"{body.expert_instance_id}, subtype={subtype.value!r} "
+                   f"{expert_instance_id}, subtype={subtype.value!r} "
                    f"(is the expert enabled? does it have this schedule configured?)",
         )
 
     expert_instance_id, symbol, resolved_subtype = match[0], match[1], match[2]
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "would_submit": True,
+            "expert_instance_id": expert_instance_id,
+            "symbol": symbol,
+            "subtype": resolved_subtype.value,
+        }
     try:
         task_id = jm.submit_market_analysis(
             expert_instance_id, symbol, subtype=resolved_subtype,
@@ -164,6 +185,12 @@ def run_schedule_now(body: RunScheduleRequest):
         "symbol": symbol,
         "subtype": resolved_subtype.value,
     }
+
+
+@router.post("/run-schedule")
+def run_schedule_now(body: RunScheduleRequest):
+    """Fire a registered schedule now (see ``run_schedule``); also served as POST /api/v1/run-schedule."""
+    return run_schedule(body.expert_instance_id, body.subtype)
 
 
 class ProcessRecommendationsRequest(BaseModel):

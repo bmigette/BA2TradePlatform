@@ -190,7 +190,10 @@ def test_discovery_lists_fb_for_pre_rename_expiries_and_emits_meta_contracts():
     assert by_exp[EXP] == {190.0}
     assert len([c for c in out if c.expiry == EXP and c.strike == 190.0]) == 2
     probes = [(sym, a, b) for name, sym, a, b in client.calls if name == "greeks_eod"]
-    assert probes == [("META", EXP - timedelta(days=14), EXP)]      # after the cutover only
+    # FB lists EXP too, which expires after FB's segment: kept only for the strikes FB quoted
+    # in its last 14 days (review 2026-09-26), then META's own strikes after the cutover
+    assert probes == [("FB", CUT - timedelta(days=15), CUT - timedelta(days=1)),
+                      ("META", EXP - timedelta(days=14), EXP)]
 
 
 def test_the_live_strike_probe_never_reaches_before_the_cutover():

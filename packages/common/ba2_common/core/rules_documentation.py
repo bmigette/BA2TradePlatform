@@ -506,6 +506,21 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Close the straddle the day after the print: days_after_event >= 1"
         },
+        ExpertEventType.N_ENTRY_TAG.value: {
+            "name": "Entry Tag (style-group member)",
+            "description": (
+                "For an open position: which MEMBER of a composed (style-group) option expert "
+                "opened it -- the integer tag the member's entry action stamped on its entry "
+                "order. Style experts AND it into every member exit (entry_tag == <member "
+                "tag>) so one open-positions ruleset carries each member's own exits. It is a "
+                "LABEL: only == and != compare it, and the value must be a positive integer. "
+                "A position whose entry order carries no tag is UNEVALUABLE and does NOT fire "
+                "for either operator. Written by the style builder, not meant to be typed by "
+                "hand: a wrong tag routes a position to another member's exits."
+            ),
+            "type": "numeric",
+            "example": "Scope the long-call member's take-profit to its own positions: entry_tag == 1"
+        },
         ExpertEventType.N_DAYS_TO_EXPIRY.value: {
             "name": "Days to Expiry (remaining option life)",
             "description": (
@@ -562,6 +577,40 @@ def get_event_type_documentation() -> dict:
             ),
             "type": "numeric",
             "example": "Buy the written call back when covered_call_days_to_expiry <= 7"
+        },
+        ExpertEventType.N_SPY_TREND_REGIME.value: {
+            "name": "SPY Trend Regime (market gate)",
+            "description": (
+                "The MARKET's trend, not the instrument's: SPY's last finished daily close against "
+                "its 200-day average, and whether its 50-day average is rising (now vs 10 sessions "
+                "ago). Compare with '==' against a mode: up (1: above and rising), pullback (2: "
+                "above and falling), bear_rally (3: below and rising), down (4: below and falling), "
+                "above_200 (5: up or pullback), below_200 (6: bear_rally or down). The same rule "
+                "runs in the backtest and live. UNKNOWN NEVER PASSES: with fewer than 210 SPY "
+                "closes, no SPY data or nothing published yet the gate is false and says why in the "
+                "activity log (no_regime / insufficient_history); a backtest logs the first date a "
+                "regime exists, so a window that starts earlier trades fewer days. Live reads SPY "
+                "daily closes from FMP like the stock prices; a backtest on another history source "
+                "can classify a few days differently, and a live account whose data feed is not FMP "
+                "only logs a daily warning (it is not refused)."
+            ),
+            "type": "numeric",
+            "example": "Enter only when spy_trend_regime == 5 (SPY above its 200-day average)"
+        },
+        ExpertEventType.N_SPY_VOL_REGIME.value: {
+            "name": "SPY Volatility Regime (market gate)",
+            "description": (
+                "The MARKET's volatility regime: SPY's 20-day realised volatility ranked over the "
+                "last 504 sessions (calm below the 30th percentile, stressed above the 70th). "
+                "Compare with '==' against a mode: calm (1), normal (2), stressed (3), "
+                "not_stressed (4: calm or normal), not_calm (5: normal or stressed). UNKNOWN NEVER "
+                "PASSES: with fewer than 524 SPY closes, no SPY data or nothing published yet the "
+                "gate is false and says why (no_regime / insufficient_history). Same source rule as "
+                "spy_trend_regime: live reads FMP daily closes; the vol percentile is the axis most "
+                "sensitive to a different history source."
+            ),
+            "type": "numeric",
+            "example": "Sell premium only when spy_vol_regime == 4 (SPY not stressed)"
         },
         ExpertEventType.N_CREDIT_DECAYED_PCT.value: {
             "name": "Credit Decayed % (the buyback trigger)",

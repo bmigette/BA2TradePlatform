@@ -13,6 +13,7 @@ from ba2_common.core.account_types import (
 )
 from threading import Lock
 from ba2_common.logger import logger
+from ba2_common.core.ohlcv_history import ACCOUNT_DEFAULT_HISTORY_SOURCE, ACCOUNT_HISTORY_SOURCE_KEY, HISTORY_SOURCES
 from ba2_common.core.models import AccountSetting
 from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
@@ -217,6 +218,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     For trading-capable accounts, subclass AccountInterface instead (which inherits this).
     """
     SETTING_MODEL = AccountSetting
+
+    #: True when ``get_account_snapshot()`` is built from the very broker read ``get_account_info()``
+    #: makes (the base derives one from the other; AlpacaAccount's snapshot calls ``get_account_info``;
+    #: TastyTrade's both call ``get_balances``). An EMPTY snapshot from such an adapter already means
+    #: that read failed, so the buying-power clamp does not repeat it through ``get_account_info()``
+    #: (``MarketExpertInterface._read_actual_buying_power``): that doubled the REST calls and the adapter
+    #: ERROR tracebacks of every outage. An adapter whose two reads are independent sets False (IBKR).
+    snapshot_is_derived_from_account_info = True
     SETTING_LOOKUP_FIELD = "account_id"
 
     # Whether this account supports trading operations
@@ -256,6 +265,19 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "default": 1.8,
                     "description": "Margin factor (max exposure / balance)",
                     "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0."
+                },
+                # ONE definition for every account type (plan 2026-10-24-history-source-task11); the default and the
+                # valid values come from ohlcv_history, the only place that spells them.
+                ACCOUNT_HISTORY_SOURCE_KEY: {
+                    "type": "str",
+                    "required": False,
+                    "default": ACCOUNT_DEFAULT_HISTORY_SOURCE,
+                    "description": "Live OHLCV history source",
+                    "valid_values": sorted(HISTORY_SOURCES),
+                    "tooltip": "fmp = FMP daily / 5-min history (cache topped up from FMP). alpaca = Alpaca-derived, "
+                               "split-verified history (the cache backtests use), topped up with raw finished sessions; "
+                               "needs Alpaca market-data keys (Alpaca accounts only). Current prices are set by the price "
+                               "feed, not this. Expert and ATR history reads follow a change on the next read; the option IV history of an Alpaca account and the daily corporate-actions job follow after /api/reload.",
                 },
             }
 
@@ -556,8 +578,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         return float(raw)
 
     def _plain_balance(self) -> float:
-        """``get_balance()``, refusing the unknown. Margin off, and the margin path's
-        first step, share this: a fabricated balance is a fabricated order size."""
+        """The sizing balance -- ``get_balance()`` (EQUITY at every live broker), refusing the
+        unknown. Margin off, and the margin path's first step, share this: a fabricated balance
+        is a fabricated order size. ``BacktestAccount`` overrides it with its deployed equity (its
+        ``get_balance()`` is cash), so every reader of this seam -- the classic RM's virtual
+        balance, the option buying-power gate, the margin ceiling -- sees the same quantity in a
+        backtest as live."""
         balance = self.get_balance()
         if balance is None:
             raise ValueError(
@@ -703,8 +729,8 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         For a sizer of a TARGET BOOK ("this name is w% of what I own"), which is a different
         question from ``get_tradable_balance``'s "what may I still spend". At every live
         broker the two are the same number (``get_balance()`` is equity there); on the
-        backtest account ``get_balance()`` is CASH (finding 6, left as is for the classic
-        RM), so a book sized on it reads a fully invested account as nearly empty.
+        backtest account ``get_balance()`` is CASH, but its sizing balance (``_plain_balance``)
+        is its deployed equity since finding 6 was fixed (2026-10-07), so they agree there too.
         ``get_account_snapshot().equity`` means cash + marks in BOTH runtimes -- the backtest
         publishes its (equity-cap-clamped) ``deployed_equity()`` there -- which is why this
         reads it.
@@ -2234,8 +2260,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     market_entry_orders = [o for o in orders if not o.depends_on_order]
                     dependent_orders = [o for o in orders if o.depends_on_order]
 
-                    # Check if any market entry order is filled (to open transaction)
-                    has_filled_entry_order = any(order.status in executed_statuses for order in market_entry_orders)
+                    # Check if any market entry order is filled (to open transaction). An entry
+                    # CANCELED after a PARTIAL fill counts: those shares traded. 2026-10-29 RAPP
+                    # (dev account 1): entry 1438 filled 34 of 35, was cancelled, and transaction
+                    # 432 was never opened, then closed as all_orders_terminal with 34 held.
+                    def _entry_filled(order):
+                        return order.status in executed_statuses or (order.filled_qty or 0) > 0
+                    has_filled_entry_order = any(_entry_filled(order) for order in market_entry_orders)
 
                     # Check if all MARKET ENTRY orders are in terminal state
                     all_entry_orders_terminal = (
@@ -2442,7 +2473,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # Update open_price from the oldest filled market entry order
                     filled_entry_orders = [
                         order for order in market_entry_orders
-                        if order.status in executed_statuses and order.open_price
+                        if _entry_filled(order) and order.open_price
                     ]
                     if filled_entry_orders:
                         oldest_order = min(filled_entry_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
@@ -2633,8 +2664,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         new_status = TransactionStatus.CLOSED
                         has_changes = True
 
-                    # ANY STATUS -> CLOSED: If all orders are in terminal state
-                    elif all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
+                    # ANY STATUS -> CLOSED: If all orders are in terminal state AND nothing is
+                    # still held. A transaction whose orders are all done but whose fills do not
+                    # balance still owns those shares; closing it leaves them untracked (the
+                    # RAPP 34 above). It stays OPENED so exit management and the breached-stop
+                    # sweep keep covering it.
+                    elif (all_orders_terminal and transaction.status != TransactionStatus.CLOSED
+                          and equity_position_is_flat):
                         from ba2_common.core.utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,
@@ -2874,14 +2910,23 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 if any(o.asset_class == AssetClass.OPTION for o in txn_orders):
                     continue
 
-                # Stamp a close price from the last known market price (best-effort, so P&L
-                # is recorded). Leave it unset if unavailable rather than guessing.
-                try:
-                    price = self.get_instrument_current_price(txn.symbol)
-                    if price:
-                        txn.close_price = float(price)
-                except Exception:  # noqa: BLE001
-                    pass
+                # THE CLOSE PRICE IS THE FILL THAT CLOSED THE POSITION. This used to stamp the
+                # market price AT RECONCILE TIME, which is a guess. A broker-side TP fill at 24.13
+                # was recorded as 23.49 (EVER tx 202, 2026-09-11), and positions sold by hand at
+                # 18:16 got that day's 20:15 price (2026-06-29, 11 rows). Unknown stays unknown:
+                # no fill found means no close price, logged at ERROR, never a substitute.
+                fill = self._external_close_fill(txn, txn_orders)
+                if fill is None:
+                    logger.error(
+                        f"[Account {self.id}] reconcile: no fill found that closed transaction "
+                        f"{txn.id} ({txn.symbol}); closing it WITHOUT a close price, so its "
+                        f"realised P/L is unknown until it is repaired by hand")
+                else:
+                    txn.close_price, fill_time, source = fill
+                    if fill_time is not None:
+                        txn.close_date = fill_time
+                    logger.info(f"[Account {self.id}] reconcile: transaction {txn.id} "
+                                f"({txn.symbol}) close price {txn.close_price} from {source}")
 
                 # Cancel any still-resting orders for this transaction (the broker has
                 # already released the position, so these can never fill correctly).
@@ -2907,6 +2952,55 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 session.commit()
 
         return closed_count
+
+    def _external_close_fill(self, txn, txn_orders) -> Optional[Tuple[float, Optional[datetime], str]]:
+        """``(price, fill time or None, source)`` of the fill that closed ``txn``, or None.
+
+        Asked when the broker no longer holds the position. In order:
+
+        1. the transaction's OWN filled closing orders (a broker-side TP/SL/OCO fill the
+           order-driven refresh had not turned into a close yet). Used only when they cover the
+           whole quantity; the price is their quantity-weighted average fill price
+           (``TradingOrder.open_price``);
+        2. the BROKER's fill history (``get_closing_fill``), for a position closed outside
+           the platform.
+
+        None when neither knows. Callers record no price then: the market price at the time of
+        the check is not what the position was sold at.
+        """
+        from ba2_common.core.types import OrderDirection
+        closing_side = OrderDirection.SELL if txn.side == OrderDirection.BUY else OrderDirection.BUY
+        want = abs(float(txn.quantity or 0))
+        qty = value = 0.0
+        for o in txn_orders:
+            if o.side != closing_side or o.status != OrderStatus.FILLED:
+                continue
+            px = o.open_price                 # TradingOrder's fill price ("opened at")
+            q = float(o.filled_qty or o.quantity or 0)
+            if px is None or q <= 0:
+                continue
+            qty += q
+            value += q * float(px)
+        if want > 0 and qty >= want - 1e-9:
+            return value / qty, None, "its own filled closing order(s)"
+
+        since = txn.open_date
+        if since is not None and since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        broker = self.get_closing_fill(txn.symbol, closing_side, want, since)
+        if broker is None:
+            return None
+        price, when = broker
+        return float(price), when, "the broker's fill history"
+
+    def get_closing_fill(self, symbol: str, side, quantity: float,
+                         since: Optional[datetime]) -> Optional[Tuple[float, datetime]]:
+        """``(quantity-weighted average price, time of the last fill)`` of the broker fills on
+        ``side`` that closed ``quantity`` of ``symbol`` after ``since``, or None.
+
+        The base has no fill history and answers None. Accounts that can read their broker's
+        executions override it (``AlpacaAccount``)."""
+        return None
 
     @abstractmethod
     def get_dividends(self, symbol: Optional[str] = None, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> List[Dict]:

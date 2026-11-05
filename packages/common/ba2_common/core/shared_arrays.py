@@ -380,19 +380,7 @@ class DerivedArrayStore:
                 return opened
             key_dir.mkdir(parents=True, exist_ok=True)
             if self._acquire(lock):
-                try:
-                    opened = self._try_open(final)
-                    if opened is None:
-                        self._build(final, build_fn, lock)
-                        opened = self._try_open(final)
-                        if opened is None:
-                            raise RuntimeError(
-                                f"shared_arrays: build of {final} left no readable set"
-                            )
-                    self._remove_stale_siblings(final)
-                    return opened
-                finally:
-                    self._release(lock)
+                return self._build_holding(final, build_fn, lock)
             # Somebody else holds the lock: wait for what they publish, and take over if they
             # die. A loop, not recursion -- a long-lived worker must not grow a stack per retry.
             t_wait = time.monotonic()
@@ -410,7 +398,50 @@ class DerivedArrayStore:
                     f"shared_arrays: {final} never settled after {2 * LOCK_STALE_S:.0f}s"
                 )
 
+    def open_or_build_nowait(self, key: str, sources: Iterable[PathLike],
+                             build_fn: BuildFn) -> Optional[ArrayDict]:
+        """``build_or_open`` that never WAITS: None while another process holds the build lock.
+
+        For a cache whose caller has an exact slow path to fall back on. ``build_or_open``
+        parks every other process on the lock until the builder publishes, which is right when
+        the arrays are the only way to answer -- and wrong when every worker of a grid walks the
+        SAME symbols in the SAME order: they would queue behind one builder per key and turn a
+        parallel warm-up into a serial one. Here the losers answer from their slow path, move on
+        to the next key, and find what the winner published on a later call.
+
+        Under ``BA2_SHARED_ARRAYS=0`` it is ``build_fn()``, like ``build_or_open``.
+        """
+        if not enabled():
+            return build_fn()
+        sources = [Path(s) for s in sources]
+        sig = self.signature(sources)
+        key_dir = self.key_dir(key)
+        final = key_dir / sig
+        opened = self._try_open(final)
+        if opened is not None:
+            return opened
+        key_dir.mkdir(parents=True, exist_ok=True)
+        lock = key_dir / (sig + ".lock")
+        if not self._acquire(lock):
+            return None
+        return self._build_holding(final, build_fn, lock)
+
     # ------------------------------------------------------------------- internals
+
+    def _build_holding(self, final: Path, build_fn: BuildFn, lock: Path) -> ArrayDict:
+        """Build (unless a racer published first) and open ``final``; ``lock`` is ours and is
+        released here whatever happens."""
+        try:
+            opened = self._try_open(final)
+            if opened is None:
+                self._build(final, build_fn, lock)
+                opened = self._try_open(final)
+                if opened is None:
+                    raise RuntimeError(f"shared_arrays: build of {final} left no readable set")
+            self._remove_stale_siblings(final)
+            return opened
+        finally:
+            self._release(lock)
 
     def _try_open(self, final: Path) -> Optional[ArrayDict]:
         """Map every array named by the done-marker of ``final``, or None if it is not usable.

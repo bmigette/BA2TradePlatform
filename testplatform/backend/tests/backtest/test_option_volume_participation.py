@@ -273,7 +273,7 @@ def test_multi_leg_combo_all_legs_liquid_fills(tmp_path):
         [_chain_row(_CALL105, "call", 105.0, _EXP_0315),
          _chain_row(_CALL110, "call", 110.0, _EXP_0315)],
         [_bar_row(_CALL105, "2024-03-06", 56.0, "call", 105.0, _EXP_0315, v=100),
-         _bar_row(_CALL110, "2024-03-06", 50.0, "call", 110.0, _EXP_0315, v=100)],
+         _bar_row(_CALL110, "2024-03-06", 51.5, "call", 110.0, _EXP_0315, v=100)],
     )
     try:
         long_leg = _leg(_CALL105, OrderDirection.BUY, "buy_to_open",
@@ -290,8 +290,9 @@ def test_multi_leg_combo_all_legs_liquid_fills(tmp_path):
 
         assert acct.get_order(parent.id).status == OrderStatus.FILLED
         assert len(acct.get_option_positions()) == 2      # one lot per leg
-        # Net debit 56.0 - 50.0 = 6.0/share -> $600 moved per structure.
-        assert acct._cash == pytest.approx(cash_before - 6.0 * 100.0)
+        # Net debit 56.0 - 51.5 = 4.5/share (inside the 5.00 width: a vertical can never cost
+        # its full width or more) -> $450 moved per structure.
+        assert acct._cash == pytest.approx(cash_before - 4.5 * 100.0)
         assert acct.rejected_illiquid_fills == 0
     finally:
         ctx.__exit__(None, None, None)

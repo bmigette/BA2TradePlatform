@@ -195,7 +195,7 @@ def build_trial_config(opt_id: int, rank: int, label: str, bt_id: int = None) ->
         # determinism probe rather than the persist path.
         hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
         trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
-                                              option_trade_records=False)  # read-only report
+                                              option_trade_records=False, stored_row=True)  # read-only report
     finally:
         db.close()
     trial_cfg["name"] = f"RERUN-{label}"

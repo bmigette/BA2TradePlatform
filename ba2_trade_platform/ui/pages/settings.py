@@ -11,11 +11,13 @@ from ...core.db import (get_db, get_all_instances, delete_instance, add_instance
                         update_instance, get_instance, ruleset_event_actions,
                         rulesets_for_event_action)
 from ...core.instrument_enrichment import enrich_instruments
+from ...core.account_creation_guard import FmpKeyRequired, require_fmp_key_for_account_creation
 from ba2_common.core.instrument_info import needs_instrument_info
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
+from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_weekday_for_display
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, uses_min_one_contract, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -129,9 +131,15 @@ class TriggerTypePicker:
     #: whose trigger has since been retired. Shown, never hidden and never repaired.
     UNKNOWN_NOTE = 'not in this platform\'s catalog'
 
-    def __init__(self, value, on_change=None):
+    def __init__(self, value, on_change=None, rule_subtype=None):
         self._value = value
         self._on_change = on_change
+        # A CALLABLE returning the rule's current Subtype (an AnalysisUseCase value), read at
+        # every render so switching the Subtype re-filters the next open. It narrows what is
+        # OFFERED (trigger_catalog.trigger_offered_for: e.g. no ``entry_tag`` on an entry rule,
+        # where it could never match); a persisted value still renders as itself. None = offer
+        # everything.
+        self._rule_subtype = rule_subtype
         self._category = 'all'
 
         self.root = ui.column().classes('flex-1 gap-1')
@@ -244,8 +252,11 @@ class TriggerTypePicker:
         self._render_chips()
         self._render_results()
 
+    def _subtype(self):
+        return self._rule_subtype() if self._rule_subtype is not None else None
+
     def _render_chips(self) -> None:
-        counts = category_counts()
+        counts = category_counts(self._subtype())
         self._chip_row.clear()
         with self._chip_row:
             for category in TRIGGER_CATEGORIES:
@@ -265,7 +276,7 @@ class TriggerTypePicker:
     def _render_results(self) -> None:
         # An empty query matches everything, so search and category compose through one call:
         # a second "no query" code path is how a category chip silently stops applying.
-        entries = search_triggers(self.search.value or '', self._category)
+        entries = search_triggers(self.search.value or '', self._category, self._subtype())
         self._results.clear()
         with self._results:
             if not entries:
@@ -364,7 +375,16 @@ def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
     """
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import margin_factor_error
     if "margin_factor" in dynamic_settings:
-        return margin_factor_error(dynamic_settings["margin_factor"])
+        problem = margin_factor_error(dynamic_settings["margin_factor"])
+        if problem:
+            return problem
+    if "ohlcv_history_source" in dynamic_settings:
+        # unknown value, or alpaca on an account without Alpaca keys: named, nothing saved
+        from ba2_trade_platform.core.account_history import validate_account_history_source
+        try:
+            validate_account_history_source(dynamic_settings)
+        except ValueError as e:                      # UnknownHistorySource and HistorySourceNeedsAlpacaKeys
+            return f"Not saved: {e}"
     return None
 
 
@@ -854,6 +874,7 @@ class AppSettingsTab:
         'alpaca_api_key': 'alpaca_key_input', 'alpaca_api_secret': 'alpaca_secret_input',
         'worker_count': 'worker_count_input',
         'account_refresh_interval': 'account_refresh_interval_input',
+        'scheduled_session_guard_enabled': 'session_guard_input',
     }
 
     def _shown_value(self, key: str):
@@ -863,6 +884,16 @@ class AppSettingsTab:
         stored = getattr(self, '_stored', {})
         if has_stored_value(stored, key):
             raw = stored[key]
+            if meta['type'] == 'bool':
+                from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+                try:
+                    return coerce_bool(raw)
+                except ValueError:
+                    logger.error(f"App setting '{key}' holds an unreadable boolean {raw!r}")
+                    ui.notify(f"App setting '{key}' holds an unreadable boolean ({raw!r}); it is "
+                              f"shown at its declared default", type='negative', timeout=0,
+                              close_button=True)
+                    return meta['default']
             if meta['type'] == 'int':
                 try:
                     return int(raw)
@@ -991,6 +1022,9 @@ class AppSettingsTab:
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
             self.alpaca_secret_input = _secret_input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret')).classes('w-full')
         
+        from .api_token_card import render_api_token_card
+        render_api_token_card()
+
         # =================================================================
         # System Settings Section
         # =================================================================
@@ -1012,6 +1046,13 @@ class AppSettingsTab:
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
+            self.session_guard_input = ui.switch(
+                'Session guard: skip scheduled passes outside the regular market session',
+                value=self._shown_value('scheduled_session_guard_enabled'))
+            ui.label('ON (default): an entry / open-positions pass that fires on a holiday, a '
+                     'weekend, after an early close or outside 09:30-16:00 New York is skipped '
+                     'and logged. Turn OFF only if the guard misbehaves; takes effect on the next '
+                     'fire.').classes('text-xs text-gray-500')
         
         # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded, and a control
         # that still shows it is not written (stored value or declared default alike).
@@ -1051,6 +1092,8 @@ class AppSettingsTab:
                     if APP_SETTINGS_DEFINITIONS[key]['type'] == 'int':
                         to_write[key] = str(numeric_setting_for_save(
                             APP_SETTINGS_DEFINITIONS, key, raw, int))
+                    elif APP_SETTINGS_DEFINITIONS[key]['type'] == 'bool':
+                        to_write[key] = 'true' if raw else 'false'
                     else:
                         to_write[key] = '' if raw is None else raw
             except NumericSettingNotSavable as e:
@@ -1177,6 +1220,16 @@ class AccountDefinitionsTab:
                 logger.warning(f"Refused to save account settings: {problem}")
                 return
 
+            # ADDING an account needs the FMP key (screeners, prices, market regime); editing
+            # an existing account does not. Checked before any write.
+            if account is None:
+                try:
+                    require_fmp_key_for_account_creation()
+                except FmpKeyRequired as e:
+                    ui.notify(e.message, type='negative')
+                    logger.warning(f"Refused to add an account: {e.message}")
+                    return
+
             # A NO-EDIT SAVE IS A NO-OP: an unedited field is not written -- a missing row
             # stays missing, and a stored value (a credential, a native-JSON bool) keeps its
             # exact bytes rather than being rewritten through the shared writer.
@@ -1300,6 +1353,13 @@ class AccountDefinitionsTab:
 
     def show_dialog(self, account: Optional[AccountDefinition] = None) -> None:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
+        if account is None:
+            # Read at click time, so no page reload is needed after the key is entered.
+            try:
+                require_fmp_key_for_account_creation()
+            except FmpKeyRequired as e:
+                ui.notify(e.message, type='negative')
+                return
         with self.dialog:
             self.dialog.clear()
             # An abstract provider (IBKRAccount today) can never be built: it is not offered
@@ -2772,6 +2832,13 @@ class ExpertSettingsTab:
         ).props('no-caps').classes('mb-2')
         setattr(self, f'{kind}_frequency', freq)
 
+        # Refusal banner: shown by ``_show_schedule_refusal`` when the STORED schedule is one the live
+        # scheduler refuses (an unknown day key). Built here, synchronously, from Quasar's own classes
+        # (no page CSS to lose to an await); hidden until a loader finds a refused schedule.
+        refusal_label = ui.label('').classes('text-negative text-weight-bold mb-2 w-full')
+        refusal_label.set_visibility(False)
+        setattr(self, f'{kind}_schedule_refusal_label', refusal_label)
+
         # Weekly: day checkboxes (unchanged behaviour/output)
         weekly_container = ui.column().classes('w-full')
         setattr(self, f'{kind}_weekly_container', weekly_container)
@@ -2805,6 +2872,19 @@ class ExpertSettingsTab:
         setattr(self, f'{kind}_weekday_select', weekday_select)
 
         self._apply_schedule_frequency_visibility(kind)
+
+    def _show_schedule_refusal(self, kind: str, schedule_config):
+        """Show (or hide) the "schedule refused" banner for the stored schedule of ``kind``. The
+        checkboxes below render the typo'd day at its default and the next Save would silently rewrite
+        the seven clean keys, so the operator must be told the LIVE scheduler is not running this
+        setting. Same sentence the scheduler logs (``schedule_refusal_message``)."""
+        label = getattr(self, f'{kind}_schedule_refusal_label', None)
+        if label is None:
+            return
+        refusal = schedule_refusal_message(schedule_config)
+        if refusal:
+            label.set_text(f"{refusal}. No job runs for this setting until it is saved with valid days.")
+        label.set_visibility(bool(refusal))
 
     def _apply_schedule_frequency_visibility(self, kind: str):
         """Show the weekly day checkboxes or the monthly Nth-weekday controls."""
@@ -2841,8 +2921,9 @@ class ExpertSettingsTab:
         hint = getattr(self, f'{kind}_local_hint', None)
         if toggle is None or hint is None:
             return
+        warnings = self._session_time_warnings(kind, toggle.value == 'Market time (NYSE)')
         if toggle.value != 'Market time (NYSE)':
-            hint.text = ''
+            hint.text = ' | '.join(warnings)
             return
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2854,7 +2935,22 @@ class ExpertSettingsTab:
             hours, minutes = map(int, time_str.split(':'))
             ny_dt = datetime.now(ny).replace(hour=hours, minute=minutes, second=0, microsecond=0)
             parts.append(f"{time_str} NYSE -> {ny_dt.astimezone(local_tz).strftime('%H:%M')} local")
-        hint.text = ('This machine\'s local time: ' + ', '.join(parts)) if parts else ''
+        hint.text = ' | '.join(([('This machine\'s local time: ' + ', '.join(parts))] if parts else [])
+                               + warnings)
+
+    def _session_time_warnings(self, kind: str, market_basis: bool) -> list:
+        """The live session guard's consequences for the times being edited: a pass outside the
+        regular session is SKIPPED by JobManager, and one too close to the close cannot finish.
+        A warning only (``schedule_genes.schedule_time_warnings``)."""
+        from datetime import datetime
+        from ba2_common.core.schedule_genes import schedule_time_warnings
+        try:
+            times = self._collect_execution_times(getattr(self, f'{kind}_execution_times', []))
+            return schedule_time_warnings(times, 'market' if market_basis else 'local',
+                                          datetime.now().astimezone().tzinfo)
+        except Exception as e:  # noqa: BLE001 -- a hint must never break the form
+            logger.warning(f"could not compute schedule time warnings: {e}")
+            return []
 
     def _update_open_positions_schedule_visibility(self):
         """Hide the open-positions schedule editor for experts that handle exits
@@ -2970,9 +3066,9 @@ class ExpertSettingsTab:
         # Load days
         days = schedule_config.get('days', {})
         for day, checkbox in self.schedule_days.items():
-            # Default weekdays to True, weekends to False if not specified
-            default_value = day not in ['saturday', 'sunday']
-            checkbox.value = days.get(day, default_value)
+            # An absent day: weekdays True, weekends False -- the ONE shared rule the live scheduler
+            # and the backtest read too (schedule_genes.schedule_weekday_enabled).
+            checkbox.value = schedule_weekday_for_display(days, day)
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
@@ -3204,6 +3300,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('enter_market')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3256,6 +3353,7 @@ class ExpertSettingsTab:
                                     int(hours), int(minutes)
                                     if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
                                         time_input.props('error=false')
+                                        self._refresh_time_basis_hint('open_positions')
                                         return
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
@@ -3312,12 +3410,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'enter_market_schedule_days'):
                 for day, checkbox in self.enter_market_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set enter market day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('enter_market')
+        self._show_schedule_refusal('enter_market', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'enter_market_time_basis'):
@@ -3376,12 +3474,12 @@ class ExpertSettingsTab:
             days = schedule_config.get('days', {})
             if hasattr(self, 'open_positions_schedule_days'):
                 for day, checkbox in self.open_positions_schedule_days.items():
-                    default_value = day not in ['saturday', 'sunday']
-                    new_value = days.get(day, default_value)
+                    new_value = schedule_weekday_for_display(days, day)
                     checkbox.value = new_value
                     logger.debug(f'Set open positions day {day} to {new_value}')
 
         self._apply_schedule_frequency_visibility('open_positions')
+        self._show_schedule_refusal('open_positions', schedule_config)
 
         # Load time basis (defaults to 'local' -- absence means legacy/unset config)
         if hasattr(self, 'open_positions_time_basis'):
@@ -3833,6 +3931,8 @@ class ExpertSettingsTab:
                 stat_items.append(f'RVOL: -{dropped_rvol}')
                 dropped_float = stats.get('dropped_float', 0)
                 stat_items.append(f'Float: -{dropped_float}')
+                dropped_vol_min = stats.get('dropped_volume_min', 0)
+                stat_items.append(f'Vol min: -{dropped_vol_min}')
                 dropped_vol = stats.get('dropped_volume_max', 0)
                 stat_items.append(f'Vol max: -{dropped_vol}')
                 dropped_drop = stats.get('dropped_price_drop', 0)
@@ -4766,27 +4866,13 @@ class ExpertSettingsTab:
 
         Raises ValueError, which ``_save_expert``'s handler turns into a red notification naming
         the leaf, the field and the setting.
+
+        The check itself is services.experts.check_market_gates, shared with the management API.
         """
-        from ba2_common.core.market_condition_live import (
-            market_condition_fields_in_ruleset,
-            ruleset_rule_contents,
-        )
+        from ...services.experts import check_market_gates
 
-        exit_where = f"open-positions ruleset {open_positions_ruleset_id}"
-        assert_market_rule_actions_live(ruleset_rule_contents(open_positions_ruleset_id),
-                                        exit_where)
-
-        used = market_condition_fields_in_ruleset(enter_market_ruleset_id)
-        on_exit = market_condition_fields_in_ruleset(open_positions_ruleset_id)
-        if not used and not on_exit:
-            return          # no market leaf: any profile setting is fine, including empty
-        profiles = parse_profile_setting(
-            self._effective_market_condition_profile(expert_instance_id))
-        if used:
-            assert_fields_served(used, profiles,
-                                 where=f"enter-market ruleset {enter_market_ruleset_id}")
-        if on_exit:
-            assert_fields_served(on_exit, profiles, where=exit_where)
+        check_market_gates(enter_market_ruleset_id, open_positions_ruleset_id,
+                           lambda: self._effective_market_condition_profile(expert_instance_id))
 
     def _validated_priority(self):
         from ...core.ExpertPriority import validate_expert_priority
@@ -5303,14 +5389,9 @@ class ExpertSettingsTab:
         
         logger.debug(f'Saved all expert settings for instance {expert_id}')
         
-        # Refresh scheduled jobs for this expert
-        try:
-            from ...core.JobManager import get_job_manager
-            job_manager = get_job_manager()
-            job_manager.refresh_expert_schedules(expert_id)
-            logger.info(f'Refreshed scheduled analysis jobs for expert {expert_id}')
-        except Exception as e:
-            logger.error(f'Error refreshing scheduled jobs for expert {expert_id}: {e}', exc_info=True)
+        # Refresh scheduled jobs for this expert (shared with the management API)
+        from ...services.experts import refresh_schedules
+        refresh_schedules(expert_id)
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""
@@ -5996,7 +6077,8 @@ class TradeSettingsTab:
                     # ValueError on any value outside its own options). The stored shape is
                     # unchanged -- the picker carries one ``event_type`` and nothing else.
                     trigger_picker = TriggerTypePicker(
-                        trigger_value, on_change=lambda: update_value_inputs())
+                        trigger_value, on_change=lambda: update_value_inputs(),
+                        rule_subtype=lambda: self.rule_subtype_select.value)
 
                     # Inline container for operator/value inputs
                     value_container = ui.row().classes('items-center gap-2')

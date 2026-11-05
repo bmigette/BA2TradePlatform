@@ -34,7 +34,7 @@ platform checkout and has only the packages on its path).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 __all__ = [
     "BacktestRunFacts",
@@ -42,9 +42,13 @@ __all__ = [
     "BACKTEST_FORCED_SETTINGS",
     "forced_expert_settings",
     "backtest_only_settings",
+    "reportable_backtest_only",
     "live_settings_from_universe",
     "SCREENER_UNIVERSE_SETTING",
     "explicit_default_settings",
+    "UndeployableRunRefused",
+    "refuse_undeployable",
+    "member_hold_tags_fact",
 ]
 
 
@@ -77,6 +81,12 @@ class BacktestRunFacts:
     #: had the gene) reading exactly as it did.
     use_atr_stop: bool = False
     regime_overlay_enabled: bool = False
+    #: BacktestAccount setting (stage-2 E2): the style members whose assigned stock is HELD;
+    #: every other member's assignment is liquidated. None = the run-level
+    #: ``hold_assigned_stock`` alone decided (every run before stage 2). Read off the same
+    #: ``account_settings`` block as ``hold_assigned_stock``, by both the handler and the
+    #: exporter.
+    hold_assigned_stock_tags: Optional[Tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +105,10 @@ class ForcedSetting:
     #: For a ``live_setting is None`` row: what closing the gap would take. The deploy round-trip
     #: pin quotes this, so an un-carried behaviour cannot be forgotten, only accepted.
     why_no_live_analogue: str = ""
+    #: For a ``live_setting is None`` row: True when a None VALUE states no behaviour for the run
+    #: (e.g. no member-scoped hold, no option entry action), so the deploy report omits it rather
+    #: than print it on every deploy. Set per row, never as a blanket "skip None".
+    silent_when_none: bool = False
 
     def value(self, facts: BacktestRunFacts) -> Any:
         return _VALUES[self.key](facts)
@@ -107,6 +121,8 @@ _VALUES = {
     "allow_automated_trade_modification": lambda f: True,
     "enable_sell": lambda f: bool(f.enable_short),
     "hold_assigned_stock": lambda f: bool(f.hold_assigned_stock),
+    "hold_assigned_stock_tags": lambda f: (sorted(f.hold_assigned_stock_tags)
+                                           if f.hold_assigned_stock_tags else None),
     "entry_action": lambda f: f.entry_action,
     "use_atr_stop": lambda f: bool(f.use_atr_stop),
     "regime_overlay_enabled": lambda f: bool(f.regime_overlay_enabled),
@@ -178,15 +194,40 @@ BACKTEST_FORCED_SETTINGS = (
             "deploy tooling must not make; it is an operator decision.",
     ),
     ForcedSetting(
+        key="hold_assigned_stock_tags",
+        live_setting=None,
+        source="BacktestAccount account_settings['hold_assigned_stock_tags'] (stage-2 E2; the "
+               "style launcher, Task 7) -> assignment_hold.holds_assigned_stock per assignment",
+        why="plan 2026-09-25 option-stage2-build E2: in a style run only the wheel member "
+            "keeps its assigned stock; a CSP / jade-lizard / ratio-spread member's assignment "
+            "is liquidated at the next bar's open, decided from the assigned position's entry "
+            "tag.",
+        why_no_live_analogue=
+            "live has no hold/liquidate decision at all -- it never sells assigned stock "
+            "(AlpacaAccount.reconcile_option_assignments opens the equity long and stops), so a "
+            "run that LIQUIDATED some members' assignments describes behaviour live cannot "
+            "reproduce. Unlike hold_assigned_stock this is not merely recorded: "
+            "refuse_undeployable refuses the export of such a run. Closing it needs a live "
+            "liquidation step keyed on the member tag, an operator decision.",
+        # None = the run had no member-scoped hold (every deployable payload: one that had it
+        # is refused), so there is nothing to report.
+        silent_when_none=True,
+    ),
+    ForcedSetting(
         key="entry_action",
         live_setting=None,
-        source="ba2test_launcher -> backtest_cfg['entry_action'] -> daily_engine._entry_is_option",
-        why="review V4. A run-global flag derived from it makes the engine submit option entries "
-            "DIRECTLY instead of staging an RM candidate.",
+        source="ba2test_launcher -> backtest_cfg['entry_action'] -> the options-run wiring "
+               "(daily_backtest_handler.strategy_uses_options, BacktestRunFacts)",
+        why="review V4. It no longer routes entries: since plan 2026-09-25 E1 BOTH runtimes route "
+            "each fired entry by its own actions through trade_cycle.entry_route (all-option "
+            "self-sizes, equity goes to the RM, a mix is refused). It still marks the run as an "
+            "options run.",
         why_no_live_analogue=
-            "live has no such key: TradeManager stages EVERY enter-market recommendation as an RM "
-            "candidate. The asymmetry is in the live engine, not in the payload, so carrying it "
-            "as an applied setting would be a lie. Recorded so a deploy states it.",
+            "live has no such key and needs none: a live account's option capability comes from "
+            "its broker, and entry routing is the shared per-entry decision. Recorded so a deploy "
+            "states it.",
+        # None = an equity run: no option entry action to state.
+        silent_when_none=True,
     ),
 )
 
@@ -211,7 +252,57 @@ LIVE_SCREENER_SETTINGS = frozenset((
     "screener_price_drop_pct", "screener_price_drop_days",
     "screener_max_stocks", "screener_sort_metric",
     "screener_weinstein_stage2_only",
+    # the option jobs' fixed candidate list (backtest ``screener_opt.universe_restriction``), comma-separated
+    "screener_symbol_universe",
 ))
+
+
+#: THE screener settings that decide WHICH symbols a screen returns (unprefixed, the vocabulary of the backtest
+#: gate and of ``screener_opt.base_settings``; live reads them as ``screener_<key>``).  A live instance that lacks
+#: one runs it on ``StockScreener._DEFAULTS`` (price_min 20, volume_min 500,000, float_min 10,000,000, max_stocks 10,
+#: price_drop_pct 15, ...), so NOTHING may be left to those defaults: the simulation refuses a missing key, the
+#: launcher writes every key, the deploy writes every key.  Pinned equal to ``StockScreener._DEFAULTS`` and to the
+#: interface definitions by ``packages/providers/tests/test_screener_setting_keys.py``.
+SCREENER_SELECTION_KEYS = (
+    "market_cap_min", "market_cap_max", "price_min", "price_max", "volume_min", "volume_max", "float_min", "float_max",
+    "relative_volume_min", "price_drop_pct", "price_drop_days", "max_stocks", "sort_metric", "weinstein_stage2_only",
+)
+#: The keys whose backtested value is "off" when a job states nothing (the metric-store gate treated an absent bound as
+#: not enforced, and the enabled prod instances carry explicit zeros): what a deploy of a payload that omits them writes.
+SCREENER_OFF_VALUES = {"market_cap_max": 0, "price_min": 0, "price_max": 0, "volume_min": 0, "volume_max": 0,
+                       "float_min": 0, "float_max": 0, "sort_metric": "market_cap"}
+
+
+def missing_screener_keys(settings: Dict[str, Any]) -> list:
+    """The selection keys absent from ``settings`` (unprefixed OR ``screener_``-prefixed names; None = absent)."""
+    out = []
+    for k in SCREENER_SELECTION_KEYS:
+        if settings.get(k) is None and settings.get(f"screener_{k}") is None:
+            out.append(k)
+    return out
+
+
+def complete_screener_settings(expert_params: Dict[str, Any]) -> Dict[str, Any]:
+    """``{screener_<key>: value}`` for EVERY selection key, from ``expert_params`` (live names) with the "off" value
+    (what the backtest ran) for the bound keys it does not carry.  A key that has no "off" value (a gene such as
+    ``max_stocks``) and is absent raises: a deploy must not invent it."""
+    out: Dict[str, Any] = {}
+    missing = []
+    for k in SCREENER_SELECTION_KEYS:
+        v = expert_params.get(f"screener_{k}")
+        if v is None:                                  # an explicit None is "not stated", never a value
+            v = expert_params.get(k)
+        if v is None:
+            if k in SCREENER_OFF_VALUES:
+                v = SCREENER_OFF_VALUES[k]
+            else:
+                missing.append(k)
+                continue
+        out[f"screener_{k}"] = v
+    if missing:
+        raise ValueError(f"screener setting(s) {missing} are neither in the payload nor have an 'off' value: refusing "
+                         f"to leave them to StockScreener's defaults")
+    return out
 
 
 def forced_expert_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
@@ -228,6 +319,16 @@ def backtest_only_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
     """{backtest key: value} for every row with NO live analogue -- carried, never applied."""
     return {row.key: row.value(facts)
             for row in BACKTEST_FORCED_SETTINGS if row.live_setting is None}
+
+
+def reportable_backtest_only(backtest_only: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The ``backtest_only`` rows of a payload a deploy tool must REPORT -- carried, never
+    applied, and SAID so (review V4/V5). A row is omitted only when its value is None AND its
+    table row declares ``silent_when_none`` (None states no behaviour for the run). A None on
+    any other row, or on a key the table does not know, is reported: never a blanket skip."""
+    silent = {row.key for row in BACKTEST_FORCED_SETTINGS if row.silent_when_none}
+    return {k: v for k, v in (backtest_only or {}).items()
+            if not (v is None and k in silent)}
 
 
 def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -280,7 +381,12 @@ def explicit_default_settings(expert_cls: Any, expert_params: Dict[str, Any]) ->
     keys = getattr(expert_cls, "DEPLOY_EXPLICIT_DEFAULT_SETTINGS", ())
     if not keys:
         return {}
-    defs = expert_cls.get_settings_definitions()
+    defs = dict(expert_cls.get_settings_definitions())
+    missing = [k for k in keys if k not in defs]
+    if missing:        # the interface's own (builtin) settings are not in the expert-specific table
+        from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+        MarketExpertInterface._ensure_builtin_settings()
+        defs.update({k: MarketExpertInterface._builtin_settings[k] for k in missing})
     return {k: defs[k]["default"] for k in keys if k not in expert_params}
 
 
@@ -297,3 +403,36 @@ def unmapped_screener_keys(universe: Optional[Dict[str, Any]]) -> list:
         k for k in (universe.get("screener_settings") or {})
         if k not in LIVE_SCREENER_SETTINGS and f"screener_{k}" not in LIVE_SCREENER_SETTINGS
     )
+
+
+class UndeployableRunRefused(ValueError):
+    """A scored run used a behaviour live cannot express, so it has no honest deploy payload."""
+
+
+def refuse_undeployable(facts: BacktestRunFacts) -> None:
+    """Raise ``UndeployableRunRefused`` when the run cannot be deployed as it was scored.
+
+    Today one fact: a member-scoped assigned-stock hold (``hold_assigned_stock_tags``). Its
+    ``backtest_only`` record would say what the run did, but the export's other fields would
+    still describe a deployable run, and the importer would apply them -- to an account that
+    holds EVERY assignment. Refusing is the only answer that is not a different strategy.
+    """
+    if facts.hold_assigned_stock_tags:
+        raise UndeployableRunRefused(
+            f"this run held assigned stock only for style members "
+            f"hold_assigned_stock_tags={sorted(facts.hold_assigned_stock_tags)} and liquidated "
+            f"every other member's assignment; live never liquidates assigned stock, so no "
+            f"live ExpertInstance can run it as scored -- refusing to export it")
+
+
+def member_hold_tags_fact(raw: Any) -> Optional[Tuple[int, ...]]:
+    """``BacktestRunFacts.hold_assigned_stock_tags`` from a stored ``account_settings`` value:
+    None stays None; anything else is validated exactly as the account validates it
+    (``assignment_hold.resolve_assigned_stock_hold_policy``) and returned sorted -- a malformed
+    stored value raises rather than reading as "no member-scoped hold"."""
+    if raw is None:
+        return None
+    from ba2_common.core.assignment_hold import (
+        HOLD_ASSIGNED_STOCK_TAGS_KEY, resolve_assigned_stock_hold_policy)
+    policy = resolve_assigned_stock_hold_policy({HOLD_ASSIGNED_STOCK_TAGS_KEY: raw})
+    return tuple(sorted(policy.member_tags))

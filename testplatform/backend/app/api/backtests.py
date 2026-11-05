@@ -16,6 +16,7 @@ from app.schemas.trade_chart import TradeChartContext
 from app.services.backtest_trade_chart import (
     TradeChartRowNotFound, build_trade_chart_context,
 )
+from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
 from app.services.sync_client import push_backtest
 
 logger = logging.getLogger(__name__)
@@ -47,10 +48,11 @@ def _run_schedule_override(run_schedule: Optional[str], run_schedule_day: Option
     ``run_schedule_override`` dict, mirroring the CLI launcher's daily/weekly handling.
 
       * run_schedule None or "daily"  -> None (no override; the engine analyses every bar).
-      * run_schedule "weekly"         -> {"days": {weekday: bool}, "times": ["09:30"]} with only
-        ``run_schedule_day`` (default "monday") enabled. ``times`` pins ANALYSIS to the first
-        regular-session bar so an intraday fill clock still analyses once that day (identical to
-        the CLI's _cmd_optimize/_cmd_backtest behaviour).
+      * run_schedule "weekly"         -> {"days": {weekday: bool}, "times": [DEFAULT_DECISION_TIME]}
+        with only ``run_schedule_day`` (default "monday") enabled. ``times`` pins ANALYSIS to one
+        bar so an intraday fill clock still analyses once that day (identical to the CLI's
+        _cmd_optimize/_cmd_backtest behaviour); the time is the ONE shared default decision time
+        (ba2_common.core.knowability), one bar or more after the session's first bar.
 
     Fail-early (no silent bad defaults, backend/CLAUDE.md): an unknown run_schedule or an unknown
     weekday raises ValueError (the route turns it into a 400).
@@ -62,7 +64,8 @@ def _run_schedule_override(run_schedule: Optional[str], run_schedule_day: Option
     day = (run_schedule_day or "monday").lower()
     if day not in _WEEKDAYS:
         raise ValueError(f"run_schedule_day must be one of {_WEEKDAYS}, got {run_schedule_day!r}")
-    return {"days": {d: (d == day) for d in _WEEKDAYS}, "times": ["09:30"]}
+    from ba2_common.core.knowability import DEFAULT_DECISION_TIME
+    return {"days": {d: (d == day) for d in _WEEKDAYS}, "times": [DEFAULT_DECISION_TIME]}
 
 
 class BacktestCreate(BaseModel):
@@ -79,6 +82,9 @@ class BacktestCreate(BaseModel):
     """
     name: str
     engine: str = "ml"  # "ml" (default, legacy) | "daily_expert"
+    # OHLCV history a daily_expert run reads: "fmp" | "alpaca". None = the new-job default (alpaca for
+    # equity, fmp for option runs); an unknown name or an option run on alpaca is refused (400).
+    ohlcv_history_source: Optional[str] = None
     # ML-engine fields (required only when engine == "ml"; validated in the route).
     model_id: Optional[str] = None  # String model ID like "mdl-abc123"
     prediction_dataset_id: Optional[int] = None
@@ -152,6 +158,7 @@ class DailyBacktestCreate(BaseModel):
     bare class-name strings or ``{"class": ..., "settings": {...}}`` objects. Datasets/model
     are NOT used by the daily engine (the universe is ``enabled_instruments``)."""
     name: str
+    ohlcv_history_source: Optional[str] = None  # None = new-job default (see BacktestCreate)
     enabled_instruments: List[str]
     experts: List[dict]  # [{"class": "FMPEarningsDrift", "settings": {...}}] or ["FMPEarningsDrift"]
     start_date: str
@@ -535,6 +542,13 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         strategy_params["warmupDays"] = backtest.warmup_days
     if run_schedule_override is not None:
         strategy_params["runScheduleOverride"] = run_schedule_override
+    # the OHLCV history this NEW run reads, persisted on the row (a re-run keeps the row's stamp)
+    history_source = _new_job_history_source(
+        backtest.ohlcv_history_source,
+        {"exit_rules": backtest.exit_rules, "exit_conditions": backtest.exit_conditions,
+         "entry_rules": backtest.entry_rules or backtest.entry_actions},
+        "POST /backtests (daily_expert)")
+    strategy_params[OHLCV_HISTORY_SOURCE_KEY] = history_source
 
     db_backtest = Backtest(
         name=backtest.name,
@@ -576,6 +590,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         'seed': backtest.seed,
         'warmup_days': backtest.warmup_days,
         'execution_interval': backtest.execution_interval or "1d",
+        OHLCV_HISTORY_SOURCE_KEY: history_source,
     }
     # Only forward a non-None override so we never clobber the engine's "every bar" default
     # with None on the daily path (and the payload stays identical for run_schedule="daily").
@@ -686,6 +701,19 @@ def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
     return {"status": "queued", "task_id": task_id, "backtest_id": backtest_id}
 
 
+def _new_job_history_source(stated: Optional[str], probe: dict, where: str) -> str:
+    """The OHLCV history a NEW API-created run is stamped with (``new_job_history_source``): an explicit value
+    wins, else alpaca for an equity run and fmp for an option run. Unknown / option-on-alpaca -> HTTP 400."""
+    from app.services.backtest.daily_backtest_handler import strategy_uses_options
+    from app.services.backtest.history_source import new_job_history_source
+
+    try:
+        return new_job_history_source(stated, uses_options=strategy_uses_options(probe) or bool(probe.get("options_cache_db")),
+                                      where=where)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/daily")
 def create_daily_backtest(
     request: DailyBacktestCreate,
@@ -718,8 +746,10 @@ def create_daily_backtest(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    history_source = _new_job_history_source(request.ohlcv_history_source, {}, "POST /backtests/daily")
     db_backtest = Backtest(
         name=request.name,
+        strategy_params={OHLCV_HISTORY_SOURCE_KEY: history_source},
         model_id=None,  # daily expert runs are not model-driven (Task-7 migration makes this nullable)
         start_date=start_date,
         end_date=end_date,
@@ -757,6 +787,7 @@ def create_daily_backtest(
             'warmup_days': request.warmup_days,
             # None on the daily-cadence path -> engine analyses every bar (unchanged).
             'run_schedule_override': run_schedule_override,
+            OHLCV_HISTORY_SOURCE_KEY: history_source,
         },
         description=f'Daily expert backtest over {len(request.enabled_instruments)} instruments',
     )
@@ -901,8 +932,10 @@ def backtest_whatif(
         raise HTTPException(status_code=400,
                             detail="Backtest has no stored equity_curve/trades to recompute")
     from app.services.backtest.whatif import recompute_curves
+    from app.services.backtest.history_source import stored_history_source
     try:
         res = recompute_curves(
+            history_source=stored_history_source(backtest, db),
             initial_capital=backtest.initial_capital,
             trades=backtest.trades,
             equity_curve=backtest.equity_curve,
@@ -1166,7 +1199,107 @@ def _is_bypass_expert_class(expert_name: Optional[str]) -> bool:
     return bool(getattr(expert_cls, "bypasses_classic_rm", False))
 
 
-def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+def _refuse_sizing_gene_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: the risk manager reads an ABSENT ``sizing_mode`` as notional. A row whose run
+    searched the sizing mode (its optimization's parameter_ranges carry ``model:sizing_mode``, goal2027
+    item 2.1) but whose ``strategy_params`` lost that gene would deploy as notional whatever the GA chose,
+    so it is refused instead. Rows of pinned runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "model:sizing_mode" not in ranges:
+        return
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("model:sizing_mode") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched sizing_mode but this row has no "
+                    f"model:sizing_mode gene; exporting would deploy it as notional by default. Refusing."))
+
+
+def _refuse_market_profile_row_without_gene(backtest: Backtest, db: Any) -> None:
+    """No silent default: decode treats an ABSENT ``market:profile`` as "no profile restriction" (every market
+    gene as individually decoded), a different phenotype from whatever the GA chose. A row whose run searched the
+    profile (its optimization's parameter_ranges carry ``market:profile``, goal2027 item 2.2) but whose
+    ``strategy_params`` lost that gene is refused. Rows of older runs (no such gene in the space) are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or "market:profile" not in ranges:
+        return
+    sp = backtest.strategy_params
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES
+    if isinstance(sp, dict) and sp.get("market:profile") is not None and sp["market:profile"] not in MARKET_PROFILE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: stored market:profile {sp['market:profile']!r} is not one of "
+                    f"{list(MARKET_PROFILE_CHOICES)}. Refusing."))
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the market profile but this row has no "
+                    f"market:profile gene; exporting would deploy every market gene unrestricted. Refusing."))
+
+
+
+def _refuse_row_missing_searched_genes(backtest: Backtest, db: Any, genes: tuple, label: str) -> None:
+    """No silent default for an opt-in gene family (goal2027 item 2.8 onwards): a row whose optimization searched
+    one of ``genes`` (its ``parameter_ranges`` carry the key) but whose ``strategy_params`` lost it would deploy
+    that setting at the expert default, a phenotype the GA never evaluated. Refused. Rows of runs that did not
+    search the family are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict):
+        return
+    searched = [g for g in genes if g in ranges]
+    if not searched:
+        return
+    sp = backtest.strategy_params if isinstance(backtest.strategy_params, dict) else {}
+    missing = [g for g in searched if sp.get(g) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the {label} but this row has no "
+                    f"{', '.join(missing)}; exporting would deploy the expert default the GA never chose. Refusing."))
+
+
+def _refuse_split_time_row_without_genes(backtest: Backtest, db: Any) -> None:
+    """No silent default for the decision times: a run that searched the SPLIT genes (its optimization's
+    parameter_ranges carry ``schedule:entry_time`` / ``schedule:manage_time``, goal2027 item 2.4) but whose
+    row lost either one would deploy the entry and manage schedules at a time the GA never chose. Refused.
+    Rows of runs without the split genes are unaffected."""
+    if db is None or backtest.optimization_id is None:
+        return
+    from ba2_common.core.schedule_genes import SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE
+    from app.models.strategy_optimization import StrategyOptimization
+    so = db.query(StrategyOptimization).filter(
+        StrategyOptimization.id == backtest.optimization_id).first()
+    ranges = so.parameter_ranges if so is not None else None
+    if not isinstance(ranges, dict) or not (
+            SCHEDULE_ENTRY_TIME_GENE in ranges or SCHEDULE_MANAGE_TIME_GENE in ranges):
+        return
+    sp = backtest.strategy_params if isinstance(backtest.strategy_params, dict) else {}
+    missing = [g for g in (SCHEDULE_ENTRY_TIME_GENE, SCHEDULE_MANAGE_TIME_GENE) if sp.get(g) is None]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"backtest {backtest.id}: its optimization searched the split decision times "
+                    f"({SCHEDULE_ENTRY_TIME_GENE} and {SCHEDULE_MANAGE_TIME_GENE}) but this row has no "
+                    f"{', '.join(missing)}; exporting would deploy a time the GA never chose. Refusing."))
+
+
+
+def _derive_export_payload_shared(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
     Thin wrapper (site plan P0a): the derivation lives in
@@ -1175,6 +1308,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     run-level block, the bypass-expert check, the legacy ruleset reconstruction) and maps the
     shared errors to the same HTTP 400s this endpoint always raised.
     """
+    from ba2_common.core.deploy_parity import UndeployableRunRefused
     from ba2_common.export.backtest_export import (
         ExportRefused, UnsupportedExportKind, derive_export_payload,
     )
@@ -1182,6 +1316,11 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     bt_block = None
     if kind == "expert_settings":
         bt_block, _strat = _opt_backtest_block(backtest, db)
+        _refuse_sizing_gene_row_without_gene(backtest, db)
+        _refuse_market_profile_row_without_gene(backtest, db)
+        _refuse_split_time_row_without_genes(backtest, db)
+        from app.services.strategy_param_space import DS_FACTOR_GENES
+        _refuse_row_missing_searched_genes(backtest, db, DS_FACTOR_GENES, "DeterministicScorer factor weights")
     try:
         return derive_export_payload(
             backtest, kind,
@@ -1189,8 +1328,33 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             bypass_check=_is_bypass_expert_class,
             reconstruct_legacy_ruleset=lambda: _reconstruct_opt_ruleset(backtest, db),
         )
+    except UndeployableRunRefused as e:
+        raise HTTPException(status_code=409, detail=f"backtest {backtest.id}: {e}") from e
     except (ExportRefused, UnsupportedExportKind) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
+    """The shared derivation plus the goal2027 ``market:profile`` setting narrowing (see
+    ``_serve_only_selected_market_profiles``)."""
+    payload = _derive_export_payload_shared(backtest, kind, db)
+    if kind == "expert_settings":
+        _serve_only_selected_market_profiles(backtest, payload)
+    return payload
+
+
+def _serve_only_selected_market_profiles(backtest: Backtest, payload: dict) -> None:
+    """goal2027 2.2: a ``market:profile`` row deploys with ``market_condition_profile`` = exactly the SELECTED
+    profile(s) (off -> empty, single -> that one, both -> both, registry order), so a live expert never needs a
+    snapshot its ruleset does not read (the run itself served both). Rows without the gene are untouched."""
+    sp = backtest.strategy_params
+    if not isinstance(sp, dict) or sp.get("market:profile") is None:
+        return
+    from app.services.strategy_param_space import MARKET_PROFILE_CHOICES, market_profile_selection
+    from ba2_common.core.market_condition_rules import PROFILE_SETTING
+    selected = market_profile_selection(sp["market:profile"])
+    payload["settings"]["expert_params"][PROFILE_SETTING] = ",".join(
+        p for p in MARKET_PROFILE_CHOICES if p in selected)
 
 
 @router.get("/{backtest_id}/export")

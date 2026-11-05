@@ -132,6 +132,32 @@ python tools/strategy_research/exploration/run_exploration.py --preflight
 python tools/strategy_research/exploration/run_exploration.py --run
 ```
 
+#### OHLCV history source (`--ohlcv-history-source fmp|alpaca`)
+
+Phase 1 now runs on **Alpaca-built history by default** (`DEFAULT_BT_HISTORY_SOURCE`), like every other stock
+grid since 2026-10-22. The flag is stamped as `ohlcv_history_source` into every job's
+`optimization_config["backtest"]` (the key the engine's `resolve_job_history_source` reads; an unstamped job
+would silently run on FMP) and is part of the job fingerprint and name (`-hsalpaca` suffix), so an FMP and an
+Alpaca campaign never share an output directory, a stored optimization or a resume.
+
+- `--cache-dir` defaults to `<BA2_HOME>/common/cache/AlpacaHistoryOHLCVProvider` (`FMPOHLCVProvider` for `fmp`);
+  a folder of the other source is refused. Preflight and the market-condition checks read that folder.
+- `alpaca` requires the PASS gate certificate on the cache (`_meta/gate_certificate.json`, the engine's own
+  `verify_alpaca_cache_certified`) and **an explicit `--store`**: the snapshot's metric store is FMP-era and is
+  refused for `alpaca` (the store's build manifest must carry the job's source). The store of record is
+  `<cache root>/screener/metric_store_alpaca_20261022`. `fmp` keeps the snapshot store as its default.
+- Market-condition snapshots must have been warmed for the same source (the job's `source_profile` follows it).
+- `warm_etf_cache.py` only warms the FMP folder and cannot extend the Alpaca build: new ETF dates come from the Alpaca pipeline (`tools/prepare_history.py`).
+
+The controls and tweaks of one campaign are compared with each other on the same history, so the change is
+internally consistent. Results are **not comparable** with any earlier FMP-history exploration output.
+
+```powershell
+$cache = "C:\Users\basti\Documents\ba2\common\cache"
+python tools/strategy_research/exploration/run_exploration.py --preflight `
+  --cache-dir $cache\AlpacaHistoryOHLCVProvider --store $cache\screener\metric_store_alpaca_20261022
+```
+
 Preview is the default and uses only the standard library (selecting `pullback_rsi` also imports
 its expert class, to derive the settings it inherits). It opens no database and starts
 no backtest. It writes the full manifest under `reports/strategy_research/<campaign hash>/`.

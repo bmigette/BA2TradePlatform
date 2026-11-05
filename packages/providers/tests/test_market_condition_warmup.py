@@ -917,3 +917,102 @@ def test_a_file_adjusted_on_the_wrong_day_is_mixed_basis_and_refetched(root):
     p2 = W.plan(PROFILE, ("MIX",), START, END, cache_root=root, source=src)
     assert not p2.symbol("MIX").refetch_required
     assert [c["verdict"] for c in p2.symbol("MIX").split_checks] == ["refetched"]
+
+
+# ------------------------------------------------ repair: the FMP step alone (stage-2, 2026-09-26)
+def test_repair_refetches_the_refused_and_publishes_nothing(root):
+    """``W.repair`` is the split-basis repair on its own: the same fetch phase ``build`` runs
+    (a FULL re-fetch for every ``refetch_required`` symbol, a range fetch for missing coverage),
+    then the same re-check -- and no feature row, object or manifest."""
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=77)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = FakeSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    p = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+    assert p.symbol("SPL").refetch_required
+
+    rep = W.repair(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), source=src)
+
+    assert rep["ok"] and rep["refetched"] == ["SPL"] and rep["range_fetched"] == []
+    assert rep["still_refused"] == {} and rep["fetch_errors"] == {}
+    assert rep["provider_calls"] == 1
+    assert src.full_refetches == ["SPL"] and src.fetches == []
+    assert not any("manifest" in f.lower() for _d, _s, fs in os.walk(root) for f in fs), \
+        "repair publishes nothing"
+    p2 = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+    assert [c["verdict"] for c in p2.symbol("SPL").split_checks] == ["refetched"]
+
+
+class _RefusingRefetchSource(FakeSource):
+    """The SATS shape: the vendor's full history ends before the cache, so the provider's own
+    guard refuses the replacement."""
+
+    def force_full_refetch(self, symbol):
+        with self._lock:
+            self.calls += 1
+            self.full_refetches.append(symbol)
+        raise RuntimeError(f"full re-fetch of {symbol} (1d) returned LESS history than the cache holds")
+
+
+def test_repair_names_every_symbol_that_still_refuses(root):
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=78)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = _RefusingRefetchSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    p = W.plan(PROFILE, ("AAA", "SPL"), START, END, cache_root=root, source=src)
+
+    rep = W.repair(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), source=src)
+
+    assert not rep["ok"] and rep["refetched"] == []
+    assert "LESS history" in rep["fetch_errors"]["SPL"]
+    assert list(rep["still_refused"]) == ["SPL"]
+    assert rep["still_refused"]["SPL"][0]["verdict"] == "drift"
+
+
+def test_the_fmp_source_passes_the_tail_keep_only_for_the_named_symbols(tmp_path):
+    from ba2_common.core import native_cache
+    from ba2_providers.market_conditions.fmp_source import FMPWarmupSource
+
+    class StubProvider:
+        api_key = "test-key"
+
+        def __init__(self):
+            self.refetches = []
+            self.kept_tails = {"SATS": {"count": 4}}
+
+        def force_full_refetch(self, symbol, interval, **kw):
+            self.refetches.append((symbol, interval, kw))
+
+    stub = StubProvider()
+    src = FMPWarmupSource(native_cache.CACHE_FOLDER, provider=stub, keep_newer_cached_tail=["sats"])
+    src.force_full_refetch("sats")
+    src.force_full_refetch("aapl")
+    assert stub.refetches == [("SATS", "1d", {"keep_newer_cached_tail": True}), ("AAPL", "1d", {})]
+    assert src.kept_tails == {"SATS": {"count": 4}}
+    assert FMPWarmupSource(native_cache.CACHE_FOLDER, provider=StubProvider()).keep_newer_cached_tail         == frozenset()
+
+
+def test_repair_refuses_a_plan_whose_source_certification_failed(root):
+    """Like build: a failed certification is fatal, nothing is fetched."""
+    _write(root, "AAPL", _unadjust(CERT["AAPL"], date(2020, 8, 31), 4.0))
+    src = FakeSource(root)
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    calls = src.calls
+    rep = W.repair(p, source=src)
+    assert not rep["ok"] and rep["fatal_preflight_errors"] and "AAPL" in rep["fatal_preflight_errors"][0]
+    assert src.calls == calls and src.fetches == [] and src.full_refetches == []
+
+
+def test_repair_reports_the_kept_tails(root):
+    split_day = date(2025, 2, 3)
+    truth = dict(TRUTH)
+    truth["SPL"] = _frame(_sessions(date(2024, 1, 2), date(2025, 6, 30)), seed=79)
+    _write(root, "SPL", _unadjust(truth["SPL"], split_day, 2.0))
+    src = FakeSource(root, truth=truth, splits={"SPL": [CalendarSplit(split_day, 2.0)]})
+    src.kept_tails = {"SPL": {"count": 2, "first": "2025-06-27", "last": "2025-06-30",
+                              "vendor_last": "2025-06-26"}}
+    p = W.plan(PROFILE, ("SPL",), START, END, cache_root=root, source=src)
+    rep = W.repair(p, source=src)
+    assert rep["kept_tails"] == src.kept_tails

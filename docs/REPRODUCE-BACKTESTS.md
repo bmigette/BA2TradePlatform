@@ -219,13 +219,119 @@ Run everything from the repo root with the test venv (`~/ba2-venvs/test`, instal
 `install.ps1 -TestOnly -Editable` / `install.sh --test-only --editable`). `ba2-test` is that
 venv's console script for `testplatform/ba2test_launcher.py`.
 
+### 4.0 Price history: the Alpaca-built OHLCV cache (equity backtests from 2026-10-20)
+
+*Status 2026-10-20: download done, split table in progress, the `build`/`verify` steps and the
+`--ohlcv-history-source` switch are being built on `feat/alpaca-history-source`; until they merge, equity jobs
+still read the FMP cache (step 1 of §4.1). Plan: [plans/2026-10-20-alpaca-history-source.md](plans/2026-10-20-alpaca-history-source.md).*
+
+One command, resumable, stops for a human at the split review:
+
+```bash
+python tools/prepare_history.py --source alpaca --steps download,split-table,ipo-dates,build,verify [--dry-run] [--from-step X]
+python tools/prepare_history.py --source fmp --steps download,verify      # the FMP cache, same layout
+# last step of BOTH sources: market-condition manifests on that cache (needs --universe-file --start --end, see 4.3)
+python tools/prepare_history.py --source alpaca --steps market-conditions --universe-file <universe.txt> --start 2020-01-02 --end 2025-12-31
+```
+
+| # | Step | What it does | Inputs -> outputs |
+|---|---|---|---|
+| 1 | `download` | `tools/alpaca_history_download.py` with the recorded arguments: RAW (unadjusted) SIP bars + market-wide corporate actions, resumable chunk by chunk | -> `~/Documents/ba2/alpaca_store` (1Day + 5Min from 2019-01-01, 7,048 symbols) and `~/Documents/ba2/alpaca_store_daily2016` (1Day + corporate actions from 2016-01-01, 11,621 symbols); both `asof 2026-10-12`, `--end 2026-10-13`, `--max-gap-days 5`, dev account-1 market-data keys; run 4 (5-minute store, phases `daily,intraday`) and run 5 (daily store) fetch the rename successors, i.e. the NEW tickers of name changes (Alpaca keys history by the current ticker), each into the store that lacks them (`_meta/rename_successors_missing_5min.txt` / `_daily.txt`, per store: a successor can have daily bars and no 5-minute ones) and only when its list is non-empty; a first `split-table` run writes the lists, then `download`, then `split-table` and `build` again; runs 6 (5-minute store, phases `daily,intraday`) and 7 (daily store, phase `daily`) fetch the **CUSIP-change predecessors** (rules below; lists `cusip_predecessors_missing_5min.txt` / `_daily.txt`, same cycle) |
+| 2 | `split-table` | Judges every split listed by Alpaca or FMP (FMP splits calendar, cached) against prices; rule set in `ba2_providers/ohlcv/alpaca_history/split_table.py` | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/split_table.json`, `split_accepted.csv`, `split_review.csv`, `split_vs_fmp.csv`; also `rename_successors.csv` (old, new, process_date, old_last_bar, new_in_store, new_in_5min: store symbols whose real series ended <= 15 days before a name change) and `rename_successors_missing_daily.txt` / `rename_successors_missing_5min.txt` (the new tickers each store lacks, fetched by the next `download`; the spin-off analogue is `spinco_symbols_missing.txt`) |
+| 3 | `ipo-dates` | Caches the FMP company-profile `ipoDate` of every store symbol (`/api/v3/profile`, 100 symbols per request, key from `--db` read only when a symbol is missing; a rerun is OFFLINE, `--refresh-ipo-dates` fetches again). It is the evidence the build needs to tell a REUSED ticker from a long suspension of the same company | -> `<cache>/AlpacaHistoryOHLCVProvider/_meta/ipo_dates.json` (`{SYM: "YYYY-MM-DD" or null}`; null = FMP has no profile or no ipoDate) |
+| 4 | `build` | Applies the table (prices / factor, volume x factor), New York-naive dates, 5-min regular session only, same files and columns as the FMP cache. **Drops Alpaca's placeholder daily bars** (`v == 0` and `n == 0`: a flat no-trade day; no backfill, counted per symbol as `dropped_placeholders` in the manifest and in the run summary; the split-table step drops them too). Repairs bad daily High/Low prints against the 5-min envelope (`_meta/bar_repairs.csv`, witness `fmp`, `yahoo` or `override`; unsettled prints that every available witness also carries beyond the envelope are `_meta/consolidated_prints.csv`). Records exchange suspensions and delistings in `_meta/suspensions.json` (every run of >= 20 NYSE sessions with no Alpaca bar is an event, owner decision 2026-10-22: `otc_suspension` when the FMP file covers the run and traded on >= 80% of its sessions, `exchange_gap` otherwise; `delisted` is a last bar > 5 sessions before the store's last session); the backtest closes a held position at its last exchange close and blocks re-entry until the symbol resumes, for all three kinds. **Reused tickers** (the series joins two companies, e.g. VG = Vonage until 2022-07, Venture Global from its 2025-01-24 IPO): when the FMP profile `ipoDate` falls after the last bar before a >= 20-session gap and no later than 7 calendar days after the gap's END (the current company listed after the old series ended: the earlier bars predate it, so dropping them only loses data, never mixes companies), the bars BEFORE that gap (daily and 5-minute) are dropped and the symbol is listed in `_meta/reused_tickers.json` (`reused`: gap, dropped range and counts, evidence); a gap whose ipoDate is missing or more than 7 days after its end is `ambiguous` (`no_ipo_date`, `ipo_after_resume`, `no_ipo_dates_file`) (nothing dropped, listed in the same file and in the run summary `gaps_for_review` for a human to decide; never a guess); an ipoDate on/before the last bar before the gap is the same company (history kept, the gap stays an event). Needs `ipo_dates.json` (step 3); without it every gap is listed `no_ipo_dates_file` | -> `<cache>/AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet`, `<SYM>_5min.parquet`, `_meta/build_manifest.json`, `_meta/suspensions.json`, `_meta/reused_tickers.json` |
+| 5 | `verify` | Data-quality gate: structure, coverage, 5-min last close vs daily close, residual jumps, High/Low envelope, Yahoo, `intraday_outage` (liquid names' regular 5-min bars vs FMP's per session), comparison with the FMP cache; known vendor-event days and the screener's excluded symbols (below) | -> `<report>/verify/*.csv`, exit 1 on any FAIL; a full run (no `--symbols`) writes `<cache>/AlpacaHistoryOHLCVProvider/_meta/gate_certificate.json` (PASS/FAIL + build manifest sha256), which the `market-conditions` step requires. **Always pass `--panel-symbols ~/Documents/ba2/common/cache/screener/daily_panel/<panel>/symbols.json`** (the current screener daily panel, 03d21a4a2f176c69 since 2026-10-22): without it the thresholds judge every built symbol, not the panel, and `residual_jumps` / `yahoo` FAIL (seen 2026-11-04) |
+| 6 | `market-conditions` | `warm_market_conditions.py plan -> build --cache-only -> verify -> prepare-host` for `ohlcv-v1` and `ta-structure-v1` on this source's cache (§4.3); refused without `--universe-file --start --end`; exit 1 if any profile fails | -> `<cache>/market_conditions/` manifests; digests per profile in the JSON report |
+
+Rules to know:
+- **Same `--end` on every resume** of the download, or every daily file is fetched again. The download refuses
+  an end after today 00:00 UTC (no unfinished day is ever stored). Never mix stores with a different `asof`
+  (the ticker-mapping date: a renamed company's history sits under its current symbol).
+- An intraday symbol-year missing at most 5 traded days is stored with the days listed
+  (`days_without_intraday_bars`, kept empty by the build); more is refused. Zero-trade daily bars are Alpaca
+  placeholders and expect no intraday bars.
+- **CUSIP-only change that restarts Alpaca history (TEVA 2026-09-14, found 2026-11-04).** A `name_changes` row with
+  `old_symbol == new_symbol` and different CUSIPs (an ADR becoming ordinary shares) is a new security under the same ticker;
+  `build_rename_map` skips it (no ticker moves), and fetched as of the store's `asof` Alpaca returns only the NEW security's bars
+  (TEVA: 21 daily bars, 2026-09-14..2026-10-12, instead of 2,709 from 2016). Fetched as of the day BEFORE the change it returns the
+  whole old series (verified 2026-11-04: `asof=2026-09-13` -> 2,709 daily bars from 2016-01-04). The mechanism: (1) `split-table` derives
+  the rows from the pinned corporate actions plus the stores (`cusip_predecessors.csv`, columns symbol, process_date, CUSIPs,
+  first_bar, key, in_daily, in_5min): a change qualifies when the symbol's first real daily bar is on/after `process_date` and at most
+  7 days after it (a series that starts before the change, e.g. an IPO the week before, holds the old security already and is NOT
+  listed). The list is DERIVED, not hand-kept: a hand list goes stale at the next `asof` refresh, and the build re-checks each key
+  against the same actions anyway. 220 CUSIP-only changes exist in the daily2016 store's actions; today exactly one qualifies (TEVA).
+  (2) `download` runs 6/7 fetch the store key `SYMBOL@<asof>` (here `TEVA@2026-09-13`: folder `symbol=TEVA@2026-09-13`, own manifest,
+  every chunk records its own `asof`; the symbol is requested from Alpaca without the suffix; the window ends at the change date, so
+  nothing at/after it is fetched). The store's pinned `asof` is untouched for every ordinary symbol (`open_store` still refuses to mix),
+  and the key cannot collide with the symbol's own chunks. Existing chunks are never altered. (3) `split-table` / `build` /
+  `ipo-dates` ignore the key as a symbol; `build` merges it into the symbol's series: old bars STRICTLY before the change (daily and
+  5-minute), then the current series. It REFUSES (`BuildError`) when the key matches no CUSIP-only name change dated asof+1 in the actions,
+  when a chunk was fetched with another asof or is empty/refused, when the current series already has a bar before the change (overlap),
+  when the seam does not line up (median of Alpaca raw close / FMP close over the last 10 sessions before vs the first 10 from the change
+  differs by more than 2%, i.e. the old and new security are not 1:1; FMP is the witness only, and no FMP file or fewer than 3 common
+  sessions per side also refuses), or when Alpaca lists a split / spin-off inside the old range that the split table never judged
+  (it sees the current series only; decide it in `split_overrides.json`). The merged symbol's build-manifest entry carries `predecessor`
+  (key, cut, bars, dropped bars, seam statistics) and the old chunks' hashes enter `inputs_sha256`.
+- Adjusted: splits, reverse splits, same-symbol unit splits, stock dividends, and spin-offs (factor 1 + rate x
+  spun-off close / parent close on the ex-date, prices only: the engine does not credit spun-off shares, so an
+  unadjusted parent would show a fake loss, e.g. IAC 2020-07-01). Not adjusted: cash dividends. Reused tickers and
+  bankruptcy re-listings (an unexplained overnight jump beyond x5) are series breaks: only the segment after the last
+  break is kept.
+- Split decision, per event with factor f: proven by the raw overnight jump (within x1.15 of f, |ln f| >= ln 1.25)
+  or by the **FMP step** (FMP adjusted close / Alpaca raw close steps by f within 2% across the date: the market
+  move cancels out, so it measures exactly what FMP applied). Small factors only when both vendors list them.
+  Undecided events are NOT applied and land in `split_review.csv`; owner decisions go in
+  `ba2_providers/ohlcv/alpaca_history/split_overrides.json` (a `pending` reviewer refuses the run). Override
+  `kind`s: `split` (default: accept with a `ratio` / reject a listing), `spinoff` (ratio = the factor prices before the
+  date are divided by; composes with a split override on the same day, e.g. ENOV 2022-04-05) and `bar_cap`
+  (`field` High|Low: the build caps that daily value at the 5-min all-session envelope bound, a row of
+  `bar_repairs.csv` with witness `override`; KORE 2023-05-23 Low, SHMD 2024-04-23 High). The file is hashed into the
+  split table (`overrides_sha256`); the build refuses when it changed since `split-table`.
+- **`verify` classes that do not block** (all listed, never silent): `known_vendor_event` days
+  (`KNOWN_VENDOR_EVENT_DAYS` in `verify.py`: the 2019-08-12 Argentine ADR crash, the 2020-03 circuit-breaker days,
+  2021-04-19 / 2021-10-25 / 2022-01-24 / 2022-03-08 where Alpaca history misses most of the session for ~60% of
+  liquid names, the 2023-01-24 NYSE auction glitch) in `hl_envelope`, `residual_jumps`, the Yahoo mismatch runs and
+  `intraday_outage` -> `verify/known_vendor_events.csv`; every other day keeps the blocking rules. An `intraday_outage`
+  day outside that list (>= 20 liquid symbols with < 50% of FMP's >= 60 bars) FAILs. Symbols excluded from the
+  universe (`screener/panel_exclusions.json`, kind `exclude`: IAC, ADEA, IPEXR, ...; the same list the screener
+  reads) are never panel symbols in the gate and are listed in its `excluded` summary.
+- Vendor list defects this guards against: Alpaca lists spurious events (HON, NVS, IR, DRS) and misses splits (KOD,
+  UHAL, SNX, RTX); FMP has CRWD mixed basis, META before 2022-06, and adjusts spin-offs (HON, IAC).
+- **Known limitation, accepted (owner 2026-10-25): some Alpaca daily closes are not the official close.** On a few
+  days the 1Day bar's close is a print from outside regular hours (late or after-hours), not the closing auction.
+  Example: SPY 2020-03-12, Alpaca daily close 255.24, its own last regular-session 5-min close 248.10, FMP / official
+  248.11 (+2.9%). Measured 2026-10-24 on 99 symbols (SPY, QQQ, the 97-name option universe), 2020-2025: the daily
+  close differs from the last regular 5-min close by > 0.1% on a median 2.3% of days and by > 0.5% on 0.27%; the
+  worst are the 2020-03 crash days (SPY 2.9%, TTE 8.8%, BAC 4.2%) and ADRs (SAN: 53% of days > 0.1%). The build does
+  NOT replace them and `verify` does not block on them (they sit under its blocking threshold). Effect: logic that
+  reads daily closes (indicators, SMA/RV regimes, ATR) is slightly off on those days; the SPY regime calendar built
+  on Alpaca vs FMP closes differs on 0.07% (trend) / 0.80% (vol) of 2020-2025 sessions
+  (`test_files/probe_spy_regime_source_disagreement.py`, arrives with the SPY-gate merge). Intraday decision prices (the 5-min bar that ended) are
+  unaffected.
+
+Why the switch (measured 2026-10-20 on the 4,465 screener-panel symbols with data, 2020-2025): days with 5-min
+bars FMP 84% / 93% / 97% vs Alpaca 94% / 97% / 98% (2020 / 2023 / 2025); symbols whose 5-min close misses the same
+vendor's daily close by > 2% on > 50% of days (wrong split basis, e.g. AMC x5/x10): FMP 144 (435 symbol-years),
+Alpaca 0. The free Alpaca plan only refuses SIP data from the last 15 minutes, so finished-session history is the
+full SIP tape.
+
+Runs of record:
+
+| Date | Step | Result |
+|---|---|---|
+| 2026-10-13..16 | download (`alpaca_store`) | 7,048 symbols, 0 failed, 232 refused chunks, 7.6 GB |
+| 2026-10-20 | download (`alpaca_store_daily2016`) | 11,621 symbols: 7,984 written, 3,767 empty (funds/OTC without Alpaca bars), 0 failed, 12,075 requests, 425 MB, 1 h 31 min |
+| 2026-10-20 | split-table (raw jump only) | 7,854 symbols, 1,620 events accepted, 2,311 review rows; superseded by the FMP-step run |
+
 ### 4.1 Equity (goal2020 and single equity backtests)
 
 | Step | Command | Notes |
 |---|---|---|
 | 1. OHLCV | `ba2-test fetch-cache --provider fmp --timeframes 5min,1d --start 2020-01-01 --end 2025-12-31 --symbols @<universe.txt> --workers 5` | goal2020 prices on **5min** bars. `grid_goal2020.sh` refuses to start below 75 % coverage per band (`tools/check_window_coverage.py`). Fetch the warmup before `--start` for FactorRanker (252 bars) and DeterministicScorer (260 bars). |
 | 2. Expert histories | `ba2-test prewarm --symbols @<universe.txt> --experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker --end 2025-12-31` | Add `FMPSenateTraderWeight` with `--start` to pre-compute Senate scores. |
-| 3. Screener metric store | `ba2-test build-screener-metrics --start 2020-01-01 --end 2025-12-31 --market-cap-min <loosest cap> --cadence-days 7` | Default path `~/Documents/ba2/common/cache/screener/metric_store`. It **must reach `ym=2020-01`**; `grid_goal2020.sh` checks this. The small-band floor is $50M (`--screener-cap-band` help); the exact `--market-cap-min` of the existing store is **(unverified)**. Build time **(unverified)**. |
+| 3. Screener metric store | `ba2-test build-screener-metrics --start 2020-01-01 --end 2025-12-31 --market-cap-min <loosest cap> --cadence-days 7` | Default path `~/Documents/ba2/common/cache/screener/metric_store`. It **must reach `ym=2020-01`**; `grid_goal2020.sh` checks this. The small-band floor is $50M (`--screener-cap-band` help); the exact `--market-cap-min` of the existing store is **(unverified)**. Build time **(unverified)**. **On the Alpaca history source (from 2026-10-21)**, rows 3 and 3b in one command (`--symbols-file` and `@FILE` now resolve against the directory you run from, so relative paths work; before this fix only absolute ones did): `ba2-test build-screener-metrics --store ~/Documents/ba2/common/cache/screener/metric_store_alpaca_20261021 --ohlcv-history-source alpaca --start 2020-01-01 --end 2026-10-12 --market-cap-min 0 --cadence-days 7 --drop-days 5 --max-lookback 30 --symbols-file tools/screener_store_universe.txt --allow-stale-symbols @tools/screener_store_allow_stale_alpaca.txt --daily-panel`. The allow-stale list = the universe symbols the build's `_meta/suspensions.json` records as `delisted` (event `[last bar date, end, kind, n, ...]`) whose last bar is more than 10 days before `--end` (the build refuses any other stale symbol); regenerate it whenever the universe or the cache changes (the current 144-name file reproduces from the 2026-10-12 build, BDCIU removed). The universe file (4,733 symbols) dropped BDCIU (a SPAC unit whose real 100-share prints repeat exactly, tripping the frozen-run gate). Of record (2026-10-22, local, on Alpaca cache build `20261022T161730Z-94bd45e0`): store `metric_store_alpaca_20261022`, daily panel `03d21a4a2f176c69` (4,723 symbols, 2019-03-01..2026-10-12, the 23 reviewed exclusions of `panel_exclusions.json` incl. the 11 reused-ticker / unclean-rename entries of the 2026-10-21 rename audit and the 5 `ipo_after_resume` tickers of the 2026-10-22 gap/reuse audit; allow-stale list unchanged at 144). Previous: `metric_store_alpaca_20261021` / panel `c51b6cd21e67a890` (cache build `20261021T135237Z-4de54841`). | **Frozen-run gate (2026-10-22):** >= 3 consecutive scans with identical close / 20-day volume / RVOL fail the build only when they are served by >= 3 DISTINCT bars that are identical in Open/High/Low/Close/Volume (a feed repeating complete bars); one bar carried over several scans, or two identical real prints (a thin SPAC unit such as BDCIU: 100 shares at 10.25 twice), pass. Measured on BDCIU: old rule 1 run, new rule 0 on every weekly alignment. |
+
+| 3b. Screener simulation data (criteria `live-daily-v2`, classic `--screener` jobs) | `ba2-test prewarm --screener-panel --screener-store ~/Documents/ba2/common/cache/screener/metric_store --start 2020-01-01 --end 2025-12-31` (or `ba2-test build-screener-metrics ... --daily-panel`) | For the store's universe: the vendor's bulk share table (1 call, refreshed weekly), the vendor's dated **share history** per symbol (1 call/symbol, ~4.7k first time, ~45 min at 3/s, resumable), the **split calendar** per symbol (1 call for each symbol without one, ~2.3k first time), the market-cap/float caches where missing, then the **daily criteria panel** `<cache>/screener/daily_panel/<fingerprint>/` (~1 GB, ~13 min). Every fetch failure ends the run with an ERROR (re-run resumes). `optimize --screener` resolves the newest panel once, stamps `screener_opt.panel` (path relative to the cache root) and `panel_fingerprint` on the job, and REFUSES when the panel is missing, does not cover `[start - 260 d, end]`, was built under another `criteria_version`, lists a symbol that is in the vendor's current listing but has stale bars (or no share source, or no split calendar). Older panel directories are kept until removed by hand (the build prints their sizes). Remote workers receive the panel directory and `screener_fundamentals/{shares,splits}` with `cache push` (a new directory per build: `cache push` compares path and size, so rebuilding in place would never ship). Design and validation: [docs/plans/2026-10-08-screener-live-sim.md](plans/2026-10-08-screener-live-sim.md). |
 
 The screened universe of each band is derived from the store, so step 1 needs the union of
 symbols the store can ever screen in. `grid_goal2020.sh` prints each band's union in its
@@ -260,19 +366,60 @@ A manifest pins the immutable feature objects every trial reads (profiles `ohlcv
 caches differ. Each host warms and verifies its own, and a job pins the digest in its name.
 
 ```bash
-python tools/warm_market_conditions.py plan --profile ohlcv-v1 \
+python tools/warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp \
     --universe-file tools/options_universe_top100.txt --start 2020-01-01 --end 2025-12-31 --out plan.ohlcv-v1.json
-python tools/warm_market_conditions.py build --plan plan.ohlcv-v1.json --cache-only --print-digest
-python tools/warm_market_conditions.py verify --manifest <digest>
-python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1
+python tools/warm_market_conditions.py build --plan plan.ohlcv-v1.json --cache-only --print-digest --ohlcv-history-source fmp
+python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source fmp
+python tools/warm_market_conditions.py prepare-host --manifest <digest> --profile ohlcv-v1 --ohlcv-history-source fmp
 ```
 
-Repeat for `ta-structure-v1`. Pinned digests of record:
+Repeat for `ta-structure-v1`. **Every `warm_market_conditions.py` subcommand needs
+`--ohlcv-history-source {fmp,alpaca}`** (required, no default: an omission or a typo exits 2, so a vendor is
+never picked silently). It selects the manifest's source profile and the price folder: `fmp` =
+`<CACHE>/FMPOHLCVProvider` (profile `fmp-daily-split-adjusted-v1`), `alpaca` = `<CACHE>/AlpacaHistoryOHLCVProvider`
+(profile `alpaca-daily-split-verified-v1`). `build` refuses a plan of the other source, `verify` and `prepare-host`
+refuse a digest of the other source, and a job pinned to a manifest of another source profile refuses to start.
+For `alpaca`, `build --fetch-missing` is refused (that cache is built only by `tools/prepare_history.py`) and `plan`
+requires the gate's PASS certificate of the current build (`_meta/gate_certificate.json`, written by the full
+`verify` step with the build manifest's sha256; none, a FAIL, or a manifest rebuilt since -> exit 1). The gate is what
+certifies this cache's split basis. `plan` still runs the split-basis check against the splits the build applied
+(`_meta/build_manifest.json`) and records it per symbol, but only a split the build lists that the stored series did
+not absorb (`drift` on the `unadjusted` basis) makes the plan actionable; `undetectable` (factors below x1.5, stock
+dividends), `mixed_basis` and `mixed` drift ask for a re-fetch, which this cache never does, so they are informational
+(54 of the 753 stage-2 names on 2026-10-21, every one on FMP's basis across the date).
 
-| Universe / host | `ohlcv-v1` | `ta-structure-v1` |
-|---|---|---|
-| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) |
-| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` |
+For `--source alpaca` the step plans with `--gap-fill previous` (the `fmp` path keeps its default, no fill): the
+build drops Alpaca's placeholder daily bars, so thin names have real gaps in their series, and the previous valid bar
+is carried forward inside the market-condition calculation only (the history files keep the gaps).
+
+The command for an Alpaca job, per source, both profiles, with the universe (`tools/options_universe_top100.txt`
+for the 97-name option universe; the 753-name stage-2 universe file for stage 2, see 4.4):
+
+```bash
+python tools/prepare_history.py --source alpaca --steps market-conditions \
+    --universe-file tools/options_universe_top100.txt --start 2020-01-02 --end 2025-12-31
+python tools/prepare_history.py --source alpaca --steps market-conditions \
+    --universe-file <universe_stage2.txt> --start 2020-01-02 --end 2025-12-31
+python tools/prepare_history.py --source fmp --steps market-conditions --universe-file <universe.txt> --start ... --end ...
+```
+
+It runs the four commands above for `ohlcv-v1` then `ta-structure-v1` (with `--ohlcv-history-source alpaca`), writes
+each plan under `<report-dir>/market_conditions/`, and records both digests in
+`prepare_history_alpaca_report.json` (`steps[-1].result.digests`). Digests differ **per source** (the manifest records
+its source profile, and the prices differ) **and per host** whenever the price caches differ; feature objects are
+content-addressed, so the two sources never overwrite or reuse each other's rows. Option jobs may run on either source since dev de90560c (Task 12: on `alpaca` the as-traded split basis comes from
+the verified split table); stage 1 stays on `fmp`, stage 1.5 runs on `alpaca` (owner 2026-10-22). Pinned digests of record:
+
+| Universe / host | `ohlcv-v1` (fmp) | `ta-structure-v1` (fmp) | `ohlcv-v1` (alpaca) | `ta-structure-v1` (alpaca) |
+|---|---|---|---|---|
+| 97 names, remote227, stage 1 since 2026-09-23 | `ca4d65d4…` (full digest in the job config, **not recorded in the repo**) | `2b6e8ca8…` (same) | `2b958769b8a44539d90b4f9b3e156a3e9a5461c425cb717c118400eb999c275f` | `7e1904763ec74ca61aa6f580f1328630c160e4de141bd93a4252fb71bdc42070` |
+| 753 names (stage 2), local, synced to remote227 | `105278717aecf5471e9c01ef365a436eeaa917248e34c44e2af10643cf2489bd` | `dbac2c668a9a398c5efe000a6c260e81ee3a32279d2b7d0087862c7f4faf494e` | `59f8826b7381baa6039c8b5c2467c785aa0770e2435cf717537880183fa78d65` | `8fac4e9de1d2b68669d34b87ed121765979ae3f51a22e7eeefd8ea40869859d7` |
+| 753 names (stage 2), local, Alpaca build `20261104T193527Z-5773e25c` (TEVA predecessor merge), synced to remote227 | (fmp unchanged) | (fmp unchanged) | `f0fe573aa4c92ca0f3a6cb88553c085f43b6dfe93b4994ab6c0a8d21e5db337a` | `e2ff85f617671c4b5ff8fde1e0375ecf7a4424b13ed9a12918c69df7624d1be4` |
+
+Stage 2 (2026-11-04 on) uses the `20261104T193527Z-5773e25c` row: `prepare_history.py --source alpaca --steps split-table,build,verify,market-conditions --panel-symbols <screener daily panel 03d21a4a2f176c69 symbols.json> --universe-file tools/options_universe_stage2.txt --start 2020-01-02 --end 2025-12-31 --workers 6`; its window check leaves only PS (listed 2026-04-29, no 2020-2025 bars), so PS was removed from `tools/options_universe_stage2.txt` (752 names). The alpaca digests are those of the local workstation on the Alpaca cache build `20261022T161730Z-94bd45e0` (gate
+certificate PASS, 2026-10-22: exchange_gap events, reused-ticker truncation, the TIGO rights-offering override), window
+2020-01-02..2025-12-31, `--gap-fill previous`; a worker that holds the pushed cache reproduces them. The previous build
+(`20261021T135237Z-4de54841`, 2026-10-21) gave `32b94b83…` / `61ea5c16…` (97 names) and `d00d1c52…` / `1b627b4c…` (753).
 
 The 98-name workstation digests in the goal2020 runbook (`c9ba981f…`, `3c3020d0…`) predate the
 2026-09-23 data repairs. To reproduce a specific job, read the digests from that job's
@@ -280,21 +427,20 @@ The 98-name workstation digests in the goal2020 runbook (`c9ba981f…`, `3c3020d
 
 ### 4.4 Options (stage 2: 753 names) — the one-command pipeline
 
-After branch `data/stage2-universe-repair` merges, follow
-[RUNBOOK-option-universe-data.md](RUNBOOK-option-universe-data.md) (not on dev yet; read it with
-`git show data/stage2-universe-repair:docs/RUNBOOK-option-universe-data.md`). The command is:
+Follow [RUNBOOK-option-universe-data.md](RUNBOOK-option-universe-data.md). The universe is the
+committed `tools/options_universe_stage2.txt`. The command is:
 
 ```bash
-python tools/prepare_option_universe.py --universe-file <universe.txt> \
+python tools/prepare_option_universe.py --universe-file tools/options_universe_stage2.txt \
     --start 2020-01-01 --end 2025-12-31 --report-dir reports/prep-<date> [--db <sqlite with the ThetaData key>] \
     [--dry-run] [--steps a,b] [--from-step X] [--procs 2] [--theta-concurrency 1]
 ```
 
 | # | Step | What it does |
 |---|---|---|
-| 1 | `split-check` | `warm_market_conditions.py plan --profile ohlcv-v1`: split calendars plus the split-basis check per FMP file |
+| 1 | `split-check` | `warm_market_conditions.py plan --profile ohlcv-v1 --ohlcv-history-source fmp`: split calendars plus the split-basis check per FMP file |
 | 2 | `dividends` | `warm_dividend_calendars.py`: FMP dividend calendars for the guard's carry separation |
-| 3 | `fmp-repair` | Force-refetches refused names, then re-checks. **Refuses while the US session is open.** |
+| 3 | `fmp-repair` | Force-refetches refused names, then re-checks (`repair --ohlcv-history-source fmp`; FMP only, the Alpaca cache is built by `prepare_history.py`). **Refuses while the US session is open.** |
 | 4 | `thetadata` | `warm_options_history.py --provider thetadata --wide`: missing partitions, plus partitions made stale by a `ROOT_HISTORY` alias |
 | 5 | `ds-prewarm` | `prewarm --experts DeterministicScorer` |
 | 6 | `gate-check` | Screener gate-store rows per name |
@@ -307,10 +453,10 @@ exclusion). `prepare-host` on each grid host and syncing the tree are **not** pa
 neither is the option risk-free rate: run `tools/refresh_fred_cache.py --series DGS3MO` and
 `--check-rate-window` (step 3b above) and sync `<CACHE_FOLDER>/fred/DGS3MO.json` to every host.
 
-The 753-name universe is the 820-name `tools/options_universe_large_cap.txt` minus 67 recorded
-exclusions: 55 with no listed options 2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. **The
-753-name file is not committed** (it sits in a session scratch folder as `universe_stage2.txt`).
-Commit it with the data branch.
+The 753-name universe, `tools/options_universe_stage2.txt`, is the 820-name
+`tools/options_universe_large_cap.txt` minus 67 recorded exclusions: 55 with no usable option chain
+2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. The 67 names and the reason for each are in
+`tools/options_universe_stage2_excluded.txt` (`SYMBOL<TAB>reason`, one per line).
 
 Measured on 2026-09-25/26 (local box, from the data runbook and the repair log):
 
@@ -540,6 +686,7 @@ recovers. So:
 | Option engine fixes, **2026-09-24/25** (`3b3465c8`, TEST 0089) | Split-crossing lots, DD refinement, option activity stepping, the <2-trade loophole. **Every option grid result before them is void.** |
 | Option fitness family | `option_consistent_annual_return`, `option_car_over_risk`, `option_car_target`, `option_car_target_soft30` and `option_convex` are mutually incomparable |
 | FMPRating window | Starts 2022; never mix it with full-window rows in per-year comparisons |
+| OHLCV history source fmp -> alpaca, **2026-10-20** (§4.0) | Equity jobs stamp `ohlcv_history_source`; a row without the stamp ran on the FMP cache. Different price history, so never compare across it |
 
 ### 6.4 Determinism caveats
 
