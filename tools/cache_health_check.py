@@ -684,9 +684,13 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
     4. EXPIRY GAPS (every symbol with data, not sampled -- this is cheap: directory listing +
        date arithmetic, no parquet reads): ``--discovery synthetic`` (the default, and the only
        mode a personal OAuth app can use -- see warm_options_history.py) plans to fetch EVERY
-       Friday in the window (``expiry_calendar``), so that is the oracle. A Friday with a
-       manifest -- COMPLETE *or* EMPTY, a holiday-shifted Friday genuinely has no chain and is
-       recorded as such -- is not a gap; a Friday with NO manifest at all inside the SPAN the
+       expiry day in the window (``expiry_calendar``: every Friday, or the Thursday before it
+       when that Friday is an NYSE holiday), so that is the oracle. An expiry with a
+       manifest -- COMPLETE *or* EMPTY, a pre-IPO expiry genuinely has no chain and is
+       recorded as such -- is not a gap. A store backfilled BEFORE the holiday shift existed
+       holds EMPTY ``exp=<holiday Friday>`` partitions and no ``exp=<Thursday>`` one, so each
+       such Thursday is reported here as a gap until the repair re-run fills it (see
+       docs/REPRODUCE-BACKTESTS.md section 4.2). An expiry with NO manifest at all inside the SPAN the
        symbol has otherwise already reached (strictly between its earliest and latest completed
        expiry) means that unit was queued and never finished: a worker chunk that died mid-run,
        or a resume that somehow skipped it. Fridays outside that span are a coverage/"shallow"

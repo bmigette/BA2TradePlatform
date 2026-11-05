@@ -359,6 +359,27 @@ basis it cannot settle. Repair it with `build --plan <plan> --fetch-missing --co
 which replaces the file wholesale. On 2026-09-16, 13 symbols took ~6 s and 13 provider calls.
 See the goal2020 runbook, "Published snapshots".
 
+**Holiday-Thursday repair re-run.** A store backfilled before `expiry_calendar` learned the
+holiday shift holds `exp=<Friday>` partitions with zero contracts and no `exp=<Thursday>`
+partition for every expiry the exchange moved off a closed Friday: 2020-04-09, 2020-07-02,
+2020-12-24, 2020-12-31, 2021-04-01, 2021-12-23, 2022-04-14, 2023-04-06, 2024-03-28,
+2025-04-17, 2025-07-03 (the Thursdays of Good Friday and the July 4 / Christmas / New Year
+Fridays; 11 per symbol). The vendor streamed those rows and the old wide loop dropped them. The
+planner now adds the calendar expiries a cached synthetic contract list lacks (using the strike
+ladder already cached), so re-running the same command plans exactly those 11 expiries per
+symbol: every COMPLETE/EMPTY partition is skipped and the few pending ones fall below
+`--wide-min-pending`, so they are fetched per expiry, not by a wide re-fetch. Check first with
+`--dry-run` (no vendor request; it prints the per-symbol pending counts):
+
+```bash
+python tools/warm_options_history.py --provider thetadata --wide --symbols-file tools/options_universe_stage2.txt     --start 2020-01-01 --end 2025-12-31 --concurrency 3 --dry-run     # then the same without --dry-run
+```
+
+The wide loop now also prints one `WARNING ... DROPPED` line per symbol when a stream carries
+bars for an in-window expiry that is neither owed nor already finished, so a future gap of this
+kind shows in the log. `cache_health_check.py` reports the missing Thursdays as expiry gaps
+until the repair is done.
+
 ### 4.3 Market-condition manifests
 
 A manifest pins the immutable feature objects every trial reads (profiles `ohlcv-v1` and

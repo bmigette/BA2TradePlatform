@@ -220,3 +220,47 @@ def test_a_thread_that_raises_still_reports_the_work_it_finished(tmp_path):
             sleep=lambda s: None, log=lambda m: None, concurrency=2)
     except KeyboardInterrupt:
         pass  # re-raised on the main thread, which is the contract
+
+
+# --------------------------------------------------------------------------- #
+# no silent drop: bars for an expiry the plan never owed are reported loudly
+# --------------------------------------------------------------------------- #
+def _run_logged(tmp_path, bars, pre_finished=()):
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+    store = OptionHistoryParquetStore(root=str(tmp_path / "store"))
+    for e in pre_finished:        # a partition the store already holds (resume behaviour)
+        store.write_partition("AAPL", e, [_bar(e, date(2024, 1, 5))], _START, _END)
+    lines = []
+    unit = w.SymbolUnit(
+        underlying="AAPL", pending_expiries=[_E1],
+        contracts=[OptionContractMeta(occ_symbol=_occ(_E1), underlying="AAPL",
+                                      option_type="call", strike=100.0, expiry=_E1)])
+    w.run_symbol_units([unit], _Provider(bars), store, _START, _END, _ns(),
+                       clock=lambda: __import__("datetime").datetime(2024, 1, 1),
+                       sleep=lambda s: None, log=lines.append)
+    return lines
+
+
+def test_bars_for_an_unplanned_expiry_are_reported_per_symbol_with_row_counts(tmp_path):
+    thursday = date(2024, 3, 28)       # a holiday-shifted expiry the plan never knew
+    lines = _run_logged(tmp_path, [
+        _bar(_E1, date(2024, 3, 1)),
+        _bar(thursday, date(2024, 3, 1)), _bar(thursday, date(2024, 3, 4)),
+    ])
+    dropped = [l for l in lines if "DROPPED" in l]
+    assert len(dropped) == 1
+    assert "[AAPL]" in dropped[0] and "2024-03-28=2" in dropped[0]
+    assert "2024-03-15" not in dropped[0], "the owed expiry must not be reported"
+
+
+def test_bars_for_an_already_finished_partition_are_dropped_quietly(tmp_path):
+    done = date(2024, 3, 28)
+    lines = _run_logged(tmp_path, [_bar(_E1, date(2024, 3, 1)), _bar(done, date(2024, 3, 1))],
+                        pre_finished=[done])
+    assert not [l for l in lines if "DROPPED" in l]
+
+
+def test_bars_for_an_expiry_outside_the_run_window_are_not_a_missed_plan(tmp_path):
+    lines = _run_logged(tmp_path, [_bar(_E1, date(2024, 3, 1)),
+                                   _bar(date(2026, 1, 16), date(2024, 3, 1))])
+    assert not [l for l in lines if "DROPPED" in l]

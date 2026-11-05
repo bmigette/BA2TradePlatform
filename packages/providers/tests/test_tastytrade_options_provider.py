@@ -671,6 +671,32 @@ def test_expiry_calendar_is_inclusive_of_a_friday_endpoint():
     assert expiry_calendar(date(2023, 1, 6), date(2023, 1, 6)) == [date(2023, 1, 6)]
 
 
+@pytest.mark.parametrize("thursday,friday", [
+    (date(2020, 4, 9), date(2020, 4, 10)),      # Good Friday
+    (date(2022, 4, 14), date(2022, 4, 15)),     # April 2022 monthly
+    (date(2025, 4, 17), date(2025, 4, 18)),     # April 2025 monthly
+    (date(2021, 12, 23), date(2021, 12, 24)),   # Christmas Eve 2021 observed
+    (date(2020, 7, 2), date(2020, 7, 3)),       # July 4 2020 observed
+])
+def test_expiry_calendar_shifts_a_holiday_friday_to_the_thursday_before(thursday, friday):
+    got = expiry_calendar(date(2020, 1, 1), date(2025, 12, 31))
+    assert thursday in got
+    assert friday not in got
+
+
+def test_expiry_calendar_keeps_the_ordinary_friday_beside_a_shifted_week():
+    got = expiry_calendar(date(2022, 4, 1), date(2022, 4, 30))
+    assert got == [date(2022, 4, 1), date(2022, 4, 8), date(2022, 4, 14), date(2022, 4, 22),
+                   date(2022, 4, 29)]
+
+
+def test_expiry_calendar_respects_the_window_when_the_shift_crosses_an_edge():
+    # window ends ON the Thursday: the shifted day is inside it
+    assert expiry_calendar(date(2022, 4, 11), date(2022, 4, 14)) == [date(2022, 4, 14)]
+    # window starts the day after the Thursday: the shifted day is before it
+    assert expiry_calendar(date(2022, 4, 15), date(2022, 4, 20)) == []
+
+
 def test_expiry_calendar_rejects_a_reversed_window():
     with pytest.raises(ValueError):
         expiry_calendar(date(2023, 2, 1), date(2023, 1, 1))
