@@ -252,3 +252,48 @@ def test_the_inventory_counts_option_actions_and_names_the_capability_that_repla
     assert "option_selection" not in counted["coverage_by_capability"]
     markdown = inventory.to_markdown(counted)
     assert "## Option actions" in markdown and "`option_selection` capability" in markdown
+
+
+# --------------------------------------------------------------------------- recorded read errors
+def _quote_down_account(exc_factory):
+    class QuoteDown(RecordingOptionsAccount):
+        def get_option_quote(self, contract_symbol):
+            raise exc_factory()
+
+    return QuoteDown()
+
+
+def _close_with_a_failing_quote(tmp_path, exc_factory):
+    held = {}
+    recorded = record_session(
+        tmp_path / "store", tmp_path / "export",
+        lambda: close_action(_quote_down_account(exc_factory), held["order"]).execute(),
+        seed=lambda: held.update(order=seed_open_option()))
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]   # fell back to entry premium
+    bundle = load_bundle(recorded["bundle_dir"])
+    errors = [o for o in bundle.observations if o.response_class == ReplayStatus.RESPONSE_ERROR]
+    assert errors and errors[0].method == "get_option_quote"
+    return recorded
+
+
+def test_a_read_that_raised_and_was_handled_replays_through_the_same_branch(tmp_path):
+    """The close fell back to the entry premium because the quote read raised a ConnectionError
+    (an OSError: the one family the live handler absorbs under BA2_ERROR_MODE=enforce). Before the
+    error observation that replayed as missing_capture; now the tape raises the same type."""
+    recorded = _close_with_a_failing_quote(tmp_path, lambda: ConnectionError("quote service down"))
+    _assert_every_stage_matches(option_selection.run(recorded["bundle_dir"]), 1)
+
+
+def test_a_third_party_error_class_replays_as_a_difference_never_a_false_match(tmp_path):
+    """Documented limit: an SDK error class (here an OSError subclass, so live absorbed it) cannot be
+    rebuilt offline; the tape raises RecordedProviderError, which the handler does not absorb, and
+    the report says DIFFERENCE (an honest gap), not match and not missing_capture."""
+    class SdkError(OSError):
+        pass
+
+    SdkError.__module__ = "alpaca.common.exceptions"
+    recorded = _close_with_a_failing_quote(tmp_path, lambda: SdkError("rate limited"))
+    report = option_selection.run(recorded["bundle_dir"])
+    (row,) = report.results
+    assert row.status == ReplayStatus.COVERAGE_DIFFERENCE
+    assert "RecordedProviderError" in row.detail and "rate limited" in row.detail

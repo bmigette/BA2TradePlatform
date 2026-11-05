@@ -61,6 +61,7 @@ from ba2_common.core.replay import (
     sanitize_identity,
     use_capture_context,
 )
+from ba2_common.core.replay.recorded_errors import rebuild_error
 from ba2_experts.FMPEarningsDrift import earning_calendar_identity
 from ba2_experts.FMPRating import symbol_identity
 from ba2_providers.cache.cached_get import insider_get_identity, past_earnings_get_identity
@@ -136,6 +137,15 @@ def _refuse_non_finite(identity: Any, provider: str, method: str, path: str = ""
             _refuse_non_finite(value, provider, method, f"{path}[{index}]")
 
 
+class _RecordedRaise:
+    """A recorded ``error`` observation: taking it raises (see ``recorded_errors``)."""
+
+    __slots__ = ("payload",)
+
+    def __init__(self, payload):
+        self.payload = payload
+
+
 class ReplayTape:
     """Every recorded provider return of ONE analysis, addressable by identity."""
 
@@ -149,6 +159,9 @@ class ReplayTape:
         for observation in self._observations:
             payload = (None if observation.payload_object is None
                        else bundle.decode(observation.payload_object))
+            if observation.response_class == ReplayStatus.RESPONSE_ERROR:
+                # A read that RAISED live (opt-in ``record_errors`` taps): served by raising.
+                payload = _RecordedRaise(payload)
             key = _key(observation.provider, observation.method, observation.request_identity)
             self._entries.setdefault(key, []).append(payload)
 
@@ -183,7 +196,10 @@ class ReplayTape:
                         if recorded is None else
                         f"all {len(recorded)} recorded return(s) already consumed"))
         self._taken[key] = used + 1
-        return recorded[used]
+        value = recorded[used]
+        if isinstance(value, _RecordedRaise):
+            raise rebuild_error(value.payload)
+        return value
 
 
 # --------------------------------------------------------------------------- #

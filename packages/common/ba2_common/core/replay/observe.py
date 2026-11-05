@@ -171,6 +171,7 @@ def observe_provider(
     provenance: Any = ReplayStatus.PROVENANCE_UNKNOWN,
     before: Optional[Callable[[Mapping[str, Any]], Any]] = None,
     payload: Optional[Callable[[Mapping[str, Any], Any], Any]] = None,
+    record_errors: bool = False,
 ):
     """Decorate a provider boundary so its RETURN is recorded when capture is on.
 
@@ -184,6 +185,12 @@ def observe_provider(
       for a cheap "was this served from cache?" probe. It must not fetch.
     * ``payload`` -- ``fn(args, result)`` when what is worth recording is not the
       return value itself. Defaults to the return value.
+
+    * ``record_errors`` -- opt-in (the option taps). When the wrapped call RAISES, an
+      observation of kind ``error`` (:func:`~ba2_common.core.replay.recorded_errors.error_payload`)
+      is recorded under the same identity and the ORIGINAL exception is re-raised unchanged, so
+      a caller that handled the failure replays through the same branch. Off by default: the
+      stock taps keep recording returns only.
 
     The wrapped function is called EXACTLY once, and its return value is passed
     back by identity: capture never changes a result or a call count.
@@ -205,7 +212,14 @@ def observe_provider(
                 except Exception as exc:
                     context.note_failure(f"{provider}.{method} pre-probe failed", exc)
 
-            result = fn(*args, **kwargs)
+            if record_errors:
+                try:
+                    result = fn(*args, **kwargs)
+                except Exception as raised:
+                    _record_raise(context, provider, method, identity, bound, raised)
+                    raise
+            else:
+                result = fn(*args, **kwargs)
 
             try:
                 request_identity = identity(bound) if bound is not None else {
@@ -232,6 +246,20 @@ def observe_provider(
         return wrapper
 
     return decorator
+
+
+def _record_raise(context, provider, method, identity, bound, raised) -> None:
+    """Record a raised read as an ``error`` observation. Never raises: the caller re-raises ``raised``."""
+    from ba2_common.core.replay.recorded_errors import error_payload
+
+    try:
+        request_identity = identity(bound) if bound is not None else {"identity_unavailable": True}
+        payload = error_payload(raised)
+    except Exception as exc:
+        context.note_failure(f"{provider}.{method} error observation not built", exc)
+        return
+    record_observation(provider=provider, method=method, identity=request_identity,
+                       payload=payload, response_class=ReplayStatus.RESPONSE_ERROR)
 
 
 def tapped_boundary(fn) -> Optional[tuple]:

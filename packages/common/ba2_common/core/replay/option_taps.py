@@ -27,6 +27,10 @@ A class that sets ``_replay_taps_exempt`` is skipped (``QuoteCachingAccount``: t
 wrapped account records). Known limit: an override that calls ``super()`` into a tapped
 parent method records twice (same identity, same value); harmless for a lookup replay.
 
+**Errors.** The option taps pass ``record_errors=True``: a read that raised is recorded as an
+``error`` observation and re-raised unchanged, so an action that skipped the candidate replays the
+same way (see :mod:`~ba2_common.core.replay.recorded_errors` for what can be rebuilt).
+
 **Identity** = call arguments plus ``account_class`` / ``account_id`` (the shape of
 ``ReadOnlyAccountInterface.quote_identity``). No wall-clock value ever enters an identity:
 the option reads take none, and the sizing reads take only caller-supplied numbers.
@@ -151,4 +155,4 @@ def tap_option_methods(cls) -> None:
             # A classmethod/staticmethod/property would be silently left untapped.
             raise TypeError(
                 f"{cls.__name__}.{name} is not a plain method; it cannot carry the option tap")
-        setattr(cls, name, observe_provider(provider, name, identity=identity)(resolved))
+        setattr(cls, name, observe_provider(provider, name, identity=identity, record_errors=True)(resolved))
