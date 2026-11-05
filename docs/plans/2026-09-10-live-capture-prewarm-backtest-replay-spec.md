@@ -544,3 +544,12 @@ References:
   `ba2_common/core/native_cache.py`, `ba2_common/core/provider_cache_model.py`,
   `ba2_providers/fmp_common.py`, expert `_gather`/`_process`, live
   `JobManager`/`TradeManager`, and backend `daily_backtest_handler`/`parity_harness`.
+
+## Status note 2026-11-05: option selection replay
+
+Option entries and exits are now captured and replayable: option chain/quote/IV + sizing taps on every
+`OptionsAccountInterface` override, a per-action record around the option actions, capture scopes for
+experts with option rules (entry AND open-positions passes), and `ba2-test replay option-selection
+--bundle <dir>` (exact selection / pricing / sizing / record / refusal stages). Design and plan:
+`docs/plans/2026-11-05-option-capture-replay-design.md`, `docs/plans/2026-11-05-option-capture-replay-plan.md`.
+Not covered: parquet-vs-broker data (no replay BT provider), option lifecycle rolls outside the actions.
