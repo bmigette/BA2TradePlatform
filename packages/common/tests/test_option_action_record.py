@@ -307,6 +307,45 @@ def test_db_rows_hold_the_expert_its_settings_the_recommendation_and_its_transac
     assert {type(i).__name__ for i in instances} >= {"ExpertInstance", "TradingOrder"}
 
 
+def test_db_rows_are_bounded_to_the_capital_holding_set_not_the_expert_history():
+    """Closed / canceled transactions (on the symbol or elsewhere) are not read by any action or
+    sizing path (every symbol read is WAITING/OPENED/CLOSING), so they are not recorded; the
+    capital-holding transactions of the expert on ANY symbol (the used-balance pass) are."""
+    expert_id = add_instance(ExpertInstance(account_id=1, expert="X", virtual_equity_pct=80.0))
+
+    def txn(symbol, status):
+        return add_instance(Transaction(symbol=symbol, quantity=1, side=OrderDirection.BUY,
+                                        status=status, expert_id=expert_id))
+
+    def order(txn_id, symbol):
+        return add_instance(TradingOrder(account_id=1, symbol=symbol, quantity=1,
+                                         side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                                         status=OrderStatus.FILLED, transaction_id=txn_id))
+
+    kept = {}
+    for name, symbol, status in (("waiting", "XYZ", TransactionStatus.WAITING),
+                                 ("opened_other", "ABC", TransactionStatus.OPENED),
+                                 ("closing_other", "DEF", TransactionStatus.CLOSING)):
+        kept[name] = txn(symbol, status)
+    dropped = {name: txn(symbol, status) for name, symbol, status in (
+        ("closed_same", "XYZ", TransactionStatus.CLOSED),
+        ("failed_same", "XYZ", TransactionStatus.FAILED),
+        ("closed_other", "ABC", TransactionStatus.CLOSED))}
+    kept_orders = {name: order(t, "X") for name, t in kept.items()}
+    dropped_orders = {name: order(t, "X") for name, t in dropped.items()}
+
+    rows, _ = oar._collect_db_rows(_entry(FakeAccount(), rec=_rec(id=None, instance_id=expert_id)))
+    got = {(r["model"], r["row"]["id"]) for r in rows}
+    for t in kept.values():
+        assert ("Transaction", t) in got
+    for o in kept_orders.values():
+        assert ("TradingOrder", o) in got
+    for t in dropped.values():
+        assert ("Transaction", t) not in got
+    for o in dropped_orders.values():
+        assert ("TradingOrder", o) not in got
+
+
 # ---------------------------------------------------------------------------
 # closes
 # ---------------------------------------------------------------------------

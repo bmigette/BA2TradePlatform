@@ -57,10 +57,11 @@ span, and Task 6 consumes it by calling ``replay_now()`` once before ``execute``
   ``ExpertSetting`` rows (``_per_instrument_cap_pct`` -> ``expert.settings[...]``; secret-looking
   keys are dropped and named in ``redacted_setting_keys``);
 * ``ExpertRecommendation`` row (``_build_order_data`` -> ``get_instance(ExpertRecommendation, id)``);
-* the expert's ``Transaction`` rows on the symbol, any status (``_held_equity_shares``,
-  ``_committed_to_underlying``, ``held_covered_calls`` via ``open_transactions``) and every
-  WAITING / OPENED / CLOSING ``Transaction`` of the expert on any symbol (the expert's
-  available-balance used-capital pass), plus ALL ``TradingOrder`` rows of those transactions;
+* every WAITING / OPENED / CLOSING ``Transaction`` of the expert on ANY symbol
+  (``CAPITAL_HOLDING_TRANSACTION_STATUSES``: the symbol reads ``_held_equity_shares``,
+  ``_committed_to_underlying``, ``held_covered_calls`` and the duplicate gate are all subsets of it,
+  and the used-balance pass reads it across symbols), plus ALL ``TradingOrder`` rows of those
+  transactions. CLOSED / FAILED history is NOT recorded: no action or sizing path reads it;
 * closes / roll: ``existing_order`` (full dump), its transaction (``get_or_none(Transaction)``),
   every ``TradingOrder`` of that transaction (``_resolve_option_order`` fallback,
   ``_close_multi_leg`` ``txn_orders``, ``_roll_in_flight``, ``_entry_order``), the order's child
@@ -448,7 +449,7 @@ def _collect_db_rows(action):
         ExpertInstance, ExpertRecommendation, ExpertSetting, TradingOrder, Transaction,
     )
     from ba2_common.core.trade_store import get_or_none, orders_where, transactions_where
-    from ba2_common.core.types import TransactionStatus
+    from ba2_common.core.types import CAPITAL_HOLDING_TRANSACTION_STATUSES
 
     rows: Dict[tuple, Dict[str, Any]] = {}
     redacted: List[str] = []
@@ -492,11 +493,17 @@ def _collect_db_rows(action):
                     redacted.append(setting.key)
                 else:
                     add(setting)
-        transactions = list(transactions_where(expert_id=expert_id, symbol=action.instrument_name))
-        transactions += list(transactions_where(
-            expert_id=expert_id,
-            statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED,
-                      TransactionStatus.CLOSING]))
+        # THE BOUND. Every transaction read of an execute filters on WAITING / OPENED / CLOSING
+        # (CAPITAL_HOLDING_TRANSACTION_STATUSES): ``_committed_to_underlying`` (symbol, all three),
+        # ``_held_equity_shares`` (symbol, OPENED), ``_own_equity_transactions`` /
+        # ``held_covered_calls`` (symbol, WAITING/OPENED), the duplicate-position gate
+        # (``open_or_waiting_position``), the option risk manager (OPENED / WAITING of the expert)
+        # and the expert's used-balance pass (``capital_transactions``, ANY symbol, all three).
+        # Nothing reads a CLOSED / FAILED row, so history is not recorded: the set is the expert's
+        # capital-holding transactions on any symbol, plus all their orders below. The transaction
+        # an existing order belongs to is added separately above, whatever its status.
+        transactions = list(transactions_where(
+            expert_id=expert_id, statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)))
         ids = []
         for transaction in transactions:
             add(transaction)
