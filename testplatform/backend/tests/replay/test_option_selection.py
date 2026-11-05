@@ -308,3 +308,23 @@ def test_the_cli_parses_and_runs_option_selection(bundle_copy, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (out / "option_selection.md").is_file() and (out / "option_selection.json").is_file()
     assert "Capability run:" in result.stdout and "historical_provider" in result.stdout
+
+
+def test_the_tape_account_serves_a_recorded_stock_quote_by_identity_and_in_recorded_order(session):
+    """The stock quote tap (provider ``broker``) is served through the same identity function the
+    recorder used; a second read of the same request is a miss, not the last value again."""
+    bundle = load_bundle(session)
+    (analysis,) = bundle.analyses
+    observations = [o for o in bundle.observations_for(analysis.analysis_id)
+                    if o.provider in ("broker", "broker_options")]
+    action = next(o for o in bundle.observations_for(analysis.analysis_id)
+                  if o.provider == "option_action")
+    inputs = bundle.decode(action.payload_object)["inputs"]
+    tape = option_selection.SpanTape(bundle, analysis, observations)
+    account = option_selection._tape_account(tape, inputs, analysis.analysis_id)
+    assert account.get_instrument_current_price("XYZ", "mid") == 100.0
+    with pytest.raises(ReplayMiss, match="tape_exhausted"):
+        account.get_instrument_current_price("XYZ", "mid")
+    with pytest.raises(ReplayMiss, match="get_instrument_current_price"):
+        account.get_instrument_current_price("OTHER", "mid")
+    assert [m.kind for m in tape.misses] == ["tape_exhausted", "tape"]

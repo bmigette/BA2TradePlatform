@@ -1,0 +1,226 @@
+"""Round trip through the REAL recorder: capture option actions, export, replay, every stage matches.
+
+An option ENTRY and a CLOSE run through ``TradeActions`` on a broker-shaped options account inside
+a real ``capture_scope`` over a real store in ``tmp_path``. The session is exported with the
+existing export service and ``option_selection`` replays it. Nothing in the bundle is written by
+hand, so a tap, a recorder field or a tape lookup that drifts from the others fails here.
+"""
+from __future__ import annotations
+
+from ba2_common.core import instance_resolver
+from ba2_common.core.db import add_instance
+from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+from ba2_common.core.models import (
+    ExpertInstance, ExpertRecommendation, ExpertSetting, TradingOrder, Transaction,
+)
+from ba2_common.core.replay import ReplayStatus, load_bundle
+from ba2_common.core.types import (
+    AssetClass, OrderDirection, OrderRecommendation, OrderStatus, OrderType, TransactionStatus,
+)
+
+from app.services.replay import option_selection
+from app.services.replay.isolation import replay_isolation
+from tests.replay.option_support import (
+    BPS, RecordingOptionsAccount, close_action, entry_action, recommendation, record_session,
+    seed_open_option,
+)
+
+MATCH = ReplayStatus.COVERAGE_MATCH
+
+
+def _assert_every_stage_matches(report, expected_rows):
+    assert report.total == expected_rows
+    for row in report.results:
+        assert row.status == MATCH, f"{row.expert_class}: {row.detail}"
+        assert row.field_diffs == ()
+    for stage in option_selection.STAGES:
+        assert set(report.stage_results[stage].values()) == {MATCH}, stage
+        assert len(report.stage_results[stage]) == expected_rows
+
+
+def test_an_entry_and_a_close_recorded_in_one_pass_both_match_at_every_stage(tmp_path):
+    held = {}
+
+    def seed():
+        held["order"] = seed_open_option()
+
+    def scenario():
+        account = RecordingOptionsAccount()
+        entry = entry_action(account).execute()
+        close = close_action(account, held["order"]).execute()
+        return entry, close, account
+
+    recorded = record_session(tmp_path / "store", tmp_path / "export", scenario, seed=seed)
+    entry, close, account = recorded["outcome"]
+    assert entry["success"], entry["message"]
+    assert close["success"], close["message"]
+    assert account.submitted and account.closed
+
+    bundle = load_bundle(recorded["bundle_dir"])
+    (analysis,) = bundle.analyses
+    actions = [o for o in bundle.observations_for(analysis.analysis_id)
+               if o.provider == "option_action"]
+    assert [o.method for o in actions] == ["OpenBullPutSpreadAction", "CloseOptionAction"]
+    assert len(analysis.clock_reads) >= 2        # one per action span, at least
+
+    report = option_selection.run(recorded["bundle_dir"], tmp_path / "report")
+    _assert_every_stage_matches(report, 2)
+    close_row = next(r for r in report.results if r.expert_class == "CloseOptionAction")
+    assert close_row.symbol == "XYZ"
+    markdown = (tmp_path / "report" / "option_selection.md").read_text(encoding="utf-8")
+    assert "historical_provider" in markdown
+
+
+def test_the_replayed_close_stamps_the_same_exit_record(tmp_path):
+    held = {}
+    recorded = record_session(
+        tmp_path / "store", tmp_path / "export",
+        lambda: close_action(RecordingOptionsAccount(), held["order"]).execute(),
+        seed=lambda: held.update(order=seed_open_option()))
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]
+    bundle = load_bundle(recorded["bundle_dir"])
+    (observation,) = [o for o in bundle.observations if o.provider == "option_action"]
+    payload = bundle.decode(observation.payload_object)
+    assert payload["outcome"]["exit_record"], "the recorder must have captured the exit record"
+    assert [s["method"] for s in payload["outcome"]["submits"]] == ["close_option_position"]
+
+    _assert_every_stage_matches(option_selection.run(recorded["bundle_dir"]), 1)
+
+
+class _Expert(MarketExpertInterface):
+    def __init__(self, expert_id):
+        self.id = expert_id
+
+    @classmethod
+    def description(cls):
+        return "stub"
+
+    def render_market_analysis(self, ma):
+        return ""
+
+    def run_analysis(self, symbol, market_analysis):
+        return None
+
+
+class _Resolver:
+    """What the live host injects: an expert by id and the broker account."""
+
+    def __init__(self, account):
+        self.account = account
+
+    def get_expert_instance(self, expert_id):
+        return _Expert(expert_id)
+
+    def get_account_instance(self, account_id):
+        return self.account
+
+    def get_account_instance_from_transaction(self, transaction):
+        return self.account
+
+
+def test_an_entry_owned_by_an_expert_replays_through_the_injected_resolver_and_scratch_rows(tmp_path):
+    """The expert capital headroom reads its ExpertInstance / settings / transactions from the
+    DB and its account through the resolver: the replay must serve both."""
+    ids = {}
+
+    def seed():
+        ids["expert"] = add_instance(ExpertInstance(account_id=1, expert="X", virtual_equity_pct=80.0))
+        add_instance(ExpertSetting(instance_id=ids["expert"],
+                                   key="max_virtual_equity_per_instrument_percent",
+                                   value_float=12.0, value_str=None))
+        ids["rec"] = add_instance(ExpertRecommendation(
+            instance_id=ids["expert"], symbol="XYZ", recommended_action=OrderRecommendation.BUY,
+            expected_profit_percent=5.0, price_at_date=100.0, details=None, confidence=70.0,
+            risk_level="MEDIUM", time_horizon="SHORT_TERM"))
+        txn = add_instance(Transaction(symbol="HELD", quantity=10, side=OrderDirection.BUY,
+                                       status=TransactionStatus.OPENED, expert_id=ids["expert"]))
+        add_instance(TradingOrder(
+            account_id=1, symbol="HELD", quantity=10, filled_qty=10, side=OrderDirection.BUY,
+            order_type=OrderType.MARKET, status=OrderStatus.FILLED, open_price=50.0,
+            asset_class=AssetClass.EQUITY, transaction_id=txn))
+
+    account = RecordingOptionsAccount()
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(_Resolver(account))
+    try:
+        def scenario():
+            rec = recommendation(id=ids["rec"], instance_id=ids["expert"])
+            return entry_action(account, rec=rec).execute()
+
+        recorded = record_session(tmp_path / "store", tmp_path / "export", scenario, seed=seed)
+    finally:
+        instance_resolver.set_instance_resolver(previous)
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]
+
+    bundle = load_bundle(recorded["bundle_dir"])
+    payload = bundle.decode(next(o.payload_object for o in bundle.observations
+                                 if o.provider == "option_action"))
+    assert {r["model"] for r in payload["db_rows"]} >= {"ExpertInstance", "ExpertSetting",
+                                                         "ExpertRecommendation", "Transaction",
+                                                         "TradingOrder"}
+
+    with replay_isolation() as probe:
+        report = option_selection.run_bundle(bundle)
+    _assert_every_stage_matches(report, 1)
+    assert probe.clean, probe.summary()
+
+
+def _record_expert_entry(tmp_path):
+    ids = {}
+
+    def seed():
+        ids["expert"] = add_instance(ExpertInstance(account_id=1, expert="X", virtual_equity_pct=80.0))
+        ids["rec"] = add_instance(ExpertRecommendation(
+            instance_id=ids["expert"], symbol="XYZ", recommended_action=OrderRecommendation.BUY,
+            expected_profit_percent=5.0, price_at_date=100.0, details=None, confidence=70.0,
+            risk_level="MEDIUM", time_horizon="SHORT_TERM"))
+        txn = add_instance(Transaction(symbol="HELD", quantity=10, side=OrderDirection.BUY,
+                                       status=TransactionStatus.OPENED, expert_id=ids["expert"]))
+        add_instance(TradingOrder(
+            account_id=1, symbol="HELD", quantity=10, filled_qty=10, side=OrderDirection.BUY,
+            order_type=OrderType.MARKET, status=OrderStatus.FILLED, open_price=50.0,
+            asset_class=AssetClass.EQUITY, transaction_id=txn))
+
+    account = RecordingOptionsAccount()
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(_Resolver(account))
+    try:
+        return record_session(
+            tmp_path / "store", tmp_path / "export",
+            lambda: entry_action(account, rec=recommendation(
+                id=ids["rec"], instance_id=ids["expert"])).execute(), seed=seed)
+    finally:
+        instance_resolver.set_instance_resolver(previous)
+
+
+def test_a_recorded_db_row_that_goes_missing_is_never_a_match(tmp_path):
+    recorded = _record_expert_entry(tmp_path)
+    bundle = load_bundle(recorded["bundle_dir"])
+
+    class _NoExpertRow:
+        def __getattr__(self, name):
+            return getattr(bundle, name)
+
+        def decode(self, *args, **kwargs):
+            value = bundle.decode(*args, **kwargs)
+            if isinstance(value, dict) and "db_rows" in value:
+                value["db_rows"] = [r for r in value["db_rows"] if r["model"] != "ExpertInstance"]
+            return value
+
+    with replay_isolation():
+        report = option_selection.run_bundle(_NoExpertRow())
+    (row,) = report.results
+    # The expert's slice (virtual_equity_pct 80) is part of the sized reserve, so without its row
+    # the replay asks the tape for a reserve live never asked: a miss naming that request.
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE, row.detail
+    assert "check_option_buying_power" in row.detail
+
+
+def test_a_refused_entry_round_trips_with_the_same_refusal(tmp_path):
+    recorded = record_session(
+        tmp_path / "store", tmp_path / "export",
+        lambda: entry_action(RecordingOptionsAccount(),
+                             **dict(BPS, dte_min=500, dte_max=600)).execute())
+    assert not recorded["outcome"]["success"]
+    report = option_selection.run(recorded["bundle_dir"])
+    _assert_every_stage_matches(report, 1)
