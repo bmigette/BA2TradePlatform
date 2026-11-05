@@ -224,3 +224,31 @@ def test_a_refused_entry_round_trips_with_the_same_refusal(tmp_path):
     assert not recorded["outcome"]["success"]
     report = option_selection.run(recorded["bundle_dir"])
     _assert_every_stage_matches(report, 1)
+
+
+def test_the_inventory_counts_option_actions_and_names_the_capability_that_replays_them(tmp_path):
+    from app.services.replay import inventory
+
+    held = {}
+    recorded = record_session(
+        tmp_path / "store", tmp_path / "export",
+        lambda: (entry_action(RecordingOptionsAccount()).execute(),
+                 entry_action(RecordingOptionsAccount(),
+                              **dict(BPS, dte_min=500, dte_max=600)).execute(),
+                 close_action(RecordingOptionsAccount(), held["order"]).execute()),
+        seed=lambda: held.update(order=seed_open_option()))
+    option_selection.run(recorded["bundle_dir"])
+
+    counted = inventory.run(recorded["bundle_dir"], tmp_path / "inv")
+    options = counted["option_actions"]
+    assert options["total"] == 3
+    assert options["by_class_and_outcome"] == {
+        "CloseOptionAction/submitted": 1,
+        "OpenBullPutSpreadAction/refused": 1,
+        "OpenBullPutSpreadAction/submitted": 1}
+    assert options["replayed_by"] == "option_selection"
+    assert options["coverage"][ReplayStatus.COVERAGE_MATCH] == 3
+    # the stock capability table is untouched
+    assert "option_selection" not in counted["coverage_by_capability"]
+    markdown = inventory.to_markdown(counted)
+    assert "## Option actions" in markdown and "`option_selection` capability" in markdown

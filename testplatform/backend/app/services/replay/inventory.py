@@ -72,6 +72,8 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
     for analysis in analyses:
         capture_failures.update(analysis.capture_failures)
 
+    option_actions = _option_actions(bundle)
+
     inventory: Dict[str, Any] = {
         "schema": "ba2_replay_inventory/1",
         "bundle_dir": str(Path(bundle_dir)),
@@ -114,6 +116,8 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             "max_per_analysis": max(clock_reads) if clock_reads else 0,
         },
         "coverage_by_capability": coverage,
+        # Separate from the stock capabilities above, which keep their exact set.
+        "option_actions": option_actions,
     }
     if out_dir is not None:
         out = Path(out_dir)
@@ -123,6 +127,43 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             encoding="utf-8")
         (out / "inventory.md").write_text(to_markdown(inventory), encoding="utf-8")
     return inventory
+
+
+def _option_actions(bundle) -> Dict[str, Any]:
+    """Recorded option entry / close actions, counted per action class and outcome.
+
+    Replayed by ``option_selection`` (``replay option-selection``); its coverage rows are counted
+    here because the stock capability table above deliberately does not list it.
+    """
+    from ba2_common.core.replay import option_action_record as oar
+
+    from app.services.replay.report import CAPABILITY_OPTION_SELECTION
+
+    by_class_outcome: Counter = Counter()
+    action_ids = set()
+    for observation in bundle.observations:
+        if observation.provider != oar.OPTION_ACTION_PROVIDER:
+            continue
+        action_ids.update(observation.analysis_ids)
+        outcome = bundle.decode(observation.payload_object)["outcome"]             if observation.payload_object is not None else None
+        if outcome is None:
+            label = "payload_missing"
+        elif outcome["status"] == "error":
+            label = "error"
+        else:
+            label = "submitted" if outcome["success"] else "refused"
+        by_class_outcome[f"{observation.method}/{label}"] += 1
+    rows = {status: 0 for status in STATUS_ORDER}
+    for entry in bundle.coverage:
+        if entry.capability == CAPABILITY_OPTION_SELECTION:
+            rows[entry.status] += 1
+    return {
+        "total": sum(by_class_outcome.values()),
+        "by_class_and_outcome": dict(sorted(by_class_outcome.items())),
+        "replayed_by": CAPABILITY_OPTION_SELECTION,
+        "replay_command": "ba2-test replay option-selection --bundle <dir>",
+        "coverage": rows,
+    }
 
 
 def to_markdown(inventory: Dict[str, Any]) -> str:
@@ -177,6 +218,15 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
     for capability, rows in inventory["coverage_by_capability"].items():
         counts = " | ".join(str(rows[status]) for status in STATUS_ORDER)
         lines.append(f"| {capability} | {counts} |")
+    options = inventory["option_actions"]
+    lines += ["", "## Option actions", "",
+              f"{options['total']} recorded option entry / close action(s), replayed by the "
+              f"`{options['replayed_by']}` capability (`{options['replay_command']}`)."]
+    lines += _table("Option actions by class and outcome", "Action / outcome",
+                    options["by_class_and_outcome"])
+    lines += ["", "| " + " | ".join(STATUS_ORDER) + " |",
+              "|---" * len(STATUS_ORDER) + "|",
+              "| " + " | ".join(str(options["coverage"][s]) for s in STATUS_ORDER) + " |"]
     return "\n".join(lines) + "\n"
 
 
