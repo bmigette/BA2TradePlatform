@@ -368,3 +368,18 @@ def test_a_close_outside_a_scope_is_unchanged():
     assert result["success"]
     account.close_option_position.assert_called_once()
     assert getattr(oar._tls, "frame", None) is None
+
+
+def test_the_record_carries_the_observation_position_at_entry_as_its_tape_span():
+    acct = FakeAccount()
+    store = _Store()
+    with capture_scope(store, _meta()) as capture:
+        before = capture.observation_position
+        acct.get_option_chain("XYZ", UTC_NOW.date(), UTC_NOW.date(), OptionRight.PUT)  # evaluator read
+        mid = capture.observation_position
+        _entry(acct).execute()
+    payload = _payload(_action_obs(store)[0])
+    assert before == 0 and mid == 1
+    assert payload["tape_span"] == {"start": mid}
+    own = _action_obs(store)[0].observation.invocation_seq
+    assert payload["tape_span"]["start"] <= own

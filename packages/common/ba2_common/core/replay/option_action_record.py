@@ -32,6 +32,7 @@ actions never leak into each other.
 Payload (``payload``)::
 
     {"version": 1,
+     "tape_span": {"start": <observation position at entry>},
      "inputs":   {... enough to rebuild the action, see rebuild_option_action ...},
      "db_rows":  [{"model": "TradingOrder", "row": {...model_dump...}}, ...],
      "outcome":  {"status": "returned"|"error", "error": repr|None, "success": bool|None,
@@ -177,8 +178,10 @@ class _Recorder:
         self._inputs: Optional[Dict[str, Any]] = None
         self._db_rows: Optional[List[Dict[str, Any]]] = None
         self._redacted: List[str] = []
+        self._tape_start: Optional[int] = None
 
     def __enter__(self):
+        self._tape_start = self.context.observation_position
         current = getattr(_tls, "frame", None)
         if current is not None and current.action is self.action:
             self._inner = True              # covered call -> base execute: one record
@@ -215,6 +218,9 @@ class _Recorder:
         inputs["redacted_setting_keys"] = self._redacted
         payload = {
             "version": RECORD_VERSION,
+            # The action's reads are exactly the observations with start <= invocation_seq < this
+            # record's own seq; anything the evaluator read earlier is outside the window.
+            "tape_span": {"start": self._tape_start},
             "inputs": inputs,
             "db_rows": self._db_rows,
             "outcome": outcome,

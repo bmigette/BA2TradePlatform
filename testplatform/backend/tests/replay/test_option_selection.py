@@ -328,3 +328,34 @@ def test_the_tape_account_serves_a_recorded_stock_quote_by_identity_and_in_recor
     with pytest.raises(ReplayMiss, match="get_instrument_current_price"):
         account.get_instrument_current_price("OTHER", "mid")
     assert [m.kind for m in tape.misses] == ["tape_exhausted", "tape"]
+
+
+def test_an_evaluator_read_before_the_action_is_never_served_to_the_actions_own_request(tmp_path):
+    """Live the evaluator read the underlying at 90, then the action read it again at 100. The
+    window starts at the action's entry, so the replay serves the action's own read."""
+    def scenario():
+        account = RecordingOptionsAccount(spot=90.0)
+        assert account.get_option_underlying_price("XYZ", "mid") == 90.0    # evaluator read
+        account._spot = 100.0
+        return entry_action(account, "buy_call", strike_method="percent_otm", strike_param=0.0,
+                            dte_min=10, dte_max=40, sizing=5.0).execute()
+
+    recorded = record_session(tmp_path / "store", tmp_path / "export", scenario)
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]
+    bundle = load_bundle(recorded["bundle_dir"])
+    prices = [bundle.decode(o.payload_object) for o in bundle.observations
+              if o.method == "get_option_underlying_price"]
+    assert prices[0] == 90.0 and 100.0 in prices[1:]
+    row = _only(option_selection.run(recorded["bundle_dir"]))
+    assert row.status == MATCH, row.detail
+
+
+def test_a_payload_without_tape_span_is_missing_capture_naming_it(session):
+    def edit(payload):
+        del payload["tape_span"]
+
+    with replay_isolation():
+        report = option_selection.run_bundle(_EditedBundle(load_bundle(session), edit))
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "tape_span" in row.detail

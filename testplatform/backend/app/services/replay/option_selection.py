@@ -25,11 +25,11 @@ contract from the parquet chain instead of the broker chain.
 
 **What a replay of ONE action is.**
 
-* The tape is the observations of the action's enclosing record that were recorded after the
-  PREVIOUS action's record and up to this one's (an action's record is written when it ends, so
-  its reads are exactly the ones in between). Reads the evaluator made between two actions fall
-  into the later window; they are served first for an identical request, which is the one
-  inexactness of this slice and is stated rather than hidden.
+* The tape is the observations of the action's enclosing record made inside the action's own
+  span: ``payload["tape_span"]["start"] <= invocation_seq <`` the action's record (written when it
+  ends). A read the evaluator made BEFORE the action is outside it, so it can never be served to
+  the action's identical (later, possibly different) request. A payload without ``tape_span`` is
+  ``missing_capture``.
 * The recorder's own ``replay_now()`` is the first clock read of each action span; the replay
   consumes it with one ``replay_now()`` call before ``execute()``. The clock is handed to the
   replay from that read onwards (found by value in the record's recorded reads).
@@ -488,7 +488,7 @@ def _clock_slice(analysis: AnalysisRecord, decision_time: datetime, start: int
 
 
 def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
-                  observation: ProviderObservation, window: Sequence[ProviderObservation],
+                  observation: ProviderObservation, observations: Sequence[ProviderObservation],
                   clock_start: int) -> Tuple[_Outcome, int]:
     """Replay ONE recorded action. Returns the outcome and the clock index to continue from."""
     try:
@@ -499,6 +499,17 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     if payload["version"] != oar.RECORD_VERSION:
         return _missing(f"unknown option action record version {payload['version']!r}"), \
             clock_start
+
+    if "tape_span" not in payload:
+        return _missing("the action record carries no tape_span, so the reads that were the "
+                        "action's own cannot be told from the evaluator's"), clock_start
+    start = payload["tape_span"]["start"]
+    if start is None:
+        return _missing("tape_span.start was not captured"), clock_start
+    # Exactly the reads made between the action's entry and its record (written at exit).
+    window = [o for o in observations
+              if start <= o.invocation_seq < observation.invocation_seq
+              and o.provider in (OPTION_PROVIDER, STOCK_PROVIDER)]
 
     decision_time = oar.replay_decision_time(payload)
     index, reads, phases = _clock_slice(analysis, decision_time, clock_start)
@@ -586,16 +597,11 @@ def run_bundle(bundle: SessionBundle, bundle_dir: str = "") -> ReplayReport:
         observations = sorted(bundle.observations_for(analysis.analysis_id),
                               key=lambda o: o.invocation_seq)
         clock_start = 0
-        previous_seq = -1
         for observation in observations:
             if observation.provider != oar.OPTION_ACTION_PROVIDER:
                 continue
-            window = [o for o in observations
-                      if previous_seq < o.invocation_seq < observation.invocation_seq
-                      and o.provider in (OPTION_PROVIDER, STOCK_PROVIDER)]
-            previous_seq = observation.invocation_seq
             outcome, clock_start = replay_action(
-                bundle, analysis, observation, window, clock_start)
+                bundle, analysis, observation, observations, clock_start)
             identity = observation.request_identity
             row = AnalysisResult(
                 analysis_id=analysis.analysis_id,

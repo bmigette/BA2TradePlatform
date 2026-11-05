@@ -341,6 +341,12 @@ class CaptureContext:
         self._outcome = ReplayStatus.OUTCOME_SKIP
         self._skip_reason = str(skip_reason)
 
+    @property
+    def observation_position(self) -> int:
+        """The ``invocation_seq`` the NEXT recorded observation will get (a monotonic count)."""
+        with self._lock:
+            return self._next_seq
+
     def record_observation(
         self,
         *,
