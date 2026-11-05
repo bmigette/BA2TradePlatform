@@ -65,3 +65,6 @@ VFS	hard-to-borrow de-SPAC: option-chain parity prices the borrow fee so the opt
 WF	no option bar in the 2020-2025 window (all local ThetaData partitions empty)
 WSE	only one expiry (2022-01-28, 1201 rows) has option bars in the 2020-2025 window in the local cache; counted by stage2_data/REPORT.md among the 55 names with no usable chain
 XELLL	no option bar in the 2020-2025 window (all local ThetaData partitions empty)
+PS	listed 2026-04-29: no 2020-2025 Alpaca bars (window check of the 20261104T193527Z-5773e25c build); removed 2026-11-04
+PRMB	HARD option basis refusal from 2020-01-02 (parity/as-traded 0.81, Primo Water -> Primo Brands ticker history): tools/option_universe_preflight.py --sections guard, 2026-11-05
+AMC	HARD option basis refusal 2023-04-04 (APE-conversion borrow fee, carry-free 0.944 outside the band) in 1 of 360 monthly-start replays: preflight --sections guard, 2026-11-05

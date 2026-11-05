@@ -380,6 +380,18 @@ bars for an in-window expiry that is neither owed nor already finished, so a fut
 kind shows in the log. `cache_health_check.py` reports the missing Thursdays as expiry gaps
 until the repair is done.
 
+**Not run for stage 2 (known BT limit).** The ThetaData account was on the FREE tier on 2026-11-05 (every option-history request refused: "requires a standard subscription"), so the repair re-run above was not done; the owner chose to proceed without it. Stage 1, 1.5 and 2 therefore all lack these 11 holiday-Thursday expiries (including the April 2022 and April 2025 MONTHLIES): in those weeks a backtest selects the neighbouring Friday expiries (monthly-only names: May), while live has the Thursday. Run the re-run when a Standard subscription is active, and treat April 2025 results (tariff crash week) with that caveat until then.
+
+**Option basis guard sweep (stage 2, 2026-11-05).** Before a stage-2 launch, replay the guard over the universe from every month start (a screener job admits a symbol on any date, and its first read is checked every session):
+
+```bash
+python tools/option_universe_preflight.py --universe-file tools/options_universe_stage2.txt --start 2020-01-02 --end 2025-12-31 \
+    --sections guard --ohlcv-history-source alpaca --procs 6 --guard-phases 5 \
+    --guard-starts <the first session of every month 2020-01..2025-12> --out preflight_guard.json
+```
+
+Result on the 752 names (~80 s): HARD (job-fatal) PRMB and AMC, removed from `tools/options_universe_stage2.txt` (750 names; reasons in `tools/options_universe_stage2_excluded.txt`); SOFT (entries withheld, recorded in the trial's `option_basis_guard.soft_skips`) AM, CIB, LW, PBR, RKLB, SMMT, SMR, STLA, SYM. A HARD finding blocks the launch; SOFT ones are review items.
+
 ### 4.3 Market-condition manifests
 
 A manifest pins the immutable feature objects every trial reads (profiles `ohlcv-v1` and
@@ -474,8 +486,8 @@ exclusion). `prepare-host` on each grid host and syncing the tree are **not** pa
 neither is the option risk-free rate: run `tools/refresh_fred_cache.py --series DGS3MO` and
 `--check-rate-window` (step 3b above) and sync `<CACHE_FOLDER>/fred/DGS3MO.json` to every host.
 
-The 753-name universe, `tools/options_universe_stage2.txt`, is the 820-name
-`tools/options_universe_large_cap.txt` minus 67 recorded exclusions: 55 with no usable option chain
+The universe `tools/options_universe_stage2.txt` (750 names since 2026-11-05) is the 820-name
+`tools/options_universe_large_cap.txt` minus 70 recorded exclusions (PS, PRMB and AMC since 2026-11-04/05): 55 with no usable option chain
 2020-2025, CBUS, BNT, BMNR, QXO, RGC and 7 ex-SPACs. The 67 names and the reason for each are in
 `tools/options_universe_stage2_excluded.txt` (`SYMBOL<TAB>reason`, one per line).
 
