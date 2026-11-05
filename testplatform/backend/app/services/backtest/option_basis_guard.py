@@ -100,8 +100,12 @@ above 1 + TOLERANCE, below ``SOFT_BAND_LOW``, no dividend calendar, a measured c
 mismatch. (The refused split basis is raised elsewhere and is untouched.) The block lasts until a
 later SAMPLED check finds the window clear (or a clean ratio); it is re-evaluated like any check.
 
-KNOWN RESIDUAL: a missed 5-15% spin-off on a dividend payer whose carry is unmeasurable would now
-be soft and skip entries instead of aborting. That is accepted ONLY because it is recorded:
+PERSISTENCE: a SOFT episode (first soft evaluation until the window clears) longer than
+``SOFT_MAX_DAYS`` (60 calendar days) is escalated to the HARD refusal. A dividend or borrow carry
+is transient; a basis error is not (constant docstring: measured episode lengths).
+
+KNOWN RESIDUAL: a missed 5-15% spin-off on a dividend payer whose carry is unmeasurable is soft
+and skips entries for up to ``SOFT_MAX_DAYS`` before the run aborts. That is accepted because it is recorded:
 ``stats()["soft_skips"]`` (per symbol: sessions skipped, sessions seen, share, first/last date,
 reason, evaluations) lands in the trial's ``option_basis_guard`` result, and ``stats()`` logs one
 WARNING listing every soft-skipped symbol, so a symbol skipped for most of a run is visible.
@@ -188,6 +192,16 @@ UNEVALUABLE_WARN_FRACTION = 0.90
 #: (x0.5, x0.25, x0.80 ...) lies below it and stays FATAL. Dividends are the only thing that
 #: lowers the parity spot by that much, so the band stops where dividends stop explaining.
 SOFT_BAND_LOW = 0.85
+#: The longest a SOFT episode may last (calendar days from its first soft evaluation to the
+#: session being checked) before it is escalated to the job-fatal refusal. WHY: an unprovable
+#: dividend or borrow carry is TRANSIENT -- it ends at the ex-date or when the fee fades -- while
+#: a basis error persists. Measured 2026-11-05 (tools/option_universe_preflight.py --sections
+#: guard, alpaca, 752 stage-2 names, 72 monthly starts x 5 phases): every dividend/event-shaped
+#: episode lasted <= 34 days (CIB 2025-03-21..04-24, 24 sessions; LW 15; STLA 10); the one
+#: persistent episode, SMMT 2022-12-29..2023-06-23 (121 sessions, around its rights offering), is
+#: the shape a missed corporate action has. 60 days (~42 sessions) leaves headroom above the
+#: longest dividend episode and still stops a hidden 5-15% basis error within two months of it.
+SOFT_MAX_DAYS = 60
 
 _INDEX_CACHE_MAX = 256
 
@@ -406,6 +420,8 @@ class BasisGuard:
         self._warned: set = set()
         #: symbol -> reason text while its entries are blocked (soft refusal), else absent
         self._soft_reason: Dict[str, str] = {}
+        #: symbol -> first session of its CURRENT soft episode (``SOFT_MAX_DAYS``)
+        self._soft_since: Dict[str, date] = {}
         #: symbol -> record of its soft skips (stats()["soft_skips"])
         self._soft: Dict[str, Dict[str, Any]] = {}
         #: symbol -> distinct sessions the guard was asked about (denominator of the skip share)
@@ -567,6 +583,11 @@ class BasisGuard:
                            underlying, session.isoformat(), blocked)
         return False
 
+    def _clear_soft(self, underlying: str) -> None:
+        """The window cleared: entries resume and the soft episode (``SOFT_MAX_DAYS``) ends."""
+        self._soft_reason.pop(underlying, None)
+        self._soft_since.pop(underlying, None)
+
     def _check_session(self, u, underlying: str, session: date) -> None:
         key = (underlying, session.toordinal())
         t0 = time.perf_counter()
@@ -589,7 +610,7 @@ class BasisGuard:
             history = list(st.history)     # earlier CHECKED sessions, newest last
             st.history.append((session, r0))
             if abs(r0 - 1.0) <= TOLERANCE:
-                self._soft_reason.pop(underlying, None)
+                self._clear_soft(underlying)
                 return
             ratios: List[Tuple[date, float]] = [(session, r0)] + history[::-1]
             if len(ratios) < WINDOW:
@@ -608,15 +629,23 @@ class BasisGuard:
             med = float(np.median([r for _, r in ratios]))
             if abs(med - 1.0) <= TOLERANCE:
                 self.outliers_passed += 1
-                self._soft_reason.pop(underlying, None)
+                self._clear_soft(underlying)
                 return
             # Carry separation (module docstring): only ever clears a would-be refusal.
             cleared, carry_txt, kind = self._carry_clears(u, underlying, ratios, med)
             if cleared:
-                self._soft_reason.pop(underlying, None)
+                self._clear_soft(underlying)
                 return
-            if (SOFT_BAND_LOW <= med < 1.0 - TOLERANCE and kind in ("veto", "unmeasurable")
-                    and all(self._dividends_at(underlying, d_) is not None for d_, _ in ratios)):
+            soft_ok = (SOFT_BAND_LOW <= med < 1.0 - TOLERANCE and kind in ("veto", "unmeasurable")
+                       and all(self._dividends_at(underlying, d_) is not None for d_, _ in ratios))
+            since = self._soft_since.get(underlying)
+            if soft_ok and since is not None and (session - since).days > SOFT_MAX_DAYS:
+                carry_txt = (f"{carry_txt}; SOFT episode since {since.isoformat()} has lasted "
+                             f"{(session - since).days} days (> SOFT_MAX_DAYS {SOFT_MAX_DAYS}): a "
+                             f"dividend/borrow carry is transient, a basis error persists")
+                soft_ok = False
+            if soft_ok:
+                self._soft_since.setdefault(underlying, session)
                 reason = (f"{underlying} {session.isoformat()}: parity/as-traded median "
                           f"{med:.4f} (checked {r0:.4f}) is below the {TOLERANCE:.0%} line but "
                           f"inside the soft band [{SOFT_BAND_LOW}, {1.0 - TOLERANCE:.2f}) and "
