@@ -2675,8 +2675,9 @@ class TradeManager:
         pass_name = "enter-market" if use_case == AnalysisUseCase.ENTER_MARKET else "open-positions"
         id_prefix = "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
 
-        # The scope opens ONLY when THIS EXPERT has a market-condition resolver, or its account
-        # is an OptionsAccountInterface. Otherwise there is nothing to record, and opening it
+        # The scope opens ONLY when THIS EXPERT has a market-condition resolver, or one of its
+        # rulesets holds an option action (see _expert_has_option_rules; the account class is NOT
+        # the test: AlpacaAccount is always an OptionsAccountInterface, stock experts included). Otherwise there is nothing to record, and opening it
         # anyway would submit a synthetic "TradeManager" AnalysisRecord per decision pass into
         # every capture session -- which replay inventory counts as an analysis and expert_replay
         # then reports as COVERAGE_UNSUPPORTED. That silently moves the replay-coverage
@@ -2703,7 +2704,7 @@ class TradeManager:
             return nullcontext()
         if not has_resolver:
             try:
-                is_options = self._expert_account_is_options(expert_instance_id)
+                is_options = self._expert_has_option_rules(expert_instance_id)
             except Exception as e:  # noqa: BLE001 -- see the docstring: recording is not a dependency
                 logger.error(
                     f"replay capture: could not resolve the account of expert {expert_instance_id}; "
@@ -2740,17 +2741,37 @@ class TradeManager:
         return capture_scope(store, meta)
 
     @staticmethod
-    def _expert_account_is_options(expert_instance_id: int) -> bool:
-        """True when the expert's account object is an ``OptionsAccountInterface``."""
-        from .interfaces import OptionsAccountInterface
+    def _expert_has_option_rules(expert_instance_id: int) -> bool:
+        """True when a ruleset of this expert holds an option entry/exit action.
+
+        THE GATE FOR THE OPTION CAPTURE SCOPE. It is the rulesets, not the account class: every
+        ``AlpacaAccount`` is an ``OptionsAccountInterface`` whether or not the expert on it ever
+        trades an option, so an isinstance test gave every Alpaca STOCK expert a scope on both
+        passes (moving stock replay coverage and recording stock-pass broker reads). Option
+        actions run only from a rule, so "an action of an option type sits in the expert's
+        enter-market or open-positions ruleset" is exactly "this pass can produce an option
+        action record". Rule membership is read through the ruleset -> rule LINK (the engine's
+        read; ``EventAction.subtype`` is not consulted), and the type from ``actions[*]``
+        (``action_type`` or ``type``, as the evaluator reads it) against
+        ``get_option_action_values()``.
+        """
+        from ba2_common.core.db import ruleset_event_actions
+        from ba2_common.core.types import get_option_action_values
+
         from .models import ExpertInstance
-        from .utils import get_account_instance_from_id
 
         expert_instance = get_instance(ExpertInstance, expert_instance_id)
-        account = get_account_instance_from_id(expert_instance.account_id)
-        if account is None:
-            raise ValueError(f"account {expert_instance.account_id} did not resolve")
-        return isinstance(account, OptionsAccountInterface)
+        option_values = set(get_option_action_values())
+        for ruleset_id in (expert_instance.enter_market_ruleset_id,
+                           expert_instance.open_positions_ruleset_id):
+            if ruleset_id is None:
+                continue
+            for rule in ruleset_event_actions(ruleset_id):
+                for action in (rule.actions or {}).values():
+                    value = action.get("action_type") or action.get("type")
+                    if getattr(value, "value", value) in option_values:
+                        return True
+        return False
 
     def _option_entry_decisions(self, expert, expert_instance_id: int, symbol: str,
                                 results) -> list:
