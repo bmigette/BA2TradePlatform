@@ -10261,6 +10261,28 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
     return ranked, skipped
 
 
+# The TOP-N export's own bound, separate from the GA's per-trial stall bound
+# (BT_LOCAL_STALL_TIMEOUT_S, 5400 s): a top-N re-run records every option trade and persists its
+# trading DB, so it is slower than a GA trial, and 5400 s dropped TOP1/3/5 of stage-2 opt 40.
+_TOPN_EXPORT_TIMEOUT_DEFAULT_S = 14400.0
+
+
+def _topn_export_timeout_s() -> float:
+    return float(os.environ.get("BT_TOPN_EXPORT_TIMEOUT_S", str(_TOPN_EXPORT_TIMEOUT_DEFAULT_S)))
+
+
+def _topn_export_slots(parallel, n_specs: int, remote_workers: list) -> tuple:
+    """``(n_local, slots)`` for the TOP-N re-runs, round-robined over ``slots``.
+
+    A job run with ``--parallel 0`` and remote workers is REMOTE-ONLY: its re-runs go to the
+    workers alone. It used to get one local slot anyway (``parallel or 1``), so three of five
+    re-runs queued one after another on the master and missed the export bound (opt 40)."""
+    if remote_workers and int(parallel or 0) <= 0:
+        return 0, list(remote_workers)
+    n_local = max(1, min(int(parallel or 1), n_specs))
+    return n_local, ["local"] * n_local + list(remote_workers)
+
+
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
                             last_gen_full_results: Optional[Dict[str, Any]] = None, *,
                             candidates: Optional[List[tuple]] = None,
@@ -10494,7 +10516,6 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             if _persist_one(rank, trial_cfg, strategy_params, {"ok": True, "results": full_results}):
                 persisted += 1
                 print(f"    persisted {name_prefix}{rank} ({persisted}/{len(ranked)}) [no re-run]")
-        n_local = max(1, min(int(parallel or 1), len(specs)))
         remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
                           if use_remote_workers else [])
         if remote_workers:
@@ -10525,20 +10546,20 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         # if the loop had returned. Same policy as the GA's stall recovery -- bounded window, drop
         # what has not finished, kill the pool rather than wait on it. This also removes the old
         # synchronous single-candidate branch, which had no bound at all.
-        export_timeout = float(_os.environ.get("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
+        export_timeout = _topn_export_timeout_s()
+        n_local, slots = _topn_export_slots(parallel, len(specs), remote_workers)
         print(f"    persisting top {len(specs)} across {n_local} local + "
               f"{len(remote_workers)} remote worker(s) (export bound {export_timeout:.0f}s)...")
-        local_ex = _new_local_pool(n_local)
+        local_ex = _new_local_pool(n_local) if n_local else None
         # NO ThreadPoolExecutor for the remote attempts: its threads cannot be killed and Python
         # joins them at exit, which is how a timed-out remote call kept this launcher alive
         # (2026-09-21 recheck, H1). Daemon threads are abandoned instead.
         import time as _time
         export_deadline = _time.monotonic() + export_timeout
         try:
-            # Round-robin each spec across every available slot (n_local local + one per remote
-            # worker) -- with n <= save-top (default 5) this just spreads a handful of re-runs
-            # across whatever capacity is on hand, no need for real load balancing.
-            slots = (["local"] * n_local) + remote_workers
+            # Round-robin each spec across every available slot (_topn_export_slots) -- with
+            # n <= save-top (default 5) this just spreads a handful of re-runs across whatever
+            # capacity is on hand, no need for real load balancing.
             futs = {}
             for idx, (rk, tc, sp2) in enumerate(specs):
                 slot = slots[idx % len(slots)]
@@ -10563,11 +10584,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                       f"(persisted {persisted}/{len(ranked)}). A hung re-run must not stop the "
                       f"matrix; the pool is killed rather than waited on.")
         finally:
-            _kill_executor(local_ex)
-            try:
-                local_ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:  # noqa: BLE001 — teardown must never mask the export result
-                pass
+            if local_ex is not None:
+                _kill_executor(local_ex)
+                try:
+                    local_ex.shutdown(wait=False, cancel_futures=True)
+                except Exception:  # noqa: BLE001 — teardown must never mask the export result
+                    pass
         return persisted
     finally:
         db.close()

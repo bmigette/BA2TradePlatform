@@ -489,3 +489,31 @@ def test_persist_trial_worker_retry_backoff_doubles_each_attempt(monkeypatch):
     assert out["ok"] is False
     assert len(attempts) == 6
     assert sleeps == [5.0, 10.0, 20.0, 40.0, 80.0]
+
+
+# --- export bound + remote-only slots (stage-2 opt 40, 2026-11-05) ----------------------------
+# opt 40 ran with --parallel 0 and one remote worker: the export still opened ONE local slot, so
+# TOP1/3/5 queued one after another on the master and the 5400 s bound (the GA stall bound,
+# shared) dropped all three while the remote worker finished TOP2/TOP4.
+
+def test_a_remote_only_job_exports_on_the_workers_alone():
+    n_local, slots = mod._topn_export_slots(0, 5, [_FAKE_WORKER])
+    assert n_local == 0 and slots == [_FAKE_WORKER]
+
+
+def test_a_job_with_local_slots_keeps_them_beside_the_workers():
+    assert mod._topn_export_slots(2, 5, [_FAKE_WORKER]) == (2, ["local", "local", _FAKE_WORKER])
+    assert mod._topn_export_slots(8, 3, []) == (3, ["local"] * 3)
+
+
+def test_no_usable_worker_falls_back_to_one_local_slot():
+    """Every worker refused by ensure_synced on a --parallel 0 job: the export must still run."""
+    assert mod._topn_export_slots(0, 5, []) == (1, ["local"])
+
+
+def test_the_export_bound_is_its_own_and_longer_than_the_ga_stall_bound(monkeypatch):
+    monkeypatch.delenv("BT_TOPN_EXPORT_TIMEOUT_S", raising=False)
+    monkeypatch.setenv("BT_LOCAL_STALL_TIMEOUT_S", "60")    # the GA bound no longer moves it
+    assert mod._topn_export_timeout_s() == 14400.0
+    monkeypatch.setenv("BT_TOPN_EXPORT_TIMEOUT_S", "900")
+    assert mod._topn_export_timeout_s() == 900.0
