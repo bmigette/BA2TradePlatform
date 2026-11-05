@@ -213,7 +213,7 @@ class Pipeline:
         out = self._p("gate.json")
         r = self._call("gate-check", "gate-check", self._tool(
             "option_universe_preflight.py", "--universe-file", self.u, *self._window(),
-            "--sections", "gate", "--out", out))
+            "--sections", "gate", "--ohlcv-history-source", HISTORY_SOURCE, "--out", out))
         g = (_read_json(out) or {}).get("gate") or {}
         r["result"] = {"present": g.get("present"), "absent": g.get("absent")}
         if r["rc"] not in (None, 0):
@@ -249,6 +249,7 @@ class Pipeline:
 
     def preflight(self) -> Optional[str]:
         argv = self._tool("option_universe_preflight.py", "--universe-file", self.u, *self._window(),
+                          "--ohlcv-history-source", HISTORY_SOURCE,
                           "--out", self._p("preflight.json"), "--procs", str(self.a.procs),
                           "--guard-phases", str(self.a.guard_phases))
         if self.a.guard_starts:

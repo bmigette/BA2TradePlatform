@@ -82,6 +82,33 @@ before the stretch). A basis error scales every expiry of a session alike, so it
 TERM measure; and since that is only consulted where the old check refused, every run that
 passed before passes.
 
+SOFT vs HARD REFUSAL (owner decision 2026-11-05; STLA 2022-04-08 ratio 0.93 with an unverifiable
+7.6% dividend aborted a whole GA job). A would-be refusal is SOFT -- NO raise, NEW ENTRIES on that
+underlying blocked instead (``check`` returns False; the provider's ``get_chain`` returns an empty
+chain, the one place option entries and rolls pick contracts; marks and exits read quotes, never
+the chain, so open positions are marked and closed normally) -- only when ALL hold:
+
+* the window median lies in [``SOFT_BAND_LOW``, 1 - TOLERANCE): below 1 is the only side carry
+  can explain, and the band is the size of the dividends / borrow seen in the universe;
+* the symbol HAS a dividend calendar in the window (a carry explanation exists to be ambiguous);
+* the carry separation failed only for want of PROOF: a veto (unverifiable/uncalendared dividend,
+  ...) or an unmeasurable carry-free ratio. A carry-free median that WAS measured and still lies
+  outside the band means the multiple survives the carry removal -- a real basis error, HARD.
+
+Everything else stays HARD (``OptionSpotBasisMismatch``, JOB-FATAL exactly as before): median
+above 1 + TOLERANCE, below ``SOFT_BAND_LOW``, no dividend calendar, a measured carry-free
+mismatch. (The refused split basis is raised elsewhere and is untouched.) The block lasts until a
+later SAMPLED check finds the window clear (or a clean ratio); it is re-evaluated like any check.
+
+KNOWN RESIDUAL: a missed 5-15% spin-off on a dividend payer whose carry is unmeasurable would now
+be soft and skip entries instead of aborting. That is accepted ONLY because it is recorded:
+``stats()["soft_skips"]`` (per symbol: sessions skipped, sessions seen, share, first/last date,
+reason, evaluations) lands in the trial's ``option_basis_guard`` result, and ``stats()`` logs one
+WARNING listing every soft-skipped symbol, so a symbol skipped for most of a run is visible.
+
+BT-ONLY by nature: live has no guard (it trades the broker's own chain and price); the BT/live
+parity rule is untouched because the guard never changes a price, only withholds entries.
+
 PURE FUNCTIONS OF THE STORE are memoised per worker (the parity spot of (underlying,
 session) never changes); the comparison itself is per run (the spot depends on the run's
 price source and split basis).
@@ -154,6 +181,13 @@ CARRY_BAND_LOW = _carry_band_low()
 #: A symbol the guard could not evaluate on more than this share of its checks is WARNED
 #: about in the run's results: it traded without the protection (plan Part E4 review).
 UNEVALUABLE_WARN_FRACTION = 0.90
+#: Lower edge of the SOFT band (module docstring): a window median in [SOFT_BAND_LOW, 1 -
+#: TOLERANCE) with a dividend calendar and an unprovable carry blocks entries instead of aborting
+#: the job. WHY 0.85: the dividends / borrow fees seen in the universe reach ~13% of spot (STLA
+#: 7.6%, special dividends up to ~13%) except data errors; a missed spin-off or split multiple
+#: (x0.5, x0.25, x0.80 ...) lies below it and stays FATAL. Dividends are the only thing that
+#: lowers the parity spot by that much, so the band stops where dividends stop explaining.
+SOFT_BAND_LOW = 0.85
 
 _INDEX_CACHE_MAX = 256
 
@@ -370,6 +404,22 @@ class BasisGuard:
         #: symbol -> [checks, unevaluable]
         self._per_symbol: Dict[str, List[int]] = {}
         self._warned: set = set()
+        #: symbol -> reason text while its entries are blocked (soft refusal), else absent
+        self._soft_reason: Dict[str, str] = {}
+        #: symbol -> record of its soft skips (stats()["soft_skips"])
+        self._soft: Dict[str, Dict[str, Any]] = {}
+        #: symbol -> distinct sessions the guard was asked about (denominator of the skip share)
+        self._sessions_seen: Dict[str, int] = {}
+        self._soft_summary_warned = False
+        self._soft_warned_keys: set = set()
+
+    def _soft_stats(self) -> Dict[str, Any]:
+        out = {}
+        for sym, rec in sorted(self._soft.items()):
+            seen = self._sessions_seen.get(sym, 0)
+            out[sym] = {**rec, "sessions_seen": seen,
+                        "skipped_share": round(rec["sessions_skipped"] / seen, 4) if seen else None}
+        return out
 
     def stats(self) -> Dict[str, Any]:
         """Run totals, plus every symbol whose checks were > ``UNEVALUABLE_WARN_FRACTION``
@@ -385,7 +435,17 @@ class BasisGuard:
                         "[backtest] option basis guard: %s was UNEVALUABLE on %d of %d chain "
                         "reads (%.1f%%) -- no call/put pair quoted at the nearest expiry, so "
                         "the split-basis check never ran for it this run.", sym, u, n, 100 * u / n)
+        soft = self._soft_stats()
+        soft = {k: v for k, v in soft.items() if v["sessions_skipped"]}
+        if soft and not self._soft_summary_warned:
+            self._soft_summary_warned = True
+            logger.warning(
+                "[backtest] option basis guard: NEW ENTRIES were skipped on %d symbol(s) (soft "
+                "refusal, dividend/carry unprovable): %s", len(soft),
+                "; ".join(f"{s_} {r['sessions_skipped']}/{r['sessions_seen']} sessions "
+                          f"({r['first_skipped']}..{r['last_skipped']})" for s_, r in soft.items()))
         return {"checks": self.checks, "unevaluable": self.unevaluable,
+                "soft_skips": soft,
                 "sampled_out": self.sampled_out,
                 "outliers_passed": self.outliers_passed, "carry_passed": self.carry_passed,
                 "seconds": round(self.seconds, 6),
@@ -433,14 +493,15 @@ class BasisGuard:
         return True
 
     def _carry_clears(self, u, underlying: str, ratios, med: float):
-        """(cleared, text for a refusal). See the module docstring."""
+        """(cleared, text for a refusal, kind). ``kind`` is "" when cleared, else "not_applicable",
+        "veto", "outside" (measured, still off) or "unmeasurable". See the module docstring."""
         if med > 1.0 + TOLERANCE:
             return False, ("carry separation not applicable: the parity spot is ABOVE the "
-                           "as-traded spot, and borrow or dividends only ever lower it")
+                           "as-traded spot, and borrow or dividends only ever lower it"), "not_applicable"
         carry = [self._carry_ratio(u, underlying, d_.toordinal()) for d_, _ in ratios]
         vetoes = [v for _r, _w, v in carry if v]
         if vetoes:
-            return False, f"carry separation refused: {vetoes[0]}"
+            return False, f"carry separation refused: {vetoes[0]}", "veto"
         avail = [r for r, _w, _v in carry if r is not None]
         need = max(MIN_CARRY_FLOOR, min(MIN_CARRY_SESSIONS, len(carry)))
         if self._non_payer(underlying, ratios):
@@ -451,12 +512,12 @@ class BasisGuard:
             medc = float(np.median(avail))
             if CARRY_BAND_LOW <= medc <= 1.0 + TOLERANCE:
                 self.carry_passed += 1
-                return True, ""
+                return True, "", ""
             return False, (f"carry-free median {medc:.4f} over {len(avail)} of {len(carry)} "
                            f"window sessions (declared dividends added back, extrapolated to "
-                           f"T=0) is outside [{CARRY_BAND_LOW:.3f}, {1.0 + TOLERANCE:.3f}]")
+                           f"T=0) is outside [{CARRY_BAND_LOW:.3f}, {1.0 + TOLERANCE:.3f}]"), "outside"
         return False, (f"carry-free ratio measurable on {len(avail)} of {len(carry)} window "
-                       f"sessions (>= {need} needed; checked session: {carry[0][1]})")
+                       f"sessions (>= {need} needed; checked session: {carry[0][1]})"), "unmeasurable"
 
     def _due(self, underlying: str, d: int) -> bool:
         """Advance ``underlying``'s sampling state by one session; True when it is checked."""
@@ -481,13 +542,33 @@ class BasisGuard:
             return True
         return (not st.evaluated) or st.since >= SAMPLE_EVERY
 
-    def check(self, u, underlying: str, session: date) -> None:
+    def check(self, u, underlying: str, session: date) -> bool:
         """Refuse (raise) when ``underlying``'s spot is off the chain's basis on ``session``.
+        Returns True when NEW ENTRIES are allowed, False under a SOFT refusal (module docstring).
         Sampled: see the module docstring."""
         key = (underlying, session.toordinal())
         if key in self._checked:
-            return
+            return underlying not in self._soft_reason
         self._checked.add(key)
+        self._sessions_seen[underlying] = self._sessions_seen.get(underlying, 0) + 1
+        self._check_session(u, underlying, session)
+        blocked = self._soft_reason.get(underlying)
+        if blocked is None:
+            return True
+        rec = self._soft[underlying]
+        rec["sessions_skipped"] += 1
+        rec["last_skipped"] = session.isoformat()
+        if rec["first_skipped"] is None:
+            rec["first_skipped"] = session.isoformat()
+        if (underlying, key[1]) not in self._soft_warned_keys:
+            self._soft_warned_keys.add((underlying, key[1]))
+            logger.warning("[backtest] option basis guard: NEW ENTRIES on %s skipped on %s (soft "
+                           "refusal; open positions keep being marked/closed): %s",
+                           underlying, session.isoformat(), blocked)
+        return False
+
+    def _check_session(self, u, underlying: str, session: date) -> None:
+        key = (underlying, session.toordinal())
         t0 = time.perf_counter()
         try:
             if not self._due(underlying, key[1]):
@@ -508,6 +589,7 @@ class BasisGuard:
             history = list(st.history)     # earlier CHECKED sessions, newest last
             st.history.append((session, r0))
             if abs(r0 - 1.0) <= TOLERANCE:
+                self._soft_reason.pop(underlying, None)
                 return
             ratios: List[Tuple[date, float]] = [(session, r0)] + history[::-1]
             if len(ratios) < WINDOW:
@@ -526,10 +608,25 @@ class BasisGuard:
             med = float(np.median([r for _, r in ratios]))
             if abs(med - 1.0) <= TOLERANCE:
                 self.outliers_passed += 1
+                self._soft_reason.pop(underlying, None)
                 return
             # Carry separation (module docstring): only ever clears a would-be refusal.
-            cleared, carry_txt = self._carry_clears(u, underlying, ratios, med)
+            cleared, carry_txt, kind = self._carry_clears(u, underlying, ratios, med)
             if cleared:
+                self._soft_reason.pop(underlying, None)
+                return
+            if (SOFT_BAND_LOW <= med < 1.0 - TOLERANCE and kind in ("veto", "unmeasurable")
+                    and all(self._dividends_at(underlying, d_) is not None for d_, _ in ratios)):
+                reason = (f"{underlying} {session.isoformat()}: parity/as-traded median "
+                          f"{med:.4f} (checked {r0:.4f}) is below the {TOLERANCE:.0%} line but "
+                          f"inside the soft band [{SOFT_BAND_LOW}, {1.0 - TOLERANCE:.2f}) and "
+                          f"the dividend/borrow carry could not be proven: {carry_txt}")
+                self._soft_reason[underlying] = reason
+                rec = self._soft.setdefault(underlying, {
+                    "sessions_skipped": 0, "first_skipped": None, "last_skipped": None,
+                    "evaluations": 0, "reason": ""})
+                rec["evaluations"] += 1
+                rec["reason"] = reason
                 return
             raise OptionSpotBasisMismatch(
                 f"{underlying} {session.isoformat()}: the option path's spot is not in the "

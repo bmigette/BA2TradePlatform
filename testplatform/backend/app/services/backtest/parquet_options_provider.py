@@ -1523,7 +1523,11 @@ class ParquetOptionsProvider:
         if self._basis_guard is not None:
             # REFUSES (OptionSpotBasisMismatch) before a single strike is priced off a spot
             # that is not in the chain's own basis -- see option_basis_guard.
-            self._basis_guard.check(u, underlying, as_of)
+            # A SOFT refusal (dividend/carry unprovable, ratio 0.85..0.95) returns False: NEW
+            # entries on this underlying are withheld for the session (an empty chain), and the
+            # guard records it per symbol in its stats. Marks/exits read quotes, not the chain.
+            if not self._basis_guard.check(u, underlying, as_of):
+                return []
         as_of_ord = as_of.toordinal()
         ds_ord = data_session.toordinal()
         keep = ((u.c_expiry_ord >= expiry_min.toordinal())

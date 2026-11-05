@@ -120,6 +120,28 @@ STLA_DIVS = [DividendRow(date(2022, 4, 19), 1.1221, date(2022, 2, 25))]
 STLA_APRIL = {d: v for d, v in STLA.items() if d >= date(2022, 4, 4)}
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _raises_or_soft(guard, exc, match=None):
+    """The would-be refusal of these cases is HARD (raises ``exc``) or, since the 2026-11-05 split,
+    SOFT (a dividend calendar exists, median in the soft band, carry unprovable: entries are
+    withheld, nothing raises). Either way it is NOT a pass, and ``match`` names the reason in
+    the raise or in the recorded soft reason. HARD-only cases keep ``pytest.raises``."""
+    import re as _re
+    try:
+        yield
+    except exc as e:
+        if match is not None:
+            assert _re.search(match, str(e)), str(e)
+        return
+    soft = guard.stats()["soft_skips"]
+    assert soft, "neither refused nor soft-skipped"
+    if match is not None:
+        assert any(_re.search(match, r["reason"]) for r in soft.values()), soft
+
+
 def _guard(monkeypatch, table, dividends=None, scale=1.0):
     """A guard over ``table`` {session: (as-traded spot, [(dte, parity/spot), ...])}; the run's
     spot is ``scale`` x the as-traded one (scale != 1: a basis error)."""
@@ -166,6 +188,10 @@ def _phases(monkeypatch, table, dividends, carry=True):
             _run(g, u, guard, days[ph:])
         except g0.OptionSpotBasisMismatch as e:
             refused.append((ph, str(e)))
+        else:
+            soft = guard.stats()["soft_skips"]
+            if soft:                     # SOFT: entries withheld -- a refusal that does not abort
+                refused.append((ph, " | ".join(r["reason"] for r in soft.values())))
     return refused
 
 
@@ -251,7 +277,7 @@ def test_an_unpriced_special_under_ten_percent_is_refused(monkeypatch, frac):
     special = [DividendRow(date(2022, 10, 28), 100.0 * frac, date(2022, 10, 14))]
     for ph in range(3):
         g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: special, scale=1 + frac)
-        with pytest.raises(g.OptionSpotBasisMismatch, match="> 2.5%"):
+        with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="> 2.5%"):
             _run(g, u, guard, days[ph:])
 
 
@@ -265,7 +291,7 @@ def test_garbage_calendar_rows_refuse_by_name(monkeypatch, row, match):
     days = _monthly(date(2023, 3, 1))
     table = {d: (5.0, [(30, 0.93), (58, 0.925)]) for d in days}
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
-    with pytest.raises(g.OptionSpotBasisMismatch, match=match):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match=match):
         _run(g, u, guard, days)
 
 
@@ -276,7 +302,7 @@ def test_the_qgen_synthetic_repurchase_refuses_by_name(monkeypatch):
     table = {d: (45.0, [(20, 0.945), (48, 0.94)]) for d in days}
     rows = [DividendRow(date(2026, 1, 8), 2.29, None)]
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: rows)
-    with pytest.raises(g.OptionSpotBasisMismatch, match="declaration date unknown"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="declaration date unknown"):
         _run(g, u, guard, days)
 
 
@@ -293,7 +319,7 @@ def test_the_carry_path_is_one_sided(monkeypatch):
 def test_too_few_expiries_keeps_the_old_refusal_and_says_so(monkeypatch):
     table = {d: (4.40, [(8, 0.90)]) for d in sorted(AMC)}
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="needs >= 2 expiries"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="needs >= 2 expiries"):
         _run(g, u, guard, sorted(table))
 
 
@@ -301,7 +327,7 @@ def test_an_upward_term_structure_is_refused_by_name(monkeypatch):
     days = _monthly(date(2024, 2, 1))
     table = {d: (100.0, [(10, 0.92), (40, 0.94)]) for d in days}
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="slopes up"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="slopes up"):
         _run(g, u, guard, days)
 
 
@@ -323,7 +349,7 @@ def test_a_stretch_basis_error_cannot_borrow_clean_sessions_from_before_it(monke
             g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [])
             spot = guard.spot_source
             guard.spot_source = (lambda f: (lambda s, d: f(s, d) * (err if d in stretch else 1.0)))(spot)
-            with pytest.raises(g0.OptionSpotBasisMismatch):
+            with _raises_or_soft(guard, g0.OptionSpotBasisMismatch):
                 _run(g, u, guard, [d for d in days if d >= stretch[0]][ph:])
 
 
@@ -381,7 +407,7 @@ def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch
     thin[date(2022, 3, 23)] = PAYER_WINDOW[date(2022, 3, 23)]
     thin[date(2022, 3, 24)] = PAYER_WINDOW[date(2022, 3, 24)]    # 2 of 5 measurable
     g, u, guard = _guard(monkeypatch, thin, dividends=lambda s, d: _FAR_ROW)
-    with pytest.raises(g.OptionSpotBasisMismatch, match="2 of 5"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="2 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
 
 
@@ -389,7 +415,7 @@ def test_fewer_than_three_carry_sessions_in_a_full_window_is_refused(monkeypatch
 def test_a_non_payer_with_two_expiries_only_is_refused_and_says_why(monkeypatch):
     """IONQ's monthlies: two usable expiries per session, no third to confirm the line."""
     g, u, guard = _guard(monkeypatch, IONQ, dividends=lambda s, d: [])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="measurable on 0 of 5"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="measurable on 0 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
     from ba2_common.core.option_carry import carry_free_spot
     d = date(2022, 3, 24)
@@ -415,7 +441,7 @@ def test_two_confirmed_non_payer_sessions_clear_one_does_not(monkeypatch):
     assert guard.stats()["carry_passed"] == 1
     one = {d: (IONQ3[d] if d == date(2022, 3, 24) else IONQ[d]) for d in IONQ}
     g, u, guard = _guard(monkeypatch, one, dividends=lambda s, d: [])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="1 of 5"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="1 of 5"):
         guard.check(u, "X", date(2022, 3, 25))
 
 
@@ -432,8 +458,8 @@ def test_a_non_payers_uncalendared_dividend_no_longer_hides_an_error(monkeypatch
     """The reviewer's adversarial5 composites (no third expiry) and the same with a flat third
     expiry: every one refused on every start offset. (x1.051 is inside the 5% line itself:
     0.9515 of the spot passes before any carry question arises.)"""
-    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale, phases=5) == ["REFUSE"] * 5
-    assert _verdicts(monkeypatch, _missing_with_third(frac), [], scale, phases=5) == ["REFUSE"] * 5
+    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale, phases=5) == ["BLOCK"] * 5
+    assert _verdicts(monkeypatch, _missing_with_third(frac), [], scale, phases=5) == ["BLOCK"] * 5
 
 
 # ---- the carry band (final review, R1) ---------------------------------------------------------
@@ -444,10 +470,20 @@ def _verdicts(monkeypatch, table, divs, scale, phases=3):
         g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: divs, scale=scale)
         try:
             _run(g, u, guard, sorted(table)[ph:])
-            out.append("PASS")
+            # SOFT (2026-11-05): entries were withheld instead of the job aborting -- still NOT a
+            # silent pass; the hard/soft split itself is tested in test_option_basis_guard_soft.py
+            out.append("SOFT" if guard.stats()["soft_skips"] else "PASS")
         except g0.OptionSpotBasisMismatch:
             out.append("REFUSE")
-    return out
+    return _V(out)
+
+
+class _V(list):
+    """Verdicts; compares equal to a pattern in which "BLOCK" matches REFUSE or SOFT."""
+
+    def __eq__(self, other):
+        return len(self) == len(other) and all(
+            a == b or (b == "BLOCK" and a in ("REFUSE", "SOFT")) for a, b in zip(self, other))
 
 
 def _unpriced_special_table():
@@ -485,13 +521,13 @@ def test_the_band_is_derived_from_the_constants():
 @pytest.mark.parametrize("scale", [1.06, 1.07, 1.075, 1.08, 1.09, 1.10, 1.25])
 def test_an_unpriced_2_5_percent_special_cannot_hide_an_error_past_the_line(monkeypatch, scale):
     divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * scale, date(2022, 10, 14))]
-    assert _verdicts(monkeypatch, _unpriced_special_table(), divs, scale) == ["REFUSE"] * 3
+    assert _verdicts(monkeypatch, _unpriced_special_table(), divs, scale) == ["BLOCK"] * 3
 
 
 @pytest.mark.parametrize("frac,scale", [(0.05, 1.08), (0.05, 1.10), (0.05, 1.25), (0.03, 1.06),
                                         (0.03, 1.08), (0.01, 1.06)])
 def test_a_dividend_missing_from_the_calendar_cannot_hide_an_error(monkeypatch, frac, scale):
-    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale) == ["REFUSE"] * 3
+    assert _verdicts(monkeypatch, _missing_dividend_table(frac), [], scale) == ["BLOCK"] * 3
 
 
 def test_amc_still_clears_inside_the_band(monkeypatch):
@@ -507,14 +543,14 @@ def test_a_payers_uncalendared_dividend_cannot_hide_an_error_of_its_size(monkeyp
     expiries: the drop between them is not carry the calendar explains, so the extrapolation
     may not add it back. Before the veto 8%->x1.08 and 10%->x1.10 passed on 4 of 5 offsets."""
     assert _verdicts(monkeypatch, _missing_dividend_table(frac), PAYER_ROWS, scale,
-                     phases=5) == ["REFUSE"] * 5
+                     phases=5) == ["BLOCK"] * 5
 
 
 def test_the_unexplained_drop_veto_names_itself(monkeypatch):
     import app.services.backtest.option_basis_guard as g0
     table = _missing_dividend_table(0.08)
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: PAYER_ROWS, scale=1.08)
-    with pytest.raises(g0.OptionSpotBasisMismatch, match="not explained by the dividend calendar"):
+    with _raises_or_soft(guard, g0.OptionSpotBasisMismatch, match="not explained by the dividend calendar"):
         _run(g, u, guard, sorted(table))
 
 
@@ -544,18 +580,18 @@ def test_the_residual_after_the_veto(monkeypatch, case):
     Pinned so that any change to it is seen."""
     if case.startswith("special"):
         divs = [DividendRow(date(2022, 10, 28), 27.5 * 0.025 * 1.051, date(2022, 10, 14))]
-        assert _verdicts(monkeypatch, _unpriced_special_table(), divs, 1.051) ==             ["REFUSE", "PASS", "PASS"]
+        assert _verdicts(monkeypatch, _unpriced_special_table(), divs, 1.051) ==             ["BLOCK", "PASS", "PASS"]
     elif case.startswith("payer"):
         assert _verdicts(monkeypatch, _missing_dividend_table(0.025), PAYER_ROWS, 1.055,
-                         phases=5) == ["REFUSE"] * 5
+                         phases=5) == ["BLOCK"] * 5
     elif case.startswith("non-payer, missing 8%"):
         assert _verdicts(monkeypatch, _missing_dividend_table(0.08), [], 1.08,
-                         phases=5) == ["REFUSE"] * 5
+                         phases=5) == ["BLOCK"] * 5
     else:
         # the worst leverage the measure allows (10d / 7d = 1.43): a 2.5% step gains 3.6%.
-        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.06, phases=5) ==             ["REFUSE", "PASS", "PASS", "PASS", "PASS"]
-        assert _verdicts(monkeypatch, _missing_with_third(0.03, t1=10), [], 1.06, phases=5) ==             ["REFUSE"] * 5
-        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.065, phases=5) ==             ["REFUSE"] * 5
+        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.06, phases=5) ==             ["BLOCK", "PASS", "PASS", "PASS", "PASS"]
+        assert _verdicts(monkeypatch, _missing_with_third(0.03, t1=10), [], 1.06, phases=5) ==             ["BLOCK"] * 5
+        assert _verdicts(monkeypatch, _missing_with_third(0.025, t1=10), [], 1.065, phases=5) ==             ["BLOCK"] * 5
 
 
 # ---- verified add-back at guard level ----------------------------------------------------------
@@ -585,7 +621,7 @@ def test_a_basis_error_plus_a_priced_7_percent_dividend_is_still_refused(monkeyp
 def test_a_basis_error_behind_an_unpriced_7_percent_special_is_refused_by_name(monkeypatch):
     table, row = _div_table(0.93, 0.93)
     g, u, guard = _guard(monkeypatch, table, dividends=lambda s, d: [row])
-    with pytest.raises(g.OptionSpotBasisMismatch, match="not priced"):
+    with _raises_or_soft(guard, g.OptionSpotBasisMismatch, match="not priced"):
         _run(g, u, guard, sorted(table))
 
 

@@ -109,7 +109,7 @@ def test_the_ds_namespaces_are_the_ones_the_prewarm_warms(tool):
 
 def test_every_section_reports_and_the_blocking_ones_fail_the_run(tool, root, tmp_path):
     out = str(tmp_path / "pf.json")
-    rep = tool.run(["AAA", "XYZ", "NOCAL", "NOTREE"], START, END, ["coverage", "split", "ds", "gate"],
+    rep = tool.run(["AAA", "XYZ", "NOCAL", "NOTREE"], START, END, ["coverage", "split", "ds", "gate"], history_source="fmp",
                    out_path=out, guard_starts=[START], guard_phases=1, procs=1, cache_root=root,
                    gate_store=os.path.join(root, "screener", "metric_store"), log=lambda m: None)
     assert json.loads(Path(out).read_text())["summary"] == rep["summary"]
@@ -144,7 +144,7 @@ def test_a_guard_refusal_is_a_blocking_finding(tool, root, tmp_path, monkeypatch
             {"start": "2024-01-02", "phase": 1, "session": "2024-03-01", "why": "ratio 0.80"}]}
 
     monkeypatch.setattr(tool, "_guard", fake_guard)
-    rep = tool.run(["AAA"], START, END, ["guard"], out_path=None, guard_starts=[START], guard_phases=2,
+    rep = tool.run(["AAA"], START, END, ["guard"], out_path=None, history_source="fmp", guard_starts=[START], guard_phases=2,
                    procs=1, cache_root=root, log=lambda m: None)
     assert calls == [("AAA", (START,), 2)]
     assert rep["summary"]["guard_refused"] == ["AAA"]
@@ -157,14 +157,19 @@ def test_the_cli_exit_codes(tool, root, tmp_path, monkeypatch, capsys):
     u.write_text("AAA\n", encoding="utf-8")
     out = str(tmp_path / "pf.json")
     gate = os.path.join(root, "screener", "metric_store")
-    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31",
+    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31", "--ohlcv-history-source", "fmp",
                       "--out", out, "--sections", "ds,gate", "--procs", "1", "--gate-store", gate]) == 0
-    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31",
+    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31", "--ohlcv-history-source", "fmp",
                       "--out", out, "--sections", "coverage", "--procs", "1"]) == 1   # unfinished
-    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31",
+    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31", "--ohlcv-history-source", "fmp",
                       "--out", out, "--sections", "bogus"]) == 2
     assert tool.main(["--universe-file", str(tmp_path / "none.txt"), "--start", "2024-01-02",
-                      "--end", "2024-12-31", "--out", out]) == 2
+                      "--end", "2024-12-31", "--ohlcv-history-source", "fmp", "--out", out]) == 2
+    # REQUIRED, no vendor default (like warm_market_conditions.py): omitted or unknown = usage error
+    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31",
+                      "--out", out, "--sections", "ds,gate"]) == 2
+    assert tool.main(["--universe-file", str(u), "--start", "2024-01-02", "--end", "2024-12-31",
+                      "--ohlcv-history-source", "yahoo", "--out", out, "--sections", "ds,gate"]) == 2
 
 
 def test_a_late_option_start_is_flagged_only_against_the_stock_s_own_history(tool):
@@ -214,7 +219,7 @@ def test_the_real_guard_wiring_passes_a_consistent_chain_and_refuses_a_x2_one(to
                       "Low": close, "Close": close, "Volume": 1e6}).to_parquet(p, index=False)
         _split_calendar(r, sym)
         _parity_chain(store, sym, days)
-    rep = tool.run(["PAR", "BAD"], start, end, ["split", "guard"], out_path=None, guard_starts=[start],
+    rep = tool.run(["PAR", "BAD"], start, end, ["split", "guard"], out_path=None, history_source="fmp", guard_starts=[start],
                    guard_phases=2, procs=1, cache_root=str(r), theta_root=theta, log=lambda m: None)
     rows = {x["symbol"]: x for x in rep["symbols"]}
     assert rows["PAR"]["guard"]["refusals"] == [] and rows["PAR"]["guard"]["checks"] > 0
@@ -253,7 +258,7 @@ def test_every_partition_state_other_than_complete_or_empty_is_reported(tool, ro
     else:
         m["end"] = "2024-11-29"
     _j.dump(m, open(mpath, "w"))
-    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, history_source="fmp", guard_starts=[START],
                    guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
     nf = rep["symbols"][0]["coverage"]["not_final"]
     got = {x["expiry"]: x for x in nf}
@@ -263,7 +268,7 @@ def test_every_partition_state_other_than_complete_or_empty_is_reported(tool, ro
 
 
 def test_the_longest_listing_lead_is_measured_and_checked_against_the_horizon(tool, root, monkeypatch):
-    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, history_source="fmp", guard_starts=[START],
                    guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
     c = rep["symbols"][0]["coverage"]
     assert c["listing_lead_max_days"] == (date(2024, 12, 20) - date(2024, 12, 2)).days
@@ -271,6 +276,54 @@ def test_the_longest_listing_lead_is_measured_and_checked_against_the_horizon(to
     assert rep["summary"]["listing_horizon_days"] == T.LISTING_HORIZON_DAYS
     assert not any("listed" in f["what"] for f in rep["findings"])
     monkeypatch.setattr(T, "LISTING_HORIZON_DAYS", 10)
-    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, guard_starts=[START],
+    rep = tool.run(["AAA"], START, END, ["coverage"], out_path=None, history_source="fmp", guard_starts=[START],
                    guard_phases=1, procs=1, cache_root=root, log=lambda x: None)
     assert any(f["severity"] == "review" and "LISTING_HORIZON_DAYS" in f["what"] for f in rep["findings"])
+
+
+def test_a_soft_guard_result_is_a_review_finding_with_counts_and_a_hard_one_is_blocking(
+        tool, root, monkeypatch):
+    def fake_guard(sym, cfg, fmp, basis):
+        return {"runs": 2, "checks": 10, "carry_passed": 0, "refusals": [], "soft": [
+            {"start": "2024-01-02", "phase": 0, "kind": "SOFT", "sessions_skipped": 7,
+             "sessions_seen": 40, "first_skipped": "2024-03-01", "last_skipped": "2024-04-01",
+             "why": "median 0.93"}]}
+
+    monkeypatch.setattr(tool, "_guard", fake_guard)
+    rep = tool.run(["AAA"], START, END, ["guard"], out_path=None, history_source="fmp",
+                   guard_starts=[START], guard_phases=2, procs=1, cache_root=root, log=lambda m: None)
+    assert rep["summary"]["guard_refused"] == [] and rep["summary"]["guard_soft_skipped"] == {"AAA": 7}
+    assert rep["summary"]["blocking"] == 0
+    (f,) = [f for f in rep["findings"] if f["section"] == "guard"]
+    assert f["severity"] == "review" and "SOFT" in f["what"] and "7 of 40" in f["what"]
+
+
+def test_the_history_source_picks_the_daily_file_and_the_basis(tool, tmp_path):
+    fmp = tool._daily_path(str(tmp_path), "BRK.B", "fmp")
+    alp = tool._daily_path(str(tmp_path), "BRK.B", "alpaca")
+    assert fmp.endswith(os.path.join("FMPOHLCVProvider", "BRK.B_1d.parquet"))
+    assert alp.endswith(os.path.join("AlpacaHistoryOHLCVProvider", "BRK-B_1d.parquet"))
+    with pytest.raises(Exception):
+        tool._daily_path(str(tmp_path), "AAA", "yahoo")
+    with pytest.raises(Exception):
+        tool.run(["AAA"], START, END, ["gate"], out_path=None, history_source="yahoo",
+                 guard_starts=[START], guard_phases=1, procs=1, cache_root=str(tmp_path))
+
+
+def test_the_alpaca_split_basis_comes_from_the_caches_verified_table(tool, tmp_path, monkeypatch):
+    import app.services.backtest.option_split_basis as B
+    seen = {}
+
+    class _RB:
+        def basis_of(self, sym):
+            return f"basis-{sym}"
+
+    def fake(symbols, cache_dir, **kw):
+        seen["args"] = (list(symbols), cache_dir)
+        return _RB()
+
+    monkeypatch.setattr(B, "build_alpaca_run_split_basis", fake)
+    path = tool._daily_path(str(tmp_path), "AAA", "alpaca")
+    r = tool._split("AAA", path, "alpaca", str(tmp_path))
+    assert r == {"ok": True, "basis": "basis-AAA"}
+    assert seen["args"] == (["AAA"], os.path.dirname(path))

@@ -14,9 +14,12 @@ The checks the stage-2 data repair (2026-09-25/26) ran as scratch scripts, commi
             calendar, the full-fetch marker, the shipped overrides) -- OK or REFUSED.
   guard     the REAL option basis guard (``option_basis_guard.BasisGuard``) replayed over the
             window: for each sampled start and each of N start phases, a FRESH guard is handed
-            every FMP session from that start (the worst case: a chain read every session) with
-            the run's as-traded spot, split dates and dividend source. A refusal is what would
-            abort a job started there.
+            every session of the chosen history source from that start (the worst case: a chain
+            read every session) with the run's as-traded spot, split dates and dividend source.
+            A HARD refusal (``OptionSpotBasisMismatch``) is what would abort a job started
+            there; a SOFT one (dividend/carry unprovable, ratio 0.85..0.95: NEW ENTRIES are
+            withheld, nothing aborts) is reported per symbol with its skipped-session counts, as
+            a ``review`` finding -- a symbol skipped for most of a window is worth a decision.
   ds        DeterministicScorer inputs: the fmp_history file of every namespace its prewarm
             warms (a MISSING file is a hermetic hard miss; ``fmp_common._HERMETIC_MISS_LIMIT``
             distinct misses abort a run) and the share of sample dates each section can score.
@@ -24,7 +27,7 @@ The checks the stage-2 data repair (2026-09-25/26) ran as scratch scripts, commi
             the window and how many lack a market cap.
 
     python tools/option_universe_preflight.py --universe-file U --start 2020-01-01 \
-        --end 2025-12-31 --out preflight.json [--sections coverage,split,guard,ds,gate] \
+        --end 2025-12-31 --ohlcv-history-source {fmp,alpaca} --out preflight.json [--sections coverage,split,guard,ds,gate] \
         [--guard-starts 2020-01-01,2023-01-01 --guard-phases 5] [--procs 2]
 
 FINDINGS carry a severity: ``blocking`` (a job would abort or read wrong data: no option tree,
@@ -34,6 +37,12 @@ window, a first option bar well after the stock's own history starts, a missing 
 symbol absent from the gate store). Exit codes:
 0 no blocking finding, 1 at least one, 2 a configuration error. The full report goes to
 ``--out``; a summary (counts + blocking findings) is printed.
+
+``--ohlcv-history-source {fmp,alpaca}`` is REQUIRED (no vendor default, like
+warm_market_conditions.py): it picks the daily closes the guard's as-traded spot is built from
+(``FMPOHLCVProvider/<SYM>_1d.parquet`` or ``AlpacaHistoryOHLCVProvider/<SYM>_1d.parquet``) and
+the split basis (FMP calendar + proof, or the alpaca cache's verified split table), exactly as a
+run with that ``ohlcv_history_source`` builds them.
 
 Run it with the test platform's interpreter (it imports the backtest guard); memory is bounded
 by ``--procs`` worker processes, each holding one symbol's option arrays at a time.
@@ -78,16 +87,34 @@ def _date(text):
         raise argparse.ArgumentTypeError(f"{text!r} is not an ISO date: {e}")
 
 
+def _history_source(text):
+    """argparse ``type``: a known history source or a usage error (exit 2)."""
+    from ba2_common.core.ohlcv_history import UnknownHistorySource, check_history_source
+    try:
+        return check_history_source(text)
+    except UnknownHistorySource as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def _cache_root():
     from ba2_common import config
     return config.CACHE_FOLDER
 
 
 # ------------------------------------------------------------------------------ per symbol
-def _fmp_daily(cache_root, sym):
-    """(sorted session dates, closes) of the FMP daily file, or None."""
+def _daily_path(cache_root, sym, history_source):
+    """The daily OHLCV parquet of ``sym`` for ``history_source`` (the run's own file)."""
+    from ba2_common.core.ohlcv_history import check_history_source, history_cache_dirname
+    source = check_history_source(history_source)
+    name = sym.replace(".", "-") if source == "alpaca" else sym      # the alpaca cache's spelling
+    return os.path.join(cache_root, history_cache_dirname(source), f"{name}_1d.parquet")
+
+
+def _fmp_daily(cache_root, sym, history_source="fmp"):
+    """(sorted session dates, closes) of the daily file of ``history_source`` (name kept: it was
+    FMP-only), or None."""
     import pandas as pd
-    path = os.path.join(cache_root, "FMPOHLCVProvider", f"{sym}_1d.parquet")
+    path = _daily_path(cache_root, sym, history_source)
     if not os.path.exists(path):
         return None, path
     df = pd.read_parquet(path, columns=["Date", "Close"])
@@ -213,10 +240,14 @@ def _first_bar_fast(store, sym, e):
     return v.date() if isinstance(v, datetime) else v
 
 
-def _split(sym, path):
+def _split(sym, path, history_source="fmp", cache_root=None):
     from ba2_common.core.split_basis import SplitBasisRefused
-    from app.services.backtest.option_split_basis import _resolve_one
+    from app.services.backtest.option_split_basis import _resolve_one, build_alpaca_run_split_basis
     try:
+        if history_source == "alpaca":
+            # the run's own basis: the verified split table the alpaca cache was built with
+            return {"ok": True, "basis": build_alpaca_run_split_basis(
+                [sym], os.path.dirname(path)).basis_of(sym)}
         return {"ok": True, "basis": _resolve_one(sym, path)}
     except SplitBasisRefused as e:
         return {"ok": False, "refused": str(e)[:600]}
@@ -240,7 +271,7 @@ def _guard(sym, cfg, fmp, basis):
         return {"skipped": "no option rows"}
     days = fmp[0]
     sd, dv = _split_dates_of(rb), _dividends_of(rb)
-    res = {"refusals": [], "runs": 0, "checks": 0, "carry_passed": 0}
+    res = {"refusals": [], "soft": [], "runs": 0, "checks": 0, "carry_passed": 0}
     for st in cfg["guard_starts"]:
         sess = [x for x in days if st <= x <= cfg["end"]]
         for ph in range(cfg["guard_phases"]):
@@ -250,9 +281,16 @@ def _guard(sym, cfg, fmp, basis):
                 for x in sess[ph:]:
                     g.check(u, sym, x)
             except G.OptionSpotBasisMismatch as e:
-                res["refusals"].append({"start": st.isoformat(), "phase": ph,
+                res["refusals"].append({"start": st.isoformat(), "phase": ph, "kind": "HARD",
                                         "session": x.isoformat(), "why": str(e)[:400]})
             s = g.stats()
+            for rec in (s.get("soft_skips") or {}).values():
+                res["soft"].append({"start": st.isoformat(), "phase": ph, "kind": "SOFT",
+                                    "sessions_skipped": rec["sessions_skipped"],
+                                    "sessions_seen": rec["sessions_seen"],
+                                    "first_skipped": rec["first_skipped"],
+                                    "last_skipped": rec["last_skipped"],
+                                    "why": rec["reason"][:400]})
             res["checks"] += int(s.get("checks", 0))
             res["carry_passed"] += int(s.get("carry_passed", 0))
     return res
@@ -279,15 +317,15 @@ def scan_symbol(sym, cfg):
     t0 = time.time()
     out = {"symbol": sym}
     try:
-        fmp, path = _fmp_daily(cfg["cache_root"], sym)
+        fmp, path = _fmp_daily(cfg["cache_root"], sym, cfg["history_source"])
         if "coverage" in cfg["sections"]:
             out["coverage"] = _coverage(sym, cfg, fmp)
         basis = None
         if "split" in cfg["sections"] or "guard" in cfg["sections"]:
             if fmp is None:
-                out["split"] = {"ok": False, "refused": f"no FMP daily file at {path}"}
+                out["split"] = {"ok": False, "refused": f"no {cfg['history_source']} daily file at {path}"}
             else:
-                r = _split(sym, path)
+                r = _split(sym, path, cfg["history_source"], cfg["cache_root"])
                 basis = r.pop("basis", None)
                 out["split"] = r
         if "guard" in cfg["sections"]:
@@ -460,8 +498,15 @@ def _findings(rows, ds, gate, cfg):
         g = r.get("guard")
         if g is not None and g.get("refusals"):
             f = g["refusals"][0]
-            add("blocking", "guard", s, f"{len(g['refusals'])} of {g['runs']} sampled runs refused, "
-                f"first {f['session']} (start {f['start']} phase {f['phase']}): {f['why'][:200]}")
+            add("blocking", "guard", s, f"HARD refusal in {len(g['refusals'])} of {g['runs']} sampled "
+                f"runs (job-fatal), first {f['session']} (start {f['start']} phase {f['phase']}): "
+                f"{f['why'][:200]}")
+        if g is not None and g.get("soft"):
+            w = max(g["soft"], key=lambda x: x["sessions_skipped"])
+            add("review", "guard", s, f"SOFT refusal (new entries withheld, no abort) in "
+                f"{len(g['soft'])} of {g['runs']} sampled runs; worst: {w['sessions_skipped']} of "
+                f"{w['sessions_seen']} sessions skipped ({w['first_skipped']}..{w['last_skipped']}, "
+                f"start {w['start']} phase {w['phase']}): {w['why'][:200]}")
     if ds is not None:
         from ba2_providers.fmp_common import _HERMETIC_MISS_LIMIT
         for m in ds["missing_files"]:
@@ -480,7 +525,9 @@ def _findings(rows, ds, gate, cfg):
 
 
 def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases, procs,
-        cache_root=None, theta_root=None, gate_store=None, log=print):
+        history_source, cache_root=None, theta_root=None, gate_store=None, log=print):
+    from ba2_common.core.ohlcv_history import check_history_source
+    history_source = check_history_source(history_source)      # REQUIRED, no default
     cache_root = cache_root or _cache_root()
     theta_root = theta_root or os.path.join(cache_root, "ThetaDataOptionsProvider")
     if gate_store is None:
@@ -489,6 +536,7 @@ def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases,
     t0 = time.time()
     from ba2_providers.options.thetadata import LISTING_HORIZON_DAYS
     cfg = {"start": start, "end": end, "sections": list(sections), "cache_root": cache_root,
+           "history_source": history_source,
            "theta_root": theta_root, "guard_starts": list(guard_starts), "guard_phases": guard_phases,
            "listing_horizon_days": LISTING_HORIZON_DAYS}
     rows = []
@@ -505,7 +553,7 @@ def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases,
         log("DS inputs")
 
         def bars_of(sym):
-            f, _p = _fmp_daily(cache_root, sym)
+            f, _p = _fmp_daily(cache_root, sym, history_source)
             return f[0] if f else []
         samples = [date(y, m, 15) for y in range(start.year, end.year + 1) for m in (1, 4, 7, 10)
                    if start <= date(y, m, 15) <= end]
@@ -519,7 +567,10 @@ def run(universe, start, end, sections, *, out_path, guard_starts, guard_phases,
         "guard_starts": [d.isoformat() for d in guard_starts], "guard_phases": guard_phases,
         "blocking": len(blocking), "review": len(findings) - len(blocking),
         "split_refused": sorted(r["symbol"] for r in rows if r.get("split") and not r["split"]["ok"]),
+        "ohlcv_history_source": history_source,
         "guard_refused": sorted(r["symbol"] for r in rows if (r.get("guard") or {}).get("refusals")),
+        "guard_soft_skipped": {r["symbol"]: max(x["sessions_skipped"] for x in r["guard"]["soft"])
+                               for r in rows if (r.get("guard") or {}).get("soft")},
         "guard_carry_cleared": sorted(r["symbol"] for r in rows
                                       if (r.get("guard") or {}).get("carry_passed")),
         "no_option_tree": sorted(r["symbol"] for r in rows
@@ -546,6 +597,10 @@ def main(argv=None):
     ap.add_argument("--universe-file", required=True)
     ap.add_argument("--start", required=True, type=_date)
     ap.add_argument("--end", required=True, type=_date)
+    ap.add_argument("--ohlcv-history-source", required=True, type=_history_source,
+                    metavar="{fmp,alpaca}",
+                    help="REQUIRED, no default: the daily closes + split basis the guard's spot "
+                         "is built from (a run's ohlcv_history_source)")
     ap.add_argument("--out", required=True, help="where to write the full JSON report")
     ap.add_argument("--sections", default=",".join(SECTIONS),
                     help=f"comma list of {', '.join(SECTIONS)} (default: all)")
@@ -575,7 +630,7 @@ def main(argv=None):
         starts = [args.start, args.start + (args.end - args.start) / 2]
     report = run(_universe(args.universe_file), args.start, args.end, sections, out_path=args.out,
                  guard_starts=starts, guard_phases=args.guard_phases, procs=args.procs,
-                 gate_store=args.gate_store,
+                 history_source=args.ohlcv_history_source, gate_store=args.gate_store,
                  log=lambda m: print(f"[{datetime.now():%H:%M:%S}] {m}", file=sys.stderr))
     print(json.dumps({"summary": report["summary"],
                       "blocking": [f for f in report["findings"] if f["severity"] == "blocking"],
