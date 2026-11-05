@@ -58,6 +58,23 @@ def test_roundtrip_json_scalars_and_containers():
     assert math.copysign(1.0, back["neg_zero"]) == -1.0
 
 
+def test_a_plain_tuple_round_trips_as_a_tuple_and_a_list_stays_a_list():
+    obj = {"names": ("a", "b"), "empty": (), "nested": [("x", 1.5)], "list": ["a", "b"]}
+    back = _roundtrip(obj)
+    assert back == obj
+    assert isinstance(back["names"], tuple) and isinstance(back["empty"], tuple)
+    assert isinstance(back["nested"][0], tuple) and isinstance(back["list"], list)
+    # the two are different recordings (content addressing must not conflate them)
+    assert encode(("a",)).data != encode(["a"]).data
+
+
+def test_a_namedtuple_is_refused_rather_than_decoded_as_a_plain_tuple():
+    from collections import namedtuple
+    Pair = namedtuple("Pair", "a b")
+    with pytest.raises(UnsupportedCaptureType):
+        encode({"pair": Pair(1, 2)})
+
+
 def test_dict_key_order_is_preserved():
     obj = {"z": 1, "a": 2, "m": 3}
     back = _roundtrip(obj)

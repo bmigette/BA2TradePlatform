@@ -40,8 +40,8 @@ Payload (``payload``)::
                                "limit_price", "option_strategy", "transaction_id", "position"}]}}
 
 ``inputs``: ``action_class``; ``instrument_name``; ``order_recommendation`` (enum);
-``account_class`` / ``account_id`` (the account itself is NOT serialised: the replay supplies a
-tape account); ``ctor_kwargs`` (every named constructor parameter of the class chain, read back off
+``account_class`` / ``account_id`` / ``account_declarations`` (the account itself is NOT serialised:
+the replay supplies a tape account that carries the recorded name, id and class-level declarations); ``ctor_kwargs`` (every named constructor parameter of the class chain, read back off
 the instance -- the EventAction config: strike method/param, DTE window, sizing, liquidity gates,
 selection weights, close trigger/target ...); ``expert_recommendation`` (only the fields the
 actions read: id, instance_id, symbol, recommended_action, expected_profit_percent, price_at_date,
@@ -76,6 +76,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from ba2_common.core.replay.context import current_capture
@@ -85,10 +86,12 @@ __all__ = [
     "OPTION_ACTION_PROVIDER",
     "RECORD_VERSION",
     "action_ctor_kwargs",
+    "build_outcome",
     "db_row_instances",
     "note_record",
     "note_submit",
     "rebuild_option_action",
+    "replay_effects",
     "record_option_action",
     "replay_decision_time",
 ]
@@ -205,31 +208,9 @@ class _Recorder:
 
     def _record(self, exc):
         action = self.action
-        frame = self._frame
-        outcome: Dict[str, Any] = {
-            "status": "error" if exc is not None else "returned",
-            "error": repr(exc) if exc is not None else None,
-            "success": None, "message": None, "result_data": None,
-            "entry_record": None, "exit_record": None,
-            "submits": [],
-        }
-        result = self.result
-        if exc is None and result is not None:
-            outcome["success"], outcome["message"], data = _result_fields(result)
-            if isinstance(data, dict):
-                outcome["entry_record"] = _encodable(
-                    self.context, data.get("entry_record"), "entry_record")
-                outcome["result_data"] = _encodable(
-                    self.context,
-                    {k: v for k, v in data.items() if k not in _RESULT_DATA_SKIP},
-                    "result data")
-        if "exit_record" in frame.records:
-            outcome["exit_record"] = _encodable(
-                self.context, frame.records["exit_record"], "exit_record")
-        if outcome["entry_record"] is None and "entry_record" in frame.records:
-            outcome["entry_record"] = _encodable(
-                self.context, frame.records["entry_record"], "entry_record")
-        outcome["submits"] = frame.submits
+        outcome = build_outcome(
+            exc, self.result, self._frame,
+            lambda value, label: _encodable(self.context, value, label))
         inputs = dict(self._inputs)
         inputs["redacted_setting_keys"] = self._redacted
         payload = {
@@ -252,6 +233,53 @@ class _Recorder:
             },
             payload=payload,
         )
+
+
+def build_outcome(exc, result, frame, encodable) -> Dict[str, Any]:
+    """The ``outcome`` block of an action record, from what one ``execute`` did.
+
+    ONE derivation for two callers: the live recorder (``_Recorder._record``) and the offline
+    replay, which builds the outcome of the re-run the same way so the two are compared like
+    for like. ``encodable(value, label)`` is the recorder's codec guard (the replay passes an
+    identity function: it compares the live objects).
+    """
+    outcome: Dict[str, Any] = {
+        "status": "error" if exc is not None else "returned",
+        "error": repr(exc) if exc is not None else None,
+        "success": None, "message": None, "result_data": None,
+        "entry_record": None, "exit_record": None,
+        "submits": [],
+    }
+    if exc is None and result is not None:
+        outcome["success"], outcome["message"], data = _result_fields(result)
+        if isinstance(data, dict):
+            outcome["entry_record"] = encodable(data.get("entry_record"), "entry_record")
+            outcome["result_data"] = encodable(
+                {k: v for k, v in data.items() if k not in _RESULT_DATA_SKIP}, "result data")
+    if "exit_record" in frame.records:
+        outcome["exit_record"] = encodable(frame.records["exit_record"], "exit_record")
+    if outcome["entry_record"] is None and "entry_record" in frame.records:
+        outcome["entry_record"] = encodable(frame.records["entry_record"], "entry_record")
+    outcome["submits"] = frame.submits
+    return outcome
+
+
+@contextmanager
+def replay_effects(action):
+    """Offline replay: collect what one re-run ``execute`` submits and stamps.
+
+    The live recorder is a no-op while replaying (it must never write into the tape it reads), but
+    the replay still needs the SAME submit / record notes the recorder collected, in the same
+    shape, so it installs the recorder's own frame without recording anything. Restores the
+    previous frame on exit, exceptions included.
+    """
+    frame = _Frame(action)
+    previous = getattr(_tls, "frame", None)
+    _tls.frame = frame
+    try:
+        yield frame
+    finally:
+        _tls.frame = previous
 
 
 def _result_fields(result):
@@ -341,6 +369,21 @@ def _recommendation_fields(recommendation) -> Optional[Dict[str, Any]]:
             for name in _RECOMMENDATION_FIELDS if hasattr(recommendation, name)}
 
 
+#: Class-level declarations of the ACCOUNT that the action code reads and that a replay's tape
+#: account cannot learn from a tapped read. ``OPTION_GREEKS_SOURCE`` decides whether the entry
+#: record can be built at all (``OptionGreeksSourceUndeclared``).
+_ACCOUNT_DECLARATIONS = ("OPTION_GREEKS_SOURCE",)
+
+
+def _account_declarations(account) -> Dict[str, Any]:
+    out = {}
+    for name in _ACCOUNT_DECLARATIONS:
+        value = getattr(account, name, None)
+        # A declaration is a string tag or absent; a test double's auto-attribute is neither.
+        out[name] = value if isinstance(value, str) else None
+    return out
+
+
 def _build_inputs(action) -> Dict[str, Any]:
     from ba2_common.core.replay.clock import replay_now
 
@@ -359,6 +402,7 @@ def _build_inputs(action) -> Dict[str, Any]:
         "order_recommendation": action.order_recommendation,
         "account_class": type(account).__name__,
         "account_id": getattr(account, "id", None),
+        "account_declarations": _account_declarations(account),
         "ctor_kwargs": action_ctor_kwargs(action),
         "expert_recommendation": _recommendation_fields(action.expert_recommendation),
         "existing_order": _dump(order)["row"] if order is not None else None,

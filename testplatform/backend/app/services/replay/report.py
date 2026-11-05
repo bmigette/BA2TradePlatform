@@ -29,6 +29,8 @@ __all__ = [
     "STAGE_ROWS",
     "CAPABILITY_CAVEATS",
     "CAPABILITY_TITLES",
+    "CAPABILITY_OPTION_SELECTION",
+    "OPTION_STAGE_ROWS",
     "STATUS_ORDER",
 ]
 
@@ -53,6 +55,28 @@ CAPABILITY_TITLES: Dict[str, str] = {
     ReplayStatus.CAPABILITY_HISTORICAL: "historical expert comparison",
     ReplayStatus.CAPABILITY_DECISION: "decision and execution comparison",
 }
+
+#: The option selection replay (``option_selection``). A separate, additive capability: it is NOT
+#: listed in :data:`CAPABILITY_TITLES`, so the four stock capabilities' "not run" lists (and the
+#: inventory's per-capability coverage) keep their exact shape. Its own report states what it did
+#: not run, including the four above.
+CAPABILITY_OPTION_SELECTION = "option_selection"
+
+OPTION_CAPABILITY_TITLE = ("option selection replay (the recorded option entry / close action "
+                           "re-run on its tape of broker reads)")
+
+#: The one comparison no tape can make: re-selecting the contract from the HISTORICAL data
+#: provider (parquet) instead of the live broker chain. Named in every option report so a
+#: ``match`` is never read as "the backtest would have chosen this contract".
+HISTORICAL_PROVIDER_TITLE = ("historical_provider comparison (the same selection on the parquet "
+                             "chain instead of the live broker chain)")
+
+OPTION_CAVEAT = (
+    "A match proves only that the shared option action code, given the broker reads (chain, "
+    "quotes, IV, sizing figures) and database rows live actually consumed, reproduces the "
+    "contracts, limit price, quantity, trade record and refusal live actually produced. "
+    "`historical_provider` (parquet vs broker) is **NOT run**: it says nothing about whether the "
+    "backtest data would have chosen the same contract.")
 
 #: What a ``match`` in each capability does and does NOT establish. Per capability
 #: because the four establish different things and one shared sentence is wrong for
@@ -115,6 +139,29 @@ STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("Execution",
      "Submit attempts/rejections, partial/full fills, final active protection",
      ()),
+)
+
+
+#: The option selection stage rows (shown only on an ``option_selection`` report). Comparison is
+#: EXACT at every stage.
+STAGE_OPTION_SELECTION = "Option contract selection"
+STAGE_OPTION_PRICING = "Option limit price"
+STAGE_OPTION_SIZING = "Option quantity"
+STAGE_OPTION_RECORD = "Option trade record"
+STAGE_OPTION_REFUSAL = "Option refusal"
+
+OPTION_STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    (STAGE_OPTION_SELECTION,
+     "Per leg: contract symbol, side, ratio, expiry (close: the position closed)",
+     (CAPABILITY_OPTION_SELECTION,)),
+    (STAGE_OPTION_PRICING, "Limit price handed to the account",
+     (CAPABILITY_OPTION_SELECTION,)),
+    (STAGE_OPTION_SIZING, "Quantity handed to the account",
+     (CAPABILITY_OPTION_SELECTION,)),
+    (STAGE_OPTION_RECORD, "entry_record / exit_record, key by key",
+     (CAPABILITY_OPTION_SELECTION,)),
+    (STAGE_OPTION_REFUSAL, "Success flag, refusal message, error",
+     (CAPABILITY_OPTION_SELECTION,)),
 )
 
 
@@ -326,12 +373,18 @@ class ReplayReport:
                       ReplayStatus.CAPABILITY_DECISION)
             if c != self.capability
         ]
+        if self.capability == CAPABILITY_OPTION_SELECTION:
+            not_run.append(HISTORICAL_PROVIDER_TITLE)
+        title = (OPTION_CAPABILITY_TITLE if self.capability == CAPABILITY_OPTION_SELECTION
+                 else CAPABILITY_TITLES[self.capability])
+        caveat = (OPTION_CAVEAT if self.capability == CAPABILITY_OPTION_SELECTION
+                  else CAPABILITY_CAVEATS[self.capability])
         return [
-            f"**Capability run:** {CAPABILITY_TITLES[self.capability]}.",
+            f"**Capability run:** {title}.",
             "",
             "**Capabilities NOT run:** " + "; ".join(not_run) + ".",
             "",
-            CAPABILITY_CAVEATS[self.capability],
+            caveat,
             "",
             "A `match` in one capability says nothing about another.",
         ]
@@ -343,7 +396,9 @@ class ReplayReport:
         saying different things about the same stage.
         """
         out: List[Tuple[str, str, str, Tuple[str, ...]]] = []
-        for stage, fields_text, capabilities in STAGE_ROWS:
+        rows = STAGE_ROWS + (OPTION_STAGE_ROWS
+                             if self.capability == CAPABILITY_OPTION_SELECTION else ())
+        for stage, fields_text, capabilities in rows:
             if self.capability not in capabilities:
                 out.append((stage, fields_text, ReplayStatus.COVERAGE_NOT_RUN, capabilities))
                 continue
@@ -431,7 +486,8 @@ class ReplayReport:
             "counts": self.counts(),
             "capabilities_not_run": [
                 c for c in CAPABILITY_TITLES if c != self.capability
-            ],
+            ] + (["historical_provider"]
+                 if self.capability == CAPABILITY_OPTION_SELECTION else []),
             "stages": [
                 {
                     "stage": stage,

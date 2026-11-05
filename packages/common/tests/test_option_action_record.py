@@ -108,6 +108,8 @@ def test_entry_records_inputs_and_the_legs_quantity_limit_the_account_received()
     assert payload["outcome"]["success"] is True
     assert payload["outcome"]["entry_record"] == result["data"]["entry_record"]
     assert payload["inputs"]["decision_time"].tzinfo is not None
+    # class-level declarations the replay's tape account must carry (no tapped read tells it)
+    assert payload["inputs"]["account_declarations"] == {"OPTION_GREEKS_SOURCE": "test_fake"}
     assert oar.replay_decision_time(payload) == payload["inputs"]["decision_time"]
 
 

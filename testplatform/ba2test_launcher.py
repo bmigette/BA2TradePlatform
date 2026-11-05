@@ -735,7 +735,7 @@ _WARM_JOIN_TIMEOUT_S = 3600.0
 
 # --- replay (offline replay of a recorded live session) --------------------------------
 def _cmd_replay(args) -> int:
-    """``inventory`` / ``experts`` / ``gather`` / ``historical`` over one bundle.
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` / ``option-selection`` over one bundle.
 
     Everything runs offline: the services enter the replay isolation (hermetic
     FMP, a closed socket layer, refusing instance/provider resolvers) and read
@@ -748,7 +748,7 @@ def _cmd_replay(args) -> int:
     if args.replay_cmd == "warm":
         return _cmd_replay_warm(args)
 
-    from app.services.replay import expert_replay, gather_tape, inventory
+    from app.services.replay import expert_replay, gather_tape, inventory, option_selection
 
     bundle = _caller_path(args.bundle)
     if not os.path.isdir(bundle):
@@ -775,7 +775,8 @@ def _cmd_replay(args) -> int:
             sys.exit(f"ba2-test: {cache_root} is not a directory")
         report = historical.run(bundle, cache_root, out, timeout=args.timeout)
     else:
-        module = expert_replay if args.replay_cmd == "experts" else gather_tape
+        module = {"experts": expert_replay, "gather": gather_tape,
+                  "option-selection": option_selection}[args.replay_cmd]
         report = module.run(bundle, out)
     print(report.to_markdown())
     if out:
@@ -11180,6 +11181,13 @@ def main(argv: "list | None" = None) -> int:
                             help="Re-run the live _gather against the recorded provider tape.")
     rpg.add_argument("--bundle", required=True, help="Exported session directory.")
     rpg.add_argument("--out", default=None, help="Write the report here.")
+    rpo = rplsub.add_parser(
+        "option-selection",
+        help="Re-run each recorded option entry / close action on its tape of broker reads "
+             "and compare contracts, limit, quantity, trade record and refusal exactly.")
+    rpo.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpo.add_argument("--out", default=None,
+                     help="Write option_selection.md/.json into this directory.")
     rph = rplsub.add_parser(
         "historical",
         help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "
