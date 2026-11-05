@@ -3995,6 +3995,9 @@ class _OptionEntryAction(TradeAction):
                 data["option_rm_rail"] = verdict.reason
                 return self._result(False, verdict.message, data)
             rm_candidate = verdict.candidate
+        note_submit("submit_option_order", legs=legs, quantity=quantity, order_type="limit",
+                    limit_price=limit_price, option_strategy=option_strategy,
+                    expert_recommendation_id=expert_rec_id, transaction_id=None)
         order = self.account.submit_option_order(
             legs=legs, quantity=quantity, order_type="limit", limit_price=limit_price,
             option_strategy=option_strategy, expert_recommendation_id=expert_rec_id)
@@ -4415,6 +4418,12 @@ class _OptionEntryAction(TradeAction):
             extra_entry_facts=entry_facts, sizing_note=sizing_note)
 
     def execute(self) -> "TradeActionResult":
+        # Replay capture (option selection replay): a no-op outside a capture scope.
+        with record_option_action(self) as _rec:
+            _rec.result = result = self._execute_entry()
+            return result
+
+    def _execute_entry(self) -> "TradeActionResult":
         # One execute, one decision: the spot the record reuses is THIS run's, never a
         # previous execute's on the same action object.
         self._last_spot = None
@@ -4717,6 +4726,13 @@ class SellCoveredCallAction(_OptionEntryAction):
         return self._result(False, detail, data=data)
 
     def execute(self) -> "TradeActionResult":
+        # The base execute records; this wrapper makes the declines below part of the SAME
+        # record (re-entry for one action object is a no-op).
+        with record_option_action(self) as _rec:
+            _rec.result = result = self._execute_covered_call()
+            return result
+
+    def _execute_covered_call(self) -> "TradeActionResult":
         # The non-options account is refused by the BASE execute with a plain result; named
         # here instead, so all six decline paths carry a reason and exactly one warning.
         if not self._supports_options():
@@ -6035,6 +6051,9 @@ class OpenPutBackspreadAction(_BackspreadAction):
 # constants used from this point on, and neither module imports this one (``option_lifecycle``
 # is the pure module and its import-leak gate forbids reaching back here), so there is no cycle.
 from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
+from ba2_common.core.replay.option_action_record import (
+    note_record, note_submit, record_option_action,
+)
 from ba2_common.core.option_lifecycle import (
     COVERED_CALL_STRATEGY, ORDER_PMCC_OVERLAY_KEY, PMCC_OVERLAY_SPEC_KEYS, PMCC_ROLL_STRATEGY,
     close_legs_are_fail_closed, restamped_max_loss, roll_legs_are_fail_closed,
@@ -6394,15 +6413,17 @@ class RollPMCCShortAction(_OptionEntryAction):
     def execute(self) -> "TradeActionResult":
         """Roll the overlay, and say which transaction the roll acted on
         (``closed_transaction_ids``) so the same pass never re-arms a TP/SL on it."""
-        self._raised = False
-        result = self._execute_roll()
-        txn_id = getattr(self.existing_order, "transaction_id", None) if self.existing_order else None
-        data = result.get("data") if isinstance(result, dict) else None
-        if isinstance(data, dict):
-            data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
-            if self._raised:
-                data["close_uncertain"] = True
-        return result
+        with record_option_action(self) as _rec:
+            self._raised = False
+            result = self._execute_roll()
+            txn_id = getattr(self.existing_order, "transaction_id", None) if self.existing_order else None
+            data = result.get("data") if isinstance(result, dict) else None
+            if isinstance(data, dict):
+                data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
+                if self._raised:
+                    data["close_uncertain"] = True
+            _rec.result = result
+            return result
 
     def _execute_roll(self) -> "TradeActionResult":
         self._last_spot = None          # see _OptionEntryAction.execute
@@ -6580,6 +6601,9 @@ class RollPMCCShortAction(_OptionEntryAction):
                                 {"contract_symbols": [l.contract_symbol for l in legs],
                                  "limit_price": quoted, "status": "PENDING",
                                  "entry_record": record})
+        note_submit("submit_option_order", legs=legs, quantity=int(structures),
+                    order_type="limit", limit_price=quoted, option_strategy=PMCC_ROLL_STRATEGY,
+                    expert_recommendation_id=None, transaction_id=txn.id)
         submitted = self.account.submit_option_order(
             legs=legs, quantity=int(structures), order_type="limit", limit_price=quoted,
             option_strategy=PMCC_ROLL_STRATEGY, transaction_id=txn.id)
@@ -6594,8 +6618,10 @@ class RollPMCCShortAction(_OptionEntryAction):
             quotes={short.contract_symbol: old_row}, underlying=structure.underlying,
             decision_label=today)
         facts = {"exit_record": exit_rec}
+        note_record("exit_record", exit_rec)
         if record is not None:                      # None on a GA fitness trial
             facts["entry_record"] = record
+            note_record("entry_record", record)
         stamp_order_data(getattr(submitted, "id", None), facts,
                          f"the {self.instrument_name} roll's trade records")
         # NO RESTAMP HERE (2026-09-02 review). The stamp follows the FILL, not the ticket:
@@ -6932,16 +6958,18 @@ class CloseOptionAction(TradeAction):
     def execute(self) -> "TradeActionResult":
         """Close the option position, and say which transaction it closed
         (``closed_transaction_ids``) so the same pass never re-arms a TP/SL on it."""
-        self._closing_transaction_id = None
-        self._raised = False
-        result = self._execute_close()
-        data = result.get("data") if isinstance(result, dict) else None
-        if isinstance(data, dict):
-            txn_id = self._closing_transaction_id
-            data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
-            if self._raised:
-                data["close_uncertain"] = True
-        return result
+        with record_option_action(self) as _rec:
+            self._closing_transaction_id = None
+            self._raised = False
+            result = self._execute_close()
+            data = result.get("data") if isinstance(result, dict) else None
+            if isinstance(data, dict):
+                txn_id = self._closing_transaction_id
+                data.setdefault("closed_transaction_ids", [txn_id] if txn_id is not None else [])
+                if self._raised:
+                    data["close_uncertain"] = True
+            _rec.result = result
+            return result
 
     def _execute_close(self) -> "TradeActionResult":
         try:
@@ -6997,6 +7025,9 @@ class CloseOptionAction(TradeAction):
             # naked). Every account honours an explicit id (AlpacaAccount's close_option_position
             # "an explicit transaction_id from a caller that has one still wins";
             # _close_multi_leg already passes it); with one holder it is the same id as before.
+            note_submit("close_option_position", position=position, order_type="limit",
+                        limit_price=limit_price,
+                        transaction_id=getattr(order, "transaction_id", None))
             result = self.account.close_option_position(
                 position, order_type="limit", limit_price=limit_price,
                 transaction_id=getattr(order, "transaction_id", None))
@@ -7139,6 +7170,7 @@ class CloseOptionAction(TradeAction):
         record = build_exit_record(
             self.account, self.close_trigger, legs=legs, quotes=self._close_quotes or {},
             underlying=underlying, rule_id=self.rule_id, rule_name=self.rule_name)
+        note_record("exit_record", record)
         stamp_order_data(getattr(submitted, "id", None), {"exit_record": record},
                          f"the exit_record of the {self.instrument_name} option close")
 
@@ -7312,6 +7344,9 @@ class CloseOptionAction(TradeAction):
                 message=f"Close spread deferred for {self.instrument_name} (manual review, not submitted)",
                 data={"contract_symbols": contract_syms, "limit_price": net_limit, "status": "PENDING"})
 
+        note_submit("submit_option_order", legs=legs, quantity=quantity, order_type="limit",
+                    limit_price=net_limit, option_strategy="close",
+                    expert_recommendation_id=None, transaction_id=order.transaction_id)
         result = self.account.submit_option_order(
             legs, quantity, order_type="limit", limit_price=net_limit,
             option_strategy="close", transaction_id=order.transaction_id)
