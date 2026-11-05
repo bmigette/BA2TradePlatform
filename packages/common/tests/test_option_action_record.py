@@ -193,6 +193,23 @@ def test_the_submit_slot_does_not_leak_between_consecutive_or_nested_actions():
     assert sorted(len(s) for s in by_recommendation[1]) == [1, 1]
 
 
+def test_an_unencodable_submit_is_a_marker_and_the_observation_is_still_recorded():
+    acct = FakeAccount()
+    store = _Store()
+    with capture_scope(store, _meta()) as ctx:
+        action = _entry(acct)
+        with oar.record_option_action(action) as handle:
+            oar.note_submit("submit_option_order", legs=[], quantity=1, limit_price=1.0)
+            oar.note_submit("submit_option_order", legs=[], quantity=2, limit_price=lambda: 1)
+            handle.result = {"success": True, "message": "ok", "data": {}}
+        assert ctx.capture_failures          # counted
+    (obs,) = _action_obs(store)
+    submits = _payload(obs)["outcome"]["submits"]
+    assert submits[0]["quantity"] == 1                       # the clean one is stored as is
+    assert set(submits[1]) == {"method", "unencodable"}      # the other is a visible marker
+    assert submits[1]["method"] == "submit_option_order"
+
+
 def test_a_recording_failure_is_counted_and_never_changes_the_result(monkeypatch):
     clean = _entry(FakeAccount()).execute()
     store = _Store()

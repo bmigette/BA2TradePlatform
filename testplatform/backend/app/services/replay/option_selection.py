@@ -522,6 +522,10 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     start = payload["tape_span"]["start"]
     if start is None:
         return _missing("tape_span.start was not captured"), clock_start
+    marked = [s["method"] for s in payload["outcome"]["submits"] if "unencodable" in s]
+    if marked:
+        return _missing(f"the recorded {', '.join(marked)} submit could not be stored by the "
+                        f"codec (unencodable marker), so there is nothing to compare"), clock_start
     window = action_window(observations, start, observation.invocation_seq)
 
     decision_time = oar.replay_decision_time(payload)

@@ -220,6 +220,18 @@ def test_a_clock_read_that_is_not_in_the_record_is_missing_capture(session):
     assert "decision clock" in row.detail
 
 
+def test_a_recorded_unencodable_submit_marker_is_missing_capture_not_a_crash(session):
+    def edit(payload):
+        payload["outcome"]["submits"][0] = {"method": "submit_option_order",
+                                            "unencodable": "<function ...>"}
+
+    with replay_isolation():
+        report = option_selection.run_bundle(_EditedBundle(load_bundle(session), edit))
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "unencodable" in row.detail and "submit_option_order" in row.detail
+
+
 # --------------------------------------------------------------------------- #
 # the report
 # --------------------------------------------------------------------------- #

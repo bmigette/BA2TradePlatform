@@ -267,8 +267,21 @@ def build_outcome(exc, result, frame, encodable) -> Dict[str, Any]:
         outcome["exit_record"] = encodable(frame.records["exit_record"], "exit_record")
     if outcome["entry_record"] is None and "entry_record" in frame.records:
         outcome["entry_record"] = encodable(frame.records["entry_record"], "entry_record")
-    outcome["submits"] = frame.submits
+    outcome["submits"] = [_encodable_submit(entry, encodable) for entry in frame.submits]
     return outcome
+
+
+def _encodable_submit(entry: Dict[str, Any], encodable) -> Dict[str, Any]:
+    """``entry`` if the codec can store it, else ``{"method", "unencodable"}``.
+
+    Submits carry live leg objects, so one with an attribute the codec refuses would otherwise
+    fail the freeze of the WHOLE action observation. The marker keeps the method name; the replay
+    reports a recorded marker as ``missing_capture`` (it cannot compare what was not stored).
+    """
+    kept = encodable(entry, "submit")
+    if kept is entry:
+        return entry
+    return {"method": entry["method"], "unencodable": kept["unencodable"]}
 
 
 @contextmanager
