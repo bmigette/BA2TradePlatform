@@ -128,10 +128,11 @@ from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.option_book import (
     RAIL_OK, BookTotals, BreakerState, CandidateStructure, RailVerdict, _short_put_assignment,
-    admit, book_totals, rearm, update_breaker,
+    _structure_totals, admit, book_totals, rearm, update_breaker,
 )
+from ba2_common.core.entry_order import transaction_entry_tag
 from ba2_common.core.option_lifecycle import (
-    LifecycleLeg, OptionStructure, structure_metrics,
+    COVERED_CALL_STRATEGY, LifecycleLeg, OptionStructure, structure_metrics,
 )
 from ba2_common.core.option_request import (
     OPTION_RAILS_UNCONFIGURED_REFUSAL, OPTION_RAIL_REFUSAL, validate_refusal_phrase,
@@ -1131,6 +1132,113 @@ def sleeve_true_equity(account, expert_instance_id: int) -> Optional[float]:
     return _read_equity(lambda: account.true_equity(), expert_instance_id,
                         "the account's true (uncapped) equity",
                         "the drawdown breaker is blind this evaluation")
+
+
+# ---------------------------------------------------------------------------
+# structure share: what each style MEMBER has committed (plan 2026-11-06)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MemberShare:
+    """One member's committed capital against the sleeve's equity. ``share_pct`` is None --
+    never 0 -- whenever any input is unmeasurable; ``unmeasurable`` says which."""
+    entry_tag: int
+    committed: Optional[float]
+    equity: Optional[float]
+    share_pct: Optional[float]
+    unmeasurable: Tuple[str, ...] = ()
+
+
+@dataclass
+class _ShareCache:
+    stamp: Any
+    equity: Optional[float]
+    committed: Dict[int, float]
+    blind: Dict[int, List[str]]
+
+
+def assigned_stock_lots(expert_instance_id: int) -> List[Any]:
+    """This expert's OPENED equity transactions that an option assignment delivered
+    (``meta_data.origin == "csp_assignment"``), oldest first. Dual-path like
+    :func:`open_option_transactions`: the in-mem store in a backtest, SQLite live."""
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import AssetClass, TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT
+
+    rows = transactions_where(expert_id=expert_instance_id, status=TransactionStatus.OPENED)
+    return sorted((t for t in rows
+                   if t.asset_class == AssetClass.EQUITY and isinstance(t.meta_data, dict)
+                   and t.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT),
+                  key=lambda t: t.id)
+
+
+def _build_share_cache(account, expert_instance_id: int, stamp: Any) -> _ShareCache:
+    """Committed capital per entry tag from the book, the assigned stock and the in-flight
+    charges. A covered call contributes 0: its capital is the lot's cost basis."""
+    committed: Dict[int, float] = {}
+    blind: Dict[int, List[str]] = {}
+
+    def add(tag: int, amount: float) -> None:
+        committed[tag] = committed.get(tag, 0.0) + amount
+
+    def lose(tag: int, why: str) -> None:
+        blind.setdefault(tag, []).append(why)
+
+    structures, unbuildable = sleeve_structures(expert_instance_id)
+    for structure in structures:
+        tag = transaction_entry_tag(structure.transaction_id)
+        if tag is None or structure.strategy == COVERED_CALL_STRATEGY:
+            continue
+        amount, _n, _no, _o, _a, why = _structure_totals(structure)
+        if why or amount is None:
+            lose(tag, f"transaction {structure.transaction_id}: {why}")
+        else:
+            add(tag, amount)
+    for transaction_id in unbuildable:
+        tag = transaction_entry_tag(transaction_id)
+        if tag is not None:
+            lose(tag, f"transaction {transaction_id}: OPENED option position with no executed "
+                      f"option order row -- its committed capital is unmeasurable")
+    for lot_txn in assigned_stock_lots(expert_instance_id):
+        tag = transaction_entry_tag(lot_txn.id)
+        if tag is None:
+            continue
+        if lot_txn.open_price is None or lot_txn.quantity is None:
+            lose(tag, f"transaction {lot_txn.id}: assigned stock lot has no cost basis "
+                      f"(open_price={lot_txn.open_price!r}, quantity={lot_txn.quantity!r})")
+        else:
+            add(tag, abs(float(lot_txn.open_price)) * abs(float(lot_txn.quantity)))
+    for charge in _prune_pending_charges(expert_instance_id, structures):
+        if charge.entry_tag is None or charge.candidate.strategy == COVERED_CALL_STRATEGY:
+            continue
+        if charge.candidate.max_loss is None:
+            lose(charge.entry_tag, f"in-flight {charge.candidate.strategy} on "
+                                   f"{charge.candidate.underlying}: max loss unmeasurable")
+        else:
+            add(charge.entry_tag, float(charge.candidate.max_loss))
+    equity = sleeve_equity(account, expert_instance_id)
+    if equity is not None and equity <= 0:
+        equity = None
+    return _ShareCache(stamp, equity, committed, blind)
+
+
+def _share_view(cache: _ShareCache, entry_tag: int) -> MemberShare:
+    why = list(cache.blind.get(entry_tag, ()))
+    if cache.equity is None:
+        why.append("sleeve equity is unavailable or not positive")
+    if why:
+        return MemberShare(entry_tag, None, cache.equity, None, tuple(why))
+    amount = cache.committed.get(entry_tag, 0.0)
+    return MemberShare(entry_tag, amount, cache.equity, amount / cache.equity * 100.0)
+
+
+def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -> MemberShare:
+    """``entry_tag``'s committed capital as a percent of the sleeve's equity at ``as_of``.
+
+    SHARED by live and backtest. Task 4 puts the per-cycle cache in front of
+    :func:`_build_share_cache`; until then every call rebuilds."""
+    if as_of is None:
+        raise ValueError("member_share needs the decision time (the recommendation's "
+                         "created_at); without it the per-cycle cache has no key")
+    return _share_view(_build_share_cache(account, expert_instance_id, as_of), entry_tag)
 
 
 def _read_equity(read, expert_instance_id: int, what: str, consequence: str
