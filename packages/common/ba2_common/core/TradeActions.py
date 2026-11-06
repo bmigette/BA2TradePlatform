@@ -3724,6 +3724,11 @@ class _OptionEntryAction(TradeAction):
                 f"(modelled concession {quote_concession(legs, halves, fraction):.4f}/share)")
         return quoted
 
+    def _record_submitted_kwargs(self) -> Dict[str, Any]:
+        """Extra `record_submitted` keywords: the member tag only when this entry has one, so
+        an untagged entry calls it exactly as before the structure_share feature."""
+        return {} if self.entry_tag is None else {"entry_tag": self.entry_tag}
+
     def _option_risk_manager(self):
         """(expert, expert_instance_id) when this expert runs the option risk manager.
 
@@ -4012,7 +4017,7 @@ class _OptionEntryAction(TradeAction):
             # structure did not exist -- the concentrated book F5 says the rails exist to
             # stop. The charge is dropped again the moment the transaction becomes visible.
             record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
-                             rm_candidate)
+                             rm_candidate, **self._record_submitted_kwargs())
         # Persist the entry facts on the order row. FIVE of them, from four lineages:
         #   - option_reserve       -- the short-premium reserve, so available BP reflects it;
         #   - max_loss_per_contract -- the measured max loss, so the loss_pct_of_max_loss exit

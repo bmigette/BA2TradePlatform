@@ -692,6 +692,9 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
 class _PendingCharge:
     transaction_id: Optional[int]
     candidate: CandidateStructure
+    #: The style-member tag of the entry this charge stands for (structure_share condition,
+    #: plan 2026-11-06). None for every untagged entry: nothing reads it then.
+    entry_tag: Optional[int] = None
 
 
 #: A hard ceiling on in-flight charges per sleeve. Nothing should ever approach it (the
@@ -716,14 +719,23 @@ def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
 
 
 def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
-                     candidate: CandidateStructure) -> None:
-    """Remember what was just put on the wire so the NEXT candidate is charged for it."""
+                     candidate: CandidateStructure, entry_tag: Optional[int] = None) -> None:
+    """Remember what was just put on the wire so the NEXT candidate is charged for it.
+
+    `entry_tag` (tagged style entries only) also feeds the per-member share cache
+    (:func:`_note_submission`); an untagged entry never touches it."""
     key = _sleeve_key(expert_instance_id)
     with _STATE_LOCK:
         charges = _PENDING.setdefault(key, [])
-        charges.append(_PendingCharge(transaction_id, candidate))
+        charges.append(_PendingCharge(transaction_id, candidate, entry_tag))
         if len(charges) > _PENDING_LIMIT:
             del charges[:-_PENDING_LIMIT]
+        if entry_tag is not None:
+            _note_submission(key, entry_tag, candidate)
+
+
+def _note_submission(key, entry_tag: int, candidate: CandidateStructure) -> None:
+    """Hook for the per-member share cache (filled in by the structure_share cache)."""
 
 
 def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
@@ -750,6 +762,12 @@ def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
 
 def _prune_pending(expert_instance_id: int,
                    visible: Sequence[OptionStructure]) -> List[CandidateStructure]:
+    """The candidates of the charges still owed; see :func:`_prune_pending_charges`."""
+    return [c.candidate for c in _prune_pending_charges(expert_instance_id, visible)]
+
+
+def _prune_pending_charges(expert_instance_id: int,
+                           visible: Sequence[OptionStructure]) -> List[_PendingCharge]:
     """Drop charges the book can now see, and charges whose order never became a position.
 
     Two reasons a charge stops being owed, and they are different facts:
@@ -798,7 +816,7 @@ def _prune_pending(expert_instance_id: int,
             _PENDING[key] = remaining
         else:
             _PENDING.pop(key, None)
-    return [c.candidate for c in kept]
+    return kept
 
 
 # ---------------------------------------------------------------------------
