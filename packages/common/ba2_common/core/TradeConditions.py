@@ -3477,6 +3477,106 @@ class EntryTagCondition(CompareCondition):
         return f"member tag {int(self.calculated_value)}"
 
 
+class StructureShareCondition(CompareCondition):
+    """Gate a style member's ENTRY on its own share of the sleeve (plan 2026-11-06).
+
+    ``share = committed(member) / sleeve_equity * 100``; the rule passes while ``share <op>
+    value`` (the style builder authors ``<``). ANDed LAST into each member's entry rule, so it
+    only runs on candidates that passed every other gate, and a False lets the NEXT member's
+    rule be tried for the symbol (a rail refusal would not).
+
+    WHICH member: the entry tag of the rule's OWN entry action, injected by
+    ``TradeActionEvaluator._evaluate_conditions`` through :meth:`bind_event_action` (the only
+    condition with that hook; every other condition is untouched). The candidate's own size is
+    not known yet (strike/qty/max_loss are computed in ``_submit_option_order``): a member may
+    overshoot X by one entry, bounded by its sizing gene.
+
+    The arithmetic, the cache and the "unmeasurable" rule live in
+    ``OptionRiskManagement.member_share`` -- ONE function for live and backtest. UNKNOWN NEVER
+    PASSES: no member tag, no decision time, an expert that does not run the option risk manager
+    (its ``record_submitted`` charges would never reach the cache), or any unmeasurable input
+    -> False and an ERROR log naming why (and the transaction). A corrupted stored tag
+    propagates (``ValueError``, not benign under BA2_ERROR_MODE=enforce).
+
+    THE CYCLE CLOCK (cache stamp). The per-cycle share cache needs ONE stamp per decision
+    cycle. No cycle-level clock is shared by live and backtest without invasive changes: in a
+    backtest every recommendation of a bar carries the bar time (``created_at=as_of``), but live
+    each symbol has its own MarketAnalysis and recommendation, created seconds apart inside
+    one TradeManager pass. So the stamp is the recommendation's ``created_at`` FLOORED TO THE
+    MINUTE in BOTH runtimes (backtest bar times are minute-aligned already, so a backtest is
+    unchanged; a live pass finishes within a minute, so its candidates share one build). A
+    mismatch only ever REBUILDS from the book and pending charges, so a pass that straddles a
+    minute boundary costs one extra build, never a wrong answer; within a minute the cache is
+    kept current by ``record_submitted``.
+    """
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str,
+                         float(value), existing_order)
+        self.rule_entry_tag: Optional[int] = None
+
+    def bind_event_action(self, event_action) -> None:
+        """Called by the evaluator with the EventAction this condition belongs to."""
+        from ba2_common.core.entry_tag import entry_tag_of_actions
+
+        self.rule_entry_tag = entry_tag_of_actions(getattr(event_action, "actions", None))
+
+    def evaluate(self) -> bool:
+        self.calculated_value = None
+        try:
+            tag = self.rule_entry_tag
+            if tag is None:
+                logger.error(f"structure_share on {self.instrument_name}: the rule has no entry "
+                             f"action carrying an entry_tag, so no member's share can be "
+                             f"measured -- the condition is FALSE")
+                return False
+            rec = self.expert_recommendation
+            instance_id = getattr(rec, "instance_id", None)
+            created_at = getattr(rec, "created_at", None)
+            if instance_id is None or created_at is None:
+                logger.error(f"structure_share on {self.instrument_name}: the recommendation "
+                             f"carries no instance_id/created_at (instance_id={instance_id!r}, "
+                             f"created_at={created_at!r}) -- the condition is FALSE")
+                return False
+            as_of = created_at.replace(second=0, microsecond=0)     # the cycle clock, see class doc
+            from ba2_common.core import OptionRiskManagement as orm
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+            if expert is None or not orm.option_risk_manager_enabled(
+                    getattr(expert, "settings", None), expert_instance_id=instance_id):
+                logger.error(f"structure_share on {self.instrument_name}: expert {instance_id} "
+                             f"does not run risk_manager_mode='classic_options', so in-flight "
+                             f"entries are never recorded and a share cannot be kept -- the "
+                             f"condition is FALSE")
+                return False
+            reading = orm.member_share(self.account, instance_id, tag, as_of)
+            if reading.share_pct is None:
+                logger.error(f"structure_share on {self.instrument_name}: member {tag}'s share "
+                             f"is UNMEASURABLE ({'; '.join(reading.unmeasurable)}) -- the "
+                             f"condition is FALSE, never read as zero")
+                return False
+            self.calculated_value = reading.share_pct
+            return self.operator_func(reading.share_pct, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating structure_share condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the member's committed capital as a share of the sleeve for "
+                f"{self.instrument_name}'s entry (structure_share) is {self.operator_str} "
+                f"{self.value:g}%")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"member {self.rule_entry_tag}: {self.calculated_value:.1f}% of sleeve"
+
+
 class DaysToExpiryCondition(CompareCondition):
     """Calendar days of option life REMAINING: ``expiry - the evaluation date``.
 
