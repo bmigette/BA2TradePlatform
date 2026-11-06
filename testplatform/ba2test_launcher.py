@@ -7445,7 +7445,8 @@ _STYLE_EQUITY_ENTRY = {"O_CC", "O_PP"}
 _STYLE_MEMBER_FIELDS = {"key", "action_overrides", "exit_overrides", "note", "neutral_entry_mode"}
 #: Values of a member's ``neutral_entry_mode`` (the ``--neutral-entry-mode`` choices).
 _STYLE_NEUTRAL_MODES = ("legacy", "hold", "low_confidence", "joint")
-_STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver", "risk"}
+_STYLE_FIELDS = {"status", "note", "members", "price_cap_policy", "convex_fitness_waiver", "risk",
+                 "structure_share"}
 #: A style's own option risk manager (plan 2026-09-25 §3 items 8-9; job A values user 2026-11-03).
 #: ``risk_manager_mode`` plus every rail, each either ``fixed`` (an expert setting) or searched
 #: (``genes``: a float band). The per-instrument cap may be narrowed here too, replacing the
@@ -7776,6 +7777,40 @@ def _validate_style_risk(where: str, risk) -> None:
             raise ValueError(f"{where}: gene {key} {band} is undecodable (min > max or step <= 0)")
 
 
+#: ``structure_share`` (plan 2026-11-06): the opt-in per-member share cap. {"min","max","step"} in
+#: percent of the sleeve's equity; ONE searched value per member, the cap is always on.
+_STYLE_STRUCTURE_SHARE_FIELDS = {"min", "max", "step"}
+
+
+def _validate_style_structure_share(where: str, style: dict) -> None:
+    """The ``structure_share`` band: exactly min/max/step, plain numbers, 0 < min <= max <= 100,
+    step > 0; needs the option risk manager (the condition reads the sleeve rails' equity and the
+    pending charges only that mode records) and at least one option-entry member (otherwise the
+    field would be inert)."""
+    import math
+
+    where = f"{where} structure_share"
+    band = style["structure_share"]
+    if not isinstance(band, dict):
+        raise ValueError(f"{where}: must be an object, got {band!r}")
+    if set(band) != _STYLE_STRUCTURE_SHARE_FIELDS:
+        raise ValueError(f"{where}: must be exactly {sorted(_STYLE_STRUCTURE_SHARE_FIELDS)}, "
+                         f"got {sorted(band)}")
+    for field in sorted(_STYLE_STRUCTURE_SHARE_FIELDS):
+        v = band[field]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{where}: {field}={v!r} must be a finite number")
+    if not (0 < band["min"] <= band["max"] <= 100):
+        raise ValueError(f"{where}: needs 0 < min <= max <= 100, got {band}")
+    if band["step"] <= 0:
+        raise ValueError(f"{where}: step must be > 0, got {band['step']}")
+    if "risk" not in style:
+        raise ValueError(f"{where}: needs a risk block (risk_manager_mode classic_options); "
+                         f"without the option risk manager the share is never kept")
+    if not any(mem["key"] not in _STYLE_EQUITY_ENTRY for mem in style["members"]):
+        raise ValueError(f"{where}: the style has no option entry member to apply it to")
+
+
 def _style_risk(kind: "str | None") -> "dict | None":
     """The active style's ``risk`` block for the ``O_STYLE`` key; None for every other key, for
     a style that declares none, and while no style is loaded (generic per-key callers; an
@@ -7877,6 +7912,8 @@ def _validate_style(name: str, style: dict) -> None:
                     f"{sorted(set(_style_member_prefixes(a)) & set(_style_member_prefixes(b)))}"
                     f"); one expert cannot carry two rules or conditions under one id -- their "
                     f"genes would be one gene")
+    if "structure_share" in style:
+        _validate_style_structure_share(where, style)
     _validate_style_price_caps(where, style, keys)
 
 
@@ -7988,7 +8025,28 @@ def _style_check_dte_band(key: str, rid: str, action: dict, overrides: dict) -> 
             f"its gene's domain")
 
 
-def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tuple[list, dict]":
+def _style_append_structure_share(key: str, rule: dict, band: dict) -> None:
+    """Append the member's ``structure_share`` leaf LAST in the rule's root AND (after every
+    gate the member's own builder authored, market-condition and SPY-regime gates included, so
+    all their leaf indexes are unchanged). One id per MEMBER, reused by every arm of a group
+    (O_CONVEX's two arms share one gene). ``optimize`` with the style's band gives the gene
+    ``cond:<member>-structure_share:value``; there is deliberately NO ``toggle_optimize``: the
+    cap is always on, only its value is searched. The authored value is the LOOSEST (max)."""
+    from ba2_common.core.rule_models import normalize_tree
+
+    root = rule.get("conditions")
+    if not isinstance(root, dict) or root.get("type") != "AND":
+        raise ValueError(f"{key} entry rule {rule['id']!r}: its root is not an AND group, so a "
+                         f"structure_share leaf appended to it would not be ANDed")
+    root.setdefault("conditions", []).append(normalize_tree({
+        "id": f"{key.lower()}-structure_share", "field": "structure_share",
+        "field_type": "numeric", "comparison": "<", "value": float(band["max"]),
+        "optimize": True, "value_min": float(band["min"]), "value_max": float(band["max"]),
+        "value_step": float(band["step"])}))
+
+
+def _style_entry_rules(key: str, tag: int, src_rules, action_overrides,
+                       structure_share=None) -> "tuple[list, dict]":
     """ONE member's entry rules inside a style: a deep copy of its OWN builder's rules,
     namespaced, each made toggleable, and every opening action tagged with the member's
     ``entry_tag`` -- ``option_entry_tag`` on an option entry, ``entry_tag`` on the equity
@@ -8037,6 +8095,8 @@ def _style_entry_rules(key: str, tag: int, src_rules, action_overrides) -> "tupl
         if not tagged:
             raise ValueError(f"{key} entry rule {rule['id']!r}: none of its actions {types} "
                              f"opens a position that carries the member tag")
+        if structure_share is not None and any(at in option_entries for at in types):
+            _style_append_structure_share(key, rule, structure_share)
     return rules, {"entry_rules": rule_map, "entry_conds": cond_map}
 
 
@@ -8302,8 +8362,9 @@ def _build_strategy_style(kind: str):
                 # evaluate_entry_rules_on_hold lets HOLD reach entry rules; this fixed
                 # leaf (no gene) keeps a directional member's admission what it was.
                 _append_directional_leaf(src, key)
-            e_rules, e_map = _style_entry_rules(key, tag, src.entry_rules,
-                                                mem.get("action_overrides"))
+            e_rules, e_map = _style_entry_rules(
+                key, tag, src.entry_rules, mem.get("action_overrides"),
+                style["structure_share"] if "structure_share" in style else None)
             x_rules, x_map = _style_scope_exits(key, tag, src.exit_rules,
                                                 mem.get("exit_overrides"))
             _style_claim_ids(key, "entry", e_rules, owners, shared)
