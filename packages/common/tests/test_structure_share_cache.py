@@ -206,12 +206,13 @@ def test_an_admitted_entry_is_seen_by_the_next_symbol_of_the_same_cycle(world):
 def test_a_tagged_record_submitted_increments_the_cached_tag_total_untagged_does_not(world):
     key = rm._sleeve_key(EID)
     share(world, CSP, T1)
+    gen0 = rm._SHARE_GEN
     assert rm._SHARE_CACHE[key].committed.get(CSP, 0.0) == 0.0
     rm.record_submitted(EID, 700, cand(5_000.0), entry_tag=CSP)
     assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0          # the cached total moved
     rm.record_submitted(EID, 701, cand(9_000.0))                   # untagged: nothing moves
     assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0
-    assert rm._SHARE_EPOCH[key] == 1
+    assert rm._SHARE_GEN - gen0 == 1                               # only the tagged one bumped
 
 
 def test_the_increment_goes_to_its_own_tag_only(world):
@@ -227,8 +228,9 @@ def test_a_submitted_covered_call_does_not_move_the_cache(world):
 
 
 def test_an_untagged_submission_touches_no_share_state(world):
+    gen0 = rm._SHARE_GEN
     rm.record_submitted(EID, 702, cand(5_000.0))
-    assert rm._SHARE_CACHE == {} and rm._SHARE_EPOCH == {}
+    assert rm._SHARE_CACHE == {} and rm._SHARE_GEN == gen0
 
 
 def test_a_submission_that_raced_a_build_is_not_lost(world, monkeypatch):
@@ -248,6 +250,52 @@ def test_a_submission_that_raced_a_build_is_not_lost(world, monkeypatch):
     assert share(world, CSP, T1).committed == 4_000.0
     assert share(world, CSP, T1).committed == 4_000.0       # and it stays
     assert world.reads == 2                                  # first build discarded, second kept
+
+
+def test_persistent_races_never_fail_open(world, monkeypatch):
+    """Every optimistic attempt loses a race: the answer must still include every recorded
+    submission (the last attempt builds under the state lock)."""
+    real = rm._prune_pending_charges
+    n = []
+
+    def racing(eid, structures):
+        out = real(eid, structures)
+        if len(n) < 3:                       # the first three attempts each race a submission
+            n.append(1)
+            rm.record_submitted(EID, 800 + len(n), cand(1_000.0), entry_tag=CSP)
+        return out
+
+    monkeypatch.setattr(rm, "_prune_pending_charges", racing)
+    assert share(world, CSP, T1).committed == 3_000.0       # all three, none lost
+    assert share(world, CSP, T1).committed == 3_000.0       # and the result was cached
+
+
+@pytest.mark.parametrize("reset", [rm.reset_state, rm.reset_pending_charges,
+                                   rm.reset_thread_state])
+def test_a_reset_during_a_build_discards_that_build(world, monkeypatch, reset):
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+    real = rm._prune_pending_charges
+    fired = []
+
+    def resetting(eid, structures):
+        out = real(eid, structures)
+        if not fired:
+            fired.append(1)
+            reset()                          # the run boundary lands mid-build
+        return out
+
+    monkeypatch.setattr(rm, "_prune_pending_charges", resetting)
+    share(world, CSP, T1)
+    assert world.reads == 2                  # the stale build was thrown away and redone
+
+
+def test_a_cancelled_pending_charge_stops_counting(world, monkeypatch):
+    rm.record_submitted(EID, 555, cand(8_000.0), entry_tag=CSP)
+    rm.record_submitted(EID, 556, cand(2_000.0), entry_tag=CSP)
+    assert share(world, CSP, T1).committed == 10_000.0
+    # the ledger is readable and 555 no longer exists/opens (cancelled); 556 is still live
+    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: {556})
+    assert share(world, CSP, T2).committed == 2_000.0
 
 
 @pytest.mark.parametrize("reset", [rm.reset_state, rm.reset_pending_charges,

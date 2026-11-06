@@ -710,10 +710,20 @@ _PENDING: Dict[Tuple[Optional[int], int], List[_PendingCharge]] = {}
 #: 2026-11-06). Same key and same lock as _PENDING; cleared by the same run-boundary resets.
 #: (``_ShareCache`` is defined with the share section below; annotations are lazy.)
 _SHARE_CACHE: Dict[Tuple[Optional[int], int], _ShareCache] = {}
-#: Bumped by every TAGGED submission; a build that observed a different value when it finished
-#: is discarded (a concurrent record_submitted would otherwise be lost between its pending
-#: snapshot and the store). Untagged submissions never touch it.
-_SHARE_EPOCH: Dict[Tuple[Optional[int], int], int] = {}
+#: A monotonic generation, NEVER reset: bumped by every TAGGED submission and by every run-
+#: boundary reset. A build that observed a different value when it finished is discarded (a
+#: concurrent record_submitted would otherwise be lost between its pending snapshot and the
+#: store, and a build that straddled a reset would store state the reset meant to forget).
+#: Untagged submissions never touch it. Process-wide on purpose: a sibling's bump costs at most
+#: one retry, never a wrong answer (a clearable per-key counter could return to a value a
+#: stale build had already read).
+_SHARE_GEN = 0
+
+
+def _bump_share_gen() -> None:
+    global _SHARE_GEN
+    with _STATE_LOCK:
+        _SHARE_GEN += 1
 
 
 def reset_pending_charges() -> None:
@@ -721,7 +731,7 @@ def reset_pending_charges() -> None:
     with _STATE_LOCK:
         _PENDING.clear()
         _SHARE_CACHE.clear()
-        _SHARE_EPOCH.clear()
+        _bump_share_gen()
 
 
 def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
@@ -751,7 +761,7 @@ def _note_submission(key: Tuple[Optional[int], int], entry_tag: int,
     """Called under _STATE_LOCK by :func:`record_submitted` for a TAGGED entry: bump the epoch
     and add the admitted candidate's max loss to the cached total of its tag, so the next
     symbol of this cycle sees it. A covered call adds nothing (see _build_share_cache)."""
-    _SHARE_EPOCH[key] = _SHARE_EPOCH.get(key, 0) + 1
+    _bump_share_gen()
     cache = _SHARE_CACHE.get(key)
     if cache is None or candidate.strategy == COVERED_CALL_STRATEGY:
         return
@@ -909,7 +919,8 @@ def reset_state() -> None:
 
     Process-wide, deliberately: this is the test fixture's and the operator's reset, the one
     that must leave nothing behind anywhere. A **running trial must never call it** -- see
-    :func:`reset_thread_state`, which is what a backtest run boundary uses.
+    :func:`reset_thread_state`, which is what a backtest run boundary uses. Also forgets
+    the structure_share cache (``_SHARE_CACHE``).
     """
     reset_breaker_states()
     reset_pending_charges()
@@ -959,7 +970,7 @@ def reset_thread_state() -> None:
     runs already shared one process-wide key with each other and with live; giving a
     backtest permission to wipe live latches to fix that would be the worse trade.
     """
-    # FIVE separate acquisitions, one per store, and deliberately not one around all three.
+    # FIVE separate acquisitions, one per store, and deliberately not one around all five.
     # A sibling can only ever read or write keys under ITS OWN thread id, so it cannot
     # observe this thread half-cleared; making the boundary atomic across the five stores
     # would buy nothing and would put the lock in two places, leaving the one that actually
@@ -967,7 +978,7 @@ def reset_thread_state() -> None:
     _clear_this_threads_keys(_BREAKER_STATE)
     _clear_this_threads_keys(_PENDING)
     _clear_this_threads_keys(_SHARE_CACHE)
-    _clear_this_threads_keys(_SHARE_EPOCH)
+    _bump_share_gen()          # a share build that straddles this boundary must not be stored
     _clear_this_threads_keys(_JOURNAL)
 
 
@@ -1270,14 +1281,21 @@ def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -
             cache = _SHARE_CACHE.get(key)
             if cache is not None and cache.stamp == as_of:
                 return _share_view(cache, entry_tag)
-            epoch = _SHARE_EPOCH.get(key, 0)
+            generation = _SHARE_GEN
         built = _build_share_cache(account, expert_instance_id, as_of)   # I/O outside the lock
         with _STATE_LOCK:
-            if _SHARE_EPOCH.get(key, 0) == epoch:
+            if _SHARE_GEN == generation:
                 _SHARE_CACHE[key] = built
                 return _share_view(built, entry_tag)
-    # three consecutive races: answer from the last build, uncached (next call rebuilds)
-    return _share_view(built, entry_tag)
+    # Three optimistic builds each lost a race. Never answer from a stale build (it could miss a
+    # submission): build once more UNDER the lock. Every record_submitted and reset takes the
+    # same re-entrant lock, so none can interleave and the result holds every recorded charge.
+    with _STATE_LOCK:
+        cache = _SHARE_CACHE.get(key)
+        if cache is None or cache.stamp != as_of:
+            cache = _build_share_cache(account, expert_instance_id, as_of)
+            _SHARE_CACHE[key] = cache
+        return _share_view(cache, entry_tag)
 
 
 def _read_equity(read, expert_instance_id: int, what: str, consequence: str
