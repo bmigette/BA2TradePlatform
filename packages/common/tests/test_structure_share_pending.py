@@ -70,3 +70,43 @@ def test_the_action_forwards_the_tag_only_when_it_has_one():
     f = ta._OptionEntryAction._record_submitted_kwargs
     assert f(SimpleNamespace(entry_tag=None)) == {}
     assert f(SimpleNamespace(entry_tag=14)) == {"entry_tag": 14}
+
+
+# ------------------------------------------------ the real submit path (call site)
+from .test_entry_tag_fact import _builder, _own_db  # noqa: E402,F401  (autouse DB fixture)
+from ba2_common.core.types import ExpertActionType  # noqa: E402
+
+
+def _submit_with_rm_engaged(monkeypatch, **action_kwargs):
+    """Run ``_OptionEntryAction._submit_option_order`` with the option RM engaged and capture
+    exactly how ``record_submitted`` is called."""
+    calls = []
+    monkeypatch.setattr(ta._OptionEntryAction, "_option_risk_manager",
+                        lambda self: (SimpleNamespace(), 7))
+    monkeypatch.setattr(ta, "admit_option_entry",
+                        lambda **kw: SimpleNamespace(allowed=True, candidate=cand(1_000.0)))
+    monkeypatch.setattr(ta, "record_submitted",
+                        lambda *args, **kw: calls.append((args, kw)))
+    from ba2_common.core.option_types import OptionLeg
+    from ba2_common.core.types import OrderDirection
+    from .test_entry_tag_fact import EXPIRY
+    leg = OptionLeg(contract_symbol="XYZ240621C00100000", side=OrderDirection.BUY,
+                    position_intent="buy_to_open", option_type=OptionRight.CALL,
+                    strike=100.0, expiry=EXPIRY, underlying="XYZ")
+    _builder(ExpertActionType.BUY_CALL, [leg], "long_call")(**action_kwargs).submitted_order()
+    return calls
+
+
+def test_a_tagged_entry_hands_its_tag_to_record_submitted(monkeypatch):
+    calls = _submit_with_rm_engaged(monkeypatch, entry_tag=14)
+    assert len(calls) == 1
+    args, kw = calls[0]
+    assert kw == {"entry_tag": 14}
+    assert args[0] == 7 and args[2] == cand(1_000.0)
+
+
+def test_an_untagged_entry_passes_no_entry_tag_keyword(monkeypatch):
+    calls = _submit_with_rm_engaged(monkeypatch)
+    assert len(calls) == 1
+    args, kw = calls[0]
+    assert kw == {} and len(args) == 3
