@@ -12,6 +12,7 @@ import threading
 import time
 from queue import Queue
 import atexit
+import itertools
 from contextlib import contextmanager
 
 
@@ -26,6 +27,7 @@ _engine = None
 # OWN sqlite file — so parallel backtest trials never clobber each other's per-run DB. Threads
 # WITHOUT an override fall through to the shared global engine.
 _tls = threading.local()
+_run_serials = itertools.count(1)
 
 
 def _build_engine(db_file: str):
@@ -112,6 +114,7 @@ def configure_db_threadlocal(db_file: str) -> None:
             pass
     _tls.db_file = db_file
     _tls.engine = None
+    _tls.run_serial = next(_run_serials)    # a NEW run identity on every configure (see run_token)
     _tls.ruleset_cache = None  # fresh run on this thread -> drop any prior run's ruleset cache
 
 
@@ -125,7 +128,19 @@ def clear_threadlocal_db() -> None:
             pass
     _tls.db_file = None
     _tls.engine = None
+    _tls.run_serial = None
     _tls.ruleset_cache = None  # drop the per-run ruleset cache (see cached_ruleset_eventactions)
+
+
+def run_token():
+    """Identity of the run this thread is in: ``None`` for the live app (no thread-local DB, one
+    stable token), otherwise a process-unique serial minted by every
+    :func:`configure_db_threadlocal`. In-memory AND file-backed backtest runs both go through it
+    (``backtest_trading_db``), so no two runs ever share a token, whatever key their sleeve
+    state is filed under."""
+    if not getattr(_tls, "db_file", None):
+        return None
+    return getattr(_tls, "run_serial", None)
 
 
 def cached_ruleset_eventactions(ruleset_id, loader):

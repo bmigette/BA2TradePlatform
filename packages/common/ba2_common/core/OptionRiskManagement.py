@@ -1306,18 +1306,23 @@ def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -
 
     SHARED by live and backtest. A per-cycle cache (keyed by the sleeve key, stamped with the
     decision time) sits in front of :func:`_build_share_cache`; a stamp mismatch rebuilds from
-    the book, so correctness never depends on the stamp."""
+    the book, so correctness never depends on the stamp. The stamp is ``(as_of, run_token)``."""
     if as_of is None:
         raise ValueError("member_share needs the decision time (the recommendation's "
                          "created_at); without it the per-cycle cache has no key")
     key = _sleeve_key(expert_instance_id)
+    # The stamp carries the RUN identity as well as the decision time: a file-backed backtest
+    # (persisted top-N re-runs) files its sleeve state under the live key and replays the same
+    # dates as the previous run, so (key, as_of) alone could hand run 2 run 1's book.
+    from ba2_common.core.db import run_token
+    stamp = (as_of, run_token())
     for _attempt in range(3):
         with _STATE_LOCK:
             cache = _SHARE_CACHE.get(key)
-            if cache is not None and cache.stamp == as_of:
+            if cache is not None and cache.stamp == stamp:
                 return _share_view(cache, entry_tag)
             generation = _SHARE_GENS.setdefault(key, 0)
-        built = _build_share_cache(account, expert_instance_id, as_of)   # I/O outside the lock
+        built = _build_share_cache(account, expert_instance_id, stamp)   # I/O outside the lock
         with _STATE_LOCK:
             if _SHARE_GENS.get(key, 0) == generation:
                 _SHARE_CACHE[key] = built
@@ -1330,9 +1335,9 @@ def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -
     with _share_key_lock(key):
         with _STATE_LOCK:
             cache = _SHARE_CACHE.get(key)
-            usable = cache is not None and cache.stamp == as_of
+            usable = cache is not None and cache.stamp == stamp
         if not usable:
-            cache = _build_share_cache(account, expert_instance_id, as_of)
+            cache = _build_share_cache(account, expert_instance_id, stamp)
             with _STATE_LOCK:
                 _SHARE_CACHE[key] = cache
         return _share_view(cache, entry_tag)

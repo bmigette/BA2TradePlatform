@@ -119,6 +119,7 @@ def test_removing_the_leaves_gives_back_the_style_without_the_field(tmp_path):
     ({"min": 20, "max": 60, "step": 0}, "step"),
     ({"min": 20, "max": 60}, "exactly"),
     ({"min": 20, "max": 60, "step": 10, "x": 1}, "exactly"),
+    ({"min": 20, "max": 60, "step": 50}, "step"),                # step > max - min
     ({"min": True, "max": 60, "step": 10}, "number"),
     ({"min": "20", "max": 60, "step": 10}, "number"),
     ([20, 60, 10], "object"),

@@ -436,3 +436,39 @@ def test_the_real_readers_over_the_in_mem_store(monkeypatch):
     assert r.unmeasurable == ()
     assert r.committed == 10_000.0 and r.share_pct == pytest.approx(10.0)
     rm.reset_state()
+
+
+# ------------------------------------------------------------------ run identity (final review)
+def test_a_cache_from_another_file_backed_run_is_never_reused(world):
+    """File-backed runs (persisted top-N re-runs) file their sleeve state under the LIVE key and
+    replay the same dates, so (key, as_of) alone would let run 2 read run 1's book."""
+    from ba2_common.core import db as common_db
+    try:
+        common_db.configure_db_threadlocal(":memory:")          # run 1
+        world.structures, world.tags = [short_put(1)], {1: CSP}
+        assert share(world, CSP, T1).committed == 10_000.0
+        common_db.clear_threadlocal_db()
+        common_db.configure_db_threadlocal(":memory:")          # run 2: same expert, same as_of
+        world.structures, world.tags = [short_put(5, strike=50.0)], {5: CSP}
+        assert share(world, CSP, T1).committed == 5_000.0
+        assert world.reads == 2
+    finally:
+        common_db.clear_threadlocal_db()
+
+
+def test_one_run_keeps_its_cache_and_live_has_a_stable_token(world):
+    from ba2_common.core import db as common_db
+    assert common_db.run_token() == common_db.run_token() is None or \
+        common_db.run_token() == common_db.run_token()
+    share(world, CSP, T1)
+    share(world, CSP, T1)
+    assert world.reads == 1                                      # live: still one build per cycle
+    try:
+        common_db.configure_db_threadlocal(":memory:")
+        token = common_db.run_token()
+        assert token is not None
+        share(world, CSP, T1)
+        share(world, CSP, T1)
+        assert common_db.run_token() == token and world.reads == 2   # one build for the run
+    finally:
+        common_db.clear_threadlocal_db()

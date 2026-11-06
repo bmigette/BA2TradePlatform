@@ -7804,6 +7804,9 @@ def _validate_style_structure_share(where: str, style: dict) -> None:
         raise ValueError(f"{where}: needs 0 < min <= max <= 100, got {band}")
     if band["step"] <= 0:
         raise ValueError(f"{where}: step must be > 0, got {band['step']}")
+    if band["max"] > band["min"] and band["step"] > band["max"] - band["min"]:
+        raise ValueError(f"{where}: step {band['step']} exceeds max - min "
+                         f"({band['max'] - band['min']}); the gene would have a single value")
     if "risk" not in style:
         raise ValueError(f"{where}: needs a risk block (risk_manager_mode classic_options); "
                          f"without the option risk manager the share is never kept")
