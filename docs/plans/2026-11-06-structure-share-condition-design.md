@@ -58,9 +58,18 @@ ERROR log naming the transaction. Never read as zero (no silent failure).
 
 ## Wiring
 
+- OPT-IN per style: a new style field `structure_share` `{"min": .., "max": .., "step": ..}` (added to
+  `_STYLE_FIELDS` and validated: 0 < min <= max <= 100, step > 0). A style without it builds exactly
+  as today (no leaf, no genes), so jobs A/P and their stored rows are unchanged.
+- First user (owner 2026-11-06): job C, style `long` (O_CBS, O_LEAP, O_PMCC, O_CONVEX) with
+  `{"min": 20, "max": 60, "step": 10}`. The cap is always ON for an opted-in style (no `:enabled`
+  toggle gene: the GA cannot switch it off), only the value is searched.
 - Leaf `<member>-structure_share` appended LAST in `_option_entry_rule` (after the benchmark regime
-  gates), `optimize=True`, `toggle_optimize=True`, value 10..100 step 10 -> genes
-  `cond:<id>:enabled`, `cond:<id>:value`. Every option-entry member of a style gets it.
+  gates), `optimize=True`, value range from the style field -> gene `cond:<id>:value`. Every
+  option-entry member of the opted-in style gets it (VERIFY the O_CONVEX member goes through
+  `_option_entry_rule`; if not, wire it in its own builder).
+- The share is of the capped sleeve equity, so it only binds below the style's `max_deployment_pct`
+  (job C searches 30..80): e.g. deployment 40 + shares 60 lets one member take the whole 40.
 - Registration (template: `entry_tag` / `N_ENTRY_TAG`): `ExpertEventType` + `get_numeric_event_values`
   (`types.py`), `CONDITION_MAP`, `rule_builders.FIELD_EVENT` (a miss silently drops the leaf),
   `rules_export_import._FIELD_ABBR`, `trigger_catalog`, `rules_documentation`; enforced by
