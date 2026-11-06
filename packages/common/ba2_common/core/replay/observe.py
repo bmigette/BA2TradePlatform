@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import inspect
 import re
+import threading
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -50,6 +51,9 @@ __all__ = [
     "tapped_boundary",
     "SECRET_KEY_TOKENS",
 ]
+
+#: Per-thread count of tapped reads currently running (only touched while capturing).
+_tap_state = threading.local()
 
 #: Attribute the decorator stamps on its wrapper, holding ``(provider, method)``.
 #: A guard test needs to assert that a SHIPPED boundary is tapped, and
@@ -141,6 +145,7 @@ def record_observation(
     fetched_at: Optional[datetime] = None,
     published_at: Optional[datetime] = None,
     first_observed_at: Optional[datetime] = None,
+    tap_depth: int = 0,
 ) -> Optional[str]:
     """Record one provider return against the active analysis.
 
@@ -160,6 +165,7 @@ def record_observation(
         fetched_at=fetched_at,
         published_at=published_at,
         first_observed_at=first_observed_at,
+        tap_depth=tap_depth,
     )
 
 
@@ -171,6 +177,7 @@ def observe_provider(
     provenance: Any = ReplayStatus.PROVENANCE_UNKNOWN,
     before: Optional[Callable[[Mapping[str, Any]], Any]] = None,
     payload: Optional[Callable[[Mapping[str, Any], Any], Any]] = None,
+    record_errors: bool = False,
 ):
     """Decorate a provider boundary so its RETURN is recorded when capture is on.
 
@@ -184,6 +191,12 @@ def observe_provider(
       for a cheap "was this served from cache?" probe. It must not fetch.
     * ``payload`` -- ``fn(args, result)`` when what is worth recording is not the
       return value itself. Defaults to the return value.
+
+    * ``record_errors`` -- opt-in (the option taps). When the wrapped call RAISES, an
+      observation of kind ``error`` (:func:`~ba2_common.core.replay.recorded_errors.error_payload`)
+      is recorded under the same identity and the ORIGINAL exception is re-raised unchanged, so
+      a caller that handled the failure replays through the same branch. Off by default: the
+      stock taps keep recording returns only.
 
     The wrapped function is called EXACTLY once, and its return value is passed
     back by identity: capture never changes a result or a call count.
@@ -205,7 +218,22 @@ def observe_provider(
                 except Exception as exc:
                     context.note_failure(f"{provider}.{method} pre-probe failed", exc)
 
-            result = fn(*args, **kwargs)
+            # Tap depth: only maintained here, i.e. only while a capture context is active, so
+            # the no-capture hot path above is untouched. A tapped read called from inside this
+            # one records depth + 1 (see ProviderObservation.tap_depth).
+            depth = getattr(_tap_state, "depth", 0)
+            _tap_state.depth = depth + 1
+            try:
+                if record_errors:
+                    try:
+                        result = fn(*args, **kwargs)
+                    except Exception as raised:
+                        _record_raise(context, provider, method, identity, bound, raised, depth)
+                        raise
+                else:
+                    result = fn(*args, **kwargs)
+            finally:
+                _tap_state.depth = depth
 
             try:
                 request_identity = identity(bound) if bound is not None else {
@@ -225,6 +253,7 @@ def observe_provider(
                 identity=request_identity,
                 payload=recorded,
                 provenance=where,
+                tap_depth=depth,
             )
             return result
 
@@ -232,6 +261,21 @@ def observe_provider(
         return wrapper
 
     return decorator
+
+
+def _record_raise(context, provider, method, identity, bound, raised, depth) -> None:
+    """Record a raised read as an ``error`` observation. Never raises: the caller re-raises ``raised``."""
+    from ba2_common.core.replay.recorded_errors import error_payload
+
+    try:
+        request_identity = identity(bound) if bound is not None else {"identity_unavailable": True}
+        payload = error_payload(raised)
+    except Exception as exc:
+        context.note_failure(f"{provider}.{method} error observation not built", exc)
+        return
+    record_observation(provider=provider, method=method, identity=request_identity,
+                       payload=payload, response_class=ReplayStatus.RESPONSE_ERROR,
+                       tap_depth=depth)
 
 
 def tapped_boundary(fn) -> Optional[tuple]:

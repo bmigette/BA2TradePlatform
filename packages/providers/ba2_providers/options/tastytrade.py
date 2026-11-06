@@ -245,19 +245,45 @@ def candle_to_bar(candle: Any, occ: str,
 # offline discovery helpers (pure)
 # --------------------------------------------------------------------------- #
 def expiry_calendar(start: date, end: date) -> List[date]:
-    """Every Friday in [start, end] — the standard weekly/monthly US equity expiry day.
+    """Every weekly expiry day in [start, end]: each Friday, or the Thursday before it when
+    that Friday is not an NYSE session.
 
-    Used by the SYNTHETIC discovery fallback (no listing endpoint needed). Non-Friday
-    expiries (Mon/Wed weeklies on the most liquid names, and Fridays moved by a holiday)
-    are simply not generated; those contracts come back as empty snapshots and are recorded
-    as such, which costs a request but never fabricates data.
+    Used by the SYNTHETIC discovery fallback (no listing endpoint needed).
+
+    HOLIDAY SHIFT. When the exchange is closed on a Friday (Good Friday, 2020-07-03,
+    2020-12-25, 2021-01-01, 2021-12-24, 2025-07-04, Juneteenth ...) the options that would
+    have expired that day expire on the preceding Thursday instead. A Friday-only grid never
+    proposed those Thursdays: measured on the ThetaData store (2026-11-05), every symbol
+    2020-2025 had ``exp=<holiday Friday>`` partitions holding zero contracts and no
+    ``exp=<Thursday>`` partition at all, while the vendor's wide stream HAD the Thursday rows
+    (they were downloaded and dropped because no plan owed them). The holiday Friday itself is
+    therefore NOT emitted: no contract can expire on a closed day, so it would be a wasted
+    request that always comes back empty.
+
+    If the Thursday is closed as well (it never is in 2020-2025; it would take two adjacent
+    closures) the week is skipped rather than guessing a third day. The answer comes from the
+    offline NYSE calendar (``ba2_common.core.market_calendar``) -- no network call. A shifted
+    Thursday that falls before ``start`` is not emitted (the window is respected exactly).
+
+    Non-Friday/Thursday expiries (Mon/Wed weeklies on the most liquid names) are still not
+    generated; those contracts come back as empty snapshots and are recorded as such, which
+    costs a request but never fabricates data.
     """
     if end < start:
         raise ValueError(f"reversed window: {start} .. {end}")
+    from ba2_common.core.market_calendar import is_regular_session
+    # Walk the Fridays whose shifted day could still land in the window: a Friday just past
+    # ``end`` shifts to a Thursday inside it, so scan one extra week on each side.
     first = start + timedelta(days=(4 - start.weekday()) % 7)
     out, d = [], first
-    while d <= end:
-        out.append(d)
+    while d <= end + timedelta(days=1):
+        if is_regular_session(d):
+            day = d
+        else:
+            thursday = d - timedelta(days=1)
+            day = thursday if is_regular_session(thursday) else None
+        if day is not None and start <= day <= end:
+            out.append(day)
         d += timedelta(days=7)
     return out
 

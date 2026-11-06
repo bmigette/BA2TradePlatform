@@ -26,12 +26,11 @@ error that no split marks.)
 WHAT IS NEVER CARRY (a ``veto``: the guard refuses, naming it, rather than clearing):
 
 * dividends to add back totalling more than ``MAX_ADDBACK_FRACTION`` (2.5%, half the guard's
-  tolerance) of the spot. Nothing verifies that the chain priced them: a special OCC adjusts
-  the strikes for is NOT in the chain, so adding it back would hide a basis error of its own
-  size (ACI 2022-10-21 $6.85 on $27.50 at x1.25; a 9% special at x1.09). Capped at half the
-  tolerance, an unpriced add-back can shift the verdict by at most that much -- the simpler of
-  the two sound rules (the other: add back only when an expiry before the ex-date shows the
-  drop), and it costs no current name;
+  tolerance) that the same session's chain does not SHOW priced (VERIFIED add-back, below).
+  A special OCC adjusts the strikes for is NOT in the chain, so adding it back would hide a
+  basis error of its own size (ACI 2022-10-21 $6.85 on $27.50 at x1.25; a 9% special at
+  x1.09). Capped at half the tolerance, an unpriced add-back can shift the verdict by at most
+  that much;
 * a dividend row whose declaration date is unknown (as-of: was it known on the session?) or
   whose split-adjusted amount is missing;
 * no dividend calendar at all;
@@ -54,6 +53,24 @@ falling between the first two expiries, is a STEP that leaves the third at the s
 drops the unexplained-drop veto already polices); the guard counts only confirmed non-payer
 sessions.
 
+VERIFIED ADD-BACK. A dividend over the cap is not a veto when the session's own chain shows it
+priced: the last usable expiry BEFORE the ex-date (it settles before the dividend) and the first
+on/after it are adjacent across the ex-date, and the step ``p_pre - p_post`` must lie in
+[``VERIFY_MIN``, ``VERIFY_MAX``] = [0.5, 1.5] x the sum D of the declared dividends of that gap.
+An unpriced special shows a step ~0 and fails for every D, however close to the cap (the
+tolerance is relative to D, never absolute); the real STLA 2022-03 chain steps 0.75-0.85 D, which
+is why the bound is not tighter. Once verified the dividend is added back like a small one (at most as far as the chain shows it: min(1, step / D) of its amount); only
+the UNVERIFIED remainder is judged by the cap, and a veto names why verification failed. A
+basis error does not ride on the verification: it scales pre and post alike, the step still
+matches, and the carry-free spot keeps the multiple, so the guard refuses it as before.
+RESIDUAL RISK: (a) quote noise: an unpriced special of D passes only if the pair's quotes
+disagree by 0.5 D in spot terms (>= 1.25% at the cap; each pair is gated to 2.5% uncertainty);
+the add-back then overshoots by D and masks a basis error of that size; (b) a PARTIALLY priced
+special (step 0.5-0.6 D) overshoots by up to 0.5 D (3.75% for 7.5%; 12% for a 25% special that
+is half in the chain); (c) any other price move between the two expiries equal to the dividend
+(an earnings gap in a thin chain) verifies a dividend the chain did not price. The guard's
+CARRY_BAND_LOW (0.975) is unchanged.
+
 A dividend DECLARED after the session is not added back (it was not known yet), so the
 correction is causal. The two-point extrapolation is only used when its noise LEVERAGE
 t1 / (t2 - t1) is at most ``MAX_LEVERAGE`` (a further expiry is tried otherwise).
@@ -68,7 +85,7 @@ from datetime import date
 from typing import Optional, Sequence, Tuple
 
 __all__ = ["CarryFreeSpot", "DividendRow", "carry_free_spot", "MAX_ADDBACK_FRACTION",
-           "MAX_LEVERAGE", "SLOPE_SLACK", "LINEARITY_TOLERANCE"]
+           "MAX_LEVERAGE", "SLOPE_SLACK", "LINEARITY_TOLERANCE", "VERIFY_MIN", "VERIFY_MAX"]
 
 #: The most (of the spot) the carry measure will add back UNVERIFIED: half the guard's 5%.
 MAX_ADDBACK_FRACTION = 0.025
@@ -82,6 +99,16 @@ SLOPE_SLACK = 0.005
 #: and still confirm it: the quote uncertainty the guard's pair gate allows
 #: (``option_basis_guard.MAX_QUOTE_UNCERTAINTY``, half its 5% tolerance).
 LINEARITY_TOLERANCE = 0.025
+#: VERIFIED add-back (module docstring): the chain's step across an ex-date must lie in
+#: [VERIFY_MIN, VERIFY_MAX] x the declared dividends of that gap. RELATIVE to the dividend, not
+#: to the spot: an unpriced special of size D (> 2.5% of spot) shows a step ~0, which clears a
+#: lower bound of VERIFY_MIN * D (>= 1.25% of spot) only if the two quotes are off by that much
+#: in opposite directions; a spot-sized absolute tolerance would pass a special just above the
+#: cap. 0.5 and not tighter because the REAL STLA 2022-03 chain shows 0.75-0.85 of the declared
+#: amount (a step of 5-6% of spot for a 7.4-7.8% dividend, measured 2026-11-05). VERIFY_MAX only
+#: rejects a step the calendar badly understates.
+VERIFY_MIN = 0.5
+VERIFY_MAX = 1.5
 
 
 @dataclass(frozen=True)
@@ -105,10 +132,39 @@ class CarryFreeSpot:
     linear_confirmed: Optional[bool] = None
 
 
-def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spot: float
-               ) -> Tuple[float, Optional[str], int]:
+def _verify(ex: date, rows: Sequence[Tuple[date, float]], pts: Sequence[Tuple[date, float]]
+            ) -> Tuple[Optional[float], str]:
+    """(add-back factor or None, why not) for the dividend ex ``ex``: does THIS session's chain
+    show it priced? The factor is ``min(1, step / D)``: the chain's own evidence caps the add-back.
+
+    The last usable expiry before the ex-date (``e_pre``, it settles before the dividend and
+    carries none of it) and the first on/after it (``e_post``, it carries it) are adjacent across
+    the ex-date; every declared row with ``e_pre < ex <= e_post`` is in the step between them, so
+    the expected step is their sum ``D``. Verified when ``VERIFY_MIN * D <= p_pre - p_post <=
+    VERIFY_MAX * D`` (prices, so no spot is needed). A verified row is added back at most as
+    far as the chain shows it: the REAL STLA 2022-03 chain steps 0.67-0.85 D, and the full D
+    would overshoot into a term structure sloping up."""
+    pre = [(e, p) for e, p in pts if e < ex]
+    post = [(e, p) for e, p in pts if e >= ex]
+    if not pre:
+        return None, f"no usable expiry before the ex-date {ex.isoformat()} to show the drop"
+    if not post:
+        return None, f"no usable expiry on/after the ex-date {ex.isoformat()}"
+    (e_pre, p_pre), (e_post, p_post) = pre[-1], post[0]
+    expected = sum(a for x, a in rows if e_pre < x <= e_post)
+    step = p_pre - p_post
+    if VERIFY_MIN * expected <= step <= VERIFY_MAX * expected:
+        return min(1.0, step / expected), ""
+    return None, (f"the chain step across the ex-date {ex.isoformat()} ({e_pre.isoformat()} "
+                   f"{p_pre:.4g} -> {e_post.isoformat()} {p_post:.4g} = {step:.4g}) is not "
+                   f"{VERIFY_MIN:g}-{VERIFY_MAX:g}x the dividends of that gap ({expected:.4g}): "
+                   f"not priced")
+
+
+def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spot: float,
+               pts: Sequence[Tuple[date, float]] = ()) -> Tuple[float, Optional[str], int]:
     """(total to add back for session < ex <= until, veto or None, rows not yet declared)."""
-    total, pending, used = 0.0, 0, []
+    total, pending, rows = 0.0, 0, []
     for r in dividends:
         if not (session < r.ex_date <= until):
             continue
@@ -123,12 +179,33 @@ def _dividends(session: date, until: date, dividends: Sequence[DividendRow], spo
             return total, f"{tag}: no split-adjusted amount", pending
         if r.amount > 0:
             total += r.amount
-            used.append(f"{r.ex_date.isoformat()} {r.amount:g}")
+            rows.append((r.ex_date, float(r.amount)))
     if total > 0 and (not (spot > 0) or total / spot > MAX_ADDBACK_FRACTION):
-        return total, (f"dividends to add back ({', '.join(used)}) total {total / spot:.1%} of "
-                       f"the spot {spot:g} (> {MAX_ADDBACK_FRACTION:.1%}): unverified, an "
-                       f"add-back that large could hide a basis error of its size (a special "
-                       f"OCC strike-adjusts is not priced by the chain)"), pending
+        # Over the cap: a row stays in the add-back only when the same session's chain shows it
+        # priced; the UNVERIFIED remainder is what the cap judges. The verification reads the
+        # whole declared calendar (rows beyond ``until`` can share a gap), not just ``rows``.
+        every = [(x.ex_date, float(x.amount)) for x in dividends
+                 if x.declared is not None and x.declared <= session and x.amount is not None
+                 and x.amount == x.amount and x.amount > 0 and x.ex_date > session]
+        unverified, why, added = [], [], 0.0
+        for ex, a in rows:
+            factor, reason = _verify(ex, every, pts)
+            if factor is None:
+                unverified.append((ex, a))
+                why.append(reason)
+                added += a
+            else:
+                added += a * factor
+        un = sum(a for _, a in unverified)
+        if un > 0 and (not (spot > 0) or un / spot > MAX_ADDBACK_FRACTION):
+            used = ", ".join(f"{x.isoformat()} {a:g}" for x, a in unverified)
+            spot_txt = f"{un / spot:.1%}" if spot > 0 else "n/a"
+            return added, (f"dividends to add back ({used}) total {spot_txt} of "
+                           f"the spot {spot:g} (> {MAX_ADDBACK_FRACTION:.1%}): unverified, an "
+                           f"add-back that large could hide a basis error of its size (a special "
+                           f"OCC strike-adjusts is not priced by the chain); verification "
+                           f"failed: {'; '.join(why)}"), pending
+        return added, None, pending
     return total, None, pending
 
 
@@ -150,7 +227,7 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
                 None)
     # Vetoes first, over every row up to the expiry the measure would read (the second nearest
     # when none qualifies): a special or a row of unknown standing there disqualifies the session.
-    _, veto, _ = _dividends(session, (pick or pts[1])[0], dividends, spot)
+    _, veto, _ = _dividends(session, (pick or pts[1])[0], dividends, spot, pts)
     if veto:
         return CarryFreeSpot(None, veto, veto=veto)
     if pick is None:
@@ -158,10 +235,10 @@ def carry_free_spot(session: date, points: Sequence[Tuple[date, float]],
                                    f"<= {MAX_LEVERAGE} (nearest {t1}d)")
     e2, p2 = pick
     t2 = (e2 - session).days
-    d1, veto, _ = _dividends(session, e1, dividends, spot)
+    d1, veto, _ = _dividends(session, e1, dividends, spot, pts)
     if veto:
         return CarryFreeSpot(None, veto, veto=veto)
-    d2, veto, pending = _dividends(session, e2, dividends, spot)
+    d2, veto, pending = _dividends(session, e2, dividends, spot, pts)
     if veto:
         return CarryFreeSpot(None, veto, veto=veto)
     s1, s2 = p1 + d1, p2 + d2

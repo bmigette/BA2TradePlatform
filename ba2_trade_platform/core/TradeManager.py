@@ -2638,8 +2638,11 @@ class TradeManager:
             
         return None
         
-    def _decision_capture_scope(self, expert_instance_id: int):
-        """A replay-capture scope for ONE enter-market decision pass (no-op when capture is off).
+    def _decision_capture_scope(self, expert_instance_id: int, use_case=None):
+        """A replay-capture scope for ONE decision pass of an expert (no-op when capture is off).
+
+        ``use_case`` is the pass: ``AnalysisUseCase.ENTER_MARKET`` (default, the entry pass) or
+        ``AnalysisUseCase.OPEN_POSITIONS`` (the exit pass). The body is the same for both.
 
         WHY THE DECISION PASS NEEDS ITS OWN SCOPE. Capture is opened per ANALYSIS, by
         ``MarketExpertInterface._analysis_capture``. The market-condition gates are not read
@@ -2649,6 +2652,11 @@ class TradeManager:
         context, and a replay of a gated bundle raises ``ReplayMiss`` in ``begin_decision``
         because the windows it needs were never written down. A gated live decision that cannot
         be replayed is a decision nobody can audit.
+
+        The same scope also carries the OPTION ACTION taps (chain/quote/IV/sizing reads and the
+        per-action record of ``OptionsAccountInterface`` entries and closes): those run inside
+        the rule evaluation of this pass, so an option expert's pass needs a scope even when it
+        has no market-condition profile.
 
         Returns a context manager. Every failure to describe the pass degrades to "not
         recorded", never to "the pass does not run": recording is evidence, not a dependency.
@@ -2662,33 +2670,60 @@ class TradeManager:
 
         from .types import AnalysisUseCase
 
-        # ONLY when THIS EXPERT has a market-condition resolver. The scope exists to record the
-        # feature windows its gates read; with no profile on the expert there is nothing to
-        # record, and opening it anyway would submit a synthetic "TradeManager" AnalysisRecord
-        # per decision pass into every capture session -- which replay inventory counts as an
-        # analysis and expert_replay then reports as COVERAGE_UNSUPPORTED. That silently moves
-        # the replay-coverage percentage of deployments that never enable this feature.
+        if use_case is None:
+            use_case = AnalysisUseCase.ENTER_MARKET
+        pass_name = "enter-market" if use_case == AnalysisUseCase.ENTER_MARKET else "open-positions"
+        id_prefix = "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
+
+        # The scope opens ONLY when THIS EXPERT has a market-condition resolver, or one of its
+        # rulesets holds an option action (see _expert_has_option_rules; the account class is NOT
+        # the test: AlpacaAccount is always an OptionsAccountInterface, stock experts included). Otherwise there is nothing to record, and opening it
+        # anyway would submit a synthetic "TradeManager" AnalysisRecord per decision pass into
+        # every capture session -- which replay inventory counts as an analysis and expert_replay
+        # then reports as COVERAGE_UNSUPPORTED. That silently moves the replay-coverage
+        # percentage of deployments that use neither feature (every stock deployment).
         #
         # PER EXPERT since Task 12 (the profile is that expert's setting): a process-wide
         # "is a resolver installed" test would now be true for every deployment, because the
         # dispatching resolver is always installed.
-        if resolver_for_expert_instance(expert_instance_id) is None:
+        try:
+            has_resolver = resolver_for_expert_instance(expert_instance_id) is not None
+        except Exception as e:  # noqa: BLE001 -- DELIBERATELY broad on the EXIT pass only, see below
+            if use_case == AnalysisUseCase.ENTER_MARKET:
+                raise          # entries: refusing is the safe reading, as before this helper
+            # EXITS ARE NEVER BLOCKED BY THE MARKET-CONDITION MACHINERY: a resolver build that
+            # fails here fails identically in _open_exit_pass_market_condition_scope, which
+            # reports it (ERROR + FAILURE activity row) and runs the pass without the scope.
+            # This lookup only decides whether to RECORD, so it must not stop a stop-loss.
+            logger.error(f"replay capture: could not look up the market-condition resolver of "
+                         f"expert {expert_instance_id}; the {pass_name} pass is not recorded: {e}",
+                         exc_info=True)
             return nullcontext()
         store = get_replay_store()
         if store is None:
             return nullcontext()
+        if not has_resolver:
+            try:
+                is_options = self._expert_has_option_rules(expert_instance_id)
+            except Exception as e:  # noqa: BLE001 -- see the docstring: recording is not a dependency
+                logger.error(
+                    f"replay capture: could not resolve the account of expert {expert_instance_id}; "
+                    f"the {pass_name} pass is not recorded: {e}", exc_info=True)
+                return nullcontext()
+            if not is_options:
+                return nullcontext()
         try:
             session_id = store.current_session_id()
             if session_id is None:
                 logger.error(
-                    "replay capture is enabled but no session is open; the enter-market decision "
+                    "replay capture is enabled but no session is open; the %s decision "
                     "pass for expert %s is not recorded and a gated decision in it cannot be "
-                    "replayed", expert_instance_id)
+                    "replayed", pass_name, expert_instance_id)
                 return nullcontext()
             meta = {
                 # The pass is not a MarketAnalysis, so it carries an id of its own shape rather
                 # than borrowing one analysis's id and colliding with that analysis's bundle.
-                "analysis_id": f"decision-{expert_instance_id}-{uuid.uuid4().hex}",
+                "analysis_id": f"{id_prefix}-{expert_instance_id}-{uuid.uuid4().hex}",
                 "attempt_id": uuid.uuid4().hex,
                 "session_id": session_id,
                 "expert_class": "TradeManager",
@@ -2696,7 +2731,7 @@ class TradeManager:
                 # One pass decides for every symbol the expert recommended; the per-symbol
                 # identity is on each recorded observation, not on the bundle.
                 "symbol": "",
-                "use_case": str(AnalysisUseCase.ENTER_MARKET.value),
+                "use_case": str(use_case.value),
                 "scheduled_at": None,
                 "started_at": datetime.now(_tz.utc),
             }
@@ -2704,6 +2739,39 @@ class TradeManager:
             logger.error(f"replay capture: could not describe the decision pass: {e}", exc_info=True)
             return nullcontext()
         return capture_scope(store, meta)
+
+    @staticmethod
+    def _expert_has_option_rules(expert_instance_id: int) -> bool:
+        """True when a ruleset of this expert holds an option entry/exit action.
+
+        THE GATE FOR THE OPTION CAPTURE SCOPE. It is the rulesets, not the account class: every
+        ``AlpacaAccount`` is an ``OptionsAccountInterface`` whether or not the expert on it ever
+        trades an option, so an isinstance test gave every Alpaca STOCK expert a scope on both
+        passes (moving stock replay coverage and recording stock-pass broker reads). Option
+        actions run only from a rule, so "an action of an option type sits in the expert's
+        enter-market or open-positions ruleset" is exactly "this pass can produce an option
+        action record". Rule membership is read through the ruleset -> rule LINK (the engine's
+        read; ``EventAction.subtype`` is not consulted), and the type from ``actions[*]``
+        (``action_type`` or ``type``, as the evaluator reads it) against
+        ``get_option_action_values()``.
+        """
+        from ba2_common.core.db import ruleset_event_actions
+        from ba2_common.core.types import get_option_action_values
+
+        from .models import ExpertInstance
+
+        expert_instance = get_instance(ExpertInstance, expert_instance_id)
+        option_values = set(get_option_action_values())
+        for ruleset_id in (expert_instance.enter_market_ruleset_id,
+                           expert_instance.open_positions_ruleset_id):
+            if ruleset_id is None:
+                continue
+            for rule in ruleset_event_actions(ruleset_id):
+                for action in (rule.actions or {}).values():
+                    value = action.get("action_type") or action.get("type")
+                    if getattr(value, "value", value) in option_values:
+                        return True
+        return False
 
     def _option_entry_decisions(self, expert, expert_instance_id: int, symbol: str,
                                 results) -> list:
@@ -3743,9 +3811,11 @@ class TradeManager:
             # around the evaluation only -- so an expert with trade modification off or no
             # open_positions ruleset never reads its profile. With no market_condition_profile
             # setting the scope yields None at once (no clock read, no state): a strict no-op.
-            # No replay-capture scope: the open-positions pass never had one. A failure to OPEN
-            # the scope never stops the exits: see _open_exit_pass_market_condition_scope.
-            with self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
+            # The replay-capture scope opens FIRST (same load-bearing order as the entry pass:
+            # begin_decision reads current_capture()); it is a no-op unless capture is on and the
+            # expert is gated or on an options account. A failure to OPEN the market-condition
+            # scope never stops the exits: see _open_exit_pass_market_condition_scope.
+            with self._decision_capture_scope(expert_instance_id, AnalysisUseCase.OPEN_POSITIONS),                     self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,

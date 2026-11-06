@@ -19,6 +19,11 @@ the spec's comparison capabilities, offline:
   the only capability that measures reconstruction, coverage and revision drift,
   and the only one for which zero difference is not always attainable.
 
+* ``option_selection`` (:mod:`option_selection`) -- re-run each recorded option ENTRY / CLOSE action
+  (shared ``TradeActions`` code) on a tape account built from the recorded broker reads and the
+  recorded DB rows, and compare contracts, limit, quantity, trade record and refusal exactly.
+  ``historical_provider`` (parquet instead of the broker chain) is reported as NOT run.
+
 ``decision`` is a LATER delivery and is reported as ``not_run`` -- never as
 absent rows, and never rolled into a percentage.
 

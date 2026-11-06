@@ -735,7 +735,7 @@ _WARM_JOIN_TIMEOUT_S = 3600.0
 
 # --- replay (offline replay of a recorded live session) --------------------------------
 def _cmd_replay(args) -> int:
-    """``inventory`` / ``experts`` / ``gather`` / ``historical`` over one bundle.
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` / ``option-selection`` over one bundle.
 
     Everything runs offline: the services enter the replay isolation (hermetic
     FMP, a closed socket layer, refusing instance/provider resolvers) and read
@@ -748,7 +748,7 @@ def _cmd_replay(args) -> int:
     if args.replay_cmd == "warm":
         return _cmd_replay_warm(args)
 
-    from app.services.replay import expert_replay, gather_tape, inventory
+    from app.services.replay import expert_replay, gather_tape, inventory, option_selection
 
     bundle = _caller_path(args.bundle)
     if not os.path.isdir(bundle):
@@ -775,7 +775,8 @@ def _cmd_replay(args) -> int:
             sys.exit(f"ba2-test: {cache_root} is not a directory")
         report = historical.run(bundle, cache_root, out, timeout=args.timeout)
     else:
-        module = expert_replay if args.replay_cmd == "experts" else gather_tape
+        module = {"experts": expert_replay, "gather": gather_tape,
+                  "option-selection": option_selection}[args.replay_cmd]
         report = module.run(bundle, out)
     print(report.to_markdown())
     if out:
@@ -10088,7 +10089,12 @@ def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitnes
             raise TimeoutError(
                 f"export deadline passed before the remote attempt to {worker.get('name')} finished")
         try:
-            return run_trial_full(worker, trial_cfg, fitness_metric)
+            if deadline is None:
+                return run_trial_full(worker, trial_cfg, fitness_metric)
+            # The attempt may use what is left of the export bound, not run_trial_full's fixed
+            # 1800 s: under GA load a TOP-N re-run outlasts 30 min (opt 40 TOP1/TOP3, 2026-11-05).
+            return run_trial_full(worker, trial_cfg, fitness_metric,
+                                  timeout=max(1.0, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
             last_exc = e
             if attempt == 0:
@@ -10258,6 +10264,28 @@ def _rank_measured_candidates(all_results, n: int, best_params, best_fitness):
         # search never measured anything, in which case there is no winner to export at all.
         ranked = [(best_params, None, best_fitness)]
     return ranked, skipped
+
+
+# The TOP-N export's own bound, separate from the GA's per-trial stall bound
+# (BT_LOCAL_STALL_TIMEOUT_S, 5400 s): a top-N re-run records every option trade and persists its
+# trading DB, so it is slower than a GA trial, and 5400 s dropped TOP1/3/5 of stage-2 opt 40.
+_TOPN_EXPORT_TIMEOUT_DEFAULT_S = 14400.0
+
+
+def _topn_export_timeout_s() -> float:
+    return float(os.environ.get("BT_TOPN_EXPORT_TIMEOUT_S", str(_TOPN_EXPORT_TIMEOUT_DEFAULT_S)))
+
+
+def _topn_export_slots(parallel, n_specs: int, remote_workers: list) -> tuple:
+    """``(n_local, slots)`` for the TOP-N re-runs, round-robined over ``slots``.
+
+    A job run with ``--parallel 0`` and remote workers is REMOTE-ONLY: its re-runs go to the
+    workers alone. It used to get one local slot anyway (``parallel or 1``), so three of five
+    re-runs queued one after another on the master and missed the export bound (opt 40)."""
+    if remote_workers and int(parallel or 0) <= 0:
+        return 0, list(remote_workers)
+    n_local = max(1, min(int(parallel or 1), n_specs))
+    return n_local, ["local"] * n_local + list(remote_workers)
 
 
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
@@ -10493,7 +10521,6 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             if _persist_one(rank, trial_cfg, strategy_params, {"ok": True, "results": full_results}):
                 persisted += 1
                 print(f"    persisted {name_prefix}{rank} ({persisted}/{len(ranked)}) [no re-run]")
-        n_local = max(1, min(int(parallel or 1), len(specs)))
         remote_workers = (_resolve_workers(db, getattr(opt, "worker_ids", None))
                           if use_remote_workers else [])
         if remote_workers:
@@ -10524,20 +10551,20 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         # if the loop had returned. Same policy as the GA's stall recovery -- bounded window, drop
         # what has not finished, kill the pool rather than wait on it. This also removes the old
         # synchronous single-candidate branch, which had no bound at all.
-        export_timeout = float(_os.environ.get("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
+        export_timeout = _topn_export_timeout_s()
+        n_local, slots = _topn_export_slots(parallel, len(specs), remote_workers)
         print(f"    persisting top {len(specs)} across {n_local} local + "
               f"{len(remote_workers)} remote worker(s) (export bound {export_timeout:.0f}s)...")
-        local_ex = _new_local_pool(n_local)
+        local_ex = _new_local_pool(n_local) if n_local else None
         # NO ThreadPoolExecutor for the remote attempts: its threads cannot be killed and Python
         # joins them at exit, which is how a timed-out remote call kept this launcher alive
         # (2026-09-21 recheck, H1). Daemon threads are abandoned instead.
         import time as _time
         export_deadline = _time.monotonic() + export_timeout
         try:
-            # Round-robin each spec across every available slot (n_local local + one per remote
-            # worker) -- with n <= save-top (default 5) this just spreads a handful of re-runs
-            # across whatever capacity is on hand, no need for real load balancing.
-            slots = (["local"] * n_local) + remote_workers
+            # Round-robin each spec across every available slot (_topn_export_slots) -- with
+            # n <= save-top (default 5) this just spreads a handful of re-runs across whatever
+            # capacity is on hand, no need for real load balancing.
             futs = {}
             for idx, (rk, tc, sp2) in enumerate(specs):
                 slot = slots[idx % len(slots)]
@@ -10562,11 +10589,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                       f"(persisted {persisted}/{len(ranked)}). A hung re-run must not stop the "
                       f"matrix; the pool is killed rather than waited on.")
         finally:
-            _kill_executor(local_ex)
-            try:
-                local_ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:  # noqa: BLE001 — teardown must never mask the export result
-                pass
+            if local_ex is not None:
+                _kill_executor(local_ex)
+                try:
+                    local_ex.shutdown(wait=False, cancel_futures=True)
+                except Exception:  # noqa: BLE001 — teardown must never mask the export result
+                    pass
         return persisted
     finally:
         db.close()
@@ -11180,6 +11208,13 @@ def main(argv: "list | None" = None) -> int:
                             help="Re-run the live _gather against the recorded provider tape.")
     rpg.add_argument("--bundle", required=True, help="Exported session directory.")
     rpg.add_argument("--out", default=None, help="Write the report here.")
+    rpo = rplsub.add_parser(
+        "option-selection",
+        help="Re-run each recorded option entry / close action on its tape of broker reads "
+             "and compare contracts, limit, quantity, trade record and refusal exactly.")
+    rpo.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpo.add_argument("--out", default=None,
+                     help="Write option_selection.md/.json into this directory.")
     rph = rplsub.add_parser(
         "historical",
         help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "

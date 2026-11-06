@@ -310,6 +310,11 @@ class ProviderObservation(_Record):
     published_at: Optional[datetime] = None
     first_observed_at: Optional[datetime] = None
     provenance: str
+    #: How many tapped reads were already running on this thread when this one started (0 = called
+    #: by the code under record itself). A tapped method that calls another tapped method records
+    #: both; a replay that serves the outer directly must ignore the inner ones. Old records lack
+    #: it and read as 0.
+    tap_depth: int = 0
     schema_version: int = SCHEMA_VERSION
 
     _DATETIME_FIELDS = (

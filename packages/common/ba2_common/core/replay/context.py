@@ -341,6 +341,12 @@ class CaptureContext:
         self._outcome = ReplayStatus.OUTCOME_SKIP
         self._skip_reason = str(skip_reason)
 
+    @property
+    def observation_position(self) -> int:
+        """The ``invocation_seq`` the NEXT recorded observation will get (a monotonic count)."""
+        with self._lock:
+            return self._next_seq
+
     def record_observation(
         self,
         *,
@@ -353,6 +359,7 @@ class CaptureContext:
         fetched_at: Optional[datetime] = None,
         published_at: Optional[datetime] = None,
         first_observed_at: Optional[datetime] = None,
+        tap_depth: int = 0,
     ) -> Optional[str]:
         """Record one provider return at its return boundary (cache hits included).
 
@@ -391,6 +398,7 @@ class CaptureContext:
                 published_at=published_at,
                 first_observed_at=first_observed_at,
                 provenance=provenance,
+                tap_depth=tap_depth,
             )
             pending = PendingObservation(observation=observation, payload=freeze(payload))
             with self._lock:
@@ -458,6 +466,16 @@ class CaptureContext:
                                ValueError(f"unknown analysis phase {phase!r}"))
             return
         self._phase = phase
+
+    @property
+    def clock_read_position(self) -> int:
+        """How many clock reads this context has recorded so far (a monotonic count).
+
+        An option action stores it at entry and at exit (``tape_span.clock_start`` / ``clock_end``)
+        so its replay is handed exactly the reads of its own span, like the observation window.
+        """
+        with self._lock:
+            return len(self._clock_reads)
 
     def record_clock_read(self, value: datetime) -> None:
         try:

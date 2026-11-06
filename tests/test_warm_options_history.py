@@ -732,6 +732,64 @@ def test_the_discovery_cache_is_invalidated_by_a_wider_window(provider, store):
     assert provider.discovered == ["AAPL"]
 
 
+def _synthetic_cache(store, expiries, strikes=(100.0, 105.0)):
+    contracts = [_contract("AAPL", e, k, r) for e in expiries for k in strikes for r in "CP"]
+    store.write_contracts("AAPL", contracts, date(2022, 4, 1), date(2022, 4, 30))
+    return contracts
+
+
+def test_a_synthetic_cache_made_before_the_holiday_shift_gains_the_missing_thursday(
+        provider, store, monkeypatch):
+    """A list cached by the Friday-only grid lacks 2022-04-14; discover() adds it with the
+    cached strike ladder, persists it, and leaves every cached contract untouched."""
+    monkeypatch.setattr(warm, "_price_range",
+                        lambda *a, **k: pytest.fail("the ladder must come from the cache"))
+    old = [date(2022, 4, 1), date(2022, 4, 8), date(2022, 4, 15), date(2022, 4, 22),
+           date(2022, 4, 29)]
+    cached = _synthetic_cache(store, old)
+    ns = warm.parse_args(["--symbols", "AAPL", "--start", "2022-04-01", "--end", "2022-04-30"])
+    got = warm.discover(provider, store, "AAPL", date(2022, 4, 1), date(2022, 4, 30), ns, True)
+    added = [c for c in got if c.expiry == date(2022, 4, 14)]
+    assert sorted((c.option_type, c.strike) for c in added) == [
+        ("call", 100.0), ("call", 105.0), ("put", 100.0), ("put", 105.0)]
+    assert {c.occ_symbol for c in cached} <= {c.occ_symbol for c in got}
+    assert provider.discovered == [], "synthetic discovery must not list the chain"
+    # persisted: a second read already has the Thursday and adds nothing more
+    again = store.read_contracts("AAPL", date(2022, 4, 1), date(2022, 4, 30))
+    assert any(c.expiry == date(2022, 4, 14) for c in again)
+    assert warm._augment_with_calendar_expiries(
+        again, "AAPL", date(2022, 4, 1), date(2022, 4, 30))[1] == []
+
+
+def test_augmenting_a_stale_cache_plans_only_the_new_expiry_not_finished_partitions(
+        provider, store):
+    """COMPLETE/EMPTY partitions stay skipped: after augmentation the only pending expiry is
+    the Thursday, so a repair re-run is not a full re-fetch."""
+    old = [date(2022, 4, 1), date(2022, 4, 8), date(2022, 4, 15), date(2022, 4, 22),
+           date(2022, 4, 29)]
+    _synthetic_cache(store, old)
+    s, e = date(2022, 4, 1), date(2022, 4, 30)
+    for d in old:   # all finished (the holiday Friday EMPTY, like the real store)
+        store.write_partition("AAPL", d, [], s, e,
+                              empty_contracts=[occ_symbol("AAPL", d, "C", 100.0)])
+    ns = warm.parse_args(["--symbols", "AAPL", "--start", "2022-04-01", "--end", "2022-04-30"])
+    plan = warm.build_plan(provider, store, ["AAPL"], s, e, ns, persist=True,
+                           log=lambda _l: None)
+    assert [u.expiry for u in plan.units] == [date(2022, 4, 14)]
+    # wide-min-pending routing: 1 pending is far below the default, so it goes per-expiry
+    wide, narrow = warm.split_by_pending(plan, ns.wide_min_pending)
+    assert wide == [] and [u.expiry for u in narrow.units] == [date(2022, 4, 14)]
+
+
+def test_rest_discovery_cache_is_never_augmented(provider, store):
+    old = [date(2022, 4, 1), date(2022, 4, 15)]
+    _synthetic_cache(store, old)
+    ns = warm.parse_args(["--symbols", "AAPL", "--discovery", "rest",
+                          "--start", "2022-04-01", "--end", "2022-04-30"])
+    got = warm.discover(provider, store, "AAPL", date(2022, 4, 1), date(2022, 4, 30), ns, True)
+    assert {c.expiry for c in got} == set(old)
+
+
 # --------------------------------------------------------------------------- #
 def _files_under(root):
     out = []

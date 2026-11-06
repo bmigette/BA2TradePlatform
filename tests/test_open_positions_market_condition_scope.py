@@ -257,7 +257,8 @@ def test_no_profile_the_real_scope_is_a_strict_no_op(world, dispatcher, instance
     calls_with_scope = list(world["recorder"].calls)
 
     # The real scope really ran and asked THIS expert's setting -- and answered "no profile".
-    assert asked == [world["expert_id"]]
+    # (the replay-capture scope that opens first reads the same setting, so more than once)
+    assert asked and set(asked) == {world["expert_id"]}
     assert live.resolver_for_expert_instance(world["expert_id"]) is None
     assert clock == []                                   # no clock read
     assert [c["decision"] for c in calls_with_scope] == [None]
@@ -734,7 +735,7 @@ def _counting_failing_build(dispatcher, monkeypatch, exc):
 
 def test_after_a_failed_scope_leaves_answer_with_the_guards_cause_and_never_rebuild(
         world, dispatcher, instances, clock, activities, monkeypatch):
-    """I2: the guard's failed attempt is the ONLY resolver build of the pass. Every leaf of that
+    """I2: at most the capture scope's lookup plus the guard's attempt build the resolver. Every leaf of that
     expert then reads no_context with the guard's cause, without retrying the lookup."""
     monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
     instances[world["expert_id"]] = "ohlcv-v1"
@@ -746,7 +747,9 @@ def test_after_a_failed_scope_leaves_answer_with_the_guards_cause_and_never_rebu
     world["recorder"].leaf = _two_leaves
     result = _run_with(world["expert_id"], _LogSpy())
 
-    assert len(builds) == 1                                  # the guard's attempt, nothing more
+    # The replay-capture scope (opened first) looks the resolver up once and fails; the guard then
+    # makes its own attempt. Nothing more: in particular no retry per leaf.
+    assert len(builds) == 2
     (call,) = world["recorder"].calls
     expected = live.no_scope_open_reason(world["expert_id"], "RuntimeError: reader build failed",
                                          live.UNRESOLVED_SCOPE_FAILED)
@@ -1041,3 +1044,40 @@ def test_a_leaf_evaluation_error_in_a_bare_scope_still_raises(dispatcher, instan
         _break_reader(monkeypatch, "raise")
         with pytest.raises(RuntimeError, match="reader exploded"):
             _eval_leaf(ExpertEventType.N_UNDERLYING_ADX, _rec_for(4))
+
+
+# --------------------------------------------------------------------------- recorder failure on exits
+def test_a_capture_reader_failure_in_the_exit_pass_leaves_the_exits_running(
+        world, dispatcher, instances, clock, monkeypatch):
+    """The exit pass opens a REAL capture scope for a gated expert, so ``begin_decision`` reaches
+    ``capturing_reader_for``. When that raises (a recorder defect) the exits still run, the gate is
+    still read from the live reader (status valid, not no_context) and the failure is counted."""
+    import ba2_common.core.market_condition_readers as readers
+    import ba2_common.core.replay as replay_pkg
+    from ba2_common.core.replay.context import CaptureHealth
+
+    submitted = []
+
+    class _Store:
+        health = CaptureHealth()
+
+        def current_session_id(self):
+            return "s1"
+
+        def submit(self, record, objects=None, observations=()):
+            submitted.append(record)
+
+    def _boom(*a, **k):
+        raise RuntimeError("recorder defect")
+
+    monkeypatch.setattr(replay_pkg, "get_replay_store", lambda: _Store())
+    monkeypatch.setattr(readers, "capturing_reader_for", _boom)
+    instances[world["expert_id"]] = "ohlcv-v1"
+    world["recorder"].leaf = _adx_leaf
+
+    result = _run(world["expert_id"])
+
+    assert result == [{"success": True, "symbol": SYMBOL, "submit_to_broker": True}]
+    (call,) = world["recorder"].calls
+    assert call["leaf"]["status"] == STATUS_VALID and call["leaf"]["passed"] is True
+    assert submitted and submitted[0].capture_failures   # counted on the pass's record

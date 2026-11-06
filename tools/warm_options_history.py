@@ -527,6 +527,10 @@ def discover(provider, store: OptionHistoryParquetStore, underlying: str,
     """
     cached = store.read_contracts(underlying, start, end)
     if cached is not None:
+        if ns.discovery == "synthetic":
+            cached, added = _augment_with_calendar_expiries(cached, underlying, start, end)
+            if added and persist:
+                store.write_contracts(underlying, cached, start, end)
         return cached
     if ns.discovery == "synthetic":
         contracts = _synthetic_contracts(underlying, start, end, ns)
@@ -550,6 +554,55 @@ def discover(provider, store: OptionHistoryParquetStore, underlying: str,
     if persist:
         store.write_contracts(underlying, contracts, start, end)
     return contracts
+
+
+def _augment_with_calendar_expiries(
+        cached: List[OptionContractMeta], underlying: str, start: date, end: date,
+) -> Tuple[List[OptionContractMeta], List[date]]:
+    """A cached SYNTHETIC contract list plus the calendar expiries it lacks.
+
+    WHY AUGMENT RATHER THAN INVALIDATE. ``store.read_contracts`` is keyed on (underlying,
+    start, end), so a list cached before ``expiry_calendar`` learned the holiday shift (Good
+    Friday 2024-03-29 -> Thursday 2024-03-28, 2025-04-18 -> 2025-04-17, ...) never contains
+    those Thursdays, and a re-run would plan nothing new for it. Two ways to fix that:
+
+      * bump the cache schema so old lists are rejected and discovery runs again. That also
+        throws away the strike ladder, which is sized from the LOCAL OHLCV parquet and may no
+        longer be reproducible identically (the OHLCV cache has been rebuilt since); a changed
+        ladder would change every expiry's contract list and make already COMPLETE partitions
+        look different from what the plan now says they should hold.
+      * (chosen) keep the cached list untouched and add ONLY the calendar expiries missing
+        from it, with the strike ladder the cache already uses. Nothing previously planned
+        changes, so ``build_plan`` still skips every COMPLETE/EMPTY partition; the only new
+        pending work is the missing Thursdays. The ladder is read off the cached expiry with
+        the most contracts (every synthetic expiry carries the same ladder; the fullest one is
+        robust to a truncated edge expiry).
+
+    Only called for ``--discovery synthetic``: a REST listing is the vendor's own and already
+    contains whatever really exists. Stale holiday FRIDAYS stay in the cached list; they are
+    EMPTY partitions in any store built by the old code, so ``build_plan`` skips them.
+
+    Returns ``(contracts, added_expiries)``; ``added_expiries`` is empty when the cache is
+    already current (the common case, and then ``contracts`` is the input list unchanged).
+    """
+    from ba2_providers.options.tastytrade import (
+        expiry_calendar, monthly_expiry_calendar, occ_symbol, parse_occ,
+    )
+    have: Dict[date, List[OptionContractMeta]] = {}
+    for c in cached:
+        have.setdefault(c.expiry, []).append(c)
+    wanted = set(expiry_calendar(start, end)) | set(monthly_expiry_calendar(start, end))
+    missing = sorted(wanted - set(have))
+    if not missing or not have:
+        return cached, []
+    template = max(have.values(), key=len)
+    ladder = sorted({("C" if c.option_type == "call" else "P", c.strike) for c in template},
+                    key=lambda t: (t[1], t[0]))
+    out = list(cached)
+    for expiry in missing:
+        for right, strike in ladder:
+            out.append(parse_occ(occ_symbol(underlying, expiry, right, strike)))
+    return out, missing
 
 
 def _synthetic_contracts(underlying: str, start: date, end: date,
@@ -964,6 +1017,56 @@ def window_slices(start: date, end: date, years: float) -> List[Tuple[date, date
     return out or [(start, end)]
 
 
+#: Expiries named in one ``_log_unplanned`` line before it elides the rest (a liquid name with
+#: Mon/Wed weeklies could otherwise print hundreds); the COUNT in the line is always complete.
+_UNPLANNED_LISTED = 12
+
+
+def _note_unplanned_bar(expiry: Optional[date], unplanned: Dict[Optional[date], int],
+                        finished: Dict[date, bool], store: OptionHistoryParquetStore,
+                        underlying: str, start: date, end: date) -> None:
+    """Account for a wide-stream bar whose expiry is not in ``pending`` -- never silently.
+
+    Dropping such a bar is correct when its partition is already finished (COMPLETE/EMPTY on
+    disk, or flushed earlier in this run): that is the resume behaviour. It is NOT correct to
+    drop it quietly when NO partition is owed or finished for that expiry -- the plan never
+    knew the expiry, and the vendor is telling us it exists. That is exactly how every
+    holiday-Thursday expiry (2022-04-14, 2025-04-17, ...) was downloaded and thrown away for
+    the whole 2020-2025 backfill: the Friday-only expiry grid never proposed it and the loop
+    below just ``continue``d. Such bars are counted per expiry (``None`` = unparseable OCC id)
+    and ``_log_unplanned`` reports them as one loud line per symbol.
+    """
+    if expiry is not None:
+        if not (start <= expiry <= end):
+            # Outside the run's expiry window (e.g. 2026-27 LEAPS that already traded inside a
+            # 2020-2025 window): this run never claimed to cover them, so not a missed plan.
+            return
+        done = finished.get(expiry)
+        if done is None:
+            done = store.partition_state(underlying, expiry, start, end) in (
+                PartitionState.COMPLETE, PartitionState.EMPTY)
+            finished[expiry] = done
+        if done:
+            return
+    unplanned[expiry] = unplanned.get(expiry, 0) + 1
+
+
+def _log_unplanned(underlying: str, unplanned: Dict[Optional[date], int],
+                   log: Callable[[str], None]) -> None:
+    """One loud line per symbol for bars the plan never owed (see ``_note_unplanned_bar``)."""
+    if not unplanned:
+        return
+    items = sorted(unplanned.items(), key=lambda kv: (kv[0] is None, kv[0]))
+    parts = [f"{'<unparseable id>' if e is None else e.isoformat()}={n}"
+             for e, n in items[:_UNPLANNED_LISTED]]
+    if len(items) > _UNPLANNED_LISTED:
+        parts.append(f"... +{len(items) - _UNPLANNED_LISTED} more expiries")
+    log(f"  [{underlying}] WARNING: {sum(unplanned.values())} bar(s) DROPPED for "
+        f"{len(unplanned)} expiry(ies) the plan does not owe and the store has not finished "
+        f"(the discovery/expiry grid does not know them; the data was streamed and discarded): "
+        f"{', '.join(parts)}")
+
+
 def run_symbol_units(units: Sequence[SymbolUnit], provider,
                      store: OptionHistoryParquetStore, start: date, end: date,
                      ns: argparse.Namespace, *, clock: Callable[[], datetime],
@@ -1011,6 +1114,10 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
         pending = set(unit.pending_expiries)
 
         by_expiry: Dict[date, List[OptionEodBar]] = {}
+        # Bars dropped because their expiry is neither owed nor finished (see
+        # _note_unplanned_bar); `finished` memoises the per-expiry store lookup.
+        unplanned: Dict[Optional[date], int] = {}
+        finished: Dict[date, bool] = {}
         completed = False
         backoff = ns.backoff
 
@@ -1033,6 +1140,7 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
 
         for attempt in range(1, max(1, ns.max_retries) + 1):
             by_expiry = {}
+            unplanned.clear()
             high_water: Optional[date] = None
             bars_seen = 0
             try:
@@ -1041,9 +1149,12 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                     bars_seen += 1
                     expiry = parse_occ_expiry(bar.occ_symbol)
                     if expiry is None or expiry not in pending:
-                        # Not a partition this run owes: unparseable, already COMPLETE/EMPTY
-                        # in the store, or already flushed above. Dropping it here is what
-                        # keeps a resumed run from rewriting partitions it has finished.
+                        # Not a partition this run owes: already COMPLETE/EMPTY in the store
+                        # or already flushed above (dropped quietly -- that is what keeps a
+                        # resumed run from rewriting finished partitions), OR an expiry the
+                        # plan never knew / an unparseable id (counted, reported loudly).
+                        _note_unplanned_bar(expiry, unplanned, finished, store,
+                                            unit.underlying, start, end)
                         continue
                     by_expiry.setdefault(expiry, []).append(bar)
                     if high_water is None or bar.bar_date > high_water:
@@ -1100,6 +1211,7 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                 log(f"  [{unit.underlying}] wide request exhausted with {len(pending)} "
                     f"partition(s) owed; retrying in {len(slices)} narrower window(s)")
                 by_expiry = {}
+                unplanned.clear()      # the narrow walk re-streams from the start
                 high_water = None
                 salvaged = True
                 narrow_bars_seen = 0
@@ -1115,6 +1227,8 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                                 window_bars += 1
                                 expiry = parse_occ_expiry(bar.occ_symbol)
                                 if expiry is None or expiry not in pending:
+                                    _note_unplanned_bar(expiry, unplanned, finished, store,
+                                                        unit.underlying, start, end)
                                     continue
                                 by_expiry.setdefault(expiry, []).append(bar)
                                 if high_water is None or bar.bar_date > high_water:
@@ -1193,6 +1307,8 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
                 completed = salvaged
                 if completed:
                     log(f"  [{unit.underlying}] recovered via narrow windows")
+
+        _log_unplanned(unit.underlying, unplanned, log)
 
         if not completed:
             # Whatever the flush already wrote is durable and is NOT counted as failed --

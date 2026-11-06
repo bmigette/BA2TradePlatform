@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
 from ba2_common.core.option_lifecycle import PMCC_ROLL_STRATEGY
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
+from ba2_common.core.replay.option_taps import tap_option_methods
 from ba2_common.core.types import OptionRight
 
 #: Marker carried by EVERY assignment-capacity refusal, so it can be told apart from a
@@ -194,6 +195,12 @@ class OptionsAccountInterface(ABC):
     """Mixin granting an AccountInterface subclass option-trading capability."""
 
     supports_options: bool = True
+
+    def __init_subclass__(cls, **kwargs):
+        # Replay capture: every concrete account OVERRIDES the option reads, so the taps are
+        # applied per subclass (see ba2_common.core.replay.option_taps for the MRO rules).
+        super().__init_subclass__(**kwargs)
+        tap_option_methods(cls)
 
     #: WHERE THIS ACCOUNT'S CHAIN GREEKS COME FROM, recorded verbatim on every leg of an option
     #: ``entry_record`` (``option_trade_record``, BT/live parity Part C) so a live-vs-backtest
@@ -3102,3 +3109,8 @@ class OptionsAccountInterface(ABC):
                 f"multiplier={multiplier!r} — an unpriceable obligation must not be "
                 f"admitted as a free one.")
         return self.assignment_capacity(cost)
+
+
+# The concrete sizing helpers defined ON the interface are tapped here; __init_subclass__
+# only runs for subclasses.
+tap_option_methods(OptionsAccountInterface)

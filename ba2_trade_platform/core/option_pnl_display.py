@@ -68,6 +68,11 @@ class QuoteCachingAccount(OptionsAccountInterface):
     same contract, and one account's quote is not the other's.
     """
 
+    #: Opt out of the replay option taps (OptionsAccountInterface.__init_subclass__): this class only
+    #: delegates to / caches for the wrapped account, which records its own reads. Tapping the
+    #: wrapper too would record every display quote a second time under the wrapper's name.
+    _replay_taps_exempt = True
+
     #: Attributes that stay LOCAL to the wrapper; everything else is forwarded to the wrapped
     #: account. `__getattr__` alone is NOT enough: a method the ABC itself defines (abstract or
     #: concrete) is found by ordinary lookup and would run the ABC's own body against the

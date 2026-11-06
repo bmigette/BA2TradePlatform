@@ -107,9 +107,12 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 # StaleAnchorPrice (``ba2_common.core.knowability``, 2026-10-07): a TP/SL/size builder was handed a
 # price that is not the decision price on an intraday clock. Absorbed it becomes 'quantity 0' or a
 # quietly failed action, i.e. a silently wrong decision.
+# ReplayMiss (``ba2_common.core.replay.context``, 2026-11-05): a replay needed a recorded value the
+# bundle does not hold. Absorbed, the replayed code would run on a fallback and report a match it
+# did not earn. A miss is a coverage fact and must reach the replay harness, in every mode.
 _NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch",
                                  "MacroAvailabilityUnknown", "OHLCVTopUpRefused",
-                                 "StaleAnchorPrice"})
+                                 "StaleAnchorPrice", "ReplayMiss"})
 
 
 def is_never_absorbed(exc: BaseException) -> bool:

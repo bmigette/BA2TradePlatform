@@ -687,9 +687,17 @@ class LiveMarketConditionResolver:
 
             # Per-profile capture for a multi-profile (composite) reader -- see
             # capturing_reader_for; one wrapper around the composite aborted the entry pass.
-            capturing, recorder = capturing_reader_for(
-                self.reader, capture, source_profile=self.source_profile,
-                timing_policy=TIMING_POLICY_PRIOR_SESSION_V1)
+            try:
+                capturing, recorder = capturing_reader_for(
+                    self.reader, capture, source_profile=self.source_profile,
+                    timing_policy=TIMING_POLICY_PRIOR_SESSION_V1)
+            except Exception as exc:  # noqa: BLE001 -- RECORDING IS NOT A DEPENDENCY
+                # The exit pass of an option expert reaches this branch too, and no recorder
+                # defect may stop a stop-loss or skip an entry's gate: count it (CaptureHealth +
+                # one ERROR), serve the live reader unwrapped. A replay of this pass then has no
+                # windows and reports a typed ReplayMiss -- honest, never a false match.
+                capture.note_failure("market-condition capture reader not built", exc)
+                return DecisionState(resolver=self, decision_time=decision_time, reader=self.reader)
             return DecisionState(resolver=self, decision_time=decision_time, reader=capturing,
                                  recorder=recorder)
         return DecisionState(resolver=self, decision_time=decision_time, reader=self.reader)

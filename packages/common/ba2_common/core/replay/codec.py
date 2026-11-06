@@ -81,6 +81,7 @@ _TAGS = (
     "$decimal",
     "$np",
     "$frame",
+    "$tuple",
 )
 
 __all__ = [
@@ -250,6 +251,11 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
         return obj
     if isinstance(obj, list):
         return [_encode_value(item, f"{path}[{i}]", sides, seen) for i, item in enumerate(obj)]
+    if type(obj) is tuple:
+        # A plain tuple only (a namedtuple would come back as a different type). Needed by the
+        # broker verdict dataclasses, e.g. AssignmentCapacity.unmeasurable: Tuple[str, ...].
+        return {"$tuple": [_encode_value(item, f"{path}[{i}]", sides, seen)
+                           for i, item in enumerate(obj)]}
     if isinstance(obj, dict):
         out: Dict[str, Any] = {}
         for key, value in obj.items():
@@ -451,6 +457,8 @@ def _decode_tag(tag: str, value: Any, frames: FrameSource) -> Any:
         return _decode_enum(value)
     if tag == "$dataclass":
         return _decode_dataclass(value, frames)
+    if tag == "$tuple":
+        return tuple(_decode_value(item, frames) for item in value)
     if tag == "$float":
         return float(value)
     if tag == "$nat":
