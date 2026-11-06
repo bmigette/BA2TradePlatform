@@ -86,6 +86,19 @@ ERROR log naming the transaction. Never read as zero (no silent failure).
 
 ## Release
 
-GA-affecting: `ba2_common` PACKAGE_VERSION bump and minimum raised in
-`required_package_versions.py`; merge only at a job boundary (not while P50k / any master is mid-job).
-Live instances get the condition only where a deployed rule contains the leaf.
+NOT GA-affecting for any existing job (owner, 2026-11-06): the condition is opt-in per style and
+absent from every current style, and every new code path is inert unless a `structure_share` leaf
+is present (no cache is built, `_PendingCharge.entry_tag` stays None and `record_submitted` is
+called exactly as before, the evaluator's tag injection is a no-op for a rule without the leaf).
+So:
+
+- bump `ba2_common` PACKAGE_VERSION (+ pyproject) and `TEST_APP_VERSION` (testplatform changed;
+  the TEST bump is what makes workers sync for job C);
+- do NOT raise the `ba2_common` minimum in `testplatform/required_package_versions.py`
+  (`tools/check_package_versions.py` accepts a TEST bump instead);
+- tests prove the neutrality: rules and genes of styles `mid` and `premium` are byte-identical to a
+  golden captured before the change, the new fields never change an `admit_option_entry` verdict or
+  rail input, and the evaluator injection is a no-op without the leaf.
+
+Merge at a job boundary anyway (not while P50k / any master is mid-job): the TEST bump makes every
+worker re-sync. Live instances get the condition only where a deployed rule contains the leaf.
