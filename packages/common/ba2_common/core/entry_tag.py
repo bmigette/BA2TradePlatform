@@ -102,3 +102,23 @@ def order_entry_tag(order: Any) -> Optional[int]:
         return coerce_entry_tag(raw)
     except ValueError as e:
         raise ValueError(f"order {getattr(order, 'id', None)}: stored {e}") from e
+
+
+def entry_tag_of_actions(actions: Any) -> Optional[int]:
+    """The member tag an EventAction's ``actions`` dict carries, or None.
+
+    Reads the ``entry_tag`` key of each action config (``rules_convert`` / ``action_from_rule``
+    write the authored ``option_entry_tag`` there, and the evaluator forwards it to the entry
+    action). Used by conditions that must know WHICH member their own rule opens
+    (``StructureShareCondition``). Distinct tags on one rule are refused: the condition could
+    not tell which member's share to measure.
+    """
+    if not isinstance(actions, dict):
+        return None
+    tags = set()
+    for cfg in actions.values():
+        if isinstance(cfg, dict) and cfg.get(ORDER_ENTRY_TAG_KEY) is not None:
+            tags.add(coerce_entry_tag(cfg[ORDER_ENTRY_TAG_KEY]))
+    if len(tags) > 1:
+        raise ValueError(f"entry actions of one rule disagree on entry_tag: {sorted(tags)}")
+    return next(iter(tags), None)

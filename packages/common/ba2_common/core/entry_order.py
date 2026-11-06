@@ -140,3 +140,17 @@ def oldest_entry_order(transactions: Iterable[Any], *, session=None) -> Optional
             f"P&L / days-opened / entry_tag condition would read False and a style member's "
             f"exit could never close it")
     return order
+
+
+def transaction_entry_tag(transaction_id: Any) -> Optional[int]:
+    """The style-member tag of ``transaction_id``'s position (stamped on its entry order), or None.
+
+    ONE definition for both runtimes: ``entry_order_for_transaction`` reads through
+    ``trade_store.orders_where`` (the backtest's in-mem store, else SQLite), and the tag is read
+    back with ``entry_tag.order_entry_tag`` -- the same two calls ``AlpacaAccount.
+    _position_entry_tag`` makes via ``TradeManager.resolve_entry_order``. No entry order or an
+    untagged one -> None; a stored value no entry could have written RAISES (``ValueError``).
+    """
+    from ba2_common.core.entry_tag import order_entry_tag
+
+    return order_entry_tag(entry_order_for_transaction(transaction_id))
