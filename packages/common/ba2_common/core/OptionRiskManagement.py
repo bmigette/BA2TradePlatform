@@ -710,28 +710,53 @@ _PENDING: Dict[Tuple[Optional[int], int], List[_PendingCharge]] = {}
 #: 2026-11-06). Same key and same lock as _PENDING; cleared by the same run-boundary resets.
 #: (``_ShareCache`` is defined with the share section below; annotations are lazy.)
 _SHARE_CACHE: Dict[Tuple[Optional[int], int], _ShareCache] = {}
-#: A monotonic generation, NEVER reset: bumped by every TAGGED submission and by every run-
-#: boundary reset. A build that observed a different value when it finished is discarded (a
-#: concurrent record_submitted would otherwise be lost between its pending snapshot and the
-#: store, and a build that straddled a reset would store state the reset meant to forget).
-#: Untagged submissions never touch it. Process-wide on purpose: a sibling's bump costs at most
-#: one retry, never a wrong answer (a clearable per-key counter could return to a value a
-#: stale build had already read).
-_SHARE_GEN = 0
+#: Per-sleeve-key share generation, NEVER cleared (so a stale build can never see its old value
+#: come back: no ABA). Bumped by every TAGGED submission and by every reset of that key. A build
+#: that observed a different value for ITS key when it finished is discarded (a concurrent
+#: record_submitted would otherwise be lost between its pending snapshot and the store, and a
+#: build that straddled a reset would store state the reset meant to forget). Per key, so one
+#: trial's submissions and resets never invalidate another thread's builds. Untagged
+#: submissions never touch it.
+_SHARE_GENS: Dict[Tuple[Optional[int], int], int] = {}
+#: One re-entrant lock per sleeve key (never removed), taken by the raced-build fallback and by
+#: every writer of that key's share state, so the locked build sees every submission while no
+#: OTHER sleeve is ever blocked. Lock order: a key lock first, ``_STATE_LOCK`` (short dict
+#: access only) inside it; never the reverse.
+_SHARE_KEY_LOCKS: Dict[Tuple[Optional[int], int], Any] = {}
 
 
-def _bump_share_gen() -> None:
-    global _SHARE_GEN
+def _share_key_lock(key: Tuple[Optional[int], int]):
     with _STATE_LOCK:
-        _SHARE_GEN += 1
+        lock = _SHARE_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = _SHARE_KEY_LOCKS[key] = threading.RLock()
+        return lock
+
+
+def _bump_share_gen(key: Tuple[Optional[int], int]) -> None:
+    with _STATE_LOCK:
+        _SHARE_GENS[key] = _SHARE_GENS.get(key, 0) + 1
+
+
+def _reset_share_keys(keys) -> None:
+    """Forget pending charges and the share cache of ``keys``, one key lock at a time, bumping
+    each key's generation so a build in flight for it is discarded."""
+    for key in keys:
+        with _share_key_lock(key):
+            with _STATE_LOCK:
+                _PENDING.pop(key, None)
+                _SHARE_CACHE.pop(key, None)
+            _bump_share_gen(key)
+
+
+def _all_share_keys() -> List[Tuple[Optional[int], int]]:
+    with _STATE_LOCK:
+        return list(set(_PENDING) | set(_SHARE_CACHE) | set(_SHARE_GENS))
 
 
 def reset_pending_charges() -> None:
     """Forget every sleeve's in-flight charges. Tests, and a fresh backtest."""
-    with _STATE_LOCK:
-        _PENDING.clear()
-        _SHARE_CACHE.clear()
-        _bump_share_gen()
+    _reset_share_keys(_all_share_keys())
 
 
 def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
@@ -747,21 +772,30 @@ def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
     `entry_tag` (tagged style entries only) also feeds the per-member share cache
     (:func:`_note_submission`); an untagged entry never touches it."""
     key = _sleeve_key(expert_instance_id)
-    with _STATE_LOCK:
-        charges = _PENDING.setdefault(key, [])
-        charges.append(_PendingCharge(transaction_id, candidate, entry_tag))
-        if len(charges) > _PENDING_LIMIT:
-            del charges[:-_PENDING_LIMIT]
-        if entry_tag is not None:
+    if entry_tag is None:
+        with _STATE_LOCK:
+            _record_pending(key, transaction_id, candidate, entry_tag)
+        return
+    # Tagged: under the key's lock, so a locked fallback build (member_share) sees this charge.
+    with _share_key_lock(key):
+        with _STATE_LOCK:
+            _record_pending(key, transaction_id, candidate, entry_tag)
             _note_submission(key, entry_tag, candidate)
+
+
+def _record_pending(key, transaction_id, candidate, entry_tag) -> None:
+    charges = _PENDING.setdefault(key, [])
+    charges.append(_PendingCharge(transaction_id, candidate, entry_tag))
+    if len(charges) > _PENDING_LIMIT:
+        del charges[:-_PENDING_LIMIT]
 
 
 def _note_submission(key: Tuple[Optional[int], int], entry_tag: int,
                      candidate: CandidateStructure) -> None:
-    """Called under _STATE_LOCK by :func:`record_submitted` for a TAGGED entry: bump the epoch
+    """Called under _STATE_LOCK by :func:`record_submitted` for a TAGGED entry: bump the share generation
     and add the admitted candidate's max loss to the cached total of its tag, so the next
     symbol of this cycle sees it. A covered call adds nothing (see _build_share_cache)."""
-    _bump_share_gen()
+    _SHARE_GENS[key] = _SHARE_GENS.get(key, 0) + 1
     cache = _SHARE_CACHE.get(key)
     if cache is None or candidate.strategy == COVERED_CALL_STRATEGY:
         return
@@ -976,9 +1010,10 @@ def reset_thread_state() -> None:
     # would buy nothing and would put the lock in two places, leaving the one that actually
     # guards the iteration (``_clear_this_threads_keys``) removable without a test noticing.
     _clear_this_threads_keys(_BREAKER_STATE)
-    _clear_this_threads_keys(_PENDING)
-    _clear_this_threads_keys(_SHARE_CACHE)
-    _bump_share_gen()          # a share build that straddles this boundary must not be stored
+    me = threading.get_ident()
+    # pending charges + share cache of this thread's keys, under each key's lock, bumping the
+    # key's generation (a share build that straddles this boundary must not be stored)
+    _reset_share_keys([k for k in _all_share_keys() if k[0] == me])
     _clear_this_threads_keys(_JOURNAL)
 
 
@@ -1281,20 +1316,25 @@ def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -
             cache = _SHARE_CACHE.get(key)
             if cache is not None and cache.stamp == as_of:
                 return _share_view(cache, entry_tag)
-            generation = _SHARE_GEN
+            generation = _SHARE_GENS.setdefault(key, 0)
         built = _build_share_cache(account, expert_instance_id, as_of)   # I/O outside the lock
         with _STATE_LOCK:
-            if _SHARE_GEN == generation:
+            if _SHARE_GENS.get(key, 0) == generation:
                 _SHARE_CACHE[key] = built
                 return _share_view(built, entry_tag)
     # Three optimistic builds each lost a race. Never answer from a stale build (it could miss a
-    # submission): build once more UNDER the lock. Every record_submitted and reset takes the
-    # same re-entrant lock, so none can interleave and the result holds every recorded charge.
-    with _STATE_LOCK:
-        cache = _SHARE_CACHE.get(key)
-        if cache is None or cache.stamp != as_of:
+    # submission): build once more under THIS SLEEVE's lock. Every tagged record_submitted and
+    # every reset of this key takes the same re-entrant lock, so none can interleave and the
+    # result holds every recorded charge; other sleeves are never blocked, and the global
+    # _STATE_LOCK is NOT held across the DB reads / broker snapshot of the build.
+    with _share_key_lock(key):
+        with _STATE_LOCK:
+            cache = _SHARE_CACHE.get(key)
+            usable = cache is not None and cache.stamp == as_of
+        if not usable:
             cache = _build_share_cache(account, expert_instance_id, as_of)
-            _SHARE_CACHE[key] = cache
+            with _STATE_LOCK:
+                _SHARE_CACHE[key] = cache
         return _share_view(cache, entry_tag)
 
 

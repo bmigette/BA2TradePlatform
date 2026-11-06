@@ -206,13 +206,13 @@ def test_an_admitted_entry_is_seen_by_the_next_symbol_of_the_same_cycle(world):
 def test_a_tagged_record_submitted_increments_the_cached_tag_total_untagged_does_not(world):
     key = rm._sleeve_key(EID)
     share(world, CSP, T1)
-    gen0 = rm._SHARE_GEN
+    gen0 = rm._SHARE_GENS[key]
     assert rm._SHARE_CACHE[key].committed.get(CSP, 0.0) == 0.0
     rm.record_submitted(EID, 700, cand(5_000.0), entry_tag=CSP)
     assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0          # the cached total moved
     rm.record_submitted(EID, 701, cand(9_000.0))                   # untagged: nothing moves
     assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0
-    assert rm._SHARE_GEN - gen0 == 1                               # only the tagged one bumped
+    assert rm._SHARE_GENS[key] - gen0 == 1                               # only the tagged one bumped
 
 
 def test_the_increment_goes_to_its_own_tag_only(world):
@@ -228,9 +228,9 @@ def test_a_submitted_covered_call_does_not_move_the_cache(world):
 
 
 def test_an_untagged_submission_touches_no_share_state(world):
-    gen0 = rm._SHARE_GEN
+    gens0 = dict(rm._SHARE_GENS)
     rm.record_submitted(EID, 702, cand(5_000.0))
-    assert rm._SHARE_CACHE == {} and rm._SHARE_GEN == gen0
+    assert rm._SHARE_CACHE == {} and rm._SHARE_GENS == gens0
 
 
 def test_a_submission_that_raced_a_build_is_not_lost(world, monkeypatch):
@@ -250,6 +250,50 @@ def test_a_submission_that_raced_a_build_is_not_lost(world, monkeypatch):
     assert share(world, CSP, T1).committed == 4_000.0
     assert share(world, CSP, T1).committed == 4_000.0       # and it stays
     assert world.reads == 2                                  # first build discarded, second kept
+
+
+def test_a_submission_on_another_sleeve_does_not_invalidate_a_build(world, monkeypatch):
+    """Generations are per sleeve key: a tagged submission on ANOTHER expert's sleeve landing
+    mid-build must not make this build be discarded and redone."""
+    real = rm._prune_pending_charges
+    fired = []
+
+    def racing(eid, structures):
+        out = real(eid, structures)
+        if not fired:
+            fired.append(1)
+            rm.record_submitted(EID + 1, 704, cand(4_000.0), entry_tag=CSP)   # other sleeve
+        return out
+
+    monkeypatch.setattr(rm, "_prune_pending_charges", racing)
+    assert share(world, CSP, T1).committed == 0.0
+    assert world.reads == 1                                  # kept, not redone
+
+
+def test_the_fallback_build_does_not_hold_the_global_state_lock(world, monkeypatch):
+    """The locked fallback build does its I/O under the sleeve's own lock, never under
+    _STATE_LOCK: another thread must be able to take _STATE_LOCK while it runs."""
+    real = rm._prune_pending_charges
+    n, got = [], {}
+
+    def racing(eid, structures):
+        out = real(eid, structures)
+        n.append(1)
+        if len(n) <= 3:
+            rm.record_submitted(EID, 810 + len(n), cand(1_000.0), entry_tag=CSP)
+        elif len(n) == 4:                                    # inside the fallback build
+            def probe():
+                got["ok"] = rm._STATE_LOCK.acquire(timeout=2)
+                if got["ok"]:
+                    rm._STATE_LOCK.release()
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+        return out
+
+    monkeypatch.setattr(rm, "_prune_pending_charges", racing)
+    assert share(world, CSP, T1).committed == 3_000.0
+    assert got.get("ok") is True
 
 
 def test_persistent_races_never_fail_open(world, monkeypatch):

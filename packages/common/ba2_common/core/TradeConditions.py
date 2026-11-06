@@ -3521,6 +3521,8 @@ class StructureShareCondition(CompareCondition):
         """Called by the evaluator with the EventAction this condition belongs to."""
         from ba2_common.core.entry_tag import entry_tag_of_actions
 
+        # A rule whose entry actions disagree on the tag raises ValueError here ON PURPOSE: it is
+        # a builder bug, enforce mode wants it loud, and it aborts that rule's evaluation.
         self.rule_entry_tag = entry_tag_of_actions(getattr(event_action, "actions", None))
 
     def evaluate(self) -> bool:
