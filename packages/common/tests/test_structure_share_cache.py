@@ -174,3 +174,114 @@ def test_unusable_equity_is_unknown_never_a_share(world, equity):
 def test_a_decision_time_is_required(world):
     with pytest.raises(ValueError, match="decision time"):
         rm.member_share(world.account, EID, CSP, None)
+
+
+# ------------------------------------------------------------------ the cache (Task 4)
+def test_one_cycle_reads_the_book_once(world):
+    world.structures, world.tags = [short_put(1)], {1: CSP}
+    share(world, CSP, T1)
+    share(world, CBS, T1)
+    share(world, CSP, T1)
+    assert world.reads == 1
+
+
+def test_a_new_decision_time_rebuilds_from_the_book(world):
+    world.structures, world.tags = [short_put(1)], {1: CSP}
+    assert share(world, CSP, T1).committed == 10_000.0
+    world.structures.append(short_put(2, strike=50.0))
+    world.tags[2] = CSP
+    assert share(world, CSP, T1).committed == 10_000.0     # same cycle: cached
+    assert share(world, CSP, T2).committed == 15_000.0     # next cycle: rebuilt, no drift
+    assert world.reads == 2
+
+
+def test_an_admitted_entry_is_seen_by_the_next_symbol_of_the_same_cycle(world):
+    assert share(world, CSP, T1).committed == 0.0
+    rm.record_submitted(EID, 700, cand(5_000.0), entry_tag=CSP)
+    r = share(world, CSP, T1)
+    assert r.committed == 5_000.0 and r.share_pct == pytest.approx(5.0)
+    assert world.reads == 1                                 # incremented, not rebuilt
+
+
+def test_a_tagged_record_submitted_increments_the_cached_tag_total_untagged_does_not(world):
+    key = rm._sleeve_key(EID)
+    share(world, CSP, T1)
+    assert rm._SHARE_CACHE[key].committed.get(CSP, 0.0) == 0.0
+    rm.record_submitted(EID, 700, cand(5_000.0), entry_tag=CSP)
+    assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0          # the cached total moved
+    rm.record_submitted(EID, 701, cand(9_000.0))                   # untagged: nothing moves
+    assert rm._SHARE_CACHE[key].committed[CSP] == 5_000.0
+    assert rm._SHARE_EPOCH[key] == 1
+
+
+def test_the_increment_goes_to_its_own_tag_only(world):
+    share(world, CSP, T1)
+    rm.record_submitted(EID, 700, cand(5_000.0), entry_tag=CSP)
+    assert share(world, CBS, T1).committed == 0.0
+
+
+def test_a_submitted_covered_call_does_not_move_the_cache(world):
+    share(world, WHEEL, T1)
+    rm.record_submitted(EID, 701, cand(11_000.0, "covered_call"), entry_tag=WHEEL)
+    assert share(world, WHEEL, T1).committed == 0.0
+
+
+def test_an_untagged_submission_touches_no_share_state(world):
+    rm.record_submitted(EID, 702, cand(5_000.0))
+    assert rm._SHARE_CACHE == {} and rm._SHARE_EPOCH == {}
+
+
+def test_a_submission_that_raced_a_build_is_not_lost(world, monkeypatch):
+    """A record_submitted landing AFTER the build read its pending snapshot but BEFORE the
+    cache was stored must not vanish: the build is not stored and is redone."""
+    real = rm._prune_pending_charges
+    fired = []
+
+    def racing(eid, structures):
+        out = real(eid, structures)
+        if not fired:
+            fired.append(1)
+            rm.record_submitted(EID, 703, cand(4_000.0), entry_tag=CSP)
+        return out
+
+    monkeypatch.setattr(rm, "_prune_pending_charges", racing)
+    assert share(world, CSP, T1).committed == 4_000.0
+    assert share(world, CSP, T1).committed == 4_000.0       # and it stays
+    assert world.reads == 2                                  # first build discarded, second kept
+
+
+@pytest.mark.parametrize("reset", [rm.reset_state, rm.reset_pending_charges,
+                                   rm.reset_thread_state])
+def test_the_run_boundary_resets_clear_the_cache(world, monkeypatch, reset):
+    # backtest-shaped key so reset_thread_state sees this thread's keys
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+    share(world, CSP, T1)
+    assert rm._SHARE_CACHE
+    reset()
+    assert rm._SHARE_CACHE == {}
+
+
+def test_each_backtest_thread_has_its_own_cache(world, monkeypatch):
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+    share(world, CSP, T1)
+    main_keys = set(rm._SHARE_CACHE)
+    seen = {}
+
+    def other():
+        share(world, CSP, T1)
+        seen["both"] = set(rm._SHARE_CACHE)
+        rm.reset_thread_state()                 # only THIS thread's key
+        seen["after"] = set(rm._SHARE_CACHE)
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join()
+    assert len(seen["both"]) == 2 and seen["after"] == main_keys
+
+
+def test_live_and_backtest_keys_do_not_share_a_cache(world, monkeypatch):
+    share(world, CSP, T1)                                   # live key (None, EID)
+    assert set(rm._SHARE_CACHE) == {(None, EID)}
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+    share(world, CSP, T1)
+    assert len(rm._SHARE_CACHE) == 2

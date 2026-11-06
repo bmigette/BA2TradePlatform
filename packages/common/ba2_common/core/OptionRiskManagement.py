@@ -338,7 +338,7 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
     return (None, expert_instance_id)
 
 
-#: ONE lock over ALL THREE stores, held by every writer and by the key scan that clears a
+#: ONE lock over ALL FIVE stores, held by every writer and by the key scan that clears a
 #: thread's own keys. It exists because ``_clear_this_threads_keys`` has to ITERATE the store
 #: to find its keys, and under ``--parallel > 1`` a sibling trial's insert lands inside that
 #: iteration: CPython then raises ``RuntimeError: dictionary changed size during iteration``
@@ -346,7 +346,7 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
 #: ``finally``, so the raise also skipped ``clear_threadlocal_db()`` and left the finishing
 #: trial's DB override installed on that worker thread (review finding, 2026-09-01).
 #:
-#: ONE lock rather than three: the three stores are keyed alike, cleared together, and the
+#: ONE lock rather than five: the five stores are keyed alike, cleared together, and the
 #: contention is nil (a handful of dict operations per bar), so three locks would buy nothing
 #: and add an ordering rule to get wrong. It is an ``RLock`` because the guarded functions
 #: legitimately call one another -- ``reset_state`` -> ``reset_breaker_states``,
@@ -706,11 +706,22 @@ _PENDING_LIMIT = 50
 
 _PENDING: Dict[Tuple[Optional[int], int], List[_PendingCharge]] = {}
 
+#: Per-sleeve, per-cycle {entry_tag: committed} for the structure_share condition (plan
+#: 2026-11-06). Same key and same lock as _PENDING; cleared by the same run-boundary resets.
+#: (``_ShareCache`` is defined with the share section below; annotations are lazy.)
+_SHARE_CACHE: Dict[Tuple[Optional[int], int], _ShareCache] = {}
+#: Bumped by every TAGGED submission; a build that observed a different value when it finished
+#: is discarded (a concurrent record_submitted would otherwise be lost between its pending
+#: snapshot and the store). Untagged submissions never touch it.
+_SHARE_EPOCH: Dict[Tuple[Optional[int], int], int] = {}
+
 
 def reset_pending_charges() -> None:
     """Forget every sleeve's in-flight charges. Tests, and a fresh backtest."""
     with _STATE_LOCK:
         _PENDING.clear()
+        _SHARE_CACHE.clear()
+        _SHARE_EPOCH.clear()
 
 
 def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
@@ -735,8 +746,20 @@ def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
             _note_submission(key, entry_tag, candidate)
 
 
-def _note_submission(key, entry_tag: int, candidate: CandidateStructure) -> None:
-    """Hook for the per-member share cache (filled in by the structure_share cache)."""
+def _note_submission(key: Tuple[Optional[int], int], entry_tag: int,
+                     candidate: CandidateStructure) -> None:
+    """Called under _STATE_LOCK by :func:`record_submitted` for a TAGGED entry: bump the epoch
+    and add the admitted candidate's max loss to the cached total of its tag, so the next
+    symbol of this cycle sees it. A covered call adds nothing (see _build_share_cache)."""
+    _SHARE_EPOCH[key] = _SHARE_EPOCH.get(key, 0) + 1
+    cache = _SHARE_CACHE.get(key)
+    if cache is None or candidate.strategy == COVERED_CALL_STRATEGY:
+        return
+    if candidate.max_loss is None:
+        cache.blind.setdefault(entry_tag, []).append(
+            f"in-flight {candidate.strategy} on {candidate.underlying}: max loss unmeasurable")
+    else:
+        cache.committed[entry_tag] = cache.committed.get(entry_tag, 0.0) + float(candidate.max_loss)
 
 
 def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
@@ -936,13 +959,15 @@ def reset_thread_state() -> None:
     runs already shared one process-wide key with each other and with live; giving a
     backtest permission to wipe live latches to fix that would be the worse trade.
     """
-    # THREE separate acquisitions, one per store, and deliberately not one around all three.
+    # FIVE separate acquisitions, one per store, and deliberately not one around all three.
     # A sibling can only ever read or write keys under ITS OWN thread id, so it cannot
-    # observe this thread half-cleared; making the boundary atomic across the three stores
+    # observe this thread half-cleared; making the boundary atomic across the five stores
     # would buy nothing and would put the lock in two places, leaving the one that actually
     # guards the iteration (``_clear_this_threads_keys``) removable without a test noticing.
     _clear_this_threads_keys(_BREAKER_STATE)
     _clear_this_threads_keys(_PENDING)
+    _clear_this_threads_keys(_SHARE_CACHE)
+    _clear_this_threads_keys(_SHARE_EPOCH)
     _clear_this_threads_keys(_JOURNAL)
 
 
@@ -1233,12 +1258,26 @@ def _share_view(cache: _ShareCache, entry_tag: int) -> MemberShare:
 def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -> MemberShare:
     """``entry_tag``'s committed capital as a percent of the sleeve's equity at ``as_of``.
 
-    SHARED by live and backtest. Task 4 puts the per-cycle cache in front of
-    :func:`_build_share_cache`; until then every call rebuilds."""
+    SHARED by live and backtest. A per-cycle cache (keyed by the sleeve key, stamped with the
+    decision time) sits in front of :func:`_build_share_cache`; a stamp mismatch rebuilds from
+    the book, so correctness never depends on the stamp."""
     if as_of is None:
         raise ValueError("member_share needs the decision time (the recommendation's "
                          "created_at); without it the per-cycle cache has no key")
-    return _share_view(_build_share_cache(account, expert_instance_id, as_of), entry_tag)
+    key = _sleeve_key(expert_instance_id)
+    for _attempt in range(3):
+        with _STATE_LOCK:
+            cache = _SHARE_CACHE.get(key)
+            if cache is not None and cache.stamp == as_of:
+                return _share_view(cache, entry_tag)
+            epoch = _SHARE_EPOCH.get(key, 0)
+        built = _build_share_cache(account, expert_instance_id, as_of)   # I/O outside the lock
+        with _STATE_LOCK:
+            if _SHARE_EPOCH.get(key, 0) == epoch:
+                _SHARE_CACHE[key] = built
+                return _share_view(built, entry_tag)
+    # three consecutive races: answer from the last build, uncached (next call rebuilds)
+    return _share_view(built, entry_tag)
 
 
 def _read_equity(read, expert_instance_id: int, what: str, consequence: str
