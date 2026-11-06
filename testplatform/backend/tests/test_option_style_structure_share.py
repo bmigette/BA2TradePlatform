@@ -145,3 +145,12 @@ def test_structure_share_on_a_style_with_no_option_entry_member_is_refused(tmp_p
         m._load_style_spec(_write(tmp_path, {"x": {
             "status": "candidate", "price_cap_policy": "none", "risk": _RISK,
             "members": [{"key": "O_CC"}], "structure_share": SHARE}}), "x")
+
+
+def test_job_c_long_opts_in_with_20_to_60_and_mid_premium_do_not():
+    m = _launcher()
+    stage2 = str(__import__("pathlib").Path(__file__).resolve().parents[3]
+                 / "tools/option_styles.stage2.json")
+    assert m._load_style_spec(stage2, "long")["structure_share"] == {"min": 20, "max": 60, "step": 10}
+    for name in ("mid", "premium"):
+        assert "structure_share" not in m._load_style_spec(stage2, name)

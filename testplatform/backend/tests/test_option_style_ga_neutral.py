@@ -61,6 +61,21 @@ def test_a_style_without_structure_share_builds_byte_identical_rules_and_genes(n
     assert "structure_share" not in json.dumps(got)
 
 
+def test_long_with_the_field_differs_from_its_golden_only_by_the_four_leaves_and_genes():
+    m = _launcher()
+    golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))["long"]
+    got = snapshot(m, "long")
+    assert got["exit"] == golden["exit"]
+    assert set(got["genes"]) - set(golden["genes"]) == {
+        f"cond:{k}-structure_share:value" for k in ("o_cbs", "o_leap", "o_pmcc", "o_convex")}
+    assert all(got["genes"][g] == golden["genes"][g] for g in golden["genes"])
+    for g_rule, n_rule in zip(golden["entry"], got["entry"]):
+        kept = [c for c in n_rule["conditions"]["conditions"] if c.get("field") != "structure_share"]
+        assert kept == g_rule["conditions"]["conditions"]
+        assert n_rule["conditions"]["conditions"][-1]["field"] == "structure_share"
+        assert {k: v for k, v in n_rule.items() if k != "conditions"} ==                {k: v for k, v in g_rule.items() if k != "conditions"}
+
+
 def _regen() -> None:
     m = _launcher()
     out = {n: snapshot(m, n, drop_structure_share=True) for n in _NAMES}

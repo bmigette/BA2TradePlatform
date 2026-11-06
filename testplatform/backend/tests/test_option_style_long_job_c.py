@@ -166,6 +166,11 @@ def test_job_c_policy_assembles_offline_against_the_real_space():
     seeds, prov = L._assemble_seed_population(bundle, strat, space, "zero", 40)
     assert len(seeds) == len(bundle["individuals"]) == 19
     assert all(set(s) == set(space) for s in seeds)
+    # structure_share (plan 2026-11-06): the four new value genes are filled, every seed at the
+    # leaf's authored (loosest) value, so a seeded start behaves like the cap-free style
+    share = [k for k in space if k.endswith('-structure_share:value')]
+    assert len(share) == 4
+    assert all(s[k] == 60.0 for s in seeds for k in share)
     # single-member seeds switch exactly their own entry rules on and every other member's off
     first = seeds[0]
     assert first["entry:o_cbs-entry:enabled"] == 1
