@@ -285,3 +285,62 @@ def test_live_and_backtest_keys_do_not_share_a_cache(world, monkeypatch):
     monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
     share(world, CSP, T1)
     assert len(rm._SHARE_CACHE) == 2
+
+
+# ------------------------------------------------------------------ parity (Task 5)
+def _scenario(world):
+    world.structures = [short_put(1), short_put(2, strike=50.0), long_call(3)]
+    world.lots = [lot(900, price=80.0, qty=200.0)]
+    world.tags = {1: CSP, 2: CSP, 3: CBS, 900: CSP}
+    rm.record_submitted(EID, 555, cand(2_500.0), entry_tag=CSP)
+
+
+def test_live_and_backtest_key_shapes_give_the_same_share_and_verdict(world, monkeypatch):
+    results = {}
+    for mode, key in (("live", lambda e: (None, e)),
+                      ("bt", lambda e: (threading.get_ident(), e))):
+        rm.reset_state()
+        monkeypatch.setattr(rm, "_sleeve_key", key)
+        _scenario(world)
+        first = share(world, CSP, T1)
+        rm.record_submitted(EID, 556, cand(1_000.0), entry_tag=CSP)
+        results[mode] = (first, share(world, CSP, T1), share(world, CBS, T1))
+    assert results["live"] == results["bt"]
+    # 10_000 + 5_000 (puts) + 16_000 (200 sh * 80) + 2_500 pending = 33_500, then + 1_000
+    assert results["bt"][0].committed == 33_500.0
+    assert results["bt"][1].committed == 34_500.0
+
+
+def test_the_real_readers_over_the_in_mem_store(monkeypatch):
+    """put -> assignment -> covered call, through trade_store (the backtest runtime)."""
+    from ba2_common.core.models import Transaction, TradingOrder
+    from ba2_common.core.trade_store import inmem_trades, store_add
+    from ba2_common.core.types import (AssetClass, OrderDirection, OrderStatus, OrderType,
+                                       TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT)
+
+    rm.reset_state()
+    acct = SimpleNamespace(get_account_snapshot=lambda: SimpleNamespace(equity=100_000.0))
+    with inmem_trades():
+        tid = store_add(Transaction(
+            symbol="AAPL", quantity=100.0, side=OrderDirection.BUY, open_price=100.0,
+            open_date=T1, status=TransactionStatus.OPENED, asset_class=AssetClass.EQUITY,
+            expert_id=EID, meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT}))
+        store_add(TradingOrder(
+            account_id=1, symbol="AAPL", quantity=100.0, filled_qty=100.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET, status=OrderStatus.FILLED,
+            open_price=100.0, transaction_id=tid, asset_class=AssetClass.EQUITY,
+            created_at=T1, data={"entry_tag": WHEEL}))
+        cc = store_add(Transaction(
+            symbol="AAPL", quantity=1.0, side=OrderDirection.SELL, open_price=1.0, open_date=T2,
+            status=TransactionStatus.OPENED, asset_class=AssetClass.OPTION, expert_id=EID,
+            option_strategy="covered_call", multiplier=100))
+        store_add(TradingOrder(
+            account_id=1, symbol="AAPL", quantity=1.0, filled_qty=1.0, side=OrderDirection.SELL,
+            order_type=OrderType.SELL_LIMIT, status=OrderStatus.FILLED, open_price=1.0,
+            transaction_id=cc, asset_class=AssetClass.OPTION, contract_symbol="AAPL270115C110",
+            strike=110.0, option_type=OptionRight.CALL, expiry=date(2027, 1, 15),
+            underlying_symbol="AAPL", created_at=T2, data={"entry_tag": WHEEL}))
+        r = rm.member_share(acct, EID, WHEEL, T3)
+    assert r.unmeasurable == ()
+    assert r.committed == 10_000.0 and r.share_pct == pytest.approx(10.0)
+    rm.reset_state()
