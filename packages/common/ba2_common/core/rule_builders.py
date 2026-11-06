@@ -97,6 +97,8 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # a composed option expert opened the position, read back off its entry order row. ANDed
     # into each member's exits; UNEVALUABLE (never fires) on an untagged position.
     "entry_tag": ExpertEventType.N_ENTRY_TAG,
+    # A style member's share of the sleeve (plan 2026-11-06); ANDed last into its entry rule.
+    "structure_share": ExpertEventType.N_STRUCTURE_SHARE,
     # THE DIRECTION CALL AS A NUMBER (SELL -2 .. BUY +2, HOLD 0). MANDATORY here and not
     # merely tidy: the option grid's entry gate is this leaf, and an unmapped field is
     # DROPPED by triggers_from_condition_tree with nothing but a WARNING -- every option

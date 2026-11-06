@@ -521,6 +521,20 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Scope the long-call member's take-profit to its own positions: entry_tag == 1"
         },
+        ExpertEventType.N_STRUCTURE_SHARE.value: {
+            "name": "Structure Share (style member's share of the sleeve)",
+            "description": (
+                "For an option ENTRY rule of a style expert: the committed capital of the "
+                "member this rule opens (open structures, assigned-stock cost basis and "
+                "entries submitted this cycle) as a percent of the sleeve's equity. The rule "
+                "passes while the share is below the threshold, so a member that already "
+                "holds its share steps aside and the next member's rule is tried. Written "
+                "by the style builder (style field structure_share), not meant to be typed "
+                "by hand. FALSE, with an error logged, when the share cannot be measured."
+            ),
+            "type": "numeric",
+            "example": "Cap the call-backspread member at 40% of the sleeve: structure_share < 40"
+        },
         ExpertEventType.N_DAYS_TO_EXPIRY.value: {
             "name": "Days to Expiry (remaining option life)",
             "description": (

@@ -542,6 +542,11 @@ class ExpertEventType(str, Enum):
     # only. UNEVALUABLE (fires in NEITHER direction) when the entry order carries no tag, which
     # is every position not opened by a style-group entry.
     N_ENTRY_TAG = "entry_tag"
+    # A style MEMBER's committed capital as a percent of the sleeve's equity (plan
+    # 2026-11-06 structure-share-condition). An ENTRY gate: ANDed last into each member's
+    # entry rule by a style that opts in (``structure_share``); False lets the next member's
+    # rule be tried. UNEVALUABLE (False, ERROR logged) when the share cannot be measured.
+    N_STRUCTURE_SHARE = "structure_share"
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
     # "21 days after opening" and "21 days before expiry" are different quantities. This is what
@@ -827,6 +832,7 @@ def get_numeric_event_values():
         ExpertEventType.N_REC_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_AFTER_EVENT.value,
         ExpertEventType.N_ENTRY_TAG.value,
+        ExpertEventType.N_STRUCTURE_SHARE.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
         ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value,

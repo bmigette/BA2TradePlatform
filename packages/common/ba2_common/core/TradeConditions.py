@@ -4764,6 +4764,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_ENTRY_TAG: EntryTagCondition,
+    ExpertEventType.N_STRUCTURE_SHARE: StructureShareCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
     ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY: CoveredCallDaysToExpiryCondition,

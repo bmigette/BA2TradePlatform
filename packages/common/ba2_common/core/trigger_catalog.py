@@ -139,7 +139,7 @@ _OPTIONS = (
     'has_option_position', 'has_covered_call', 'has_protective_put', 'has_assigned_shares',
     'days_to_expiry', 'short_leg_days_to_expiry', 'covered_call_days_to_expiry',
     'loss_pct_of_max_loss', 'profit_multiple_of_premium', 'credit_decayed_pct',
-    'long_leg_delta', 'iv_rank', 'iv_to_realized_vol',
+    'long_leg_delta', 'iv_rank', 'iv_to_realized_vol', 'structure_share',
 )
 
 #: Everything that describes the TAPE rather than the position or the expert's call -- the four
