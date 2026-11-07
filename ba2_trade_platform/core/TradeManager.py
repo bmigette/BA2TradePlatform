@@ -898,20 +898,31 @@ class TradeManager:
             # makes the overlapping windows across refreshes harmless.
             after = datetime.now(timezone.utc) - timedelta(days=7)
             activities = account.get_option_activities(after=after)
-            if not activities:
-                return
-            results = account.reconcile_option_assignments(activities)
-            applied = [r for r in (results or [])
-                       if not str(r.get("result", "")).startswith(("already_processed", "skipped"))]
-            self.logger.info(
-                f"[Account {account.id}] Option reconciliation: {len(activities)} activity(ies), "
-                f"{len(applied)} newly applied"
-            )
+            if activities:
+                results = account.reconcile_option_assignments(activities)
+                applied = [r for r in (results or [])
+                           if not str(r.get("result", "")).startswith(
+                               ("already_processed", "skipped"))]
+                self.logger.info(
+                    f"[Account {account.id}] Option reconciliation: {len(activities)} "
+                    f"activity(ies), {len(applied)} newly applied"
+                )
         except Exception as e:
             self.logger.error(
                 f"[Account {getattr(account, 'id', '?')}] Option reconciliation failed: {e}",
                 exc_info=True
             )
+        # The live twin of the backtest's next-bar assignment liquidation: sell the stock lots
+        # the reconciler flagged "not held" (assignment_hold). Runs on EVERY refresh, not only
+        # when new activities arrived, because a refused/failed sale stays pending and is retried
+        # here. Its own try: an activity-feed failure must not stop a sale already owed.
+        if hasattr(account, "process_pending_assignment_liquidations"):
+            try:
+                account.process_pending_assignment_liquidations()
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {getattr(account, 'id', '?')}] assignment liquidation sweep "
+                    f"failed: {e}", exc_info=True)
 
     # ======================================================================
     # Daily ATM-IV recorder — the series behind IVRankCondition

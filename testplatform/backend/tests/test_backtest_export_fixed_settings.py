@@ -14,7 +14,7 @@ from app.models.backtest import Backtest
 from app.models.database import Base, SessionLocal, engine
 from app.models.strategy import Strategy
 from app.models.strategy_optimization import StrategyOptimization
-from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
+from ba2_common.core.deploy_parity import BacktestRunFacts, deploy_expert_settings
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -26,7 +26,7 @@ def _host_db():
 #: The gates every export now carries (ba2_common.core.deploy_parity, review V3). Not the
 #: subject of THIS file -- it is about the fixed-settings floor -- so each expectation below is
 #: written as "the floor, PLUS the gates", rather than restating four booleans four times.
-_GATES = forced_expert_settings(
+_GATES = deploy_expert_settings(
     BacktestRunFacts(enable_short=False, hold_assigned_stock=False, entry_action=None))
 
 
@@ -121,29 +121,30 @@ def _opt_linked(db, account_settings):
     return _backtest(optimization_id=opt.id, strategy_params={"model:profit_ratio": 1.2})
 
 
-def test_a_member_scoped_hold_run_is_REFUSED_for_export_not_stated_as_False():
-    """Stage-2 E2 review I1: live cannot express a per-member hold (it never sells assigned
-    stock), so exporting ``hold_assigned_stock: False`` for such a run would describe a
-    different run. The export refuses, naming the setting."""
-    from fastapi import HTTPException
-
+def test_a_member_scoped_hold_run_is_EXPORTED_with_its_tags():
+    """Live now makes the per-member hold/liquidate decision itself, so the run is no longer
+    refused: the export carries the member tags (and ``hold_assigned_stock: False``) as live
+    settings of the deployed instance."""
     db = SessionLocal()
     try:
         bt = _opt_linked(db, {"hold_assigned_stock": False, "hold_assigned_stock_tags": [7]})
-        with pytest.raises(HTTPException) as exc:
-            _derive_export_payload(bt, "expert_settings", db=db)
-        assert exc.value.status_code == 409
-        assert "hold_assigned_stock_tags" in str(exc.value.detail)
+        payload = _derive_export_payload(bt, "expert_settings", db=db)
+        params = payload["settings"]["expert_params"]
+        assert params["hold_assigned_stock_tags"] == [7]
+        assert params["hold_assigned_stock"] is False
+        assert "hold_assigned_stock" not in payload["backtest_only"]
+        assert "hold_assigned_stock_tags" not in payload["backtest_only"]
     finally:
         db.close()
 
 
-def test_a_run_without_the_member_scoped_hold_exports_it_as_None():
+def test_a_run_level_hold_run_exports_the_flag_and_no_tags():
     db = SessionLocal()
     try:
         bt = _opt_linked(db, {"hold_assigned_stock": True})
         payload = _derive_export_payload(bt, "expert_settings", db=db)
-        assert payload["backtest_only"]["hold_assigned_stock"] is True
-        assert payload["backtest_only"]["hold_assigned_stock_tags"] is None
+        params = payload["settings"]["expert_params"]
+        assert params["hold_assigned_stock"] is True
+        assert "hold_assigned_stock_tags" not in params
     finally:
         db.close()

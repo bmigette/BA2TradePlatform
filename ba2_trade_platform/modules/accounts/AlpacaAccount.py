@@ -35,7 +35,8 @@ from ...core.account_types import (
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance, InstanceNotFound
-from ba2_common.core.assignment_hold import assigned_stock_entry_data
+from ba2_common.core.assignment_hold import assigned_stock_entry_data, decide_live_assigned_stock
+from ba2_common.core.assignment_liquidation import pending_meta, sweep_pending_liquidations
 from ba2_common.core.entry_tag import order_entry_tag
 from sqlmodel import Session, select, or_
 
@@ -7595,7 +7596,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stock_entry_data, refusal = self._member_tag_entry_data(opt_txn, "assigned put")
                 if refusal is not None:
                     return refusal
+                # WHO KEEPS THE STOCK: the SHARED decision the backtest account makes
+                # (assignment_hold), from the owning instance's settings and this put's entry tag.
+                # Not held -> the lot is flagged for liquidation IN THE SAME INSERT (a crash can
+                # never leave an unflagged lot), and sweep_pending_liquidations sells it.
+                hold, hold_note = self._assigned_stock_disposition(
+                    opt_txn, expert_id, underlying, symbol, share_qty)
                 now = datetime.now(timezone.utc)
+                txn_meta = {"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
+                            "activity_id": activity_id, "contract": symbol}
                 equity_txn = Transaction(
                     symbol=underlying,
                     quantity=share_qty,
@@ -7605,8 +7614,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     open_date=now,
                     expert_id=expert_id,
                     close_reason=None,
-                    meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
-                               "activity_id": activity_id, "contract": symbol},
+                    meta_data=txn_meta if hold else pending_meta(txn_meta),
                 )
                 equity_txn_id = add_instance(equity_txn)
                 # The assignment's ENTRY order row. Without it the shares exist only as a
@@ -7625,7 +7633,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     closed_note="closed short put txn",
                     open_note="settled the short put LEG; structure still OPEN")
                 return (f"csp_assignment: opened equity long {underlying} "
-                        f"{share_qty}@{strike}; {leg_note}")
+                        f"{share_qty}@{strike}; {leg_note}; {hold_note}")
 
             if right == OptionRight.CALL and is_short:
                 # Short call assigned -> shares called away. The held equity long is
@@ -7652,9 +7660,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         held=held, underlying=underlying, contracts=contracts,
                         strike=strike, contract=symbol, activity_id=activity_id,
                         leg_note=leg_note, remainder_entry_data=remainder_entry_data)
-                logger.warning(
+                logger.error(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
-                    f"equity long found for {underlying} (expert {expert_id}).")
+                    f"equity long found for {underlying} (expert {expert_id}). A NAKED call "
+                    f"delivers SHORT stock at the broker; live does not book it and the "
+                    f"assigned-stock policy cannot liquidate it (the backtest books it and buys "
+                    f"it back at the next open) -- cover the short {underlying} position by hand.")
                 return f"called_away_no_long: {leg_note}, no equity long to close"
 
             # Long option assigned is not a normal flow; record + log.
@@ -7690,6 +7701,64 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
+
+    def _assigned_stock_disposition(self, opt_txn, expert_id, underlying: str, contract: str,
+                                    share_qty: float) -> "tuple[bool, str]":
+        """``(hold, note)`` for the stock a short put's assignment delivers.
+
+        The SAME decision the backtest makes (``assignment_hold``): policy from the owning
+        expert instance's ``hold_assigned_stock`` / ``hold_assigned_stock_tags`` settings, keyed
+        on the assigned position's entry tag. A policy that cannot be read or applied (no stored
+        setting, no owning instance, untagged position under a member-scoped policy, malformed
+        tags) is NEVER guessed: the stock is HELD and the problem is logged as an ERROR plus a
+        FAILURE activity naming the instance -- the shares are at the broker either way, and an
+        unintended sale is the irreversible mistake. Never raises.
+        """
+        from ...core.utils import get_expert_instance_from_id
+        from ba2_common.core.assignment_hold import LiveAssignedStockDecision
+        where = (f"[Account {self.id}] assignment of {contract} (option txn "
+                 f"{getattr(opt_txn, 'id', None)}, expert {expert_id}) delivering "
+                 f"{share_qty:g} x {underlying}")
+        try:
+            settings = None
+            if expert_id is not None:
+                expert = get_expert_instance_from_id(expert_id)
+                settings = expert.settings if expert is not None else None
+            decision = decide_live_assigned_stock(
+                settings, self._position_entry_tag(opt_txn), where=where)
+        except Exception as e:
+            decision = LiveAssignedStockDecision(
+                True, f"{where}: could not evaluate the policy: {e}")
+            logger.error(decision.problem, exc_info=True)
+        if decision.problem is not None:
+            msg = (f"{decision.problem} -- HOLDING the delivered stock (no sale was attempted). "
+                   f"Set hold_assigned_stock / hold_assigned_stock_tags on the instance and "
+                   f"liquidate by hand if it should not be held.")
+            logger.error(msg)
+            try:
+                from ...core.db import log_activity
+                from ...core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(severity=ActivityLogSeverity.FAILURE,
+                             activity_type=ActivityLogType.TRANSACTION_CREATED, description=msg,
+                             data={"contract": contract, "underlying": underlying,
+                                   "shares": share_qty, "assigned_stock_policy": "unresolved"},
+                             source_account_id=self.id, source_expert_id=expert_id)
+            except Exception as e:
+                logger.error(f"[Account {self.id}] could not record the assigned-stock policy "
+                             f"activity: {e}")
+            return True, "assigned stock: HOLD (policy unresolved, see ERROR)"
+        if decision.hold:
+            logger.warning(f"{where}: HOLDING the delivered stock (policy: hold).")
+            return True, "assigned stock: HOLD"
+        logger.warning(f"{where}: policy is to LIQUIDATE -- a market SELL of exactly the "
+                       f"delivered shares is queued for the next refresh sweep.")
+        return False, "assigned stock: LIQUIDATE (queued)"
+
+    def process_pending_assignment_liquidations(self) -> List[dict]:
+        """Sell the assignment-delivered lots flagged for liquidation (live twin of
+        ``BacktestAccount.process_pending_assignment_liquidations``); see
+        ``ba2_common.core.assignment_liquidation``. Called by ``TradeManager`` on every refresh."""
+        return sweep_pending_liquidations(self)
 
     def _settle_option_leg(self, opt_txn, *, contract: str, contracts, close_reason: str,
                            activity_id: str, underlying: str, right, strike, expiry,
