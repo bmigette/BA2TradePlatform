@@ -279,6 +279,7 @@ def _cmd_prewarm(args) -> int:
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     if not symbols and not args.screener_panel:
         sys.exit("ba2-test prewarm: --symbols is empty (or pass --screener-panel --screener-store ...).")
+    _report_option_history_coverage(args, symbols)
 
     # SCREENER PANEL (criteria live-daily-v2): every input of the screener simulation (the vendor's share table and
     # per-symbol share history, the market-cap / float caches, the daily panel itself) for the universe of
@@ -1544,9 +1545,67 @@ def _apply_options_store(args, backtest_block: dict) -> None:
     ``sqlite`` is what an unflagged run already resolved to, so writing it changes nothing for
     existing jobs — it only stops the answer depending on who is asking.
     """
-    from app.services.backtest.options_store import resolve_options_store
-    backtest_block["options_store"] = resolve_options_store(
-        {"options_store": getattr(args, "options_store", None)})
+    from app.services.backtest.options_store import (
+        OPTION_HISTORY_SOURCE_KEY, resolve_options_store)
+    source = getattr(args, "option_history_source", None)
+    try:
+        backtest_block["options_store"] = resolve_options_store(
+            {"options_store": getattr(args, "options_store", None), OPTION_HISTORY_SOURCE_KEY: source})
+    except ValueError as e:      # --option-history-source contradicting --options-store
+        sys.exit(f"ba2-test: REFUSED: {e}")
+    if source:
+        # RECORDED when stated (the replayable run config names the vendor); identity-wise only the
+        # non-legacy value counts (options_store.non_legacy_option_history_source).
+        backtest_block[OPTION_HISTORY_SOURCE_KEY] = source
+
+
+#: ``--option-history-source`` help, shared by every subcommand that creates an option job.
+_OPTION_HISTORY_SOURCE_HELP = (
+    "Whose option history the run reads: thetadata (the legacy store, ThetaDataOptionsProvider/) or "
+    "alphavantage (AlphaVantageOptionsProvider/, filled by tools/download_av_option_chains.py; close-only "
+    "bars, as-traded strikes, vendor NBBO/OI/IV/greeks). A view of --options-store for the two parquet "
+    "vendors: stating both with different values is refused. Recorded on the run config as "
+    "option_history_source; thetadata is the legacy implicit vendor and stays out of the checkpoint "
+    "fingerprint, a non-legacy value joins it.")
+
+
+def _add_option_history_source_arg(parser) -> None:
+    """``--option-history-source {thetadata,alphavantage}`` (None = not stated: the store flag / env decide)."""
+    from app.services.backtest.options_store import OPTION_HISTORY_SOURCES
+    parser.add_argument("--option-history-source", choices=list(OPTION_HISTORY_SOURCES), default=None,
+                        help=_OPTION_HISTORY_SOURCE_HELP)
+
+
+def _report_option_history_coverage(args, symbols) -> None:
+    """``prewarm --option-history-source``: the option store is filled by its own downloader, so prewarm
+    only REPORTS (read-only, no network) how much of [--start, --end] the AV store holds per symbol."""
+    source = getattr(args, "option_history_source", None)
+    if not source:
+        return
+    if source != "alphavantage":
+        print(f">> option history source thetadata: read from the ThetaData store; nothing to prewarm "
+              f"(tools/warm_options_history.py fills it).", flush=True)
+        return
+    from datetime import date as _date
+    from ba2_providers.options.alphavantage import AvOptionStore
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    from download_av_option_chains import latest_session, trading_days
+    start = _date.fromisoformat(args.start) if args.start else _date(2020, 1, 1)
+    end = _date.fromisoformat(args.end[:10]) if args.end else latest_session()
+    days = trading_days(start, end)
+    store = AvOptionStore()
+    short = {}
+    for sym in symbols:
+        got, want = store.coverage(sym, days)
+        if got < want:
+            short[sym] = want - got
+    print(f">> option history source alphavantage ({store.root}): {len(symbols) - len(short)}/{len(symbols)} symbols "
+          f"fully recorded over {start}..{end} ({len(days)} sessions)", flush=True)
+    if short:
+        worst = ", ".join(f"{s}:{n}" for s, n in sorted(short.items(), key=lambda kv: -kv[1])[:8])
+        print(f"!! {len(short)} symbol(s) incomplete (days owed, worst first: {worst}). Run "
+              f"tools/download_av_option_chains.py --start {start} --end {end}; a run on a gap trades nothing there.",
+              flush=True)
 
 
 # --- the LOWER TRADE FLOOR for the long-dated grid-2 keys -----------------------------------
@@ -11288,6 +11347,7 @@ def main(argv: "list | None" = None) -> int:
     pw.add_argument("--screener-store", default=None,
                     help="Metric-store directory whose symbols are the screener universe (with --screener-panel).")
     _add_estimates_source_arg(pw)
+    _add_option_history_source_arg(pw)
     pw.add_argument("--ohlcv-history-source", choices=["fmp", "alpaca"], default=None,
                     help="OHLCV history the --screener-panel is built from (REQUIRED with --screener-panel, no default): "
                          "a derived store names its history and a job refuses a panel built from the other one.")
@@ -11700,6 +11760,7 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--fill-model", default="next_bar_open")
     _add_history_source_arg(op)
     _add_estimates_source_arg(op)
+    _add_option_history_source_arg(op)
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
@@ -12021,6 +12082,7 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--fill-model", default="next_bar_open")
     _add_history_source_arg(ob)
     _add_estimates_source_arg(ob)
+    _add_option_history_source_arg(ob)
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])

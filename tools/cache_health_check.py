@@ -633,7 +633,8 @@ def _read_symbol_list(path: str) -> List[str]:
 #: --provider -> default --out mapping (both providers write the SAME COLUMNS shape via the
 #: SAME OptionHistoryParquetStore, just to separate trees, so one check function covers both).
 _OPTIONS_PROVIDER_DIRS = {"tastytrade": "TastyTradeOptionsProvider",
-                          "thetadata": "ThetaDataOptionsProvider"}
+                          "thetadata": "ThetaDataOptionsProvider",
+                          "alphavantage": "AlphaVantageOptionsProvider"}
 
 
 def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15,

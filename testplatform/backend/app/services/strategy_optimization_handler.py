@@ -36,6 +36,8 @@ import numpy as np
 from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
 from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, check_estimates_source
 from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
+from app.services.backtest.options_store import (
+    LEGACY_OPTION_HISTORY_SOURCE, check_option_history_source, non_legacy_option_history_source)
 from ba2_common.core.ohlcv_history import resolve_job_history_source
 
 
@@ -2039,7 +2041,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
             backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
             _screener_identity(backtest_cfg.get("screener_opt")),
-            resolve_job_history_source(backtest_cfg), _estimates_source_mod.resolve_job_estimates_source(backtest_cfg))
+            resolve_job_history_source(backtest_cfg), _estimates_source_mod.resolve_job_estimates_source(backtest_cfg),
+            non_legacy_option_history_source(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -3728,7 +3731,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            screener_universe_rule: Optional[str] = None,
                            screener_criteria: Optional[str] = None,
                            ohlcv_history_source: Optional[str] = None,
-                           estimates_source: Optional[str] = None) -> str:
+                           estimates_source: Optional[str] = None,
+                           option_history_source: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3803,6 +3807,11 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         # Joined ONLY when it is not the legacy fmp, like ohlcv_history_source: every job from before the
         # setting existed read fmp, and keeps its fingerprint (resumes are not broken by the new flag).
         payload["estimates_source"] = check_estimates_source(estimates_source)
+    if option_history_source is not None and check_option_history_source(option_history_source) != LEGACY_OPTION_HISTORY_SOURCE:
+        # Which vendor's option history a genome was scored on is part of its identity. Joined ONLY when
+        # it is not the legacy thetadata (and never for a run without a parquet option vendor, where the
+        # caller passes None), so every job from before the switch keeps its fingerprint.
+        payload["option_history_source"] = option_history_source
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

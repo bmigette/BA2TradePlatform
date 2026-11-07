@@ -312,7 +312,8 @@ def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():
             'backtest_cfg.get("screener_universe_rule"),\n'
             '            _screener_identity(backtest_cfg.get("screener_opt")),\n'
             '            resolve_job_history_source(backtest_cfg), '
-            '_estimates_source_mod.resolve_job_estimates_source(backtest_cfg))') in src
+            '_estimates_source_mod.resolve_job_estimates_source(backtest_cfg),\n'
+            '            non_legacy_option_history_source(backtest_cfg))') in src
 
 
 # --------------------------------------------------------------------------- #

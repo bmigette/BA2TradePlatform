@@ -200,6 +200,7 @@ These are **estimates** derived from the figures above, not tested configuration
 |---|---|---|
 | ThetaData option store, local workstation | ~15.6 GB | local measurement (operator, 2026-09) |
 | ThetaData option store, remote227 (819 of the 820 large-cap names) | ~18 GB | stage-2 plan §2 |
+| Alpha Vantage option store (856 names, 2020-2026-11) | 45-80 GB, central 63 GB (**estimate**, section 4.6) | measured 55.5 B/row on AAPL/HOG |
 | FMP OHLCV cache | ~16 GB | local measurement |
 | `fmp_history` | ~8 GB | local measurement |
 | `market_conditions` | ~2 GB | local measurement |
@@ -554,6 +555,64 @@ Measured on 2026-09-25/26 (local box, from the data runbook and the repair log):
 | FMP forced refetch | 94 names, ~120 MB |
 | Dividend calendars | 796 requests, 12.6 MB |
 | Both manifests, cold, cache-only, concurrency 1 | 45-70 min |
+
+### 4.6 Alpha Vantage option history (second store, beside ThetaData; owner decision 2026-11-07)
+
+`CACHE_FOLDER/AlphaVantageOptionsProvider/` is a SECOND parquet store with the ThetaData layout
+(`<SYM>/exp=<DATE>/<SYM>_<DATE>_1d.parquet` + `_manifest.json`), read by the same `ParquetOptionsProvider`.
+The ThetaData store is never touched; a job picks one with `--option-history-source {thetadata,alphavantage}`.
+Code: `packages/providers/ba2_providers/options/alphavantage.py` (mapping, store), downloader
+`tools/download_av_option_chains.py`. Needs the premium `alpha_vantage_api_key` AppSetting (75 calls/minute for the
+KEY, shared with `tools/backfill_av_estimates.py`).
+
+**Download.** One AV call (`HISTORICAL_OPTIONS&symbol=X&date=D`) is one end-of-day chain, so the unit is (symbol, NYSE
+session). Resumable and crash-safe: a fetched day is staged in `<SYM>/_days/` and then recorded in
+`<SYM>/_ledger.jsonl` (an empty chain is recorded too and never re-requested); staged days are compacted into the
+`exp=` partitions every 200 days, at the end of each symbol and on Ctrl-C. A failed day is not recorded: it is in the
+`--report` JSON with its reason and is retried by the next run. The API key is never printed (error text is redacted).
+
+```bash
+# the owner universe: 820 large caps + the top-100 list = 856 names, 2020-01-01 .. latest completed session
+python tools/download_av_option_chains.py --symbols-file tools/options_universe_large_cap.txt     --symbols-file tools/options_universe_top100.txt --start 2020-01-01     --db ~/Documents/ba2/test/dl_forecasting.db --calls-per-minute 70 --report av_options_report.json
+# --dry-run prints the calls still owed; --limit N is a smoke run; --root/--budget-file relocate the store/limiter
+```
+
+Rate budget: `--calls-per-minute` is this process's own cap; `--key-limit` (75) is the ceiling over every process sharing
+`--budget-file` (default `<cache>/_av_rate_budget.json`), so several downloaders coexist. `backfill_av_estimates.py` does
+NOT use the file (it sleeps ~45 calls/min on its own): while it runs pass `--calls-per-minute 25`, then restart with 70
+(resume loses nothing).
+
+**Time.** 856 names x 1,722 sessions (2020-01-02..2026-11-06) = 1,474,032 calls: 13.7 days at 75/min, 14.6 at 70/min,
+17.1 at 60/min (**estimate**; names listed after 2020 spend one call per empty session; the transfer is ~0.7 MB per call).
+
+**Disk (measured 2026-11-07 on AAPL and HOG, 3 sessions each).** AAPL 2022-03: 1,716-1,764 contracts per chain; HOG 591. Parquet
+zstd, one file: 55.5 bytes per contract-row with the greeks/size/mark columns (20.2 B AAPL / 14.5 B HOG for the 15 ThetaData-shaped
+columns alone; the five greeks are ~31 B of the 55). Tiny 3-day partitions measure ~125-155 B/row (file overhead), so the figure
+for a full store is the dense one. **Estimate**: 856 names x 1,722 sessions x 600-1,000 contracts = 0.9-1.5 G rows = **45-80 GB (central 63 GB)**,
+against ~18 GB for the ThetaData store; staged days add <1 GB transiently per symbol.
+
+**Mapping decisions** (module docstring has the evidence):
+
+| AV field | Store column | Rule |
+|---|---|---|
+| `last` | `close` | ONLY on a day the contract traded (`volume > 0` and `last > 0`), else null: AV carries a stale `last` on no-trade rows (1,841 of 9,496 NVDA 2024-05-31 contracts had volume 0 and last > 0). Same rule as ThetaData (`close > 0` iff `volume > 0`). The backtest marks a no-trade row from its quote. |
+| (none) | `open`, `high`, `low` | AV has no OHLC. Set = `close` on a traded day, else null. A `next_bar_open` fill reads `open` and refuses to fill on null, so null everywhere would make the store untradeable; the fill reference is the fill day's LAST print instead of its first (on the fill day, not look-ahead for decisions; coarser than a true open). Manifests say `ohlc: close-only`. |
+| `bid`, `ask` | `bid`, `ask` | ThetaData's `_quote` rule: ask <= 0 means no quote; bid 0 with an ask is a real "nobody bids". |
+| `volume`, `open_interest`, `implied_volatility` | `volume`, `open_interest`, `iv` | Int64 / Int64 / decimal; IV 0 or > 100 is null (ThetaData's `_clean_iv`). A row with neither a trade nor a quote is dropped. |
+| `mark`, `bid_size`, `ask_size`, `delta`, `gamma`, `theta`, `vega`, `rho` | same names | Extra columns, kept for the record. The reader ignores them: it inverts its own greeks from `close`, as for every parquet store. |
+| `strike`, `contractID` | `strike`, `occ_symbol` | **As-traded** strikes, like ThetaData: NVDA 2024-05-31 (10:1 split 2024-06-10) lists 1,005..1,165 around a ~$1,100 spot. The Part E split-basis machinery therefore applies unchanged. |
+
+**Switching a job.** `--option-history-source alphavantage` on `optimize`, `optimize-batch`, `prewarm` (read-only coverage report of the AV store) and
+`scripts/run_daily_backtest.py`; it selects `options_store=alphavantage` and is recorded on the run config as `option_history_source`
+(stating it with a contradicting `--options-store` is refused). The drivers `run_options_matrix.py`, `run_options2_matrix.py`,
+`run_convex_matrix.py` take `--option-history-source` too (default `thetadata`, which is what they always did through `--options-store thetadata`):
+`alphavantage` adds `--options-store alphavantage --option-history-source alphavantage` to every job, an `-optalphavantage` name suffix, and
+joins the digest, the discovery name and the checkpoint fingerprint. `thetadata` adds nothing anywhere, so every existing job keeps its name, completion
+row and checkpoint. History floor of the store: 2020-01-01. Warm the derived arrays for it with
+`python tools/build_shared_arrays.py --options-store alphavantage --universe-file ...` like step 6 of 4.2.
+
+Caveats: AV is queried by the CURRENT ticker only; renamed names (META before 2022-06, ...) may return nothing for the old period and are recorded
+empty. Compare a job on the two vendors only after checking close/quote agreement on a sample (not done yet).
 
 ### 4.5 Alternative: import a warmed cache
 

@@ -36,7 +36,44 @@ from typing import Any, Callable, Dict, Optional
 SQLITE = "sqlite"
 TASTYTRADE = "tastytrade"
 THETADATA = "thetadata"
-OPTIONS_STORES = (SQLITE, TASTYTRADE, THETADATA)
+ALPHAVANTAGE = "alphavantage"
+OPTIONS_STORES = (SQLITE, TASTYTRADE, THETADATA, ALPHAVANTAGE)
+
+#: The VENDOR choice of a parquet option run (``--option-history-source``): which vendor's history the
+#: option reader serves. ``thetadata`` is the legacy implicit one -- every option job on record read it --
+#: so it is kept OUT of job digests, discovery names and the checkpoint fingerprint (a non-legacy value
+#: joins them), exactly like ``--ohlcv-history-source fmp`` / ``--estimates-source fmp``. The source is a
+#: view of ``options_store`` for the two parquet vendors: ``alphavantage`` IS the store ``alphavantage``.
+OPTION_HISTORY_SOURCES = (THETADATA, ALPHAVANTAGE)
+OPTION_HISTORY_SOURCE_KEY = "option_history_source"
+LEGACY_OPTION_HISTORY_SOURCE = THETADATA
+
+
+class UnknownOptionHistorySource(ValueError):
+    """An option-history source that is not one of ``OPTION_HISTORY_SOURCES``."""
+
+
+def check_option_history_source(value) -> str:
+    if value not in OPTION_HISTORY_SOURCES:
+        raise UnknownOptionHistorySource(
+            f"unknown option history source {value!r}; expected one of {', '.join(OPTION_HISTORY_SOURCES)}")
+    return value
+
+
+def non_legacy_option_history_source(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``'alphavantage'`` when the run reads the Alpha Vantage store, else None. This (not the raw
+    key) is what joins fingerprints, trial configs and result provenance: the legacy ThetaData
+    run, and every non-parquet run, adds nothing, so their identities are byte-identical."""
+    return ALPHAVANTAGE if resolve_options_store(config) == ALPHAVANTAGE else None
+
+
+def with_option_history_source_name(name: str, source: str) -> str:
+    """``name`` carrying a NON-legacy option history source (a job name is the job's identity: two
+    vendors under one name would skip-as-done or compare unlike runs). Legacy -> unchanged. Idempotent."""
+    if check_option_history_source(source) == LEGACY_OPTION_HISTORY_SOURCE:
+        return name
+    tag = f"-opt{source}"
+    return name if name.endswith(tag) else f"{name}{tag}"
 
 #: Superseded names, accepted on input and normalised. NOT offered in ``OPTIONS_STORES``.
 #:
@@ -52,14 +89,15 @@ STORE_ALIASES = {"parquet": TASTYTRADE}
 #: Store -> the vendor whose history it holds. Consumed by
 #: ``daily_backtest_handler.backtest_options_provider``; the values must be keys of
 #: ``ba2_providers.options.OPTIONS_HISTORY_PROVIDERS`` or the floor lookup raises.
-STORE_VENDOR = {SQLITE: "alpaca", TASTYTRADE: "tastytrade", THETADATA: "thetadata"}
+STORE_VENDOR = {SQLITE: "alpaca", TASTYTRADE: "tastytrade", THETADATA: "thetadata",
+                ALPHAVANTAGE: "alphavantage"}
 
 #: Store -> its sub-directory of CACHE_FOLDER. Each vendor writes its OWN tree and they must
 #: never resolve to one directory: the two hold different contracts over different windows, and
 #: the warmer already keeps them apart (tools/warm_options_history.py picks the directory from
 #: ``--provider``). TastyTrade's comes from the WRITER's own constant rather than being retyped,
 #: because a hand-copied directory name is how a reader drifts from its writer.
-_STORE_DIRS = {TASTYTRADE: None, THETADATA: "ThetaDataOptionsProvider"}
+_STORE_DIRS = {TASTYTRADE: None, THETADATA: "ThetaDataOptionsProvider", ALPHAVANTAGE: "AlphaVantageOptionsProvider"}
 
 #: Sub-directory of CACHE_FOLDER holding the parquet tree. Imported from the writer so the
 #: reader can never drift from it.
@@ -86,6 +124,15 @@ def resolve_options_store(config: Optional[Dict[str, Any]] = None) -> str:
     raw = None
     if config is not None:
         raw = config.get("options_store")
+    source = None if config is None else config.get(OPTION_HISTORY_SOURCE_KEY)
+    if source not in (None, ""):
+        # The vendor choice IS the store for the two parquet vendors. An explicit store that names
+        # another one is a contradiction, refused (a silent pick would score a job on the wrong history).
+        source = check_option_history_source(source)
+        if raw not in (None, "") and STORE_ALIASES.get(str(raw).strip().lower(), str(raw).strip().lower()) != source:
+            raise ValueError(
+                f"conflicting option history: {OPTION_HISTORY_SOURCE_KEY}={source!r} but options_store={raw!r}")
+        return source
     if raw is None:
         raw = os.environ.get("BACKTEST_OPTIONS_STORE")
     store = str(raw).strip().lower() if raw else SQLITE
@@ -125,7 +172,10 @@ def default_options_parquet_root(store: str = TASTYTRADE) -> str:
         raise ValueError(
             f"{store!r} has no parquet tree (stores with one: {sorted(_STORE_DIRS)}).")
     provider_dir = _STORE_DIRS[store]
-    if provider_dir is None:
+    if store == ALPHAVANTAGE:
+        # Taken from the WRITER, like the TastyTrade one below.
+        from ba2_providers.options.alphavantage import PROVIDER_DIR as provider_dir
+    elif provider_dir is None:
         # Taken from the WRITER so the reader can never drift from it.
         from ba2_providers.options.parquet_store import PROVIDER_DIR
         provider_dir = PROVIDER_DIR

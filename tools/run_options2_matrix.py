@@ -91,7 +91,8 @@ if _TOOLS_DIR not in sys.path:
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
     add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce,
-    add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name)
+    add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name,
+    add_option_history_source_flag, option_store_tokens, with_option_history_source_name)
 
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
@@ -246,7 +247,7 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         # THE PARQUET STORE, ALWAYS. daily_backtest_handler.validate_options_window enforces
         # the serving vendor's history floor, and the sqlite/Alpaca store's is 2024-01-18 --
         # so the design's 2023-01 start RAISES before the job runs on the default store.
-        "--options-store", args.options_store,
+        *option_store_tokens(args),
         # The underlyings' OHLCV history (fmp | alpaca): option jobs default to fmp in the launcher,
         # so the source is ALWAYS stated here (owner 2026-10-22: this grid runs on alpaca).
         "--ohlcv-history-source", args.ohlcv_history_source,
@@ -371,6 +372,7 @@ def main(argv=None) -> int:
     ap = build_parser()
     add_refused_decision_times_flag(ap)
     add_estimates_source_flag(ap)
+    add_option_history_source_flag(ap)
     args = ap.parse_args(argv)
     refuse_decision_times_and_announce(args)
 
@@ -388,6 +390,7 @@ def main(argv=None) -> int:
     jobs = list(_jobs(strategies, experts, args.earnings_expert, args.name_suffix))
     _est = estimates_source_of(args, __file__)
     jobs = [(with_estimates_source_name(n, _est), e, st) for n, e, st in jobs]
+    jobs = [(with_option_history_source_name(n, args), e, st) for n, e, st in jobs]
     done = _completed_names()
     print(f"options grid 2: {len(jobs)} jobs (strategies={strategies}, experts={experts}, "
           f"earnings_expert={args.earnings_expert}, universe={len(symbols)} symbols); "
