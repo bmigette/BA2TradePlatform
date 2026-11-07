@@ -329,6 +329,7 @@ def _cmd_prewarm(args) -> int:
     try:
         fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
                                    finnhub_key=keys["finnhub"],
+                                   estimates_source=_resolve_estimates_source(args, "prewarm"),
                                    log=lambda msg: print(msg, flush=True))
     except PrewarmConfigError as e:
         print(f"ba2-test prewarm: {e}")
@@ -1411,6 +1412,67 @@ def _add_history_source_arg(parser) -> None:
     from ba2_common.core.ohlcv_history import HISTORY_SOURCES
     parser.add_argument("--ohlcv-history-source", choices=sorted(HISTORY_SOURCES), default=None,
                         help=_HISTORY_SOURCE_HELP)
+
+
+#: ``--estimates-source`` help, shared by every subcommand that creates a job.
+_ESTIMATES_SOURCE_HELP = (
+    "Where the job's analyst estimates come from; REQUIRED, no default (estimates_source on the run config, "
+    "in the checkpoint fingerprint). fmp = FMP /analyst-estimates, which returns ONLY today's consensus: a "
+    "historical estimate read then raises EstimatesNotPointInTime. alphavantage = the point-in-time quarterly "
+    "consensus (Alpha Vantage EARNINGS_ESTIMATES, split-adjusted), read from the prewarmed cache.")
+
+
+def _add_estimates_source_arg(parser) -> None:
+    """``--estimates-source {fmp,alphavantage}`` (required at job creation: ``_resolve_estimates_source``)."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCES
+    parser.add_argument("--estimates-source", choices=list(ESTIMATES_SOURCES), default=None,
+                        help=_ESTIMATES_SOURCE_HELP)
+
+
+def _resolve_estimates_source(args, command: str) -> str:
+    """The job's estimates source: as stated, else the run REFUSES (no default)."""
+    stated = getattr(args, "estimates_source", None)
+    if not stated:
+        sys.exit(f"ba2-test {command}: REFUSED: --estimates-source {{fmp,alphavantage}} is required; a "
+                 f"backtest must name where its analyst estimates come from (fmp has no history of "
+                 f"revisions, alphavantage is point-in-time). There is no default.")
+    return stated
+
+
+def _refuse_reused_estimates_source_name(name: str, source: str, command: str) -> None:
+    """Refuse (exit) a run whose NAME is a COMPLETED optimization stamped with a DIFFERENT estimates source
+    (same reasoning as ``_refuse_reused_history_source_name``). An unstamped stored job read FMP."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+
+    def _find(node):
+        if isinstance(node, dict):
+            if ESTIMATES_SOURCE_KEY in node:
+                return node[ESTIMATES_SOURCE_KEY]
+            node = list(node.values())
+        if isinstance(node, list):
+            for v in node:
+                found = _find(v)
+                if found is not None:
+                    return found
+        return None
+
+    db = SessionLocal()
+    try:
+        rows = (db.query(StrategyOptimization)
+                .filter(StrategyOptimization.name == name, StrategyOptimization.status == "completed").all())
+        clashes = []
+        for r in rows:
+            stored = _find(r.optimization_config or {}) or "fmp"
+            if stored != source:
+                clashes.append((r.id, stored))
+    finally:
+        db.close()
+    if clashes:
+        sys.exit(f"ba2-test {command}: REFUSED: --name {name!r} is already a completed optimization "
+                 f"{clashes} (id, estimates source) but this run uses {source!r}. Use a name that differs "
+                 f"(matrix_flags.with_estimates_source_name); one name must not stand for two estimate sources.")
 
 
 def _is_option_job(spec: dict, strategy_kind: "str | None") -> bool:
@@ -9421,6 +9483,7 @@ def _cmd_optimize(args) -> int:
     manage_sched = _daily_manage_schedule()
     # The OHLCV history source, resolved (and an option job on alpaca refused) before anything is built.
     history_source = _resolve_history_source(args, "optimize", spec, args.strategy)
+    estimates_source = _resolve_estimates_source(args, "optimize")
 
     init_db()
 
@@ -9457,6 +9520,7 @@ def _cmd_optimize(args) -> int:
     _refuse_reused_timegene_name(_opt_name, decision_times, "optimize",
                                  split=_decision_times_is_split(getattr(args, "decision_times", None)))
     _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
+    _refuse_reused_estimates_source_name(_opt_name, estimates_source, "optimize")
     if not getattr(args, "rerun", False) and not seed_check_only:
         _db = SessionLocal()
         try:
@@ -9550,6 +9614,8 @@ def _cmd_optimize(args) -> int:
             "execution_interval": args.interval,
             # Which OHLCV history every trial of this job reads (also in the checkpoint fingerprint).
             "ohlcv_history_source": history_source,
+            # Where the trials' analyst estimates come from (no default; also in the fingerprint).
+            "estimates_source": estimates_source,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -9951,6 +10017,7 @@ def _cmd_optimize_batch(args) -> int:
     # batch BEFORE the first job is enqueued, not midway
     for _e, _k in jobs:
         _resolve_history_source(args, "optimize-batch", _EXPERT_OPT[_e], _k)
+    _resolve_estimates_source(args, "optimize-batch")      # refuse the batch up front when it is not stated
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
@@ -9973,6 +10040,8 @@ def _cmd_optimize_batch(args) -> int:
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         history_source = _resolve_history_source(args, "optimize-batch", spec, strat_kind)
         _refuse_reused_history_source_name(name, history_source, "optimize-batch")
+        estimates_source = _resolve_estimates_source(args, "optimize-batch")
+        _refuse_reused_estimates_source_name(name, estimates_source, "optimize-batch")
         db = SessionLocal()
         try:
             neutral_mode = getattr(args, "neutral_entry_mode", "legacy")
@@ -10019,6 +10088,7 @@ def _cmd_optimize_batch(args) -> int:
                 "execution_interval": args.interval,
                 # Which OHLCV history every trial of this job reads (see _cmd_optimize).
                 "ohlcv_history_source": history_source,
+                "estimates_source": estimates_source,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
@@ -11196,6 +11266,7 @@ def main(argv: "list | None" = None) -> int:
                          "window (the panel always covers 2019-03-01..today). Resumable.")
     pw.add_argument("--screener-store", default=None,
                     help="Metric-store directory whose symbols are the screener universe (with --screener-panel).")
+    _add_estimates_source_arg(pw)
     pw.add_argument("--ohlcv-history-source", choices=["fmp", "alpaca"], default=None,
                     help="OHLCV history the --screener-panel is built from (REQUIRED with --screener-panel, no default): "
                          "a derived store names its history and a job refuses a panel built from the other one.")
@@ -11600,6 +11671,7 @@ def main(argv: "list | None" = None) -> int:
                          "entry then fires on every evaluated symbol.")
     op.add_argument("--fill-model", default="next_bar_open")
     _add_history_source_arg(op)
+    _add_estimates_source_arg(op)
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
@@ -11920,6 +11992,7 @@ def main(argv: "list | None" = None) -> int:
                          "trial -- state the store here.")
     ob.add_argument("--fill-model", default="next_bar_open")
     _add_history_source_arg(ob)
+    _add_estimates_source_arg(ob)
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])

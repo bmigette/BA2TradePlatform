@@ -142,3 +142,39 @@ def client(gate_engine, monkeypatch):
             yield c
     finally:
         main.app.dependency_overrides.clear()
+
+
+_ESTIMATES_STRICT = {"on": False}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tolerant_estimates_source():
+    """TEST HARNESS ONLY: most backtest tests build a run config by hand and say nothing about the analyst
+    estimates. The product refuses such a config (a backtest must name its source, no default:
+    ``ba2_common.core.estimates_source``), so for the tests that are about something else this answers ``fmp``
+    when the key is absent. Session-scoped because module-scoped fixtures run engines too. A test of the
+    refusal itself opts out with ``@pytest.mark.strict_estimates_source`` (see ``_strict_estimates_source``).
+    Every product module calls the resolver through the module attribute precisely so this one patch reaches
+    all of them."""
+    from _pytest.monkeypatch import MonkeyPatch
+    from ba2_common.core import estimates_source as es
+
+    real = es.resolve_job_estimates_source
+
+    def tolerant(job_config):
+        absent = es.ESTIMATES_SOURCE_KEY not in job_config or job_config[es.ESTIMATES_SOURCE_KEY] in (None, "")
+        if absent and not _ESTIMATES_STRICT["on"]:
+            return "fmp"
+        return real(job_config)
+
+    mp = MonkeyPatch()
+    mp.setattr(es, "resolve_job_estimates_source", tolerant)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _strict_estimates_source(request):
+    _ESTIMATES_STRICT["on"] = request.node.get_closest_marker("strict_estimates_source") is not None
+    yield
+    _ESTIMATES_STRICT["on"] = False

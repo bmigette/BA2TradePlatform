@@ -34,6 +34,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, check_estimates_source
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
 from ba2_common.core.ohlcv_history import resolve_job_history_source
 
 
@@ -2030,7 +2032,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
             backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
             _screener_identity(backtest_cfg.get("screener_opt")),
-            resolve_job_history_source(backtest_cfg))
+            resolve_job_history_source(backtest_cfg), _estimates_source_mod.resolve_job_estimates_source(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -3106,6 +3108,7 @@ def _build_daily_trial_config(
     # split-basis converter reads FMP's calendar).
     from app.services.backtest.history_source import refuse_option_job_on_unsupported_source
     history_source = resolve_job_history_source(backtest_cfg)
+    estimates_source = _estimates_source_mod.resolve_job_estimates_source(backtest_cfg)   # no default: the job names it
     refuse_option_job_on_unsupported_source(
         {OHLCV_HISTORY_SOURCE_KEY: history_source},
         uses_options=bool(options_cache_db) or strategy_uses_options(
@@ -3320,6 +3323,7 @@ def _build_daily_trial_config(
         # Which OHLCV history the trial reads (see above). In the whitelist: a key missing here is
         # silently dropped and the trial would read the legacy history whatever the job says.
         OHLCV_HISTORY_SOURCE_KEY: history_source,
+        ESTIMATES_SOURCE_KEY: estimates_source,      # whitelist: a dropped key would refuse in the engine
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
         "start_date": backtest_cfg["start_date"],
         "end_date": backtest_cfg["end_date"],
@@ -3716,7 +3720,8 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            rm_toggles_unpinned: Optional[List[str]] = None,
                            screener_universe_rule: Optional[str] = None,
                            screener_criteria: Optional[str] = None,
-                           ohlcv_history_source: Optional[str] = None) -> str:
+                           ohlcv_history_source: Optional[str] = None,
+                           estimates_source: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3785,6 +3790,10 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["screener_criteria"] = screener_criteria
     if ohlcv_history_source is not None and ohlcv_history_source != LEGACY_HISTORY_SOURCE:
         payload["ohlcv_history_source"] = check_history_source(ohlcv_history_source)
+    if estimates_source is not None:
+        # Where the analyst estimates come from is part of what a genome was scored on (fmp refuses
+        # historical estimate reads, alphavantage serves point-in-time ones): a checkpoint never crosses.
+        payload["estimates_source"] = check_estimates_source(estimates_source)
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

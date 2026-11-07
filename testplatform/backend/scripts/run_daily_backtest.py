@@ -56,6 +56,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.services.sync_client import push_backtest
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, ESTIMATES_SOURCES
 from ba2_common.core.ohlcv_history import DEFAULT_BT_HISTORY_SOURCE, HISTORY_SOURCES, OHLCV_HISTORY_SOURCE_KEY
 
 # Load .env so a configured FMP_API_KEY (project root or backend/.env) is picked up before
@@ -140,6 +141,11 @@ def _parse_args(argv: list) -> argparse.Namespace:
         "fmp = CACHE_FOLDER/FMPOHLCVProvider, alpaca = CACHE_FOLDER/AlpacaHistoryOHLCVProvider. "
         "An option run on alpaca is refused (ThetaData strikes are as-traded; the split-basis "
         "converter still reads FMP's calendar).",
+    )
+    p.add_argument(
+        "--estimates-source", choices=list(ESTIMATES_SOURCES), required=True,
+        help="Where the run's analyst estimates come from (REQUIRED, no default): fmp has only today's "
+        "consensus (a historical estimate read raises EstimatesNotPointInTime), alphavantage is point-in-time.",
     )
     p.add_argument(
         "--initial-capital", type=float, default=100_000.0, help="Starting cash."
@@ -241,6 +247,7 @@ def _build_real_config(args: argparse.Namespace) -> dict:
         "seed": int(args.seed),
         "subtype": "daily_expert",
         OHLCV_HISTORY_SOURCE_KEY: args.ohlcv_history_source,
+        ESTIMATES_SOURCE_KEY: args.estimates_source,
     }
     override = _run_schedule_override(args.run_schedule, args.run_schedule_day)
     if override:

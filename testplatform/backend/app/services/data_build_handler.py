@@ -23,6 +23,8 @@ import os
 from datetime import datetime
 from typing import Any, Dict
 
+from ba2_common.core.estimates_source import resolve_job_estimates_source
+
 logger = logging.getLogger(__name__)
 
 
@@ -285,7 +287,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                                                    history_source=sp["ohlcv_history_source"])
         try:
             fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
-                                       finnhub_key=keys["finnhub"], log=logger.info)
+                                       finnhub_key=keys["finnhub"], log=logger.info,
+                                       estimates_source=resolve_job_estimates_source(payload))
             summary = run_prewarm(fetchers, experts, symbols, workers, end=end_date)
         except PrewarmConfigError as e:
             # A configuration gap, not a data gap: it would repeat for every remaining symbol,

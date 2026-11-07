@@ -305,7 +305,12 @@ class PrewarmFetchers:
                  fmp_key: Optional[str],
                  end_date: datetime,
                  finnhub_key: Optional[str],
+                 estimates_source: str,
                  log: Optional[Callable[[str], None]] = None) -> None:
+        from ba2_common.core.estimates_source import check_estimates_source
+        # The run's estimates source (no default): alphavantage additionally warms the point-in-time
+        # consensus namespace for every symbol an estimate-reading expert warms.
+        self.estimates_source = check_estimates_source(estimates_source)
         if not fmp_key:
             raise PrewarmConfigError(
                 "FMP_API_KEY not configured (set it in .env or the app-settings DB).")
@@ -404,7 +409,23 @@ class PrewarmFetchers:
 
         for namespace in ESTIMATOR_NAMESPACES:
             self._warm(namespace, sym)
+        self._warm_av_consensus(sym)
 
+    def _routed_details(self):
+        """``fundamentals_details()`` of a bundle on this run's estimates source (built once)."""
+        if getattr(self, "_details_router", None) is None:
+            from ba2_common.core.backtest_context import LiveProviderBundle
+            from ba2_providers import get_provider
+            self._details_router = LiveProviderBundle(
+                get_provider, estimates_source=self.estimates_source).fundamentals_details()
+        return self._details_router
+
+    def _warm_av_consensus(self, sym: str) -> None:
+        """Warm the Alpha Vantage point-in-time EPS consensus (+ split calendar) of *sym* when this run's
+        estimates source is ``alphavantage``; nothing for ``fmp``."""
+        if self.estimates_source == "alphavantage":
+            from ba2_experts.warm_fetchers import AV_CONSENSUS_NAMESPACE
+            self._warm(AV_CONSENSUS_NAMESPACE, sym)
     # --------------------------------------------------------------- fetchers
     def do_fmprating(self, sym: str) -> None:
         """Consensus reconstruction inputs + the dated individual grades (rating-recency)."""
@@ -459,9 +480,12 @@ class PrewarmFetchers:
         --timeframes 1d`` over [start-warmup, end] as well.
         """
         from ba2_experts.FactorRanker import data as _fr_data
-        _fr_data.fetch_value_inputs([sym], as_of=self.end_date)    # statements + OHLCV as_of price
-        _fr_data.fetch_quality_inputs([sym], as_of=self.end_date)  # statements (disk hits)
-        _fr_data.fetch_pead_inputs([sym], as_of=self.end_date)     # past_earnings + estimates
+        # The routed details of THIS run's estimates source (the same object a backtest bundle hands the expert).
+        details = self._routed_details()
+        _fr_data.fetch_value_inputs([sym], as_of=self.end_date, details=details)    # statements + OHLCV as_of price
+        _fr_data.fetch_quality_inputs([sym], as_of=self.end_date, details=details)  # statements (disk hits)
+        _fr_data.fetch_pead_inputs([sym], as_of=self.end_date, details=details)     # past_earnings + estimates
+        self._warm_av_consensus(sym)                               # pead dispersion from AV when so stated
         _fr_data.fetch_close_prices([sym], as_of=self.end_date)    # momentum: 1d OHLCV parquet
 
     def do_finnhub(self, sym: str) -> None:

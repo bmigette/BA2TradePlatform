@@ -16,6 +16,8 @@ from app.schemas.trade_chart import TradeChartContext
 from app.services.backtest_trade_chart import (
     TradeChartRowNotFound, build_trade_chart_context,
 )
+from ba2_common.core import estimates_source as _estimates_source_mod
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
 from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
 from app.services.sync_client import push_backtest
 
@@ -85,6 +87,7 @@ class BacktestCreate(BaseModel):
     # OHLCV history a daily_expert run reads: "fmp" | "alpaca". None = the new-job default (alpaca for
     # equity, fmp for option runs); an unknown name or an option run on alpaca is refused (400).
     ohlcv_history_source: Optional[str] = None
+    estimates_source: Optional[str] = None      # REQUIRED at creation (no default): fmp | alphavantage
     # ML-engine fields (required only when engine == "ml"; validated in the route).
     model_id: Optional[str] = None  # String model ID like "mdl-abc123"
     prediction_dataset_id: Optional[int] = None
@@ -159,6 +162,7 @@ class DailyBacktestCreate(BaseModel):
     are NOT used by the daily engine (the universe is ``enabled_instruments``)."""
     name: str
     ohlcv_history_source: Optional[str] = None  # None = new-job default (see BacktestCreate)
+    estimates_source: Optional[str] = None      # REQUIRED at creation (no default): fmp | alphavantage
     enabled_instruments: List[str]
     experts: List[dict]  # [{"class": "FMPEarningsDrift", "settings": {...}}] or ["FMPEarningsDrift"]
     start_date: str
@@ -549,6 +553,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
          "entry_rules": backtest.entry_rules or backtest.entry_actions},
         "POST /backtests (daily_expert)")
     strategy_params[OHLCV_HISTORY_SOURCE_KEY] = history_source
+    strategy_params[ESTIMATES_SOURCE_KEY] = _new_job_estimates_source(backtest.estimates_source, "POST /backtests (daily_expert)")
 
     db_backtest = Backtest(
         name=backtest.name,
@@ -701,6 +706,14 @@ def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
     return {"status": "queued", "task_id": task_id, "backtest_id": backtest_id}
 
 
+def _new_job_estimates_source(stated: Optional[str], where: str) -> str:
+    """The analyst-estimates source a NEW API-created run is stamped with. Required: no default (HTTP 400)."""
+    try:
+        return _estimates_source_mod.resolve_job_estimates_source({ESTIMATES_SOURCE_KEY: stated})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"{where}: {e}")
+
+
 def _new_job_history_source(stated: Optional[str], probe: dict, where: str) -> str:
     """The OHLCV history a NEW API-created run is stamped with (``new_job_history_source``): an explicit value
     wins, else alpaca for an equity run and fmp for an option run. Unknown / option-on-alpaca -> HTTP 400."""
@@ -747,9 +760,10 @@ def create_daily_backtest(
         raise HTTPException(status_code=400, detail=str(e))
 
     history_source = _new_job_history_source(request.ohlcv_history_source, {}, "POST /backtests/daily")
+    estimates_source = _new_job_estimates_source(request.estimates_source, "POST /backtests/daily")
     db_backtest = Backtest(
         name=request.name,
-        strategy_params={OHLCV_HISTORY_SOURCE_KEY: history_source},
+        strategy_params={OHLCV_HISTORY_SOURCE_KEY: history_source, ESTIMATES_SOURCE_KEY: estimates_source},
         model_id=None,  # daily expert runs are not model-driven (Task-7 migration makes this nullable)
         start_date=start_date,
         end_date=end_date,
@@ -788,6 +802,7 @@ def create_daily_backtest(
             # None on the daily-cadence path -> engine analyses every bar (unchanged).
             'run_schedule_override': run_schedule_override,
             OHLCV_HISTORY_SOURCE_KEY: history_source,
+            ESTIMATES_SOURCE_KEY: estimates_source,
         },
         description=f'Daily expert backtest over {len(request.enabled_instruments)} instruments',
     )

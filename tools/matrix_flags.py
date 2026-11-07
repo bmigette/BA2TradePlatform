@@ -129,6 +129,27 @@ def add_history_source_flag(ap: Any) -> None:
                          "share a name, a skip-if-completed check or a checkpoint.")
 
 
+def add_estimates_source_flag(ap: Any) -> None:
+    """``--estimates-source`` on a GRID DRIVER's parser: REQUIRED, no default (a job must name where its
+    analyst estimates come from; fmp has no revision history, alphavantage is point-in-time)."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCES
+    ap.add_argument("--estimates-source", choices=list(ESTIMATES_SOURCES), required=True,
+                    help="Analyst-estimates source of every job: forwarded to `ba2-test optimize` (stamped on the "
+                         "run config and its checkpoint fingerprint), part of the job NAME for alphavantage and "
+                         "of the digest (it is in the argv), so two sources never share a name or a checkpoint.")
+
+
+def estimates_source_tokens(source: str) -> List[str]:
+    """``--estimates-source`` tokens for one job's argv (always stated, never implicit)."""
+    return ["--estimates-source", source]
+
+
+def with_estimates_source_name(name: str, source: str) -> str:
+    """``name`` with the estimates-source token for a non-fmp source (idempotent); fmp keeps the plain name."""
+    from ba2_common.core.estimates_source import check_estimates_source
+    return name if check_estimates_source(source) == "fmp" or "-estalphavantage" in name         else name + "-estalphavantage"
+
+
 def history_source_tokens(source: str) -> List[str]:
     """``--ohlcv-history-source`` tokens for one job's argv (always stated: a job's source is never implicit)."""
     return ["--ohlcv-history-source", source]
