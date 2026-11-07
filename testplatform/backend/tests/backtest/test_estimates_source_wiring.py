@@ -148,7 +148,10 @@ def test_job_name_digest_and_fingerprint_differ_between_the_sources():
     space = {"a": {"optimize": True, "min": 0, "max": 1}}
     ga = {"populationSize": 4, "generations": 2}
     base = checkpoint_fingerprint(space, ga)
-    assert checkpoint_fingerprint(space, ga, estimates_source="fmp") != base          # stated -> part of identity
+    # fmp is the legacy implicit source: it keeps the pre-flag fingerprint (and digest), so every job from
+    # before --estimates-source resumes; a non-fmp source is part of the identity.
+    assert checkpoint_fingerprint(space, ga, estimates_source="fmp") == base
+    assert job_name_with_digest("n", cmd + estimates_source_tokens("fmp")) == job_name_with_digest("n", cmd)
     assert (checkpoint_fingerprint(space, ga, estimates_source="fmp")
             != checkpoint_fingerprint(space, ga, estimates_source="alphavantage"))
 
