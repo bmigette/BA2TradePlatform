@@ -60,6 +60,31 @@ def parse_window(values):
     return values[0], values[1]
 
 
+def parse_overrides(items):
+    """``["k=v", ...]`` -> ``{k: v}``; v is JSON when it parses (numbers, true/false), else the raw string."""
+    out = {}
+    for item in items or []:
+        key, sep, raw = str(item).partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set takes KEY=VALUE, got {item!r}")
+        try:
+            out[key.strip()] = json.loads(raw)
+        except ValueError:
+            out[key.strip()] = raw
+    return out
+
+
+def apply_expert_overrides(config, overrides):
+    """Set ``overrides`` in every expert's settings of a rebuilt run config; returns the previous values."""
+    previous = {}
+    for spec in config.get("experts") or []:
+        settings = spec.setdefault("settings", {})
+        for key, value in overrides.items():
+            previous.setdefault(key, settings.get(key))
+            settings[key] = value
+    return previous
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("backtest_id", type=int)
@@ -81,9 +106,16 @@ def main() -> int:
                     help="MEASUREMENT ONLY: let --decision-time 09:30 (the session's first bar) run, "
                          "with the engine's first-bar warning, as a stored row without an override "
                          "does. The GA gene validation still refuses 09:30.")
+    ap.add_argument("--estimates-source", choices=("fmp", "alphavantage"),
+                    help="re-measure on this estimates source; default: the row's own (fmp for a row stored "
+                         "before runs named one)")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override an EXPERT setting for this re-run (JSON value, else a string), e.g. "
+                         "--set model_target_method=consensus. Repeatable. Still writes no row.")
     ns = ap.parse_args()
     try:
         ns.window = parse_window(ns.window)
+        ns.set = parse_overrides(ns.set)
     except ValueError as e:
         ap.error(str(e))
 
@@ -101,7 +133,13 @@ def main() -> int:
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
         config = rebuild_config_for_backtest(bt, db, window=ns.window,
-                                             recompute_universe=ns.recompute_universe)
+                                             recompute_universe=ns.recompute_universe,
+                                             estimates_source=ns.estimates_source)
+        if ns.set:
+            if not config.get("experts"):
+                print("--set: the rebuilt config has no experts block")
+                return 1
+            previous = apply_expert_overrides(config, ns.set)
         stored_times = ((config.get("run_schedule_override") or {}).get("times"))
         if ns.decision_time:
             from ba2_common.core.schedule_genes import retime_schedules
@@ -120,6 +158,9 @@ def main() -> int:
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
     print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
           flush=True)
+    print(f"estimates source {config.get('estimates_source')}", flush=True)
+    if ns.set:
+        print(f"expert setting overrides {ns.set}  (row's own: {previous})", flush=True)
     _note = config.get("screener_universe_legacy_note")
     if _note is not None:
         print(f"static universe: {_note['static_universe_size']} symbols, LEGACY list kept "
@@ -161,6 +202,7 @@ def main() -> int:
     if ns.out:
         Path(ns.out).write_text(json.dumps(
             {"row": ns.backtest_id, "name": name, "window": ns.window or stored_window,
+             "estimates_source": config.get("estimates_source"), "overrides": ns.set,
              "decision_time": ns.decision_time, "stored_times": stored_times,
              "stored": stored, "stored_window": stored_window, "rerun": got,
              "preload_symbols": results.get("symbol_count"),

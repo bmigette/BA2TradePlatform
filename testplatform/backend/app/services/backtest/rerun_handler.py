@@ -192,7 +192,8 @@ def legacy_universe_note(bt_block: Dict[str, Any], hoisted: Dict[str, Any], deco
 
 
 def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
-                                    recompute_universe: bool = False) -> Dict[str, Any]:
+                                    recompute_universe: bool = False,
+                                    estimates_source: Any = None) -> Dict[str, Any]:
     """Rebuild an opt-derived row's run config.
 
     Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
@@ -247,6 +248,8 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
     # bt_block, so it follows the overridden window.
     if window is not None:
         bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
+    _stamp_estimates_source(bt_block, bt_block.get(ESTIMATES_SOURCE_KEY), estimates_source)
 
     # The optimization may have run on another machine (e.g. a Windows store path) or the store may
     # have moved — remap a missing screener store to this machine's local SCREENER_STORE_DIR so the
@@ -280,7 +283,7 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
     return trial_cfg
 
 
-def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
+def _build_standalone_rerun_config(bt: Backtest, estimates_source: Any = None) -> Dict[str, Any]:
     """Rebuild a standalone daily_expert row's run config from its persisted strategy_params."""
     sp = bt.strategy_params or {}
     if not bt.expert_name:
@@ -315,6 +318,7 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     # Part F: _build_config then applies the current model explicitly and the re-run records it.
     if sp.get("optionSpreadModel") is not None:
         payload["option_spread_model"] = sp["optionSpreadModel"]
+    _stamp_estimates_source(payload, sp.get("estimates_source"), estimates_source)   # api/backtests.py stamps it
     # Universe: static -> explicit symbols; screener -> the metric_store block.
     if universe.get("mode") == "screener":
         payload["universe"] = universe
@@ -334,8 +338,26 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     return _build_config(payload)
 
 
+#: The estimates source of a row stored before runs had to name one (TEST 0175, 2026-11-07): every such run
+#: read the FMP snapshot, so this is the fact of how it ran, not a default for new runs.
+LEGACY_ESTIMATES_SOURCE = "fmp"
+
+
+def _stamp_estimates_source(block: Dict[str, Any], stored: Any, override: Any) -> None:
+    """Put the run's estimates source in ``block``: ``override`` (a re-measure on another source) wins, else
+    the stored one, else LEGACY_ESTIMATES_SOURCE for a row that predates the key."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, check_estimates_source
+    if override not in (None, ""):
+        block[ESTIMATES_SOURCE_KEY] = check_estimates_source(override)
+    elif stored not in (None, ""):
+        block[ESTIMATES_SOURCE_KEY] = check_estimates_source(stored)
+    else:
+        block[ESTIMATES_SOURCE_KEY] = LEGACY_ESTIMATES_SOURCE
+
+
 def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None,
-                              recompute_universe: bool = False) -> Dict[str, Any]:
+                              recompute_universe: bool = False,
+                              estimates_source: Any = None) -> Dict[str, Any]:
     """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
 
     This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
@@ -347,6 +369,9 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
     rebuilt from the parent ``StrategyOptimization`` row. Standalone rows reconstruct purely from
     the row's own ``strategy_params`` and need no session; when ``db`` is None here a short-lived
     ``SessionLocal`` is opened only if the row turns out to be optimization-derived.
+
+    ``estimates_source``: re-measure the row on another estimates source (fmp|alphavantage). Omitted, the
+    row's stored source is used, and a row stored before runs named one ran on fmp (LEGACY_ESTIMATES_SOURCE).
     """
     if bt.engine_type != "daily_expert":
         raise ValueError(
@@ -359,13 +384,13 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
         raise ValueError("--recompute-universe is only supported for optimization-derived rows")
     if bt.optimization_id:
         if db is not None:
-            return _build_optimization_rerun_config(db, bt, window, recompute_universe)
+            return _build_optimization_rerun_config(db, bt, window, recompute_universe, estimates_source)
         session = SessionLocal()
         try:
-            return _build_optimization_rerun_config(session, bt, window, recompute_universe)
+            return _build_optimization_rerun_config(session, bt, window, recompute_universe, estimates_source)
         finally:
             session.close()
-    return _build_standalone_rerun_config(bt)
+    return _build_standalone_rerun_config(bt, estimates_source)
 
 
 def build_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
