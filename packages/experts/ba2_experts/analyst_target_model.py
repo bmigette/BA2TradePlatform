@@ -95,7 +95,14 @@ DEFAULT_MAX_ANCHOR_PE = 80.0
 #: the computation.
 DEFAULT_MAX_EXPECTED_PROFIT_PERCENT = 100.0
 
-VALID_METHODS = ("forward", "trailing", "reported", "reported_2y")
+VALID_METHODS = ("forward", "trailing", "reported", "reported_2y", "consensus")
+
+#: "consensus" (2026-11-07): next unreported quarter's EPS consensus AS OF the decision (the estimates
+#: source's get_quarterly_eps_consensus: Alpha Vantage serves it point-in-time, FMP only live) over the
+#: SAME quarter's reported EPS one year earlier. target = price x that growth. Same sanity rules as the
+#: reported methods. Point-in-time exactly when the run's estimates source is (the provider refuses
+#: otherwise), so the GA offers it only on alphavantage runs.
+CONSENSUS_EARNINGS_QUARTERS = 4
 
 #: The methods built only from data public at the decision (see "POINT-IN-TIME" above); the only
 #: ones a backtest may run.
@@ -150,6 +157,8 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
     point_in_time = method in POINT_IN_TIME_METHODS
     ref = replay_now(as_of)
     det = providers.fundamentals_details()
+    if method == "consensus":
+        return _fetch_consensus_inputs(det, symbol, as_of, ref)
     # One spare row: a same-day 'amc' report is dropped below and must not shorten the history.
     quarters = REPORTED_QUARTERS[method] + 1 if point_in_time else 4
 
@@ -238,6 +247,9 @@ def estimate_price_target(inputs: Dict[str, List[dict]], current_price: Optional
     if method in POINT_IN_TIME_METHODS:
         return _estimate_from_reported(earnings, current_price, method, max_anchor_pe,
                                        max_expected_profit_percent)
+    if method == "consensus":
+        return _estimate_from_consensus(earnings, inputs.get("consensus") or [], current_price,
+                                        max_anchor_pe, max_expected_profit_percent)
 
     if method == "trailing":
         if len(earnings) < 4:
@@ -307,4 +319,65 @@ def _estimate_from_reported(earnings: List[dict], current_price: float, method: 
         "anchor_eps": round(ttm, 4),
         "following_eps": round(following, 4),
         "method": method,
+    }
+
+
+def _fetch_consensus_inputs(det: Any, symbol: str, as_of: Optional[datetime], ref: datetime) -> Dict[str, Any]:
+    """Reported quarters (knowable at ``ref``) + the next unreported quarters' consensus as of ``as_of``.
+
+    The consensus read goes through the configured estimates source; a source that cannot answer for a
+    historical ``as_of`` raises ``EstimatesNotPointInTime`` (loud, never absorbed)."""
+    try:
+        past = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
+                                     lookback_periods=CONSENSUS_EARNINGS_QUARTERS + 1, format_type="dict")
+        earnings = past.get("earnings", []) if isinstance(past, dict) else []
+        earnings = _knowable_rows(earnings, ref)[:CONSENSUS_EARNINGS_QUARTERS]
+    except ReplayMiss:
+        raise
+    except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
+        absorb_if_benign(e)
+        logger.warning("analyst_target_model: past-earnings fetch failed for %s: %s", symbol, e)
+        earnings = []
+    try:
+        consensus = det.get_quarterly_eps_consensus(symbol, as_of=as_of).get("quarters", [])
+    except (ReplayMiss, EstimatesNotPointInTime):
+        raise
+    except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
+        absorb_if_benign(e)
+        logger.warning("analyst_target_model: quarterly consensus fetch failed for %s: %s", symbol, e)
+        consensus = []
+    return {"earnings": earnings, "estimates": [], "consensus": consensus}
+
+
+def _estimate_from_consensus(earnings: List[dict], consensus: List[dict], current_price: float,
+                             max_anchor_pe: float, max_expected_profit_percent: float
+                             ) -> Optional[Dict[str, Any]]:
+    """Next quarter's consensus over the same quarter a year earlier, applied to the price."""
+    eps = [r.get("reported_eps") for r in earnings[:CONSENSUS_EARNINGS_QUARTERS]]
+    if len(eps) < CONSENSUS_EARNINGS_QUARTERS or any(not e for e in eps) or not consensus:
+        return None
+    next_q = consensus[0].get("eps_avg")
+    year_ago = eps[CONSENSUS_EARNINGS_QUARTERS - 1]   # newest first: 4th reported quarter = same quarter, a year earlier
+    ttm = sum(eps)
+    if next_q is None or next_q <= 0 or year_ago <= 0 or ttm <= 0:
+        return None
+    anchor_pe = current_price / ttm
+    if anchor_pe > max_anchor_pe:
+        return None
+    growth = next_q / year_ago
+    if growth <= 1.0 or not MIN_REPORTED_GROWTH <= growth <= MAX_REPORTED_GROWTH:
+        return None
+    target = current_price * growth
+    expected_profit_percent = (growth - 1.0) * 100.0
+    if expected_profit_percent > max_expected_profit_percent:
+        expected_profit_percent = max_expected_profit_percent
+        target = current_price * (1.0 + max_expected_profit_percent / 100.0)
+    return {
+        "target_price": round(target, 4),
+        "expected_profit_percent": round(expected_profit_percent, 2),
+        "anchor_pe": round(anchor_pe, 2),
+        "anchor_eps": round(ttm, 4),
+        "following_eps": round(ttm * growth, 4),
+        "method": "consensus",
+        "consensus_snapshot_date": consensus[0].get("snapshot_date"),
     }

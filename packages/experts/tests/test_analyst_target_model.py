@@ -353,3 +353,50 @@ def test_historical_replay_permission_reads_the_snapshot_and_is_scoped():
         assert fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")["estimates"]
     with pytest.raises(EstimatesNotPointInTime):
         fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")
+
+
+# --------------------------------------------------------------------------- #
+# "consensus" (2026-11-07): next quarter's consensus as of the decision / same quarter a year earlier
+# --------------------------------------------------------------------------- #
+def _consensus_inputs(next_q, year_ago=1.0, recent=1.2):
+    return {"earnings": _earnings(recent, recent, recent, year_ago), "estimates": [],
+            "consensus": [{"eps_avg": next_q, "snapshot_date": "2023-03-01"}]}
+
+
+def test_consensus_grows_price_by_next_quarter_vs_same_quarter_last_year():
+    out = estimate_price_target(_consensus_inputs(1.3), 100.0, method="consensus")
+    assert out["target_price"] == pytest.approx(130.0)
+    assert out["consensus_snapshot_date"] == "2023-03-01"
+
+
+def test_consensus_without_a_snapshot_is_none():
+    inputs = {"earnings": _earnings(1.2, 1.2, 1.2, 1.0), "estimates": [], "consensus": []}
+    assert estimate_price_target(inputs, 100.0, method="consensus") is None
+
+
+def test_consensus_shrinking_quarter_has_no_bullish_target():
+    assert estimate_price_target(_consensus_inputs(0.9), 100.0, method="consensus") is None
+
+
+def test_consensus_fetch_reads_the_estimates_source_as_of_the_decision():
+    calls = {}
+
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            calls["as_of"] = as_of
+            return {"quarters": [{"eps_avg": 1.3, "snapshot_date": "2022-02-01"}]}
+
+    as_of = datetime(2022, 3, 1, 15, tzinfo=timezone.utc)
+    out = fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.2, 1.2, 1.2, 1.0))), "AAPL",
+                                 as_of=as_of, method="consensus")
+    assert calls["as_of"] == as_of and out["consensus"][0]["eps_avg"] == 1.3
+
+
+def test_consensus_refusal_from_a_non_point_in_time_source_propagates():
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            raise EstimatesNotPointInTime("fmp has no history")
+
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.0))), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")

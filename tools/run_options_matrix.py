@@ -85,7 +85,8 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, is_analysis_failure_reason, note_job_exit,
-    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce,
+    add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
@@ -620,6 +621,7 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         value = getattr(args, field)
         if value is not None:
             cmd += [flag, str(value)]
+    cmd += estimates_source_tokens(estimates_source_of(args, __file__))
     cmd += cap_passthrough(args)
     if args.fitness_trade_scale:
         cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
@@ -688,6 +690,12 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     """
     cmd = build_cmd(args, launcher, "", expert, strat, universe, neutral_entry_mode)
     tokens = cmd[cmd.index("optimize") + 1:]
+    # --estimates-source fmp is the legacy implicit source: kept out of the experiment identity so every
+    # job from before the flag keeps its name (a non-fmp source joins the config, hence the name).
+    for _i in range(len(tokens) - 1):
+        if tokens[_i] == "--estimates-source" and tokens[_i + 1] == "fmp":
+            tokens = tokens[:_i] + tokens[_i + 2:]
+            break
     config = {}
     i = 0
     while i < len(tokens):
@@ -736,6 +744,7 @@ _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exit
 def main(argv=None) -> int:
     ap = build_parser()
     add_refused_decision_times_flag(ap)
+    add_estimates_source_flag(ap)
     args = resolve_args(ap, argv)
     refuse_decision_times_and_announce(args)
 

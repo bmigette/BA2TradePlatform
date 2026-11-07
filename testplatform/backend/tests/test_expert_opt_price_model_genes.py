@@ -112,3 +112,10 @@ def test_option_jobs_keep_their_pre_existing_ds_and_senate_gene_space():
             assert not new & set(mod._pin_style_dead_genes(kind, dict(spec["expert_params"]), spec=spec)), (expert, kind)
         assert new <= set(mod._pin_style_dead_genes("O_STK", dict(spec["expert_params"]), spec=spec))
         assert new <= set(mod._pin_style_dead_genes("S1", dict(spec["expert_params"]), spec=spec))
+
+
+def test_consensus_method_is_offered_only_on_alphavantage_runs():
+    params = mod._EXPERT_OPT["DeterministicScorer"]["expert_params"]
+    assert "consensus" not in mod._with_estimates_methods(params, "fmp")["model_target_method"]["choices"]
+    av = mod._with_estimates_methods(params, "alphavantage")["model_target_method"]["choices"]
+    assert av[-1] == "consensus" and "consensus" not in params["model_target_method"]["choices"]

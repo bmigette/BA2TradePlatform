@@ -249,6 +249,12 @@ def job_name_with_digest(name: str, cmd: List[str]) -> str:
             skip = True
             continue
         kept.append(tok)
+    # ``--estimates-source fmp`` is the legacy implicit source (every job before the flag read fmp): it stays out of
+    # the digest so those jobs keep their names, skip-if-completed rows and checkpoints. A non-fmp source is kept.
+    for i in range(len(kept) - 1):
+        if kept[i] == "--estimates-source" and kept[i + 1] == "fmp":
+            del kept[i:i + 2]
+            break
     digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
     return f"{name}-d{digest}"
 

@@ -412,7 +412,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             },
             "model_target_method": {
                 "type": "str", "required": False, "default": "reported",
-                "choices": ["forward", "trailing", "reported", "reported_2y"],
+                "choices": ["forward", "trailing", "reported", "reported_2y", "consensus"],
                 "description": "Price-target method (model mode)",
                 "tooltip": "'reported' / 'reported_2y': TTM reported EPS grown by its 1-year / "
                            "annualised 2-year growth (knowable in a backtest). 'forward' / "

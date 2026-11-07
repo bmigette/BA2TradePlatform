@@ -282,7 +282,7 @@ ds_matrix() {                        # $@ = extra driver args (e.g. --strategies
       echo
       export BA2_MAX_REMOTE_SLOTS="$(ds_remote_slots_for "$band")"
       echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st}, remote slots ${BA2_MAX_REMOTE_SLOTS}) $*  $(date)"
-      "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}" "$@"
+      "$PY" "$DRIVER" --estimates-source fmp       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}" "$@"
       rc=$?
       echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
       [ $rc -ne 0 ] && rc_any=$rc

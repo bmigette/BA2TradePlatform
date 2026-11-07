@@ -241,7 +241,7 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
             },
             "model_target_method": {
                 "type": "str", "required": False, "default": "forward",
-                "choices": ["forward", "trailing", "reported", "reported_2y"],
+                "choices": ["forward", "trailing", "reported", "reported_2y", "consensus"],
                 "description": "Only used when expected_profit_mode='model'. 'forward' anchors "
                                "the P/E multiple on the nearest-FY consensus EPS estimate "
                                "(unbiased on average, validated in "

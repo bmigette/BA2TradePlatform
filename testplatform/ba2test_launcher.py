@@ -2084,6 +2084,15 @@ def _style_dead_gene_keys() -> frozenset:
     return frozenset(g if g.startswith("schedule:") else f"model:{g}" for g in _STYLE_DEAD_GENES)
 
 
+def _with_estimates_methods(expert_params: dict, estimates_source: "str | None") -> dict:
+    """An alphavantage run can also draw ``model_target_method='consensus'`` (point-in-time quarterly consensus);
+    an fmp run cannot (FMP has no estimate history: the provider refuses a historical read). A new dict."""
+    gene = expert_params.get("model_target_method")
+    if estimates_source != "alphavantage" or not gene or "consensus" in gene.get("choices", ()):
+        return expert_params
+    return {**expert_params, "model_target_method": {**gene, "choices": [*gene["choices"], "consensus"]}}
+
+
 def _pin_style_dead_genes(kind: "str | None", expert_params: dict, spec: "dict | None" = None) -> dict:
     """``expert_params`` for a gene space: unchanged for every key but ``O_STYLE``; for it, the
     ``_STYLE_DEAD_GENES`` removed (a new dict -- the caller's spec table is shared). On every option
@@ -9829,7 +9838,7 @@ def _cmd_optimize(args) -> int:
             # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
             # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else _pin_style_dead_genes(args.strategy, spec=spec, expert_params={**spec["expert_params"],
+                              else _pin_style_dead_genes(args.strategy, spec=spec, expert_params={**_with_estimates_methods(spec["expert_params"], estimates_source),
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                  regime_searched=_policy_searches_regime(rm_toggle_policy)),
@@ -10167,7 +10176,7 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else _pin_style_dead_genes(strat_kind, spec=spec, expert_params={**spec["expert_params"],
+                                  else _pin_style_dead_genes(strat_kind, spec=spec, expert_params={**_with_estimates_methods(spec["expert_params"], estimates_source),
                                         **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
                                                      atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                      regime_searched=_policy_searches_regime(rm_toggle_policy)),

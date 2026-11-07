@@ -65,7 +65,8 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce,
+    add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name)
 
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
@@ -254,6 +255,7 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     if args.screener_gate_store:
         cmd += ["--screener-gate-store", args.screener_gate_store,
                 "--max-stock-price", str(args.max_stock_price)]
+    cmd += estimates_source_tokens(estimates_source_of(args, __file__))
     if args.workers:
         cmd += ["--workers", args.workers]
     return cmd
@@ -373,6 +375,7 @@ _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exit
 def main(argv=None) -> int:
     ap = build_parser()
     add_refused_decision_times_flag(ap)
+    add_estimates_source_flag(ap)
     args = ap.parse_args(argv)
     refuse_decision_times_and_announce(args)
 
@@ -388,6 +391,8 @@ def main(argv=None) -> int:
             launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
     jobs = list(_jobs(strategies, experts, args.name_suffix))
+    _est = estimates_source_of(args, __file__)
+    jobs = [(with_estimates_source_name(n, _est), e, st) for n, e, st in jobs]
     done = _completed_names()
     print(f"convex-harvest grid: {len(jobs)} jobs (strategies={strategies}, experts={experts}, "
           f"fitness={args.fitness}, universe={len(symbols)} symbols); "

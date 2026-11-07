@@ -3790,9 +3790,11 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["screener_criteria"] = screener_criteria
     if ohlcv_history_source is not None and ohlcv_history_source != LEGACY_HISTORY_SOURCE:
         payload["ohlcv_history_source"] = check_history_source(ohlcv_history_source)
-    if estimates_source is not None:
+    if estimates_source is not None and check_estimates_source(estimates_source) != "fmp":
         # Where the analyst estimates come from is part of what a genome was scored on (fmp refuses
         # historical estimate reads, alphavantage serves point-in-time ones): a checkpoint never crosses.
+        # Joined ONLY when it is not the legacy fmp, like ohlcv_history_source: every job from before the
+        # setting existed read fmp, and keeps its fingerprint (resumes are not broken by the new flag).
         payload["estimates_source"] = check_estimates_source(estimates_source)
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":

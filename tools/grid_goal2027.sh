@@ -212,6 +212,9 @@ EOF
 preflight() {
   local end="$1"
   case "${PHASE:-}" in A|B) ;; *) echo "FATAL: PHASE must be A (Nov-Dec, data to 2025) or B (January, data to 2026)" >&2; exit 2 ;; esac
+  # Analyst estimates source (2026-11-07): REQUIRED, never defaulted. alphavantage = point-in-time estimates
+  # (needs the AV estimates namespace prewarmed); fmp = no historical estimates (estimate readers refuse in BT).
+  case "${ESTIMATES_SOURCE:-}" in fmp|alphavantage) ;; *) echo "FATAL: ESTIMATES_SOURCE must be fmp or alphavantage" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
   check_checkout || exit 1
   check_home || exit 1
@@ -275,6 +278,7 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
       --pass-min-folds 2 --pass-require-fold 2026)
   [ -n "$end" ] && args+=(--wf-data-end "$end")
   [ -n "$WORKERS" ] && args+=(--workers "$WORKERS")
+  args+=(--estimates-source "$ESTIMATES_SOURCE")
   local suffix="$SUFFIX_BASE"
   local mc_o="$MC_OHLCV" mc_t="$MC_TA"
   if [ "$kind" = "senate" ]; then
@@ -429,7 +433,7 @@ case "$CMD" in
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
       local_env=()
-      for v in PHASE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
+      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
         [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
       done
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1
