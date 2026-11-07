@@ -341,3 +341,20 @@ class CompanyFundamentalsDetailsInterface(DataProviderInterface):
         if format_type == "dict":
             return {"symbol": symbol, "as_of_date": as_of_date.isoformat(), "metrics": {}}
         return f"_No financial-ratio data available from {self.get_provider_name()} for {symbol}._"
+
+    def get_quarterly_eps_consensus(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        as_of: Annotated[Optional[datetime], "Decision time; None = now (live)"] = None,
+    ) -> Dict[str, Any]:
+        """The UNREPORTED fiscal quarters' EPS consensus as of ``as_of``, on TODAY's split basis.
+
+        Returns ``{"symbol", "as_of", "source", "quarters": [{"fiscal_period_end", "report_date" (None when
+        unknown), "eps_avg", "eps_high", "eps_low", "analyst_count" (high/low/count None when the source has
+        none for that snapshot), "snapshot_date" (the day the value was true), ...}]}`` ordered by report
+        date. A quarter without a snapshot dated <= ``as_of`` is OMITTED, never guessed. A source that can
+        only answer as of today raises ``EstimatesNotPointInTime`` for a historical ``as_of`` in a backtest.
+
+        Not abstract: a vendor without a consensus feed does not implement it.
+        """
+        raise NotImplementedError(f"{self.get_provider_name()} has no quarterly EPS consensus")

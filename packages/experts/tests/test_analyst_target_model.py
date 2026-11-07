@@ -276,12 +276,34 @@ def test_reported_respects_the_profit_cap():
     assert out["target_price"] == pytest.approx(140.0)
 
 
+class _SnapshotOnlyDetails(_FakeDetailsProvider):
+    """What the FMP provider does in a hermetic backtest: refuse a historical estimates read."""
+
+    def get_earnings_estimates(self, **kw):
+        from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+        refuse_if_not_point_in_time(kw["as_of_date"], hermetic=True, what="fake FMP")
+        return super().get_earnings_estimates(**kw)
+
+
 @pytest.mark.parametrize("method", ["forward", "trailing"])
-def test_backtest_refuses_estimate_methods(method):
-    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+def test_provider_refusal_propagates_instead_of_degrading_to_empty(method):
+    """The refusal lives in the provider now; the model must not absorb it into 'no estimates'."""
+    bundle = _FakeBundle(_SnapshotOnlyDetails(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
     with pytest.raises(EstimatesNotPointInTime):
         fetch_estimator_inputs(bundle, "AAPL", as_of=datetime(2022, 3, 1, tzinfo=timezone.utc),
                                method=method)
+
+
+def test_quarterly_source_cannot_feed_the_annual_methods():
+    from ba2_experts.analyst_target_model import EstimatesGranularityError
+
+    class _AV(_FakeDetailsProvider):
+        def get_earnings_estimates(self, **kw):
+            return {"frequency": "quarterly", "source": "alphavantage", "estimates": _estimates(5.0, 6.0)}
+
+    with pytest.raises(EstimatesGranularityError):
+        fetch_estimator_inputs(_FakeBundle(_AV(earnings=_earnings(1.0))), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="forward")
 
 
 class _RecordingDetails(_FakeDetailsProvider):
@@ -325,7 +347,7 @@ def test_live_estimate_methods_still_fetch():
 
 def test_historical_replay_permission_reads_the_snapshot_and_is_scoped():
     from ba2_experts.analyst_target_model import estimate_snapshot_allowed
-    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    bundle = _FakeBundle(_SnapshotOnlyDetails(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
     as_of = datetime(2022, 3, 1, tzinfo=timezone.utc)
     with estimate_snapshot_allowed():
         assert fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")["estimates"]

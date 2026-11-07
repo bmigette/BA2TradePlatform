@@ -66,6 +66,7 @@ from .socialmedia import StockTwitsSentiment, StockTwitsTrending
 from .screener import FMPScreenerProvider, FMPHistoricalScreenerProvider
 from .options import (AlpacaOptionsProvider, TastyTradeOptionsProvider,
                       ThetaDataOptionsProvider)
+from .fundamentals.estimates.AlphaVantageEstimatesProvider import AlphaVantageEstimatesProvider
 from .riskstats import FinanceCalcRiskStatsProvider
 from .valuation import FinanceCalcValuationProvider
 
@@ -102,6 +103,13 @@ FUNDAMENTALS_DETAILS_PROVIDERS: Dict[str, Type[CompanyFundamentalsDetailsInterfa
     "yfinance": YFinanceCompanyDetailsProvider,
     "fmp": FMPCompanyDetailsProvider,
     # "simfin": SimFinFundamentalsDetailsProvider,
+}
+
+#: The provider behind the ESTIMATE methods of ``fundamentals_details()`` (``ba2_common.core.estimates_router``);
+#: the key is the ``data_provider_estimates`` / ``--estimates-source`` value.
+ESTIMATES_PROVIDERS: Dict[str, type] = {
+    "fmp": FMPCompanyDetailsProvider,
+    "alphavantage": AlphaVantageEstimatesProvider,
 }
 
 NEWS_PROVIDERS: Dict[str, Type[MarketNewsInterface]] = {
@@ -195,6 +203,7 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         "indicators": INDICATORS_PROVIDERS,
         "fundamentals_overview": FUNDAMENTALS_OVERVIEW_PROVIDERS,
         "fundamentals_details": FUNDAMENTALS_DETAILS_PROVIDERS,
+        "estimates": ESTIMATES_PROVIDERS,
         "news": NEWS_PROVIDERS,
         "macro": MACRO_PROVIDERS,
         "insider": INSIDER_PROVIDERS,
