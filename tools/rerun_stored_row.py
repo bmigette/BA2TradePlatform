@@ -96,7 +96,8 @@ def basis_refused_symbols(config):
     lo, hi = cib.judged_window(config["start_date"], config["end_date"], int(config["warmup_days"]))
     rep = pf.scan(config["enabled_instruments"], interval, lo, hi,
                   workers=max(1, min(8, (_os.cpu_count() or 2) - 1)), job_kind=pf.job_kind_of(config))
-    return sorted({r.symbol for r in rep.mismatched} | {s for s, _ in rep.stale})
+    return sorted({r.symbol for r in rep.mismatched} | {s for s, _ in rep.stale}
+                  | {r.symbol for r in rep.coverage_refused})
 
 
 def main() -> int:
@@ -171,15 +172,21 @@ def main() -> int:
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
         if ns.exclude_basis_refused:
-            probe = rebuild_config_for_backtest(bt, db, window=ns.window,
-                                                recompute_universe=ns.recompute_universe,
-                                                estimates_source=ns.estimates_source)
-            refused = basis_refused_symbols(probe)
-            if refused:
-                print(f"basis preflight: excluding {len(refused)} refused symbols: {', '.join(refused)}",
+            # Judged on the FINAL config (the universe can shrink after the rebuild), repeated until clean: a
+            # verdict can depend on the universe's window, so one pass is not enough.
+            excluded = {x.strip().upper() for x in (ns.exclude_symbols or "").split(",") if x.strip()}
+            for _ in range(4):
+                probe = rebuild_config_for_backtest(bt, db, window=ns.window,
+                                                    recompute_universe=ns.recompute_universe,
+                                                    estimates_source=ns.estimates_source,
+                                                    exclude_symbols=sorted(excluded))
+                refused = set(basis_refused_symbols(probe)) - excluded
+                if not refused:
+                    break
+                excluded |= refused
+                print(f"basis preflight: excluding {len(refused)} refused symbols: {', '.join(sorted(refused))}",
                       flush=True)
-                ns.exclude_symbols = ",".join(
-                    sorted({*refused, *[x.strip() for x in (ns.exclude_symbols or '').split(',') if x.strip()]}))
+            ns.exclude_symbols = ",".join(sorted(excluded))
         config = rebuild_config_for_backtest(bt, db, window=ns.window,
                                              recompute_universe=ns.recompute_universe,
                                              estimates_source=ns.estimates_source,
