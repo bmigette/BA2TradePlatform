@@ -51,6 +51,12 @@ The delisting date is the LAST DAILY BAR (what the build's suspensions.json reco
 bars are fetched for every candidate (about 90 bars each), then daily bars of only the last month: a few
 hundred requests in all. Raw responses are cached in --work-dir, so re-runs cost nothing.
 
+Exit price of a delisting (the backtest applies it): ``--write`` also saves ``<out>.terminal_events.json`` (worthless
+removals, bankruptcy-ticker renames such as RAD -> RADCQ, merger cash prices, extras tagged ``worthless``). After the cache
+rebuild, ``--install-terminals <cache>/_meta/suspensions.json`` resolves them against each ``delisted`` event and writes
+``_meta/delisting_terminals.json``: 0 for worthless / bankruptcy, the per-share cash of a cash merger, else the last close
+(counted and logged by the backtest). Stock-for-stock mergers keep the last close.
+
 Credentials are never printed: --keys-db / --account-id (accountsetting, opened read-only, same mechanism as
 tools/alpaca_history_download.py) or APCA_API_KEY_ID / APCA_API_SECRET_KEY. Paper-account keys read the
 public asset list and market data fine.
@@ -468,6 +474,89 @@ def check_against_suspensions(dates_tsv: Path, suspensions_json: Path) -> list:
     return problems
 
 
+def read_extra_tags(path: Path) -> dict:
+    """``{SYMBOL: tag or None}`` of the extras file: ``SYMBOL [worthless]  # evidence``. ``worthless`` = equity cancelled
+    (bankruptcy, seizure, liquidation): a holder received nothing."""
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("#", 1)[0].split()
+        if parts:
+            out[parts[0].upper()] = parts[1].lower() if len(parts) > 1 else None
+    return out
+
+
+def terminal_events(actions: dict, extra_tags: dict) -> dict:
+    """What happened to each symbol's shares, from Alpaca corporate actions (+ tagged extras): ``{symbol: [{kind, date,
+    price}]}``. Consumed AT/after the delisting only (point-in-time safe)."""
+    events: dict = collections.defaultdict(list)
+    for row in actions.get("worthless_removals", []):
+        events[row["symbol"]].append({"kind": "worthless", "date": row["process_date"], "price": 0.0})
+    for row in actions.get("cash_mergers", []):
+        if row["acquiree_symbol"] != row.get("acquirer_symbol") and row.get("rate") is not None:
+            events[row["acquiree_symbol"]].append({"kind": "cash_merger", "date": row["process_date"],
+                                                   "price": float(row["rate"])})
+    for kind in ("stock_mergers", "stock_and_cash_mergers"):
+        for row in actions.get(kind, []):
+            if row["acquiree_symbol"] != row.get("acquirer_symbol"):
+                events[row["acquiree_symbol"]].append({"kind": "stock_merger", "date": row["process_date"], "price": None})
+    for row in actions.get("name_changes", []):
+        new = row["new_symbol"]
+        if len(new) >= 5 and new.endswith("Q") and new != row["old_symbol"] and new[:-1].startswith(row["old_symbol"][:3]):
+            events[row["old_symbol"]].append({"kind": "bankruptcy_otc", "date": row["process_date"], "price": 0.0})
+    for symbol, tag in extra_tags.items():
+        if tag == "worthless":
+            events[symbol].append({"kind": "worthless", "date": None, "price": 0.0})
+    return dict(events)
+
+
+_PRIORITY = ("worthless", "bankruptcy_otc", "cash_merger", "stock_merger")
+_WINDOW_DAYS = {"worthless": (-5, 730), "bankruptcy_otc": (-5, 730), "cash_merger": (-3, 10), "stock_merger": (-3, 10)}
+
+
+def resolve_terminals(events: dict, suspension_symbols: dict) -> tuple:
+    """-> (terminals {symbol: {last_session, kind, price, source}}, counts by kind incl. 'unknown').
+
+    One entry per ``delisted`` event of the cache build whose corporate action falls in the kind's window around the last
+    session (a cash merger within -3..+10 days, a worthless removal / bankruptcy ticker -5..+730 days, an extras tag any
+    date); anything else is 'unknown' (not written: the account prices it at the last close and counts it)."""
+    terminals, counts = {}, collections.Counter()
+    for symbol, rows in sorted(suspension_symbols.items()):
+        delisted = [r for r in rows if r[2] == "delisted"]
+        if not delisted:
+            continue
+        last = dt.date.fromisoformat(delisted[-1][0])
+        chosen = None
+        for kind in _PRIORITY:
+            for ev in events.get(symbol, []):
+                if ev["kind"] != kind:
+                    continue
+                if ev["date"] is not None:
+                    lo, hi = _WINDOW_DAYS[kind]
+                    if not lo <= (dt.date.fromisoformat(ev["date"]) - last).days <= hi:
+                        continue
+                chosen = ev
+                break
+            if chosen:
+                break
+        if chosen is None:
+            counts["unknown"] += 1
+            continue
+        counts[chosen["kind"]] += 1
+        terminals[symbol] = {"last_session": last.isoformat(), "kind": chosen["kind"], "price": chosen["price"],
+                             "source": "tag" if chosen["date"] is None else f"corporate action {chosen['date']}"}
+    return terminals, dict(counts)
+
+
+def install_terminals(events_json: Path, suspensions_json: Path) -> tuple:
+    """Write ``delisting_terminals.json`` beside ``suspensions_json`` (the cache's _meta), stamped with its build."""
+    suspensions = json.loads(suspensions_json.read_text(encoding="utf-8"))
+    events = json.loads(events_json.read_text(encoding="utf-8"))
+    terminals, counts = resolve_terminals(events, suspensions["symbols"])
+    target = suspensions_json.with_name("delisting_terminals.json")
+    target.write_text(json.dumps({"build": suspensions["build"], "symbols": terminals}, indent=1), encoding="utf-8")
+    return target, counts
+
+
 def make_report(base: list, accepted: dict, rejected: list, params: dict, stats: dict) -> dict:
     reasons = collections.Counter(reason for _, reason, _ in rejected)
     by_year = collections.Counter(entry["last_bar"][:4] for entry in accepted.values())
@@ -510,10 +599,17 @@ def main(argv: Optional[list] = None) -> int:
         "~/Documents/ba2/common/cache/AlpacaHistoryOHLCVProvider/_meta/ipo_dates.json").expanduser())
     ap.add_argument("--report", type=Path, help="write the JSON report here (default <work-dir>/report.json)")
     ap.add_argument("--write", action="store_true", help="write --out (and --out.dates.tsv); default is a dry run")
+    ap.add_argument("--install-terminals", type=Path, metavar="SUSPENSIONS_JSON",
+                    help="after the rebuild: write the cache's _meta/delisting_terminals.json (exit price of each delisting: "
+                    "0 worthless / bankruptcy, the merger cash price, else the last close) from --out's .terminal_events.json")
     ap.add_argument("--check-cache", type=Path, metavar="SUSPENSIONS_JSON",
                     help="after the rebuild: compare --out's .dates.tsv with the cache build's _meta/suspensions.json "
                     "and exit 1 on any difference (no network)")
     args = ap.parse_args(argv)
+    if args.install_terminals:
+        target, counts = install_terminals(args.out.with_suffix(".terminal_events.json"), args.install_terminals)
+        print(f"wrote {target}; delisting exits by kind: {counts} (unknown = last close, counted and logged by the backtest)")
+        return 0
     if args.check_cache:
         problems = check_against_suspensions(args.out.with_suffix(".dates.tsv"), args.check_cache)
         for symbol, why in problems:
@@ -531,7 +627,8 @@ def main(argv: Optional[list] = None) -> int:
     inactive, active = fetch_assets(headers, args.trading_host, args.work_dir)
     actions = fetch_corporate_actions(transport, args.start, args.end)
     fmp_key = None if args.no_fmp else load_fmp_key(args.keys_db)
-    extras = read_symbol_file(args.extra_file) if args.extra_file.exists() else []
+    extra_tags = read_extra_tags(args.extra_file) if args.extra_file.exists() else {}
+    extras = list(extra_tags)
     if fmp_key:
         extras += [s for s in fetch_fmp_delisted(fmp_key, args.work_dir, args.start) if s not in extras]
     candidates, rejected = gather_candidates(inactive, active, actions, universe,
@@ -565,6 +662,8 @@ def main(argv: Optional[list] = None) -> int:
             "symbol\tfirst_month\tlast_bar\tsources\tname\n" + "".join(
                 f"{s}\t{e['first_month']}\t{e['last_bar']}\t{'+'.join(e['sources'])}\t{e['name'] or ''}\n"
                 for s, e in sorted(accepted.items())), encoding="utf-8")
+        args.out.with_suffix(".terminal_events.json").write_text(
+            json.dumps(terminal_events(actions, extra_tags), sort_keys=True), encoding="utf-8")
         print(f"wrote {args.out} ({len(out)} symbols)")
     else:
         print("dry run: nothing written (--write writes the universe file)")

@@ -122,3 +122,28 @@ def test_check_against_suspensions(tmp_path):
     assert bu.check_against_suspensions(tsv, sus) == [
         ("B", "delisted event last session 2022-03-10 != expected last bar 2022-03-17"),
         ("C", "no delisted event in the cache build (no bars, or last bar within the slack)")]
+
+
+def test_terminal_events_resolve_against_the_cache_delistings(tmp_path):
+    actions = {"worthless_removals": [{"symbol": "WORTH", "process_date": "2023-06-01"}],
+               "cash_mergers": [{"acquiree_symbol": "CASH", "process_date": "2022-10-28", "rate": 54.2},
+                                {"acquiree_symbol": "OLDM", "process_date": "2019-01-01", "rate": 9.0}],
+               "stock_mergers": [{"acquiree_symbol": "STK", "acquirer_symbol": "BIG", "process_date": "2022-02-14"}],
+               "name_changes": [{"old_symbol": "RAD", "new_symbol": "RADCQ", "process_date": "2023-10-17"},
+                                {"old_symbol": "FB", "new_symbol": "META", "process_date": "2022-06-09"}]}
+    events = bu.terminal_events(actions, {"SIVB": "worthless", "PLAIN": None})
+    d = lambda last: [last, None, "delisted", 9, None]          # noqa: E731
+    suspensions = {"SIVB": [d("2023-03-09")], "WORTH": [d("2023-05-30")], "CASH": [d("2022-10-27")],
+                   "OLDM": [d("2022-10-27")],                   # a merger of ANOTHER era on a reused ticker: not this delisting's
+                   "STK": [d("2022-02-11")], "RAD": [d("2023-10-16")], "PLAIN": [d("2022-01-03")],
+                   "TEMP": [["2022-01-03", "2022-03-01", "exchange_gap", 40, None]]}
+    terminals, counts = bu.resolve_terminals(events, suspensions)
+    assert {s: (t["kind"], t["price"]) for s, t in terminals.items()} == {
+        "SIVB": ("worthless", 0.0), "WORTH": ("worthless", 0.0), "CASH": ("cash_merger", 54.2),
+        "STK": ("stock_merger", None), "RAD": ("bankruptcy_otc", 0.0)}
+    assert counts["unknown"] == 2 and counts["worthless"] == 2                                # OLDM and PLAIN; TEMP is no delisting
+    events_file, sus_file = tmp_path / "e.json", tmp_path / "suspensions.json"
+    events_file.write_text(json.dumps(events))
+    sus_file.write_text(json.dumps({"build": "B7", "rule": {}, "symbols": suspensions}))
+    target, _ = bu.install_terminals(events_file, sus_file)
+    assert json.loads(target.read_text())["build"] == "B7" and target.name == "delisting_terminals.json"

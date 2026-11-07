@@ -87,3 +87,64 @@ def symbols_to_liquidate(held_symbols: Iterable[str], session: date, events: Sus
     if not events:
         return []
     return [s for s in held_symbols if is_suspended(s, session, events)]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Terminal value of a DELISTING (kind ``delisted``): what a holder actually received, not the last exchange close.
+#
+# ``<cache dir>/_meta/delisting_terminals.json`` (written by ``tools/build_screener_universe.py --install-terminals`` from
+# Alpaca corporate actions after a cache build) ::
+#
+#     {"build": "<the suspensions.json build string>", "symbols": {SYM: {"last_session": "YYYY-MM-DD",
+#       "kind": "worthless" | "bankruptcy_otc" | "cash_merger" | "stock_merger" | "unknown", "price": 0.0 | 12.5 | null,
+#       "source": "..."}}}
+#
+# ``worthless`` / ``bankruptcy_otc`` -> price 0 (equity cancelled / left the exchange on a bankruptcy ticker); ``cash_merger`` ->
+# the per-share cash of the merger action; ``stock_merger`` / ``unknown`` -> null = the last close (counted and logged by the
+# account).  Point-in-time safe: it is only read AT or after the delisting.  No file -> ``{}`` (every delisting at the last close).
+# ---------------------------------------------------------------------------------------------------------------------
+TERMINALS_FILE = os.path.join("_meta", "delisting_terminals.json")
+TERMINAL_KINDS = ("worthless", "bankruptcy_otc", "cash_merger", "stock_merger", "unknown")
+ZERO_KINDS = ("worthless", "bankruptcy_otc")
+
+#: ``{symbol: (last_session, kind, price | None)}``
+DelistingTerminals = Mapping[str, Tuple[date, str, Optional[float]]]
+
+
+def load_delisting_terminals(cache_dir: str) -> Dict[str, Tuple[date, str, Optional[float]]]:
+    """The terminals of ``<cache_dir>/_meta/delisting_terminals.json``; ``{}`` when absent.  A malformed file, or one stamped with
+    another suspensions build than the cache's ``suspensions.json``, RAISES ValueError (a stale table would price a delisting
+    from another cache)."""
+    path = os.path.join(cache_dir, TERMINALS_FILE)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        with open(os.path.join(cache_dir, SUSPENSIONS_FILE), encoding="utf-8") as f:
+            build = json.load(f)["build"]
+        if raw["build"] != build:
+            raise ValueError(f"terminals built for {raw['build']!r}, suspensions.json is {build!r}")
+        out: Dict[str, Tuple[date, str, Optional[float]]] = {}
+        for sym, row in raw["symbols"].items():
+            kind, price = row["kind"], row["price"]
+            if kind not in TERMINAL_KINDS:
+                raise ValueError(f"unknown kind {kind!r}")
+            if price is not None and (isinstance(price, bool) or not isinstance(price, (int, float)) or price < 0):
+                raise ValueError(f"bad price {price!r}")
+            if (kind in ZERO_KINDS and price != 0) or (kind in ("stock_merger", "unknown") and price is not None)                     or (kind == "cash_merger" and price is None):
+                raise ValueError(f"{sym}: kind {kind!r} with price {price!r}")
+            out[sym.upper()] = (date.fromisoformat(row["last_session"]), kind, None if price is None else float(price))
+        return out
+    except (KeyError, TypeError, ValueError, OSError) as e:
+        raise ValueError(f"{path} is malformed ({type(e).__name__}: {e}): reinstall it with "
+                         f"tools/build_screener_universe.py --install-terminals") from e
+
+
+def terminal_exit(symbol: str, last_session: date, terminals: DelistingTerminals) -> Tuple[Optional[float], str]:
+    """``(price, kind)`` for a delisting whose last session is ``last_session``.  ``price`` None = use the last close.  A terminal
+    recorded for another last session (a reused ticker, a different event) is not this delisting's: ``(None, 'unknown')``."""
+    row = terminals.get(symbol)
+    if row is None or row[0] != last_session:
+        return None, "unknown"
+    return row[2], row[1]

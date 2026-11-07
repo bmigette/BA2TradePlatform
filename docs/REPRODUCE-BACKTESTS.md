@@ -372,11 +372,7 @@ How the backtest treats a name that delists mid-run (tests: `testplatform/backen
 `packages/providers/tests/test_live_sim_build.py`): the daily engine closes a held position at the last exchange close on the first
 session after the last bar (`delisting_liquidation`, a synthetic FILLED order, logged WARNING), cancels its working orders, never
 fills after the last bar and blocks re-entry; the screener panel masks the symbol from the morning after its last session (before
-BUILD_REV 4 an unreviewed delisting lingered up to 35 days as a candidate the engine then refused). **Known approximation:** the exit
-is the LAST BAR's close. For a cash merger that equals the deal price; for a bankruptcy or seizure whose last print precedes the
-collapse (SIVB's last bar is 2023-03-09 at 106) the real shareholder outcome is ~zero, so these exits are OPTIMISTIC. The
-`sources` column of the dates file marks `worthless_removals` / `extra_list` names; do not read the P&L of those trades as
-survivorship-free until a terminal-value rule exists. A delisting within the last 5 sessions before the store's end is not yet a
+BUILD_REV 4 an unreviewed delisting lingered up to 35 days as a candidate the engine then refused). **Exit price of a delisting (2026-11-07):** a worthless removal, a bankruptcy ticker (RAD -> RADCQ) or an extras-file name tagged `worthless` (SIVB, FRC, ...) liquidates at **0** (`delisting_worthless`); a cash merger at the corporate action's per-share cash (`delisting_cash_merger`); stock-for-stock mergers and unknown reasons at the last close (`delisting_liquidation`, WARNING logged, counted in `BacktestAccount.delisting_exit_counts`). The table is `<cache>/AlpacaHistoryOHLCVProvider/_meta/delisting_terminals.json`, installed after the cache rebuild with `build_screener_universe.py --out ... --install-terminals <cache>/_meta/suspensions.json` (stamped with the suspensions build; a terminal recorded for another last session is ignored). Without the file every delisting closes at the last close, as before. It is NOT covered by the gate certificate: every worker's cache must carry the same file (`cache push` after installing), or master and worker price delistings differently. A delisting within the last 5 sessions before the store's end is not yet a
 `delisted` event (build slack).
 
 ### 4.1 Equity (goal2020 and single equity backtests)

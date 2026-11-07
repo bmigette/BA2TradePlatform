@@ -79,7 +79,7 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
-from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate
+from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate, terminal_exit
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
@@ -680,6 +680,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._positions: Dict[str, _Position] = {}
         # Exchange suspension / delisting events (set_suspension_events); {} = feature off (FMP source).
         self._suspension_events: Dict[str, Any] = {}
+        # Terminal values of delistings (set_delisting_terminals); {} = every delisting at the last close.
+        self._delisting_terminals: Dict[str, Any] = {}
+        #: delisting exits by terminal kind this run (kind -> count); 'unknown' / 'stock_merger' = priced at the last close.
+        self.delisting_exit_counts: Dict[str, int] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
         self._equity_snapshots: List[Dict[str, Any]] = []
         # Parallel ascending list of snapshot dates (snapshots are appended in clock order) so
@@ -2715,6 +2719,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         FMP source, or an Alpaca cache without the file) leaves every path exactly as it was."""
         self._suspension_events = dict(events)
 
+    def set_delisting_terminals(self, terminals: Any) -> None:
+        """Install ``ba2_common.core.suspension_events.load_delisting_terminals`` (what a holder received at a delisting)."""
+        self._delisting_terminals = dict(terminals)
+
     def liquidate_suspended_positions(self, as_of: datetime) -> bool:
         """Close every held STOCK position whose symbol is suspended from its exchange on ``as_of``'s session, and cancel
         every working order of such a symbol; True when the book changed.
@@ -2747,6 +2755,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                  f"the suspension table does not match the cache it is run on (rebuild the cache)")
             gone = any(last < session and resume is None for last, resume in events[sym])   # the event in effect never resumes
             comment = "delisting_liquidation" if gone else "suspension_liquidation"
+            if gone:
+                # What the holder RECEIVED, not the last print: 0 for a worthless removal / bankruptcy ticker (SIVB 106 -> 0),
+                # the per-share cash of a cash merger; unknown or stock-for-stock -> the last close, counted and logged.
+                tprice, tkind = terminal_exit(sym, last_session, self._delisting_terminals)
+                self.delisting_exit_counts[tkind] = self.delisting_exit_counts.get(tkind, 0) + 1
+                if tprice is not None:
+                    px, comment = tprice, {"worthless": "delisting_worthless", "bankruptcy_otc": "delisting_worthless",
+                                           "cash_merger": "delisting_cash_merger"}[tkind]
+                else:
+                    logger.warning("[backtest] %s: delisting after %s has no terminal value (%s): closed at the last close %.4f",
+                                   sym, last_session, tkind, float(px))
             qty = pos.qty
             self._liquidate_stock_position(pos, price=float(px), comment=comment)
             logger.warning(
@@ -5229,7 +5248,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         EQUITY ROWS ONLY. Option rows read their recorded ``exit_record`` trigger instead: a
         close_option ticket is a limit order with no stop, so this guess labelled every option
         close -- stop-loss and DTE exits included -- ``take_profit``."""
-        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation"):
+        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation", "delisting_worthless",
+                                  "delisting_cash_merger"):
             return exit_order.comment                   # the exchange-suspension close names itself
         tp = exit_order.limit_price
         sl = exit_order.stop_price
