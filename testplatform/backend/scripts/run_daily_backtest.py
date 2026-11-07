@@ -148,6 +148,12 @@ def _parse_args(argv: list) -> argparse.Namespace:
         "consensus (a historical estimate read raises EstimatesNotPointInTime), alphavantage is point-in-time.",
     )
     p.add_argument(
+        "--option-history-source", choices=["thetadata", "alphavantage"], default=None,
+        help="Whose option history an option run reads (recorded on the run config as option_history_source, "
+        "and it selects the matching options_store). Omitted: the store resolves as before "
+        "(options_store / BACKTEST_OPTIONS_STORE / sqlite).",
+    )
+    p.add_argument(
         "--initial-capital", type=float, default=100_000.0, help="Starting cash."
     )
     p.add_argument("--commission", type=float, default=1.0, help="Commission per trade.")
@@ -249,6 +255,9 @@ def _build_real_config(args: argparse.Namespace) -> dict:
         OHLCV_HISTORY_SOURCE_KEY: args.ohlcv_history_source,
         ESTIMATES_SOURCE_KEY: args.estimates_source,
     }
+    if args.option_history_source:
+        config["option_history_source"] = args.option_history_source
+        config["options_store"] = args.option_history_source
     override = _run_schedule_override(args.run_schedule, args.run_schedule_day)
     if override:
         config["run_schedule_override"] = override

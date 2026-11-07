@@ -586,7 +586,7 @@ def _parse(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="build_shared_arrays.py",
         description="Prewarm and garbage-collect the per-host derived .npy array cache.")
-    p.add_argument("--options-store", choices=["thetadata", "tastytrade", "sqlite", "parquet"],
+    p.add_argument("--options-store", choices=["thetadata", "alphavantage", "tastytrade", "sqlite", "parquet"],
                    help="Option parquet tree to warm ('parquet' is the tastytrade alias).")
     p.add_argument("--universe-file", help="One symbol per line; '#' starts a comment.")
     p.add_argument("--symbols", help="Comma-separated symbols (combined with --universe-file).")
