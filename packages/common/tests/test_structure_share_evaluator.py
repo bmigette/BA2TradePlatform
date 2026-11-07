@@ -25,7 +25,7 @@ def share_rig(monkeypatch):
     monkeypatch.setattr(rm, "sleeve_structures", lambda eid: ([], []))
     monkeypatch.setattr(rm, "transaction_entry_tag", lambda tid: None)
     monkeypatch.setattr(rm, "assigned_stock_lots", lambda eid: [])
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: None)
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: None)
     expert = SimpleNamespace(settings={"risk_manager_mode": "classic_options"})
     monkeypatch.setattr("ba2_common.core.instance_resolver.get_instance_resolver",
                         lambda: SimpleNamespace(get_expert_instance=lambda i: expert))

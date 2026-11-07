@@ -696,6 +696,16 @@ class _PendingCharge:
     #: The style-member tag of the entry this charge stands for (structure_share condition,
     #: plan 2026-11-06). None for every untagged entry: nothing reads it then.
     entry_tag: Optional[int] = None
+    #: The symbol of the transaction ``transaction_id`` named WHEN the charge was recorded, so a
+    #: later row that merely REUSES the id is not mistaken for it (2026-11-07). SQLite (live and
+    #: file-backed backtests) gives a deleted max id to the next insert: an unfilled entry's
+    #: WAITING transaction is deleted, an unrelated stock buy takes its id, and an id-only charge
+    #: then stays "in flight" for that position's whole life. None when it could not be read:
+    #: the charge is then matched on the id alone, as before. Not covered: an id reused by a
+    #: row on the SAME symbol (one_per_underlying blocks that underlying anyway while it is
+    #: open), and a live ticker rename of an in-flight entry's row (the charge is dropped one
+    #: cycle early, until the renamed structure is visible in the book).
+    transaction_symbol: Optional[str] = None
 
 
 #: A hard ceiling on in-flight charges per sleeve. Nothing should ever approach it (the
@@ -772,20 +782,40 @@ def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
     `entry_tag` (tagged style entries only) also feeds the per-member share cache
     (:func:`_note_submission`); an untagged entry never touches it."""
     key = _sleeve_key(expert_instance_id)
+    # Read before any lock: it is a ledger read (see _PendingCharge.transaction_symbol).
+    symbol = _transaction_symbol(transaction_id) if transaction_id is not None else None
     if entry_tag is None:
         with _STATE_LOCK:
-            _record_pending(key, transaction_id, candidate, entry_tag)
+            _record_pending(key, transaction_id, candidate, entry_tag, symbol)
         return
     # Tagged: under the key's lock, so a locked fallback build (member_share) sees this charge.
     with _share_key_lock(key):
         with _STATE_LOCK:
-            _record_pending(key, transaction_id, candidate, entry_tag)
+            _record_pending(key, transaction_id, candidate, entry_tag, symbol)
             _note_submission(key, entry_tag, candidate)
 
 
-def _record_pending(key, transaction_id, candidate, entry_tag) -> None:
+def _transaction_symbol(transaction_id: int) -> Optional[str]:
+    """The symbol of transaction ``transaction_id`` now, or None (logged) when it cannot be read."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction
+
+    try:
+        txn = get_instance(Transaction, transaction_id)
+    except Exception as e:  # noqa: BLE001 -- the charge then falls back to its id alone
+        logger.warning(f"Option RM: could not read transaction {transaction_id} for its pending "
+                       f"charge ({e}); the charge is matched on its id alone")
+        return None
+    if txn is None:
+        logger.warning(f"Option RM: transaction {transaction_id} of a just-submitted entry was "
+                       f"not found; its pending charge is matched on its id alone")
+        return None
+    return txn.symbol
+
+
+def _record_pending(key, transaction_id, candidate, entry_tag, transaction_symbol=None) -> None:
     charges = _PENDING.setdefault(key, [])
-    charges.append(_PendingCharge(transaction_id, candidate, entry_tag))
+    charges.append(_PendingCharge(transaction_id, candidate, entry_tag, transaction_symbol))
     if len(charges) > _PENDING_LIMIT:
         del charges[:-_PENDING_LIMIT]
 
@@ -806,8 +836,8 @@ def _note_submission(key: Tuple[Optional[int], int], entry_tag: int,
         cache.committed[entry_tag] = cache.committed.get(entry_tag, 0.0) + float(candidate.max_loss)
 
 
-def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
-    """The ids of this expert's transactions that still exist and could still open.
+def _live_transactions(expert_instance_id: int) -> Optional[Dict[int, Optional[str]]]:
+    """``{id: symbol}`` of this expert's transactions that still exist and could still open.
 
     ``None`` when the ledger could not be read -- and an unreadable ledger must NOT be
     treated as "everything was cancelled", because that would forgive every in-flight
@@ -825,7 +855,7 @@ def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
                      f"{expert_instance_id} ({e}) -- in-flight charges are kept, which is "
                      f"the conservative reading", exc_info=True)
         return None
-    return {t.id for t in rows}
+    return {t.id: t.symbol for t in rows}
 
 
 def _prune_pending(expert_instance_id: int,
@@ -843,14 +873,16 @@ def _prune_pending_charges(expert_instance_id: int,
     * its transaction is OPENED and ``book_totals`` now counts it -- keeping the charge as
       well would double-charge the sleeve and stop it trading;
     * its transaction is gone or resolved (a rejected or cancelled entry) -- it never became
-      exposure, and a charge for it would block the sleeve for the life of the process.
+      exposure, and a charge for it would block the sleeve for the life of the process;
+    * its id now names ANOTHER symbol's transaction (``_PendingCharge.transaction_symbol``):
+      the entry's row was deleted and SQLite reused the id -- the same fact as "gone".
 
     A charge whose transaction id was never captured is KEPT (it really was submitted); the
     FIFO ``_PENDING_LIMIT`` is what stops those accumulating.
 
     THE LEDGER READ HAPPENS OUTSIDE ``_STATE_LOCK``, and the store is then edited by REMOVING
     the charges this pass decided against rather than by overwriting the list wholesale.
-    ``_live_transaction_ids`` issues a SELECT; holding a lock every writer needs across a
+    ``_live_transactions`` issues a SELECT; holding a lock every writer needs across a
     database round trip would serialise the sleeve on I/O for no benefit. The consequence of
     dropping the lock in between is that a sibling worker thread may ``record_submitted`` a
     NEW charge while this read is in flight, and an overwrite would silently discard it -- the
@@ -865,7 +897,7 @@ def _prune_pending_charges(expert_instance_id: int,
     if not charges:
         return []
     seen = {s.transaction_id for s in visible}
-    live = _live_transaction_ids(expert_instance_id)
+    live = _live_transactions(expert_instance_id)
     kept: List[_PendingCharge] = []
     for charge in charges:
         if charge.transaction_id is None:
@@ -873,8 +905,13 @@ def _prune_pending_charges(expert_instance_id: int,
             continue
         if charge.transaction_id in seen:
             continue
-        if live is not None and charge.transaction_id not in live:
-            continue
+        if live is not None:
+            if charge.transaction_id not in live:
+                continue
+            now = live[charge.transaction_id]
+            if (charge.transaction_symbol is not None and now is not None
+                    and now != charge.transaction_symbol):
+                continue
         kept.append(charge)
     dropped = {id(c) for c in charges} - {id(c) for c in kept}
     with _STATE_LOCK:

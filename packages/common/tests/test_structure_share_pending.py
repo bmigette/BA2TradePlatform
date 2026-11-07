@@ -31,7 +31,7 @@ def visible(txn_id):
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     rm.reset_state()
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: {101, 102})
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: dict.fromkeys({101, 102}))
     yield
     rm.reset_state()
 

@@ -23,7 +23,7 @@ class _World:
         mp.setattr(rm, "sleeve_structures", self._structures)
         mp.setattr(rm, "transaction_entry_tag", lambda tid: self.tags.get(tid))
         mp.setattr(rm, "assigned_stock_lots", lambda eid: [])
-        mp.setattr(rm, "_live_transaction_ids", lambda eid: None)
+        mp.setattr(rm, "_live_transactions", lambda eid: None)
         self.account = SimpleNamespace(
             get_account_snapshot=lambda: SimpleNamespace(equity=self.equity))
 
