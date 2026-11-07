@@ -167,8 +167,8 @@ def ledger_holds(monkeypatch):
     transaction still exists, or they would be measuring the sweep instead.
     """
     def _hold(*transaction_ids):
-        monkeypatch.setattr(rm, "_live_transaction_ids",
-                            lambda eid: set(transaction_ids))
+        monkeypatch.setattr(rm, "_live_transactions",
+                            lambda eid: dict.fromkeys(transaction_ids))
     return _hold
 
 
@@ -862,7 +862,7 @@ def test_a_charge_whose_entry_never_opened_stops_blocking_the_sleeve(empty_sleev
     first = gate(legs=put_spread_legs(), strategy="bull_put_spread",
                  underlying="AAPL", max_loss_per_contract=30_000.0)
     rm.record_submitted(7, 101, first.candidate)
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: set())   # it was cancelled
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: {})   # it was cancelled
 
     second = gate(legs=put_spread_legs(symbol="MSFT"), strategy="bull_put_spread",
                   underlying="MSFT", max_loss_per_contract=20_000.0)
@@ -877,7 +877,7 @@ def test_an_unreadable_ledger_KEEPS_the_charge(empty_sleeve, monkeypatch):
     first = gate(legs=put_spread_legs(), strategy="bull_put_spread",
                  underlying="AAPL", max_loss_per_contract=30_000.0)
     rm.record_submitted(7, 101, first.candidate)
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: None)
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: None)
 
     second = gate(legs=put_spread_legs(symbol="MSFT"), strategy="bull_put_spread",
                   underlying="MSFT", max_loss_per_contract=20_000.0)

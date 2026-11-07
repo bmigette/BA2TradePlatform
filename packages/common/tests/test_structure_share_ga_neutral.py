@@ -50,7 +50,7 @@ def _legs(symbol: str) -> List[OptionLeg]:
 def _run(monkeypatch, tag: Optional[int]):
     rm.reset_state()
     monkeypatch.setattr(rm, "sleeve_structures", lambda eid: ([], []))
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: {100, 101, 102})
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: dict.fromkeys({100, 101, 102}))
     seen, verdicts = [], []
     real_admit = _REAL_ADMIT
 

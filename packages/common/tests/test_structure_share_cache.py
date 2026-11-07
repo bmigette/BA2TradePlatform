@@ -64,7 +64,7 @@ class World:
         monkeypatch.setattr(rm, "transaction_entry_tag", lambda tid: self.tags.get(tid))
         monkeypatch.setattr(rm, "assigned_stock_lots", lambda eid: list(self.lots))
         # None = "ledger unreadable": every in-flight charge is KEPT (the conservative reading)
-        monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: None)
+        monkeypatch.setattr(rm, "_live_transactions", lambda eid: None)
 
     def _structures(self, eid):
         self.reads += 1
@@ -338,7 +338,7 @@ def test_a_cancelled_pending_charge_stops_counting(world, monkeypatch):
     rm.record_submitted(EID, 556, cand(2_000.0), entry_tag=CSP)
     assert share(world, CSP, T1).committed == 10_000.0
     # the ledger is readable and 555 no longer exists/opens (cancelled); 556 is still live
-    monkeypatch.setattr(rm, "_live_transaction_ids", lambda eid: {556})
+    monkeypatch.setattr(rm, "_live_transactions", lambda eid: dict.fromkeys({556}))
     assert share(world, CSP, T2).committed == 2_000.0
 
 
