@@ -99,3 +99,16 @@ def test_model_genes_are_declared_expert_settings():
             assert key in defs, (cls.__name__, key)
         for choice in mod._EXPERT_OPT[cls.__name__]["expert_params"]["model_target_method"]["choices"]:
             assert choice in defs["model_target_method"]["choices"]
+
+
+def test_option_jobs_keep_their_pre_existing_ds_and_senate_gene_space():
+    """The new DS/Senate model genes are for the stock grids; an option kind drops them (the
+    stage-2 option grid must not gain search dimensions), the O_STK equity control keeps them."""
+    for expert in ("DeterministicScorer", "FMPSenateTraderWeight"):
+        spec = mod._EXPERT_OPT[expert]
+        new = set(spec["stock_only_params"])
+        assert new <= set(spec["expert_params"])
+        for kind in ("O_STYLE", "O_LC"):
+            assert not new & set(mod._pin_style_dead_genes(kind, dict(spec["expert_params"]), spec=spec)), (expert, kind)
+        assert new <= set(mod._pin_style_dead_genes("O_STK", dict(spec["expert_params"]), spec=spec))
+        assert new <= set(mod._pin_style_dead_genes("S1", dict(spec["expert_params"]), spec=spec))

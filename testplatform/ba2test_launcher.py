@@ -1733,6 +1733,8 @@ _EXPERT_OPT = {
                                             "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
+        # Stock grids only (goal2027, 2026-11-07): option jobs keep their pre-existing DS space.
+        "stock_only_params": ("use_model_target", "model_target_method", "max_expected_profit_percent"),
         # OPTION JOBS ONLY (plan 2026-09-24 Task 10, stage-1 relaunch): the regime multiplier
         # mirrors on the SELL side, so a bearish regime amplifies SELL conviction instead of
         # muting it -- without it the bearish option arms (O_LP, O_BEARCS) get almost no SELL
@@ -1846,6 +1848,8 @@ _EXPERT_OPT = {
         "fixed_settings": {"sizing_mode": "risk_atr",
                            "min_trader_hold_roundtrips":
                                SENATE_SCALPER_BOUNDS["hold_min_roundtrips"]},
+        # Stock grids only (goal2027, 2026-11-07): an option job keeps its pre-existing space.
+        "stock_only_params": ("expected_profit_mode", "model_target_method", "max_expected_profit_percent"),
     },
     # FactorRanker is a BYPASS expert: it ignores enter/exit rulesets and the classic RM, and
     # rebalances a portfolio by factor score. So its optimization searches ONLY the factor-model
@@ -2017,12 +2021,18 @@ def _style_dead_gene_keys() -> frozenset:
     return frozenset(g if g.startswith("schedule:") else f"model:{g}" for g in _STYLE_DEAD_GENES)
 
 
-def _pin_style_dead_genes(kind: "str | None", expert_params: dict) -> dict:
+def _pin_style_dead_genes(kind: "str | None", expert_params: dict, spec: "dict | None" = None) -> dict:
     """``expert_params`` for a gene space: unchanged for every key but ``O_STYLE``; for it, the
-    ``_STYLE_DEAD_GENES`` removed (a new dict -- the caller's spec table is shared)."""
-    if kind != _STYLE_KEY:
+    ``_STYLE_DEAD_GENES`` removed (a new dict -- the caller's spec table is shared). On every option
+    kind (the ``_option_fixed_settings_for`` rule) the spec's ``stock_only_params`` are removed too:
+    genes added for the stock grids that must not widen an option grid's search space."""
+    stock_only = set((spec or {}).get("stock_only_params") or ())
+    if stock_only and not (kind in _OPTION_STRATEGY_KEYS and kind != "O_STK"):
+        stock_only = set()
+    if kind != _STYLE_KEY and not stock_only:
         return expert_params
-    return {k: v for k, v in expert_params.items() if k not in _STYLE_DEAD_GENES}
+    dead = (_STYLE_DEAD_GENES if kind == _STYLE_KEY else frozenset()) | stock_only
+    return {k: v for k, v in expert_params.items() if k not in dead}
 
 
 def _effective_sizing_mode(spec: dict, args) -> "str | None":
@@ -9741,7 +9751,7 @@ def _cmd_optimize(args) -> int:
             # namespace) are merged in ONLY when --screener is set. _rm_opt_for's atr_searched
             # swaps in _RM_OPT_ATR_SEARCHED under the ATR-searched policy (no-op otherwise).
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else _pin_style_dead_genes(args.strategy, {**spec["expert_params"],
+                              else _pin_style_dead_genes(args.strategy, spec=spec, expert_params={**spec["expert_params"],
                                     **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args),
                                                  atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                  regime_searched=_policy_searches_regime(rm_toggle_policy)),
@@ -10075,7 +10085,7 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else _pin_style_dead_genes(strat_kind, {**spec["expert_params"],
+                                  else _pin_style_dead_genes(strat_kind, spec=spec, expert_params={**spec["expert_params"],
                                         **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
                                                      atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                      regime_searched=_policy_searches_regime(rm_toggle_policy)),
