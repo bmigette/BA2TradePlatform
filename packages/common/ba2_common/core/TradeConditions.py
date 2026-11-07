@@ -3090,8 +3090,8 @@ class DaysToEarningsCondition(CompareCondition):
     per-symbol CONSTANT (MSFT 310d, AAPL 34d, NVDA 154d on every bar), which is why the
     documented ``iv_rank<=30 and days_to_earnings<=5 -> open_straddle`` rule could never fire.
 
-    The annual estimates remain as a FALLBACK for a symbol whose calendar carries no
-    scheduled future print — degraded, not absent.
+    There is NO estimates fallback: a symbol whose calendar shows no report within the
+    knowability horizon (30 days) has "no scheduled report".
 
     Unknown is never a value: with no usable evaluation date or no upcoming earnings from
     either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
@@ -3152,25 +3152,6 @@ class DaysToEarningsCondition(CompareCondition):
                 upcoming.append(d)
         return min(upcoming) if upcoming else None
 
-    def _next_estimate_period(self, provider, symbol: str, as_of: date):
-        """Earliest forward analyst-estimate period end on or after ``as_of``. FALLBACK ONLY:
-        FMP serves these ANNUAL regardless of the frequency argument, so the answer is a
-        fiscal year end rather than an earnings date."""
-        result = provider.get_earnings_estimates(
-            symbol, frequency="quarterly",
-            as_of_date=datetime.combine(as_of, _time.min, tzinfo=timezone.utc),
-            lookback_periods=4, format_type="dict",
-        )
-        estimates = (result or {}).get("estimates") or []
-        future = []
-        for est in estimates:
-            if not isinstance(est, dict):
-                continue
-            d = self._parse_day(est.get("fiscal_date_ending"))
-            if d is not None and d >= as_of:
-                future.append(d)
-        return min(future) if future else None
-
     def _next_earnings_date(self, symbol: str, as_of: date):
         """Best-effort next earnings date for ``symbol`` as of ``as_of``, or None.
 
@@ -3187,17 +3168,10 @@ class DaysToEarningsCondition(CompareCondition):
                 return None
             provider = _get_provider("fundamentals_details", "fmp")
 
-            scheduled = self._next_scheduled_report(provider, symbol, as_of)
-            if scheduled is not None:
-                return scheduled
-
-            estimated = self._next_estimate_period(provider, symbol, as_of)
-            if estimated is not None:
-                logger.info(
-                    f"No scheduled earnings report for {symbol} within "
-                    f"{self.EARNINGS_HORIZON_DAYS} days of {as_of.isoformat()}; falling back "
-                    f"to the (annual) analyst-estimate period {estimated.isoformat()}")
-            return estimated
+            # No fallback: a report beyond the knowability horizon (or none in the calendar) is
+            # "no scheduled report". The annual analyst-estimate period is a fiscal-year end,
+            # not a report date, and is not readable at a historical as_of.
+            return self._next_scheduled_report(provider, symbol, as_of)
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)

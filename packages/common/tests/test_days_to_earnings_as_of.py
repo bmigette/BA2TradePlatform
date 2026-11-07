@@ -226,30 +226,15 @@ def test_the_documented_straddle_gate_can_actually_fire(monkeypatch):
     assert len(fires) == 6, f"expected the 6 bars within 5 days of the print, got {fires}"
 
 
-def test_the_annual_estimates_are_the_fallback_not_the_source(monkeypatch):
-    """When the calendar has no scheduled future print (a stale/short calendar), fall back to
-    the analyst estimates rather than returning nothing — degraded, not absent."""
-    p = _FakeFundamentals(reports=["2023-10-24", "2024-01-30"])  # nothing after the bar
+def test_there_is_no_estimates_fallback(monkeypatch):
+    """A calendar with no print inside the horizon reads "no scheduled report"; the annual
+    analyst-estimate period (a fiscal-year end) is never consulted or returned."""
+    p = _FakeFundamentals(reports=["2023-10-24", "2024-01-30", "2024-07-30"])  # none within 30d
     monkeypatch.setattr(TradeConditions, "_provider_resolver",
                         lambda category, name, **kw: p, raising=False)
-    got = DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
-        ._next_earnings_date("MSFT", SIM_BAR)
-    assert got == NEXT_ANNUAL
-    assert p.estimate_calls, "the estimates fallback was never consulted"
-
-
-def test_the_estimates_fallback_is_also_asked_as_of_the_bar(monkeypatch):
-    """The fallback used ``as_of_date=datetime.now(timezone.utc)``, which in a backtest asks
-    the provider to drop every estimate before the REAL today."""
-    p = _FakeFundamentals(reports=["2023-10-24"])
-    monkeypatch.setattr(TradeConditions, "_provider_resolver",
-                        lambda category, name, **kw: p, raising=False)
-    DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
-        ._next_earnings_date("MSFT", SIM_BAR)
-    (call,) = p.estimate_calls
-    as_of = call["as_of_date"]
-    as_of_d = as_of.date() if isinstance(as_of, datetime) else as_of
-    assert as_of_d == SIM_BAR, f"estimates asked as of {as_of_d}, not the bar {SIM_BAR}"
+    cond = DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0)
+    assert cond._next_earnings_date("MSFT", SIM_BAR) is None
+    assert not p.estimate_calls
 
 
 def test_the_announcement_date_wins_over_the_fiscal_period_end(monkeypatch):
