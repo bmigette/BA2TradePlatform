@@ -9,7 +9,8 @@ testplatform/backend/tests/test_export_payload_golden.py.
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ba2_common.core.deploy_parity import (
-    BacktestRunFacts, backtest_only_settings, forced_expert_settings, member_hold_tags_fact,
+    BacktestRunFacts, backtest_only_settings, deploy_expert_settings,
+    member_hold_tags_fact,
     refuse_undeployable,
 )
 from ba2_common.core.factor_ranker_topn import repair_fr_top_n_below_pool
@@ -336,7 +337,7 @@ def derive_export_payload(
         # refused by name (``UndeployableRunRefused``, the caller's 409), never exported with a
         # field that describes a different run.
         refuse_undeployable(facts)
-        expert_params = {**expert_params, **forced_expert_settings(facts)}
+        expert_params = {**expert_params, **deploy_expert_settings(facts)}
         payload = {
             "backtest_id": backtest.id,
             "name": backtest.name,

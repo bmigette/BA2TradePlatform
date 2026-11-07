@@ -243,7 +243,7 @@ def test_the_deployed_ruleset_is_the_ruleset_the_backtest_ran(db, key, expert, r
 @pytest.mark.parametrize("key,expert,rule_id", CASES,
                          ids=[f"{k}|{e}" for k, e, _ in CASES])
 def test_the_deployed_expert_settings_are_the_settings_the_backtest_ran(db, key, expert, rule_id):
-    from ba2_common.core.deploy_parity import forced_expert_settings
+    from ba2_common.core.deploy_parity import deploy_expert_settings
 
     strat, genome, decoded, trial = _backtest_side(key, expert)
     bt = _persisted_row(db, key, expert, strat, genome, decoded)
@@ -254,7 +254,7 @@ def test_the_deployed_expert_settings_are_the_settings_the_backtest_ran(db, key,
     # assertion compared against the trial block alone, and passed while the four gates reached
     # the engine and not the deploy.
     assert live_settings == {**trial["experts"][0]["settings"],
-                             **forced_expert_settings(_facts_for(trial))}, (
+                             **deploy_expert_settings(_facts_for(trial))}, (
         f"{key}: the deploy payload's expert settings differ from the trial's")
     # Non-vacuous: every optimized model:* gene is in there at its optimized value.
     for gene, value in genome.items():
@@ -386,12 +386,20 @@ def test_every_forced_setting_reaches_the_deployed_instance(db, key, expert, rul
         # different experiment. They are CARRIED because use_atr_stop declares default True --
         # a deploy that omitted it would size its stops differently from the run it came from.
         "use_atr_stop", "regime_overlay_enabled",
+        # The assigned-stock policy (live-assigned-stock-liquidation): live decides hold vs
+        # liquidate per instance with the backtest's own function. Carried by the EXPORT only --
+        # the backtest engine takes it from its account config (applied_in_backtest=False).
+        "hold_assigned_stock", "hold_assigned_stock_tags",
     }, ("the forced-settings table changed. ADDING a row is the point of the table -- say so "
         "here. REMOVING one means a setting the backtest engine forces no longer reaches the "
         "deployed instance, which is review finding V3 verbatim.")
     for row in carried:
+        if row.key == "hold_assigned_stock_tags":
+            continue        # None (no member scope) is legitimately not written; see the policy test
         assert row.live_setting in payload["settings"]["expert_params"], (
             f"{key}: the deploy payload does not carry {row.live_setting!r}. {row.why}")
+        if not row.applied_in_backtest:
+            continue        # the engine reads it from the account config: the policy test below
         assert row.live_setting in engine, (
             f"{key}: the ENGINE did not receive {row.live_setting!r}; the handler and the "
             f"exporter have stopped reading the same table")
@@ -399,6 +407,36 @@ def test_every_forced_setting_reaches_the_deployed_instance(db, key, expert, rul
             f"{key}: the deployed instance would get {row.live_setting}="
             f"{imported[row.live_setting]!r} but the backtest engine ran with "
             f"{engine[row.live_setting]!r}. {row.why}")
+
+
+@pytest.mark.parametrize("key,expert,rule_id", CASES,
+                         ids=[f"{k}|{e}" for k, e, _ in CASES])
+def test_the_deployed_instance_makes_the_backtests_assigned_stock_decision(
+        db, key, expert, rule_id):
+    """The deployed policy settings, read by LIVE's decision function, give the same answer as the
+    policy the backtest account resolves from the trial's account config -- for every entry tag
+    shape (untagged / tagged-in / tagged-out). One shared pair of functions, two callers."""
+    from ba2_common.core.assignment_hold import (
+        decide_live_assigned_stock, holds_assigned_stock, resolve_assigned_stock_hold_policy,
+        UntaggedAssignmentRefused)
+
+    strat, genome, decoded, trial = _backtest_side(key, expert)
+    bt = _persisted_row(db, key, expert, strat, genome, decoded)
+    imported = _imported_settings(_settings_payload(db, bt))
+    policy = resolve_assigned_stock_hold_policy(trial["account_settings"])
+    for tag in (None, 1, 2, 3):
+        try:
+            want = holds_assigned_stock(policy, tag, where="bt")
+        except UntaggedAssignmentRefused:
+            want = None
+        got = decide_live_assigned_stock(
+            {"hold_assigned_stock": imported["hold_assigned_stock"],
+             "hold_assigned_stock_tags": imported.get("hold_assigned_stock_tags")},
+            tag, where="live")
+        if want is None:       # BT refuses -> live holds LOUDLY (problem set)
+            assert got.hold and got.problem
+        else:
+            assert got.problem is None and got.hold == want, (key, tag)
 
 
 @pytest.mark.parametrize("key,expert,rule_id", CASES,
@@ -419,8 +457,7 @@ def test_a_behaviour_with_no_live_analogue_is_RECORDED_rather_than_silently_drop
     # hold_assigned_stock_tags (stage-2 E2 review I1): the member-scoped hold. No live
     # analogue (live never liquidates assigned stock); recorded here AND refused for export
     # when set (deploy_parity.refuse_undeployable).
-    assert {r.key for r in uncarried} == {"hold_assigned_stock", "entry_action",
-                                          "hold_assigned_stock_tags"}, (
+    assert {r.key for r in uncarried} == {"entry_action"}, (
         "a behaviour gained or lost a live analogue -- re-read deploy_parity's table and say "
         "here which, and why")
     for row in uncarried:
@@ -488,8 +525,9 @@ def test_the_handler_and_the_exporter_read_THE_SAME_TABLE():
     exporter = open(os.path.join(
         os.path.dirname(_TESTPLATFORM), "packages", "common", "ba2_common", "export",
         "backtest_export.py"), encoding="utf-8").read()
-    for src, who in ((handler, "the handler"), (exporter, "the exporter")):
-        assert "forced_expert_settings" in src, (
+    for src, who, reader in ((handler, "the handler", "forced_expert_settings"),
+                             (exporter, "the exporter", "deploy_expert_settings")):
+        assert reader in src, (
             f"{who} no longer reads deploy_parity's table")
     assert 'gate_settings["allow_automated_trade_opening"]' not in handler, (
         "the handler is hand-writing a gate again instead of reading the table")

@@ -30,11 +30,20 @@ only on stock the WHEEL member was put, never on a CSP member's shares waiting f
 next-bar liquidation. An untagged position delivers untagged stock (``None``: no ``data`` is
 written), so every existing run and live row stays byte-identical.
 
-LIVE. The broker reconciler (``AlpacaAccount._apply_option_activity``) has NO hold/liquidate
-decision: live never sells assigned stock (``deploy_parity`` ``hold_assigned_stock``:
-``why_no_live_analogue``), so ``holds_assigned_stock`` has one caller, the backtest account.
-The tag carry IS shared: both runtimes stamp the assignment's stock entry order through
-``assigned_stock_entry_data``.
+LIVE. The broker reconciler (``AlpacaAccount._apply_option_activity``) asks the SAME question
+through ``decide_live_assigned_stock``, which reads the policy off the OWNING EXPERT INSTANCE's
+settings (``hold_assigned_stock`` / ``hold_assigned_stock_tags``, declared on
+``MarketExpertInterface``) and then calls exactly ``resolve_assigned_stock_hold_policy`` +
+``holds_assigned_stock`` -- the backtest account's two calls. The option position's entry tag is
+read from the same row on both sides, and ``assigned_stock_entry_data`` stamps the delivered stock
+on both. A not-held assignment is then liquidated by
+``ba2_common.core.assignment_liquidation`` (live analogue of the next-bar-open sale).
+
+A policy live cannot read (no setting stored, both forms set, a malformed tag list, an untagged
+position under a member-scoped policy, no owning instance) is NEVER guessed: the live decision is
+HOLD (the shares are at the broker whatever we decide; an unwanted sale is the irreversible
+mistake) and the problem is returned for the caller to log as an ERROR + activity naming the
+instance.
 """
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional
@@ -127,3 +136,46 @@ def assigned_stock_entry_data(entry_tag: Optional[int]) -> Optional[dict]:
     if tag is None:
         return None
     return {ORDER_ENTRY_TAG_KEY: tag}
+
+
+@dataclass(frozen=True)
+class LiveAssignedStockDecision:
+    """The live answer for one assignment. ``hold`` False -> liquidate the delivered stock.
+
+    ``problem`` is None for a real decision. Non-None means the policy could not be read or
+    applied, ``hold`` is True as the safe fallback, and the caller must make that LOUD.
+    """
+    hold: bool
+    problem: Optional[str] = None
+
+
+def decide_live_assigned_stock(settings: Optional[Mapping[str, Any]], entry_tag: Optional[int], *,
+                               where: str) -> LiveAssignedStockDecision:
+    """The live hold/liquidate decision for one assignment, from the owning instance's settings.
+
+    ``settings``: the instance's decoded settings (``ExpertInstance.settings``: a key with no
+    stored row reads None) or None when no owning instance could be resolved. Reuses the shared
+    functions; the only live-specific part is turning "no stored policy" into a loud HOLD instead
+    of the backtest's silent default-off (a backtest run always states its policy; an instance
+    deployed before this setting existed does not).
+    """
+    if settings is None:
+        return LiveAssignedStockDecision(True, f"{where}: no owning expert instance could be "
+                                               f"resolved, so no assigned-stock policy exists")
+    hold_raw = settings[HOLD_ASSIGNED_STOCK_KEY] if HOLD_ASSIGNED_STOCK_KEY in settings else None
+    tags_raw = (settings[HOLD_ASSIGNED_STOCK_TAGS_KEY]
+                if HOLD_ASSIGNED_STOCK_TAGS_KEY in settings else None)
+    if hold_raw is None and tags_raw is None:
+        return LiveAssignedStockDecision(
+            True, f"{where}: the owning instance stores neither {HOLD_ASSIGNED_STOCK_KEY} nor "
+                  f"{HOLD_ASSIGNED_STOCK_TAGS_KEY}; the backtest that scored it liquidated or held "
+                  f"per its own run setting and that is unknown here. Run "
+                  f"tools/backfill_assigned_stock_policy.py")
+    cfg: dict = {HOLD_ASSIGNED_STOCK_KEY: bool(hold_raw) if hold_raw is not None else False}
+    if tags_raw is not None:
+        cfg[HOLD_ASSIGNED_STOCK_TAGS_KEY] = tags_raw
+    try:
+        policy = resolve_assigned_stock_hold_policy(cfg)
+        return LiveAssignedStockDecision(holds_assigned_stock(policy, entry_tag, where=where))
+    except ValueError as e:     # malformed / both forms / UntaggedAssignmentRefused (a ValueError)
+        return LiveAssignedStockDecision(True, f"{where}: {e}")
