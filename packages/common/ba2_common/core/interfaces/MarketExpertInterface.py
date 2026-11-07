@@ -687,6 +687,33 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic modification and closing of existing positions"
                 },
+                # WHO KEEPS THE STOCK A SHORT-OPTION ASSIGNMENT DELIVERS (ba2_common.core.
+                # assignment_hold; the backtest's BacktestAccount makes the identical decision
+                # through the same functions). Per instance, because assignments arrive per
+                # account but belong to the strategy that wrote the option. The declared defaults
+                # are NOT applied when nothing is stored: an instance with neither key stored is
+                # treated as UNDECIDED -- the stock is held and an ERROR names the instance --
+                # because the backtest that scored it may have held or liquidated.
+                "hold_assigned_stock": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Keep (True) or liquidate (False) the stock a short-option "
+                                   "assignment delivers",
+                    "tooltip": "True only for strategies whose own rules manage the delivered "
+                               "shares (the wheel). False: the shares are sold with a market "
+                               "order at the next open, exactly as the backtest did. Not set at "
+                               "all: the stock is HELD and an error is logged. Do not combine "
+                               "with hold_assigned_stock_tags."
+                },
+                "hold_assigned_stock_tags": {
+                    "type": "json", "required": False, "default": None,
+                    "description": "Member entry tags (list of ints) whose assignments keep "
+                                   "their stock; every other member's is liquidated",
+                    "tooltip": "Member-scoped form of hold_assigned_stock for a style instance "
+                               "that composes several members (only the wheel holds). The tag "
+                               "is the entry tag of the assigned option position. An untagged "
+                               "assigned position is held with an error. Leave empty for the "
+                               "run-wide hold_assigned_stock."
+                },
                 # MARKET-CONDITION GATES (plan Task 12, operator decision 2026-09-16). The
                 # profile travels WITH THE EXPERT, like its ruleset does, instead of being a
                 # process-wide environment variable live and a launcher flag in backtests -- so
