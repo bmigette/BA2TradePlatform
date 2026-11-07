@@ -9357,6 +9357,104 @@ def _screener_seed_fill(space: dict, bundle_fill: "dict | None" = None) -> "tupl
 
 
 
+def _assemble_genome_seeds(path: str, strat, space: dict, anchor: str, population: int,
+                           expert: str) -> "tuple[list, list]":
+    """``--seed-genomes``: complete each seed against the job's gene space and strict-check it.
+
+    Per gene: the seed's value, else the strategy template's authored value (cond/entry/exit), else the
+    expert's declared default (model:*), else -- screener genes only -- the loosest screen of the range
+    (``_screener_seed_fill``). Numeric values are clipped and snapped to the range lattice; a choice value
+    that is not one of the choices refuses. Every clip, snap, fill and dropped gene is printed. A gene none
+    of those answers refuses the launch (SystemExit), naming the seed and the gene."""
+    from app.services.genetic import GeneticOptimizer, snap_to_lattice
+    from app.services.strategy_param_space import authored_genome
+    from ba2_experts import get_expert_class
+    try:
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read())
+    except (OSError, ValueError) as e:
+        sys.exit(f"optimize: --seed-genomes {path}: cannot read: {e}")
+    inds = data.get("individuals") if isinstance(data, dict) else None
+    if not isinstance(inds, list) or not inds or not all(
+            isinstance(i, dict) and isinstance(i.get("genes"), dict) for i in inds):
+        sys.exit(f"optimize: --seed-genomes {path}: expected {{'individuals': [{{'genes': {{...}}}}]}}")
+    if len(inds) > population:
+        sys.exit(f"optimize: --seed-genomes: {len(inds)} seeds exceed --population {population}")
+    try:
+        authored = authored_genome(strat, space, lattice_anchor=anchor)
+    except ValueError as e:
+        sys.exit(f"optimize: --seed-genomes refused: authored genome: {e}")
+    defs = get_expert_class(expert).get_settings_definitions()
+    screener_fill = None
+    opt = GeneticOptimizer(param_ranges=space, population_size=population, n_generations=1, lattice_anchor=anchor)
+    seeds, provenance = [], []
+    for i, ind in enumerate(inds):
+        genes, label = ind["genes"], ind.get("label", f"seed{i}")
+        notes = {"seed": [], "authored": [], "default": [], "screener_fill": [], "changed": [],
+                 "dropped": sorted(k for k in genes if k not in space)}
+        out = {}
+        for key, cfg in space.items():
+            if key in genes:
+                v, src = genes[key], "seed"
+            elif key in authored:
+                v, src = authored[key], "authored"
+            elif key.startswith("model:") and key[6:] in defs and defs[key[6:]].get("default") is not None:
+                v, src = defs[key[6:]]["default"], "default"
+            elif key.startswith("screener:"):
+                if screener_fill is None:
+                    screener_fill = _screener_seed_fill(space)[0]
+                v, src = screener_fill[key], "screener_fill"
+            else:
+                sys.exit(f"optimize: --seed-genomes refused: seed {label!r}: no value for gene {key!r} "
+                         f"(not in the seed, the template or the expert's defaults)")
+            if cfg["type"] == "choice":
+                if v not in cfg["choices"]:
+                    alt = next((c for c in cfg["choices"]
+                                if str(c).lower() == str(v).lower()
+                                or (isinstance(v, bool) and not isinstance(c, bool)
+                                    and isinstance(c, (int, float)) and c == int(v))), None)
+                    if alt is None:
+                        sys.exit(f"optimize: --seed-genomes refused: seed {label!r}: {key}={v!r} ({src}) is not "
+                                 f"one of {cfg['choices']!r}")
+                    notes["changed"].append(f"{key}: {v!r} -> {alt!r}")
+                    v = alt
+            else:
+                try:
+                    raw = float(v)
+                except (TypeError, ValueError):
+                    sys.exit(f"optimize: --seed-genomes refused: seed {label!r}: {key}={v!r} ({src}) is not a number")
+                snapped = snap_to_lattice(min(max(raw, cfg["min"]), cfg["max"]), cfg, anchor)
+                snapped = int(round(snapped)) if cfg["type"] == "int" else float(snapped)
+                if abs(snapped - raw) > 1e-9 * max(1.0, abs(raw)):
+                    notes["changed"].append(f"{key}: {raw!r} -> {snapped!r} (range {cfg['min']}..{cfg['max']} "
+                                            f"step {cfg.get('step')})")
+                v = snapped
+            out[key] = v
+            notes[src].append(key)
+        try:
+            opt.encode_params_strict(out)
+        except ValueError as e:
+            sys.exit(f"optimize: --seed-genomes refused: seed {label!r}: {e}")
+        print(f"optimize: seed {label!r}: {len(notes['seed'])} genes from the seed, {len(notes['authored'])} authored, "
+              f"{len(notes['default'])} expert defaults, {len(notes['screener_fill'])} screener fills; "
+              f"{len(notes['changed'])} clipped/snapped; {len(notes['dropped'])} seed genes not in this space",
+              flush=True)
+        for c in notes["changed"]:
+            print(f"optimize:   changed {c}", flush=True)
+        for k in notes["dropped"]:
+            print(f"optimize:   dropped (not in this job's space) {k}={genes[k]!r}", flush=True)
+        for k in notes["default"] + notes["screener_fill"]:
+            print(f"optimize:   filled {k}={out[k]!r}", flush=True)
+        seeds.append(out)
+        provenance.append({"label": label, "source": path, "from_seed": len(notes["seed"]),
+                           "authored": len(notes["authored"]), "default": notes["default"],
+                           "screener_fill": notes["screener_fill"], "changed": notes["changed"],
+                           "dropped": notes["dropped"]})
+    print(f"optimize: --seed-genomes: {len(seeds)} seed(s) accepted; {population - len(seeds)} random individuals",
+          flush=True)
+    return seeds, provenance
+
+
 def _assemble_seed_population(bundle: dict, strat, space: dict, anchor: str, population: int) -> "tuple[list, list]":
     """-> ``(seed gene dicts, provenance list)`` for a bundle against the job's own gene space; every
     refusal is a ``SystemExit`` naming the seed (and the gene, where there is one). Each assembled
@@ -9506,8 +9604,16 @@ def _cmd_optimize(args) -> int:
     seed_path = getattr(args, "seed_population", None)
     seed_check_only = bool(getattr(args, "seed_check_only", False))
     seed_bundle = seed_sha = None
-    if seed_check_only and not seed_path:
-        sys.exit("optimize: --seed-check-only needs --seed-population BUNDLE")
+    seed_genomes_path = getattr(args, "seed_genomes", None)
+    if seed_genomes_path:
+        if seed_path:
+            sys.exit("optimize: --seed-genomes and --seed-population are mutually exclusive")
+        if args.strategy == _STYLE_KEY:
+            sys.exit(f"optimize: --seed-genomes is for classic strategies; an {_STYLE_KEY} job uses --seed-population")
+        if getattr(args, "warm_start_from", None) is not None or getattr(args, "chain_seed_from", None):
+            sys.exit("optimize: --seed-genomes is mutually exclusive with --warm-start-from and --chain-seed-from")
+    if seed_check_only and not (seed_path or seed_genomes_path):
+        sys.exit("optimize: --seed-check-only needs --seed-population BUNDLE or --seed-genomes JSON")
     if seed_path:
         if args.strategy != _STYLE_KEY:
             sys.exit(f"optimize: --seed-population applies only to --strategy {_STYLE_KEY}")
@@ -9649,7 +9755,7 @@ def _cmd_optimize(args) -> int:
         # affect it, then thread it into the run config below so the handler's _build_experts (and
         # the optimization handler's _build_daily_trial_config) seed the enter ruleset with it.
         strat_entry_action = getattr(strat, "entry_action", None)
-        if seed_bundle is None:     # a seeded job writes its Strategy only AFTER the seeds are accepted (below)
+        if seed_bundle is None and not seed_genomes_path:     # a seeded job writes its Strategy only AFTER the seeds are accepted (below)
             db.add(strat); db.commit(); db.refresh(strat)
 
         backtest_block = {
@@ -9918,6 +10024,17 @@ def _cmd_optimize(args) -> int:
             # A style's random generation 0 can draw every member's entry toggle off (21 of 28 pilot
             # genomes made no trade); the handler repairs it. Set for every O_STYLE job, seeded or not.
             cfg["requireAnEntryRule"] = True
+        if seed_genomes_path:
+            from app.services.strategy_optimization_handler import _resolve_lattice_anchor, job_param_space
+            _space = job_param_space(strat, cfg["expert_params"], bypass)
+            _seeds, _prov = _assemble_genome_seeds(seed_genomes_path, strat, _space, _resolve_lattice_anchor(cfg),
+                                                   int(args.population), expert)
+            cfg["seedPopulation"] = _seeds
+            cfg["seedProvenance"] = _prov
+            if seed_check_only:
+                print("optimize: --seed-check-only: genome seeds accepted; nothing was written")
+                return 0
+            db.add(strat); db.commit(); db.refresh(strat)
         if seed_bundle is not None:
             from app.services.strategy_optimization_handler import _resolve_lattice_anchor, job_param_space
             _space = job_param_space(strat, cfg["expert_params"], bypass)
@@ -11651,6 +11768,15 @@ def main(argv: "list | None" = None) -> int:
                          "completed (authored defaults, policy fills, clamps), and checked with the GA's own "
                          "strict encoder at launch; any refusal stops the launch before a row is written. "
                          "Mutually exclusive with --warm-start-from / --chain-seed-from.")
+    op.add_argument("--seed-genomes", default=None, metavar="JSON",
+                    help="Classic (non-O_STYLE) jobs: seed generation 0 with these genomes, e.g. the settings an "
+                         "expert runs LIVE (tools/build_live_seed_genomes.py). File: {'individuals': [{'label': .., "
+                         "'genes': {gene: value}}]}. Each seed is completed against THIS job's gene space -- a gene "
+                         "the seed lacks takes the strategy template's authored value, else the expert's declared "
+                         "default, else (screener genes) the loosest screen -- clipped and snapped to the gene's range "
+                         "(every change printed), then checked with the GA's strict encoder; the rest of the "
+                         "population is random. Mutually exclusive with --seed-population / --warm-start-from / "
+                         "--chain-seed-from.")
     op.add_argument("--seed-check-only", action="store_true",
                     help="With --seed-population: assemble and check the seeds, print the report and exit 0 "
                          "without writing a Strategy or StrategyOptimization row.")

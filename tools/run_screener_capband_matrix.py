@@ -794,6 +794,12 @@ def main() -> int:
                          "the small band (BID, GRSD, HCAC, OGG, SHOT, TRIB, VII) and the large band "
                          "(FITB-PA) of the 2026-10-07 store until their bars are fetched.")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--print-commands", action="store_true",
+                    help="With --dry-run: also print each job's full launcher command.")
+    ap.add_argument("--launcher-arg", action="append", default=[], metavar="--FLAG=VALUE",
+                    help="Append this token verbatim to EVERY launched optimize command (repeatable), e.g. "
+                         "--launcher-arg=--seed-genomes=seeds.json --launcher-arg=--initial-capital=1000. It is part "
+                         "of the driver argv, so it changes the job-name digest like any other flag.")
     # ----------------------------------------------------------------------------------------
     # goal2027 walk-forward (docs/plans/2026-10-25-goal2027-walk-forward-plan.md). Every flag below
     # except --walk-forward itself is REFUSED without --walk-forward, and the pass thresholds, the
@@ -1092,6 +1098,7 @@ def main() -> int:
             cmd += ["--no-robust-fitness"]
         if args.spread_bps and args.spread_bps > 0:
             cmd += ["--spread-bps", str(args.spread_bps)]
+        cmd += list(args.launcher_arg)
         # Auto-labels for easy filtering (GET /api/backtests?label=...): one tag for the grid/
         # batch id (--name-suffix, e.g. "goal5"), one for the strategy (or expert, for the
         # bypass FactorRanker job which has no strategy). Every top-N Backtest this job persists
@@ -1207,6 +1214,9 @@ def main() -> int:
                 _uni_note = screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
                   f"({expert} {strat or '(bypass)'} / {band})  [{_uni_note}]")
+            if args.print_commands:
+                import shlex
+                print("    " + shlex.join(cmd))
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
             _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "
