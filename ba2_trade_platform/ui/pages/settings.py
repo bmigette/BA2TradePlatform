@@ -1756,6 +1756,9 @@ class ExpertSettingsTab:
             
             self.experts_table.add_slot('body-cell-actions', """
                 <q-td :props="props">
+                    <q-btn v-if="props.row.expert === 'DeterministicScorer'" :href="'/style/' + props.row.id" target="_blank" icon="view_list" flat dense color='purple'>
+                        <q-tooltip>Style view (read-only option members)</q-tooltip>
+                    </q-btn>
                     <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'>
                         <q-tooltip>Edit Expert</q-tooltip>
                     </q-btn>
