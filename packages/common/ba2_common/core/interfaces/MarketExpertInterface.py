@@ -2,6 +2,7 @@ import dataclasses
 import math
 import threading
 import time
+import weakref
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
@@ -572,6 +573,10 @@ def _snapshot_is_empty(snap: Any) -> bool:
     return all(v is None or isinstance(v, bool) or (isinstance(v, dict) and not v) for v in values)
 
 
+#: Per-thread ``_gather_*`` namespaces of every expert instance (see MarketExpertInterface.__setattr__).
+_GATHER_TLS = threading.local()
+
+
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
@@ -593,6 +598,53 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     # search space). Read via getattr(expert, "bypasses_classic_rm", False).
     # Base default is False; only weight-target experts (e.g. FactorRanker) set it.
     bypasses_classic_rm: bool = False
+
+    # ---- per-call gather inputs are PER THREAD ------------------------------------------------------------
+    # ``run_analysis`` / ``analyze_as_of`` hand the symbol and per-call settings to ``_gather`` through
+    # ``self._gather_*`` attributes. Live, ONE cached expert instance serves concurrent analyses (WorkerQueue
+    # threads), so plain instance attributes let analysis B overwrite analysis A's symbol between A's assignment
+    # and A's ``_gather``: A then stores B's recommendation under A's symbol (found 2026-11-07 by the replay
+    # test: prod 2026-11-06 CORT got RSI's BUY at RSI's price). Every ``_gather_*`` attribute therefore lives in
+    # a per-thread namespace: each analysis reads exactly what its own thread set, as a backtest (one thread)
+    # always did. Set and read them on the SAME thread (every caller does: no gather fans these reads out).
+    # Only DATA attributes are routed: a name the class defines (``_gather_holdings``, ``_gather_all`` ...) is a
+    # method, and assigning it on an instance (a test double) stays an ordinary instance attribute.
+    @classmethod
+    def _is_gather_state(cls, name: str) -> bool:
+        return name.startswith("_gather_") and not hasattr(cls, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if self._is_gather_state(name):
+            self._gather_thread_namespace()[name] = value
+            return
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails, i.e. never for methods (``_gather``, ``_gather_all`` ...).
+        if type(self)._is_gather_state(name):
+            ns = self._gather_thread_namespace()
+            if name in ns:
+                return ns[name]
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        if self._is_gather_state(name):
+            ns = self._gather_thread_namespace()
+            if name not in ns:
+                raise AttributeError(name)
+            del ns[name]
+            return
+        super().__delattr__(name)
+
+    def _gather_thread_namespace(self) -> Dict[str, Any]:
+        """This thread's ``_gather_*`` values for THIS instance (weakly keyed: a dropped expert frees them)."""
+        per_thread = getattr(_GATHER_TLS, "by_expert", None)
+        if per_thread is None:
+            per_thread = _GATHER_TLS.by_expert = weakref.WeakKeyDictionary()
+        ns = per_thread.get(self)
+        if ns is None:
+            ns = per_thread[self] = {}
+        return ns
 
     """
     Abstract base class for trading account interfaces.
