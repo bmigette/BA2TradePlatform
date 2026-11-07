@@ -556,7 +556,7 @@ def build_analyst_card(analyst: Optional[Dict[str, Any]],
     if targets:
         rows = sorted(
             ([str(t.get("publishedDate") or "")[:10], t.get("analystCompany") or "",
-              t.get("analystName") or "", _money(_num(t.get("adjPriceTarget")))  # split-adjusted, same basis as the price]
+              t.get("analystName") or "", _money(_num(t.get("adjPriceTarget")))]  # split-adjusted, same basis as the price
              for t in targets),
             key=lambda r: r[0], reverse=True)
         card.tables.append(DetailTable("Recent price targets",
