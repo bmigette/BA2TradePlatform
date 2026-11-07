@@ -526,7 +526,14 @@ def test_gather_fetches_estimator_inputs_only_when_use_model_target_is_on():
     # use_model_target ON: now the exploding fake IS reached -- prove it's actually wired,
     # not merely untested, by asserting the AssertionError surfaces.
     e._gather_use_model_target = True
+    e._gather_model_target_method = "reported"
     with pytest.raises(AssertionError, match="get_past_earnings called"):
+        e._gather(providers, as_of=NOW)
+
+    # An estimate-based method is refused in a backtest before any fetch.
+    from ba2_experts.analyst_target_model import EstimatesNotPointInTime
+    e._gather_model_target_method = "forward"
+    with pytest.raises(EstimatesNotPointInTime):
         e._gather(providers, as_of=NOW)
 
 

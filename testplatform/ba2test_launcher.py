@@ -1612,6 +1612,11 @@ _EXPERT_OPT = {
             # can't compute an estimate, so this is always safe for the GA to pick.
             "expected_profit_mode": {"optimize": True, "type": "choice",
                                      "choices": ["static", "dynamic", "model"]},
+            # 2026-11-07: the point-in-time price-target methods only. 'forward'/'trailing' read
+            # FMP estimates, a single snapshot of today's revisions (lookahead), and a backtest
+            # refuses them (analyst_target_model.EstimatesNotPointInTime).
+            "model_target_method": {"optimize": True, "type": "choice",
+                                    "choices": ["reported", "reported_2y"]},
             "dynamic_scale": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             # 2026-08-26 addition: a real earnings beat against a near-zero/negative analyst
             # estimate (surprise_pct's denominator) produces a mathematically-correct but
@@ -1666,6 +1671,11 @@ _EXPERT_OPT = {
             # magnitude, which this expert doesn't have).
             "expected_profit_mode": {"optimize": True, "type": "choice",
                                      "choices": ["static", "model"]},
+            # 2026-11-07: the point-in-time price-target methods only. 'forward'/'trailing' read
+            # FMP estimates, a single snapshot of today's revisions (lookahead), and a backtest
+            # refuses them (analyst_target_model.EstimatesNotPointInTime).
+            "model_target_method": {"optimize": True, "type": "choice",
+                                    "choices": ["reported", "reported_2y"]},
             # Same range and rationale as FMPEarningsDrift's cap of the same name (added after
             # a live 3977% blowup there): a sane anchor P/E can still compound with a large
             # following-period EPS growth estimate into an unrealistic multi-bagger target.
@@ -1711,6 +1721,16 @@ _EXPERT_OPT = {
             "theta_sell": {"optimize": True, "min": 0.1, "max": 0.4, "step": 0.1, "type": "float"},
             "k_stop": {"optimize": True, "min": 1.5, "max": 3.0, "step": 0.5, "type": "float"},
             "k_target": {"optimize": True, "min": 3.0, "max": 6.0, "step": 1.0, "type": "float"},
+            # 2026-11-07 (owner): the fundamentals price target as an alternative to the ATR target
+            # for BUYs (falls back to ATR when the model has no answer for the symbol).
+            "use_model_target": {"optimize": True, "type": "choice", "choices": [False, True]},
+            # 2026-11-07: the point-in-time price-target methods only. 'forward'/'trailing' read
+            # FMP estimates, a single snapshot of today's revisions (lookahead), and a backtest
+            # refuses them (analyst_target_model.EstimatesNotPointInTime).
+            "model_target_method": {"optimize": True, "type": "choice",
+                                    "choices": ["reported", "reported_2y"]},
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
         # OPTION JOBS ONLY (plan 2026-09-24 Task 10, stage-1 relaunch): the regime multiplier
@@ -1778,6 +1798,16 @@ _EXPERT_OPT = {
             "max_trade_price_delta_pct": {"optimize": True, "min": 5.0, "max": 20.0, "step": 2.5, "type": "float"},
             "growth_confidence_multiplier": {"optimize": True, "min": 2.0, "max": 8.0, "step": 1.0, "type": "float"},
             "confidence_to_profit_factor": {"optimize": True, "min": 0.05, "max": 0.30, "step": 0.05, "type": "float"},
+            # 2026-11-07 (owner): a BUY's expected profit from the fundamentals price target
+            # instead of confidence x factor (static kept when the model has no answer).
+            "expected_profit_mode": {"optimize": True, "type": "choice", "choices": ["static", "model"]},
+            # 2026-11-07: the point-in-time price-target methods only. 'forward'/'trailing' read
+            # FMP estimates, a single snapshot of today's revisions (lookahead), and a backtest
+            # refuses them (analyst_target_model.EstimatesNotPointInTime).
+            "model_target_method": {"optimize": True, "type": "choice",
+                                    "choices": ["reported", "reported_2y"]},
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
             "min_traders": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
             "min_trades": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
             # Scoring-model knobs (2026-07 upgrade): trade-size filter/boost, sell-side

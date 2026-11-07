@@ -35,6 +35,7 @@ from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
 from ba2_experts.scoring_table import ScoringTable, use_scoring_table
+from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
 
 _USE_SCORING_TABLE = use_scoring_table()
 # NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
@@ -134,6 +135,10 @@ _PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
 #: rest are COUNTED in ``held_back_omitted``, so a cut list says it was cut instead of reading as
 #: complete. Recommended symbols are never capped: they are what the cycle actually acted on.
 BASKET_HELD_BACK_MAX = 50
+
+
+#: Symbols already reported as lacking the price-target model's cached earnings (log once each).
+_MODEL_INPUT_MISSES: set = set()
 
 
 def clear_price_map_memo() -> None:
@@ -396,6 +401,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "description": "Confidence to profit factor",
                 "tooltip": "Factor to convert confidence to expected profit. Default 0.15 means 100% confidence = 15% expected profit. Formula: expected_profit = confidence * factor."
             },
+            "expected_profit_mode": {
+                "type": "str", "required": False, "default": "static",
+                "choices": ["static", "model"],
+                "description": "Expected profit of a BUY",
+                "tooltip": "'static': confidence x confidence_to_profit_factor. 'model': the "
+                           "fundamentals price target of ba2_experts.analyst_target_model (see "
+                           "model_target_method), falling back to the static figure when the "
+                           "model has no answer for the symbol. SELL signals always use static."
+            },
+            "model_target_method": {
+                "type": "str", "required": False, "default": "reported",
+                "choices": ["forward", "trailing", "reported", "reported_2y"],
+                "description": "Price-target method (model mode)",
+                "tooltip": "'reported' / 'reported_2y': TTM reported EPS grown by its 1-year / "
+                           "annualised 2-year growth (knowable in a backtest). 'forward' / "
+                           "'trailing' read FMP estimates and run live only."
+            },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Model expected-profit ceiling (%)",
+                "tooltip": "Model mode only: the price target is capped at price x (1 + this/100)."
+            },
             "min_traders": {
                 "type": "int",
                 "required": True,
@@ -551,6 +578,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades", "skill_lookback_months",
         "skill_signal_weight", "skill_confidence_weight",
         "min_trader_avg_hold_days", "min_trader_hold_roundtrips",
+        "expected_profit_mode", "model_target_method", "max_expected_profit_percent",
     )
 
     @classmethod
@@ -837,7 +865,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = self._decision_price(providers, symbol, as_of)
+        estimator_inputs = self._model_estimator_inputs(providers, [symbol], as_of, gather_settings)
         return {
+            "estimator_inputs": estimator_inputs.get(symbol),
             "all_trades": all_trades,
             # still-held ONLY -- see the note where this is built; the windowed set hides
             # closing sales whose DISCLOSURE fell outside max_disclose_date_days.
@@ -1138,7 +1168,45 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 f"Senate basket prices resolved: {len(bundle_by_symbol)}/{len(symbols)} symbols")
             if unavailable:
                 self.logger.warning(f"Senate basket skipping symbols without a current price: {unavailable}")
+        estimator_inputs = self._model_estimator_inputs(
+            providers, self._buy_candidates(bundle_by_symbol), as_of, gather_settings)
+        for symbol, inputs in estimator_inputs.items():
+            bundle_by_symbol[symbol]["estimator_inputs"] = inputs
         return bundle_by_symbol
+
+    def _model_estimator_inputs(self, providers: ProviderBundle, symbols: List[str],
+                                as_of: Optional[datetime],
+                                settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The price-target model's inputs per symbol, fetched only in expected_profit_mode=model."""
+        if self._setting_or_default(settings, "expected_profit_mode") != "model":
+            return {}
+        method = str(self._setting_or_default(settings, "model_target_method"))
+        from ba2_providers.fmp_common import FMPHistoryCacheMiss
+        out: Dict[str, Any] = {}
+        for sym in symbols:
+            try:
+                out[sym] = fetch_estimator_inputs(providers, sym, as_of, method=method)
+            except FMPHistoryCacheMiss as e:
+                # A disclosed symbol outside the prewarmed set (basket mode discovers symbols
+                # from the feed, like the price misses _gather_all already skips): no model
+                # inputs, so the static expected profit stays. Logged once per symbol.
+                if sym not in _MODEL_INPUT_MISSES:
+                    _MODEL_INPUT_MISSES.add(sym)
+                    self.logger.warning(f"{sym}: no cached quarterly earnings for the price-target "
+                                        f"model ({e}); static expected profit used")
+                out[sym] = None
+        return out
+
+    @staticmethod
+    def _buy_candidates(bundle_by_symbol: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Symbols with at least one purchase in their window: the only ones that can come out
+        BUY, so the only ones whose model inputs are worth reading (most basket symbols carry
+        sales only). Same buy test as _calculate_recommendation's _is_buy_t."""
+        def _is_buy_type(t: Dict[str, Any]) -> bool:
+            ttype = str(t.get("type", "")).lower()
+            return "purchase" in ttype or "buy" in ttype
+        return [sym for sym, bundle in bundle_by_symbol.items()
+                if any(_is_buy_type(t) for t in bundle["all_trades"])]
 
     @staticmethod
     def _price_cache_miss_exceptions() -> Tuple[type, ...]:
@@ -1268,6 +1336,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_trader_hold_roundtrips=int(self._setting_or_default(settings, "min_trader_hold_roundtrips")),
             is_live=(as_of is None),
         )
+        self._apply_model_expected_profit(rec, data_bundle, settings, current_price)
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
             current_price=current_price, details=rec["details"],
@@ -1275,6 +1344,25 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             raw_outputs={"name": "Senate Trade Analysis", "type": "senate_trade_analysis",
                          "text": rec["details"], "recommendation": rec,
                          "filtered_trades": filtered})
+
+    def _apply_model_expected_profit(self, rec: Dict[str, Any], data_bundle: Dict[str, Any],
+                                     settings: Dict[str, Any], current_price: float) -> None:
+        """expected_profit_mode=model: a BUY's expected profit becomes the fundamentals price
+        target's upside when the model has one for the symbol; otherwise the static figure stays."""
+        if rec["signal"] != OrderRecommendation.BUY \
+                or self._setting_or_default(settings, "expected_profit_mode") != "model":
+            return
+        model_out = estimate_price_target(
+            data_bundle.get("estimator_inputs") or {}, current_price=current_price,
+            method=str(self._setting_or_default(settings, "model_target_method")),
+            max_expected_profit_percent=float(self._setting_or_default(settings, "max_expected_profit_percent")))
+        if model_out is None:
+            rec["details"] += "\nModel price target: not computable, static expected profit kept.\n"
+            return
+        rec["expected_profit_percent"] = model_out["expected_profit_percent"]
+        rec["details"] += (f"\nModel price target ({model_out['method']}): ${model_out['target_price']:.2f} "
+                           f"(+{model_out['expected_profit_percent']:.1f}%, anchor P/E "
+                           f"{model_out['anchor_pe']:.1f})\n")
 
     def _process_all(self, bundle_by_symbol: Dict[str, Dict[str, Any]], settings: Dict[str, Any],
                      as_of: Optional[datetime] = None) -> List[Recommendation]:

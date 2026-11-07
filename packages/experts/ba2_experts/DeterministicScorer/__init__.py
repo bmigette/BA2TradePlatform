@@ -316,14 +316,18 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             },
             "model_target_method": {
                 "type": "str", "required": False, "default": "forward",
-                "choices": ["forward", "trailing"],
+                "choices": ["forward", "trailing", "reported", "reported_2y"],
                 "description": "Only used when use_model_target=true. 'forward' anchors the "
                                "P/E multiple on the nearest-FY consensus EPS estimate "
                                "(unbiased on average, validated in "
                                "test_files/probe_analyst_price_target_model.py); 'trailing' "
                                "anchors on trailing TTM reported EPS (lower worst-case, "
-                               "persistent low bias). See ba2_experts.analyst_target_model's "
-                               "module docstring for the full validation writeup.",
+                               "persistent low bias). Both read FMP estimates, which are one "
+                               "snapshot of today's revisions, so a backtest refuses them. "
+                               "'reported' / 'reported_2y' use only reported quarterly EPS "
+                               "(TTM grown by its 1-year / annualised 2-year growth) and are "
+                               "the methods the GA searches. See ba2_experts."
+                               "analyst_target_model's module docstring.",
             },
             "max_expected_profit_percent": {
                 "type": "float", "required": False, "default": 100.0,
@@ -380,6 +384,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         self._gather_w_earnings = float(settings.get("w_earnings", DEF_W_EARNINGS) or 0.0)
         self._gather_index_symbol = str(settings.get("index_symbol", data.INDEX_SYMBOL))
         self._gather_use_model_target = bool(settings.get("use_model_target", False))
+        self._gather_model_target_method = str(settings.get("model_target_method", "forward"))
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, settings, as_of)
 
@@ -445,7 +450,8 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # Only fetch the model's inputs when use_model_target=true -- opt-in I/O, matching the
         # default-off contract every other gate in this method already follows.
         if bool(getattr(self, "_gather_use_model_target", False) or False):
-            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of)
+            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of,
+                                                         method=getattr(self, "_gather_model_target_method", "forward"))
         return bundle
 
     # --------------------------------------------------------------- process
@@ -938,6 +944,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             self._gather_w_earnings = float(settings.get("w_earnings", 0.0) or 0.0)
             self._gather_index_symbol = str(settings.get("index_symbol", "SPY"))
             self._gather_use_model_target = bool(settings.get("use_model_target", False))
+            self._gather_model_target_method = str(settings.get("model_target_method", "forward"))
 
             providers = self._live_providers()
             # Recorded live analysis (spec step 2): a no-op when capture is off,

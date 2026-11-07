@@ -623,6 +623,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         expert._gather_max_days_since_report = int(
             _setting(settings, "max_days_since_report", analysis))
         expert._gather_expected_profit_mode = _setting(settings, "expected_profit_mode", analysis)
+        if expert._gather_expected_profit_mode == "model":
+            expert._gather_model_target_method = _setting(settings, "model_target_method", analysis)
         # The RECORD says which branch ran, not the tape. When the calendar branch
         # ran, the tape presents an FMP-typed provider (the branch is chosen by
         # isinstance) and serves the bulk calendar; if that response is missing the
@@ -635,6 +637,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
     if expert_class == "FMPInsiderClusterBuy":
         expert._gather_lookback_days = int(_setting(settings, "lookback_days", analysis))
         expert._gather_expected_profit_mode = _setting(settings, "expected_profit_mode", analysis)
+        if expert._gather_expected_profit_mode == "model":
+            expert._gather_model_target_method = _setting(settings, "model_target_method", analysis)
         return TapeProviderBundle(tape)
 
     if expert_class == "DeterministicScorer":
@@ -658,6 +662,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         expert._gather_w_earnings = float(_setting(settings, "w_earnings", analysis) or 0.0)
         expert._gather_index_symbol = str(_setting(settings, "index_symbol", analysis))
         expert._gather_use_model_target = bool(_setting(settings, "use_model_target", analysis))
+        if expert._gather_use_model_target:
+            expert._gather_model_target_method = str(_setting(settings, "model_target_method", analysis))
 
         def _refuse_api_key():
             raise refuse("fmp_api_key", analysis_id=analysis.analysis_id,

@@ -171,9 +171,16 @@ def test_analyze_as_of_sets_gather_lookback_from_settings():
 # --------------------------------------------------------------------------- #
 # expected_profit_mode='model' (ba2_experts.analyst_target_model, opt-in, default off)
 # --------------------------------------------------------------------------- #
+def _reported(ttm_eps, base_eps, quarters=9):
+    """Newest-first reported quarters for the point-in-time 'reported' method: 4 quarters at
+    ttm_eps then base_eps (growth = ttm_eps / base_eps)."""
+    return ([{"report_date": "2026-06-10", "reported_eps": ttm_eps, "time": "bmo"}] * 4
+            + [{"report_date": "2025-06-10", "reported_eps": base_eps, "time": "bmo"}] * (quarters - 4))
+
+
 class FakeDetails:
     def __init__(self, earnings=None, estimates=None):
-        self._earnings = earnings if earnings is not None else []
+        self._earnings = earnings if earnings is not None else _reported(1.2, 1.0)
         self._estimates = estimates if estimates is not None else [
             {"estimated_eps_avg": 5.0}, {"estimated_eps_avg": 6.0}]
 
@@ -191,30 +198,34 @@ def _model_provider(insider_payload, **details_kwargs):
 
 def test_process_model_mode_replaces_the_flat_constant():
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(LiveProviderBundle(_model_provider(THREE_BUYERS)), as_of=NOW)
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.signal == OrderRecommendation.BUY
-    # current_price=100, anchor P/E = 100/5.0 = 20x, following EPS 6.0 -> target 120 -> +20%
+    # current_price=100, TTM 4.8 vs prior 4.0 -> growth 1.2 -> target 120 -> +20%
     assert rec.expected_profit_percent == pytest.approx(20.0)
 
 
 def test_process_model_mode_falls_back_to_flat_percent_when_uncomputable():
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(
-        LiveProviderBundle(_model_provider(THREE_BUYERS, estimates=[{"estimated_eps_avg": 5.0}])),
-        as_of=NOW)  # only 1 period -- 'forward' needs 2
+        LiveProviderBundle(_model_provider(THREE_BUYERS, earnings=_reported(0.9, 1.0))),
+        as_of=NOW)  # shrinking EPS -- no bullish target
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.expected_profit_percent == 10.0  # SETTINGS' flat expected_profit_percent
 
 
 def test_process_model_mode_respects_max_expected_profit_percent_cap():
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model", "max_expected_profit_percent": 5.0}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "max_expected_profit_percent": 5.0,
+                "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(LiveProviderBundle(_model_provider(THREE_BUYERS)), as_of=NOW)  # uncapped +20%
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.expected_profit_percent == pytest.approx(5.0)
@@ -224,8 +235,9 @@ def test_process_model_mode_only_applies_on_a_real_cluster():
     """A HOLD (no cluster) must stay expected_profit=0 even in 'model' mode -- the model
     should never be consulted for a symbol that isn't actually a BUY."""
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(LiveProviderBundle(_model_provider(TWO_BUYERS)), as_of=NOW)
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.signal == OrderRecommendation.HOLD

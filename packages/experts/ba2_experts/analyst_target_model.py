@@ -42,6 +42,24 @@ analysis, where those flags are never set, always hits the live API). This modul
 must not, set up its own caching layer -- doing so would silently break that contract for every
 expert that opts into it.
 
+POINT-IN-TIME (2026-11-07). FMP's analyst-estimates endpoint has no history of revisions: a cached
+payload is ONE snapshot (the day it was warmed), so a backtest decision in 2021 reading it sees the
+FY2021/FY2022 estimates as they were LATER revised, i.e. close to the reported actuals. "forward" and
+"trailing" both read those estimates and are therefore REFUSED in a backtest
+(``EstimatesNotPointInTime`` when ``as_of`` is set); live (as_of=None) they read today's estimates,
+which is correct. The GA uses the knowable methods instead, built only from REPORTED quarterly EPS
+whose announcement was public at the decision:
+
+  method="reported":    anchor_EPS = TTM (last 4 reported quarters), growth = TTM / prior TTM.
+  method="reported_2y": same anchor, growth = (TTM / TTM two years earlier) ** 0.5 (smoother).
+
+    target = anchor_PE * anchor_EPS * growth = price * growth
+
+A same-day report counts only when FMP's slot is 'bmo' (the decision runs after the open). Growth
+outside [MIN_REPORTED_GROWTH, MAX_REPORTED_GROWTH] is a near-zero base, not a valuation, and a
+non-positive upside (EPS shrinking) is no bullish target: both return None and the caller falls back.
+They need no estimates fetch at all, only the quarterly-earnings history the experts already warm.
+
 KNOWN LIMITATION -- do not "fix" by hardcoding symbols or sectors: names mid a demand supercycle
 where consensus EPS ESTIMATES are being revised up faster than analyst PRICE TARGETS follow
 (AMD/AMAT/MU during the 2025-26 AI/memory cycle in the validation run) persistently overshoot
@@ -52,8 +70,10 @@ Callers that need tighter accuracy than ~20% on ~70% of names should not lean on
 """
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.replay import ReplayMiss, replay_now
@@ -72,7 +92,48 @@ DEFAULT_MAX_ANCHOR_PE = 80.0
 #: the computation.
 DEFAULT_MAX_EXPECTED_PROFIT_PERCENT = 100.0
 
-VALID_METHODS = ("forward", "trailing")
+VALID_METHODS = ("forward", "trailing", "reported", "reported_2y")
+
+#: The methods built only from data public at the decision (see "POINT-IN-TIME" above); the only
+#: ones a backtest may run.
+POINT_IN_TIME_METHODS = ("reported", "reported_2y")
+
+#: Reported quarters each point-in-time method reads (newest first): TTM + the TTM it grows from.
+REPORTED_QUARTERS = {"reported": 8, "reported_2y": 12}
+
+#: Annual EPS growth bounds for the reported methods: past them the base TTM is near zero (or a
+#: split/restatement artefact), not a growth rate.
+MIN_REPORTED_GROWTH = 0.25
+MAX_REPORTED_GROWTH = 4.0
+
+
+class EstimatesNotPointInTime(RuntimeError):
+    """A backtest asked for an estimate-based method. FMP's estimates are one snapshot of today's
+    revisions, so the result would read the future; use a POINT_IN_TIME_METHODS method."""
+
+
+_snapshot_permission = threading.local()
+
+
+@contextmanager
+def estimate_snapshot_allowed() -> Iterator[None]:
+    """HISTORICAL REPLAY ONLY: let an estimate-based method read the snapshot with ``as_of`` set.
+
+    The replay rebuilds a recorded LIVE analysis to compare it field by field, and labels any
+    estimates input "revision unknown" itself; it is not a trading decision. A backtest must never
+    enter this. Per-thread, restores the previous state on exit."""
+    previous = getattr(_snapshot_permission, "allowed", False)
+    _snapshot_permission.allowed = True
+    try:
+        yield
+    finally:
+        _snapshot_permission.allowed = previous
+
+
+def _knowable_rows(rows: List[dict], ref: datetime) -> List[dict]:
+    """Drop a report dated on the decision day unless FMP slots it before the open ('bmo')."""
+    day = ref.date().isoformat()
+    return [r for r in rows if str(r.get("report_date", ""))[:10] != day or r.get("time") == "bmo"]
 
 
 # --------------------------------------------------------------------------- #
@@ -81,8 +142,12 @@ VALID_METHODS = ("forward", "trailing")
 # estimator to "not computable" rather than aborting the caller's whole analysis.
 # --------------------------------------------------------------------------- #
 def fetch_estimator_inputs(providers: Any, symbol: str,
-                           as_of: Optional[datetime]) -> Dict[str, List[dict]]:
-    """Trailing quarterly earnings + forward EPS estimates, point-in-time.
+                           as_of: Optional[datetime], method: str = "forward") -> Dict[str, List[dict]]:
+    """Trailing quarterly earnings + forward EPS estimates for *method*.
+
+    A point-in-time method (``reported``/``reported_2y``) reads only the reported quarters it needs,
+    never the estimates endpoint. An estimate-based method with ``as_of`` set (a backtest) raises
+    ``EstimatesNotPointInTime``: see the module docstring.
 
     ``providers`` is a ProviderBundle (``providers.fundamentals_details()`` -> a
     CompanyFundamentalsDetailsInterface, e.g. FMPCompanyDetailsProvider). Returns
@@ -96,13 +161,25 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
     # response would be unreproducible by construction (see
     # ba2_common.core.replay.observe). as_of given => returned unchanged, so the
     # historical path keeps its exact semantics.
+    if method not in VALID_METHODS:
+        raise ValueError(f"method must be one of {VALID_METHODS}, got {method!r}")
+    point_in_time = method in POINT_IN_TIME_METHODS
+    if as_of is not None and not point_in_time and not getattr(_snapshot_permission, "allowed", False):
+        raise EstimatesNotPointInTime(
+            f"price-target method {method!r} reads FMP estimates, which are one snapshot of today's "
+            f"revisions: a backtest at {as_of:%Y-%m-%d} would see the future. Use one of "
+            f"{POINT_IN_TIME_METHODS}.")
     ref = replay_now(as_of)
     det = providers.fundamentals_details()
+    # One spare row: a same-day 'amc' report is dropped below and must not shorten the history.
+    quarters = REPORTED_QUARTERS[method] + 1 if point_in_time else 4
 
     try:
         past = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
-                                     lookback_periods=4, format_type="dict")
+                                     lookback_periods=quarters, format_type="dict")
         earnings = past.get("earnings", []) if isinstance(past, dict) else []
+        if point_in_time:
+            earnings = _knowable_rows(earnings, ref)[:REPORTED_QUARTERS[method]]
     except ReplayMiss:
         # An offline replay whose tape lacks this response must stop and say so,
         # never degrade to an empty section that then compares as a plausible
@@ -112,6 +189,9 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
         absorb_if_benign(e)
         logger.warning("analyst_target_model: past-earnings fetch failed for %s: %s", symbol, e)
         earnings = []
+
+    if point_in_time:
+        return {"earnings": earnings, "estimates": []}
 
     try:
         # "quarterly" is the CACHE NAMESPACE, not a request for quarterly rows -- FMP's
@@ -171,6 +251,10 @@ def estimate_price_target(inputs: Dict[str, List[dict]], current_price: Optional
     earnings = inputs.get("earnings") or []
     estimates = inputs.get("estimates") or []  # ascending by fiscal_date_ending
 
+    if method in POINT_IN_TIME_METHODS:
+        return _estimate_from_reported(earnings, current_price, method, max_anchor_pe,
+                                       max_expected_profit_percent)
+
     if method == "trailing":
         if len(earnings) < 4:
             return None
@@ -203,5 +287,40 @@ def estimate_price_target(inputs: Dict[str, List[dict]], current_price: Optional
         "anchor_pe": round(anchor_pe, 2),
         "anchor_eps": round(anchor_eps, 4),
         "following_eps": round(following_eps, 4),
+        "method": method,
+    }
+
+
+def _estimate_from_reported(earnings: List[dict], current_price: float, method: str,
+                            max_anchor_pe: float, max_expected_profit_percent: float
+                            ) -> Optional[Dict[str, Any]]:
+    """The point-in-time methods: TTM reported EPS grown by its own trailing growth rate."""
+    n = REPORTED_QUARTERS[method]
+    eps = [r.get("reported_eps") for r in earnings[:n]]
+    # 0 is how the provider spells a missing print; a real 0.00 quarter is too rare to matter.
+    if len(eps) < n or any(not e for e in eps):
+        return None
+    ttm = sum(eps[:4])
+    base = sum(eps[n - 4:n])
+    if ttm <= 0 or base <= 0:
+        return None
+    anchor_pe = current_price / ttm
+    if anchor_pe > max_anchor_pe:
+        return None
+    growth = ttm / base if method == "reported" else (ttm / base) ** 0.5
+    if growth <= 1.0 or not MIN_REPORTED_GROWTH <= growth <= MAX_REPORTED_GROWTH:
+        return None
+    following = ttm * growth
+    target = anchor_pe * following
+    expected_profit_percent = (target / current_price - 1.0) * 100.0
+    if expected_profit_percent > max_expected_profit_percent:
+        expected_profit_percent = max_expected_profit_percent
+        target = current_price * (1.0 + max_expected_profit_percent / 100.0)
+    return {
+        "target_price": round(target, 4),
+        "expected_profit_percent": round(expected_profit_percent, 2),
+        "anchor_pe": round(anchor_pe, 2),
+        "anchor_eps": round(ttm, 4),
+        "following_eps": round(following, 4),
         "method": method,
     }

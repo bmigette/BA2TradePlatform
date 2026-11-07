@@ -1222,11 +1222,15 @@ def _run_one_analysis(bundle: SessionBundle, entry: Dict[str, Any], store,
             if context is None:
                 return {"ran": False, "detail": "the capture scope did not open"}
             _install_bundle_recorder(expert, context)
-            recommendation = expert.analyze_as_of(as_of, BacktestContext(
-                providers=LiveProviderBundle(get_provider),
-                settings=settings,
-                as_of=as_of,
-                extra={"symbol": entry["symbol"]}))
+            # A recorded live analysis may have used an estimate-based price-target method; the
+            # reconstruction reads the warmed snapshot and this report labels it revision_unknown.
+            from ba2_experts.analyst_target_model import estimate_snapshot_allowed
+            with estimate_snapshot_allowed():
+                recommendation = expert.analyze_as_of(as_of, BacktestContext(
+                    providers=LiveProviderBundle(get_provider),
+                    settings=settings,
+                    as_of=as_of,
+                    extra={"symbol": entry["symbol"]}))
             type(expert)._record_outcome(context, recommendation)
         outcome = {"ran": True}
     except (KeyboardInterrupt, SystemExit):

@@ -540,10 +540,14 @@ class PrewarmFetchers:
         """FMPSenateTraderWeight: warm the SAME fmp_history namespaces ``_gather`` reads --
         per-symbol senate/house trades (congress_{chamber}_trades) + the symbol's full daily
         price history (historical_price_full), plus each DISCLOSED trader's full history
-        (congress_trader_history, keyed by trader name, discovered from the trades)."""
+        (congress_trader_history, keyed by trader name, discovered from the trades), and the
+        price-target model's quarterly earnings (past_earnings_quarterly)."""
         s = self._ensure_senate_expert()
         trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
         s._get_price_at_date(sym, self.end_date)  # warms historical_price_full (once)
+        # expected_profit_mode='model' (a GA gene) reads the reported quarterly earnings of the
+        # price-target model; its point-in-time methods never read the estimates namespace.
+        self._warm("past_earnings_quarterly", sym)
         self.warm_new_traders(s, trades)
 
     def do_senate_latest(self) -> None:

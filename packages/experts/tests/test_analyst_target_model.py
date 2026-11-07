@@ -217,3 +217,117 @@ def test_pipeline_fetch_then_estimate():
     out = estimate_price_target(inputs, current_price=100.0, method="trailing")
     assert out is not None
     assert out["anchor_pe"] == pytest.approx(25.0)
+
+
+# --------------------------------------------------------------------------- #
+# point-in-time methods (2026-11-07): reported quarterly EPS only
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timezone  # noqa: E402
+
+from ba2_experts.analyst_target_model import (  # noqa: E402
+    EstimatesNotPointInTime, MAX_REPORTED_GROWTH, POINT_IN_TIME_METHODS,
+)
+
+
+def test_reported_grows_ttm_by_its_one_year_growth():
+    # newest first: TTM = 4 x 1.25 = 5.0, prior TTM = 4 x 1.0 = 4.0 -> growth 1.25
+    inputs = {"earnings": _earnings(*[1.25] * 4, *[1.0] * 4), "estimates": []}
+    out = estimate_price_target(inputs, current_price=100.0, method="reported")
+    assert out["anchor_pe"] == pytest.approx(20.0)          # 100 / 5.0
+    assert out["following_eps"] == pytest.approx(6.25)      # 5.0 x 1.25
+    assert out["target_price"] == pytest.approx(125.0)      # price x growth
+    assert out["expected_profit_percent"] == pytest.approx(25.0)
+
+
+def test_reported_2y_annualises_two_year_growth():
+    # TTM 5.76 vs TTM two years earlier 4.0 -> ratio 1.44 -> 1.2 a year
+    inputs = {"earnings": _earnings(*[1.44] * 4, *[1.2] * 4, *[1.0] * 4), "estimates": []}
+    out = estimate_price_target(inputs, current_price=100.0, method="reported_2y")
+    assert out["target_price"] == pytest.approx(120.0)
+
+
+@pytest.mark.parametrize("method", POINT_IN_TIME_METHODS)
+def test_reported_needs_the_full_quarter_history(method):
+    n = 8 if method == "reported" else 12
+    inputs = {"earnings": _earnings(*[1.0] * (n - 1)), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method=method) is None
+
+
+def test_reported_missing_print_is_none():
+    inputs = {"earnings": _earnings(1.2, 0, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_shrinking_eps_has_no_bullish_target():
+    inputs = {"earnings": _earnings(*[0.9] * 4, *[1.0] * 4), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_degenerate_base_is_rejected():
+    # prior TTM 0.04 -> growth 100x: a near-zero base, not a growth rate
+    inputs = {"earnings": _earnings(*[1.0] * 4, *[0.01] * 4), "estimates": []}
+    assert 4.0 / 0.04 > MAX_REPORTED_GROWTH
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_respects_the_profit_cap():
+    inputs = {"earnings": _earnings(*[2.0] * 4, *[1.0] * 4), "estimates": []}  # +100%
+    out = estimate_price_target(inputs, 100.0, method="reported", max_expected_profit_percent=40.0)
+    assert out["target_price"] == pytest.approx(140.0)
+
+
+@pytest.mark.parametrize("method", ["forward", "trailing"])
+def test_backtest_refuses_estimate_methods(method):
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=datetime(2022, 3, 1, tzinfo=timezone.utc),
+                               method=method)
+
+
+class _RecordingDetails(_FakeDetailsProvider):
+    def __init__(self, earnings):
+        super().__init__(earnings=earnings)
+        self.calls = []
+
+    def get_past_earnings(self, **kw):
+        self.calls.append(("past", kw["lookback_periods"]))
+        return super().get_past_earnings(**kw)
+
+    def get_earnings_estimates(self, **kw):
+        self.calls.append(("estimates", None))
+        return super().get_earnings_estimates(**kw)
+
+
+def test_reported_fetch_reads_earnings_only_and_drops_a_same_day_amc_print():
+    as_of = datetime(2022, 3, 1, 15, 0, tzinfo=timezone.utc)
+    rows = ([{"reported_eps": 9.0, "report_date": "2022-03-01", "time": "amc"}]
+            + [{"reported_eps": 1.0, "report_date": f"2021-{m:02d}-01", "time": "bmo"} for m in range(12, 0, -1)])
+    det = _RecordingDetails(rows)
+    out = fetch_estimator_inputs(_FakeBundle(det), "AAPL", as_of=as_of, method="reported")
+    assert det.calls == [("past", 9)]                  # 8 quarters + 1 spare, no estimates read
+    assert out["estimates"] == []
+    assert len(out["earnings"]) == 8 and out["earnings"][0]["report_date"] == "2021-12-01"
+
+
+def test_reported_fetch_keeps_a_same_day_bmo_print():
+    as_of = datetime(2022, 3, 1, 15, 0, tzinfo=timezone.utc)
+    rows = [{"reported_eps": 2.0, "report_date": "2022-03-01", "time": "bmo"}] + \
+        [{"reported_eps": 1.0, "report_date": f"2021-{m:02d}-01", "time": "bmo"} for m in range(12, 0, -1)]
+    out = fetch_estimator_inputs(_FakeBundle(_RecordingDetails(rows)), "AAPL", as_of=as_of, method="reported")
+    assert out["earnings"][0]["report_date"] == "2022-03-01"
+
+
+def test_live_estimate_methods_still_fetch():
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    out = fetch_estimator_inputs(bundle, "AAPL", as_of=None, method="forward")
+    assert out["estimates"] == _estimates(5.0, 6.0)
+
+
+def test_historical_replay_permission_reads_the_snapshot_and_is_scoped():
+    from ba2_experts.analyst_target_model import estimate_snapshot_allowed
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    as_of = datetime(2022, 3, 1, tzinfo=timezone.utc)
+    with estimate_snapshot_allowed():
+        assert fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")["estimates"]
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")
