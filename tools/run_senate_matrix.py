@@ -42,7 +42,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    add_estimates_source_flag, add_history_source_flag, cap_passthrough, estimates_source_tokens, with_estimates_source_name, decision_times_plan, decision_times_tokens, history_source_tokens,
+    add_estimates_source_flag, add_history_source_flag, estimates_source_of, cap_passthrough, estimates_source_tokens, with_estimates_source_name, decision_times_plan, decision_times_tokens, history_source_tokens,
     refuse_split_decision_times,
     job_name_with_digest, with_decision_times_name, with_history_source_name)
 
@@ -272,12 +272,12 @@ def main() -> int:
     for i, (name, strat) in enumerate(jobs, 1):
         # The OHLCV history is part of the job's identity (an alpaca job never resumes an fmp one).
         name = with_history_source_name(name, args.ohlcv_history_source)
-        name = with_estimates_source_name(name, args.estimates_source)
+        name = with_estimates_source_name(name, estimates_source_of(args, __file__))
         cmd = [exe, "optimize", "--expert", _EXPERT, "--universe", universe,
                "--strategy", strat,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
-               *estimates_source_tokens(args.estimates_source),
+               *estimates_source_tokens(estimates_source_of(args, __file__)),
                "--population", str(args.population),
                "--generations", str(args.generations),
                "--initial-capital", str(args.initial_capital),

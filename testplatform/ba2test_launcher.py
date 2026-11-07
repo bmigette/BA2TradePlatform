@@ -1431,12 +1431,13 @@ def _add_estimates_source_arg(parser) -> None:
 
 def _resolve_estimates_source(args, command: str) -> str:
     """The job's estimates source: as stated, else the run REFUSES (no default)."""
-    stated = getattr(args, "estimates_source", None)
-    if not stated:
+    from ba2_common.core import estimates_source as _es
+    try:
+        return _es.require_stated_estimates_source(getattr(args, "estimates_source", None), command)
+    except _es.EstimatesSourceMissing:
         sys.exit(f"ba2-test {command}: REFUSED: --estimates-source {{fmp,alphavantage}} is required; a "
                  f"backtest must name where its analyst estimates come from (fmp has no history of "
                  f"revisions, alphavantage is point-in-time). There is no default.")
-    return stated
 
 
 def _refuse_reused_estimates_source_name(name: str, source: str, command: str) -> None:

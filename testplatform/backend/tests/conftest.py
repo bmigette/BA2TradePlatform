@@ -167,8 +167,16 @@ def _tolerant_estimates_source():
             return "fmp"
         return real(job_config)
 
+    real_stated = es.require_stated_estimates_source
+
+    def tolerant_stated(stated, where):
+        if stated in (None, "") and not _ESTIMATES_STRICT["on"]:
+            return "fmp"
+        return real_stated(stated, where)
+
     mp = MonkeyPatch()
     mp.setattr(es, "resolve_job_estimates_source", tolerant)
+    mp.setattr(es, "require_stated_estimates_source", tolerant_stated)
     yield
     mp.undo()
 

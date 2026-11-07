@@ -73,7 +73,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    add_estimates_source_flag, add_history_source_flag, cap_passthrough, estimates_source_tokens, with_estimates_source_name, decision_times_plan, decision_times_split, decision_times_tokens,
+    add_estimates_source_flag, add_history_source_flag, estimates_source_of, cap_passthrough, estimates_source_tokens, with_estimates_source_name, decision_times_plan, decision_times_split, decision_times_tokens,
     history_source_tokens,
     job_name_with_digest, screener_dry_run_universe_note, with_decision_times_name, with_history_source_name,
     with_universe_rule_name)
@@ -1006,7 +1006,7 @@ def main() -> int:
             name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
         # The OHLCV history is part of the job's identity too (an alpaca job never resumes an fmp one).
         name = with_history_source_name(name, args.ohlcv_history_source)
-        name = with_estimates_source_name(name, args.estimates_source)
+        name = with_estimates_source_name(name, estimates_source_of(args, __file__))
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -1051,7 +1051,7 @@ def main() -> int:
                # window and bucket empty calendar years into the consistency fitness.
                "--start", job_start, "--end", job_end, "--fitness", args.fitness,
                "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
-               *estimates_source_tokens(args.estimates_source),
+               *estimates_source_tokens(estimates_source_of(args, __file__)),
                "--population", str(population),
                "--generations", str(generations),
                # (screener jobs only; the token ORDER is unchanged so existing name digests hold)

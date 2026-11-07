@@ -53,6 +53,14 @@ def resolve_job_estimates_source(job_config: Mapping) -> str:
     return check_estimates_source(job_config[ESTIMATES_SOURCE_KEY])
 
 
+def require_stated_estimates_source(stated, where: str) -> str:
+    """The source a job-creating entry point (CLI flag, API field) was GIVEN: absent -> ``EstimatesSourceMissing``.
+    Entry points call this through the module so the test harness can answer for hand-built argv."""
+    if stated in (None, ""):
+        raise EstimatesSourceMissing(f"{where}: the estimates source is not stated; there is no default")
+    return check_estimates_source(stated)
+
+
 def with_estimates_source_name(name: str, source: str) -> str:
     """``name`` carrying the estimates source (a job name is the job's identity; two sources under one name
     would skip-as-done or compare unlike runs). Idempotent."""
