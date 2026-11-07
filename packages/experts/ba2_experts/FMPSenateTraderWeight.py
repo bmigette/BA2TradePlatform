@@ -35,6 +35,7 @@ from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
 from ba2_experts.scoring_table import ScoringTable, use_scoring_table
+from ba2_common.core.estimates_pit import EstimatesNotPrewarmed, EstimatesUnavailable
 from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
 
 _USE_SCORING_TABLE = use_scoring_table()
@@ -139,6 +140,8 @@ BASKET_HELD_BACK_MAX = 50
 
 #: Symbols already reported as lacking the price-target model's cached earnings (log once each).
 _MODEL_INPUT_MISSES: set = set()
+#: ``_model_estimator_inputs`` marker: the symbol's estimate-based model has no estimate -> dropped from the basket.
+_ESTIMATES_UNAVAILABLE = object()
 
 
 def clear_price_map_memo() -> None:
@@ -1171,6 +1174,12 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         estimator_inputs = self._model_estimator_inputs(
             providers, self._buy_candidates(bundle_by_symbol), as_of, gather_settings)
         for symbol, inputs in estimator_inputs.items():
+            if inputs is _ESTIMATES_UNAVAILABLE:
+                # The basket analogue of a failed per-symbol analysis: the symbol is dropped from THIS
+                # analysis (never decided on the static expected profit instead). Warned in
+                # _model_estimator_inputs.
+                del bundle_by_symbol[symbol]
+                continue
             bundle_by_symbol[symbol]["estimator_inputs"] = inputs
         return bundle_by_symbol
 
@@ -1186,6 +1195,12 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         for sym in symbols:
             try:
                 out[sym] = fetch_estimator_inputs(providers, sym, as_of, method=method)
+            except (EstimatesUnavailable, EstimatesNotPrewarmed) as e:
+                # An estimate-based method with no estimate for this symbol: its analysis FAILS (owner,
+                # 2026-11-07), i.e. the symbol leaves this basket analysis; the rest of the basket goes on.
+                self.logger.warning(f"{sym}: dropped from the Senate basket analysis, the price-target "
+                                    f"model ({method}) has no estimate: {e}")
+                out[sym] = _ESTIMATES_UNAVAILABLE
             except FMPHistoryCacheMiss as e:
                 # A disclosed symbol outside the prewarmed set (basket mode discovers symbols
                 # from the feed, like the price misses _gather_all already skips): no model

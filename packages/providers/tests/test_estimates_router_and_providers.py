@@ -78,8 +78,30 @@ def test_get_earnings_estimates_has_the_fmp_shape_and_marks_the_quarterly_granul
 def test_a_payload_miss_in_a_backtest_is_recorded_not_fetched(av):
     with fmp_common.frozen_ttl_cache(), fmp_common.hermetic_fmp_history():
         out = av.get_quarterly_eps_consensus("NOPAYLOAD", PAST)      # make_api_request would assert
-    assert out["quarters"] == []
+    assert out["quarters"] == [] and out["unavailable"] == av_mod.UNAVAILABLE_NOT_PREWARMED
     assert f"{av_mod.AV_CONSENSUS_NAMESPACE}/NOPAYLOAD" in fmp_common.hermetic_miss_symbols()
+
+
+def test_the_no_estimates_sentinel_reads_as_no_data_not_a_prewarm_gap(av):
+    _write(av_mod.AV_CONSENSUS_NAMESPACE, "NODATA", [])
+    with fmp_common.frozen_ttl_cache(), fmp_common.hermetic_fmp_history():
+        out = av.get_quarterly_eps_consensus("NODATA", PAST)
+    assert out["quarters"] == [] and out["unavailable"] == av_mod.UNAVAILABLE_NO_DATA
+    assert f"{av_mod.AV_CONSENSUS_NAMESPACE}/NODATA" not in fmp_common.hermetic_miss_symbols()
+
+
+def test_a_decision_before_any_snapshot_reads_as_none_as_of(av):
+    _write(av_mod.AV_CONSENSUS_NAMESPACE, "MSFT", _av_payload())
+    _write(av_mod.SPLIT_CALENDAR_NAMESPACE, "MSFT", {"symbol": "MSFT", "historical": []})
+    with fmp_common.frozen_ttl_cache(), fmp_common.hermetic_fmp_history():
+        out = av.get_quarterly_eps_consensus("MSFT", datetime(1990, 1, 2))
+    assert out["quarters"] == [] and out["unavailable"] == av_mod.UNAVAILABLE_NONE_AS_OF
+
+
+def test_an_empty_av_answer_is_a_cacheable_no_data_payload(monkeypatch):
+    calls = []
+    monkeypatch.setattr(av_mod, "make_api_request", lambda f, p, source="x": calls.append(f) or {})
+    assert av_mod.fetch_av_consensus_payload("ZZZZ") == {} and calls == ["EARNINGS_ESTIMATES"]
 
 
 def test_a_split_calendar_miss_raises_instead_of_reading_as_never_split(av):

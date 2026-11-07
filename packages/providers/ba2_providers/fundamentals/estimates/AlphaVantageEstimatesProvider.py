@@ -34,6 +34,10 @@ AV_CONSENSUS_NAMESPACE = "av_eps_consensus"
 SPLIT_CALENDAR_NAMESPACE = "mc_stock_split"
 SPLIT_CALENDAR_MAX_AGE_DAYS = 1.0
 _LIVE_TTL_S = 6 * 3600.0
+#: ``get_quarterly_eps_consensus``'s ``unavailable`` values (absent when quarters were found).
+UNAVAILABLE_NO_DATA = "no_data"              # AV has no estimates for the symbol (cached sentinel / live {})
+UNAVAILABLE_NONE_AS_OF = "none_as_of"        # estimates exist, none knowable at the decision date
+UNAVAILABLE_NOT_PREWARMED = "not_prewarmed"  # hermetic backtest: never downloaded
 #: Alpha Vantage allows one request per second on the free tier.
 _MIN_CALL_GAP_S = 1.1
 
@@ -56,9 +60,16 @@ def _expect(payload: Any, key: str, function: str, symbol: str) -> Dict[str, Any
 
 
 def fetch_av_consensus_payload(symbol: str) -> Dict[str, Any]:
-    """Two AV calls (EARNINGS_ESTIMATES, EARNINGS) for ``symbol`` -> the cacheable combined payload."""
-    estimates = _expect(make_api_request("EARNINGS_ESTIMATES", {"symbol": symbol}, source="ba2_estimates"),
-                        "estimates", "EARNINGS_ESTIMATES", symbol)
+    """Two AV calls (EARNINGS_ESTIMATES, EARNINGS) for ``symbol`` -> the cacheable combined payload.
+
+    ``{}`` when AV has no estimates for the symbol (it answers an empty object): falsy, so a prewarm/backfill
+    under ``persist_empty_sentinel()`` stores the "checked, none" sentinel and a backtest can tell it from a
+    symbol that was never downloaded. Measured 2026-11-07: ~1,640 of 6,381 universe symbols, mostly small caps;
+    the empty answer is occasionally transient (a retry recovered ~5%), so the backfill retries once."""
+    raw = make_api_request("EARNINGS_ESTIMATES", {"symbol": symbol}, source="ba2_estimates")
+    if isinstance(raw, dict) and not raw:
+        return {}
+    estimates = _expect(raw, "estimates", "EARNINGS_ESTIMATES", symbol)
     time.sleep(_MIN_CALL_GAP_S)
     earnings = _expect(make_api_request("EARNINGS", {"symbol": symbol}, source="ba2_estimates"),
                        "quarterlyEarnings", "EARNINGS", symbol)
@@ -110,12 +121,19 @@ class AlphaVantageEstimatesProvider:
         result = {"symbol": sym, "as_of": None if as_of is None else as_of.isoformat(),
                   "source": "alphavantage", "quarters": []}
         if not payload:
-            logger.warning(f"AV EPS consensus for {sym}: no payload (not warmed / no data)")
+            # "unavailable" says WHY the quarters are empty; an estimate-based decision turns it into a failed
+            # analysis (analyst_target_model). Other readers (an LLM tool) just see no estimates.
+            prewarm_gap = f"{AV_CONSENSUS_NAMESPACE}/{sym}" in hermetic_miss_symbols()
+            result["unavailable"] = UNAVAILABLE_NOT_PREWARMED if prewarm_gap else UNAVAILABLE_NO_DATA
+            logger.warning(f"AV EPS consensus for {sym}: "
+                           f"{'not downloaded (prewarm gap)' if prewarm_gap else 'Alpha Vantage has no estimates'}")
             return result
         fetched_on = date.fromisoformat(payload["fetched_on"])
         splits = load_split_calendar(sym)
         result["quarters"] = quarterly_consensus(payload["estimates"], payload["earnings"], splits, as_of,
                                                  fetched_on)
+        if not result["quarters"]:
+            result["unavailable"] = UNAVAILABLE_NONE_AS_OF
         return result
 
     def get_earnings_estimates(self, symbol: str, frequency: str, as_of_date: datetime,

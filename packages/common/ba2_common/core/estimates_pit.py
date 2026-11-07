@@ -51,6 +51,20 @@ class EstimatesNotPointInTime(RuntimeError):
     would read the future. Use a point-in-time source (``alphavantage``) or a method that needs none."""
 
 
+class EstimatesUnavailable(RuntimeError):
+    """An estimate-based decision found NO estimate for the symbol at the decision (the source has none for
+    it, or none as of that date). The symbol's analysis FAILS: it never falls back to a non-estimate answer,
+    and the symbol stays in the universe for experts that do not read estimates (owner, 2026-11-07).
+
+    The backtest engine counts it apart from other analysis failures (a coverage fact of the source, not a
+    broken expert), so it does not feed the failed-share refusal; never absorbed by ``absorb_if_benign``."""
+
+
+class EstimatesNotPrewarmed(RuntimeError):
+    """A hermetic backtest read a symbol's estimates that were never downloaded (no cache file, not even the
+    'source has none' sentinel). A data-prep gap: an ordinary analysis failure, counted as one."""
+
+
 _snapshot_permission = threading.local()
 
 

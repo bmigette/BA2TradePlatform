@@ -2727,3 +2727,21 @@ def test_weight_basket_model_inputs_only_for_symbols_with_a_purchase():
                "MSFT": {"all_trades": [{"type": "Sale (Full)"}]},
                "NVDA": {"all_trades": [{"type": "sale_partial"}, {"type": "buy"}]}}
     assert FMPSenateTraderWeight._buy_candidates(bundles) == ["AAPL", "NVDA"]
+
+
+def test_weight_basket_drops_a_symbol_without_an_estimate_instead_of_using_static(monkeypatch):
+    """Owner 2026-11-07: no estimate -> that symbol's analysis fails (dropped from the basket), the rest go on."""
+    import logging
+    from ba2_common.core.estimates_pit import EstimatesUnavailable
+    mod = sys.modules["ba2_experts.FMPSenateTraderWeight"]
+
+    def fake(providers, sym, as_of, method):
+        if sym == "NOEST":
+            raise EstimatesUnavailable(f"{sym}: no consensus")
+        return _model_inputs(1.3)
+    monkeypatch.setattr(mod, "fetch_estimator_inputs", fake)
+    e = mod.FMPSenateTraderWeight.__new__(mod.FMPSenateTraderWeight)
+    e.logger = logging.getLogger("t")
+    out = e._model_estimator_inputs(None, ["AAPL", "NOEST"], None,
+                                    {"expected_profit_mode": "model", "model_target_method": "consensus"})
+    assert out["NOEST"] is mod._ESTIMATES_UNAVAILABLE and out["AAPL"] == _model_inputs(1.3)

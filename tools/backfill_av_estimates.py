@@ -2,8 +2,11 @@
 
 Sequential on purpose: ``fetch_av_consensus_payload`` makes 2 AV calls per symbol with a 1.1 s gap, so one
 symbol at a time stays under the 75 calls/minute premium plan (a parallel prewarm would not). Resumable: a
-symbol already in the disk cache is not refetched. Symbols AV cannot serve are listed in the report, not
-retried forever.
+symbol already in the disk cache is not refetched. A symbol AV has NO estimates for is stored as the empty
+"checked, none" sentinel (a backtest then fails that symbol's estimate-based analysis as EstimatesUnavailable,
+instead of reading it as a prewarm gap); it is listed under "empty" in the report. AV's empty answer is
+sometimes transient: re-run with --retry-empty to re-ask those once. Errors (throttle, malformed) are listed
+under "failed" and never cached.
 
     python tools/backfill_av_estimates.py --symbols-file tools/screener_store_universe_dated.txt \\
         --db ~/Documents/ba2/test/dl_forecasting.db \
@@ -43,6 +46,8 @@ def main(argv=None) -> int:
     ap.add_argument("--symbols-file", action="append", required=True)
     ap.add_argument("--limit", type=int, default=None, help="first N symbols only (a smoke run)")
     ap.add_argument("--report", default=None, help="write a JSON report (ok / failed with reasons)")
+    ap.add_argument("--retry-empty", action="store_true",
+                    help="re-ask AV for symbols cached as 'no estimates' (the sentinel is replaced if AV now answers)")
     ap.add_argument("--db", required=True,
                     help="sqlite DB holding the API keys (AppSetting), e.g. ~/Documents/ba2/test/dl_forecasting.db")
     args = ap.parse_args(argv)
@@ -50,13 +55,19 @@ def main(argv=None) -> int:
     logging.disable(logging.WARNING)
     from ba2_common.core import db as _db
     _db.configure_db(os.path.expanduser(args.db))
-    from ba2_providers.fmp_common import frozen_ttl_cache
+    from ba2_providers.fmp_common import _fmp_history_cache_dir, frozen_ttl_cache, persist_empty_sentinel
     from ba2_providers.fundamentals.estimates.AlphaVantageEstimatesProvider import (
-        load_av_consensus_payload, load_split_calendar)
+        AV_CONSENSUS_NAMESPACE, load_av_consensus_payload, load_split_calendar)
 
     symbols = _read_symbols(args.symbols_file)
     if args.limit:
         symbols = symbols[:args.limit]
+    if args.retry_empty:
+        cache_dir = _fmp_history_cache_dir()
+        for sym in symbols:
+            path = os.path.join(cache_dir, f"{AV_CONSENSUS_NAMESPACE}__{sym}.json")
+            if os.path.exists(path) and os.path.getsize(path) <= 4:      # the "[]" sentinel
+                os.remove(path)
     ok, empty, failed = [], [], {}
     t0 = time.time()
     for i, sym in enumerate(symbols, 1):
@@ -71,10 +82,11 @@ def main(argv=None) -> int:
         try:
             # The disk cache is written only under the TTL freeze (the prewarm/backtest layer); outside it
             # fmp_history_disk_cached is the live pass-through and persists nothing.
-            with frozen_ttl_cache():
+            with frozen_ttl_cache(), persist_empty_sentinel():
                 payload = load_av_consensus_payload(sym)
                 (ok if payload else empty).append(sym)
-                load_split_calendar(sym)
+                if payload:
+                    load_split_calendar(sym)
         except Exception as e:  # noqa: BLE001 -- one symbol's gap is reported, never stops the backfill
             failed[sym] = f"{type(e).__name__}: {str(e)[:200]}"
         if i % 50 == 0 or i == len(symbols):

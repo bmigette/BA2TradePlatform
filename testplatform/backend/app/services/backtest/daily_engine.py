@@ -156,6 +156,11 @@ MAX_FAILED_ANALYSIS_SHARE = 0.05
 MIN_ANALYSIS_PASSES_FOR_REFUSAL = 20
 
 
+def _is_estimates_unavailable(exc: Optional[BaseException]) -> bool:
+    """``ba2_common.core.estimates_pit.EstimatesUnavailable`` (by MRO name: no import in the hot path)."""
+    return exc is not None and any(k.__name__ == "EstimatesUnavailable" for k in type(exc).__mro__)
+
+
 class AnalysisFailureRefusal(RuntimeError):
     """The run's analysis passes failed too often for its result to mean anything.
 
@@ -1216,8 +1221,17 @@ class DailyBacktestEngine:
         rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})
         rec["passes"] += 1
 
-    def _analysis_failed(self, expert_id: int, what: str) -> None:
+    def _analysis_failed(self, expert_id: int, what: str, exc: Optional[BaseException] = None) -> None:
         rec = self.analysis_failures[expert_id]
+        if _is_estimates_unavailable(exc):
+            # The symbol's analysis failed because the estimates source has no estimate for it (owner,
+            # 2026-11-07: fail the analysis, keep the symbol in the universe). A coverage fact of the source
+            # (~26% of the broad universe on Alpha Vantage), not a broken expert: counted and reported apart,
+            # outside the failed share that refuses the run.
+            rec["estimates_unavailable"] = rec.get("estimates_unavailable", 0) + 1
+            if rec.get("first_estimates_unavailable") is None:
+                rec["first_estimates_unavailable"] = what[:500]
+            return
         rec["failed"] += 1
         if rec["first_error"] is None:
             rec["first_error"] = what[:500]
@@ -1226,9 +1240,13 @@ class DailyBacktestEngine:
         """The ``analysis_failures`` blob: totals plus the per-expert counts and first error."""
         passes = sum(r["passes"] for r in self.analysis_failures.values())
         failed = sum(r["failed"] for r in self.analysis_failures.values())
+        unavailable = sum(r.get("estimates_unavailable", 0) for r in self.analysis_failures.values())
         first = next((r["first_error"] for r in self.analysis_failures.values() if r["first_error"]), None)
-        return {"passes": passes, "failed": failed, "first_error": first,
-                "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+        out = {"passes": passes, "failed": failed, "first_error": first,
+               "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+        if unavailable:
+            out["estimates_unavailable"] = unavailable
+        return out
 
     def entry_gate_record(self) -> Optional[Dict[str, Any]]:
         """``{rule: {"n", "met", "b": {leaf: first-false count}, "order": [leaf...]}}`` of the ENTRY
@@ -1240,6 +1258,13 @@ class DailyBacktestEngine:
         ``MAX_FAILED_ANALYSIS_SHARE`` (judged from ``MIN_ANALYSIS_PASSES_FOR_REFUSAL`` passes on).
         An expert that analyses fine and emits no BUY has ZERO failed passes: not a failure."""
         rec = self.analysis_failures_record()
+        if rec.get("estimates_unavailable"):
+            first_eu = next((r.get("first_estimates_unavailable") for r in self.analysis_failures.values()
+                             if r.get("first_estimates_unavailable")), None)
+            logger.warning(
+                f"[daily_engine] ESTIMATES UNAVAILABLE: {rec['estimates_unavailable']} of {rec['passes']} "
+                f"analysis passes failed for want of an estimate (not counted toward the failed-share "
+                f"refusal); first: {first_eu}")
         if not rec["failed"]:
             return
         logger.warning(
@@ -1472,7 +1497,7 @@ class DailyBacktestEngine:
                     raise
                 _reraise_option_basis_refusal(e)
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}", e)
                 continue
 
             if self._stage_recommendation_candidate(
@@ -1720,7 +1745,7 @@ class DailyBacktestEngine:
                 raise
             _reraise_option_basis_refusal(e)
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
-            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}", e)
             return False
 
         # TYPE GUARD: a basket expert's analyze_as_of MUST return List[Recommendation] (one per
@@ -1862,7 +1887,7 @@ class DailyBacktestEngine:
                     raise
                 _reraise_option_basis_refusal(e)
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}", e)
                 continue
             if rec_is_unpriced(rec):
                 # A HELD symbol with no decidable price at this tick: nothing can be decided for it, so
@@ -2065,7 +2090,7 @@ class DailyBacktestEngine:
                 raise
             _reraise_option_basis_refusal(e)
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
-            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}", e)
             return
 
         if getattr(rec, "skip", False):

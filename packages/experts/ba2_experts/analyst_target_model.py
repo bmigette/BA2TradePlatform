@@ -63,6 +63,14 @@ outside [MIN_REPORTED_GROWTH, MAX_REPORTED_GROWTH] is a near-zero base, not a va
 non-positive upside (EPS shrinking) is no bullish target: both return None and the caller falls back.
 They need no estimates fetch at all, only the quarterly-earnings history the experts already warm.
 
+NO ESTIMATE = FAILED ANALYSIS (owner, 2026-11-07). An estimate-based method ("consensus", "forward",
+"trailing") that finds NO estimate for the symbol raises ``EstimatesUnavailable`` from
+``fetch_estimator_inputs``: the symbol's analysis fails, it never falls back to the static answer. The
+symbol is NOT removed from any universe (other experts and methods do not need estimates). A backtest
+counts these apart from other failures; a never-downloaded symbol raises ``EstimatesNotPrewarmed`` (an
+ordinary failure). "None" from ``estimate_price_target`` still means the estimates exist but give no
+sane bullish target, and the caller still falls back for that.
+
 KNOWN LIMITATION -- do not "fix" by hardcoding symbols or sectors: names mid a demand supercycle
 where consensus EPS ESTIMATES are being revised up faster than analyst PRICE TARGETS follow
 (AMD/AMAT/MU during the 2025-26 AI/memory cycle in the validation run) persistently overshoot
@@ -78,6 +86,7 @@ from typing import Any, Dict, List, Optional
 
 # Re-exported: the typed refusal and the replay permission moved to the provider layer.
 from ba2_common.core.estimates_pit import EstimatesNotPointInTime, estimate_snapshot_allowed  # noqa: F401
+from ba2_common.core.estimates_pit import EstimatesNotPrewarmed, EstimatesUnavailable
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.replay import ReplayMiss, replay_now
 from ba2_common.logger import logger
@@ -205,6 +214,8 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
         raise EstimatesGranularityError(
             f"method {method!r} compares the next two FISCAL YEARS' EPS, but the alphavantage estimates "
             f"source returns quarters; use method 'reported' or 'reported_2y', or --estimates-source fmp live.")
+    if not estimates:
+        raise EstimatesUnavailable(f"{symbol}: no EPS estimates for method {method!r} as of {ref:%Y-%m-%d}")
     return {"earnings": earnings, "estimates": estimates}
 
 
@@ -339,13 +350,22 @@ def _fetch_consensus_inputs(det: Any, symbol: str, as_of: Optional[datetime], re
         logger.warning("analyst_target_model: past-earnings fetch failed for %s: %s", symbol, e)
         earnings = []
     try:
-        consensus = det.get_quarterly_eps_consensus(symbol, as_of=as_of).get("quarters", [])
+        answer = det.get_quarterly_eps_consensus(symbol, as_of=as_of)
     except (ReplayMiss, EstimatesNotPointInTime):
         raise
     except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
-        absorb_if_benign(e)
-        logger.warning("analyst_target_model: quarterly consensus fetch failed for %s: %s", symbol, e)
-        consensus = []
+        absorb_if_benign(e)     # a benign (network) failure: no consensus could be read, so the analysis fails
+        raise EstimatesUnavailable(f"{symbol}: quarterly EPS consensus could not be read: {e}") from e
+    consensus = answer.get("quarters", []) if isinstance(answer, dict) else []
+    if not consensus:
+        why = answer.get("unavailable") if isinstance(answer, dict) else None
+        source = answer.get("source") if isinstance(answer, dict) else None
+        if why == "not_prewarmed":
+            raise EstimatesNotPrewarmed(
+                f"{symbol}: the {source} EPS consensus was never downloaded; run `ba2-test prewarm` with "
+                f"--estimates-source {source} (or tools/backfill_av_estimates.py)")
+        raise EstimatesUnavailable(f"{symbol}: no quarterly EPS consensus from {source} as of {ref:%Y-%m-%d}"
+                                   f"{f' ({why})' if why else ''}")
     return {"earnings": earnings, "estimates": [], "consensus": consensus}
 
 

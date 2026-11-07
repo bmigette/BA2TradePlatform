@@ -204,7 +204,7 @@ def test_fetch_estimator_inputs_degrades_to_empty_on_a_benign_fetch_failure(monk
     import ba2_common.core.failure_modes as fm
     monkeypatch.setenv("BA2_ERROR_MODE", "legacy")  # a ValueError here is not a real defect type
     fm._mode.cache_clear() if hasattr(fm._mode, "cache_clear") else None
-    bundle = _FakeBundle(_FakeDetailsProvider(raise_on="past"))
+    bundle = _FakeBundle(_FakeDetailsProvider(raise_on="past", estimates=_estimates(5.0, 6.0)))
     out = fetch_estimator_inputs(bundle, "AAPL", as_of=None)
     assert out["earnings"] == []
 
@@ -400,3 +400,60 @@ def test_consensus_refusal_from_a_non_point_in_time_source_propagates():
     with pytest.raises(EstimatesNotPointInTime):
         fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.0))), "AAPL",
                                as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+# --------------------------------------------------------------------------- #
+# no estimate = failed analysis (owner, 2026-11-07): raise, never fall back
+# --------------------------------------------------------------------------- #
+from ba2_experts.analyst_target_model import EstimatesNotPrewarmed, EstimatesUnavailable  # noqa: E402
+
+
+def _consensus_det(answer):
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            return answer
+    return _FakeBundle(Det(earnings=_earnings(1.2, 1.2, 1.2, 1.0)))
+
+
+@pytest.mark.parametrize("why", ["no_data", "none_as_of", None])
+def test_consensus_without_any_estimate_fails_the_analysis(why):
+    answer = {"quarters": [], "source": "alphavantage", **({"unavailable": why} if why else {})}
+    with pytest.raises(EstimatesUnavailable, match="AAPL"):
+        fetch_estimator_inputs(_consensus_det(answer), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+def test_consensus_never_downloaded_is_a_prewarm_gap_not_a_coverage_fact():
+    answer = {"quarters": [], "source": "alphavantage", "unavailable": "not_prewarmed"}
+    with pytest.raises(EstimatesNotPrewarmed):
+        fetch_estimator_inputs(_consensus_det(answer), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+def test_consensus_unreadable_source_fails_the_analysis():
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            raise ConnectionError("network down")       # benign (OSError): still no estimate -> fails
+
+    with pytest.raises(EstimatesUnavailable):
+        fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.0))), "AAPL", as_of=None, method="consensus")
+
+
+@pytest.mark.parametrize("method", ["forward", "trailing"])
+def test_annual_estimate_methods_without_estimates_fail_the_analysis(method):
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=[]))
+    with pytest.raises(EstimatesUnavailable):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=None, method=method)
+
+
+@pytest.mark.parametrize("method", POINT_IN_TIME_METHODS)
+def test_reported_methods_never_need_an_estimate(method):
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=[]))
+    assert fetch_estimator_inputs(bundle, "AAPL", as_of=None, method=method)["estimates"] == []
+
+
+def test_estimates_unavailable_is_never_absorbed(monkeypatch):
+    from ba2_common.core.failure_modes import absorb_if_benign
+    monkeypatch.setenv("BA2_ERROR_MODE", "legacy")
+    with pytest.raises(EstimatesUnavailable):
+        absorb_if_benign(EstimatesUnavailable("x"), EstimatesUnavailable)

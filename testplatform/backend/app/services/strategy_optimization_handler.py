@@ -1400,7 +1400,10 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     job-level summary can aggregate them. Same shape idea as ``dt_missing``."""
     af = (results or {}).get("analysis_failures")
     if af and af.get("passes"):
-        return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
+        out = {"passes": int(af["passes"]), "failed": int(af["failed"])}
+        if af.get("estimates_unavailable"):
+            out["eu"] = int(af["estimates_unavailable"])    # failed for want of an estimate, not in "failed"
+        return {"af": out}
     return {}
 
 
@@ -1447,8 +1450,12 @@ def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Di
     worst_af, worst_key = max(rows, key=lambda x: x[0]["failed"] / max(x[0]["passes"], 1))
     agg = {"trials": len(rows), "passes": passes, "failed": failed,
            "worst_share": round(worst_af["failed"] / max(worst_af["passes"], 1), 4), "worst_trial": worst_key}
+    eu = sum(a.get("eu", 0) for a, _ in rows)
+    if eu:
+        agg["estimates_unavailable"] = eu
     line = (f"[{opt_name}] analysis passes over {len(rows)} trial(s): {passes} total, {failed} failed "
-            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
+            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})"
+            + (f"; {eu} more failed for want of an estimate ({eu / passes:.2%})" if eu and passes else ""))
     (logger.warning if failed else logger.info)(line)
     return agg
 
