@@ -4278,6 +4278,13 @@ _OPTION_CAR_STRATEGIES = ((_PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"})
 # will ask for it.
 _CONVEX_FITNESS = "option_convex"
 
+# The LONG-HORIZON option-book fitness (owner-approved 2026-11-07, registered in
+# strategy_fitness.py). Built for mixed long books (stage-2 O_STYLE "long" styles holding
+# O_CBS / O_LEAP / O_PMCC / O_CONVEX), so a style holding a convex member needs NO
+# ``convex_fitness_waiver`` under it. Never a default for any kind; an O_CONVEX job still has to
+# name ``option_convex`` (the other refusals are unchanged).
+_LONG_FITNESS = "option_long"
+
 
 def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str) -> None:
     """Task 13 seam: O_CONVEX and every other strategy score under MUTUALLY EXCLUSIVE fitness
@@ -4300,12 +4307,13 @@ def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str)
     """
     is_convex_kind = strat_kind in _CONVEX_OPTION_STRATEGIES
     is_convex_fitness = fitness == _CONVEX_FITNESS
-    if strat_kind == _STYLE_KEY and not is_convex_fitness:
+    if strat_kind == _STYLE_KEY and not is_convex_fitness and fitness != _LONG_FITNESS:
         # A STYLE holding a convex member scores it under the style's (CAR-family) fitness,
         # the very metric that "teaches the GA to gut the convexity". Open question Q5: refused
         # until the style records who accepted that (``convex_fitness_waiver``). A style under
         # option_convex falls through to the O_CONVEX-only refusal below: the metric is tied to
-        # the one structure.
+        # the one structure. option_long (``_LONG_FITNESS``) was designed for mixed long books
+        # and passes without a waiver.
         style = _style_active(strat_kind)
         convex = [k for k in _style_member_keys(strat_kind) if k in _CONVEX_OPTION_STRATEGIES]
         if convex and "convex_fitness_waiver" not in style:
@@ -4358,6 +4366,9 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     ``option_convex`` (``_CONVEX_FITNESS``) is NOT a default for any kind: the convex-harvest
     grid names it explicitly, and the ``cli_fitness`` short-circuit above is what carries it.
     See ``_refuse_convex_fitness_mismatch`` for the Task-13 mutual-refusal seam.
+
+    ``option_long`` (``_LONG_FITNESS``, 2026-11-07) is likewise NOT a default for any kind; an
+    explicit ``--fitness option_long`` is carried by the ``cli_fitness`` short-circuit above.
 
     ``option_car_over_risk`` (2026-09-17, registered in ``strategy_fitness.py``) is likewise
     NOT a default for any kind, and deliberately so: it is the ~50%/yr-WITH-drawdown-tolerance
@@ -11510,7 +11521,14 @@ def main(argv: "list | None" = None) -> int:
                          "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
                          "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
                          "rate/concentration recorded not scored) -- never a default, name it "
-                         "explicitly, and never compare its scores with a CAR-family score.")
+                         "explicitly, and never compare its scores with a CAR-family score. "
+                         "'option_long' is the LONG-HORIZON option-book metric (LEAPS, call "
+                         "backspreads, PMCC, convex): end-of-window total return x a drawdown "
+                         "factor (free to 25%%, 0 at 60%%) x a negative-calendar-year factor "
+                         "(max(0.5, 1 + r) per losing year), breadth floor >=12 structures/yr "
+                         "AND >=10 underlyings -- never a default; accepted for O_STYLE "
+                         "with a convex member WITHOUT a convex_fitness_waiver; scores are NOT "
+                         "comparable with any CAR-family or option_convex score.")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
