@@ -23,6 +23,9 @@ import sys
 import time
 from typing import List
 
+#: 2 AV calls per symbol at <= 70 calls/minute (the premium plan allows 75).
+_SYMBOL_MIN_S = 2 * 60.0 / 70
+
 
 def _read_symbols(paths: List[str]) -> List[str]:
     out: List[str] = []
@@ -57,6 +60,14 @@ def main(argv=None) -> int:
     ok, empty, failed = [], [], {}
     t0 = time.time()
     for i, sym in enumerate(symbols, 1):
+        # A symbol AV has no estimates for fails on its first call, before the provider's inter-call gap, so
+        # unpaced no-data symbols fire back to back and trip the per-minute limit. Pace every symbol as if it
+        # made both calls.
+        if i > 1:
+            wait = _SYMBOL_MIN_S - (time.monotonic() - sym_t0)
+            if wait > 0:
+                time.sleep(wait)
+        sym_t0 = time.monotonic()
         try:
             # The disk cache is written only under the TTL freeze (the prewarm/backtest layer); outside it
             # fmp_history_disk_cached is the live pass-through and persists nothing.
