@@ -193,7 +193,8 @@ def legacy_universe_note(bt_block: Dict[str, Any], hoisted: Dict[str, Any], deco
 
 def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
                                     recompute_universe: bool = False,
-                                    estimates_source: Any = None) -> Dict[str, Any]:
+                                    estimates_source: Any = None,
+                                    exclude_symbols: Any = None) -> Dict[str, Any]:
     """Rebuild an opt-derived row's run config.
 
     Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
@@ -264,6 +265,14 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
             raise ValueError(f"--recompute-universe: backtest {bt.id} is not a screener-based row "
                              f"(optimization #{opt.id} has no screener_opt block)")
         bt_block = recompute_static_universe(bt_block, opt.parameter_ranges, row_id=bt.id)
+
+    if exclude_symbols:
+        drop = {str(x).upper() for x in exclude_symbols}
+        bt_block["enabled_instruments"] = [x for x in bt_block.get("enabled_instruments") or []
+                                           if str(x).upper() not in drop]
+        if not bt_block["enabled_instruments"]:
+            raise ValueError(f"exclude_symbols {sorted(drop)} leaves backtest {bt.id} with an empty universe")
+        bt_block["excluded_instruments"] = sorted(set(bt_block.get("excluded_instruments") or []) | drop)
 
     decoded = decode_params(strat, _gene_params(bt.strategy_params))
     # hoisted applies the screener (genes + store) exactly as the GA did; None for non-screener opts.
@@ -357,7 +366,7 @@ def _stamp_estimates_source(block: Dict[str, Any], stored: Any, override: Any) -
 
 def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None,
                               recompute_universe: bool = False,
-                              estimates_source: Any = None) -> Dict[str, Any]:
+                              estimates_source: Any = None, exclude_symbols: Any = None) -> Dict[str, Any]:
     """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
 
     This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
@@ -372,6 +381,10 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
 
     ``estimates_source``: re-measure the row on another estimates source (fmp|alphavantage). Omitted, the
     row's stored source is used, and a row stored before runs named one ran on fmp (LEGACY_ESTIMATES_SOURCE).
+
+    ``exclude_symbols`` (optimization-derived rows): removed from the static universe and recorded on the
+    run's ``excluded_instruments``, as the launcher's ``--exclude-symbols`` does (e.g. a symbol whose cache
+    became unusable since the row ran). Never applied silently: the caller states it.
     """
     if bt.engine_type != "daily_expert":
         raise ValueError(
@@ -382,12 +395,16 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
         raise ValueError("window override is only supported for optimization-derived rows")
     if recompute_universe and not bt.optimization_id:
         raise ValueError("--recompute-universe is only supported for optimization-derived rows")
+    if exclude_symbols and not bt.optimization_id:
+        raise ValueError("exclude_symbols is only supported for optimization-derived rows")
     if bt.optimization_id:
         if db is not None:
-            return _build_optimization_rerun_config(db, bt, window, recompute_universe, estimates_source)
+            return _build_optimization_rerun_config(db, bt, window, recompute_universe, estimates_source,
+                                                    exclude_symbols)
         session = SessionLocal()
         try:
-            return _build_optimization_rerun_config(session, bt, window, recompute_universe, estimates_source)
+            return _build_optimization_rerun_config(session, bt, window, recompute_universe, estimates_source,
+                                                    exclude_symbols)
         finally:
             session.close()
     return _build_standalone_rerun_config(bt, estimates_source)

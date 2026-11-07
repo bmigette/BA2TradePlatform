@@ -90,11 +90,15 @@ def load_split_calendar(symbol: str) -> List[Tuple[date, float]]:
     """``[(ex_date, ratio)]`` of ``symbol`` (4-for-1 -> 4.0), through the hermetic cache."""
     from ba2_providers import symbol_info
     sym = symbol.upper()
-    api_key = get_app_setting("FMP_API_KEY")
-    if not api_key:
-        raise ValueError("FMP API key not configured (needed for the split calendar of the estimates basis)")
+    def _fetch():
+        # The key is needed only for a fetch: a backtest reads the cache (a GA worker may hold no key).
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            raise ValueError("FMP API key not configured (needed for the split calendar of the estimates basis)")
+        return symbol_info.fetch_splits(api_key, sym)
+
     payload = fmp_history_disk_cached(
-        SPLIT_CALENDAR_NAMESPACE, sym, lambda: symbol_info.fetch_splits(api_key, sym),
+        SPLIT_CALENDAR_NAMESPACE, sym, _fetch,
         max_age_days=SPLIT_CALENDAR_MAX_AGE_DAYS, retain=False)
     if f"{SPLIT_CALENDAR_NAMESPACE}/{sym}" in hermetic_miss_symbols():
         raise SplitCalendarMissing(
@@ -108,8 +112,8 @@ class AlphaVantageEstimatesProvider:
     """``get_quarterly_eps_consensus`` / ``get_earnings_estimates`` from Alpha Vantage, point in time."""
 
     def __init__(self, source: str = "ba2_estimates"):
-        if not get_app_setting("alpha_vantage_api_key"):
-            raise ValueError("Alpha Vantage API key not configured. Set 'alpha_vantage_api_key' in app settings.")
+        # No key check here: a backtest reads only the cache (a GA worker has no AV key), and a live fetch
+        # refuses without one in alpha_vantage_common.get_api_key, loudly, at the call that needs it.
         self.source = source
 
     def get_provider_name(self) -> str:

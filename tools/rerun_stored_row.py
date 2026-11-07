@@ -85,6 +85,20 @@ def apply_expert_overrides(config, overrides):
     return previous
 
 
+def basis_refused_symbols(config):
+    """Symbols of ``config``'s universe the intraday/daily basis preflight would refuse (mismatched or stale)."""
+    import os as _os
+    from app.services.backtest import intraday_basis_preflight as pf
+    from ba2_providers.ohlcv import cross_interval_basis as cib
+    interval = pf.interval_to_check(config)
+    if interval is None:
+        return []
+    lo, hi = cib.judged_window(config["start_date"], config["end_date"], int(config["warmup_days"]))
+    rep = pf.scan(config["enabled_instruments"], interval, lo, hi,
+                  workers=max(1, min(8, (_os.cpu_count() or 2) - 1)), job_kind=pf.job_kind_of(config))
+    return sorted({r.symbol for r in rep.mismatched} | {s for s, _ in rep.stale})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("backtest_id", type=int)
@@ -109,6 +123,19 @@ def main() -> int:
     ap.add_argument("--estimates-source", choices=("fmp", "alphavantage"),
                     help="re-measure on this estimates source; default: the row's own (fmp for a row stored "
                          "before runs named one)")
+    ap.add_argument("--ohlcv-history-source", choices=("fmp", "alpaca"),
+                    help="re-measure on this OHLCV history; default: the row's own (fmp for a row stored "
+                         "before the Alpaca switch of 2026-10-22)")
+    ap.add_argument("--exclude-symbols", metavar="A,B",
+                    help="remove these symbols from the row's universe for this re-run (recorded in the output), "
+                         "e.g. a symbol the intraday-basis preflight refuses since the row ran")
+    ap.add_argument("--exclude-basis-refused", action="store_true",
+                    help="scan the universe with the intraday/daily basis preflight first and exclude every "
+                         "symbol it would refuse (mismatched or stale), listing them; for re-measuring an old row "
+                         "whose cache has since been found defective. The excluded list is in the output.")
+    ap.add_argument("--source-db", metavar="SQLITE",
+                    help="read the row, its optimization and strategy from THIS test-platform DB (e.g. an "
+                         "unzipped backup) instead of the configured one; opened read-only, nothing is written")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override an EXPERT setting for this re-run (JSON value, else a string), e.g. "
                          "--set model_target_method=consensus. Repeatable. Still writes no row.")
@@ -124,7 +151,18 @@ def main() -> int:
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
     from app.services.backtest.rerun_handler import rebuild_config_for_backtest
 
-    db = SessionLocal()
+    if ns.source_db:
+        from pathlib import Path as _P
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        src = _P(ns.source_db).resolve()
+        if not src.is_file():
+            ap.error(f"--source-db {src} does not exist")
+        _engine = create_engine(f"sqlite:///file:{src.as_posix()}?mode=ro&uri=true")
+        db = sessionmaker(bind=_engine)()
+        print(f"source DB (read-only): {src}", flush=True)
+    else:
+        db = SessionLocal()
     try:
         bt = db.query(Backtest).filter(Backtest.id == ns.backtest_id).first()
         if bt is None:
@@ -132,9 +170,24 @@ def main() -> int:
             return 1
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
+        if ns.exclude_basis_refused:
+            probe = rebuild_config_for_backtest(bt, db, window=ns.window,
+                                                recompute_universe=ns.recompute_universe,
+                                                estimates_source=ns.estimates_source)
+            refused = basis_refused_symbols(probe)
+            if refused:
+                print(f"basis preflight: excluding {len(refused)} refused symbols: {', '.join(refused)}",
+                      flush=True)
+                ns.exclude_symbols = ",".join(
+                    sorted({*refused, *[x.strip() for x in (ns.exclude_symbols or '').split(',') if x.strip()]}))
         config = rebuild_config_for_backtest(bt, db, window=ns.window,
                                              recompute_universe=ns.recompute_universe,
-                                             estimates_source=ns.estimates_source)
+                                             estimates_source=ns.estimates_source,
+                                             exclude_symbols=[x.strip() for x in (ns.exclude_symbols or "").split(",")
+                                                              if x.strip()])
+        if ns.ohlcv_history_source:
+            from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
+            config[OHLCV_HISTORY_SOURCE_KEY] = ns.ohlcv_history_source
         if ns.set:
             if not config.get("experts"):
                 print("--set: the rebuilt config has no experts block")
@@ -158,7 +211,8 @@ def main() -> int:
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
     print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
           flush=True)
-    print(f"estimates source {config.get('estimates_source')}", flush=True)
+    print(f"estimates source {config.get('estimates_source')}, OHLCV history "
+          f"{config.get('ohlcv_history_source', 'fmp (legacy)')}", flush=True)
     if ns.set:
         print(f"expert setting overrides {ns.set}  (row's own: {previous})", flush=True)
     _note = config.get("screener_universe_legacy_note")
@@ -203,6 +257,8 @@ def main() -> int:
         Path(ns.out).write_text(json.dumps(
             {"row": ns.backtest_id, "name": name, "window": ns.window or stored_window,
              "estimates_source": config.get("estimates_source"), "overrides": ns.set,
+             "ohlcv_history_source": config.get("ohlcv_history_source"), "source_db": ns.source_db,
+             "excluded_symbols": ns.exclude_symbols,
              "decision_time": ns.decision_time, "stored_times": stored_times,
              "stored": stored, "stored_window": stored_window, "rerun": got,
              "preload_symbols": results.get("symbol_count"),

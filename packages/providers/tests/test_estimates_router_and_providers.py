@@ -280,3 +280,17 @@ def test_job_name_carries_the_source_once():
 def test_registry_has_the_estimates_category():
     from ba2_providers import ESTIMATES_PROVIDERS
     assert set(ESTIMATES_PROVIDERS) == set(es.ESTIMATES_SOURCES)
+
+
+
+def test_a_backtest_needs_no_api_key(monkeypatch):
+    """A GA worker holds neither the AV nor (necessarily) the FMP key: cache reads must not ask for them."""
+    monkeypatch.setattr(av_mod, "get_app_setting", lambda key, default=None: None)
+    monkeypatch.setattr(av_mod, "make_api_request", lambda *a, **k: pytest.fail("network used"))
+    fmp_common._HISTORY_MEM_CACHE._store.clear()
+    fmp_common.reset_hermetic_misses()
+    _write(av_mod.AV_CONSENSUS_NAMESPACE, "MSFT", _av_payload())
+    _write(av_mod.SPLIT_CALENDAR_NAMESPACE, "MSFT", {"symbol": "MSFT", "historical": []})
+    with fmp_common.frozen_ttl_cache(), fmp_common.hermetic_fmp_history():
+        out = av_mod.AlphaVantageEstimatesProvider().get_quarterly_eps_consensus("MSFT", PAST)
+    assert out["quarters"]
