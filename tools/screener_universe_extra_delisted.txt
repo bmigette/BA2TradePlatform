@@ -1,0 +1,17 @@
+# Delisted US common stocks that no automatic source of tools/build_screener_universe.py lists (no merger or
+# worthless-removal corporate action, absent from Alpaca's inactive-asset list). Each line is a CANDIDATE:
+# the build still demands Alpaca daily bars ending inside the span, an FMP profile that is not an ETF/fund and not
+# actively trading, and rejects renames and reused tickers. Add a name only with its evidence in the comment.
+SIVB   # SVB Financial, closed 2023-03-10
+FRC    # First Republic Bank, seized 2023-05-01
+SBNY   # Signature Bank, closed 2023-03-12
+SI     # Silvergate Capital, liquidation 2023
+BBBY   # Bed Bath & Beyond, bankruptcy 2023-04
+RAD    # Rite Aid, bankruptcy 2023-10
+TUP    # Tupperware, bankruptcy 2024-09
+PRTY   # Party City, bankruptcy 2023-2024
+WISH   # ContextLogic, 2024 asset sale
+FSR    # Fisker, bankruptcy 2024-06
+NKLA   # Nikola, bankruptcy 2025-02
+RIDE   # Lordstown Motors, bankruptcy 2023-06
+LAZR   # Luminar, bankruptcy 2025-12

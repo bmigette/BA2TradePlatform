@@ -43,9 +43,11 @@ from ba2_common.core.ohlcv_history_stamp import stamp_history_source
 from ba2_providers.screener import live_sim as ls
 
 #: Bump when the BUILD logic changes what the panel contains for the same inputs (it is part of the panel fingerprint).
+#: 4: a symbol whose bars stopped and that the vendor no longer lists (``delisted_symbols``) is masked from the morning
+#:    after its last session, like an acknowledged delisting (before: its last close lingered in live's 35-day window).
 #: 3: manifest records stale_listed_last_bar (the stale-listed refusal is judged against the job window).
 #: 2: shares in RAW (as-traded) basis everywhere, split factors, coverage lists.
-BUILD_REV = 3
+BUILD_REV = 4
 SHARES_ALL_URL = "https://financialmodelingprep.com/api/v4/shares_float/all"
 SHARES_HIST_URL = "https://financialmodelingprep.com/api/v4/historical/shares_float"
 
@@ -742,6 +744,18 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
                                       "listed_by_vendor": sy in listing})
         log(f"daily panel: ACKNOWLEDGED DELISTING (reviewed list) {sy}: history kept through {lbar}, never selected after "
             f"[{e['reason']}; {e['added']}, {e['reviewed_by']}]")
+    # UNACKNOWLEDGED DELISTINGS (bars stopped, not in the vendor's current listing): the vendor lists only actively traded
+    # names, so live drops such a symbol the day it stops trading; mask it the same way instead of letting its last close
+    # linger as a candidate for the 35-day window (the engine would then refuse every entry in it anyway).
+    auto_masked = {}
+    for sy in delisted:
+        if sy in ackd or sy in excl:
+            continue
+        lbar = date.fromordinal(int(bar_ord[sy][-1])).isoformat()
+        mask_after_last_session(arrays, sessions, symbols.index(sy), lbar)
+        auto_masked[sy] = lbar
+    if auto_masked:
+        log(f"daily panel: {len(auto_masked)} delisted symbols (stale bars, not in the vendor listing) masked after their last session")
     ackd_unneeded = [sy for sy in ackd if sy in set(symbols) and sy not in bar_ord]
     for sy in stale_listed:
         log(f"daily panel: RECORDED stale-listed {sy}: last bar {date.fromordinal(int(bar_ord[sy][-1])).isoformat()} (listed by the vendor; "
@@ -755,6 +769,7 @@ def build_daily_panel(cache_folder: str, symbols: List[str], first_day: str, end
                 "stale_listed_count": len(stale_listed),
                 "excluded_unusable": excluded_unusable, "acknowledged_delisted": acknowledged_delisted,
                 "acknowledged_delisted_not_needed": ackd_unneeded, "exclusions_not_needed": unneeded, "delisted_symbols": delisted, "delisted_symbols_count": len(delisted),
+                "delisted_masked_after_last_session": auto_masked,
                 "acknowledged_stale": sorted(ack), "split_report": split_rep,
                 "splits_unknown": split_rep["splits_unknown"], "shares_missing_listed": shares_missing_listed,
                 "shares_lag_days": lag_days, "shares_vendor_snapshot": srep["snapshot"],
