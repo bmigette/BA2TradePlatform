@@ -331,8 +331,16 @@ def test_backtest_gather_refuses_estimate_based_methods(method):
     e = _expert()
     e._gather_expected_profit_mode = "model"
     e._gather_model_target_method = method
+    from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+
+    class _Refusing(FakeDetailsWithEstimates):      # what the hermetic FMP provider does
+        def get_earnings_estimates(self, symbol, frequency, as_of_date, lookback_periods, format_type, **kw):
+            refuse_if_not_point_in_time(as_of_date, hermetic=True, what="fake FMP")
+
+    refusing = _Refusing()
+    provider = lambda c, n, **k: {"fundamentals_details": refusing, "ohlcv": FakeOHLCV()}[c]  # noqa: E731
     with pytest.raises(EstimatesNotPointInTime):
-        e._gather(LiveProviderBundle(_model_provider()), as_of=NOW)
+        e._gather(LiveProviderBundle(provider), as_of=NOW)
 
 
 def test_gather_does_not_fetch_estimator_inputs_when_mode_is_not_model():

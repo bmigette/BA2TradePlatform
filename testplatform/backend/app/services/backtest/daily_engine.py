@@ -55,6 +55,7 @@ from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_we
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.suspension_events import is_suspended
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.trade_cycle import (
@@ -210,8 +211,8 @@ class _BacktestProviderBundle(LiveProviderBundle):
     close of the latest bar that has ENDED at the decision instant. On a daily clock it is the inherited read, unchanged.
     """
 
-    def __init__(self, get_provider: Callable[..., Any], price_source: Any):
-        super().__init__(get_provider)
+    def __init__(self, get_provider: Callable[..., Any], price_source: Any, estimates_source: str):
+        super().__init__(get_provider, estimates_source=estimates_source)
         self._price_source = price_source
 
     def price_at_date(self, symbol: str, as_of: Optional[datetime]) -> Optional[float]:
@@ -2488,6 +2489,7 @@ class DailyBacktestEngine:
             bundle = _BacktestProviderBundle(
                 lambda category, name, **kw: _get_provider(category, name, **kw),
                 self.price,
+                _estimates_source_mod.resolve_job_estimates_source(self.config),   # the run's explicit estimates source; no default
             )
             self._bundle_cache = bundle
         return bundle

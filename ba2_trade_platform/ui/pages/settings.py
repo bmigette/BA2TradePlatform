@@ -875,6 +875,7 @@ class AppSettingsTab:
         'worker_count': 'worker_count_input',
         'account_refresh_interval': 'account_refresh_interval_input',
         'scheduled_session_guard_enabled': 'session_guard_input',
+        'data_provider_estimates': 'estimates_provider_input',
     }
 
     def _shown_value(self, key: str):
@@ -1006,6 +1007,10 @@ class AppSettingsTab:
             self.finnhub_input = _secret_input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key')).classes('w-full')
             self.fred_input = _secret_input(label='FRED API Key', value=self._shown_value('fred_api_key')).classes('w-full')
             self.alpha_vantage_input = _secret_input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key')).classes('w-full')
+            self.estimates_provider_input = ui.select(
+                APP_SETTINGS_DEFINITIONS['data_provider_estimates']['choices'],
+                label='Analyst estimates provider (live)',
+                value=self._shown_value('data_provider_estimates')).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
                 self.fmp_input = _secret_input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY')).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')

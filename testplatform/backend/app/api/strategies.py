@@ -658,6 +658,12 @@ def _stamp_new_optimization_source(cfg: dict, strategy_id: int, db: Session) -> 
             where="optimization create")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Where the analyst estimates come from: stated by the caller, no default (HTTP 400).
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, resolve_job_estimates_source
+    try:
+        bt[ESTIMATES_SOURCE_KEY] = resolve_job_estimates_source(bt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"optimization create: {e}")
     out["backtest"] = bt
     return out
 

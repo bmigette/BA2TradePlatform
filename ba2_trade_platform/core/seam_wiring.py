@@ -73,10 +73,22 @@ from __future__ import annotations
 
 import threading
 
+
 from ..logger import logger
 
 _wired = False
 _lock = threading.Lock()
+
+
+def live_estimates_source_from_settings() -> str:
+    """The live estimates source: the stored ``data_provider_estimates`` app setting, else its DECLARED default."""
+    from ba2_common.config import get_app_setting
+    from ba2_common.core.estimates_source import ESTIMATES_SETTING_KEY
+
+    from .app_settings import app_setting_default
+    stored = get_app_setting(ESTIMATES_SETTING_KEY)
+    return stored if stored else app_setting_default(ESTIMATES_SETTING_KEY)
+
 
 
 def wire_all_seams() -> None:
@@ -129,6 +141,12 @@ def wire_all_seams() -> None:
         from . import account_history
 
         set_live_history_resolver(account_history.history_spec_for_expert)
+
+        # 4c) Which provider answers the ESTIMATE methods of fundamentals_details() live: the app setting
+        #     data_provider_estimates (declared default fmp). A backtest names its own source instead.
+        from ba2_common.core.estimates_source import set_live_estimates_source_resolver
+
+        set_live_estimates_source_resolver(live_estimates_source_from_settings)
         _rm_module.set_indicator_provider_resolver(account_history.indicator_provider_for_expert)
 
         # 5) Instrument auto-adder hook (Penny screening queues symbols via ba2_experts).

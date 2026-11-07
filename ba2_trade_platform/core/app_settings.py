@@ -43,6 +43,13 @@ APP_SETTINGS_DEFINITIONS: Dict[str, Dict[str, Any]] = {
                               "description": "Alpha Vantage API Key"},
     "FMP_API_KEY": {"type": "str", "required": False,
                     "description": "Financial Modeling Prep (FMP) API Key"},
+    # Which provider answers the ESTIMATE methods of fundamentals_details() live (and in a replay of live).
+    # fmp = today's consensus from FMP; alphavantage = the point-in-time quarterly consensus (needs the
+    # Alpha Vantage key; free tier 25 calls/day). A backtest names its own source (--estimates-source).
+    # The pattern data_provider_<kind> is reserved for later kinds (earnings, statements, insider).
+    "data_provider_estimates": {"type": "str", "required": False, "default": "fmp",
+                                "choices": ["fmp", "alphavantage"],
+                                "description": "Analyst-estimates data provider"},
     # Broker API keys
     "alpaca_api_key": {"type": "str", "required": False, "description": "Alpaca API Key"},
     "alpaca_api_secret": {"type": "str", "required": False, "description": "Alpaca API Secret"},

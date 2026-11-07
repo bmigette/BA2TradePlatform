@@ -129,6 +129,7 @@ class NamespaceFetchers:
             "earnings_estimates_quarterly": self._earnings_estimates,
             "insider_v2": self._insider_transactions,
             "finnhub_reco_trends": self._finnhub_reco_trends,
+            AV_CONSENSUS_NAMESPACE: self._av_eps_consensus,
         }
 
     def namespaces(self) -> tuple:
@@ -197,6 +198,17 @@ class NamespaceFetchers:
             request.symbol, end_date=request.end_date, lookback_days=request.lookback_days,
             as_of=request.end_date, format_type="dict")
 
+    def _av_eps_consensus(self, request: NamespaceRequest):
+        """The Alpha Vantage point-in-time EPS consensus payload of one symbol (EARNINGS_ESTIMATES + EARNINGS,
+        2 calls) AND its split calendar (the basis of the values), through the same disk cache the backtest
+        reads hermetically. Warmed only when the run's estimates source is ``alphavantage``."""
+        from ba2_providers.fundamentals.estimates.AlphaVantageEstimatesProvider import (
+            load_av_consensus_payload, load_split_calendar,
+        )
+        payload = load_av_consensus_payload(request.symbol)
+        load_split_calendar(request.symbol)
+        return payload
+
     def _finnhub_reco_trends(self, request: NamespaceRequest):
         raise WarmFetchError(
             "finnhub_reco_trends is warmed by ba2-test prewarm (it needs the Finnhub key, "
@@ -208,6 +220,10 @@ class NamespaceFetchers:
 #: ``_warm_estimator_inputs`` and the replay dependency adapter cannot disagree about
 #: which two namespaces "model mode" means.
 ESTIMATOR_NAMESPACES = ("past_earnings_quarterly", "earnings_estimates_quarterly")
+
+#: The Alpha Vantage point-in-time consensus namespace (``AlphaVantageEstimatesProvider``): an ADDITIONAL
+#: warm for every estimate reader when the run's estimates source is ``alphavantage``.
+AV_CONSENSUS_NAMESPACE = "av_eps_consensus"
 
 
 class DefaultWarmFetcher:

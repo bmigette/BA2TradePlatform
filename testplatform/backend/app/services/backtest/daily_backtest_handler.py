@@ -29,6 +29,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, forced_expert_settings, member_hold_tags_fact)
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
 from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY, resolve_job_history_source
 from ba2_common.core.types import is_option_action
 
@@ -581,8 +583,13 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         {OHLCV_HISTORY_SOURCE_KEY: history_source},
         uses_options=uses_options or bool(options_cache_db), where="_build_config")
 
+    # WHERE the run's analyst estimates come from. No default: a run that does not name it refuses
+    # (estimates_source.py); the engine builds its provider bundle from this.
+    estimates_source = _estimates_source_mod.resolve_job_estimates_source(payload)
+
     return {
         OHLCV_HISTORY_SOURCE_KEY: history_source,
+        ESTIMATES_SOURCE_KEY: estimates_source,
         "backtest_id": payload["backtest_id"],
         "name": payload.get("name", f"daily-backtest-{payload['backtest_id']}"),
         "start_date": start_date,
@@ -1026,6 +1033,8 @@ def run_daily_backtest(
         # The OHLCV history this run reads, resolved ONCE (unstamped = the legacy fmp; an unknown
         # stamp refuses) and written back so every later reader of this config agrees.
         OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(config),
+        # Where the run's analyst estimates come from (named by the job, never defaulted).
+        ESTIMATES_SOURCE_KEY: _estimates_source_mod.resolve_job_estimates_source(config),
         # Per-day DYNAMIC screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); the
         # engine reads it (``self._screener_runtime``) to gate ENTRIES to the per-day screened

@@ -129,6 +129,41 @@ def add_history_source_flag(ap: Any) -> None:
                          "share a name, a skip-if-completed check or a checkpoint.")
 
 
+def add_estimates_source_flag(ap: Any) -> None:
+    """``--estimates-source`` on a GRID DRIVER's parser: REQUIRED (``estimates_source_of`` refuses when absent), no default (a job must name where its
+    analyst estimates come from; fmp has no revision history, alphavantage is point-in-time)."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCES
+    ap.add_argument("--estimates-source", choices=list(ESTIMATES_SOURCES), default=None,
+                    help="Analyst-estimates source of every job: forwarded to `ba2-test optimize` (stamped on the "
+                         "run config and its checkpoint fingerprint), part of the job NAME for alphavantage and "
+                         "of the digest (it is in the argv), so two sources never share a name or a checkpoint.")
+
+
+def estimates_source_of(args: Any, driver: str) -> "str | None":
+    """The driver's stated ``--estimates-source``; absent -> exit with a refusal (no default).
+
+    A ``--dry-run`` only PRINTS the plan and creates nothing: it may omit the flag (returns None, and the job
+    names / argv then carry no estimates token). A real run never gets None."""
+    from ba2_common.core import estimates_source as es
+    if getattr(args, "estimates_source", None) in (None, "") and getattr(args, "dry_run", False):
+        return None
+    try:
+        return es.require_stated_estimates_source(getattr(args, "estimates_source", None), driver)
+    except es.EstimatesSourceMissing as e:
+        raise SystemExit(f"{driver}: REFUSED: --estimates-source {{fmp,alphavantage}} is required ({e})")
+
+
+def estimates_source_tokens(source: "str | None") -> List[str]:
+    """``--estimates-source`` tokens for one job's argv (none for a dry run that did not state it)."""
+    return [] if source is None else ["--estimates-source", source]
+
+
+def with_estimates_source_name(name: str, source: str) -> str:
+    """``name`` with the estimates-source token for a non-fmp source (idempotent); fmp keeps the plain name."""
+    from ba2_common.core.estimates_source import check_estimates_source
+    return name if source is None or check_estimates_source(source) == "fmp" or "-estalphavantage" in name         else name + "-estalphavantage"
+
+
 def history_source_tokens(source: str) -> List[str]:
     """``--ohlcv-history-source`` tokens for one job's argv (always stated: a job's source is never implicit)."""
     return ["--ohlcv-history-source", source]

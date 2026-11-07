@@ -298,7 +298,8 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         skip_detail_fetch = False
         # LIVE-ONLY calendar shortcut (see module docstring). Backtest (as_of set) never enters
         # this branch, so grid/backtest results are byte-identical to before this change.
-        calendar_branch = as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider)
+        calendar_branch = as_of is None and isinstance(getattr(details_provider, "base_provider", details_provider),
+                                                      FMPCompanyDetailsProvider)
         # Which branch ran is a RECORDED FACT, not something a replay may infer
         # from which observations happen to be on the tape: inferring it would let
         # a missing calendar response silently reroute the replay down the

@@ -74,8 +74,12 @@ class LiveProviderBundle:
     provider's get_ohlcv_data (Decision 1: one price source for all experts)."""
 
     def __init__(self, get_provider: Callable[..., Any], ohlcv_name: str = LIVE_OHLCV_PROVIDER,
-                 ohlcv_kwargs: Optional[Dict[str, Any]] = None):
+                 ohlcv_kwargs: Optional[Dict[str, Any]] = None, estimates_source: Optional[str] = None):
+        """``estimates_source`` None = LIVE: the app setting ``data_provider_estimates`` (resolved lazily, once
+        per bundle, through ``estimates_source.live_estimates_source``). A backtest passes its run's explicit
+        source ('fmp' | 'alphavantage'), never None."""
         self._get = get_provider
+        self._estimates_source = estimates_source
         self._ohlcv_name = ohlcv_name
         self._ohlcv_kwargs = dict(ohlcv_kwargs) if ohlcv_kwargs else {}
         self._memo: Dict[str, Any] = {}
@@ -115,7 +119,19 @@ class LiveProviderBundle:
         return provider
 
     def ohlcv(self): return self._get("ohlcv", self._ohlcv_name, **self._ohlcv_kwargs)
-    def fundamentals_details(self): return self._once("fundamentals_details", "fmp")
+    def fundamentals_details(self):
+        """FMP for everything, except the estimate methods, which go to the configured estimates source
+        (``estimates_router``). One router per bundle (memoised), like every other provider here."""
+        router = self._memo.get("fundamentals_details/router")
+        if router is None:
+            from ba2_common.core.estimates_router import EstimatesRoutedDetails
+            from ba2_common.core.estimates_source import check_estimates_source, live_estimates_source
+            source = (live_estimates_source() if self._estimates_source is None
+                      else check_estimates_source(self._estimates_source))
+            base = self._once("fundamentals_details", "fmp")
+            estimates = base if source == "fmp" else self._once("estimates", source)
+            router = self._memo["fundamentals_details/router"] = EstimatesRoutedDetails(base, estimates, source)
+        return router
     def fundamentals_overview(self): return self._once("fundamentals_overview", "fmp")
     def insider(self): return self._once("insider", "fmp")
     def news(self): return self._once("news", "fmp")

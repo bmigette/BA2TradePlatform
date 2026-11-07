@@ -45,10 +45,13 @@ expert that opts into it.
 POINT-IN-TIME (2026-11-07). FMP's analyst-estimates endpoint has no history of revisions: a cached
 payload is ONE snapshot (the day it was warmed), so a backtest decision in 2021 reading it sees the
 FY2021/FY2022 estimates as they were LATER revised, i.e. close to the reported actuals. "forward" and
-"trailing" both read those estimates and are therefore REFUSED in a backtest
-(``EstimatesNotPointInTime`` when ``as_of`` is set); live (as_of=None) they read today's estimates,
-which is correct. The GA uses the knowable methods instead, built only from REPORTED quarterly EPS
-whose announcement was public at the decision:
+"trailing" both read those estimates. The REFUSAL now lives in the provider, not here:
+``FMPCompanyDetailsProvider.get_earnings_estimates`` raises ``EstimatesNotPointInTime``
+(``ba2_common.core.estimates_pit``) for a historical ``as_of`` inside a hermetic backtest, and live
+(as_of=None) reads today's estimates, which is correct. The Alpha Vantage source is point-in-time but
+QUARTERLY; "forward"/"trailing" need the ANNUAL FY1/FY2 rows, so with it they raise
+``EstimatesGranularityError`` rather than compare quarters as if they were years. The GA uses the
+knowable methods, built only from REPORTED quarterly EPS whose announcement was public at the decision:
 
   method="reported":    anchor_EPS = TTM (last 4 reported quarters), growth = TTM / prior TTM.
   method="reported_2y": same anchor, growth = (TTM / TTM two years earlier) ** 0.5 (smoother).
@@ -70,11 +73,11 @@ Callers that need tighter accuracy than ~20% on ~70% of names should not lean on
 """
 from __future__ import annotations
 
-import threading
-from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
+# Re-exported: the typed refusal and the replay permission moved to the provider layer.
+from ba2_common.core.estimates_pit import EstimatesNotPointInTime, estimate_snapshot_allowed  # noqa: F401
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.replay import ReplayMiss, replay_now
 from ba2_common.logger import logger
@@ -107,27 +110,8 @@ MIN_REPORTED_GROWTH = 0.25
 MAX_REPORTED_GROWTH = 4.0
 
 
-class EstimatesNotPointInTime(RuntimeError):
-    """A backtest asked for an estimate-based method. FMP's estimates are one snapshot of today's
-    revisions, so the result would read the future; use a POINT_IN_TIME_METHODS method."""
-
-
-_snapshot_permission = threading.local()
-
-
-@contextmanager
-def estimate_snapshot_allowed() -> Iterator[None]:
-    """HISTORICAL REPLAY ONLY: let an estimate-based method read the snapshot with ``as_of`` set.
-
-    The replay rebuilds a recorded LIVE analysis to compare it field by field, and labels any
-    estimates input "revision unknown" itself; it is not a trading decision. A backtest must never
-    enter this. Per-thread, restores the previous state on exit."""
-    previous = getattr(_snapshot_permission, "allowed", False)
-    _snapshot_permission.allowed = True
-    try:
-        yield
-    finally:
-        _snapshot_permission.allowed = previous
+class EstimatesGranularityError(RuntimeError):
+    """A method that needs ANNUAL estimates (forward/trailing) was given a source of QUARTERLY ones."""
 
 
 def _knowable_rows(rows: List[dict], ref: datetime) -> List[dict]:
@@ -164,11 +148,6 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
     if method not in VALID_METHODS:
         raise ValueError(f"method must be one of {VALID_METHODS}, got {method!r}")
     point_in_time = method in POINT_IN_TIME_METHODS
-    if as_of is not None and not point_in_time and not getattr(_snapshot_permission, "allowed", False):
-        raise EstimatesNotPointInTime(
-            f"price-target method {method!r} reads FMP estimates, which are one snapshot of today's "
-            f"revisions: a backtest at {as_of:%Y-%m-%d} would see the future. Use one of "
-            f"{POINT_IN_TIME_METHODS}.")
     ref = replay_now(as_of)
     det = providers.fundamentals_details()
     # One spare row: a same-day 'amc' report is dropped below and must not shorten the history.
@@ -193,6 +172,7 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
     if point_in_time:
         return {"earnings": earnings, "estimates": []}
 
+    est = None
     try:
         # "quarterly" is the CACHE NAMESPACE, not a request for quarterly rows -- FMP's
         # analyst-estimates endpoint always returns ANNUAL rows regardless of what's asked for,
@@ -204,14 +184,18 @@ def fetch_estimator_inputs(providers: Any, symbol: str,
         est = det.get_earnings_estimates(symbol=symbol, frequency="quarterly", as_of_date=ref,
                                          lookback_periods=2, format_type="dict")
         estimates = est.get("estimates", []) if isinstance(est, dict) else []
-    except ReplayMiss:
-        raise                       # see the earnings fetch above
+    except (ReplayMiss, EstimatesNotPointInTime):
+        raise                       # see the earnings fetch above; a non-point-in-time read must be loud
     except Exception as e:  # noqa: BLE001 - hermetic/defect errors re-raise via absorb_if_benign
         absorb_if_benign(e)
         logger.warning("analyst_target_model: earnings-estimates fetch failed for %s: %s",
                        symbol, e)
         estimates = []
 
+    if isinstance(est, dict) and est.get("frequency") == "quarterly" and est.get("source") == "alphavantage":
+        raise EstimatesGranularityError(
+            f"method {method!r} compares the next two FISCAL YEARS' EPS, but the alphavantage estimates "
+            f"source returns quarters; use method 'reported' or 'reported_2y', or --estimates-source fmp live.")
     return {"earnings": earnings, "estimates": estimates}
 
 
