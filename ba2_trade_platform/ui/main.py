@@ -1,5 +1,5 @@
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools, portfolio_allocation
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools, portfolio_allocation, style_view
 from .layout import layout_render
 from ..api.app import register_management_api
 from pathlib import Path
@@ -82,6 +82,12 @@ def market_analysis_detail_page(analysis_id: int) -> None:
     logger.debug(f"[ROUTE] /market_analysis/{analysis_id} - Loading market analysis detail page")
     with layout_render(f'Market Analysis Detail'):
         market_analysis_detail.content(analysis_id)
+
+@ui.page('/style/{instance_id}')
+def style_view_page(instance_id: int) -> None:
+    logger.debug(f"[ROUTE] /style/{instance_id} - Loading O_STYLE view")
+    with layout_render(f'Style View - Expert {instance_id}'):
+        style_view.content(instance_id)
 
 @ui.page('/rulesettest')
 def rulesettest_page() -> None:
