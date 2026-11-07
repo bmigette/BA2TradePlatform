@@ -367,13 +367,13 @@ def _build_fmp_rating():
     # PROVE no-lookahead: if the as_of filter leaked, the reconstruction (and the
     # decision) would change.
     price_target_history = [
-        {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-        {"publishedDate": "2026-06-09", "priceTarget": 124.0},
-        {"publishedDate": "2026-06-08", "priceTarget": 128.0},
-        {"publishedDate": "2026-06-07", "priceTarget": 128.0},
-        {"publishedDate": "2026-06-06", "priceTarget": 160.0},
+        {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},
+        {"publishedDate": "2026-06-09", "priceTarget": 124.0, "adjPriceTarget": 124.0},
+        {"publishedDate": "2026-06-08", "priceTarget": 128.0, "adjPriceTarget": 128.0},
+        {"publishedDate": "2026-06-07", "priceTarget": 128.0, "adjPriceTarget": 128.0},
+        {"publishedDate": "2026-06-06", "priceTarget": 160.0, "adjPriceTarget": 160.0},
         # FUTURE row (after NOW) — must be ignored (no-lookahead).
-        {"publishedDate": "2026-07-01", "priceTarget": 9999.0},
+        {"publishedDate": "2026-07-01", "priceTarget": 9999.0, "adjPriceTarget": 9999.0},
     ]
     grades_history = [
         {"date": "2026-06-10", "analystRatingsStrongBuy": 10, "analystRatingsbuy": 5,

@@ -1411,3 +1411,14 @@ def test_the_LIVE_persist_site_hand_spells_no_stamp_key_either_STRUCTURAL():
                     f"{fn} spells the stamp key {literal} by hand; import the constant "
                     f"from ba2_common.core.earnings_stamp instead -- a rename on the "
                     f"reader side would not reach this spelling")
+
+
+def test_split_events_caps_the_window_at_the_announce_horizon():
+    """A wider earnings_days_look must not reveal a report date not yet announced."""
+    from ba2_common.core.knowability import EARNINGS_ANNOUNCE_HORIZON_DAYS
+    from ba2_experts.FMPEarningsEvent import _split_events
+    from datetime import date, timedelta
+    day = date(2024, 4, 5)
+    far = (day + timedelta(days=EARNINGS_ANNOUNCE_HORIZON_DAYS + 20)).isoformat()
+    upcoming, _ = _split_events([{"report_date": far}], day.isoformat(), 90)
+    assert upcoming is None

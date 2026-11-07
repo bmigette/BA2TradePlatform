@@ -26,6 +26,7 @@ from ba2_common.core.portfolio_allocation import PositionFetchFailed
 # The earnings-event STAMP CONTRACT (design 2026-08-31 leaps-grid S9): the key paths the
 # ranking expert writes and the two O_ERN timing conditions below read back. Shared with
 # TradeActions, which stamps the event date onto the entry order at submit.
+from ba2_common.core.knowability import EARNINGS_ANNOUNCE_HORIZON_DAYS
 from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
@@ -3103,10 +3104,12 @@ class DaysToEarningsCondition(CompareCondition):
     stays the answer for UNCHAINED uses: any expert, no stamp required.
     """
 
-    #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
-    #: one quarter (so a delayed print is still found) and bounded, so a stale calendar
-    #: cannot hand back a date from the far future as if it were the next one.
-    EARNINGS_HORIZON_DAYS = 200
+    #: How far past the evaluation bar a scheduled report date is VISIBLE: the knowability
+    #: horizon (``knowability.EARNINGS_ANNOUNCE_HORIZON_DAYS``, 30 days). The cached calendar
+    #: holds the realized date of every future print, but companies announce a date only
+    #: ~2-6 weeks ahead, so reading further would give a backtest dates live cannot know.
+    #: Beyond it the condition sees "no scheduled report". Same reader live and in backtest.
+    EARNINGS_HORIZON_DAYS = EARNINGS_ANNOUNCE_HORIZON_DAYS
     #: Calendar rows to pull. The provider returns rows <= end_date newest-first, so this
     #: only needs to span [bar, bar + horizon] plus a little history.
     EARNINGS_CALENDAR_PERIODS = 8
@@ -3145,7 +3148,7 @@ class DaysToEarningsCondition(CompareCondition):
             # The gate is about the EVENT, so the announcement wins when both are present.
             d = self._parse_day(row.get("report_date")) or \
                 self._parse_day(row.get("fiscal_date_ending"))
-            if d is not None and d >= as_of:
+            if d is not None and as_of <= d <= as_of + timedelta(days=self.EARNINGS_HORIZON_DAYS):
                 upcoming.append(d)
         return min(upcoming) if upcoming else None
 

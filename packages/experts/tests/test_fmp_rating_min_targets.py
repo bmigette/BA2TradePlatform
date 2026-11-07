@@ -46,11 +46,11 @@ def _expert():
 # --------------------------------------------------------------------------- #
 def test_count_targets_in_window_filters_window_and_nulls():
     history = [
-        {"publishedDate": "2026-06-10", "priceTarget": 110.0},   # in window
-        {"publishedDate": "2026-06-01", "priceTarget": 150.0},   # in window
-        {"publishedDate": "2026-01-01", "priceTarget": 140.0},   # > 90d before -> out
-        {"publishedDate": "2026-12-31", "priceTarget": 99.0},    # future -> out
-        {"publishedDate": "2026-06-05", "priceTarget": None},    # null target -> out
+        {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},   # in window
+        {"publishedDate": "2026-06-01", "priceTarget": 150.0, "adjPriceTarget": 150.0},   # in window
+        {"publishedDate": "2026-01-01", "priceTarget": 140.0, "adjPriceTarget": 140.0},   # > 90d before -> out
+        {"publishedDate": "2026-12-31", "priceTarget": 99.0, "adjPriceTarget": 99.0},    # future -> out
+        {"publishedDate": "2026-06-05", "priceTarget": None, "adjPriceTarget": None},    # null target -> out
     ]
     assert FMPRating._count_targets_in_window(history, NOW, 90) == 2
     assert FMPRating._count_targets_in_window([], NOW, 90) == 0
@@ -62,15 +62,15 @@ def test_count_targets_in_window_filters_window_and_nulls():
 # --------------------------------------------------------------------------- #
 def test_consensus_target_as_of_surfaces_count():
     history = [
-        {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-        {"publishedDate": "2026-06-05", "priceTarget": 150.0},
-        {"publishedDate": "2026-06-01", "priceTarget": 130.0},
+        {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},
+        {"publishedDate": "2026-06-05", "priceTarget": 150.0, "adjPriceTarget": 150.0},
+        {"publishedDate": "2026-06-01", "priceTarget": 130.0, "adjPriceTarget": 130.0},
     ]
     c = FMPRating._consensus_target_as_of(history, NOW, 90)
     assert c["targetCount"] == 3
     # single recent analyst -> degenerate consensus, targetCount 1
     one = FMPRating._consensus_target_as_of(
-        [{"publishedDate": "2026-06-10", "priceTarget": 19.0}], NOW, 90)
+        [{"publishedDate": "2026-06-10", "priceTarget": 19.0, "adjPriceTarget": 19.0}], NOW, 90)
     assert one["targetCount"] == 1
     assert one["targetHigh"] == one["targetLow"] == 19.0
 

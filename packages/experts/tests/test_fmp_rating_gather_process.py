@@ -45,11 +45,11 @@ UPGRADE = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
 # 90-day window: targets sorted [110,124,128,128,160] -> mean 130, max 160, min 110,
 # median 128 == CONSENSUS; latest grades row <= NOW -> UPGRADE counts.
 PRICE_TARGET_HISTORY = [
-    {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-    {"publishedDate": "2026-06-09", "priceTarget": 124.0},
-    {"publishedDate": "2026-06-08", "priceTarget": 128.0},
-    {"publishedDate": "2026-06-07", "priceTarget": 128.0},
-    {"publishedDate": "2026-06-06", "priceTarget": 160.0},
+    {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},
+    {"publishedDate": "2026-06-09", "priceTarget": 124.0, "adjPriceTarget": 124.0},
+    {"publishedDate": "2026-06-08", "priceTarget": 128.0, "adjPriceTarget": 128.0},
+    {"publishedDate": "2026-06-07", "priceTarget": 128.0, "adjPriceTarget": 128.0},
+    {"publishedDate": "2026-06-06", "priceTarget": 160.0, "adjPriceTarget": 160.0},
 ]
 GRADES_HISTORY = [
     {"date": "2026-06-10", "analystRatingsStrongBuy": 10, "analystRatingsbuy": 5,
@@ -231,3 +231,14 @@ def test_as_of_design_docstring_present():
     # And the reconstruction sources must be named so the design is discoverable.
     assert "grades-historical" in src
     assert "price-target" in src
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _live_clock_is_now(monkeypatch):
+    """The live path now rebuilds the consensus from the dated rows (split-adjusted), so its
+    trailing window needs a wall clock; pin it to NOW (the fixtures' decision date)."""
+    import sys
+    monkeypatch.setattr(sys.modules[FMPRating.__module__], "replay_now", lambda as_of=None: as_of or NOW)

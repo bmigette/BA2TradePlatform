@@ -224,9 +224,9 @@ def _fmp_rating_case():
                  "targetLow": 110.0, "targetMedian": 128.0}
     upgrade = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
     price_targets = [
-        {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-        {"publishedDate": "2026-06-09", "priceTarget": 124.0},
-        {"publishedDate": "2026-06-08", "priceTarget": 128.0},
+        {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},
+        {"publishedDate": "2026-06-09", "priceTarget": 124.0, "adjPriceTarget": 124.0},
+        {"publishedDate": "2026-06-08", "priceTarget": 128.0, "adjPriceTarget": 128.0},
     ]
     counters = {"consensus": 0, "upgrades": 0, "price_targets": 0, "grades": 0}
 
@@ -480,8 +480,8 @@ def _ds_fred_meta():
 _DS_GRADES = [{"date": "2026-06-01", "analystRatingsStrongBuy": 6,
                "analystRatingsbuy": 4, "analystRatingsHold": 2,
                "analystRatingsSell": 1, "analystRatingsStrongSell": 0}]
-_DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0},
-               {"publishedDate": "2026-06-04", "priceTarget": 116.0}]
+_DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0, "adjPriceTarget": 120.0},
+               {"publishedDate": "2026-06-04", "priceTarget": 116.0, "adjPriceTarget": 116.0}]
 
 
 def _deterministic_scorer_case(bars=400, quote=True):

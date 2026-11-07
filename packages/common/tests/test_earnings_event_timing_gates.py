@@ -33,7 +33,7 @@ WHAT THIS FILE PINS, AND WHY EACH ONE IS A REAL FAILURE MODE
 Every date is frozen in 2024 while the wall clock is 2026: nothing here can pass by
 accidentally agreeing with today.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -218,7 +218,8 @@ def test_the_stamp_wins_over_a_live_calendar_that_says_something_else(monkeypatc
     ``<= 45`` TRUE. The stamp must win, and the provider must not be touched at all: the
     strategy is timing the event the RANK was computed for.
     """
-    cal = _CountingCalendar(["2024-04-25", "2024-01-30"])
+    NEXT = (WED + timedelta(days=20)).isoformat()   # inside the 30-day announce horizon
+    cal = _CountingCalendar([NEXT, "2024-01-30"])
     monkeypatch.setattr(TradeConditions, "_provider_resolver",
                         lambda category, name, **kw: cal, raising=False)
 
@@ -240,7 +241,8 @@ def test_an_absent_stamp_does_not_fall_back_to_the_calendar_even_when_one_is_ava
     recommendations that have no event at all -- every symbol of every non-earnings expert,
     for which the calendar will cheerfully return a date ~43 days out. The gate must be
     UNEVALUABLE, and the provider must not be reached."""
-    cal = _CountingCalendar(["2024-04-25", "2024-01-30"])
+    NEXT = (WED + timedelta(days=20)).isoformat()   # inside the 30-day announce horizon
+    cal = _CountingCalendar([NEXT, "2024-01-30"])
     monkeypatch.setattr(TradeConditions, "_provider_resolver",
                         lambda category, name, **kw: cal, raising=False)
 
@@ -258,14 +260,15 @@ def test_the_unchained_days_to_earnings_condition_is_unchanged(monkeypatch):
     answer for UNCHAINED uses (any expert, no stamp), and the decision NOT to make it
     stamp-first-with-a-calendar-fallback is what keeps 'absent stamp never fires' true for
     the new field. Same recommendation, same bar, DIFFERENT answers -- deliberately."""
-    cal = _CountingCalendar(["2024-04-25", "2024-01-30"])
+    NEXT = (WED + timedelta(days=20)).isoformat()   # inside the 30-day announce horizon
+    cal = _CountingCalendar([NEXT, "2024-01-30"])
     monkeypatch.setattr(TradeConditions, "_provider_resolver",
                         lambda category, name, **kw: cal, raising=False)
 
     legacy = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, _BacktestAccount(WED),
                               "MSFT", _rec(_stamp(WED, FRI)), operator_str="<=", value=45.0)
     assert legacy.evaluate() is True
-    assert legacy.calculated_value == _days_between(date(2024, 4, 25), WED) == 43
+    assert legacy.calculated_value == 20
     assert cal.calls >= 1, "the unchained condition still reads the calendar"
 
 

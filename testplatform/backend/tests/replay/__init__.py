@@ -244,8 +244,8 @@ def rating_case(analysis_id: str = RATING_ID, *, consensus_rows=None,
     rows = [consensus] if consensus_rows is None else consensus_rows
     upgrades = [{"symbol": symbol, "strongBuy": 10, "buy": 5, "hold": 3,
                  "sell": 1, "strongSell": 1}]
-    targets = [{"publishedDate": _days_ago_iso(2), "priceTarget": 126.0},
-               {"publishedDate": _days_ago_iso(5), "priceTarget": 132.0}]
+    targets = [{"publishedDate": _days_ago_iso(2), "priceTarget": 126.0, "adjPriceTarget": 126.0},
+               {"publishedDate": _days_ago_iso(5), "priceTarget": 132.0, "adjPriceTarget": 132.0}]
     grades = [{"date": _days_ago_iso(9), "gradingCompany": f"House {n}"}
               for n in range(12)]
 
@@ -444,8 +444,8 @@ def _scorer_fred_meta():
 _SCORER_GRADES = [{"date": _days_ago_iso(6), "analystRatingsStrongBuy": 6,
                    "analystRatingsbuy": 4, "analystRatingsHold": 2,
                    "analystRatingsSell": 1, "analystRatingsStrongSell": 0}]
-_SCORER_TARGETS = [{"publishedDate": _days_ago_iso(2), "priceTarget": 120.0},
-                   {"publishedDate": _days_ago_iso(8), "priceTarget": 116.0}]
+_SCORER_TARGETS = [{"publishedDate": _days_ago_iso(2), "priceTarget": 120.0, "adjPriceTarget": 120.0},
+                   {"publishedDate": _days_ago_iso(8), "priceTarget": 116.0, "adjPriceTarget": 116.0}]
 
 
 def scorer_case(analysis_id: str = SCORER_ID, bars: int = 400, *,
