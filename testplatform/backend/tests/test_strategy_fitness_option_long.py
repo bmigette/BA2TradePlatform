@@ -3,7 +3,7 @@
 Formula, in this literal order: wipeout sentinel -> unreadable return -> return term
 (``total_return``, as ``option_convex``) -> DD factor (free <= 25%, linear to 0 at 60%) ->
 negative-calendar-year factor (product of max(0.5, 1 + r/100) over losing years) -> breadth
-floor (>= 12 structures/yr AND >= 10 underlyings) -> a non-positive return passes through RAW.
+floor (>= 5 structures/yr AND >= 8 underlyings) -> a non-positive return passes through RAW.
 """
 import os
 import sys
@@ -106,12 +106,12 @@ def test_no_year_series_means_no_invented_factor():
 
 
 def test_breadth_floor_structures_per_year():
-    assert _score(tpy=11.9) == LOW_TRADE_SENTINEL
-    assert _score(tpy=12.0) > 0
+    assert _score(tpy=4.9) == LOW_TRADE_SENTINEL
+    assert _score(tpy=5.0) > 0
 
 
 def test_breadth_floor_structures_not_legs():
-    # 4-leg structures: 48 leg rows = 12 structures over 3y = 4/yr < 12
+    # 4-leg structures: 48 leg rows = 12 structures over 3y = 4/yr < 5
     rows = []
     for i in range(48):
         s = i // 4
@@ -124,8 +124,8 @@ def test_breadth_floor_structures_not_legs():
 
 
 def test_breadth_floor_underlyings():
-    assert _score(n_under=9) == LOW_TRADE_SENTINEL
-    assert _score(n_under=10) > 0
+    assert _score(n_under=7) == LOW_TRADE_SENTINEL
+    assert _score(n_under=8) > 0
 
 
 def test_negative_return_passes_through_raw_and_ranks_below_small_positive():

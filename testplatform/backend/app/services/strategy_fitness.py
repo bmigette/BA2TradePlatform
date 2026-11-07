@@ -362,8 +362,9 @@ _CONVEX_ALIASES = ("option_convex",)
 _LONG_DD_FREE_PCT = 25.0   # |drawdown| (%) charged not at all
 _LONG_DD_DEAD_PCT = 60.0   # factor reaches 0.0 here; linear between, 0.0 beyond
 _LONG_NEG_YEAR_FLOOR = 0.5  # a negative calendar year costs at most half: max(0.5, 1 + r/100)
-_LONG_MIN_STRUCTURES_PER_YEAR = 12.0  # option STRUCTURES per year (not legs)
-_LONG_MIN_UNDERLYINGS = 10            # distinct underlyings over the whole window
+_LONG_MIN_STRUCTURES_PER_YEAR = 5.0   # option STRUCTURES per year (not legs); owner 2026-11-07:
+#   12 refused every LEAPS seed at $20k (~10/yr: one-year holds), so 5
+_LONG_MIN_UNDERLYINGS = 8             # distinct underlyings over the whole window (owner 2026-11-07)
 _LONG_ALIASES = ("option_long",)
 # One name on purpose. ``option_car``'s aliases exist because the CAR family predates the
 # fitness catalog; a new metric with three spellings is three strings a routing rail has to
@@ -2377,8 +2378,8 @@ def _option_long(results: dict) -> float:
          each year with r < 0 contributes ``max(0.5, 1 + r/100)``; the factor is the product.
          If no yearly series can be formed the factor is 1.0 (no invented value; same stance as
          ``_consistency_factor`` for < 2 years).
-      6. BREADTH FLOOR: >= 12 option STRUCTURES per year (``_trades_per_year(...,
-         option_structures=True)``) AND >= 10 distinct underlyings, else LOW_TRADE_SENTINEL.
+      6. BREADTH FLOOR: >= 5 option STRUCTURES per year (``_trades_per_year(...,
+         option_structures=True)``) AND >= 8 distinct underlyings, else LOW_TRADE_SENTINEL.
       7. A return <= 0 is returned RAW (a <1 factor on a negative would raise it toward 0), so a
          losing book stays negative and ranks below any positive one. Otherwise
          ``ret x dd_factor x neg_year_factor``.
