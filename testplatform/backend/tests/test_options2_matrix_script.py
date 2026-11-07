@@ -223,6 +223,7 @@ def test_the_launched_command_is_exactly_this():
         "--parallel", "4",
         "--early-stop-min-rel", "0.01",
         "--profit-cap-pct", "2000.0", "--profit-share-cap-pct", "25.0",
+        "--estimates-source", "fmp",       # every launcher states the source (e9b34dfb)
     ]
 
 
