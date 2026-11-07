@@ -323,6 +323,58 @@ Runs of record:
 | 2026-10-20 | download (`alpaca_store_daily2016`) | 11,621 symbols: 7,984 written, 3,767 empty (funds/OTC without Alpaca bars), 0 failed, 12,075 requests, 425 MB, 1 h 31 min |
 | 2026-10-20 | split-table (raw jump only) | 7,854 symbols, 1,620 events accepted, 2,311 review rows; superseded by the FMP-step run |
 
+#### 4.0.1 The DATED, survivorship-free stock universe (owner decision 2026-11-07)
+
+A symbol is eligible from its listing until its delisting. `tools/screener_store_universe.txt` (4,733 names) is today's
+listing plus 144 delisted names that happened to be in a scratch file; it misses SIVB, FRC, TWTR, ATVI, XLNX, CTXS, SPLK,
+PXD, HES, ANSS, CERN and ~1,600 more delistings of 2019-03..2026-11. **The January data rebuild MUST use the dated
+universe**, not the committed survivor file:
+
+```
+python tools/build_screener_universe.py --keys-db ~/Documents/ba2/trade/db.sqlite --account-id 1            # dry run: report only
+python tools/build_screener_universe.py --keys-db ... --account-id 1 --end <rebuild end> --write           # writes the files below
+```
+
+Output: `tools/screener_store_universe_dated.txt` (base order, additions appended sorted),
+`tools/screener_store_universe_dated.dates.tsv` (symbol, first month, **last bar = the delisting date**, source, name) and
+`<work-dir>/report.json` (counts by reason; every rejection with its detail). The work dir (`--work-dir`, default
+`~/Documents/ba2/common/cache/_universe_build`) caches every API response, so a re-run costs nothing. Cost of a cold run
+(measured 2026-11-07): ~300 Alpaca requests (assets x2, one corporate-actions call per month, batched monthly bars, batched
+last-month daily bars) and ~200 FMP profile calls. Credentials: an account's `api_key`/`api_secret` (a PAPER account is fine,
+asset list and SIP history are public) from `--keys-db`, the FMP key from its `appsetting.FMP_API_KEY`; nothing is printed.
+
+Sources and rules (full list in the tool's docstring): Alpaca inactive assets, the ACQUIREE of every cash/stock/stock-and-cash
+merger and every worthless removal in the span (Alpaca drops many dead tickers from its asset list; TWTR, ATVI, SPLK, PXD, HES
+exist only there), FMP delisted-companies page 0 (our plan returns only the newest 100), plus
+`tools/screener_universe_extra_delisted.txt` (reviewed bankruptcies with no merger record: SIVB, FRC, ...). Kept: NYSE / NASDAQ /
+AMEX common shares and ADSs. Rejected, counted by reason: ETFs and funds (FMP flag), warrants / units / rights / preferreds /
+notes (name and five-letter-series rules), OTC and ARCA/BATS rows, class-share symbols with `.`/`-`, CUSIP-like ids,
+**renames** (old side of a name change whose new symbol is listed: the rename machinery of `rename_successors.csv` carries the
+history; a successor on OTC such as RAD -> RADCQ after a bankruptcy is a delisting), **reused tickers** (two inactive assets with
+one ticker, an FMP ipoDate after the last bar, a month without any bar between first and last, FMP "actively trading" while
+Alpaca bars ended): those go to the report for a human, never guessed. Each kept name has Alpaca daily bars in the span and
+its delisting date is its last daily bar. SPAC common shares are kept (the base file holds 272 SPAC names); `--exclude-spacs`
+drops them.
+
+Rebuild order with the dated file (replaces `tools/screener_store_universe.txt` in rows 3 and 3b of 4.1 and in the Alpaca download
+and `prepare_history.py` steps): (1) download (`alpaca_history_download.py` / `prepare_history.py --steps download`,
+`--symbols-file tools/screener_store_universe_dated.txt`); (2) `split-table,build,verify` (the build writes
+`_meta/suspensions.json`: every added name must appear there as `delisted` with the same last session);
+(3) **regenerate the allow-stale list** from that `suspensions.json` (delisted events whose last bar is > 10 days before `--end`;
+the old 144-name file is far too short, expect ~1,700 names) and pass it as `--allow-stale-symbols`; (4) metric store and daily
+panel (`build-screener-metrics ... --daily-panel`): delisted names drop out of the metric store 7 calendar days after their last bar
+(`staleness_max_days`) and out of the panel from the morning after their last session (BUILD_REV 4, see below);
+(5) consistency check, no network: `python tools/build_screener_universe.py --out tools/screener_store_universe_dated.txt --check-cache
+<cache>/AlpacaHistoryOHLCVProvider/_meta/suspensions.json` (exit 1 on any added name without a matching `delisted` event).
+The snapshot of 2026-11-07 is committed for review; regenerate it in January with the rebuild's `--end`.
+
+How the backtest treats a name that delists mid-run (tests: `testplatform/backend/tests/backtest/test_suspension_liquidation.py`,
+`packages/providers/tests/test_live_sim_build.py`): the daily engine closes a held position at the last exchange close on the first
+session after the last bar (`delisting_liquidation`, a synthetic FILLED order, logged WARNING), cancels its working orders, never
+fills after the last bar and blocks re-entry; the screener panel masks the symbol from the morning after its last session (before
+BUILD_REV 4 an unreviewed delisting lingered up to 35 days as a candidate the engine then refused). **Exit price of a delisting (2026-11-07):** a worthless removal, a bankruptcy ticker (RAD -> RADCQ) or an extras-file name tagged `worthless` (SIVB, FRC, ...) liquidates at **0** (`delisting_worthless`); a cash merger at the corporate action's per-share cash (`delisting_cash_merger`); stock-for-stock mergers and unknown reasons at the last close (`delisting_liquidation`, WARNING logged, counted in `BacktestAccount.delisting_exit_counts`). The table is `<cache>/AlpacaHistoryOHLCVProvider/_meta/delisting_terminals.json`, installed after the cache rebuild with `build_screener_universe.py --out ... --install-terminals <cache>/_meta/suspensions.json` (stamped with the suspensions build; a terminal recorded for another last session is ignored). Without the file every delisting closes at the last close, as before. It is NOT covered by the gate certificate: every worker's cache must carry the same file (`cache push` after installing), or master and worker price delistings differently. A delisting within the last 5 sessions before the store's end is not yet a
+`delisted` event (build slack).
+
 ### 4.1 Equity (goal2020 and single equity backtests)
 
 | Step | Command | Notes |

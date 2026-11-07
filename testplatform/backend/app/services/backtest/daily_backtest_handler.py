@@ -720,6 +720,30 @@ _REGIME_LOOKBACK_DAYS = 1200
 _SUSPENSION_EVENTS_MEMO: Dict[Any, Any] = {}
 
 
+_DELISTING_TERMINALS_MEMO: Dict[Any, Any] = {}
+
+
+def _delisting_terminals_for(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The cache's terminal values of delistings (``load_delisting_terminals``); ``{}`` for any source but ``alpaca`` or a cache
+    without ``_meta/delisting_terminals.json`` (every delisting then closes at the last close, as before).  Read after
+    ``_suspension_events_for`` has verified the certificate; the loader refuses a file stamped with another suspensions build."""
+    from ba2_common.core.suspension_events import TERMINALS_FILE, load_delisting_terminals
+    from app.services.backtest.history_source import job_history_cache_dir
+
+    if resolve_job_history_source(config) != "alpaca":
+        return {}
+    cache_dir = job_history_cache_dir(config)
+    path = os.path.join(cache_dir, TERMINALS_FILE)
+    if not os.path.isfile(path):
+        return {}
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _DELISTING_TERMINALS_MEMO:
+        _DELISTING_TERMINALS_MEMO.clear()
+        _DELISTING_TERMINALS_MEMO[key] = load_delisting_terminals(cache_dir)
+    return _DELISTING_TERMINALS_MEMO[key]
+
+
 def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
     """The run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).
 
@@ -1143,6 +1167,7 @@ def run_daily_backtest(
                                   else True),
         )
         account.set_suspension_events(_suspension_events_for(config))
+        account.set_delisting_terminals(_delisting_terminals_for(config))
         resolver.register_account(account_id, account)
 
         experts = _build_experts(config, resolver, account_id)
