@@ -748,6 +748,7 @@ def _record_pass_state(context, expert, expert_instance, pass_name, lookback_day
                 "settings": _encodable(context, settings, "settings", "decision step"),
                 "redacted_setting_keys": recorded_redacted,
                 **_account_block(account),
+                **_account_settings(context, account),
                 "recommendations_considered": [
                     {"id": r.id, "symbol": r.symbol, "created_at": r.created_at}
                     for r in fetched],
@@ -773,6 +774,18 @@ def _record_pass_state(context, expert, expert_instance, pass_name, lookback_day
         except Exception:  # noqa: BLE001
             pass
         return None
+
+
+def _account_settings(context, account) -> Dict[str, Any]:
+    """The account's NON-secret settings the decision reads (``margin_enabled``, ``margin_factor``,
+    ``minimum_equity_threshold_percent``, ...): credential-shaped keys are absent and NAMED. The replay
+    seeds its tape account with them; without them a margin account would silently replay as a plain one."""
+    settings = account.settings
+    kept = {key: value for key, value in settings.items() if not core.is_secret(key)}
+    return {
+        "account_settings": _encodable(context, kept, "account settings", "decision step"),
+        "redacted_account_setting_keys": sorted(key for key in settings if core.is_secret(key)),
+    }
 
 
 def _pass_state_rows(expert_instance, ruleset_id, fetched):

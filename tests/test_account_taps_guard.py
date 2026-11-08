@@ -151,7 +151,7 @@ _ALLOWED = {
     "check_cover_for_covered_call": "option family: derived from tapped get_positions",
     "get_iv_rank": "option family: derived from the tapped implied-volatility reads",
     "iv_rank_unavailable_reason": "option family: text explaining get_iv_rank",
-    "get_tradable_balance": "derived from the tapped get_account_snapshot",
+    "get_tradable_balance": "derived from the tapped get_balance (margin off) / get_account_snapshot (margin on)",
     "get_tradable_equity": "derived from the tapped get_account_snapshot",
     "get_setting_with_interface_default": "a settings read (DB rows are recorded in pass_state)",
     "_create_transaction_for_order": "DB write inside the executed order build, not a broker call",

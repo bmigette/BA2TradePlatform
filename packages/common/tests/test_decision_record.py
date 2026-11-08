@@ -303,15 +303,18 @@ def test_pass_state_holds_the_expert_rulesets_and_book_and_drops_credentials():
         observation_id = dr.record_pass_state(
             expert=_RealFilterExpert(), expert_instance=instance, pass_name="enter-market",
             lookback_days=1, cutoff_time=UTC_NOW, decision_time=UTC_NOW,
-            account=SimpleNamespace(id=1, OPTION_GREEKS_SOURCE=None), ruleset_id=rs,
-            fetched_recommendations=fetched, selected_recommendations=fetched[:1])
+            account=SimpleNamespace(id=1, OPTION_GREEKS_SOURCE=None,
+                                    settings={"margin_enabled": True, "api_secret": "sk-ACCT-LEAK"}),
+            ruleset_id=rs, fetched_recommendations=fetched, selected_recommendations=fetched[:1])
         context.set_skip("t")
     assert observation_id is not None
     ((_, payload),) = _steps(store, "pass_state")
     inputs = payload["inputs"]
     assert "data_provider_api_key" in inputs["redacted_setting_keys"]
     assert "data_provider_api_key" not in inputs["settings"] and inputs["settings"]["enable_buy"] is True
-    assert "sk-LEAK" not in repr(payload)
+    assert "sk-LEAK" not in repr(payload) and "sk-ACCT-LEAK" not in repr(payload)
+    assert inputs["account_settings"] == {"margin_enabled": True}
+    assert inputs["redacted_account_setting_keys"] == ["api_secret"]
     models = [r["model"] for r in payload["db_rows"]]
     assert {"ExpertInstance", "ExpertSetting", "Ruleset", "EventAction", "RulesetEventActionLink",
             "ExpertRecommendation", "Transaction"} <= set(models)

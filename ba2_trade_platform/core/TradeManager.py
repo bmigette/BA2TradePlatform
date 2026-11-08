@@ -14,7 +14,8 @@ from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset,
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 from ba2_common.core.replay.clock import replay_now
-from ba2_common.core.trade_cycle import persist_funded_entry, row_or_none, stage_funded_entry
+from ba2_common.core.trade_cycle import (
+    entry_submit_stop, persist_funded_entry, row_or_none, stage_funded_entry, submit_funded_entry)
 from ba2_common.core.replay.decision_record import (
     note_funded, note_gate, note_pass_error, note_selection, pass_discard, pass_fail, pass_skip,
     record_execute, record_pass_state)
@@ -1965,87 +1966,15 @@ class TradeManager:
 
     @staticmethod
     def _entry_submit_stop(order, safeguard_sl):
-        """Use the backtest's stop policy without changing the RM sizing input.
-
-        The evaluator has already attached the ruleset stop to the transaction.
-        Sending just the safeguard here would overwrite a tighter ruleset leg in
-        AccountInterface's initial_setup block. Read the current transaction on
-        each attempt so a delayed retry also preserves subsequent tightening.
-        """
-        from ba2_common.core.position_sizing import reconcile_protective_stop
-
-        transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-        return reconcile_protective_stop(
-            ruleset_sl=transaction.stop_loss if transaction else None,
-            safeguard_sl=safeguard_sl,
-            is_long=order.side == OrderDirection.BUY,
-        )
+        """The stop handed to the broker for an entry (``trade_cycle.entry_submit_stop``)."""
+        return entry_submit_stop(order, safeguard_sl)
 
     def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
-        """Submit a funded entry, retrying when the DB (not the broker) is what failed.
-
-        WHY. A sqlite write lock must never cost a trade. Measured on PROD 2026-08-10: CVS was
-        screened, passed its ruleset and was FUNDED by the RM (1 share @ $95.69), then
-        submit_order's Transaction insert hit "database is locked". db.retry_on_lock burns 4
-        attempts against a 30s busy_timeout -- ~2 minutes -- then re-raises; the caller logged it
-        and moved on. The trade was simply lost, leaving a stranded qty-0 PENDING row with no
-        transaction and no broker id. Nothing sweeps those: the only code that touches PENDING
-        entries DELETES them, and order 460 sat untouched for 8 hours. Dev is worse -- 161 lock
-        events in a day and 5 entries lost the same way.
-
-        The lock is transient and the retry is trivially correct HERE, because at this point the
-        RM-sized quantity and safeguard stop are still in memory (fo.quantity / fo.stop_price);
-        re-deriving them later from a stranded row is not possible, which is why this belongs in
-        the funded loop and not in a sweeper.
-
-        ONLY lock failures are retried. A broker rejection, a validation error or a wash-trade
-        lock is a real answer and must not be re-attempted -- re-sending on those risks a
-        duplicate order, which is far worse than a missed one.
-        """
-        import time as _time
-
-        last_err = None
-        for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
-            try:
-                submit_sl = self._entry_submit_stop(order, sl_price)
-                from ba2_common.core.trade_cycle import stamp_safeguard_anchor
-                _txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-                stamp_safeguard_anchor(
-                    order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
-                    lambda: account.get_instrument_current_price(order.symbol))
-                submitted = account.submit_order(order, sl_price=submit_sl)
-            except Exception as e:  # noqa: BLE001 — classified immediately below
-                if "database is locked" not in str(e).lower():
-                    raise  # a real answer from the broker/validator: never re-send
-                last_err = e
-                if attempt < self._ENTRY_SUBMIT_RETRIES:
-                    delay = self._ENTRY_SUBMIT_BACKOFF_S * attempt
-                    self.logger.warning(
-                        f"Entry submit for order {order.id} ({order.symbol}) lost to a DB lock "
-                        f"(attempt {attempt}/{self._ENTRY_SUBMIT_RETRIES}); retrying in {delay:.0f}s")
-                    _time.sleep(delay)
-            else:
-                # The stop this entry was SIZED on, recorded once as the transaction's max-loss
-                # stop. ``sl_price`` is the RM safeguard the candidate was sized off, BEFORE
-                # _entry_submit_stop reconciled it with the ruleset stop; the helper falls back
-                # to the ruleset stop only when there is no safeguard. OUTSIDE the try on
-                # purpose: nothing it does may be mistaken for a DB-locked submit and re-send
-                # the order. It never raises (see the helper).
-                if submitted:
-                    from ba2_common.core.trade_cycle import record_max_loss_stop
-                    record_max_loss_stop(order, sl_price)
-                    # the transaction may only exist since the submit; the fill-time re-base reads
-                    # the stamp from it either way (idempotent when already stamped before)
-                    stamp_safeguard_anchor(
-                        order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
-                        lambda: account.get_instrument_current_price(order.symbol))
-                return submitted
-        self.logger.error(
-            f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
-            f"{self._ENTRY_SUBMIT_RETRIES} DB-lock retries: {last_err}. The RM funded this trade "
-            f"and it never reached the broker; order {order.id} is left PENDING with no broker id.",
-            exc_info=True)
-        return None
+        """Submit a funded entry, retrying when the DB (not the broker) is what failed
+        (``trade_cycle.submit_funded_entry``: shared with the offline decision replay, whose
+        docstring carries the history -- CVS 2026-08-10, order 460)."""
+        return submit_funded_entry(account, order, sl_price, retries=self._ENTRY_SUBMIT_RETRIES,
+                                   backoff_s=self._ENTRY_SUBMIT_BACKOFF_S, log=self.logger)
 
     def _rechain_behind_entry_legs(self, account, dependent_order, parent_order_id) -> bool:
         """Chain an exit that fires on its ENTRY's fill behind the cancellation of that entry's
