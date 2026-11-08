@@ -35,6 +35,9 @@ An effect call records ONE entry into the current frame via
 * OUTERMOST call only: a tapped effect reached from inside another (``adjust_tp`` -> ``adjust_tp_sl``,
   ``close_transaction`` -> ``submit_order``, ``submit_order`` -> ``adjust_tp_sl`` bracket set-up)
   is passthrough, so one decision is one effect;
+* inside a decision PASS but outside every step frame (dependent TP/SL legs submitted by the waiting-
+  trigger check, compensation, refresh) the effect goes to the pass-level ``effects_outside_steps``
+  list (``decision_record.note_unframed_effect``), never dropped;
 * arguments are snapshotted BEFORE the call (``submit_order`` mutates the order), the return value
   or the exception text after; the exception is re-raised unchanged.
 
@@ -165,7 +168,11 @@ def _note(context, method: str, call: Dict[str, Any], **outcome: Any) -> None:
     try:
         if "returned" in outcome:
             outcome["returned"] = _plain(outcome["returned"])
-        note_account_effect(method, call=call, **outcome)
+        if not note_account_effect(method, call=call, **outcome):
+            # No accepting frame: inside a decision pass this is an effect outside every step (the
+            # pass-level list keeps it); elsewhere it is not recorded by design.
+            from ba2_common.core.replay.decision_record import note_unframed_effect
+            note_unframed_effect(context, method, call, **outcome)
     except Exception as exc:                    # recording never changes the call's outcome
         context.note_failure(f"account effect {method} not noted", exc)
 

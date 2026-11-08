@@ -77,6 +77,7 @@ __all__ = [
     "note_pass_error",
     "note_selection",
     "note_sizing_run",
+    "note_unframed_effect",
     "pass_discard",
     "pass_fail",
     "pass_skip",
@@ -186,7 +187,8 @@ def decision_context():
 def _ledger(context) -> Dict[str, Any]:
     ledger = context.decision_ledger
     if not ledger:
-        ledger.update({"symbols": {}, "steps": [], "steps_not_recorded": [], "errors": []})
+        ledger.update({"symbols": {}, "steps": [], "steps_not_recorded": [], "errors": [],
+                       "effects_outside_steps": []})
     return ledger
 
 
@@ -217,6 +219,39 @@ def note_gate(symbol: str, name: str, passed: bool, detail: Optional[str] = None
             {"name": name, "passed": bool(passed), "detail": detail})
     except Exception as exc:  # noqa: BLE001 -- recording never reaches the decision
         context.note_failure("gate verdict not noted", exc, CaptureHealth.STEP_NOT_RECORDED)
+
+
+#: Most account effects kept outside a step per pass (a runaway loop must not grow the summary).
+MAX_EFFECTS_OUTSIDE_STEPS = 200
+
+
+def note_unframed_effect(context, method: str, call: Dict[str, Any], **outcome: Any) -> bool:
+    """An account EFFECT that happened inside a decision pass but outside every step frame.
+
+    Examples: the dependent TP/SL legs ``_check_all_waiting_trigger_orders`` submits in the enter
+    pass, ``_fail_unsent_entry``'s cancels, a ``refresh_orders`` driven change. They are kept in the
+    pass-level list ``effects_outside_steps`` of the pass summary, in call order. A frame that exists
+    but does not accept account effects (the option family notes its own submits) is NOT a gap.
+    Returns whether the effect was kept. Never raises.
+    """
+    try:
+        if decision_context() is not context or getattr(core._tls, "frame", None) is not None:
+            return False
+        entries = _ledger(context)["effects_outside_steps"]
+        if len(entries) >= MAX_EFFECTS_OUTSIDE_STEPS:
+            context.note_failure(
+                f"account effect {method} outside a step not recorded (cap {MAX_EFFECTS_OUTSIDE_STEPS})",
+                RuntimeError("too many effects outside a step"), CaptureHealth.STEP_NOT_RECORDED)
+            return False
+        entry = {"method": method, "call": call}
+        entry.update(outcome)
+        entries.append(_share_effect_rows(encodable_effect(
+            entry, lambda value, label: _encodable(context, value, label, "decision step"))))
+        return True
+    except Exception as exc:  # noqa: BLE001 -- recording never reaches the decision
+        context.note_failure(f"account effect {method} outside a step not recorded", exc,
+                             CaptureHealth.STEP_NOT_RECORDED)
+        return False
 
 
 def note_pass_error(where: str, exc: BaseException) -> None:
@@ -303,6 +338,7 @@ def pass_summary(context, *, created: Sequence[Any] = ()) -> Dict[str, Any]:
         "errors": list(ledger["errors"]),
         "steps": list(ledger["steps"]),
         "steps_not_recorded": list(ledger["steps_not_recorded"]),
+        "effects_outside_steps": list(ledger["effects_outside_steps"]),
     }
 
 
