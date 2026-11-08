@@ -56,6 +56,7 @@ from ba2_common.core.replay.codec import SharedValue
 from ba2_common.core.replay.context import CaptureHealth, current_capture
 from ba2_common.core.replay.observe import record_observation
 from ba2_common.core.replay.option_action_record import _ACCOUNT_DECLARATIONS
+from ba2_common.logger import logger
 
 __all__ = [
     "DECISION_FAMILIES",
@@ -90,6 +91,14 @@ __all__ = [
     "sizing_frame_open",
     "sizing_view",
 ]
+
+#: PER-PASS RECORDING BUDGET. Recording runs on the pass thread; once ONE pass has spent this much recorder
+#: time, or hit this many recorder failures, its remaining steps are not recorded: each is counted
+#: (``STEP_NOT_RECORDED``), listed in the summary's ``steps_not_recorded`` and the summary says why
+#: (``recording_budget_exceeded``). A degraded recorder (slow disk, a codec that keeps refusing) can
+#: therefore cost a pass at most this much, whatever the pass size. The pass itself is never affected.
+PASS_RECORD_SECONDS_BUDGET = 30.0
+PASS_RECORD_FAILURE_BUDGET = 25
 
 DECISION_PROVIDER = "decision_step"
 RECORD_VERSION = 1
@@ -188,7 +197,7 @@ def _ledger(context) -> Dict[str, Any]:
     ledger = context.decision_ledger
     if not ledger:
         ledger.update({"symbols": {}, "steps": [], "steps_not_recorded": [], "errors": [],
-                       "effects_outside_steps": []})
+                       "effects_outside_steps": [], "budget_exceeded": None})
     return ledger
 
 
@@ -196,6 +205,36 @@ def _add_record_seconds(context, seconds: float) -> None:
     """Pass-thread time spent recording (inputs built, outcome frozen): what recording COSTS a pass."""
     ledger = _ledger(context)
     ledger["record_seconds"] = (ledger["record_seconds"] if "record_seconds" in ledger else 0.0) + seconds
+
+
+def _budget_allows(context, kind: str, symbol: str) -> bool:
+    """Whether the pass may still record a step; a refused step is counted and listed. Never raises."""
+    try:
+        ledger = _ledger(context)
+        reason = ledger["budget_exceeded"]
+        if reason is None:
+            seconds = ledger["record_seconds"] if "record_seconds" in ledger else 0.0
+            failures = sum(context.capture_failures.values())
+            if seconds >= PASS_RECORD_SECONDS_BUDGET:
+                reason = (f"recorder time {seconds:.1f}s reached the per-pass budget of "
+                          f"{PASS_RECORD_SECONDS_BUDGET:.1f} seconds")
+            elif failures >= PASS_RECORD_FAILURE_BUDGET:
+                reason = (f"{failures} recorder failures reached the per-pass budget of "
+                          f"{PASS_RECORD_FAILURE_BUDGET}")
+            if reason is not None:
+                ledger["budget_exceeded"] = reason
+                logger.error(
+                    f"replay capture: decision pass {context.analysis_id} stops recording further "
+                    f"steps: {reason}; the pass itself is unaffected")
+        if reason is None:
+            return True
+        context.health.record(CaptureHealth.STEP_NOT_RECORDED)
+        ledger["steps_not_recorded"].append(
+            {"kind": kind, "symbol": symbol, "error": f"per-pass recording budget exceeded: {reason}"})
+        return False
+    except Exception as exc:  # noqa: BLE001 -- the budget is a safety net, never a dependency
+        logger.error(f"replay capture: recording budget check failed: {exc}", exc_info=True)
+        return True
 
 
 def _symbol(context, symbol: str) -> Dict[str, Any]:
@@ -339,6 +378,7 @@ def pass_summary(context, *, created: Sequence[Any] = ()) -> Dict[str, Any]:
         "steps": list(ledger["steps"]),
         "steps_not_recorded": list(ledger["steps_not_recorded"]),
         "effects_outside_steps": list(ledger["effects_outside_steps"]),
+        "recording_budget_exceeded": ledger["budget_exceeded"],
     }
 
 
@@ -546,6 +586,8 @@ def record_rules(evaluator, instrument_name, recommendation, ruleset_id, existin
     context = decision_context()
     if context is None:
         return _NOOP_CONTEXT
+    if not _budget_allows(context, KIND_RULES, instrument_name):
+        return _NOOP_CONTEXT
     try:
         return _RulesRecorder(evaluator, context, instrument_name, recommendation, ruleset_id,
                               existing_order)
@@ -602,6 +644,8 @@ def record_size(manager, expert_instance_id, candidates, option_decisions):
     """Context manager around one ``size_candidate_orders``; the caller sets ``.result`` (funded)."""
     context = decision_context()
     if context is None or not candidates:
+        return _NOOP_CONTEXT
+    if not _budget_allows(context, KIND_SIZE, ",".join(sorted(order.symbol for order, _rec in candidates))):
         return _NOOP_CONTEXT
     try:
         return _SizeRecorder(manager, context, expert_instance_id, candidates, option_decisions)
@@ -721,6 +765,8 @@ def record_execute(evaluator, symbol, recommendation, submit_to_broker):
         return _NOOP_CONTEXT
     try:
         if _has_option_action(evaluator):
+            return _NOOP_CONTEXT
+        if not _budget_allows(context, KIND_EXECUTE, symbol):
             return _NOOP_CONTEXT
         return _ExecuteRecorder(evaluator, context, symbol, recommendation, submit_to_broker)
     except Exception as exc:  # noqa: BLE001 -- recording never reaches the decision

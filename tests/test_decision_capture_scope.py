@@ -231,3 +231,57 @@ def test_exit_pass_bookkeeping_failure_never_loses_the_return_value(store, monke
     monkeypatch.setattr(tm_mod.logger, "error", lambda *a, **k: None)
     assert TradeManager().process_open_positions_recommendations(expert_id) is sent
     assert store.health.count(CaptureHealth.PASS_NOT_RECORDED) == 1
+
+
+# --- I3: the rollout allow-list --------------------------------------------------------------------
+def _set_allowlist(value):
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+
+    add_instance(AppSetting(key="replay_decision_pass_experts", value_str=value))
+
+
+def test_default_records_every_expert(store):
+    _scope(_expert("FMPRating"))
+    _scope(_expert("DeterministicScorer"))
+    assert len(_passes(store)) == 2
+
+
+def test_the_allowlist_restricts_the_rollout_and_counts_the_rest_as_discards(store):
+    _set_allowlist(" FMPRating , DeterministicScorer ")
+    _scope(_expert("FMPRating"))
+    _scope(_expert("FMPEarningsDrift"))
+    assert [p.expert_class for p in _passes(store)] == ["FMPRating"]
+    assert store.health.discards() == {"expert_not_allowed": 1}
+    assert store.health.discards_by_expert() == {"FMPEarningsDrift": 1}
+    assert store.health.total == 0
+
+
+def test_a_star_or_blank_allowlist_means_all(store):
+    _set_allowlist("*")
+    _scope(_expert("FMPEarningsDrift"))
+    assert len(_passes(store)) == 1
+
+
+def test_an_unreadable_allowlist_records_nothing_loudly_and_never_blocks_the_pass(store, monkeypatch):
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core import replay_capture
+
+    def _boom():
+        raise RuntimeError("settings table unreadable")
+
+    monkeypatch.setattr(replay_capture, "decision_pass_expert_allowlist", _boom)
+    monkeypatch.setattr(tm_mod.logger, "error", lambda *a, **k: None)
+    assert _scope(_expert("FMPRating")) is None
+    assert store.health.count(CaptureHealth.PASS_NOT_RECORDED) == 1
+
+
+def test_an_exception_in_a_pass_of_a_non_allowed_expert_propagates_untouched(store):
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    _set_allowlist("FMPRating")
+    expert_id = _expert("FMPEarningsDrift")
+    with pytest.raises(ValueError, match="pass body"):
+        with TradeManager()._decision_capture_scope(expert_id) as context:
+            assert context is None
+            raise ValueError("pass body")

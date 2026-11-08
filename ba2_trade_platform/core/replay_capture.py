@@ -43,6 +43,14 @@ from .models import AppSetting
 #: The app setting that turns capture on. Created as "false" on first read.
 CAPTURE_SETTING_KEY = "replay_capture_enabled"
 
+#: Optional ROLLOUT allow-list of the stock decision-pass recording: a comma-separated list of expert
+#: class names (``FMPRating,DeterministicScorer``). Absent, blank or ``*`` = every expert (the default
+#: whenever capture is on). The row is NOT created automatically; add it on the Settings page / DB to
+#: start with selected experts. A pass of an expert that is not listed is not recorded and is counted
+#: as a discard with reason ``expert_not_allowed`` (per expert in the capture-health surface). It
+#: changes what is recorded, never what is traded.
+DECISION_PASS_EXPERTS_KEY = "replay_decision_pass_experts"
+
 #: Store layout version. A future incompatible layout gets its own directory
 #: rather than mixing two shapes in one root.
 STORE_LAYOUT = "v1"
@@ -128,6 +136,28 @@ def capture_enabled() -> bool:
     # coerce_bool, not `== 'true'`: a value written as 1/"1"/"True" means the same
     # thing to whoever set it, and raises loudly on a spelling nothing can mean.
     return coerce_bool(row.value_str)
+
+
+def decision_pass_expert_allowlist() -> Optional[frozenset]:
+    """The expert classes whose decision passes are recorded, or ``None`` for every expert.
+
+    Read per pass (one indexed row); an unreadable setting raises -- the caller counts the pass as not
+    recorded and logs it, it does not guess.
+    """
+    from sqlmodel import select
+
+    from .db import get_db
+
+    with get_db() as session:
+        row = session.exec(
+            select(AppSetting).where(AppSetting.key == DECISION_PASS_EXPERTS_KEY)
+        ).first()
+    if row is None or row.value_str is None:
+        return None
+    names = [name.strip() for name in row.value_str.split(",") if name.strip()]
+    if not names or "*" in names:
+        return None
+    return frozenset(names)
 
 
 def store_root() -> str:

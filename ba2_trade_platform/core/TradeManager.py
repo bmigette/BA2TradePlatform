@@ -2786,9 +2786,20 @@ class TradeManager:
                 return
             try:
                 meta = self._decision_pass_meta(store, expert_instance_id, uc, pass_name, trigger)
+                from . import replay_capture
+
+                allowed = replay_capture.decision_pass_expert_allowlist()
+                not_allowed = allowed is not None and meta["expert_class"] not in allowed
+                if not_allowed:
+                    # ROLLOUT allow-list (replay_capture.DECISION_PASS_EXPERTS_KEY): not an error, a
+                    # decision not to record; counted per reason and expert so it stays visible.
+                    store.health.record_discard("expert_not_allowed", meta["expert_class"])
             except Exception as e:  # noqa: BLE001 -- a recording problem never stops a decision
                 self._decision_pass_not_recorded(store, expert_instance_id, uc, pass_name, trigger, e)
                 yield None
+                return
+            if not_allowed:
+                yield None          # outside the try: the pass body's own exceptions land here
                 return
             with capture_scope(store, meta) as context:
                 if context is None:
