@@ -194,7 +194,8 @@ def legacy_universe_note(bt_block: Dict[str, Any], hoisted: Dict[str, Any], deco
 def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
                                     recompute_universe: bool = False,
                                     estimates_source: Any = None,
-                                    exclude_symbols: Any = None) -> Dict[str, Any]:
+                                    exclude_symbols: Any = None,
+                                    screener_panel: Any = None) -> Dict[str, Any]:
     """Rebuild an opt-derived row's run config.
 
     Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
@@ -260,6 +261,9 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
         bt_block["screener_opt"] = {**so, "store": SCREENER_STORE_DIR}
         so = bt_block["screener_opt"]
 
+    if screener_panel is not None:
+        bt_block = with_screener_panel(bt_block, screener_panel, row_id=bt.id)
+
     if recompute_universe:
         if not bt_block.get("screener_opt"):
             raise ValueError(f"--recompute-universe: backtest {bt.id} is not a screener-based row "
@@ -290,6 +294,32 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest, window: Any = None,
         trial_cfg["screener_universe_legacy_note"] = legacy_universe_note(
             bt_block, hoisted, decoded, row_id=bt.id)
     return trial_cfg
+
+
+def with_screener_panel(bt_block: Dict[str, Any], panel: str, *, row_id: Any = None) -> Dict[str, Any]:
+    """``bt_block`` re-pointed at ANOTHER daily panel (a directory under ``<cache>/screener/daily_panel``, or its
+    fingerprint): a stored row pins the panel it was scored on, and a re-run on a window that panel cannot serve
+    (e.g. an out-of-sample period after a symbol's delisting was acknowledged and the panel rebuilt) needs the newer
+    one. The panel's own manifest supplies the fingerprint; its criteria version must equal the row's. Explicit only
+    (the caller states it); the new panel's figures can differ from the stored row's wherever the panels differ."""
+    import os
+    from ba2_common.config import CACHE_FOLDER
+    from ba2_providers.screener import live_sim as _ls
+    so = bt_block.get("screener_opt")
+    if not (isinstance(so, dict) and so.get("panel")):
+        raise ValueError(f"--screener-panel: backtest {row_id} has no daily-panel screener block")
+    path = panel if os.path.isdir(panel) else _ls.panel_dir_for(CACHE_FOLDER, panel)
+    man = _ls.read_manifest(path)
+    if man is None:
+        raise ValueError(f"--screener-panel: no panel manifest at {path}")
+    if man.get("criteria_version") != so.get("criteria_version"):
+        raise ValueError(f"--screener-panel: panel criteria {man.get('criteria_version')!r} != the row's "
+                         f"{so.get('criteria_version')!r}")
+    out = dict(bt_block)
+    out["screener_opt"] = {**so, "panel": _ls.panel_rel(CACHE_FOLDER, path),
+                           "panel_fingerprint": man["panel_fingerprint"]}
+    out["_screener_panel_override"] = {"from": so.get("panel_fingerprint"), "to": man["panel_fingerprint"]}
+    return out
 
 
 def _build_standalone_rerun_config(bt: Backtest, estimates_source: Any = None) -> Dict[str, Any]:
@@ -366,7 +396,8 @@ def _stamp_estimates_source(block: Dict[str, Any], stored: Any, override: Any) -
 
 def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None,
                               recompute_universe: bool = False,
-                              estimates_source: Any = None, exclude_symbols: Any = None) -> Dict[str, Any]:
+                              estimates_source: Any = None, exclude_symbols: Any = None,
+                              screener_panel: Any = None) -> Dict[str, Any]:
     """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
 
     This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
@@ -397,14 +428,16 @@ def rebuild_config_for_backtest(bt: Backtest, db: Any = None, window: Any = None
         raise ValueError("--recompute-universe is only supported for optimization-derived rows")
     if exclude_symbols and not bt.optimization_id:
         raise ValueError("exclude_symbols is only supported for optimization-derived rows")
+    if screener_panel is not None and not bt.optimization_id:
+        raise ValueError("screener_panel is only supported for optimization-derived rows")
     if bt.optimization_id:
         if db is not None:
             return _build_optimization_rerun_config(db, bt, window, recompute_universe, estimates_source,
-                                                    exclude_symbols)
+                                                    exclude_symbols, screener_panel)
         session = SessionLocal()
         try:
             return _build_optimization_rerun_config(session, bt, window, recompute_universe, estimates_source,
-                                                    exclude_symbols)
+                                                    exclude_symbols, screener_panel)
         finally:
             session.close()
     return _build_standalone_rerun_config(bt, estimates_source)

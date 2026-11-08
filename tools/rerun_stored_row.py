@@ -137,6 +137,11 @@ def main() -> int:
     ap.add_argument("--source-db", metavar="SQLITE",
                     help="read the row, its optimization and strategy from THIS test-platform DB (e.g. an "
                          "unzipped backup) instead of the configured one; opened read-only, nothing is written")
+    ap.add_argument("--screener-panel", metavar="FINGERPRINT|DIR",
+                    help="re-point the row at another screener daily panel (its fingerprint under "
+                         "<cache>/screener/daily_panel, or a directory): a stored row pins the panel it was scored on, "
+                         "which may not serve another window (e.g. an out-of-sample period after a delisting was "
+                         "acknowledged and the panel rebuilt). Printed; still writes no row.")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override an EXPERT setting for this re-run (JSON value, else a string), e.g. "
                          "--set model_target_method=consensus. Repeatable. Still writes no row.")
@@ -179,6 +184,7 @@ def main() -> int:
                 probe = rebuild_config_for_backtest(bt, db, window=ns.window,
                                                     recompute_universe=ns.recompute_universe,
                                                     estimates_source=ns.estimates_source,
+                                                    screener_panel=ns.screener_panel,
                                                     exclude_symbols=sorted(excluded))
                 refused = set(basis_refused_symbols(probe)) - excluded
                 if not refused:
@@ -190,6 +196,7 @@ def main() -> int:
         config = rebuild_config_for_backtest(bt, db, window=ns.window,
                                              recompute_universe=ns.recompute_universe,
                                              estimates_source=ns.estimates_source,
+                                                    screener_panel=ns.screener_panel,
                                              exclude_symbols=[x.strip() for x in (ns.exclude_symbols or "").split(",")
                                                               if x.strip()])
         if ns.ohlcv_history_source:
@@ -218,6 +225,8 @@ def main() -> int:
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
     print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
           flush=True)
+    if ns.screener_panel:
+        print(f"screener panel OVERRIDE: {ns.screener_panel} (the stored row was scored on another panel)", flush=True)
     print(f"estimates source {config.get('estimates_source')}, OHLCV history "
           f"{config.get('ohlcv_history_source', 'fmp (legacy)')}", flush=True)
     if ns.set:
