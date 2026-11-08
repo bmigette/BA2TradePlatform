@@ -25,7 +25,7 @@ ba2_common-pure: no ba2_providers / ba2_trade_platform imports.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, List, NamedTuple, Optional
 
 from ba2_common.core.failure_modes import is_never_absorbed
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
@@ -351,3 +351,132 @@ def record_max_loss_stop(order: Optional[TradingOrder], safeguard_sl: Optional[f
             f"Could not record the max-loss stop for order {getattr(order, 'id', None)} "
             f"(transaction {getattr(order, 'transaction_id', None)}): {e}", exc_info=True)
         return None
+
+
+# ---------------------------------------------------------------------------------------------------
+# funded-entry staging (the composition between the RM's sizing and the broker submit)
+# ---------------------------------------------------------------------------------------------------
+class StagedEntry(NamedTuple):
+    """What :func:`stage_funded_entry` did: the evaluator's results and the main entry order it found
+    (``None`` when ``execute`` created none)."""
+
+    results: List[Any]
+    order: Optional[TradingOrder]
+
+
+def row_or_none(model_class, row_id):
+    """``get_instance`` that answers None instead of raising ``InstanceNotFound``.
+
+    "The row is gone" is a legitimate answer for a compensation routine -- it means there is nothing left
+    to compensate -- and must not abort the caller.
+    """
+    from ba2_common.core.db import InstanceNotFound, get_instance
+
+    if not row_id:
+        return None
+    try:
+        return get_instance(model_class, row_id)
+    except InstanceNotFound:
+        return None
+
+
+def persist_funded_entry(order: TradingOrder, quantity: float, stop_price: Optional[float] = None) -> None:
+    """Write the risk manager's decision onto the entry row BEFORE the broker is called.
+
+    WHY IT MUST BE BEFORE. At this point the RM-sized quantity and the safeguard stop exist only in
+    memory, on a TRANSIENT candidate object that is about to be thrown away; re-deriving them later from
+    a stranded row is not possible. Everything that can go wrong from here (a lock, a broker rejection, a
+    crash, a restart) leaves a row on disk, and that row is either sized and re-drivable or it is a dead
+    qty-0 stub nothing can reconstruct (order 460 on PROD 2026-08-10 sat untouched for 8 hours).
+    Persisting first also makes the broker submit the ONLY thing left that can fail, which is what lets
+    the compensation for an unsent entry be a simple statement about a row.
+
+    ``stop_price`` mirrors what the DB sizing path already does: there the candidate IS the persisted row;
+    the temp-list path sizes a transient candidate and only ever passed the stop as a ``submit_order``
+    argument, leaving the row's ``stop_price`` null -- the value the wash-trade re-submit reads to rebuild
+    the protective leg (with none it re-sends the entry naked). An explicit stop the ruleset already put
+    on the order wins: the RM's is a SAFEGUARD, not an override.
+
+    Safe only because the order is DETACHED (the enter loop's read-only session invariant): on an attached
+    row this ``update_instance`` is the self-deadlock.
+    """
+    from ba2_common.core.db import update_instance
+
+    order.quantity = quantity
+    if stop_price and not order.stop_price:
+        order.stop_price = stop_price
+    update_instance(order)
+
+
+def stamp_leg_quantities(order: TradingOrder) -> None:
+    """Stamp the entry's (RM-sized) quantity onto the protective legs ``execute()`` just created.
+
+    The legs were built from the entry's quantity while it was still the TRANSIENT 0 of
+    :func:`build_entry_candidate`, because the bracket is created inside ``execute()`` and the RM size is
+    stamped only afterwards. Measured 2026-08-08: 23 of 96 entry-staged legs carried quantity 0 (WKC /
+    GNTX / CSTL were refused by the quantity<=0 guard and cancelled, leaving a stop and NO take-profit).
+    Scoped to legs of THIS entry, created seconds ago by THIS execute(), so all are full-position legs.
+
+    LIVE-ONLY BY DESIGN: the backtest account builds its legs lazily at fill time from the FILLED entry
+    quantity, so it cannot inherit a transient 0; live must stage the leg before the fill because the
+    broker needs it resting. Persisted per leg through its own short-lived session, NOT left as a pending
+    mutation on the caller's session. A failure here never blocks the entry.
+    """
+    from sqlmodel import select
+
+    from ba2_common.core.db import get_db, update_instance
+
+    try:
+        with get_db() as leg_session:
+            leg_ids = [leg.id for leg in leg_session.exec(
+                select(TradingOrder).where(TradingOrder.depends_on_order == order.id)).all()]
+        for leg_id in leg_ids:
+            leg = row_or_none(TradingOrder, leg_id)
+            if leg is not None and leg.quantity != order.quantity:
+                logger.info(f"Stamped protective leg {leg.id} ({leg.order_type}) "
+                            f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
+                leg.quantity = order.quantity
+                update_instance(leg)
+    except Exception as leg_err:  # noqa: BLE001 -- never block the entry
+        logger.error(f"Failed to stamp protective-leg quantity for order {order.id}: {leg_err}",
+                     exc_info=True)
+
+
+def stage_funded_entry(evaluator: Any, symbol: str, quantity: float, stop_price: Optional[float], *,
+                       on_executed: Optional[Callable[[List[Any], Optional[TradingOrder]], None]] = None
+                       ) -> StagedEntry:
+    """Persist ONE funded entry up to (not including) the broker: execute, persist the RM decision, stamp legs.
+
+    1. ``evaluator.execute()`` creates the real order + transaction + TP/SL bracket (called only for
+       funded symbols);
+    2. the main entry order is the first created order that is a BUY/SELL, fetched DETACHED (no session
+       is left holding it; see :func:`persist_funded_entry`);
+    3. ``on_executed(results, order)`` (the recorder's hook) runs as soon as the order is known, before
+       anything is persisted -- called with ``order=None`` when ``execute`` created none;
+    4. the RM-sized quantity and safeguard stop go onto the row (:func:`persist_funded_entry`) and the
+       protective legs get the same quantity (:func:`stamp_leg_quantities`).
+
+    Returns ``StagedEntry(results, order)``; ``order`` is ``None`` when no main order was created (logged,
+    nothing to submit). An exception from ``execute`` or the persist propagates: the caller owns the
+    compensation. The broker submit (DB-lock retry, unsent-entry compensation) is the live tail and is
+    not here. Shared by ``TradeManager`` and the offline decision replay.
+    """
+    results = evaluator.execute()
+    order: Optional[TradingOrder] = None
+    for result in results:
+        if result.get("success") and isinstance(result.get("data"), dict):
+            order_id = result["data"].get("order_id")
+            if order_id:
+                # DETACHED on purpose: get_instance(session=None) opens and closes its own session and
+                # hands back a fully loaded, detached row (see the enter loop's block comment).
+                row = row_or_none(TradingOrder, order_id)
+                if row and row.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
+                    order = row
+    if on_executed is not None:
+        on_executed(results, order)
+    if order is None:
+        logger.warning(f"No main order created for funded {symbol}")
+        return StagedEntry(results, None)
+    persist_funded_entry(order, quantity, stop_price)
+    stamp_leg_quantities(order)
+    return StagedEntry(results, order)

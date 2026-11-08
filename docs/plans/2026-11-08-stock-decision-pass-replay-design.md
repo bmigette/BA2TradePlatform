@@ -463,3 +463,8 @@ Where the build departs from, or pins down, the text above:
 * Schema 3 (`OUTCOME_DECISION`, `AnalysisRecord.decision_object`, health kinds `pass_not_recorded` / `pass_discarded` /
   `step_not_recorded`; schemas 1 and 2 still load). `CaptureHealth.total` excludes discards (an accounted-for outcome).
 * The replay-side `experts`, `gather-tape` and `historical` capabilities skip decision-pass rows (Task 8 gives them their own).
+* Task 7 as built: `trade_cycle.stage_funded_entry(evaluator, symbol, quantity, stop_price, on_executed=...)` is execute + detached fetch of
+  the main order + `persist_funded_entry` + `stamp_leg_quantities` (the live-only leg stamp stays inside it: the backtest account builds
+  its legs at fill time). TradeManager calls it and keeps the broker tail (`_submit_funded_entry_with_retry`, `_fail_unsent_entry`);
+  `_persist_funded_entry` / `_row_or_none` delegate to the shared `persist_funded_entry` / `row_or_none`. The backtest engine's own
+  loop (`daily_engine.py:2448+`) is NOT changed (section 4 is later): it still has its own copy of the composition.

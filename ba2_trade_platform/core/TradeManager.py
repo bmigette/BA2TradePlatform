@@ -14,6 +14,7 @@ from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset,
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 from ba2_common.core.replay.clock import replay_now
+from ba2_common.core.trade_cycle import persist_funded_entry, row_or_none, stage_funded_entry
 from ba2_common.core.replay.decision_record import (
     note_funded, note_gate, note_pass_error, note_selection, pass_discard, pass_fail, pass_skip,
     record_execute, record_pass_state)
@@ -1519,18 +1520,9 @@ class TradeManager:
 
     @staticmethod
     def _row_or_none(model_class, row_id):
-        """``get_instance`` that answers None instead of raising InstanceNotFound.
-
-        "The row is gone" is a legitimate answer for a compensation routine — it means there is
-        nothing left to compensate — and must not abort the caller.
-        """
-        from .db import InstanceNotFound
-        if not row_id:
-            return None
-        try:
-            return get_instance(model_class, row_id)
-        except InstanceNotFound:
-            return None
+        """``get_instance`` that answers None instead of raising InstanceNotFound
+        (``trade_cycle.row_or_none``)."""
+        return row_or_none(model_class, row_id)
 
     def _fail_unsent_entry(self, order, reason: str) -> bool:
         """Cancel an entry that never reached the broker, and release everything behind it.
@@ -1963,37 +1955,9 @@ class TradeManager:
         return min(ages) if ages else None
 
     def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
-        """Write the risk manager's decision onto the entry row BEFORE the broker is called.
-
-        WHY IT MUST BE BEFORE. At this point the RM-sized quantity and the safeguard stop exist
-        only in memory, on a TRANSIENT candidate object that is about to be thrown away — see
-        ``_submit_funded_entry_with_retry``'s own docstring: "re-deriving them later from a
-        stranded row is not possible". Everything that can go wrong from here (a lock, a broker
-        rejection, a crash, a restart) leaves a row on disk, and that row is either sized and
-        re-drivable or it is a dead qty-0 stub nothing can reconstruct. Order 460 on PROD
-        2026-08-10 was the latter and sat untouched for 8 hours.
-
-        Persisting first also makes the broker submit the ONLY thing left that can fail, which
-        is what lets the compensation in ``_fail_unsent_entry`` be a simple, provable statement
-        about a row rather than a guess about how far the submit got.
-
-        ``stop_price`` mirrors what the DB sizing path already does. There the candidate IS the
-        persisted row, so ``_ensure_safeguard_stop``'s write lands in the database for free; the
-        temp-order-list path sizes a transient candidate and only ever passed the stop as a
-        ``submit_order`` argument, leaving the row's ``stop_price`` null. That null is what
-        ``_check_all_washtrade_locked_orders`` re-reads to rebuild the protective leg when it
-        re-submits a cleared lock — with no stop on the row it re-sends the entry naked.
-
-        An explicit stop the ruleset already put on the order always wins, exactly as in
-        ``_ensure_safeguard_stop``: the RM's is a SAFEGUARD, not an override.
-
-        Safe to call here only because the order is DETACHED (see the enter loop's read-only
-        session invariant). On an attached row this update_instance is the self-deadlock.
-        """
-        order.quantity = quantity
-        if stop_price and not order.stop_price:
-            order.stop_price = stop_price
-        update_instance(order)
+        """Write the RM's decision onto the entry row BEFORE the broker is called
+        (``trade_cycle.persist_funded_entry``, shared with the offline decision replay)."""
+        persist_funded_entry(order, quantity, stop_price)
 
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
@@ -3456,86 +3420,21 @@ class TradeManager:
                             order = None
                             try:
                                 with record_execute(evaluator, candidate.symbol, recommendation, True) as step:
-                                    # Persist the real order + transaction + TP/SL bracket (execute is
-                                    # byte-identical to the old flow; now called ONLY for funded symbols).
-                                    execution_results = evaluator.execute()
-                                    step.result = execution_results
-                                    for result in execution_results:
-                                        if result.get('success') and isinstance(result.get('data'), dict):
-                                            oid = result['data'].get('order_id')
-                                            if oid:
-                                                # DETACHED on purpose — see the block comment above
-                                                # this loop's `with get_db() as session:`. Fetching
-                                                # through the long-lived `session` attaches the row,
-                                                # the RM stamp two lines below makes that session
-                                                # DIRTY, and the next query on it autoflushes and
-                                                # takes sqlite's one write lock — which submit_order
-                                                # then blocks on from its own second connection.
-                                                # get_instance(session=None) opens and closes its own
-                                                # session and hands back a fully loaded, detached row.
-                                                o = self._row_or_none(TradingOrder, oid)
-                                                if o and o.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
-                                                    order = o
-                                    step.order = order
-                                    if order is None:
-                                        self.logger.warning(f"No main order created for funded {candidate.symbol}")
-                                        continue
-                                    # RM-sized quantity + safeguard stop from the candidate pass,
-                                    # WRITTEN TO DISK before the broker is asked for anything.
-                                    self._persist_funded_entry(order, fo.quantity, fo.stop_price or None)
+                                    def _executed(results, main_order, step=step):
+                                        step.result = results
+                                        step.order = main_order
 
-                                    # ...and stamp the SAME quantity onto the protective legs execute()
-                                    # just created. They were built by the account from the entry's
-                                    # quantity while it was still the TRANSIENT 0 that
-                                    # build_entry_candidate() sets, because the bracket is created inside
-                                    # execute() and the RM size is stamped only here, one line above.
-                                    #
-                                    # A leg is therefore born correct only when the stamp happens to land
-                                    # first, which is a race, not a rule. Measured 2026-08-08: 23 of 96
-                                    # entry-staged legs across dev+prod carried quantity 0 (every one of
-                                    # them `trigger=FILLED`, i.e. staged against an unfilled entry), and
-                                    # the three live ones — WKC / GNTX / CSTL — were refused by the
-                                    # quantity<=0 guard and cancelled, leaving those positions with a
-                                    # stop and NO take-profit.
-                                    #
-                                    # Doing it here closes the race at the source: same value, same
-                                    # moment. Scoped to legs of THIS entry, created seconds ago by
-                                    # THIS execute(), so they are all full-position legs — the
-                                    # partial-close case (a leg sized for the REMAINING shares behind a
-                                    # close order) hangs off a different parent and cannot be reached.
-                                    #
-                                    # NOT shared with the backtest deliberately: BacktestAccount builds
-                                    # its legs lazily at fill time from the FILLED entry quantity
-                                    # (`held = abs(net)`), so it cannot inherit a transient 0 and has no
-                                    # equivalent defect. Live must stage the leg before the fill because
-                                    # the broker needs it resting; that constraint is live-only.
-                                    #
-                                    # PERSISTED HERE, per leg, through its own short-lived session —
-                                    # NOT left as a pending mutation on the enter loop's session. That
-                                    # is what the previous version did behind `no_autoflush`, and it
-                                    # only moved the problem: the legs stayed dirty and attached, so
-                                    # the NEXT candidate's first query flushed them instead and took
-                                    # the write lock right before ITS submit. `no_autoflush` closes one
-                                    # column; owning nothing on that session closes them all.
-                                    try:
-                                        from sqlmodel import select as _leg_select
-                                        from .db import get_db as _get_db
-                                        with _get_db() as leg_session:
-                                            leg_ids = [l.id for l in leg_session.exec(
-                                                _leg_select(TradingOrder).where(
-                                                    TradingOrder.depends_on_order == order.id)).all()]
-                                        for leg_id in leg_ids:
-                                            leg = self._row_or_none(TradingOrder, leg_id)
-                                            if leg is not None and leg.quantity != order.quantity:
-                                                self.logger.info(
-                                                    f"Stamped protective leg {leg.id} ({leg.order_type}) "
-                                                    f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
-                                                leg.quantity = order.quantity
-                                                update_instance(leg)
-                                    except Exception as leg_err:  # noqa: BLE001 — never block the entry
-                                        self.logger.error(
-                                            f"Failed to stamp protective-leg quantity for order {order.id}: "
-                                            f"{leg_err}", exc_info=True)
+                                    # Execute (the real order + transaction + TP/SL bracket, ONLY for
+                                    # funded symbols), fetch the main order DETACHED, write the RM-sized
+                                    # quantity + safeguard stop onto it BEFORE the broker is asked for
+                                    # anything and stamp the protective legs: ONE shared function
+                                    # (trade_cycle.stage_funded_entry), the same the offline decision
+                                    # replay calls. Its docstrings carry the history of each step.
+                                    order = stage_funded_entry(
+                                        evaluator, candidate.symbol, fo.quantity, fo.stop_price or None,
+                                        on_executed=_executed).order
+                                    if order is None:
+                                        continue
 
                                     # The submit wrapper reconciles this RM safeguard with the
                                     # transaction's ruleset stop using the same helper as backtests.

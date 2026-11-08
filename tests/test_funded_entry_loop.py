@@ -1039,11 +1039,12 @@ def test_a_real_db_error_during_compensation_is_not_swallowed(file_db):
     error or a corrupt file are not answers, and silently treating them as "no row" would turn
     a failed compensation into a silent no-op — the same blindness this whole change is about."""
     from sqlalchemy.exc import OperationalError
-    from ba2_trade_platform.core import TradeManager as _tm_mod
     from ba2_trade_platform.core.TradeManager import get_trade_manager
 
     boom = OperationalError("SELECT tradingorder", {}, Exception("disk I/O error"))
-    with patch.object(_tm_mod, "get_instance", side_effect=boom):
+    # ``_row_or_none`` is ``trade_cycle.row_or_none`` now (shared with the decision replay); it reads
+    # ``get_instance`` from ba2_common.core.db.
+    with patch.object(_pkg_db, "get_instance", side_effect=boom):
         with pytest.raises(OperationalError):
             get_trade_manager()._row_or_none(TradingOrder, 1)
 
