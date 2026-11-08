@@ -98,6 +98,10 @@ __all__ = [
 #: (``recording_budget_exceeded``). A degraded recorder (slow disk, a codec that keeps refusing) can
 #: therefore cost a pass at most this much, whatever the pass size. The pass itself is never affected.
 PASS_RECORD_SECONDS_BUDGET = 30.0
+#: The exit pass (``open-positions``) guards OPEN positions: its recorder budget is small, so a degraded
+#: recorder can delay a stop/exit by at most this much (the entry pass keeps the loose budget above).
+EXIT_PASS_RECORD_SECONDS_BUDGET = 3.0
+EXIT_PASS_NAME = "open-positions"
 PASS_RECORD_FAILURE_BUDGET = 25
 
 DECISION_PROVIDER = "decision_step"
@@ -198,6 +202,7 @@ def _ledger(context) -> Dict[str, Any]:
     if not ledger:
         ledger.update({"symbols": {}, "steps": [], "steps_not_recorded": [], "errors": [],
                        "effects_outside_steps": [], "budget_exceeded": None})
+        context.submit_hook = lambda seconds: _submit_counted(context, seconds)
     return ledger
 
 
@@ -205,6 +210,20 @@ def _add_record_seconds(context, seconds: float) -> None:
     """Pass-thread time spent recording (inputs built, outcome frozen): what recording COSTS a pass."""
     ledger = _ledger(context)
     ledger["record_seconds"] = (ledger["record_seconds"] if "record_seconds" in ledger else 0.0) + seconds
+
+
+def _seconds_budget(context) -> float:
+    flags = context.meta["branch_flags"]
+    return EXIT_PASS_RECORD_SECONDS_BUDGET if flags["pass"] == EXIT_PASS_NAME else PASS_RECORD_SECONDS_BUDGET
+
+
+def _submit_counted(context, seconds: float) -> None:
+    """The scope-close submit (record build + queue hand-off) is recorder time too; over budget is an ERROR."""
+    _add_record_seconds(context, seconds)
+    total = _ledger(context)["record_seconds"]
+    if total >= _seconds_budget(context):
+        logger.error(f"replay capture: decision pass {context.analysis_id} spent {total:.1f}s recording "
+                     f"(its submit took {seconds:.2f}s), over its budget of {_seconds_budget(context):.1f}s")
 
 
 def _budget_allows(context, kind: str, symbol: str) -> bool:
@@ -215,9 +234,9 @@ def _budget_allows(context, kind: str, symbol: str) -> bool:
         if reason is None:
             seconds = ledger["record_seconds"] if "record_seconds" in ledger else 0.0
             failures = sum(context.capture_failures.values())
-            if seconds >= PASS_RECORD_SECONDS_BUDGET:
+            if seconds >= _seconds_budget(context):
                 reason = (f"recorder time {seconds:.1f}s reached the per-pass budget of "
-                          f"{PASS_RECORD_SECONDS_BUDGET:.1f} seconds")
+                          f"{_seconds_budget(context):.1f} seconds")
             elif failures >= PASS_RECORD_FAILURE_BUDGET:
                 reason = (f"{failures} recorder failures reached the per-pass budget of "
                           f"{PASS_RECORD_FAILURE_BUDGET}")
@@ -801,6 +820,8 @@ def record_pass_state(*, expert, expert_instance, pass_name: str, lookback_days:
     """
     context = decision_context()
     if context is None:
+        return None
+    if not _budget_allows(context, KIND_PASS_STATE, ""):
         return None
     started = time.perf_counter()
     try:

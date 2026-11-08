@@ -74,3 +74,64 @@ def test_a_spent_budget_is_not_a_decision_input(monkeypatch):
         with dr.record_rules(_Evaluator(), "A", _rec("A"), 9, None) as step:
             step.result = ["x"]                # assignment on the no-op handle is harmless
         context.set_skip("t")
+
+
+def _exit_meta():
+    meta = _meta()
+    meta["branch_flags"] = {**meta["branch_flags"], "pass": "open-positions"}
+    return meta
+
+
+def test_the_exit_pass_has_its_own_small_budget():
+    """An exit pass guards open positions: it may spend EXIT_PASS_RECORD_SECONDS_BUDGET, not the 30 s of an entry pass."""
+    assert dr.EXIT_PASS_RECORD_SECONDS_BUDGET <= 5.0 < dr.PASS_RECORD_SECONDS_BUDGET
+    spent = dr.EXIT_PASS_RECORD_SECONDS_BUDGET + 0.5
+    store = _Store()
+    with capture_scope(store, _exit_meta()) as context:
+        dr._add_record_seconds(context, spent)
+        _good_step("A")
+        summary = dr.pass_summary(context)
+        context.set_skip("t")
+    assert _steps(store, "rules") == [] and "seconds" in summary["recording_budget_exceeded"]
+    store = _Store()
+    with capture_scope(store, _meta()) as context:           # the same spend is fine in an entry pass
+        dr._add_record_seconds(context, spent)
+        _good_step("A")
+        context.set_skip("t")
+    assert len(_steps(store, "rules")) == 1
+
+
+def test_pass_state_is_under_the_budget_too():
+    store = _Store()
+    with capture_scope(store, _exit_meta()) as context:
+        dr._add_record_seconds(context, 60.0)
+        assert dr.record_pass_state(expert=None, expert_instance=None, pass_name="open-positions",
+                                    lookback_days=1, cutoff_time=None, decision_time=None, account=None,
+                                    ruleset_id=None, fetched_recommendations=[],
+                                    selected_recommendations=[]) is None
+        summary = dr.pass_summary(context)
+        context.set_skip("t")
+    assert [e["kind"] for e in summary["steps_not_recorded"]] == [dr.KIND_PASS_STATE]
+    assert "budget" in summary["steps_not_recorded"][0]["error"]
+    assert store.health.count(CaptureHealth.STEP_NOT_RECORDED) == 1
+
+
+def test_the_scope_close_submit_is_counted_in_the_recorder_time(monkeypatch):
+    import time as _time
+    errors = []
+    monkeypatch.setattr("ba2_common.core.replay.context.logger.error", lambda msg, *a, **k: errors.append(msg))
+    store = _Store()
+    real_submit = store.submit
+
+    def slow_submit(*args, **kwargs):
+        _time.sleep(0.05)
+        return real_submit(*args, **kwargs)
+
+    store.submit = slow_submit
+    monkeypatch.setattr(dr, "EXIT_PASS_RECORD_SECONDS_BUDGET", 0.01)
+    with capture_scope(store, _exit_meta()) as context:
+        _good_step("A")
+        before = context.decision_ledger["record_seconds"]
+        context.set_skip("t")
+    assert context.decision_ledger["record_seconds"] >= before + 0.04
+    assert any("submit" in m and "budget" in m for m in errors)

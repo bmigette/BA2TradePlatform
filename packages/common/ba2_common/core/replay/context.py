@@ -23,6 +23,7 @@ import contextvars
 import functools
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -285,6 +286,8 @@ class CaptureContext:
         #: Stock decision pass only: per-symbol verdicts the step recorders and the gate notes
         #: accumulate; frozen into the ``decision`` object when the pass ends.
         self.decision_ledger: Dict[str, Any] = {}
+        #: Called with the seconds the scope-close submit took (the decision recorder counts them in its budget).
+        self.submit_hook = None
         self._lock = threading.Lock()
 
         if "settings" in self.meta:
@@ -669,10 +672,17 @@ class CaptureContext:
         if self._discard_reason is not None and self._outcome is None:
             store.health.record_discard(self._discard_reason, self.meta["expert_class"])
             return
+        started = time.perf_counter()
         try:
             store.submit(self.build_record(), objects=self.objects, observations=self.observations)
         except Exception as exc:
             self._note_failure("analysis record not submitted", exc)
+        finally:
+            if self.submit_hook is not None:
+                try:
+                    self.submit_hook(time.perf_counter() - started)
+                except Exception as exc:  # noqa: BLE001 -- accounting never reaches the writer
+                    logger.error(f"replay capture: submit accounting failed: {exc}", exc_info=True)
 
     # -- failure boundary
 
