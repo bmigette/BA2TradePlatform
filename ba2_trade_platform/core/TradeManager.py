@@ -15,7 +15,8 @@ from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenTy
 from .db import get_instance, get_all_instances, add_instance, update_instance
 from ba2_common.core.replay.clock import replay_now
 from ba2_common.core.trade_cycle import (
-    entry_submit_stop, persist_funded_entry, row_or_none, stage_funded_entry, submit_funded_entry)
+    entry_submit_stop, persist_funded_entry, row_or_none, select_enter_candidates, stage_funded_entry,
+    submit_funded_entry)
 from ba2_common.core.replay.decision_record import (
     note_funded, note_gate, note_pass_error, note_selection, pass_discard, pass_fail, pass_skip,
     record_execute, record_pass_state)
@@ -3140,21 +3141,10 @@ class TradeManager:
                     pass_skip("no actionable recommendations")
                     return created_orders
                 
-                # Filter to get only the latest recommendation per instrument
-                # This prevents processing multiple recommendations for the same symbol
-                latest_per_instrument = {}
-                for rec in all_recommendations:
-                    # Keep only the first (most recent) recommendation for each symbol
-                    if rec.symbol not in latest_per_instrument:
-                        latest_per_instrument[rec.symbol] = rec
-                
-                # Convert to list and sort by profit potential
-                recommendations = sorted(
-                    latest_per_instrument.values(),
-                    key=lambda r: r.expected_profit_percent,
-                    reverse=True
-                )
-                
+                # Latest recommendation per instrument (prevents processing several for one symbol),
+                # best profit potential first: the SHARED selection the decision replay recomputes.
+                recommendations = select_enter_candidates(all_recommendations)
+
                 note_selection(recommendations)
                 record_pass_state(
                     expert=expert, expert_instance=expert_instance, pass_name="enter-market",

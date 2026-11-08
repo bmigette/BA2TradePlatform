@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ba2_common.core.replay import ReplayStatus, load_bundle
+from ba2_common.core.replay.decision_record import is_decision_pass
 
 from app.services.replay.report import CAPABILITY_TITLES, STATUS_ORDER
 
 __all__ = ["run", "to_markdown", "INVENTORY_NAME"]
 
 INVENTORY_NAME = "inventory.json"
+
+#: ``analyses_by_record_kind`` keys: an expert analysis vs a stock decision pass.
+RECORD_KIND_EXPERT = "expert_analysis"
+RECORD_KIND_DECISION_PASS = "decision_pass"
 
 #: Every capability the report knows about, so one with no rows still appears as
 #: ``not_run`` instead of dropping out of the table.
@@ -35,12 +40,18 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
     """Count everything in ``bundle_dir``; write ``inventory.json`` when asked."""
     bundle = load_bundle(bundle_dir)
     analyses = bundle.analyses
+    # A stock decision pass is NOT an expert analysis (it carries the owning expert's class only as
+    # its owner): it is counted by record kind, never under ``analyses_by_expert``.
+    decision_passes = [a for a in analyses if is_decision_pass(a)]
+    expert_analyses = [a for a in analyses if not is_decision_pass(a)]
 
-    by_expert = Counter(a.expert_class for a in analyses)
+    by_record_kind = Counter(RECORD_KIND_DECISION_PASS if is_decision_pass(a) else RECORD_KIND_EXPERT
+                             for a in analyses)
+    by_expert = Counter(a.expert_class for a in expert_analyses)
     by_use_case = Counter(a.use_case for a in analyses)
     by_outcome = Counter(a.outcome for a in analyses)
     by_capture_status = Counter(a.bundle_capture_status for a in analyses)
-    by_expert_outcome = Counter((a.expert_class, a.outcome) for a in analyses)
+    by_expert_outcome = Counter((a.expert_class, a.outcome) for a in expert_analyses)
     skip_reasons = Counter(a.skip_reason for a in analyses
                            if a.outcome == ReplayStatus.OUTCOME_SKIP)
 
@@ -63,8 +74,12 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
         # An analysis with no coverage row for a capability has not been run for
         # it. Saying so explicitly is what stops a partial run reading as a full
         # one when the totals are divided.
+        # The decision capability answers for decision passes only, the expert capabilities for expert
+        # analyses only.
+        applicable = (decision_passes if capability == ReplayStatus.CAPABILITY_DECISION
+                      else expert_analyses)
         rows[ReplayStatus.COVERAGE_NOT_RUN] += sum(
-            1 for a in analyses if a.analysis_id not in seen)
+            1 for a in applicable if a.analysis_id not in seen)
         coverage[capability] = rows
 
     capture_gaps = Counter(gap for a in analyses for gap in a.capture_gaps)
@@ -95,6 +110,7 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             "observations": len(bundle.observations),
             "coverage_rows": len(bundle.coverage),
         },
+        "analyses_by_record_kind": dict(sorted(by_record_kind.items())),
         "analyses_by_expert": dict(sorted(by_expert.items())),
         "analyses_by_use_case": dict(sorted(by_use_case.items())),
         "analyses_by_outcome": dict(sorted(by_outcome.items())),
@@ -118,6 +134,7 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
         "coverage_by_capability": coverage,
         # Separate from the stock capabilities above, which keep their exact set.
         "option_actions": option_actions,
+        "decision_passes": _decision_passes(bundle, decision_passes),
     }
     if out_dir is not None:
         out = Path(out_dir)
@@ -127,6 +144,31 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             encoding="utf-8")
         (out / "inventory.md").write_text(to_markdown(inventory), encoding="utf-8")
     return inventory
+
+
+def _decision_passes(bundle, passes) -> Dict[str, Any]:
+    """Recorded stock decision passes, counted by pass kind, outcome and recorded step kind.
+
+    Replayed by the ``decision`` capability (``replay decision``); its coverage rows are in
+    ``coverage_by_capability``.
+    """
+    by_pass: Counter = Counter()
+    by_outcome: Counter = Counter()
+    steps: Counter = Counter()
+    for analysis in passes:
+        by_pass[analysis.branch_flags["pass"] if "pass" in analysis.branch_flags else "unknown"] += 1
+        by_outcome[analysis.outcome] += 1
+        for observation in bundle.observations_for(analysis.analysis_id):
+            if observation.provider == "decision_step":
+                steps[observation.method] += 1
+    return {
+        "total": len(passes),
+        "by_pass": dict(sorted(by_pass.items())),
+        "by_outcome": dict(sorted(by_outcome.items())),
+        "steps_by_kind": dict(sorted(steps.items())),
+        "replayed_by": ReplayStatus.CAPABILITY_DECISION,
+        "replay_command": "ba2-test replay decision --bundle <dir>",
+    }
 
 
 def _option_actions(bundle) -> Dict[str, Any]:
@@ -190,7 +232,8 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
         f"{inventory['totals']['observations']} provider observations, "
         f"{inventory['totals']['coverage_rows']} coverage rows.",
     ]
-    lines += _table("Analyses by expert", "Expert", inventory["analyses_by_expert"])
+    lines += _table("Analyses by record kind", "Record kind", inventory["analyses_by_record_kind"])
+    lines += _table("Analyses by expert (expert analyses only)", "Expert", inventory["analyses_by_expert"])
     lines += _table("Analyses by use case", "Use case", inventory["analyses_by_use_case"])
     lines += _table("Analyses by outcome", "Outcome", inventory["analyses_by_outcome"])
     lines += _table("Analyses by expert and outcome", "Expert / outcome",
@@ -221,6 +264,13 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
     for capability, rows in inventory["coverage_by_capability"].items():
         counts = " | ".join(str(rows[status]) for status in STATUS_ORDER)
         lines.append(f"| {capability} | {counts} |")
+    decisions = inventory["decision_passes"]
+    lines += ["", "## Decision passes", "",
+              f"{decisions['total']} recorded stock decision pass(es), replayed by the "
+              f"`{decisions['replayed_by']}` capability (`{decisions['replay_command']}`)."]
+    lines += _table("Decision passes by kind", "Pass", decisions["by_pass"])
+    lines += _table("Decision passes by outcome", "Outcome", decisions["by_outcome"])
+    lines += _table("Recorded decision steps", "Step", decisions["steps_by_kind"])
     options = inventory["option_actions"]
     lines += ["", "## Option actions", "",
               f"{options['total']} recorded option entry / close action(s), replayed by the "

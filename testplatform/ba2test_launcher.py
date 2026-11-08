@@ -737,7 +737,7 @@ _WARM_JOIN_TIMEOUT_S = 3600.0
 
 # --- replay (offline replay of a recorded live session) --------------------------------
 def _cmd_replay(args) -> int:
-    """``inventory`` / ``experts`` / ``gather`` / ``historical`` / ``option-selection`` over one bundle.
+    """``inventory`` / ``experts`` / ``gather`` / ``historical`` / ``option-selection`` / ``decision`` over one bundle.
 
     Everything runs offline: the services enter the replay isolation (hermetic
     FMP, a closed socket layer, refusing instance/provider resolvers) and read
@@ -752,7 +752,7 @@ def _cmd_replay(args) -> int:
     if args.replay_cmd in ("checkout", "export"):
         return _cmd_replay_code_tools(args)
 
-    from app.services.replay import expert_replay, gather_tape, inventory, option_selection
+    from app.services.replay import decision_pass, expert_replay, gather_tape, inventory, option_selection
 
     bundle = _caller_path(args.bundle)
     if not os.path.isdir(bundle):
@@ -780,7 +780,7 @@ def _cmd_replay(args) -> int:
         report = historical.run(bundle, cache_root, out, timeout=args.timeout)
     else:
         module = {"experts": expert_replay, "gather": gather_tape,
-                  "option-selection": option_selection}[args.replay_cmd]
+                  "option-selection": option_selection, "decision": decision_pass}[args.replay_cmd]
         report = module.run(bundle, out)
     # ONE clear line: which code recorded the session and which code ran this replay.
     if report.code_provenance is not None:
@@ -11641,6 +11641,13 @@ def main(argv: "list | None" = None) -> int:
     rpo.add_argument("--bundle", required=True, help="Exported session directory.")
     rpo.add_argument("--out", default=None,
                      help="Write option_selection.md/.json into this directory.")
+    rpd = rplsub.add_parser(
+        "decision",
+        help="Re-run each recorded stock decision pass (enter-market / open-positions) on its tape: "
+             "selection, rules and gates, sizing, order build, TP/SL and account effects, compared "
+             "exactly.")
+    rpd.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpd.add_argument("--out", default=None, help="Write decision.md/.json into this directory.")
     rph = rplsub.add_parser(
         "historical",
         help="Re-run each recorded analysis through analyze_as_of against a PINNED cache "

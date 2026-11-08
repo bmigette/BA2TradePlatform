@@ -31,6 +31,15 @@ __all__ = [
     "CAPABILITY_TITLES",
     "CAPABILITY_OPTION_SELECTION",
     "OPTION_STAGE_ROWS",
+    "DECISION_STAGE_ROWS",
+    "STAGE_SELECTION",
+    "STAGE_RULES_AND_SIZING",
+    "STAGE_EXECUTION",
+    "STAGE_DECISION_RULES",
+    "STAGE_DECISION_SIZING",
+    "STAGE_DECISION_TPSL",
+    "STAGE_DECISION_ORDER",
+    "STAGE_DECISION_SUBMIT",
     "STATUS_ORDER",
 ]
 
@@ -123,10 +132,14 @@ CAPABILITY_CAVEATS: Dict[str, str] = {
 #: recorded provider returns, and a historical row when it was rebuilt from a pinned
 #: cache root -- the first proves the mapping, the second measures reconstruction
 #: drift. Only the capability that actually ran fills the row in ITS report.
+STAGE_SELECTION = "Selection"
+STAGE_RULES_AND_SIZING = "Rules and sizing"
+STAGE_EXECUTION = "Execution"
+
 STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
-    ("Selection",
+    (STAGE_SELECTION,
      "Candidate coverage, filters, ranked order, selected/held symbols",
-     ()),
+     (ReplayStatus.CAPABILITY_DECISION,)),
     ("Expert inputs",
      "Normalized _gather bundle rebuilt from the recorded provider returns "
      "(gather tape) or from a pinned historical cache root (historical)",
@@ -134,13 +147,49 @@ STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("Recommendation",
      "Skip reason, signal, confidence, expected profit, current price, target",
      (ReplayStatus.CAPABILITY_RECORDED_EXPERT, ReplayStatus.CAPABILITY_HISTORICAL)),
-    ("Rules and sizing",
+    (STAGE_RULES_AND_SIZING,
      "Branch, eligibility, operands/budget, intended side/quantity, TP/SL",
-     ()),
-    ("Execution",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_EXECUTION,
      "Submit attempts/rejections, partial/full fills, final active protection",
-     ()),
+     (ReplayStatus.CAPABILITY_DECISION,)),
 )
+
+#: The stock decision-pass replay's finer stage rows (shown only on a ``decision`` report; the three
+#: coarse rows above are their roll-up). Comparison is EXACT at every stage; a numeric difference carries
+#: its delta. A row that is about another kind of step (a ``rules`` row has no order build) is
+#: ``not_run`` there, so every row is represented at every stage.
+STAGE_DECISION_RULES = "Decision rules"
+STAGE_DECISION_SIZING = "Decision sizing"
+STAGE_DECISION_TPSL = "Decision TP/SL"
+STAGE_DECISION_ORDER = "Decision order build"
+STAGE_DECISION_SUBMIT = "Decision submit / refusal"
+
+DECISION_STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    (STAGE_DECISION_RULES,
+     "Action summaries, every condition evaluation (type, result, the values it read), rule verdicts, "
+     "gate verdicts (open position, equity, route)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_SIZING,
+     "Candidate orders, funded set (symbol, quantity, stop), the RM's decisions (outcome, reason, "
+     "operands, binding constraint) and context figures",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_TPSL,
+     "Take-profit / stop-loss prices handed to the account (submit_order, adjust_tp/sl)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_ORDER,
+     "The main order and transaction the execute built (fields, not ids or timestamps)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_SUBMIT,
+     "Ordered account effect calls with arguments, action results, the refusal or error",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+)
+
+DECISION_NOT_RUN = (
+    "Smart risk manager passes (LLM reasoning); option entries/exits (replayed by `option-selection`); "
+    "broker fills, rejections and adapter-built protective legs (observations, not decisions); rules "
+    "that read market-data providers (OHLCV / indicators / fundamentals) report `missing_capture` "
+    "until those reads are served from the tape")
 
 
 #: The option selection stage rows (shown only on an ``option_selection`` report). Comparison is
@@ -401,6 +450,8 @@ class ReplayReport:
         ]
         if self.capability == CAPABILITY_OPTION_SELECTION:
             not_run.append(HISTORICAL_PROVIDER_TITLE)
+        if self.capability == ReplayStatus.CAPABILITY_DECISION:
+            not_run.append(DECISION_NOT_RUN)
         title = (OPTION_CAPABILITY_TITLE if self.capability == CAPABILITY_OPTION_SELECTION
                  else CAPABILITY_TITLES[self.capability])
         caveat = (OPTION_CAVEAT if self.capability == CAPABILITY_OPTION_SELECTION
@@ -424,6 +475,8 @@ class ReplayReport:
         out: List[Tuple[str, str, str, Tuple[str, ...]]] = []
         rows = STAGE_ROWS + (OPTION_STAGE_ROWS
                              if self.capability == CAPABILITY_OPTION_SELECTION else ())
+        if self.capability == ReplayStatus.CAPABILITY_DECISION:
+            rows = rows + DECISION_STAGE_ROWS
         for stage, fields_text, capabilities in rows:
             if self.capability not in capabilities:
                 out.append((stage, fields_text, ReplayStatus.COVERAGE_NOT_RUN, capabilities))

@@ -9,7 +9,8 @@ attribute on the concrete class). A class that sets ``_replay_taps_exempt`` is s
 
 **Sizing reads** (``SIZING_READ_TAPPED_METHODS``, provider ``"broker"``): what the stock sizing and
 rules code asks the account: ``get_account_snapshot``, ``get_positions``,
-``get_instrument_current_price``, ``get_balance``, ``has_pending_closing_order`` and ``get_fractionable``.
+``get_instrument_current_price``, ``get_balance``, ``get_account_info``, ``has_pending_closing_order`` and
+``get_fractionable``.
 
 * ``get_instrument_current_price`` is tapped on the base class; an OVERRIDE (``AlpacaAccount``
   normalises ``price_type`` and calls ``super()``) used to escape the tap, so a quote the caller
@@ -88,6 +89,9 @@ SIZING_READ_TAPPED_METHODS: Dict[str, Tuple[str, Callable[[Mapping[str, Any]], M
     # The balance every expert sizes against (``get_tradable_balance`` -> ``_plain_balance`` -> here). At
     # Alpaca / TastyTrade it is its own broker call, NOT derived from the snapshot, so it needs its own tap.
     "get_balance": (ACCOUNT_PROVIDER, account_only_identity),
+    # The buying-power clamp falls back to it when the snapshot carries no figure
+    # (``MarketExpertInterface._read_actual_buying_power``): a broker read like the others.
+    "get_account_info": (ACCOUNT_PROVIDER, account_only_identity),
     "get_account_snapshot": (ACCOUNT_PROVIDER, account_only_identity),
     "get_positions": (ACCOUNT_PROVIDER, account_only_identity),
     "get_instrument_current_price": (ACCOUNT_PROVIDER, _quote_identity),

@@ -69,6 +69,7 @@ __all__ = [
     "RECORD_VERSION",
     "VOLATILE_ORDER_FIELDS",
     "decision_context",
+    "execute_rows_after",
     "execute_view",
     "is_decision_pass",
     "note_funded",
@@ -621,33 +622,7 @@ class _ExecuteRecorder(_StepRecorder):
         }
 
     def _rows_after(self, results) -> List[Dict[str, Any]]:
-        from ba2_common.core.models import Transaction
-        from ba2_common.core.trade_store import get_or_none, orders_where
-
-        order_ids: List[int] = []
-        for result in results or []:
-            data = result.get("data") if isinstance(result, dict) else None
-            if isinstance(data, dict) and data.get("order_id"):
-                order_ids.append(data["order_id"])
-        if self.order is not None and self.order.id is not None:
-            order_ids.append(self.order.id)
-        rows: Dict[tuple, Dict[str, Any]] = {}
-        transaction_ids: List[int] = []
-        for order_id in dict.fromkeys(order_ids):
-            from ba2_common.core.models import TradingOrder
-            order = get_or_none(TradingOrder, order_id)
-            if order is None:
-                continue
-            rows[("TradingOrder", order.id)] = _dump(order)
-            for leg in orders_where(depends_on_order=order.id):
-                rows[("TradingOrder", leg.id)] = _dump(leg)
-            if order.transaction_id is not None:
-                transaction_ids.append(order.transaction_id)
-        for transaction_id in dict.fromkeys(transaction_ids):
-            transaction = get_or_none(Transaction, transaction_id)
-            if transaction is not None:
-                rows[("Transaction", transaction.id)] = _dump(transaction)
-        return core.sorted_rows(rows)
+        return execute_rows_after(results, self.order)
 
     def outcome_block(self, exc, encode):
         results = self.result if exc is None else None
@@ -668,6 +643,37 @@ class _ExecuteRecorder(_StepRecorder):
             "observation_id": self.observation_id,
             "effects": [e["method"] for e in self._frame.submits],
         }
+
+
+def execute_rows_after(results, order) -> List[Dict[str, Any]]:
+    """The rows an execute created/changed: each result's order, its protective legs, the main ``order``
+    and the transactions they belong to (dumps). ONE derivation for the recorder and the replay."""
+    from ba2_common.core.models import Transaction, TradingOrder
+    from ba2_common.core.trade_store import get_or_none, orders_where
+
+    order_ids: List[int] = []
+    for result in results or []:
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict) and data.get("order_id"):
+            order_ids.append(data["order_id"])
+    if order is not None and order.id is not None:
+        order_ids.append(order.id)
+    rows: Dict[tuple, Dict[str, Any]] = {}
+    transaction_ids: List[int] = []
+    for order_id in dict.fromkeys(order_ids):
+        held = get_or_none(TradingOrder, order_id)
+        if held is None:
+            continue
+        rows[("TradingOrder", held.id)] = _dump(held)
+        for leg in orders_where(depends_on_order=held.id):
+            rows[("TradingOrder", leg.id)] = _dump(leg)
+        if held.transaction_id is not None:
+            transaction_ids.append(held.transaction_id)
+    for transaction_id in dict.fromkeys(transaction_ids):
+        transaction = get_or_none(Transaction, transaction_id)
+        if transaction is not None:
+            rows[("Transaction", transaction.id)] = _dump(transaction)
+    return core.sorted_rows(rows)
 
 
 def record_execute(evaluator, symbol, recommendation, submit_to_broker):

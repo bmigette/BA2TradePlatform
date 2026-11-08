@@ -154,10 +154,26 @@ _ALLOWED = {
     "get_tradable_balance": "derived from the tapped get_balance (margin off) / get_account_snapshot (margin on)",
     "get_tradable_equity": "derived from the tapped get_account_snapshot",
     "get_setting_with_interface_default": "a settings read (DB rows are recorded in pass_state)",
+    # looked up with getattr(account, name, None): absent on a live account (backtest-only accessors) or
+    # class constants / derived from the tapped reads
+    "_as_of_date": "backtest-only accessor; absent on a live account (the lookup answers None)",
+    "intraday_volume_so_far": "backtest-only accessor; absent on a live account (the lookup answers None)",
+    "option_modelled_half_spread": "option family accessor of the backtest account; absent live",
+    "option_order_quantity_limit": "option family accessor of the backtest account; absent live",
+    "OPTION_GREEKS_SOURCE": "class declaration of the account (recorded in pass_state account_declarations)",
+    "snapshot_is_derived_from_account_info": "class constant of the account",
+    "buying_power_is_mandatory": "class constant of the account",
+    "get_stock_exposure_headroom": "derived from the tapped get_account_snapshot / get_positions / prices",
+    "describe_capital": "description derived from the tapped snapshot / balance reads",
+    "_cfg": "a dict of the risk manager's own config (not an account call)",
+    "id": "the account's own id (recorded)",
+    "_no_exposure_ceiling_warned": "an in-process warning latch on the account object",
     "_create_transaction_for_order": "DB write inside the executed order build, not a broker call",
 }
 
 _CALL = re.compile(r"\b(?:self\.)?(?:_?account|acct)\.([A-Za-z_]\w*)\(")
+#: ``getattr(account, "get_account_info", None)``: the same call by another spelling (the buying-power clamp).
+_GETATTR_CALL = re.compile(r"getattr\((?:self\.)?(?:_?account|acct),\s*[\"']([A-Za-z_]\w*)[\"']")
 
 
 def test_the_decision_path_only_calls_tapped_or_explained_account_methods():
@@ -168,7 +184,7 @@ def test_the_decision_path_only_calls_tapped_or_explained_account_methods():
             for number, line in enumerate(handle, 1):
                 if line.lstrip().startswith("#"):
                     continue
-                for name in _CALL.findall(line):
+                for name in _CALL.findall(line) + _GETATTR_CALL.findall(line):
                     called.setdefault(name, f"{relative}:{number}")
     unexplained = {name: where for name, where in called.items()
                    if name not in tapped and name not in _ALLOWED}

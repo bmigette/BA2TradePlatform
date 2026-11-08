@@ -468,3 +468,34 @@ Where the build departs from, or pins down, the text above:
   its legs at fill time). TradeManager calls it and keeps the broker tail (`_submit_funded_entry_with_retry`, `_fail_unsent_entry`);
   `_persist_funded_entry` / `_row_or_none` delegate to the shared `persist_funded_entry` / `row_or_none`. The backtest engine's own
   loop (`daily_engine.py:2448+`) is NOT changed (section 4 is later): it still has its own copy of the composition.
+
+## 9. Implementation notes (Task 8 as built, 2026-11-08)
+
+* Size cut (section 0): rows are `SharedValue` objects (`codec.py`, tag `$ref`), steps reference recommendations by hash, `execute` carries no raw
+  `rows_after`; the replay reads the new shape.
+* `testplatform/backend/app/services/replay/decision_pass.py`; CLI `ba2-test replay decision --bundle <dir> [--out <dir>]`; report capability
+  `decision` (`CAPABILITY_DECISION`), coarse stage rows Selection / Rules and sizing / Execution plus the finer Decision rules / sizing / TP-SL /
+  order build / submit-refusal rows (only on a decision report); the inventory counts passes by `record_kind` (`analyses_by_record_kind`,
+  `decision_passes`) and the decision capability's `not_run` is owed by decision passes only; `experts` / `gather` / `historical` skip them.
+* `TapeAccount` is a SUBCLASS of `TapeOptionsAccount` (not a generalisation of it): the option replay is untouched. It serves the sizing reads
+  (`get_balance`, `get_account_info`, `get_account_snapshot`, `get_positions`, `get_instrument_current_price`, `has_pending_closing_order`,
+  `get_fractionable`) from the tape, `get_account_snapshot` / `get_positions` from whichever of `broker_options` / `broker` holds them, and answers
+  the six effect methods with the return live recorded (recording each call in the live effect shape). A call the recording does not hold in that
+  order is refused as `UnrecordedEffect` and shows as a Submit difference.
+* Gaps found while building it (fixed here, all in the taps): `get_balance` is a broker call of its own at Alpaca / TastyTrade (the margin-off
+  tradable balance) and `get_account_info` is the buying-power clamp's fallback; neither was tapped, so a stock pass could not have replayed. Both
+  are in `SIZING_READ_TAPPED_METHODS` now, and the account guard also matches `getattr(account, "name", ...)` spellings. `pass_state` also records the
+  account's non-secret settings (`margin_enabled`, `margin_factor`, `minimum_equity_threshold_percent`, ...; credential-shaped keys named in
+  `redacted_account_setting_keys`).
+* Funded-entry composition is shared: `trade_cycle.stage_funded_entry` (execute, detached order fetch, persist RM quantity + stop, stamp leg
+  quantities) and `trade_cycle.submit_funded_entry` (the stop reconciliation, anchor stamp, `submit_order`, max-loss record, DB-lock retry), plus
+  `select_enter_candidates`. TradeManager calls them; so does the replay. What is still two copies: the enter loop's ORCHESTRATION (select, evaluate,
+  gates, candidate, size, funded loop) in `TradeManager` and in `_PassReplay._enter`, and the backtest engine's own loop.
+* Comparison scope (named, not hidden): effects are compared with ids / timestamps / broker ids removed and transaction ids as ordinals; the order
+  view keeps only the main orders (protective legs are built by the broker ADAPTER) and the transaction view drops the fields the adapter writes
+  (`take_profit`, `stop_loss`, `meta_data`, `status`, `quantity`, prices); the TP/SL stage compares the prices handed to the account.
+* Not replayed yet: rules that read market-data providers (OHLCV / indicator / fundamentals conditions) report `missing_capture` because the
+  isolation's provider resolver refuses and no tape-backed provider is wired for them (the RM's ATR read IS served from the tape when live recorded
+  one); option entries/exits; Smart RM passes; the unsent-entry compensation path.
+* The tests are in the ROOT suite (`tests/test_decision_pass_replay.py`, trade venv): driving the real TradeManager needs the root harness and
+  `langchain`, which the testplatform test venv does not have (`ModelFactory` import). They replay through `ba2test_launcher._cmd_replay`.

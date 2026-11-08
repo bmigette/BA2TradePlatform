@@ -142,6 +142,19 @@ def fired_entry_lot_size(evaluator: Any) -> Optional[int]:
     return None
 
 
+def select_enter_candidates(recommendations_newest_first: Iterable[ExpertRecommendation]
+                            ) -> list:
+    """The enter pass' evaluation order: the LATEST recommendation per symbol (the input is newest first),
+    best expected profit first. Shared by ``TradeManager`` and the offline decision replay (which
+    recomputes the selection from the recorded rows)."""
+    latest_per_instrument = {}
+    for rec in recommendations_newest_first:
+        # Keep only the first (most recent) recommendation for each symbol
+        if rec.symbol not in latest_per_instrument:
+            latest_per_instrument[rec.symbol] = rec
+    return sorted(latest_per_instrument.values(), key=lambda r: r.expected_profit_percent, reverse=True)
+
+
 def build_entry_candidate(recommendation: ExpertRecommendation, account_id: int,
                           lot_size: Optional[int] = None) -> TradingOrder:
     """Build the TRANSIENT (unpersisted) candidate entry order for the temp-order-list flow.
