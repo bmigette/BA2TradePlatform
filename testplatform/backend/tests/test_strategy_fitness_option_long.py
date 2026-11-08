@@ -191,3 +191,32 @@ def test_option_long_is_never_a_default_and_o_convex_still_needs_option_convex()
     assert L._resolve_fitness(LONG, "O_STYLE", "calmar_ratio") == LONG
     with pytest.raises(SystemExit):
         L._refuse_convex_fitness_mismatch("optimize", "O_CONVEX", LONG)
+
+
+# --- option_long_dd40_50 (owner 2026-11-08, $10k job L10): same metric, DD free 40% / 0 at 50% ---
+DD4050 = "option_long_dd40_50"
+
+
+@pytest.mark.parametrize("dd,factor", [(-25, 1.0), (-40, 1.0), (-45, 0.5), (-50, 0.0), (-55, 0.0)])
+def test_dd40_50_band(dd, factor):
+    assert compute_fitness(DD4050, _res(ret=80.0, dd=dd)) == pytest.approx(80.0 * factor)
+
+
+def test_dd40_50_is_its_own_catalog_key_and_scores_structures():
+    assert_catalog_complete()
+    entry = [m for m in METRICS_CATALOG if m["key"] == DD4050]
+    assert len(entry) == 1 and entry[0]["aliases"] == []
+    assert scores_option_structures(DD4050)
+
+
+def test_dd40_50_leaves_option_long_unchanged():
+    # 30% dd: option_long charges it (1 - 5/35), the 40/50 variant does not
+    assert compute_fitness(LONG, _res(ret=70.0, dd=-30)) == pytest.approx(70.0 * (1 - 5 / 35))
+    assert compute_fitness(DD4050, _res(ret=70.0, dd=-30)) == pytest.approx(70.0)
+
+
+def test_launcher_accepts_dd40_50_for_a_style_with_a_convex_member():
+    L._STYLE_ACTIVE = _with_style("leaps_convex")
+    L._refuse_convex_fitness_mismatch("optimize", "O_STYLE", DD4050)
+    with pytest.raises(SystemExit):
+        L._refuse_convex_fitness_mismatch("optimize", "O_CONVEX", DD4050)

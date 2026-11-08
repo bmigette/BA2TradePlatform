@@ -151,33 +151,37 @@ def test_the_hold_tags_reach_the_trial_config_and_the_accounts_policy(monkeypatc
     assert policy.member_tags == frozenset({_WHEEL_TAG}) and policy.run_level is False
 
 
-def test_a_member_scoped_run_is_refused_by_deploy_parity_on_both_reads(monkeypatch):
-    """The trial read (the handler's run facts) and the export read (the persisted
-    optimization block) both see the member-scoped hold; the export refuses (409)."""
+def test_a_member_scoped_run_is_deployable_and_both_reads_carry_the_hold(monkeypatch):
+    """The trial read (the handler's run facts) and the export read (the persisted optimization
+    block) both see the member-scoped hold. Since dev a6f07ac3 (2026-11-07, live sells assigned
+    stock like the backtest) ``hold_assigned_stock_tags`` is a LIVE setting, so the run is no
+    longer refused: the export carries the policy instead of answering 409."""
     from datetime import datetime
     from fastapi import HTTPException
     from app.api.backtests import _derive_export_payload
     from app.models.backtest import Backtest
     from app.models.database import SessionLocal
     from app.services.backtest.daily_backtest_handler import _run_facts
-    from ba2_common.core.deploy_parity import UndeployableRunRefused, refuse_undeployable
+    from ba2_common.core.deploy_parity import refuse_undeployable
 
     opt_id, cfg = _run(_argv("premium"), monkeypatch)
     facts = _run_facts(_trial(cfg["backtest"]))
     assert facts.hold_assigned_stock_tags == (_WHEEL_TAG,)
-    with pytest.raises(UndeployableRunRefused, match="hold_assigned_stock_tags"):
-        refuse_undeployable(facts)
+    refuse_undeployable(facts)   # no UndeployableRunRefused
     bt = Backtest(name="TOP1-t7", expert_name="FMPRating", engine_type="daily_expert",
                   strategy_params={}, start_date=datetime(2024, 3, 1),
                   end_date=datetime(2024, 4, 1), initial_capital=20_000.0,
                   optimization_id=opt_id)
     db = SessionLocal()
     try:
-        with pytest.raises(HTTPException) as exc:
-            _derive_export_payload(bt, "expert_settings", db=db)
+        try:
+            payload = _derive_export_payload(bt, "expert_settings", db=db)
+        except HTTPException as e:   # any refusal left must not be the assigned-stock policy
+            assert "hold_assigned_stock" not in str(e.detail), e.detail
+            return
     finally:
         db.close()
-    assert exc.value.status_code == 409 and "hold_assigned_stock_tags" in str(exc.value.detail)
+    assert "hold_assigned_stock_tags" in json.dumps(payload, default=str)
 
 
 # --- the recorded style -------------------------------------------------------------------------

@@ -4352,6 +4352,8 @@ _CONVEX_FITNESS = "option_convex"
 # ``convex_fitness_waiver`` under it. Never a default for any kind; an O_CONVEX job still has to
 # name ``option_convex`` (the other refusals are unchanged).
 _LONG_FITNESS = "option_long"
+#: Every option_long variant (strategy_fitness._LONG_DD_BANDS): same metric, own DD band.
+_LONG_FITNESSES = frozenset({_LONG_FITNESS, "option_long_dd40_50"})
 
 
 def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str) -> None:
@@ -4375,7 +4377,7 @@ def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str)
     """
     is_convex_kind = strat_kind in _CONVEX_OPTION_STRATEGIES
     is_convex_fitness = fitness == _CONVEX_FITNESS
-    if strat_kind == _STYLE_KEY and not is_convex_fitness and fitness != _LONG_FITNESS:
+    if strat_kind == _STYLE_KEY and not is_convex_fitness and fitness not in _LONG_FITNESSES:
         # A STYLE holding a convex member scores it under the style's (CAR-family) fitness,
         # the very metric that "teaches the GA to gut the convexity". Open question Q5: refused
         # until the style records who accepted that (``convex_fitness_waiver``). A style under
@@ -11714,7 +11716,10 @@ def main(argv: "list | None" = None) -> int:
                          "(max(0.5, 1 + r) per losing year), breadth floor >=12 structures/yr "
                          "AND >=10 underlyings -- never a default; accepted for O_STYLE "
                          "with a convex member WITHOUT a convex_fitness_waiver; scores are NOT "
-                         "comparable with any CAR-family or option_convex score.")
+                         "comparable with any CAR-family or option_convex score. "
+                         "'option_long_dd40_50' is option_long with the drawdown free to "
+                         "40%% and 0 at 50%% (its own scores, never compared with "
+                         "option_long's).")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")

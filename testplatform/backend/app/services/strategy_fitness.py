@@ -366,6 +366,14 @@ _LONG_MIN_STRUCTURES_PER_YEAR = 5.0   # option STRUCTURES per year (not legs); o
 #   12 refused every LEAPS seed at $20k (~10/yr: one-year holds), so 5
 _LONG_MIN_UNDERLYINGS = 8             # distinct underlyings over the whole window (owner 2026-11-07)
 _LONG_ALIASES = ("option_long",)
+# Same metric with a WIDER drawdown tolerance (owner 2026-11-08, $10k LC/BULLCS/CONVEX/LEAP job):
+# free to 40%, zero at 50%. Its OWN canonical key, not an alias -- an alias promises identical
+# scores, and these differ for every run with 25% < |dd| < 60%. Never compare the two.
+_LONG_DD4050_KEY = "option_long_dd40_50"
+#: metric -> (dd free %, dd dead %). Every option_long variant scores through ``_option_long``.
+_LONG_DD_BANDS = {"option_long": (_LONG_DD_FREE_PCT, _LONG_DD_DEAD_PCT),
+                  _LONG_DD4050_KEY: (40.0, 50.0)}
+_LONG_METRICS = frozenset(_LONG_DD_BANDS)
 # One name on purpose. ``option_car``'s aliases exist because the CAR family predates the
 # fitness catalog; a new metric with three spellings is three strings a routing rail has to
 # know about. TASK 13 SEAM: the O_CONVEX strategy key and the mutual refusal (an O_CONVEX job
@@ -575,6 +583,15 @@ _SPECIAL_META = {
         "supports_win_rate_factor": False,
         "uses_adjusted_under_caps": False,
     },
+    _LONG_DD4050_KEY: {
+        "label": "Long-Horizon Option Book, DD 40/50 (Option)",
+        "description": "option_long with a wider drawdown band: drawdown free to 40%, linear "
+                       "to 0 at 50%. Same return, negative-year, breadth and robustness terms. "
+                       "Scores are NOT comparable with option_long or any other metric.",
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": False,
+        "uses_adjusted_under_caps": False,
+    },
 }
 
 
@@ -617,9 +634,10 @@ def _build_metrics_catalog() -> list:
         _OCT_SOFT30_KEY: [],
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
         _LONG_KEY: [],
+        _LONG_DD4050_KEY: [],
     }
     for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY,
-                    _OCT_SOFT30_KEY, _CONVEX_KEY, _LONG_KEY):
+                    _OCT_SOFT30_KEY, _CONVEX_KEY, _LONG_KEY, _LONG_DD4050_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -650,7 +668,7 @@ def assert_catalog_complete() -> None:
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
                 | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES)
-                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES) | set(_LONG_ALIASES))
+                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES) | set(_LONG_METRICS))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -668,7 +686,7 @@ def scores_option_structures(fitness_metric: str) -> bool:
     """
     metric = str(fitness_metric).lower()
     return (metric in _OCAR_ALIASES or metric in _OCR_ALIASES or metric in _OCT_ALIASES
-            or metric == _OCT_SOFT30_KEY or metric in _LONG_ALIASES)
+            or metric == _OCT_SOFT30_KEY or metric in _LONG_METRICS)
 
 
 def compute_fitness(fitness_metric: str, results: dict,
@@ -779,12 +797,12 @@ def compute_fitness(fitness_metric: str, results: dict,
             results["fitness_robust"] = None
         return _fit
 
-    if metric in _LONG_ALIASES:
+    if metric in _LONG_METRICS:
         # OPTION-ONLY, never a default. Reached only by an explicit ``option_long``. Wrappers:
         # spread stress and robustness (concentration x MC x spread, per-STRUCTURE P&L) apply
         # exactly as for the option CAR family; the win-rate factor is omitted (hit rate is
         # not a ranking quantity for a long convex-leaning book) -- see _option_long.
-        _fit = _option_long(results)
+        _fit = _option_long(results, *_LONG_DD_BANDS[metric])
         return _maybe_robust(
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust, option_structures=True)
@@ -2348,17 +2366,19 @@ def _long_neg_year_factor(year_returns: list) -> float:
     return factor
 
 
-def _long_dd_factor(dd: float) -> float:
-    """1.0 at |dd| <= 25%, linear to 0.0 at 60%, 0.0 beyond."""
+def _long_dd_factor(dd: float, free_pct: float = _LONG_DD_FREE_PCT,
+                    dead_pct: float = _LONG_DD_DEAD_PCT) -> float:
+    """1.0 at |dd| <= free_pct (25%), linear to 0.0 at dead_pct (60%), 0.0 beyond."""
     d = abs(float(dd))
-    if d <= _LONG_DD_FREE_PCT:
+    if d <= free_pct:
         return 1.0
-    if d >= _LONG_DD_DEAD_PCT:
+    if d >= dead_pct:
         return 0.0
-    return 1.0 - (d - _LONG_DD_FREE_PCT) / (_LONG_DD_DEAD_PCT - _LONG_DD_FREE_PCT)
+    return 1.0 - (d - free_pct) / (dead_pct - free_pct)
 
 
-def _option_long(results: dict) -> float:
+def _option_long(results: dict, dd_free_pct: float = _LONG_DD_FREE_PCT,
+                 dd_dead_pct: float = _LONG_DD_DEAD_PCT) -> float:
     """LONG-HORIZON option-book metric (owner-approved 2026-11-07).
 
     ``total_return x dd_factor x neg_year_factor``, behind a breadth floor. THE ORDER IS THE
@@ -2372,7 +2392,8 @@ def _option_long(results: dict) -> float:
          ``results["max_drawdown"]`` -- exactly the series ``_option_convex`` reads under an
          equity cap (the uncapped-P&L scoring curve and the capped drawdown curve; see its
          docstring). Never the profit-capped/adjusted figure.
-      4. DD FACTOR: 1.0 at |dd| <= 25%, linear to 0.0 at 60%, 0.0 beyond.
+      4. DD FACTOR: 1.0 at |dd| <= dd_free_pct, linear to 0.0 at dd_dead_pct, 0.0 beyond
+         (25/60 for option_long, 40/50 for option_long_dd40_50; ``_LONG_DD_BANDS``).
       5. NEGATIVE-YEAR FACTOR: calendar-year returns of ``results["equity_curve"]`` (the scoring
          curve) via ``_calendar_year_returns`` (same partial-year merging as the CAR family);
          each year with r < 0 contributes ``max(0.5, 1 + r/100)``; the factor is the product.
@@ -2411,7 +2432,7 @@ def _option_long(results: dict) -> float:
     ret = float(ret)
 
     # --- 4. DD FACTOR / 5. NEGATIVE-YEAR FACTOR ----------------------------------------------
-    dd_factor = _long_dd_factor(dd)
+    dd_factor = _long_dd_factor(dd, dd_free_pct, dd_dead_pct)
     year_returns = _calendar_year_returns(results.get("equity_curve"))
     neg_year_factor = _long_neg_year_factor(year_returns)
 

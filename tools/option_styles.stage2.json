@@ -69,6 +69,28 @@
           "max_virtual_equity_per_instrument_percent": {"min": 5, "max": 25, "step": 5}
         }
       }
+    },
+    "long10k": {
+      "status": "draft",
+      "note": "Stage-2 job L10 (owner 2026-11-08): MAX-PROFIT long option book for a $10k account; the $10k initial capital and equity cap are launch flags. Members chosen by one-lot cost at $10k (stage-1/1.5/2 trade records, 1-lot entry cost median / p90): O_LC (30-60 DTE) $330-520 / $0.7-2.1k, O_BULLCS $90-205 / $0.5-0.8k, O_CONVEX $345 / $680, O_LEAP $1.6k / $4.6k. Left out: O_PMCC and O_CBS (lost money in stage 1.5 and job C, $1.2-2k a lot), O_STRD / O_STRG (volatility, not the long book asked for), O_BF (weak). Member order is precedence, first passing rule wins: the cheap, frequent structures first and O_LEAP LAST, so a LEAPS refused by the sizing rail (one lot = 15-45% of $10k) never blocks a cheaper member on that name. structure_share 20..80 step 10 per member (job C used 20..60): at $10k a 20% share is $2k, about one median LEAPS lot, so a member may take most of the book. O_LC / O_BULLCS keep job A's DTE overrides; O_CONVEX / O_LEAP are DTE-invariant members (authored bands). Risk = job C's block with the per-instrument cap widened to 10..40 (a 5% slice is $500: most LC / LEAP lots would be refused) and deployment 30..90. Fitness option_long_dd40_50 (owner 2026-11-08: drawdown free to 40%, 0 at 50%).",
+      "price_cap_policy": "none",
+      "structure_share": {"min": 20, "max": 80, "step": 10},
+      "members": [
+        {"key": "O_LC", "action_overrides": {"option_dte_min": 30, "option_dte_max": 50, "option_dte_min_range": 25, "option_dte_max_range": 65, "option_dte_step": 5}},
+        {"key": "O_BULLCS", "action_overrides": {"option_dte_min": 45, "option_dte_max": 75, "option_dte_min_range": 40, "option_dte_max_range": 90, "option_dte_step": 5}},
+        {"key": "O_CONVEX"},
+        {"key": "O_LEAP"}
+      ],
+      "risk": {
+        "risk_manager_mode": "classic_options",
+        "fixed": {"max_concurrent_structures": 20, "undefined_risk_max_pct": 0},
+        "genes": {
+          "max_deployment_pct": {"min": 30, "max": 90, "step": 10},
+          "circuit_breaker_pct": {"min": 20, "max": 50, "step": 10},
+          "max_notional_leverage": {"min": 2, "max": 10, "step": 2},
+          "max_virtual_equity_per_instrument_percent": {"min": 10, "max": 40, "step": 5}
+        }
+      }
     }
   }
 }
