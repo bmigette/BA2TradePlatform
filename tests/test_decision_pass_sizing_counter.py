@@ -237,3 +237,24 @@ def test_unchanged_rows_dedupe_across_two_consecutive_passes(test_engine, monkey
     assert second["stored_bytes"] < 0.5 * first["stored_bytes"]
     assert second["stored_bytes_by_kind"]["pass_state"] < 0.5 * first["stored_bytes_by_kind"]["pass_state"]
     assert second["stored_bytes_by_kind"]["rules"] == 0         # identical payloads are one object
+
+
+# --- M6: the dry run runs the FULL recorder, so it is a test/dev tool, never honoured on prod ------------
+def test_the_dry_run_flag_is_refused_loudly_outside_a_test_or_dev_context(monkeypatch):
+    errors = []
+    monkeypatch.setattr(ds.logger, "error", lambda msg, *a, **k: errors.append(msg))
+    monkeypatch.setattr(ds, "_REFUSAL_LOGGED", False)
+    monkeypatch.setenv(ds.DRYRUN_ENV, "1")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv(ds.DRYRUN_CONFIRM_ENV, raising=False)
+
+    assert ds.dry_run_enabled() is False
+    assert ds.dry_run_enabled() is False
+    assert len(errors) == 1 and ds.DRYRUN_ENV in errors[0] and ds.DRYRUN_CONFIRM_ENV in errors[0]
+
+
+def test_the_dry_run_flag_is_honoured_with_the_explicit_dev_confirmation(monkeypatch):
+    monkeypatch.setenv(ds.DRYRUN_ENV, "1")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv(ds.DRYRUN_CONFIRM_ENV, "dev")
+    assert ds.dry_run_enabled() is True

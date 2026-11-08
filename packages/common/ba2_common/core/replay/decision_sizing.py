@@ -8,6 +8,10 @@ decision summary, with the codec the store uses) and counts the bytes, and the p
 recorders spent are read off the pass ledger. One INFO line per pass, and a process-wide
 :class:`DryRunCounters` for the totals.
 
+The dry run runs the FULL recorder on the live pass thread, so it is a test / dev measuring tool: outside
+pytest it is honoured only together with ``BA2_REPLAY_DECISION_DRYRUN_CONFIRM=dev`` (set by hand on a dev
+instance). On any other process (prod) the flag is IGNORED and one ERROR line says so.
+
 With a real store installed the flag is ignored: real writes are already the measurement
 (``tests/test_decision_pass_sizing_counter.py`` pins that the two agree).
 """
@@ -25,6 +29,7 @@ from ba2_common.logger import logger
 
 __all__ = [
     "DRYRUN_ENV",
+    "DRYRUN_CONFIRM_ENV",
     "DryRunCounters",
     "COUNTERS",
     "dry_run_enabled",
@@ -35,11 +40,26 @@ __all__ = [
 ]
 
 DRYRUN_ENV = "BA2_REPLAY_DECISION_DRYRUN"
+#: The explicit "this is a dev instance" confirmation the flag needs outside pytest.
+DRYRUN_CONFIRM_ENV = "BA2_REPLAY_DECISION_DRYRUN_CONFIRM"
 _DRYRUN_SESSION = "dryrun"
+_REFUSAL_LOGGED = False
 
 
 def dry_run_enabled() -> bool:
-    return os.environ.get(DRYRUN_ENV) == "1"
+    """Whether the counter-only dry run is on: the flag AND a test / dev context (see the module doc)."""
+    global _REFUSAL_LOGGED
+    if os.environ.get(DRYRUN_ENV) != "1":
+        return False
+    if "PYTEST_CURRENT_TEST" in os.environ or os.environ.get(DRYRUN_CONFIRM_ENV) == "dev":
+        return True
+    if not _REFUSAL_LOGGED:
+        _REFUSAL_LOGGED = True
+        logger.error(
+            f"{DRYRUN_ENV}=1 is IGNORED: the decision-pass dry run runs the full recorder on the pass "
+            f"thread and is a test/dev tool. To use it on a dev instance also set "
+            f"{DRYRUN_CONFIRM_ENV}=dev. This process records nothing.")
+    return False
 
 
 class DryRunStore:
