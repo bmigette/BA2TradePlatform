@@ -17,10 +17,22 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+#: Bundle/record schema history (bump on EVERY additive field or recorded-content change):
+#:
+#: * 1 -- first format; ``ProviderObservation.tap_depth`` was later added to it WITHOUT a bump
+#:   (a v1 reader built before that refuses a newer v1 bundle with "unknown field(s)").
+#: * 2 -- the recorded ``settings`` object is the expert's FULL resolved settings (every
+#:   definition resolved with its default the way the live code resolves it, every stored key,
+#:   plus the ``instance.*`` decision columns), secrets dropped. v1 recordings hold only the
+#:   expert's own keys; they stay readable, and the tools that need the rest say so loudly
+#:   (``settings_record.explain_missing_setting``) instead of failing opaquely.
+SCHEMA_VERSION = 2
+#: Versions ``load_bundle`` accepts. N-1 stays readable.
+READABLE_SCHEMA_VERSIONS = (1, 2)
 
 __all__ = [
     "SCHEMA_VERSION",
+    "READABLE_SCHEMA_VERSIONS",
     "ReplayStatus",
     "SessionRecord",
     "AnalysisRecord",

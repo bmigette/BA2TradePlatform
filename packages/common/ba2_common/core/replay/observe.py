@@ -50,6 +50,7 @@ __all__ = [
     "sanitize_identity",
     "tapped_boundary",
     "SECRET_KEY_TOKENS",
+    "is_secret_key",
 ]
 
 #: Per-thread count of tapped reads currently running (only touched while capturing).
@@ -83,6 +84,10 @@ _REDACTED = r"\1=REDACTED"
 def _is_secret_key(name: Any) -> bool:
     text = str(name).lower()
     return any(token in text for token in SECRET_KEY_TOKENS)
+
+
+#: Public name of the ONE credential-key rule (settings recording reuses it).
+is_secret_key = _is_secret_key
 
 
 def _json_safe(value: Any, depth: int = 0) -> Any:
