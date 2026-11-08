@@ -870,6 +870,35 @@ def current_decision() -> Optional[DecisionState]:
     return _DECISION.get()
 
 
+class ReplayFrameState(DecisionState):
+    """A REPLAY-ONLY decision frame: it carries the recorded pass's ``decision_time`` and nothing
+    else. ``live_decision_time()`` reads ``current_decision().decision_time``, so installing this
+    makes a replayed option action see the same frozen instant its live run saw (and take no
+    clock read), without any market-condition reader. A gate that asks it for a context is a
+    defect of the replay, so ``context()`` refuses loudly instead of serving an empty one."""
+
+    def context(self) -> MarketConditionContext:
+        raise RuntimeError(
+            "a replay decision frame carries only the recorded decision time; a market-condition "
+            "context was requested from it (the replay must not evaluate market-condition gates)")
+
+
+@contextmanager
+def replay_decision_frame(decision_time: datetime) -> Iterator[ReplayFrameState]:
+    """Install a :class:`ReplayFrameState` for ``decision_time`` for the block (replay only).
+
+    Live code never calls this; it exists so the offline replay can reproduce the frame the live
+    enter/exit decision pass held while the recorded action ran."""
+    if decision_time.tzinfo is None:
+        raise ValueError("a replay decision frame needs a timezone-aware decision_time")
+    state = ReplayFrameState(resolver=None, decision_time=decision_time, reader=None)  # type: ignore[arg-type]
+    token = _DECISION.set(state)
+    try:
+        yield state
+    finally:
+        _DECISION.reset(token)
+
+
 def resolver_for_expert_instance(expert_instance_id: Optional[Any]
                                  ) -> Optional["LiveMarketConditionResolver"]:
     """The live resolver that serves ``expert_instance_id``'s gates, or ``None``.

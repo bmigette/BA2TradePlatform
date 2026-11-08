@@ -457,3 +457,56 @@ def test_the_record_carries_the_clock_read_span_of_the_action():
     assert spans[0]["clock_start"] == 1 and spans[0]["clock_end"] == before_second
     assert spans[1]["clock_start"] == before_second
     assert spans[1]["clock_end"] > spans[1]["clock_start"]
+
+
+# ---------------------------------------------------------------------------
+# the live decision frame (audit gap #1)
+# ---------------------------------------------------------------------------
+FRAME_TIME = datetime(2026, 11, 5, 13, 59, 30, tzinfo=timezone.utc)
+
+
+def test_the_record_carries_the_live_decision_frame_instant_without_a_clock_read():
+    from ba2_common.core.market_condition_live import replay_decision_frame
+
+    store = _Store()
+    with capture_scope(store, _meta()) as ctx:
+        with replay_decision_frame(FRAME_TIME):
+            result = _entry(FakeAccount()).execute()
+        reads = ctx.clock_read_position
+    assert result["success"], result["message"]
+    payload = _payload(_action_obs(store)[0])
+    assert payload["version"] == oar.RECORD_VERSION == 2
+    assert payload["inputs"]["decision_frame_time"] == FRAME_TIME
+    assert oar.replay_decision_frame_time(payload) == FRAME_TIME
+    # only the recorder's own decision_time read: reading the frame took none
+    assert reads == 1
+    assert payload["tape_span"]["clock_end"] - payload["tape_span"]["clock_start"] == 1
+
+
+def test_the_record_says_none_when_no_decision_frame_was_open():
+    store = _Store()
+    with capture_scope(store, _meta()):
+        _entry(FakeAccount()).execute()
+    payload = _payload(_action_obs(store)[0])
+    assert payload["inputs"]["decision_frame_time"] is None
+    assert oar.replay_decision_frame_time(payload) is None
+
+
+def test_a_version_1_record_reports_the_missing_field_instead_of_a_value():
+    assert oar.replay_decision_frame_time({"version": 1, "inputs": {}}) is oar.NO_FRAME_FIELD
+    assert 1 in oar.READABLE_VERSIONS and oar.RECORD_VERSION in oar.READABLE_VERSIONS
+
+
+def test_the_replay_frame_pins_live_decision_time_and_refuses_a_market_condition_context():
+    from ba2_common.core.market_condition_live import current_decision, replay_decision_frame
+    from ba2_common.core.option_session import live_decision_time
+
+    assert current_decision() is None
+    with replay_decision_frame(FRAME_TIME) as frame:
+        assert live_decision_time() == FRAME_TIME
+        with pytest.raises(RuntimeError, match="replay decision frame"):
+            frame.context()
+    assert current_decision() is None
+    with pytest.raises(ValueError):
+        with replay_decision_frame(datetime(2026, 11, 5, 14, 0)):
+            pass

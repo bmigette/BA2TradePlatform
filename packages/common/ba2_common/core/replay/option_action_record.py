@@ -31,7 +31,7 @@ actions never leak into each other.
 
 Payload (``payload``)::
 
-    {"version": 1,
+    {"version": 2,           # 1 = before ``decision_frame_time`` existed (still read)
      "tape_span": {"start": <observation position at entry>,
                    "clock_start": <clock reads recorded at entry>,
                    "clock_end": <clock reads recorded at exit>},
@@ -51,7 +51,12 @@ actions read: id, instance_id, symbol, recommended_action, expected_profit_perce
 data); ``existing_order`` (full ``model_dump``); ``attrs`` (``submit_to_broker``, ``close_percent``,
 ``evaluation_details`` set after construction by the evaluator); ``decision_time`` (ONE
 ``replay_now()`` read taken first; in capture it is therefore the first clock read of the action's
-span, and Task 6 consumes it by calling ``replay_now()`` once before ``execute``).
+span, and Task 6 consumes it by calling ``replay_now()`` once before ``execute``);
+``decision_frame_time`` (version 2): the ``decision_time`` of the live decision frame
+(``market_condition_live.current_decision()``) the action ran under, read off the frame WITHOUT a
+clock read, or ``None`` when no frame was open (then ``live_decision_time()`` read the clock
+itself, and that read is inside the recorded clock span). The frame instant can differ from the
+recorder's own read, and it is the frame that live used for the DTE / session label.
 
 **DB reads of an execute** (what ``db_rows`` must let a scratch DB reproduce), by code path:
 
@@ -89,6 +94,9 @@ from ba2_common.core.replay.observe import SECRET_KEY_TOKENS, record_observation
 __all__ = [
     "OPTION_ACTION_PROVIDER",
     "RECORD_VERSION",
+    "READABLE_VERSIONS",
+    "replay_decision_frame_time",
+    "NO_FRAME_FIELD",
     "action_ctor_kwargs",
     "build_outcome",
     "db_row_instances",
@@ -101,7 +109,9 @@ __all__ = [
 ]
 
 OPTION_ACTION_PROVIDER = "option_action"
-RECORD_VERSION = 1
+RECORD_VERSION = 2
+#: Versions the replay reads. 1 predates ``inputs["decision_frame_time"]``.
+READABLE_VERSIONS = (1, 2)
 
 #: The constructor parameters every TradeAction takes positionally; everything else is config.
 _BASE_PARAMS = frozenset({
@@ -412,6 +422,14 @@ def _account_declarations(account) -> Dict[str, Any]:
     return out
 
 
+def _live_frame_time():
+    """``decision_time`` of the open live decision frame, or ``None`` when there is none."""
+    from ba2_common.core.market_condition_live import current_decision
+
+    frame = current_decision()
+    return None if frame is None else frame.decision_time
+
+
 def _build_inputs(action) -> Dict[str, Any]:
     from ba2_common.core.replay.clock import replay_now
 
@@ -436,6 +454,8 @@ def _build_inputs(action) -> Dict[str, Any]:
         "existing_order": _dump(order)["row"] if order is not None else None,
         "attrs": attrs,
         "decision_time": replay_now(),
+        # Read off the frame object: NO clock read (the recorded clock span is unchanged).
+        "decision_frame_time": _live_frame_time(),
     }
 
 
@@ -583,3 +603,22 @@ def rebuild_option_action(payload: Dict[str, Any], account):
 def replay_decision_time(payload: Dict[str, Any]):
     """The recorded decision clock (the recorder's own first read of the action's span)."""
     return payload["inputs"]["decision_time"]
+
+
+class _NoFrameField:
+    """Sentinel: a version-1 record, written before ``decision_frame_time`` was captured."""
+
+    def __repr__(self):
+        return "NO_FRAME_FIELD"
+
+
+NO_FRAME_FIELD = _NoFrameField()
+
+
+def replay_decision_frame_time(payload: Dict[str, Any]):
+    """The live decision frame's instant (``datetime``), ``None`` (live held no frame: it read
+    the clock itself), or :data:`NO_FRAME_FIELD` (a version-1 record: unknown, must be inferred
+    or refused by the caller, never assumed)."""
+    if payload["version"] < 2:
+        return NO_FRAME_FIELD
+    return payload["inputs"]["decision_frame_time"]
