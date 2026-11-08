@@ -817,13 +817,17 @@ def _cmd_replay_code_tools(args) -> int:
             from ba2_common.core.replay import retention
 
             store = _caller_path(args.store)
-            if args.dry_run:
-                plan = retention.preview_prune(store, args.keep_days)
-            else:
+            if args.dry_run and args.yes:
+                raise ValueError("--dry-run and --yes contradict each other")
+            execute = bool(args.yes)                  # deleting needs an explicit --yes
+            if execute:
                 plan = retention.execute_prune(store, args.keep_days)
+            else:
+                plan = retention.preview_prune(store, args.keep_days)
             print(retention.format_plan(plan))
-            if args.dry_run:
-                print("-- dry run: nothing was deleted")
+            if not execute:
+                print("-- dry run: nothing was deleted" + ("" if args.dry_run else
+                                                           " (add --yes to delete what is listed above)"))
             # A preview that would refuse is a failure: the operator must see it before running for real.
             return 1 if plan["problems"] else 0
         if args.replay_cmd == "checkout":
@@ -11642,11 +11646,13 @@ def main(argv: "list | None" = None) -> int:
     rpp = rplsub.add_parser(
         "prune",
         help="Delete the sessions of a replay store older than --keep-days, then the object files no "
-             "remaining session reaches. Operator-run, never automatic; safe while the live app writes "
+             "remaining session reaches. A PREVIEW unless --yes is given. Operator-run, never automatic; safe while the live app writes "
              "(open sessions and young objects are never touched).")
     rpp.add_argument("--store", required=True, help="Replay store directory (has index.sqlite).")
     rpp.add_argument("--keep-days", required=True, type=int, help="Keep sessions that ended within this many days.")
-    rpp.add_argument("--dry-run", action="store_true", help="Print what would be deleted; delete nothing.")
+    rpp.add_argument("--dry-run", action="store_true",
+                     help="Print what would be deleted; delete nothing (this is the default without --yes).")
+    rpp.add_argument("--yes", action="store_true", help="Actually delete. Without it the command only previews.")
     rpe = rplsub.add_parser("experts",
                             help="Re-run _process on each recorded bundle and diff the result.")
     rpe.add_argument("--bundle", required=True, help="Exported session directory.")

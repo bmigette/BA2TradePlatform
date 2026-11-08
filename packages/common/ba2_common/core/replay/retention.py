@@ -56,6 +56,9 @@ class RetentionRefused(RetentionError):
 # --------------------------------------------------------------------------- store access
 def _open_index(root) -> Tuple[Path, ReplayIndex]:
     root = Path(root)
+    if (root / "manifest.json").is_file():
+        raise RetentionRefused(f"{root} is an exported bundle (it has manifest.json), not a live replay store; "
+                               f"a prune only runs on the live store directory (the one with index.sqlite)")
     if not (root / "index.sqlite").is_file():
         raise RetentionRefused(f"{root} is not a replay store: no index.sqlite")
     if not (root / "objects").is_dir():

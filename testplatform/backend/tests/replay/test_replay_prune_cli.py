@@ -26,8 +26,9 @@ def store(tmp_path):
     s.close(timeout=2.0)
 
 
-def _prune(store, *, keep_days, dry_run):
-    args = types.SimpleNamespace(replay_cmd="prune", store=str(store.root), keep_days=keep_days, dry_run=dry_run)
+def _prune(store, *, keep_days, dry_run=False, yes=False):
+    args = types.SimpleNamespace(replay_cmd="prune", store=str(store.root), keep_days=keep_days,
+                                 dry_run=dry_run, yes=yes)
     return ba2test_launcher._cmd_replay(args)
 
 
@@ -39,13 +40,36 @@ def test_dry_run_prints_what_would_go_and_deletes_nothing(store, capsys):
 
 
 def test_a_real_run_deletes_the_old_session_and_keeps_the_open_one(store, capsys):
-    assert _prune(store, keep_days=30, dry_run=False) == 0
+    assert _prune(store, keep_days=30, yes=True) == 0
     assert "deleted 1 session(s)" in capsys.readouterr().out
     assert [s.session_id for s in store.index.list_sessions()] == ["live"]
 
 
 def test_a_refusal_is_a_loud_exit_not_a_silent_success(store):
     with pytest.raises(SystemExit) as exc:
-        _prune(store, keep_days=0, dry_run=False)
+        _prune(store, keep_days=0, yes=True)
     assert "keep_days" in str(exc.value)
     assert {s.session_id for s in store.index.list_sessions()} == {"old", "live"}
+
+
+def test_without_yes_the_prune_is_a_dry_run(store, capsys):
+    """Deleting needs an explicit --yes: the default only shows what would go."""
+    assert _prune(store, keep_days=30) == 0
+    out = capsys.readouterr().out
+    assert "would delete 1 session(s)" in out and "--yes" in out
+    assert {s.session_id for s in store.index.list_sessions()} == {"old", "live"}
+
+
+def test_dry_run_and_yes_together_are_refused(store):
+    with pytest.raises(SystemExit):
+        _prune(store, keep_days=30, dry_run=True, yes=True)
+    assert {s.session_id for s in store.index.list_sessions()} == {"old", "live"}
+
+
+def test_an_exported_bundle_is_not_a_store_to_prune(store, tmp_path):
+    bundle = store.export_session("old", tmp_path / "bundle")
+    args = types.SimpleNamespace(replay_cmd="prune", store=str(bundle), keep_days=30, dry_run=False, yes=True)
+    with pytest.raises(SystemExit) as exc:
+        ba2test_launcher._cmd_replay(args)
+    assert "exported bundle" in str(exc.value)
+    assert (bundle / "manifest.json").is_file()
