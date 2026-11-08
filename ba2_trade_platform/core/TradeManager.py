@@ -2804,7 +2804,11 @@ class TradeManager:
         from ba2_common.core.replay.decision_record import RECORD_KIND
         from ba2_common.core.types import AnalysisUseCase
 
-        session_id = store.current_session_id()
+        # NOT current_session_id(): that runs the host's rollover check (a 2 s drain plus index writes) on THIS
+        # thread, and a pass - an exit pass especially - must never wait on it. The background session roller
+        # (replay_capture) rolls at the UTC date change; until it has, the pass records into the still-open
+        # previous session, which is a valid session.
+        session_id = store.session_id
         if session_id is None:
             raise RuntimeError("replay capture is enabled but no session is open")
         instance = get_instance(ExpertInstance, expert_instance_id)

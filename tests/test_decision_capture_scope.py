@@ -285,3 +285,16 @@ def test_an_exception_in_a_pass_of_a_non_allowed_expert_propagates_untouched(sto
         with TradeManager()._decision_capture_scope(expert_id) as context:
             assert context is None
             raise ValueError("pass body")
+
+
+def test_a_slow_session_rollover_never_delays_a_decision_pass(store):
+    """The rollover (2 s drain + index writes) belongs to a background roller, never to the pass thread."""
+    import time
+
+    store.set_session_hook(lambda: time.sleep(1.5))
+    expert_id = _expert("FMPRating")
+    for use_case in (None, AnalysisUseCase.OPEN_POSITIONS):
+        started = time.perf_counter()
+        _scope(expert_id, *(() if use_case is None else (use_case,)))
+        assert time.perf_counter() - started < 1.0, "the pass waited on the session rollover"
+    assert {a.session_id for a in _passes(store)} == {"s1"}

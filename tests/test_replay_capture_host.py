@@ -432,3 +432,20 @@ def test_shutdown_finalizes_the_session_and_uninstalls_the_store(cache_root):
         assert reopened.index.get_session(session_id).status == "finalized"
     finally:
         reopened.close()
+
+
+def test_a_background_roller_rolls_the_session_at_the_date_change(cache_root, monkeypatch):
+    """Decision passes no longer roll the session on their own thread: a daemon roller does."""
+    import time
+
+    monkeypatch.setattr(replay_capture, "SESSION_ROLL_INTERVAL_SECONDS", 0.05)
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+    first = store.session_id
+    replay_capture._SESSION_DATE = "2020-01-01"
+    deadline = time.monotonic() + 5.0
+    while store.session_id == first and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert store.session_id != first
+    replay_capture.shutdown_replay_capture(timeout=5.0)
+    assert replay_capture._roller_thread is None

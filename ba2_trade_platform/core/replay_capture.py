@@ -79,6 +79,12 @@ RECORDED_EXPERTS = (
 _LOCK = threading.RLock()
 _SESSION_DATE: Optional[str] = None
 _SESSION_TEMPLATE: Dict[str, Any] = {}
+
+#: How often the background roller checks the UTC date. Decision passes do NOT roll the session themselves
+#: (the rollover drains the writer and writes the index: a pass thread must never wait on it).
+SESSION_ROLL_INTERVAL_SECONDS = 30.0
+_roller_thread: Optional[threading.Thread] = None
+_roller_stop = threading.Event()
 _BATCH = threading.local()
 
 
@@ -195,6 +201,7 @@ def initialize_replay_capture() -> Optional[ReplayStore]:
             _SESSION_TEMPLATE.update(_collect_session_provenance(store))
             store.set_session_hook(_roll_session_if_needed)
             set_replay_store(store)
+            _start_session_roller()
             set_capture_batch_provider(get_current_batch)
             _begin_session(store)
             logger.info(f"Replay capture is ON; recording expert inputs to {root}")
@@ -224,6 +231,7 @@ def shutdown_replay_capture(timeout: float = 30.0) -> None:
                 return
             global _SESSION_DATE
             session_id = store.session_id
+            _stop_session_roller()
             set_replay_store(None)
             set_capture_batch_provider(None)
             if session_id is not None:
@@ -271,6 +279,30 @@ def _begin_session(store: ReplayStore) -> str:
     store.begin_session(session)
     _SESSION_DATE = today
     return session.session_id
+
+
+def _start_session_roller() -> None:
+    global _roller_thread
+    _roller_stop.clear()
+
+    def loop() -> None:
+        while not _roller_stop.wait(SESSION_ROLL_INTERVAL_SECONDS):
+            try:
+                _roll_session_if_needed()
+            except Exception as exc:  # noqa: BLE001 -- keep rolling; the failure is loud
+                logger.error(f"replay capture: background session roll failed: {exc}", exc_info=True)
+
+    _roller_thread = threading.Thread(target=loop, name="ba2-replay-session-roller", daemon=True)
+    _roller_thread.start()
+
+
+def _stop_session_roller() -> None:
+    global _roller_thread
+    thread = _roller_thread
+    _roller_thread = None
+    _roller_stop.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=ROLLOVER_DRAIN_TIMEOUT + 3.0)
 
 
 def _roll_session_if_needed() -> None:

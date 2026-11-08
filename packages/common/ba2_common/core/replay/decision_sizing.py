@@ -65,6 +65,10 @@ def dry_run_enabled() -> bool:
 class DryRunStore:
     """Just enough store for ``TradeManager._decision_pass_meta`` (a session id): nothing is written."""
 
+    @property
+    def session_id(self) -> str:
+        return _DRYRUN_SESSION
+
     def current_session_id(self) -> str:
         return _DRYRUN_SESSION
 
