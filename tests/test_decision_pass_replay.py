@@ -468,3 +468,37 @@ def test_an_account_call_the_rerun_makes_that_live_did_not_is_a_difference_namin
     assert any("effects" in d.field for d in aapl.field_diffs)
     others = [r for r in rows(report, "execute") if r.symbol != "AAPL"]
     assert all(r.status == MATCH for r in others)
+
+
+# --------------------------------------------------------------------------- I5: payload versions
+UNSUPPORTED = ReplayStatus.COVERAGE_UNSUPPORTED
+
+
+def _set_version(payload, version=99):
+    payload["version"] = version
+
+
+def test_a_step_with_an_unreadable_payload_version_is_unsupported_naming_the_version(tmp_path, test_engine):
+    bundle_dir = enter_bundle(tmp_path, test_engine)
+    rewrite_payload(bundle_dir, lambda o: o.provider == "decision_step" and o.method == "rules"
+                    and o.request_identity.get("symbol") == "AAPL", _set_version)
+
+    report = run_replay(bundle_dir)
+
+    (aapl,) = [r for r in rows(report, "rules") if r.symbol == "AAPL"]
+    assert aapl.status == UNSUPPORTED and "version 99" in aapl.detail
+    assert [r.status for r in rows(report, "rules") if r.symbol != "AAPL"] == [MATCH, MATCH]
+    # what depends on the unreadable step says so; nothing is a silent match
+    (aapl_exec,) = [r for r in rows(report, "execute") if r.symbol == "AAPL"]
+    assert aapl_exec.status != MATCH
+
+
+def test_an_unreadable_pass_state_version_makes_the_whole_pass_unsupported(tmp_path, test_engine):
+    bundle_dir = enter_bundle(tmp_path, test_engine)
+    rewrite_payload(bundle_dir, lambda o: o.provider == "decision_step" and o.method == "pass_state",
+                    _set_version)
+
+    report = run_replay(bundle_dir)
+
+    assert {r.status for r in report.results} == {UNSUPPORTED}
+    assert any("version 99" in r.detail for r in report.results)

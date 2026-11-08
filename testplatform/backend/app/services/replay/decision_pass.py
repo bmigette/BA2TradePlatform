@@ -428,6 +428,9 @@ class _PassReplay:
         self.state: Optional[Dict[str, Any]] = None
         self.steps: List[_Step] = []
         self.undecodable: List[Tuple[ProviderObservation, str]] = []
+        #: Observations whose payload ``version`` this replay cannot read: (observation, version).
+        self.unsupported: List[Tuple[ProviderObservation, Any]] = []
+        self.summary_unsupported: Optional[Any] = None
         self.account: Optional[TapeAccount] = None
         self.evaluators: Dict[str, Any] = {}
         self.rules_missing: Dict[str, str] = {}      # symbol -> why its rules step is missing_capture
@@ -442,12 +445,25 @@ class _PassReplay:
             except Exception as exc:  # noqa: BLE001 -- a payload the codec refuses is a coverage gap
                 self.undecodable.append((observation, f"{type(exc).__name__}: {exc}"))
                 continue
+            version = payload["version"] if isinstance(payload, dict) and "version" in payload else None
+            if not core.check_version({"version": version}, dr.READABLE_VERSIONS):
+                self.unsupported.append((observation, version))      # never guessed at
+                continue
             if observation.method == dr.KIND_PASS_STATE:
                 self.state_obs, self.state = observation, payload
             else:
                 self.steps.append(_Step(observation, payload))
         if self.analysis.decision_object:
-            self.summary = self.bundle.decode(self.analysis.decision_object)
+            summary = self.bundle.decode(self.analysis.decision_object)
+            version = summary["version"] if isinstance(summary, dict) and "version" in summary else None
+            if core.check_version({"version": version}, dr.READABLE_VERSIONS):
+                self.summary = summary
+            else:
+                self.summary_unsupported = version
+
+    def _unsupported_detail(self, what: str, version: Any) -> str:
+        return (f"the recorded {what} has payload version {version!r}; this replay reads "
+                f"{list(dr.READABLE_VERSIONS)} (record written by a newer or unknown build)")
 
     def steps_of(self, kind: str) -> List[_Step]:
         return [step for step in self.steps if step.kind == kind]
@@ -493,6 +509,17 @@ class _PassReplay:
     # -- run -----------------------------------------------------------------------------
     def run(self) -> List[_Row]:
         self.decode()
+        unsupported_state = [(o, v) for o, v in self.unsupported if o.method == dr.KIND_PASS_STATE]
+        if self.state is None and unsupported_state:
+            detail = self._unsupported_detail("pass_state", unsupported_state[0][1])
+            self.rows.append(_row(KIND_PASS, "", 0, _UNSUPPORTED, detail))
+            for observation, version in self.unsupported:
+                if observation.method != dr.KIND_PASS_STATE and observation.method in _KIND_STAGES:
+                    self.rows.append(_row(observation.method,
+                                          str(observation.request_identity.get("symbol", "")),
+                                          observation.invocation_seq, _UNSUPPORTED,
+                                          self._unsupported_detail(f"{observation.method} step", version)))
+            return self.rows
         if self.state is None:
             self._all_missing("the pass' pass_state was not recorded or could not be decoded"
                               + ("".join(f" [{o.method}: {why}]" for o, why in self.undecodable)))
@@ -501,6 +528,17 @@ class _PassReplay:
             self.rows.append(_row(observation.method, str(observation.request_identity.get("symbol", "")),
                                   observation.invocation_seq, _MISSING,
                                   f"the recorded {observation.method} step could not be decoded: {why}"))
+        if self.summary_unsupported is not None:
+            self.rows.append(_row(KIND_PASS, "", 0, _UNSUPPORTED,
+                                  self._unsupported_detail("pass summary", self.summary_unsupported)))
+        for observation, version in self.unsupported:
+            if observation.method in _KIND_STAGES and observation.method != dr.KIND_PASS_STATE:
+                symbol = str(observation.request_identity.get("symbol", ""))
+                detail = self._unsupported_detail(f"{observation.method} step", version)
+                if observation.method == dr.KIND_RULES:
+                    self.rules_missing.setdefault(symbol, detail)
+                self.rows.append(_row(observation.method, symbol, observation.invocation_seq,
+                                      _UNSUPPORTED, detail))
         for failed in (self.summary["steps_not_recorded"] if "steps_not_recorded" in self.summary else []):
             kind = failed["kind"]
             if kind in _KIND_STAGES and kind != dr.KIND_PASS_STATE:
