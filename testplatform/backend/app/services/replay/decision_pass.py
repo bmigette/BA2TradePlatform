@@ -144,13 +144,20 @@ class TapeAccount(TapeOptionsAccount):
         self._settings_cache = dict(settings)
         self._effects: deque = deque()
         self._effect_index = 0
+        self._stamps_protective_prices = False
 
     # -- per step ----------------------------------------------------------------------------
-    def use_tape(self, tape, effects: Sequence[Dict[str, Any]] = ()) -> None:
-        """Serve the next step from ``tape``; ``effects`` are the effect calls live recorded for it."""
+    def use_tape(self, tape, effects: Sequence[Dict[str, Any]] = (),
+                 stamps_protective_prices: bool = False) -> None:
+        """Serve the next step from ``tape``; ``effects`` are the effect calls live recorded for it.
+
+        ``stamps_protective_prices``: the recorded adapter wrote TP/SL onto the transaction (its recorded
+        transaction rows carry them), so the re-run stamps the prices it is handed the same way.
+        """
         self._tape = tape
         self._effects = deque(effects)
         self._effect_index = 0
+        self._stamps_protective_prices = stamps_protective_prices
 
     # -- tapped reads ------------------------------------------------------------------------
     def _read(self, method: str, **arguments):
@@ -196,8 +203,46 @@ class TapeAccount(TapeOptionsAccount):
             raise RecordedEffectError(recorded["error"])
         returned = recorded["returned"] if "returned" in recorded else None
         result = apply(call, recorded, returned, args, kwargs) if apply is not None else returned
+        if result and self._stamps_protective_prices:
+            self._stamp_protective_prices(method, args)
         core.note_effect(method, call=call, returned=_plain(result))
         return result
+
+    @staticmethod
+    def _stamp_protective_prices(method: str, args) -> None:
+        """What every broker adapter does on a SUCCESSFUL call: write the TP/SL it was handed onto the
+        transaction (``AlpacaAccount.submit_order`` step 4b, ``protective_legs`` ``take_profit`` /
+        ``stop_loss``), and only the prices that were given.
+
+        The shared code READS them back (``entry_submit_stop`` reconciles the safeguard with the
+        transaction's ruleset stop), so a re-run that did not stamp them would send the broker another
+        stop than live did, and ``take_profit`` / ``stop_loss`` could not be compared at all.
+        """
+        from ba2_common.core.db import get_instance, update_instance
+        from ba2_common.core.models import Transaction
+
+        if method == "submit_order":
+            order, tp, sl = args[0], args[1], args[2]
+            transaction_id = order.transaction_id
+        elif method == "adjust_tp_sl":
+            transaction_id, tp, sl = args[0].id, args[1], args[2]
+        elif method == "adjust_tp":
+            transaction_id, tp, sl = args[0].id, args[1], None
+        elif method == "adjust_sl":
+            transaction_id, tp, sl = args[0].id, None, args[1]
+        else:
+            return
+        # submit_order stamps what is truthy, the adjusters what is not None (as the adapters do).
+        tp = tp if (tp if method == "submit_order" else tp is not None) else None
+        sl = sl if (sl if method == "submit_order" else sl is not None) else None
+        if transaction_id is None or (tp is None and sl is None):
+            return
+        transaction = get_instance(Transaction, transaction_id)
+        if tp is not None:
+            transaction.take_profit = tp
+        if sl is not None:
+            transaction.stop_loss = sl
+        update_instance(transaction)
 
     def submit_order(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False):
         def apply(call, recorded, returned, args, kwargs):
@@ -296,9 +341,19 @@ def normalise_effects(effects: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     return walk(list(effects))
 
 
-#: Fields the execute order/transaction views do not compare: the adapter writes them (protective legs,
-#: the broker's TP/SL bookkeeping on the transaction), so only the shared code's own build is compared.
-_ADAPTER_TRANSACTION_FIELDS = frozenset({"take_profit", "stop_loss", "meta_data", "status", "quantity",
+#: Transaction fields the execute view does NOT compare, because the broker adapter provably writes them
+#: from broker state the replay does not have (fills, the broker's own reconciliation):
+#:   * ``status``      -- WAITING -> OPENED/CLOSING happens at the broker's fill / close
+#:                        (``ReadOnlyAccountInterface`` status sync, ``AccountInterface.close_transaction``);
+#:   * ``quantity``    -- re-derived from the FILLED entry orders after submit (``AccountInterface``);
+#:   * ``open_price`` / ``close_price`` -- fill prices;
+#:   * ``meta_data``   -- the safeguard / max-loss anchors are stamped from the broker quote at submit;
+#:   * ``created_at``  -- a timestamp.
+#: ``take_profit`` and ``stop_loss`` ARE compared: the shared code decides them and hands them to the
+#: adapter; where the recorded adapter stamped them (its recorded transactions carry them) the tape
+#: account stamps the prices it is handed the same way (``_stamp_protective_prices``), and the shared
+#: code reads them back as it did live.
+_ADAPTER_TRANSACTION_FIELDS = frozenset({"meta_data", "status", "quantity",
                                          "open_price", "close_price", "created_at"})
 
 
@@ -610,13 +665,18 @@ class _PassReplay:
         stack.callback(TradeConditions.set_provider_resolver, previous)
 
     # -- one step ------------------------------------------------------------------------
-    def _run_step(self, tape: SpanTape, context: CaptureContext, effects, body):
+    def _run_step(self, tape: SpanTape, context: CaptureContext, effects, body, step=None):
         """Run ``body(frame)`` under a replay context on ``tape``; returns ``(value, error, frame)``.
+
+        ``step`` (an execute step) says whether the recorded adapter stamped TP/SL on the transaction.
 
         A ``ReplayMiss`` propagates (the caller turns it into ``missing_capture``); any other exception is
         the step's own outcome.
         """
-        self.account.use_tape(tape, effects)
+        stamps = step is not None and any(
+            t["take_profit"] is not None or t["stop_loss"] is not None
+            for t in step.payload["outcome"]["transactions"])
+        self.account.use_tape(tape, effects, stamps)
         with use_capture_context(context), core.replay_effects(None, True) as frame:
             try:
                 return body(frame), None, frame
@@ -938,7 +998,7 @@ class _PassReplay:
             return submitted
 
         try:
-            _, error, frame = self._run_step(tape, context, recorded_effects, body)
+            _, error, frame = self._run_step(tape, context, recorded_effects, body, step)
         except ReplayMiss as miss:
             return self._miss_row(dr.KIND_EXECUTE, symbol, step.seq, miss)
         swallowed = self._swallowed(tape)
@@ -1076,7 +1136,7 @@ class _PassReplay:
             return evaluator.execute(submit_to_broker=submit_to_broker)
 
         try:
-            results, error, frame = self._run_step(tape, context, recorded_effects, body)
+            results, error, frame = self._run_step(tape, context, recorded_effects, body, step)
         except ReplayMiss as miss:
             return self._miss_row(dr.KIND_EXECUTE, symbol, step.seq, miss)
         swallowed = self._swallowed(tape)

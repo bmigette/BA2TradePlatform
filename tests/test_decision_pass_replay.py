@@ -502,3 +502,67 @@ def test_an_unreadable_pass_state_version_makes_the_whole_pass_unsupported(tmp_p
 
     assert {r.status for r in report.results} == {UNSUPPORTED}
     assert any("version 99" in r.detail for r in report.results)
+
+
+# --------------------------------------------------------------------------- I6: transaction TP/SL
+def _stamping_world():
+    """The enter world on an account that, like AlpacaAccount, stamps the transaction's TP/SL itself."""
+    from tests.test_decision_pass_capture_roundtrip import _Account
+    from tests.test_funded_entry_loop import _make_scenario
+    from ba2_common.core.db import get_instance, update_instance
+    from ba2_common.core.models import Transaction
+
+    class _Stamping(_Account):
+        def _stamp(self, transaction, tp=None, sl=None):
+            txn = get_instance(Transaction, transaction.id)
+            if tp is not None:
+                txn.take_profit = tp
+            if sl is not None:
+                txn.stop_loss = sl
+            update_instance(txn)
+
+        def adjust_sl(self, transaction, new_sl_price, source=""):
+            self._stamp(transaction, sl=new_sl_price)
+            return super().adjust_sl(transaction, new_sl_price, source)
+
+        def adjust_tp(self, transaction, new_tp_price, source=""):
+            self._stamp(transaction, tp=new_tp_price)
+            return super().adjust_tp(transaction, new_tp_price, source)
+
+        def adjust_tp_sl(self, transaction, new_tp_price=None, new_sl_price=None, source=""):
+            self._stamp(transaction, tp=new_tp_price, sl=new_sl_price)
+            return super().adjust_tp_sl(transaction, new_tp_price, new_sl_price, source)
+
+    acct_def, inst, expert = _make_scenario(["AAPL", "MSFT", "GOOGL"], with_stop_loss=True,
+                                            per_instrument_pct=40.0)
+    return inst, expert, _Stamping(acct_def.id)
+
+
+def test_the_transaction_tp_sl_the_adapter_stamps_is_compared_and_replays_to_a_match(tmp_path, test_engine):
+    bundle_dir = record(tmp_path, test_engine, _stamping_world, lambda w: _run_enter(w[1], w[2], w[0].id))
+    bundle = load_bundle(bundle_dir)
+    recorded = [bundle.decode(o.payload_object) for o in bundle.observations
+                if o.provider == "decision_step" and o.method == "execute"]
+    stops = [t["stop_loss"] for p in recorded for t in p["outcome"]["transactions"]]
+    assert stops and all(s is not None for s in stops), "the live adapter must have stamped a stop"
+
+    report = run_replay(bundle_dir)
+
+    _assert_all_match(report, ENTER_KINDS)
+
+
+def test_a_changed_transaction_stop_loss_is_an_order_build_difference_naming_it(tmp_path, test_engine):
+    bundle_dir = record(tmp_path, test_engine, _stamping_world, lambda w: _run_enter(w[1], w[2], w[0].id))
+
+    def move_the_stop(payload):
+        for txn in payload["outcome"]["transactions"]:
+            txn["stop_loss"] = 1.23
+
+    rewrite_payload(bundle_dir, lambda o: o.provider == "decision_step" and o.method == "execute"
+                    and o.request_identity["symbol"] == "AAPL", move_the_stop)
+
+    report = run_replay(bundle_dir)
+
+    aapl = {r.symbol: r for r in rows(report, "execute")}["AAPL"]
+    assert aapl.status == DIFFERENCE
+    assert any("stop_loss" in d.field for d in aapl.field_diffs)
