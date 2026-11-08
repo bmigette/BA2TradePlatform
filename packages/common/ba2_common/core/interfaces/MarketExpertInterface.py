@@ -1538,12 +1538,58 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             "scheduled_at": created_at,
             "started_at": datetime.now(_tz.utc),
         }
-        if settings is not None:
-            meta["settings"] = settings
+        branch_flags: Dict[str, Any] = {}
+        recorded, redacted = self._recorded_settings(settings, branch_flags)
+        if recorded is not None:
+            meta["settings"] = recorded
+        if redacted:
+            branch_flags["redacted_setting_keys"] = redacted
         batch_id = _current_capture_batch()
         if batch_id is not None:
-            meta["branch_flags"] = {"batch_id": batch_id}
+            branch_flags["batch_id"] = batch_id
+        if branch_flags:
+            meta["branch_flags"] = branch_flags
         return meta
+
+    def resolve_all_settings(self) -> Dict[str, Any]:
+        """EVERY setting of this instance, resolved exactly as the live code resolves one.
+
+        The union of the merged definitions (own + builtin risk-manager/platform settings)
+        and every stored key, each through ``get_setting_with_interface_default`` -- the same
+        call ``_resolve_settings`` makes for the expert's own keys, so the two can never
+        disagree. A stored key with no definition has no default to fall back to and is
+        returned as stored.
+        """
+        definitions = type(self).get_merged_settings_definitions()
+        stored = self.settings
+        resolved: Dict[str, Any] = {}
+        for key in sorted(set(definitions) | set(stored)):
+            if key in definitions:
+                resolved[key] = self.get_setting_with_interface_default(key, log_warning=False)
+            else:
+                resolved[key] = stored[key]
+        return resolved
+
+    def _recorded_settings(self, passed, branch_flags):
+        """``(settings_to_record, redacted_names)`` for one analysis (schema 2 content).
+
+        A failure to resolve the full set must not stop the analysis: it is logged as an
+        error and flagged on the record, and the record keeps what the live body passed.
+        """
+        from ba2_common.core.replay.settings_record import full_recorded_settings
+
+        try:
+            return full_recorded_settings(
+                self.resolve_all_settings(), get_instance(ExpertInstance, self.id), passed)
+        except Exception as e:
+            logger.error(f"replay capture: could not resolve the full settings of expert "
+                         f"{getattr(self, 'id', None)}; the record keeps only the settings "
+                         f"the analysis was handed: {e}", exc_info=True)
+            branch_flags["settings_resolution_failed"] = f"{type(e).__name__}: {e}"
+            if passed is None:
+                return None, []
+            from ba2_common.core.replay.settings_record import redact_settings
+            return redact_settings(passed)
 
     @staticmethod
     def _use_case_of(market_analysis: Optional["MarketAnalysis"]) -> str:

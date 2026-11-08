@@ -492,3 +492,35 @@ def test_a_dead_writer_thread_degrades_to_a_visible_drop_without_blocking(tmp_pa
             assert "saturated" in entry.detail
     finally:
         store.close(timeout=2.0)
+
+
+def test_load_bundle_still_reads_the_previous_schema_version(tmp_path):
+    """N-1 stays readable (a v1 bundle predates the full recorded settings)."""
+    store = ReplayStore(tmp_path / "store", writer="sync")
+    store.begin_session(_session())
+    _record_one_analysis(store)
+    store.finalize_session("s1")
+    out = store.export_session("s1", tmp_path / "export")
+    store.close()
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert len(load_bundle(out).analyses) == 1
+
+
+def test_a_pre_v2_recording_is_reported_as_incomplete_naming_the_missing_keys():
+    from ba2_common.core.replay.dependencies import MissingDependencySetting
+    from ba2_common.core.replay.settings_record import explain_missing_setting
+
+    exc = MissingDependencySetting("use_atr_stop", "the ATR indicator")
+    message = explain_missing_setting(exc, {"w_analyst": 1.0}, schema_version=1)
+
+    assert message.startswith("recorded settings incomplete (pre-v2 recording")
+    for key in ("use_atr_stop", "sizing_mode", "atr_period"):
+        assert key in message
+    assert "1 keys" in message and "as-recorded" in message
+
+    current = explain_missing_setting(exc, {"w_analyst": 1.0}, schema_version=2)
+    assert "pre-v2" not in current and "branch flags" in current

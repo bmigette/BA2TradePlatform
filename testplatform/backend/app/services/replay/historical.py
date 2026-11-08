@@ -171,6 +171,8 @@ DS_ANALYST_KEY_FLAG = "ds_analyst_key_present"
 _HOST_BRANCH_FLAGS = frozenset({
     "use_case", "market_analysis_id", "batch_id",
     "historical", "as_of", "live_attempt_id",
+    # How the RECORDING resolved/redacted the settings; says nothing about the calculation.
+    "settings_resolution_failed", "redacted_setting_keys",
 })
 
 #: Branch flags whose value is DECIDED BY ``as_of is None``, i.e. by which of the
@@ -333,6 +335,7 @@ def _preflight(bundle: SessionBundle, analysis: AnalysisRecord, pinned: PinnedRo
                plans):
     """Either the row this analysis already earns, or the job that will produce it."""
     from ba2_common.core.replay.dependencies import adapter_for
+    from ba2_common.core.replay.settings_record import explain_missing_setting
 
     if analysis.expert_class not in SUPPORTED_EXPERTS or \
             adapter_for(analysis.expert_class) is None:
@@ -367,7 +370,8 @@ def _preflight(bundle: SessionBundle, analysis: AnalysisRecord, pinned: PinnedRo
     except MissingDependencySetting as exc:
         return AnalysisResult.for_analysis(
             analysis, ReplayStatus.COVERAGE_MISSING_CAPTURE,
-            f"the recorded settings cannot declare this expert's dependencies: {exc}")
+            "the recorded settings cannot declare this expert's dependencies: "
+            + explain_missing_setting(exc, settings, schema_version=analysis.schema_version))
 
     blocking, notes = _coverage_verdict(plan)
     if blocking:

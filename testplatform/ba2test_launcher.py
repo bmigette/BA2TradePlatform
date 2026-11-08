@@ -815,6 +815,7 @@ def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
     from ba2_common.core.replay.dependencies import (
         MissingDependencySetting, Window, required_replay_inputs,
     )
+    from ba2_common.core.replay.settings_record import explain_missing_setting
     import ba2_experts.replay_dependencies  # noqa: F401 - registers the per-expert adapters
     from ba2_providers.warm import planner
 
@@ -836,7 +837,8 @@ def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
             continue
         key = (record.expert_class, record.settings_object)
         group = groups.setdefault(
-            key, {"settings": session.decode(record.settings_object), "symbols": set()})
+            key, {"settings": session.decode(record.settings_object), "symbols": set(),
+                  "schema_version": record.schema_version})
         if record.symbol:
             group["symbols"].add(record.symbol)
 
@@ -849,7 +851,8 @@ def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
             requirements.extend(required_replay_inputs(
                 expert_class, group["settings"], None, sorted(group["symbols"]), window))
         except MissingDependencySetting as e:
-            print(f"!! cannot resolve {expert_class}: {e}")
+            print(f"!! cannot resolve {expert_class}: " + explain_missing_setting(
+                e, group["settings"], schema_version=group["schema_version"]))
 
     plan = planner.plan(requirements, roots, as_of_now=as_of_now)
     print(plan.to_markdown())

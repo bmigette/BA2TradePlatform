@@ -40,6 +40,7 @@ from ba2_common.core.replay.context import (
     classify_failure,
 )
 from ba2_common.core.replay.schemas import (
+    READABLE_SCHEMA_VERSIONS,
     SCHEMA_VERSION,
     AnalysisRecord,
     CoverageEntry,
@@ -120,9 +121,10 @@ def load_bundle(directory) -> SessionBundle:
         raise ReplayStoreError(f"{root} is not a replay bundle: no {MANIFEST_NAME}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     version = manifest["schema_version"]
-    if version != SCHEMA_VERSION:
+    if version not in READABLE_SCHEMA_VERSIONS:
         raise ValueError(
-            f"bundle schema_version {version} is not supported (expected {SCHEMA_VERSION})"
+            f"bundle schema_version {version} is not supported "
+            f"(this reader reads {list(READABLE_SCHEMA_VERSIONS)}, writes {SCHEMA_VERSION})"
         )
     codec_version = manifest["codec_version"]
     if codec_version != CODEC_VERSION:
