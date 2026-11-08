@@ -294,3 +294,47 @@ def test_concurrent_writer_never_loses_an_object_to_a_prune(world):
         thread.join()
     assert not errors, errors[:3]
     assert path.is_file()
+
+
+# --------------------------------------------------------------------------- prune cost / lock time
+def test_sessions_are_deleted_in_short_batches(world, monkeypatch):
+    from ba2_common.core.replay import store as store_module
+
+    for n in range(6):
+        sid = f"old-{n}"
+        world.begin_session(_session(sid, NOW - 50 * DAY))
+        _record(world, sid, f"a-{sid}", NOW - 50 * DAY, sid)
+        _finish(world, sid, NOW - 50 * DAY)
+    entered = []
+    real_enter = store_module._transaction.__enter__
+
+    def counting(self):
+        entered.append(1)
+        return real_enter(self)
+
+    monkeypatch.setattr(store_module._transaction, "__enter__", counting)
+    assert world.index.delete_sessions([f"old-{n}" for n in range(6)], batch_size=2) == 6
+    assert len(entered) == 3                                   # one short transaction per batch
+    assert not any(s.session_id.startswith("old-") for s in world.index.list_sessions())
+
+
+def test_a_batched_delete_still_refuses_an_open_or_unknown_session_before_deleting_any(world):
+    from ba2_common.core.replay.store import ReplayStoreError
+
+    with pytest.raises(ReplayStoreError):
+        world.index.delete_sessions(["old", "live"], batch_size=1)          # live is open
+    assert any(s.session_id == "old" for s in world.index.list_sessions())
+
+
+def test_a_closed_kept_session_is_read_once_per_prune(world, monkeypatch):
+    calls = []
+    real = type(world.index).root_hashes
+
+    def counting(self, session_id):
+        calls.append(session_id)
+        return real(self, session_id)
+
+    monkeypatch.setattr(type(world.index), "root_hashes", counting)
+    retention.execute_prune(world.root, 30, now=_later())
+    assert calls.count("recent") == 1                  # finalized: cannot change, scanned once for both scans
+    assert calls.count("live") == 2                    # open: a writer may add to it between the scans

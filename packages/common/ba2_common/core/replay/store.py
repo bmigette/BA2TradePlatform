@@ -391,28 +391,41 @@ class ReplayIndex:
                 (status, payload["ended_at"], _dumps(payload), session_id),
             )
 
-    def delete_sessions(self, session_ids: Sequence[str]) -> int:
-        """Delete sessions and everything the index holds for them, in ONE transaction.
+    def delete_sessions(self, session_ids: Sequence[str], batch_size: int = 5) -> int:
+        """Delete sessions and everything the index holds for them, ``batch_size`` sessions per transaction.
 
-        Refuses (nothing is deleted) when any session is unknown or still ``open``: an open session is
-        being written by a live process. Returns the number of sessions deleted.
+        Short transactions on purpose: the live writer waits at most its busy timeout (30 s) for the index,
+        and one transaction over a month of sessions can outlast that. Refuses (nothing is deleted) when any
+        session is unknown or still ``open`` -- an open session is being written by a live process -- and
+        re-checks ``open`` inside each batch. Returns the number of sessions deleted.
         """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        session_ids = list(session_ids)
         conn = self._connection()
-        with _transaction(conn):
-            for session_id in session_ids:
-                row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
-                if row is None:
-                    raise ReplayStoreError(f"session {session_id} is not in the index")
-                if row["status"] == ReplayStatus.SESSION_OPEN:
-                    raise ReplayStoreError(f"session {session_id} is open (a live process is writing it); refusing to delete it")
-            for session_id in session_ids:
-                conn.execute("DELETE FROM observation_links WHERE observation_id IN "
-                             "(SELECT observation_id FROM observations WHERE session_id = ?)", (session_id,))
-                conn.execute("DELETE FROM observations WHERE session_id = ?", (session_id,))
-                conn.execute("DELETE FROM analyses WHERE session_id = ?", (session_id,))
-                conn.execute("DELETE FROM coverage WHERE session_id = ?", (session_id,))
-                conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        for session_id in session_ids:
+            self._require_deletable(conn, session_id)
+        for start in range(0, len(session_ids), batch_size):
+            with _transaction(conn):
+                batch = session_ids[start:start + batch_size]
+                for session_id in batch:
+                    self._require_deletable(conn, session_id)
+                for session_id in batch:
+                    conn.execute("DELETE FROM observation_links WHERE observation_id IN "
+                                 "(SELECT observation_id FROM observations WHERE session_id = ?)", (session_id,))
+                    conn.execute("DELETE FROM observations WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM analyses WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM coverage WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         return len(session_ids)
+
+    @staticmethod
+    def _require_deletable(conn, session_id: str) -> None:
+        row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise ReplayStoreError(f"session {session_id} is not in the index")
+        if row["status"] == ReplayStatus.SESSION_OPEN:
+            raise ReplayStoreError(f"session {session_id} is open (a live process is writing it); refusing to delete it")
 
     def delete_object_rows(self, hashes: Sequence[str]) -> None:
         """Drop the registry rows of objects whose files were deleted."""
@@ -426,10 +439,11 @@ class ReplayIndex:
         found: Set[str] = set(self.get_session(session_id).object_hashes())
         for analysis in self.analyses(session_id):
             found.update(analysis.object_hashes())
-        for row in conn.execute("SELECT payload FROM observations WHERE session_id = ?", (session_id,)):
-            payload_object = json.loads(row["payload"])["payload_object"]
-            if payload_object is not None:
-                found.add(payload_object)
+        # Extracted by SQLite: the observation payloads (which can be large) are not parsed in Python.
+        for row in conn.execute("SELECT json_extract(payload, '$.payload_object') AS payload_object "
+                                "FROM observations WHERE session_id = ?", (session_id,)):
+            if row["payload_object"] is not None:
+                found.add(row["payload_object"])
         return found
 
     def mark_interrupted(self) -> List[str]:

@@ -147,13 +147,22 @@ def _children(path: Path, problems: List[str]) -> Tuple[str, ...]:
         return ()
 
 
-def _reachable(index: ReplayIndex, session_ids: List[str], paths: Dict[str, Path],
-               problems: List[str], label: str) -> Set[str]:
-    """Every object hash reachable from ``session_ids`` (their own records, then the links between objects)."""
+def _reachable(index: ReplayIndex, sessions: List[SessionRecord], paths: Dict[str, Path],
+               problems: List[str], label: str, root_cache: Dict[str, Set[str]]) -> Set[str]:
+    """Every object hash reachable from ``sessions`` (their own records, then the links between objects).
+
+    A CLOSED session's roots are read once per prune (``root_cache``): it is no longer written, and anything a
+    late pass still adds is protected by the object age bound. An open one is read on every scan.
+    """
     seen: Set[str] = set()
     pending: List[str] = []
-    for session_id in session_ids:
-        pending.extend(index.root_hashes(session_id))
+    for session in sessions:
+        if session.status == ReplayStatus.SESSION_OPEN:
+            pending.extend(index.root_hashes(session.session_id))
+            continue
+        if session.session_id not in root_cache:
+            root_cache[session.session_id] = set(index.root_hashes(session.session_id))
+        pending.extend(root_cache[session.session_id])
     while pending:
         object_hash = pending.pop()
         if object_hash in seen:
@@ -167,7 +176,9 @@ def _reachable(index: ReplayIndex, session_ids: List[str], paths: Dict[str, Path
     return seen
 
 
-def _scan(root: Path, index: ReplayIndex, keep_days: int, now: datetime) -> _Scan:
+def _scan(root: Path, index: ReplayIndex, keep_days: int, now: datetime,
+          root_cache: Optional[Dict[str, Set[str]]] = None) -> _Scan:
+    root_cache = {} if root_cache is None else root_cache
     scan = _Scan()
     cutoff = now - timedelta(days=keep_days)
     for session in index.list_sessions():
@@ -188,7 +199,7 @@ def _scan(root: Path, index: ReplayIndex, keep_days: int, now: datetime) -> _Sca
         sizes[path] = (stat.st_size, stat.st_mtime)
         if path.suffix in _SUFFIXES:
             paths[path.stem] = path
-    reachable = _reachable(index, [s.session_id for s in protected], paths, scan.problems, "a kept or open session")
+    reachable = _reachable(index, protected, paths, scan.problems, "a kept or open session", root_cache)
     bound_ts = scan.bound.timestamp()
     for path, (size, mtime) in sorted(sizes.items(), key=lambda kv: str(kv[0])):
         if path.suffix in _SUFFIXES and path.stem in reachable:
@@ -308,14 +319,15 @@ def _delete_if_still_old(path: Path, trash: Path, bound_ts: float, failures: Lis
 
 
 def _execute_locked(root: Path, index: ReplayIndex, keep_days: int, now: datetime) -> Dict[str, Any]:
-    first = _scan(root, index, keep_days, now)
+    root_cache: Dict[str, Set[str]] = {}
+    first = _scan(root, index, keep_days, now, root_cache)
     if first.problems:
         raise RetentionRefused("the store is inconsistent, nothing was deleted: " + "; ".join(first.problems))
     if first.delete_sessions:
         index.delete_sessions([s.session_id for s in first.delete_sessions])
         logger.info(f"replay retention: deleted {len(first.delete_sessions)} session(s) older than {keep_days} day(s)")
     # Look again with the sessions gone and BEFORE touching a file: what a live writer committed meanwhile counts.
-    scan = _scan(root, index, keep_days, now)
+    scan = _scan(root, index, keep_days, now, root_cache)
     if scan.problems:
         raise RetentionRefused(
             f"the store became inconsistent after the sessions were deleted ({len(first.delete_sessions)} gone); "
