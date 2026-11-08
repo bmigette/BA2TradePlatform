@@ -258,8 +258,14 @@ class ReplayStore:
         status = (
             ReplayStatus.SESSION_FINALIZED if remaining == 0 else ReplayStatus.SESSION_INTERRUPTED
         )
+        # What this process failed to record, written INTO the session so an exported bundle states it
+        # (the counters are cumulative for the process; the rollover finalizes a session per UTC day).
+        snapshot = self.health.snapshot()
+        snapshot["scope"] = "process_cumulative"
+        snapshot["as_of"] = datetime.now(timezone.utc).isoformat()
         self.index.update_session_status(
-            session_id, status, ended_at=datetime.now(timezone.utc)
+            session_id, status, ended_at=datetime.now(timezone.utc),
+            capabilities_update={"capture_health": snapshot},
         )
         if remaining:
             logger.error(

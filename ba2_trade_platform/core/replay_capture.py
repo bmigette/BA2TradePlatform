@@ -213,6 +213,19 @@ def get_capture_health() -> Dict[str, int]:
     return store.health.as_dict()
 
 
+def get_capture_status() -> Dict[str, Any]:
+    """The live capture state for the ops endpoint: on/off, the open session and the health counters.
+
+    ``enabled`` False means no store is installed (capture off); the counters are then empty and say so
+    rather than reading as a clean bill of health.
+    """
+    store = get_replay_store()
+    if store is None:
+        return {"enabled": False, "session_id": None, "counters": {}, "discards": {},
+                "discards_by_expert": {}, "total_failures": 0}
+    return {"enabled": True, "session_id": store.session_id, **store.health.snapshot()}
+
+
 # --------------------------------------------------------------------------- #
 # Sessions
 # --------------------------------------------------------------------------- #

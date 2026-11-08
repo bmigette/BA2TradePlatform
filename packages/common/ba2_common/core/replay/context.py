@@ -118,12 +118,33 @@ class CaptureHealth:
         self._lock = threading.Lock()
         self._counts: Dict[str, int] = {kind: 0 for kind in self.KINDS}
         self._discards: Dict[str, int] = {}
+        self._discards_by_expert: Dict[str, int] = {}
 
-    def record_discard(self, reason: str) -> None:
-        """Count a discarded pass under ``reason`` (also bumps :data:`PASS_DISCARDED`)."""
+    def record_discard(self, reason: str, expert_class: Optional[str] = None) -> None:
+        """Count a discarded pass under ``reason`` (also bumps :data:`PASS_DISCARDED`).
+
+        ``expert_class`` (the owning expert of the pass) additionally feeds the per-expert tally.
+        """
         with self._lock:
             self._counts[self.PASS_DISCARDED] += 1
             self._discards[reason] = self._discards.get(reason, 0) + 1
+            if expert_class:
+                self._discards_by_expert[expert_class] = self._discards_by_expert.get(expert_class, 0) + 1
+
+    def discards_by_expert(self) -> Dict[str, int]:
+        """Discarded passes by the owning expert class (passes with no named expert are not here)."""
+        with self._lock:
+            return dict(self._discards_by_expert)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Everything the health surfaces show, taken under one lock: counters, discards, failure total."""
+        with self._lock:
+            return {
+                "counters": dict(self._counts),
+                "discards": dict(self._discards),
+                "discards_by_expert": dict(self._discards_by_expert),
+                "total_failures": sum(c for k, c in self._counts.items() if k != self.PASS_DISCARDED),
+            }
 
     def discards(self) -> Dict[str, int]:
         """Discarded passes by reason."""
@@ -646,7 +667,7 @@ class CaptureContext:
     def submit_to(self, store) -> None:
         """Hand the finished record to the store. Failures stay inside recording."""
         if self._discard_reason is not None and self._outcome is None:
-            store.health.record_discard(self._discard_reason)
+            store.health.record_discard(self._discard_reason, self.meta["expert_class"])
             return
         try:
             store.submit(self.build_record(), objects=self.objects, observations=self.observations)

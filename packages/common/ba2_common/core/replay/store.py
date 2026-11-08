@@ -347,7 +347,8 @@ class ReplayIndex:
                     (ref.hash, ref.kind, ref.size, now),
                 )
 
-    def update_session_status(self, session_id: str, status: str, ended_at=None) -> None:
+    def update_session_status(self, session_id: str, status: str, ended_at=None,
+                              capabilities_update: Optional[Dict[str, Any]] = None) -> None:
         conn = self._connection()
         with _transaction(conn):
             row = conn.execute(
@@ -357,6 +358,9 @@ class ReplayIndex:
                 raise ReplayStoreError(f"session {session_id} is not in the index")
             payload = json.loads(row["payload"])
             payload["status"] = status
+            if capabilities_update:
+                payload["capabilities"] = {**(payload["capabilities"] if "capabilities" in payload else {}),
+                                           **capabilities_update}
             if ended_at is not None:
                 if ended_at.tzinfo is None:
                     raise ValueError("ended_at must be timezone-aware")
