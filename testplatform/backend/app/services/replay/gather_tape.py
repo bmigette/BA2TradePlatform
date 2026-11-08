@@ -79,6 +79,7 @@ from app.services.replay.expert_replay import (
     replay_context,
 )
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = ["ReplayTape", "TapeProviderBundle", "run"]
@@ -799,7 +800,4 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     with replay_isolation():
         for analysis in bundle.analyses:
             report.results.append(replay_gather(bundle, analysis))
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)

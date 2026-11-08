@@ -160,6 +160,7 @@ def initialize_replay_capture() -> Optional[ReplayStore]:
             store.mark_interrupted_sessions()
             global _SESSION_TEMPLATE
             _SESSION_TEMPLATE = _describe_instance()
+            _SESSION_TEMPLATE.update(_collect_session_provenance(store))
             store.set_session_hook(_roll_session_if_needed)
             set_replay_store(store)
             set_capture_batch_provider(get_current_batch)
@@ -282,6 +283,28 @@ def _describe_instance() -> Dict[str, Any]:
     }
 
 
+def _collect_session_provenance(store: ReplayStore) -> Dict[str, Any]:
+    """The exact code this process runs (patch of a dirty tree, untracked files, versions).
+
+    Once per process start -- the code in memory is the code at start -- never in the decision
+    path, and never raises: a failure is returned as ``provenance_error`` so the session says
+    so, and live trading is unaffected.
+    """
+    from ba2_common.core.replay.provenance import collect_provenance
+
+    try:
+        provenance, error = collect_provenance(_repo_root(), store.publish_session_object)
+    except Exception as e:  # collect_provenance does not raise; this is the belt for its braces
+        provenance, error = {}, f"collect_provenance: {e}"
+    if error:
+        logger.error(f"replay capture: code provenance incomplete: {error}")
+    return {"provenance": provenance, "provenance_error": error}
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def _instance_id() -> str:
     """A stable, OPAQUE id for this installation: sha256 of its database path.
 
@@ -317,7 +340,7 @@ def _source_revision():
     not an error -- but the revision then stays UNKNOWN (``None``) instead of
     being filled with something that looks like an answer.
     """
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    repo = _repo_root()
     try:
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,

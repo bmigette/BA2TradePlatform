@@ -749,6 +749,8 @@ def _cmd_replay(args) -> int:
     """
     if args.replay_cmd == "warm":
         return _cmd_replay_warm(args)
+    if args.replay_cmd in ("checkout", "export"):
+        return _cmd_replay_code_tools(args)
 
     from app.services.replay import expert_replay, gather_tape, inventory, option_selection
 
@@ -780,6 +782,9 @@ def _cmd_replay(args) -> int:
         module = {"experts": expert_replay, "gather": gather_tape,
                   "option-selection": option_selection}[args.replay_cmd]
         report = module.run(bundle, out)
+    # ONE clear line: which code recorded the session and which code ran this replay.
+    if report.code_provenance is not None:
+        print(report.code_provenance["line"])
     print(report.to_markdown())
     if out:
         print(f"-- wrote {os.path.join(out, report.capability + '.md')}")
@@ -795,7 +800,34 @@ def _cmd_replay(args) -> int:
     # assume zero difference is always attainable", and an endpoint/vintage
     # difference is expected evidence. Gate a CI step on it only where the pinned
     # root is meant to reproduce the session exactly.
-    return 0 if report.counts()[ReplayStatus.COVERAGE_DIFFERENCE] == 0 else 1
+    counts = report.counts()
+    if counts[ReplayStatus.COVERAGE_DIFFERENCE]:
+        return 1
+    # code_drift is NOT a parity finding, but it is not a clean pass either: the replay ran on
+    # other code than the recording, so a green exit would be a lie. Distinct exit code.
+    return 2 if counts[ReplayStatus.COVERAGE_CODE_DRIFT] else 0
+
+
+def _cmd_replay_code_tools(args) -> int:
+    """``replay checkout`` (recorded code into a worktree) and ``replay export`` (read-only)."""
+    from app.services.replay import provenance
+
+    try:
+        if args.replay_cmd == "checkout":
+            bundle = _caller_path(args.bundle)
+            into = _caller_path(args.into)
+            repo = _caller_path(args.repo) if args.repo else None
+            path = provenance.checkout_recorded_code(
+                bundle, into, repo, allow_capped_untracked=args.allow_capped_untracked)
+            print(f"-- recorded code checked out at {path}")
+            return 0
+        store = _caller_path(args.store)
+        out = _caller_path(args.out)
+        path = provenance.export_session(store, args.session, out)
+        print(f"-- exported session {args.session} to {path}")
+        return 0
+    except Exception as exc:
+        sys.exit(f"ba2-test replay {args.replay_cmd}: {exc}")
 
 
 def _cmd_replay_warm_plan(args, bundle: str, out) -> int:
@@ -11575,6 +11607,22 @@ def main(argv: "list | None" = None) -> int:
                             help="What the session contains (counts, coverage, gaps).")
     rpi.add_argument("--bundle", required=True, help="Exported session directory.")
     rpi.add_argument("--out", default=None, help="Write inventory.json/.md here.")
+    rpc = rplsub.add_parser(
+        "checkout",
+        help="Create a git worktree at the recorded revision with the recorded uncommitted "
+             "patch applied, so the recording can be replayed on its own code.")
+    rpc.add_argument("--bundle", required=True, help="Exported session directory.")
+    rpc.add_argument("--into", required=True, help="New worktree path (must not exist/be empty).")
+    rpc.add_argument("--repo", default=None,
+                     help="Repository to add the worktree to (default: this checkout).")
+    rpc.add_argument("--allow-capped-untracked", action="store_true",
+                     help="Proceed even when an untracked file's content was too large to store.")
+    rpx = rplsub.add_parser(
+        "export",
+        help="Export one session of a replay store as a bundle. READ-ONLY on the store.")
+    rpx.add_argument("--store", required=True, help="Replay store directory (has index.sqlite).")
+    rpx.add_argument("--session", required=True, help="Session id to export.")
+    rpx.add_argument("--out", required=True, help="Bundle directory to write.")
     rpe = rplsub.add_parser("experts",
                             help="Re-run _process on each recorded bundle and diff the result.")
     rpe.add_argument("--bundle", required=True, help="Exported session directory.")

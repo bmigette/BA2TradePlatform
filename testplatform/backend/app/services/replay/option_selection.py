@@ -70,6 +70,7 @@ from ba2_common.core.replay.option_taps import OPTION_PROVIDER, OPTION_TAPPED_ME
 from app.services.replay.expert_replay import compare_values
 from app.services.replay.gather_tape import ReplayTape
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import (
     CAPABILITY_OPTION_SELECTION,
     STAGE_OPTION_PRICING,
@@ -663,7 +664,4 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     bundle = load_bundle(bundle_dir)
     with replay_isolation():
         report = run_bundle(bundle, str(Path(bundle_dir)))
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)
