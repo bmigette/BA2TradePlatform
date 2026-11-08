@@ -1390,6 +1390,32 @@ def export_backtest_json(
     return _derive_export_payload(backtest, kind, db)
 
 
+@router.get("/{backtest_id}/export/html")
+def export_backtest_html(
+    backtest_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download the backtest detail page as ONE self-contained HTML file (all charts + tables).
+
+    Read-only; rendered by ``app.services.backtest.html_export`` from the same ``to_dict()`` /
+    ``yearly_breakdown`` the detail page uses. A queued/running row has no results yet -> 409.
+    """
+    from fastapi.responses import Response
+    from app.services.backtest.html_export import render_backtest_html
+
+    backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not backtest:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+    if backtest.status in ("pending", "queued", "running"):
+        raise HTTPException(status_code=409, detail=f"Backtest {backtest_id} is {backtest.status}; no results to export yet")
+    strategy = db.query(Strategy).filter(Strategy.id == backtest.strategy_id).first() if backtest.strategy_id else None
+    content = render_backtest_html(backtest, strategy)
+    return Response(
+        content=content, media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=backtest-{backtest_id}.html"},
+    )
+
+
 @router.post("/{backtest_id}/export")
 def export_backtest(
     backtest_id: int,
