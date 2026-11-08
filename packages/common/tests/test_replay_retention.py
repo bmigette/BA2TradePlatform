@@ -204,3 +204,93 @@ def test_statistics_report_sessions_objects_bytes_and_dates(world):
     assert stats["total_bytes"] == stats["object_bytes"] + stats["index_bytes"]
     assert stats["oldest_session"].startswith("2026-09-29") and stats["newest_session"].startswith("2026-11-08")
     assert sum(stats["bytes_by_day"].values()) <= stats["object_bytes"]
+
+
+# --------------------------------------------------------------------------- prune vs live writer races
+def _prunable(world):
+    """(hash, kind, data, path) of an object only the old session reaches: the prune WILL delete it."""
+    unique = world.index.root_hashes("old") - world.index.root_hashes("recent") - world.index.root_hashes("live")
+    object_hash = sorted(unique)[0]
+    kind, data, _ = world.objects.get(object_hash)
+    return object_hash, kind, data, world.objects.path_for(object_hash, kind)
+
+
+def test_a_republish_between_the_second_scan_and_the_unlink_keeps_the_object(world, monkeypatch):
+    """Race A: the second scan saw the file old, then a live pass re-published identical content."""
+    object_hash, kind, data, path = _prunable(world)
+    real_scan = retention._scan
+    calls = []
+
+    def scan_then_republish(*args, **kwargs):
+        scan = real_scan(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 2:
+            assert any(h == object_hash for h, _, _ in scan.delete_files)      # the stale scan lists it as old
+            world.objects.put(kind, data)                                     # live writer: touch
+        return scan
+
+    monkeypatch.setattr(retention, "_scan", scan_then_republish)
+    result = retention.execute_prune(world.root, 30, now=_later())
+    assert path.is_file() and world.objects.get(object_hash)[1] == data
+    assert result["objects_skipped_republished"] >= 1
+
+
+def test_a_republish_after_the_prune_moved_the_file_aside_keeps_the_object(world, monkeypatch):
+    """Race A, tighter: the writer touches between the prune's stat and its delete (file already moved aside)."""
+    object_hash, kind, data, path = _prunable(world)
+    real_replace = os.replace
+
+    def replace_then_republish(src, dst, *a, **k):
+        real_replace(src, dst, *a, **k)
+        if Path(src) == path:
+            world.objects.put(kind, data)           # path is gone: put rewrites it
+    monkeypatch.setattr(retention.os, "replace", replace_then_republish)
+    retention.execute_prune(world.root, 30, now=_later())
+    assert path.is_file() and world.objects.get(object_hash)[1] == data
+
+
+def test_put_whose_file_is_deleted_before_the_touch_rewrites_it(world, monkeypatch):
+    """Race B: put saw the file, the prune unlinked it, the touch hit FileNotFoundError."""
+    object_hash, kind, data, path = _prunable(world)
+    real_utime = os.utime
+
+    def unlink_then_utime(target, *a, **k):
+        if Path(target) == path and path.exists():
+            path.unlink()
+        return real_utime(target, *a, **k)
+
+    monkeypatch.setattr("ba2_common.core.replay.store.os.utime", unlink_then_utime)
+    assert world.objects.put(kind, data) == object_hash
+    assert path.is_file() and world.objects.get(object_hash)[1] == data
+
+
+def test_concurrent_writer_never_loses_an_object_to_a_prune(world):
+    import threading
+    object_hash, kind, data, path = _prunable(world)
+    stop = threading.Event()
+    errors = []
+
+    def writer():
+        while not stop.is_set():
+            try:
+                world.objects.put(kind, data)
+                if not path.is_file():
+                    errors.append("put returned for a missing file")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        for _ in range(15):
+            _age_all_objects(world, NOW - 90 * DAY)
+            try:
+                retention.execute_prune(world.root, 30, now=_later())
+            except retention.RetentionError:
+                pass
+            world.objects.put(kind, data)
+    finally:
+        stop.set()
+        thread.join()
+    assert not errors, errors[:3]
+    assert path.is_file()

@@ -103,9 +103,10 @@ class ObjectStore:
         """
         object_hash = content_hash(kind, data)
         path = self.path_for(object_hash, kind)
-        if path.exists():
-            self._touch(path)
+        if path.exists() and self._touch(path):
             return object_hash
+        # Absent -- or deleted by a retention prune between the check and the touch: (re)write it. ``put``
+        # returns only once the file is on disk with a fresh age.
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f"{object_hash}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
@@ -130,17 +131,23 @@ class ObjectStore:
         return object_hash
 
     @staticmethod
-    def _touch(path: Path) -> None:
+    def _touch(path: Path) -> bool:
         """Refresh the mtime of an object that was published again (content-addressed dedupe).
+
+        Returns False when the file vanished (a retention prune deleted it): the caller rewrites it.
 
         Retention (:mod:`ba2_common.core.replay.retention`) never deletes an object younger than its age
         bound; without this an old object that a NEW analysis re-uses would still look old to it.
         """
         try:
             os.utime(path, None)
+            return True
+        except FileNotFoundError:
+            return False
         except OSError as exc:
             logger.error(f"replay store: could not refresh the age of {path.name} ({exc}); a retention "
                          f"prune could treat this re-used object as old")
+            return True
 
     def exists(self, object_hash: str) -> bool:
         return any(self.path_for(object_hash, kind).exists() for kind in _EXTENSIONS)

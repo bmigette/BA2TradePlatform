@@ -38,6 +38,7 @@ __all__ = ["RetentionError", "RetentionRefused", "statistics", "preview_prune", 
            "format_plan", "human_bytes", "MIN_KEEP_DAYS"]
 
 LOCK_NAME = "prune.lock"
+TRASH_NAME = "prune-trash"
 MIN_KEEP_DAYS = 1
 _SUFFIXES = {".json": "json", ".arrow": "arrow"}
 _GRACE = timedelta(days=1)
@@ -255,6 +256,57 @@ def execute_prune(root, keep_days: int, now: Optional[datetime] = None) -> Dict[
         index.close()
 
 
+def _restore_leftover_trash(root: Path, trash: Path) -> None:
+    """A crashed prune may have left files in the trash: they are objects, put them back (never delete blind)."""
+    if not trash.is_dir():
+        return
+    for leftover in list(trash.iterdir()):
+        target = root / "objects" / leftover.name[:2] / leftover.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            leftover.unlink()
+        else:
+            os.replace(leftover, target)
+
+
+def _delete_if_still_old(path: Path, trash: Path, bound_ts: float, failures: List[str]) -> str:
+    """Delete ``path`` unless a live writer re-published it since the scan. Returns deleted / republished / failed.
+
+    The scan's mtime is stale by now: a pass may have re-published identical content (``put`` refreshes the age).
+    So the age is re-read right before, the file is MOVED to the trash (atomic, keeps its mtime), the age is
+    checked again on the moved file, and only then is it unlinked. A writer touching after the move finds the
+    path missing and rewrites it.
+    """
+    try:
+        if path.stat().st_mtime >= bound_ts:
+            return "republished"
+        trash.mkdir(exist_ok=True)
+        moved = trash / path.name
+        os.replace(path, moved)
+    except FileNotFoundError:
+        return "deleted"                                # already gone: the goal state
+    except OSError as exc:
+        failures.append(f"{path.name}: {exc}")
+        return "failed"
+    try:
+        if moved.stat().st_mtime >= bound_ts:           # touched between the check and the move
+            if path.exists():
+                moved.unlink()                          # the writer already rewrote it
+            else:
+                os.replace(moved, path)
+            return "republished"
+        moved.unlink()
+        return "deleted"
+    except OSError as exc:
+        failures.append(f"{path.name}: {exc}")
+        try:
+            if moved.exists() and not path.exists():
+                os.replace(moved, path)                 # keep the object reachable by its name
+        except OSError:
+            pass
+        return "failed"
+
+
 def _execute_locked(root: Path, index: ReplayIndex, keep_days: int, now: datetime) -> Dict[str, Any]:
     first = _scan(root, index, keep_days, now)
     if first.problems:
@@ -272,21 +324,29 @@ def _execute_locked(root: Path, index: ReplayIndex, keep_days: int, now: datetim
     deleted: List[str] = []
     failures: List[str] = []
     freed = 0
+    skipped_republished = 0
+    bound_ts = scan.bound.timestamp()
+    trash = root / TRASH_NAME
+    _restore_leftover_trash(root, trash)
     for object_hash, path, size in scan.delete_files:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass                                    # already gone: the goal state
-        except OSError as exc:
-            failures.append(f"{path.name}: {exc}")
+        outcome = _delete_if_still_old(path, trash, bound_ts, failures)
+        if outcome == "republished":
+            skipped_republished += 1
+            continue
+        if outcome == "failed":
             continue
         freed += size
         deleted.append(object_hash)
+    try:
+        trash.rmdir()
+    except OSError:
+        pass
     index.delete_object_rows(deleted)
     report = _report(scan, keep_days, now, executed=True)
     report["objects_delete"] = len(deleted)
     report["bytes_delete"] = freed
     report["failures"] = failures
+    report["objects_skipped_republished"] = skipped_republished
     logger.info(f"replay retention: deleted {len(deleted)} object file(s), {freed} bytes")
     if failures:
         raise RetentionError(f"{len(failures)} object file(s) could not be deleted: " + "; ".join(failures[:5])
