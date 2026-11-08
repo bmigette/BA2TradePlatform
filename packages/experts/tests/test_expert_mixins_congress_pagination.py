@@ -128,7 +128,9 @@ def test_full_history_stops_gracefully_on_a_mid_pagination_fetch_error(monkeypat
         page = params["page"]
         requested_pages.append(page)
         if page == 2:
-            raise requests.exceptions.HTTPError("400 Client Error: Bad Request")
+            resp = requests.Response()
+            resp.status_code = 400
+            raise requests.exceptions.HTTPError("400 Client Error: Bad Request", response=resp)
         return _FakeResponse([{"symbol": "AAPL", "transactionDate": f"2026-0{page + 1}-01"}])
 
     monkeypatch.setattr("ba2_providers.fmp_common.fmp_http_get", fake_get)

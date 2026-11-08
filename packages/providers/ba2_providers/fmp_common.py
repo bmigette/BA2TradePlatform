@@ -558,6 +558,42 @@ class TTLCache:
 _HISTORY_MEM_CACHE = TTLCache(_FMP_HISTORY_DISK_MAX_AGE_DAYS * 86400.0)
 
 
+def fmp_history_disk_read(namespace: str, symbol: str) -> Any:
+    """The persisted ``(namespace, symbol)`` payload, or None when absent/unreadable. Never fetches,
+    never registers a hermetic miss (a prewarm-time read of what is already on disk)."""
+    import json as _json
+    import os as _os
+    path = _os.path.join(_fmp_history_cache_dir(), f"{namespace}__{symbol.upper()}.json")
+    try:
+        with open(path, "r") as fh:
+            return _json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"fmp_history cache file {path} could not be read ({type(e).__name__}: {e})")
+        return None
+
+
+def fmp_history_disk_write(namespace: str, symbol: str, payload: Any) -> None:
+    """Atomically (re)write ``(namespace, symbol)`` and drop its in-process memo. For payloads the
+    PREWARM derives itself (e.g. the congress trader roster) rather than fetches. Raises on a write
+    error: a derived artifact that silently failed to land is a hermetic miss later."""
+    import json as _json
+    import os as _os
+    d = _fmp_history_cache_dir()
+    _os.makedirs(d, exist_ok=True)
+    path = _os.path.join(d, f"{namespace}__{symbol.upper()}.json")
+    tmp = f"{path}.{_os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            _json.dump(payload, fh)
+        _os.replace(tmp, path)
+    finally:
+        if _os.path.exists(tmp):
+            _os.remove(tmp)
+    _HISTORY_MEM_CACHE.invalidate(f"{namespace}__{symbol.upper()}")
+
+
 # FMP error responses use one of these keys in a 200-status JSON dict.
 _FMP_ERROR_KEYS = ("Error Message", "error", "message")
 
@@ -974,8 +1010,13 @@ def fmp_http_get(
             )
             continue
 
-        # Any other 4xx (401/404/...) is a non-retryable client error -> raise.
-        resp.raise_for_status()
+        # Any other 4xx (401/404/...) is a non-retryable client error -> raise. requests' HTTPError message
+        # embeds the FULL request URL, ``apikey=`` included, and every caller logs/propagates it: re-raise
+        # it redacted AT THE SOURCE (same class and ``.response``, so status-code handling still works).
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as http_err:
+            raise requests.exceptions.HTTPError(redact(http_err), response=http_err.response) from None
         # The attempt was already counted above; add what the body actually cost.
         record_fmp_bytes(endpoint or "unknown", _response_bytes(resp))
         return resp

@@ -94,6 +94,8 @@ class _StubFetchers:
         self.raiser = raiser            # (symbol) -> raise, to test failure handling
         self.symbols = []
         self.senate_latest_calls = 0
+        self.senate_extra_symbols = []
+        self.senate_failures = []
         self.logs = []
         # Derived from the shared table, so an expert added there is covered here too.
         self.table = {name: self._do for name in pf.FETCHER_METHODS}
@@ -106,6 +108,9 @@ class _StubFetchers:
 
     def validate(self, experts):
         return [e for e in experts if e not in self.table]
+
+    def finalize_senate_roster(self):
+        return 0
 
     def do_senate_latest(self):
         self.senate_latest_calls += 1

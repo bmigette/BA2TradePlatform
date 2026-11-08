@@ -22,6 +22,8 @@ import re
 import time
 import requests
 
+from ba2_experts.expert_mixins import _http_status
+
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ba2_common.core.db import get_db, update_instance, add_instance
@@ -37,6 +39,10 @@ from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTrad
 from ba2_experts.scoring_table import ScoringTable, use_scoring_table
 from ba2_common.core.estimates_pit import EstimatesNotPrewarmed, EstimatesUnavailable
 from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
+
+#: fmp_history entry the PREWARM writes: every congress trader (name) it met, sorted. See ``_pre_cap_backfill``.
+CONGRESS_ROSTER_NAMESPACE = "congress_trader_roster"
+CONGRESS_ROSTER_KEY = "ALL"
 
 _USE_SCORING_TABLE = use_scoring_table()
 # NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
@@ -883,6 +889,33 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "symbol": symbol,
         }
 
+    def _pre_cap_backfill(self, house: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Disclosures OLDER than the house ``-latest`` feed reaches, from the roster's trader histories.
+
+        FMP's ``house-latest`` is capped at 100 pages x 250 rows (disclosures back to ~2023-05 as of
+        2026-11): a 2020-2023 backtest would otherwise see NO house disclosure before the cap, silently.
+        ``-trades-by-name`` has no such cap, so the prewarm records every trader it met in
+        ``congress_trader_roster/ALL`` (feed + per-symbol ``-trades`` rows, which also surface members who left
+        Congress before the cap) and warms each one's full history. Rows dated before the feed's oldest house
+        disclosure are returned here; the caller's fingerprint dedup absorbs any senate overlap.
+        Live (not frozen): the roster fetch is ``[]`` -> no backfill (live only needs the recent feed).
+        A hermetic run with no prewarmed roster registers ONE named miss (never silent)."""
+        from ba2_providers.fmp_common import fmp_history_disk_cached
+        roster = fmp_history_disk_cached(CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY, lambda: []) or []
+        if not roster or not house:
+            return []
+        floor = min((str(t.get("disclosureDate") or "")[:10] for t in house if t.get("disclosureDate")),
+                    default="")
+        if not floor:
+            return []
+        extra: List[Dict[str, Any]] = []
+        for name in roster:
+            for t in (self._fetch_trader_history(name) or []):
+                ds = str(t.get("disclosureDate") or "")[:10]
+                if ds and ds < floor:
+                    extra.append(t)
+        return extra
+
     def _all_trades_index_cached(self, is_live: bool = False) -> Dict[str, Any]:
         """Unscoped counterpart of ``_symbol_trades_index_cached``: a per-instance memo of the
         deduped ALL-SYMBOLS senate+house trade list (the ``{chamber}-latest`` feed), PLUS a
@@ -919,6 +952,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         senate = self._fetch_senate_trades(symbol=None, full_history=True) or []
         house = self._fetch_house_trades(symbol=None, full_history=True) or []
+        senate = senate + self._pre_cap_backfill(house)
         # Same dedup fingerprint as _symbol_trades_index_cached, generalized across symbols
         # (amended/duplicate filings must count once, same as the per-symbol path).
         seen: set = set()
@@ -1539,10 +1573,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 all_trades.extend(senate_data)
                 self.logger.debug(f"Found {len(senate_data)} senate trades by {trader_name}")
 
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) not in (400, 404):  # 400/404 = FMP knows no such name: definitively no rows
+                self._fetch_failed(f"senate trader history for {trader_name}", e)
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch senate trader history for {trader_name}: {e}")
+            self._fetch_failed(f"senate trader history for {trader_name}", e)
         except Exception as e:
-            self.logger.error(f"Unexpected error fetching senate trader history for {trader_name}: {e}")
+            self._fetch_failed(f"senate trader history for {trader_name} (unexpected)", e)
 
         # Fetch house trades by name
         try:
@@ -1563,10 +1600,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 all_trades.extend(house_data)
                 self.logger.debug(f"Found {len(house_data)} house trades by {trader_name}")
 
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) not in (400, 404):
+                self._fetch_failed(f"house trader history for {trader_name}", e)
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch house trader history for {trader_name}: {e}")
+            self._fetch_failed(f"house trader history for {trader_name}", e)
         except Exception as e:
-            self.logger.error(f"Unexpected error fetching house trader history for {trader_name}: {e}")
+            self._fetch_failed(f"house trader history for {trader_name} (unexpected)", e)
 
         self.logger.debug(f"Found total of {len(all_trades)} trades by {trader_name} (senate + house)")
         return all_trades if all_trades else None
@@ -1585,12 +1625,31 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             data = response.json()
             hist = data.get("historical", []) if isinstance(data, dict) else []
             return hist if isinstance(hist, list) else []
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) in (400, 404):
+                return []  # DEFINITIVE "FMP has no history for this ticker" -> prewarm's empty sentinel
+            self._fetch_failed(f"price history for {symbol}", e)
+            return []
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch price history for {symbol}: {e}")
+            self._fetch_failed(f"price history for {symbol}", e)
             return []
         except Exception as e:
-            self.logger.error(f"Error fetching price history for {symbol}: {e}")
+            self._fetch_failed(f"price history for {symbol} (unexpected)", e)
             return []
+
+    def _fetch_failed(self, what: str, err: Exception) -> None:
+        """A fetch of ``what`` failed after the shared getter's retries.
+
+        FROZEN (prewarm / backtest) runs RAISE: this is called from inside a ``fmp_history_disk_cached``
+        fetch, and swallowing here made the caller's cache write persist a PARTIAL answer (one chamber's
+        trader history) or, under the prewarm sentinel, a false ``[]`` "known empty" for a ticker FMP
+        does have data for. The live path keeps its log-and-degrade behaviour.
+        The message is redacted: requests' errors quote the URL, ``apikey=`` included."""
+        from ba2_providers.fmp_common import _is_ttl_frozen, redact
+        msg = f"Failed to fetch {what}: {redact(err)}"
+        self.logger.error(msg)
+        if _is_ttl_frozen():
+            raise ValueError(msg) from None
 
     def _get_price_at_date(self, symbol: str, date: datetime) -> Optional[float]:
         """Opening price for ``symbol`` on ``date`` (or None if not a trading day / unavailable).

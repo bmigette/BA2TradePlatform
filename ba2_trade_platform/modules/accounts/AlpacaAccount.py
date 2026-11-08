@@ -4672,8 +4672,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 session.commit()
 
                 # 5. Find the existing exit orders: the position's resting PROTECTION that is
-                # still working (see the C1 note above). Executed rows are excluded too -- a
-                # leg that already fired protects nothing and has nothing left to cancel.
+                # still working (see the C1 note above). A FILLED leg is excluded -- it fired,
+                # protects nothing and has nothing left to cancel. A PARTIALLY_FILLED one is
+                # NOT: it still holds its remainder at the broker, so it must be cancelled
+                # before its replacement goes in (dev 2026-11-05 CELH: skipping it sent a new
+                # OCO the broker rejected for insufficient qty, and the remainder kept no stop).
                 all_orders = [
                     o for o in session.exec(
                         select(TradingOrder).where(
@@ -4682,7 +4685,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             TradingOrder.id != entry_order.id
                         )
                     ).all()
-                    if o.status not in OrderStatus.get_executed_statuses()
+                    if o.status != OrderStatus.FILLED
                     and TransactionHelper.is_resting_protection(o)
                 ]
 

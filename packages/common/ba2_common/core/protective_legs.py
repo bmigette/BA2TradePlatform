@@ -321,7 +321,9 @@ class ProtectiveLegsMixin:
                             TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
                             TradingOrder.id != entry_order.id)
                     ).all()
-                    if o.status not in OrderStatus.get_executed_statuses()
+                    # FILLED legs fired and protect nothing; a PARTIALLY_FILLED leg still holds
+                    # its remainder at the broker and must be cancelled before a replacement.
+                    if o.status != OrderStatus.FILLED
                     and TransactionHelper.is_resting_protection(o)
                 ]
                 spec = self._target_exit_spec(txn, entry_order)

@@ -22,6 +22,11 @@ from ba2_common.core.types import MarketAnalysisStatus
 from ba2_common.logger import logger as _module_logger
 
 
+def _http_status(err: Exception) -> Optional[int]:
+    """The HTTP status of a ``requests`` error, or None."""
+    return getattr(getattr(err, "response", None), "status_code", None)
+
+
 class AnalysisStatusRenderMixin:
     """Status dispatcher + pending/running/failed/skipped cards for expert UIs.
 
@@ -218,7 +223,7 @@ class FMPCongressTradingMixin(FMPApiKeyMixin):
             self.logger.error(f"Cannot fetch {label}: FMP API key not configured")
             return None
 
-        from ba2_providers.fmp_common import fmp_http_get, FMPError
+        from ba2_providers.fmp_common import fmp_http_get, FMPError, redact
 
         symbol_text = f" for {symbol}" if symbol else " (all)"
         paginate = symbol is None and full_history
@@ -250,38 +255,55 @@ class FMPCongressTradingMixin(FMPApiKeyMixin):
                 if paginate:
                     import time as _time
                     rows: List[Dict[str, Any]] = []
+                    cap_page = None
                     for page in range(max_pages):
-                        # A mid-pagination failure (retries already exhausted inside
-                        # fmp_http_get) must NOT discard everything accumulated so far —
-                        # mirrors tools/build_senate_universe.py's _fetch_latest_disclosures,
-                        # which stops that chamber's walk on any fetch error and keeps what
-                        # it has. Confirmed live 2026-07-18: FMP's house-latest endpoint
-                        # returns a genuine HTTP 400 once page exceeds its own internal depth
-                        # limit (~page 100) — NOT a transient/retryable error, so without this
-                        # catch the whole deep fetch (and its cache write) would be lost, even
-                        # though 100+ pages of real history were already fetched.
+                        # Retries (429/5xx/transient) already happen inside fmp_http_get. What
+                        # reaches here is therefore either FMP's HARD page cap (a genuine HTTP
+                        # 400 once ``page`` passes its internal depth limit -- confirmed live
+                        # 2026-07-18 and 2026-11-08: house-latest answers 250 rows/page whatever
+                        # ``limit`` says and refuses page 101, i.e. 25,250 rows) or a real
+                        # failure. The cap ends the walk and is REPORTED below; a failure
+                        # propagates, because a partial list would be cached as if complete.
                         try:
                             resp = fmp_http_get(
                                 url, {**params, "page": page}, symbol="",
                                 endpoint=f"{chamber}-trades", timeout=timeout,
                             )
-                        except (requests.exceptions.RequestException, FMPError) as e:
-                            self.logger.warning(
-                                f"Full-history {label} pagination stopped at page {page} "
-                                f"(fetch failed: {e}); keeping {len(rows)} rows fetched so far."
-                            )
-                            break
+                        except requests.exceptions.HTTPError as e:
+                            if page > 0 and _http_status(e) == 400:
+                                cap_page = page
+                                break
+                            raise
                         d = resp.json()
                         if not isinstance(d, list) or not d:
                             break  # end of feed
                         rows.extend(d)
                         if page < max_pages - 1:
                             _time.sleep(0.1)  # gentle on the shared rate-limit gate
+                    if cap_page is not None:
+                        oldest = min((str(r.get("disclosureDate") or "") for r in rows
+                                      if isinstance(r, dict) and r.get("disclosureDate")),
+                                     default="?")
+                        self.logger.warning(
+                            f"FMP {chamber}-latest hit its HARD PAGE CAP at page {cap_page} "
+                            f"(HTTP 400, not transient): {len(rows)} rows kept, oldest disclosureDate "
+                            f"{oldest}. Disclosures BEFORE {oldest} are NOT in this feed -- the "
+                            f"history is INCOMPLETE; callers must backfill it from per-trader / "
+                            f"per-symbol histories.")
                     return rows
-                resp = fmp_http_get(
-                    url, params, symbol=(symbol or ""), endpoint=f"{chamber}-trades",
-                    timeout=timeout,
-                )
+                try:
+                    resp = fmp_http_get(
+                        url, params, symbol=(symbol or ""), endpoint=f"{chamber}-trades",
+                        timeout=timeout,
+                    )
+                except requests.exceptions.HTTPError as e:
+                    # A ticker FMP does not know (garbage / foreign / delisted) answers 400/404
+                    # instead of []: that is a DEFINITIVE "no disclosures", cacheable as the
+                    # empty sentinel (prewarm), not a failure. 401/402/403 (key / plan) and
+                    # everything else still raise.
+                    if symbol and _http_status(e) in (400, 404):
+                        return []
+                    raise
                 d = resp.json()
                 return d if isinstance(d, list) else []
 
@@ -305,16 +327,18 @@ class FMPCongressTradingMixin(FMPApiKeyMixin):
             return data if isinstance(data, list) else []
 
         except (requests.exceptions.RequestException, FMPError) as e:
-            error_msg = f"Failed to fetch FMP {label}{symbol_text}: {e}"
+            # redact(): requests' messages quote the request URL, apikey included. No ``from e`` /
+            # ``exc_info`` either -- the chained original (and its traceback text) carries the URL too.
+            error_msg = f"Failed to fetch FMP {label}{symbol_text}: {redact(e)}"
             if raise_on_error:
                 self.logger.error(error_msg)
-                raise ValueError(error_msg) from e
-            self.logger.error(error_msg, exc_info=True)
+                raise ValueError(error_msg) from None
+            self.logger.error(error_msg)
             return None
         except Exception as e:
-            error_msg = f"Unexpected error fetching {label}{symbol_text}: {e}"
+            error_msg = f"Unexpected error fetching {label}{symbol_text}: {redact(e)}"
             if raise_on_error:
                 self.logger.error(error_msg)
-                raise ValueError(error_msg) from e
-            self.logger.error(error_msg, exc_info=True)
+                raise ValueError(error_msg) from None
+            self.logger.error(error_msg)
             return None

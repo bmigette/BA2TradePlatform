@@ -72,6 +72,12 @@ _WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
 # submitted order. See _check_stranded_waiting_transactions.
 _STRANDED_ENTRY_GRACE_MINUTES = 5.0
 
+# How long a CLOSING transaction must have had NOTHING working (its last order at least this
+# old) before _retry_stuck_closes asks close_transaction again. Long enough that a close just
+# submitted or just rejected is not hammered every refresh; short enough that a stranded
+# position is retried the same session. See _retry_stuck_closes.
+_STUCK_CLOSE_RETRY_MINUTES = 30.0
+
 
 def classify_waiting_trigger(parent_status, trigger_status, parent_filled_qty=None):
     """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
@@ -622,6 +628,26 @@ class TradeManager:
                             exc_info=True,
                         )
 
+                    # A protective OCO whose TP leg PARTLY filled: the broker cancels the
+                    # stop leg, leaving the remainder with a take-profit and no stop.
+                    try:
+                        self._reprotect_partially_filled_exits(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error re-protecting partly filled exits for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
+                    # A CLOSING transaction whose close died at the broker with nothing
+                    # left working: no other pass revisits CLOSING, so retry it here.
+                    try:
+                        self._retry_stuck_closes(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error retrying stuck closes for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
                     # ALLOCATOR TP/SL (TastyTrade): detect protective fills (-> the symbol is
                     # HELD), lost/expired/cancelled OCOs (-> loud alert) and size mismatches,
                     # and finish a re-placement a rebalance started. A no-op for every account
@@ -872,6 +898,164 @@ class TradeManager:
                     f"{txn_id} ({symbol}): {e}",
                     exc_info=True,
                 )
+                continue
+
+    def _equity_transactions_of(self, account, status):
+        """``account``'s equity transactions in ``status``, as detached rows.
+
+        Transactions link to an account only through their orders (same join as
+        ``_force_close_breached_stops``). Options are skipped: their ``symbol`` is the
+        UNDERLYING and they have their own close path."""
+        from sqlmodel import Session, select
+        from .db import get_db
+        from .types import AssetClass
+
+        with Session(get_db().bind) as session:
+            txns = session.exec(
+                select(Transaction).join(TradingOrder).where(
+                    TradingOrder.account_id == account.id,
+                    Transaction.status == status,
+                ).distinct()
+            ).all()
+            out = [t for t in txns
+                   if t.asset_class != AssetClass.OPTION and t.multiplier in (None, 1)
+                   and t.symbol]
+            for t in out:
+                session.expunge(t)
+        return out
+
+    def _reprotect_partially_filled_exits(self, account):
+        """Re-protect a position whose protective OCO partly filled and lost its stop leg.
+
+        WHY. When the take-profit side of an Alpaca OCO fills only PART of the position, the
+        broker cancels the stop leg and keeps the take-profit working for the remainder (dev
+        8080 CELH, transaction 72: 29 of 52 sold 2026-09-28, the other 23 then rode with no
+        stop for six weeks). Nothing noticed: the order refresh records the leg as CANCELED
+        and the parent as PARTIALLY_FILLED, both "normal" states.
+
+        THE RULE. For each OPENED equity transaction with a ``stop_loss``: an OCO on it that
+        is PARTIALLY_FILLED, whose stop leg(s) (``parent_order_id`` = the OCO) are all
+        terminal and unfilled -- or that has no leg row at all -- and that no staged
+        replacement (WAITING_TRIGGER, ``depends_on_order`` = the OCO) is already waiting on,
+        is replaced through ``account.adjust_tp_sl`` at the transaction's own TP/SL. That
+        path cancels the working OCO and stages the new exit for the remainder on the
+        cancel (sized by ``TransactionHelper.post_fill_position_quantity``). A refusal is
+        logged as an ERROR and in the activity log; it is retried next refresh.
+
+        Live-only (TradeManager is never called by the backtest, which fills exits whole).
+        """
+        from ba2_common.core.trade_store import orders_where
+        from .types import TransactionStatus, ActivityLogSeverity, ActivityLogType
+        from .db import log_activity
+
+        terminal = OrderStatus.get_terminal_statuses()
+        for txn in self._equity_transactions_of(account, TransactionStatus.OPENED):
+            if txn.stop_loss is None:
+                continue
+            try:
+                orders = orders_where(transaction_id=txn.id)
+                stranded = []
+                for oco in orders:
+                    if (oco.order_type != OrderType.OCO
+                            or oco.status != OrderStatus.PARTIALLY_FILLED):
+                        continue
+                    legs = [o for o in orders if o.parent_order_id == oco.id]
+                    stop_alive = any(o.status not in terminal or o.status == OrderStatus.FILLED
+                                     for o in legs)
+                    staged = any(o.depends_on_order == oco.id
+                                 and o.status == OrderStatus.WAITING_TRIGGER for o in orders)
+                    if not stop_alive and not staged:
+                        stranded.append(oco)
+                if not stranded:
+                    continue
+
+                ids = [o.id for o in stranded]
+                self.logger.warning(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id}: protective "
+                    f"OCO {ids} partly filled and its stop leg is gone -- the remainder has no "
+                    f"stop. Replacing the exit at TP={txn.take_profit} SL={txn.stop_loss}.")
+                ok = account.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss,
+                                          source="partial_fill_reprotect")
+                if not ok:
+                    msg = (f"Re-protecting {txn.symbol} transaction {txn.id} after partly "
+                           f"filled OCO {ids} FAILED: the remainder still has no stop. "
+                           f"Retried next refresh.")
+                    self.logger.error(f"[Account {account.id}] {msg}")
+                    log_activity(ActivityLogSeverity.FAILURE, ActivityLogType.TP_SL_ADJUSTED,
+                                 msg, data={"transaction_id": txn.id, "symbol": txn.symbol,
+                                            "oco_order_ids": ids},
+                                 source_account_id=account.id)
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {account.id}] partly-filled-exit check failed for transaction "
+                    f"{txn.id} ({txn.symbol}): {e}", exc_info=True)
+                continue
+
+    def _retry_stuck_closes(self, account, *, now=None):
+        """Retry the close of a CLOSING transaction that has nothing left working.
+
+        WHY. ``close_transaction`` flips a transaction to CLOSING before it submits the close.
+        If the broker then rejects or cancels that close, the transaction stays CLOSING and no
+        pass ever looks at it again: every exit pass, the breached-stop safety net included,
+        scans OPENED only; the external-close reconciler closes it only once the broker holds
+        no shares of the symbol at all. Dev 8080 PRG, transaction 258: the stop-breach forced
+        close of 2026-10-28 was refused (insufficient qty) and the last share sat unprotected
+        for 11 days, while the safety net's own log said "it will be retried next refresh".
+
+        THE RULE. While the market is open, for each CLOSING equity transaction of
+        ``account`` with NO order still working (no active or unsent status) and whose newest
+        order is at least ``_STUCK_CLOSE_RETRY_MINUTES`` old, call
+        ``account.close_transaction`` again. It is the one close path: it re-checks the broker
+        position, retires a dead close order and sizes the new one on the open quantity. A
+        failed retry is an ERROR and an activity-log FAILURE, and is retried after the same
+        wait.
+        """
+        from datetime import timedelta
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.utils import as_utc_key, log_close_order_activity
+        from .types import TransactionStatus
+
+        # Same gate as the breached-stop sweep: a market close sent after hours would queue
+        # for the open on a decision nobody re-checked.
+        if not account.is_market_open():
+            return
+
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=_STUCK_CLOSE_RETRY_MINUTES)
+        working = OrderStatus.get_active_statuses() | OrderStatus.get_unsent_statuses()
+        for txn in self._equity_transactions_of(account, TransactionStatus.CLOSING):
+            try:
+                orders = orders_where(transaction_id=txn.id)
+                if not orders or any(o.status in working for o in orders):
+                    continue
+                newest = max(as_utc_key(o.created_at, default=now) for o in orders)
+                if newest > cutoff:
+                    continue
+
+                self.logger.warning(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id} is CLOSING with "
+                    f"no order working since {newest:%Y-%m-%d %H:%M} UTC -- its close died at "
+                    f"the broker. Retrying the close.")
+                result = account.close_transaction(txn.id)
+                if not isinstance(result, dict):
+                    raise ValueError(f"close_transaction({txn.id}) returned "
+                                     f"{type(result).__name__}, not a result dict")
+                success = bool(result['success'])
+                if not success:
+                    self.logger.error(
+                        f"[Account {account.id}] retrying the close of {txn.symbol} "
+                        f"transaction {txn.id} FAILED: {result['message']}. Retried again "
+                        f"in {_STUCK_CLOSE_RETRY_MINUTES:g} min.")
+                log_close_order_activity(
+                    transaction=txn, account_id=account.id, success=success,
+                    error_message=None if success else result['message'],
+                    close_order_id=result['close_order_id'],
+                    canceled_count=result['canceled_count'],
+                    deleted_count=result['deleted_count'], is_retry=True)
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {account.id}] stuck-close retry failed for transaction "
+                    f"{txn.id} ({txn.symbol}): {e}", exc_info=True)
                 continue
 
     def _reconcile_account_option_activities(self, account):
