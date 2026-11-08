@@ -293,7 +293,18 @@ def note_unframed_effect(context, method: str, call: Dict[str, Any], **outcome: 
     Returns whether the effect was kept. Never raises.
     """
     try:
-        if decision_context() is not context or getattr(core._tls, "frame", None) is not None:
+        if decision_context() is not context:
+            return False
+        frame = getattr(core._tls, "frame", None)
+        if frame is not None:
+            step = frame.action
+            if isinstance(step, _Step) and step.kind in (KIND_RULES, KIND_SIZE):
+                # A rules / size frame does not accept account effects, so this one is in NO record: a
+                # gap, counted and listed with the method (the option family's own frames are not a gap).
+                context.health.record(CaptureHealth.STEP_NOT_RECORDED)
+                _ledger(context)["steps_not_recorded"].append(
+                    {"kind": step.kind, "symbol": step.symbol,
+                     "error": f"account effect {method} inside a {step.kind} step is not recorded"})
             return False
         entries = _ledger(context)["effects_outside_steps"]
         if len(entries) >= MAX_EFFECTS_OUTSIDE_STEPS:

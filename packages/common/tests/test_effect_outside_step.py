@@ -119,3 +119,21 @@ def test_a_credential_in_the_error_text_is_redacted():
         (entry,) = pass_summary(current_capture())["effects_outside_steps"]
     assert "SUPERSECRET123" not in entry["error"] and "abc999" not in entry["error"]
     assert "REDACTED" in entry["error"] and "symbol=AAPL" in entry["error"]
+
+
+def test_an_effect_inside_a_rules_or_size_frame_is_counted_not_dropped():
+    """Those frames do not accept account effects: the effect is a gap in the record and must say so."""
+    from tests.test_decision_record import _Evaluator, _rec
+    from ba2_common.core.replay import decision_record as dr
+    from tests.test_max_loss_persisted_at_submit import _own_db  # noqa: F401
+
+    store = RecordingStore()
+    with capture_scope(store, _meta()):
+        with dr.record_rules(_Evaluator(), "AAPL", _rec("AAPL"), 9, None) as step:
+            _Acct().adjust_tp_sl(_txn(5), new_tp_price=1.0)
+            step.result = []
+        summary = pass_summary(current_capture())
+    (gap,) = [e for e in summary["steps_not_recorded"] if "adjust_tp_sl" in e["error"]]
+    assert gap["kind"] == dr.KIND_RULES and gap["symbol"] == "AAPL"
+    assert store.health.count(CaptureHealth.STEP_NOT_RECORDED) == 1
+    assert summary["effects_outside_steps"] == []
