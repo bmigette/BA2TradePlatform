@@ -82,6 +82,7 @@ _TAGS = (
     "$np",
     "$frame",
     "$tuple",
+    "$ref",
 )
 
 __all__ = [
@@ -91,6 +92,7 @@ __all__ = [
     "KIND_ARROW",
     "ENUM_MODULE_PREFIXES",
     "Encoded",
+    "SharedValue",
     "UnsupportedCaptureType",
     "UnsafeEnumReference",
     "encode",
@@ -168,6 +170,24 @@ class Encoded(NamedTuple):
         its own hash inside itself, so this is the only way to key them.
         """
         return {content_hash(side.kind, side.data): side for side in self.sides}
+
+
+class SharedValue:
+    """A value stored as its OWN content-addressed JSON object and referenced by hash (``$ref``).
+
+    For rows that repeat unchanged across observations and passes (a Transaction, its orders, a
+    recommendation): the same row encodes to the same bytes, so the store keeps ONE copy, and a
+    payload holding it carries only the hash. ``decode`` resolves the reference back to the value,
+    so a reader never sees the indirection. The value is frozen on construction and never mutated.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = freeze(value)
+
+    def __repr__(self) -> str:
+        return f"SharedValue({self.value!r})"
 
 
 def content_hash(kind: str, data: bytes) -> str:
@@ -294,6 +314,20 @@ def _encode_value(obj: Any, path: str, sides: List[Encoded], seen: Dict[str, Non
                 for field in dataclasses.fields(obj)
             },
         }}
+    if isinstance(obj, SharedValue):
+        inner = encode(obj.value)
+        if inner.kind != KIND_JSON:
+            raise UnsupportedCaptureType(f"SharedValue({type(obj.value).__name__})", path)
+        for side in inner.sides:
+            side_hash = content_hash(side.kind, side.data)
+            if side_hash not in seen:
+                seen[side_hash] = None
+                sides.append(side)
+        inner_hash = content_hash(inner.kind, inner.data)
+        if inner_hash not in seen:
+            seen[inner_hash] = None
+            sides.append(Encoded(kind=inner.kind, data=inner.data, meta=inner.meta))
+        return {"$ref": {"hash": inner_hash}}
     if isinstance(obj, (pd.DataFrame, pd.Series)):
         frame = _encode_frame(obj, path)
         frame_hash = content_hash(frame.kind, frame.data)
@@ -473,8 +507,29 @@ def _decode_tag(tag: str, value: Any, frames: FrameSource) -> Any:
         return Decimal(value)
     if tag == "$np":
         return _decode_numpy(value, frames)
+    if tag == "$ref":
+        return _decode_ref(value["hash"], frames)
     data, frame_meta = _resolve_frame(frames, value["hash"])
     return _decode_frame(data, frame_meta)
+
+
+def _decode_ref(object_hash: str, frames: FrameSource) -> Any:
+    """Resolve a ``$ref`` (a JSON object stored on its own) and decode it."""
+    if frames is None:
+        raise KeyError(f"no object source to resolve {object_hash}")
+    if callable(frames):
+        resolved = frames(object_hash)
+    else:
+        if object_hash not in frames:
+            raise KeyError(f"object {object_hash} is missing from the bundle")
+        resolved = frames[object_hash]
+    if isinstance(resolved, Encoded):
+        kind, data, meta = resolved.kind, resolved.data, resolved.meta
+    else:
+        kind, data, meta = resolved[0], resolved[1], resolved[2]
+    if kind != KIND_JSON:
+        raise ValueError(f"referenced object {object_hash} has kind {kind!r}, expected json")
+    return decode(kind, data, meta, frames=frames)
 
 
 def _decode_enum(reference: str) -> Enum:
@@ -624,7 +679,7 @@ def extract_meta(kind: str, data: bytes) -> Dict[str, Any]:
 
 
 def frame_refs(kind: str, data: bytes) -> Tuple[str, ...]:
-    """The frame object hashes referenced by a JSON object, in document order."""
+    """The frame and shared-value (``$ref``) object hashes referenced by a JSON object, in document order."""
     if kind != KIND_JSON:
         return ()
     found: List[str] = []
@@ -636,8 +691,8 @@ def frame_refs(kind: str, data: bytes) -> Tuple[str, ...]:
             return
         if not isinstance(node, dict):
             return
-        if len(node) == 1 and "$frame" in node:
-            frame_hash = node["$frame"]["hash"]
+        if len(node) == 1 and ("$frame" in node or "$ref" in node):
+            frame_hash = node["$frame" if "$frame" in node else "$ref"]["hash"]
             if frame_hash not in found:
                 found.append(frame_hash)
             return
@@ -670,7 +725,7 @@ def freeze(obj: Any) -> Any:
 def _freeze(obj: Any, memo: Dict[int, Any]) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str, bytes, Decimal, Enum)):
         return obj
-    if isinstance(obj, (datetime, date, np.generic)):
+    if isinstance(obj, (datetime, date, np.generic, SharedValue)):
         return obj
     key = id(obj)
     if key in memo:

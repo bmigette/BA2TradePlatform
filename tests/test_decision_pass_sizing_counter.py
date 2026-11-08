@@ -18,6 +18,7 @@ import pytest
 from sqlmodel import SQLModel
 
 from ba2_common.core.replay import decision_sizing as ds
+from ba2_common.core.replay.codec import frame_refs
 from ba2_common.core.replay import ReplayStore, SessionRecord, set_replay_store
 from ba2_common.core.types import (
     AnalysisUseCase, ExpertActionType, OrderDirection, OrderOpenType, OrderRecommendation,
@@ -57,15 +58,16 @@ def realistic_enter_world(n_recs=20, n_open=30, confident=None):
         "allow_automated_trade_opening": (True, "bool"), "enable_buy": (True, "bool"),
         "enable_sell": (False, "bool"), "max_virtual_equity_per_instrument_percent": (4.0, "float"),
     })
-    payload = {"FMPRating": {f"metric_{i:02d}": round(1.2345 * i, 4) for i in range(40)},
-               "notes": "analyst consensus " * 40}
+    def payload_for(index):                     # distinct per recommendation, like real analyses
+        return {"FMPRating": {f"metric_{i:02d}": round(1.2345 * i + index, 4) for i in range(40)},
+                "notes": f"analyst consensus {index} " * 40}
     details = "Strong momentum with improving fundamentals and a supportive analyst revision trend. " * 8
     for index in range(n_recs):
         factories.create_recommendation(
             instance_id=inst.id, symbol=f"S{index:02d}", recommended_action=OrderRecommendation.BUY,
             expected_profit_percent=float(n_recs - index), price_at_date=100.0,
             confidence=90.0 if index % 5 else 55.0, risk_level=RiskLevel.MEDIUM,
-            time_horizon=TimeHorizon.SHORT_TERM, details=details, data=payload, created_at=FROZEN_NOW)
+            time_horizon=TimeHorizon.SHORT_TERM, details=f"{index} " + details, data=payload_for(index), created_at=FROZEN_NOW)
     for index in range(n_open):
         symbol = f"O{index:02d}"
         txn = factories.create_transaction(symbol=symbol, quantity=10.0, status=TransactionStatus.OPENED,
@@ -161,11 +163,22 @@ def test_the_counter_agrees_with_what_a_real_store_writes(test_engine, monkeypat
         set_replay_store(None)
     (analysis,) = store.index.analyses("s1")
     written = {}
+    done = set()                                       # a shared object is written once per pass
     for observation in store.index.observations(analysis.analysis_id):
         if observation.provider != "decision_step":
             continue
         kind, data, _meta = store.objects.get(observation.payload_object)
-        written[observation.method] = written.get(observation.method, 0) + len(data)
+        size = len(data)
+        pending = list(frame_refs(kind, data))
+        while pending:                                    # the side objects (shared rows, frames) it holds
+            ref = pending.pop()
+            if ref in done:
+                continue
+            done.add(ref)
+            ref_kind, ref_data, _ = store.objects.get(ref)
+            size += len(ref_data)
+            pending.extend(frame_refs(ref_kind, ref_data))
+        written[observation.method] = written.get(observation.method, 0) + size
     for part, size in written.items():
         assert measurement["bytes"][part] == pytest.approx(size, rel=0.05), part
     store.close(timeout=2.0)
@@ -203,3 +216,24 @@ def test_measure_realistic_pass(test_engine, monkeypatch):
         with open(out, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2, default=str)
     assert last["total_bytes"] > 0
+
+
+def test_unchanged_rows_dedupe_across_two_consecutive_passes(test_engine, monkeypatch):
+    """Two enter passes over an UNCHANGED book (nothing funded, so nothing is created between them): the
+    open transactions, their orders and the recommendations are stored once; the second pass writes only
+    its own pass_state index and the steps that differ."""
+    monkeypatch.setenv(ds.DRYRUN_ENV, "1")
+    _reset(test_engine)
+    inst, expert, account = realistic_enter_world()
+    expert.save_settings({"enable_buy": (False, "bool")})         # the RM funds nothing: the book stays put
+    _run_enter(expert, account, inst.id)
+    _run_enter(expert, account, inst.id)
+    first, second = ds.COUNTERS.snapshot()
+    out = os.environ.get("BA2_DECISION_MEASURE_OUT")
+    if out:
+        with open(out + ".dedupe.json", "w", encoding="utf-8") as handle:
+            json.dump({"first": first, "second": second}, handle, indent=2, default=str)
+    assert second["steps"].get("execute", 0) == 0
+    assert second["stored_bytes"] < 0.5 * first["stored_bytes"]
+    assert second["stored_bytes_by_kind"]["pass_state"] < 0.5 * first["stored_bytes_by_kind"]["pass_state"]
+    assert second["stored_bytes_by_kind"]["rules"] == 0         # identical payloads are one object

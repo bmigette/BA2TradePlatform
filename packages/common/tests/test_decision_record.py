@@ -50,7 +50,7 @@ def _meta(**kw):
 
 def _payload(pending):
     encoded = codec.encode(pending.payload)
-    return codec.decode(encoded.kind, encoded.data, encoded.meta)
+    return codec.decode(encoded.kind, encoded.data, encoded.meta, frames=encoded.frame_map())
 
 
 def _steps(store, kind=None):
@@ -217,7 +217,7 @@ def test_the_execute_step_collects_account_effects_and_the_rows_it_created():
     assert out["results"][0]["data"] == {"order_id": oid}                 # bulky details dropped
     assert len(out["orders"]) == 1 and "id" not in out["orders"][0] and "broker_order_id" not in out["orders"][0]
     assert out["transactions"][0]["stop_loss"] == 95.0 and out["transactions"][0]["take_profit"] == 110.0
-    assert {r["model"] for r in out["rows_after"]} == {"TradingOrder", "Transaction"}
+    assert "rows_after" not in out                       # the normalised orders/transactions are the record
     assert payload["inputs"]["funded"] == {"quantity": 10.0, "stop_price": 95.0}
 
 

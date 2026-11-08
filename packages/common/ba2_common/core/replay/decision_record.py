@@ -41,6 +41,7 @@ Payload (all steps)::
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -51,6 +52,7 @@ from ba2_common.core.replay.action_record import (
     encodable as _encodable,
     encodable_effect,
 )
+from ba2_common.core.replay.codec import SharedValue
 from ba2_common.core.replay.context import CaptureHealth, current_capture
 from ba2_common.core.replay.observe import record_observation
 from ba2_common.core.replay.option_action_record import _ACCOUNT_DECLARATIONS
@@ -110,7 +112,50 @@ VOLATILE_ORDER_FIELDS = frozenset({
 #: Keys of an action summary that duplicate ``evaluation_details`` (copied into every summary).
 _SUMMARY_DUPLICATES = ("condition_evaluations", "rule_evaluations")
 
-#: Recommendation fields are the full row (the rules read many of them); the codec stores it.
+#: Models whose rows are stored as their OWN content-addressed object (``SharedValue``) and referenced by
+#: hash: the same unchanged row, in ``pass_state`` and in the steps that use it, and across consecutive
+#: passes, is one object on disk. A reader decodes the reference transparently.
+SHARED_ROW_MODELS = frozenset({"Transaction", "TradingOrder", "ExpertRecommendation"})
+
+
+#: A row field (a recommendation's ``data`` / ``details``, an order's copy of them) at least this long (JSON
+#: characters) is stored as its own object too: the order row repeats the recommendation's ``data`` verbatim,
+#: and an order whose status changed keeps pointing at the same bulky field.
+_BIG_FIELD_CHARS = 512
+
+
+def _big_fields_shared(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, (dict, list, str)) and len(
+                value if isinstance(value, str) else json.dumps(value, default=str)) >= _BIG_FIELD_CHARS:
+            out[key] = SharedValue(value)
+        else:
+            out[key] = value
+    return out
+
+
+def _shared_row(row: Dict[str, Any]) -> SharedValue:
+    """One dumped row as a stored-once object (its bulky fields shared as well)."""
+    return SharedValue(_big_fields_shared(row))
+
+
+def _share(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """``{"model", "row"}`` with the row shared when its model repeats across passes."""
+    if entry["model"] in SHARED_ROW_MODELS:
+        return {"model": entry["model"], "row": _shared_row(entry["row"])}
+    return entry
+
+
+def _share_effect_rows(value: Any) -> Any:
+    """The row dumps inside the recorded account effects (the order before/after ``submit_order``), shared."""
+    if isinstance(value, list):
+        return [_share_effect_rows(item) for item in value]
+    if isinstance(value, dict):
+        if "model" in value and "row" in value and len(value) == 2 and isinstance(value["row"], dict):
+            return _share(value)
+        return {k: _share_effect_rows(v) for k, v in value.items()}
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +443,10 @@ def _step_failed(context, kind: str, symbol: str, exc: BaseException) -> None:
         pass
 
 
-def _recommendation_row(recommendation) -> Optional[Dict[str, Any]]:
-    return None if recommendation is None else _dump(recommendation)["row"]
+def _recommendation_row(recommendation) -> Optional[SharedValue]:
+    """The recommendation's row, shared: byte-identical to the one ``pass_state`` holds, so a step carries
+    only the hash instead of repeating it."""
+    return None if recommendation is None else _shared_row(_dump(recommendation)["row"])
 
 
 def _account_block(account) -> Dict[str, Any]:
@@ -431,7 +478,7 @@ class _RulesRecorder(_StepRecorder):
             "ruleset_id": self.ruleset_id,
             "recommendation": _recommendation_row(self.recommendation),
             "existing_order": (None if self.existing_order is None
-                               else _dump(self.existing_order)["row"]),
+                               else _shared_row(_dump(self.existing_order)["row"])),
             "existing_transaction_ids": [t.id for t in evaluator.existing_transactions],
             **_account_block(evaluator.account),
         }
@@ -491,7 +538,7 @@ class _SizeRecorder(_StepRecorder):
         return {
             "pass": self._pass_name(),
             "expert_instance_id": self.expert_instance_id,
-            "candidates": [{"order": _dump(order)["row"],
+            "candidates": [{"order": _shared_row(_dump(order)["row"]),
                             "recommendation": _recommendation_row(rec)}
                            for order, rec in self.candidates],
             "option_decisions": list(self.option_decisions or []),
@@ -604,7 +651,7 @@ class _ExecuteRecorder(_StepRecorder):
 
     def outcome_block(self, exc, encode):
         results = self.result if exc is None else None
-        effects = [encodable_effect(entry, encode) for entry in self._frame.submits]
+        effects = _share_effect_rows([encodable_effect(entry, encode) for entry in self._frame.submits])
         try:
             rows = self._rows_after(results)
         except Exception as row_exc:  # noqa: BLE001 -- counted; the step keeps what it has
@@ -612,8 +659,8 @@ class _ExecuteRecorder(_StepRecorder):
             rows = []
         view = execute_view(encode(results, "execute results"), effects, encode(rows, "rows"),
                             None if exc is None else repr(exc))
+        view["orders"] = [_big_fields_shared(order) for order in view["orders"]]
         view["status"] = "error" if exc is not None else "returned"
-        view["rows_after"] = rows
         return view
 
     def after_emit(self, ledger):
@@ -761,4 +808,4 @@ def _pass_state_rows(expert_instance, ruleset_id, fetched):
     def order(item):
         return (item[0][0], str(item[0][1]))
 
-    return [value for _key, value in sorted(rows.items(), key=order)], sorted(set(redacted))
+    return [_share(value) for _key, value in sorted(rows.items(), key=order)], sorted(set(redacted))

@@ -27,28 +27,58 @@ the estimates this replaces were 30-150 KB and 50-300 ms per pass). Fixture: ONE
 stop-loss and take-profit actions, ~3 KB of `data` and ~640 characters of `details` per recommendation (synthetic: the
 absolute figures scale with the real rows), fake account; median of 3 alternating off/on runs on the dev machine.
 
-| Part | Steps | Bytes (codec payload, uncompressed) | Per unit |
-|---|---|---|---|
-| `pass_state` | 1 | 171,818 | ~3.5 KB per recommendation fetched + ~3 KB per open transaction (with its orders) |
-| `rules` | 20 | 129,631 | 6.5 KB per recommendation |
-| `size` | 1 | 68,597 | 3.4 KB per candidate (incl. the RM's decisions + context) |
-| `execute` | 12 | 189,153 | 15.8 KB per funded entry (effects + raw rows_after + the normalised view) |
-| decision summary (`decision_object`) | 1 | 12,748 | |
-| broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | |
-| **Total per pass** | | **612,451** | |
+| Part | Steps | Before the size cut | After the size cut | Per unit (after) |
+|---|---|---|---|---|
+| `pass_state` | 1 | 173,998 | 198,298 (a ~25 KB index plus the shared row objects) | ~1.0 KB per row object (~200 rows) |
+| `rules` | 20 | 131,811 | 77,289 | ~3.9 KB per recommendation (the evaluation details) |
+| `size` | 1 | 71,009 | 21,652 | ~1.1 KB per candidate |
+| `execute` | 12 | 193,921 | 78,929 | ~6.6 KB per funded entry |
+| decision summary (`decision_object`) | 1 | 12,748 | 12,748 | |
+| broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | 7,097 (identical payloads are one object) | |
+| **Total per pass (first pass, nothing on disk yet)** | | **623,991** | **396,013 (-37%)** | |
 
-Time on the pass thread: the recorders took **51 ms** (inputs built, outcomes frozen); wall time 1.43 s without capture vs 1.51 s
-with the dry run (+79 ms, an upper bound: it includes the dry run's own encoding, which a live store does on the writer
-thread). Encoding to disk is not on the pass thread.
+(Before = the Task 1 measurement redone on this fixture with distinct per-recommendation `data`, which is what
+real analyses carry; with identical payloads it was the 612,451 first quoted. Pass-thread cost is unchanged: 54 ms of
+recording, wall 1.41 s without capture vs 1.59 s with the dry run.)
 
-So a LOADED pass is 4-10x the old size estimate: at ~100 such passes a day that is ~60 MB/day uncompressed per app, not 5-15
-MB; a pass with few recommendations and nothing funded is proportionally smaller (use the per-unit figures). The store has no GC (below), so
-this makes retention the first follow-up. Cheap reductions the numbers point at, NOT done (they change the payload shape the
-replay reads, owner's call): (a) drop the raw `rows_after` from `execute` and re-derive nothing (the view is the compared
-form) or the reverse; ~35% of `execute`; (b) reference the recommendation by id in `rules.inputs` instead of repeating the
-full row that `pass_state` already holds; ~45% of `rules`; (c) store each Transaction/Order/Recommendation row as its own
-content-addressed object so unchanged rows dedupe across passes (risk 5), which removes most of `pass_state` for
-a repeat pass.
+The size cut (coordinator decision, nothing had shipped, so the payload shape the replay reads is the new one):
+
+* (a) A step no longer repeats a recommendation row. `rules`, `size` and `execute` hold the row as a `SharedValue`
+  (`codec.py`: stored as its own content-addressed JSON object, referenced by hash, decoded back transparently), and it is
+  byte-identical to the one `pass_state` holds, so it is the SAME object on disk. This is the by-id reference of the brief
+  with one difference: the reader gets the full row from the payload without a lookup in `pass_state`, and a
+  recommendation that `pass_state` did not hold still works.
+* (b) `execute` no longer carries the raw `rows_after` (the normalised `orders` / `transactions` of the view are the record).
+* (c) Every Transaction, TradingOrder and ExpertRecommendation row in `pass_state` is its own object, and so is any row
+  field of 512+ JSON characters (a recommendation's `data` / `details`, which an order row repeats verbatim). The same
+  holds for the order dumps inside the recorded `submit_order` effects, the candidates in `size` and the orders of the
+  `execute` view. An unchanged row is the same bytes on the next pass, so the store keeps one copy (`put` is a no-op on an
+  existing hash).
+
+Dedupe over two consecutive passes (test `test_unchanged_rows_dedupe_across_two_consecutive_passes`: same fixture,
+nothing funded so only the book's own churn changes, dry-run counter with a process-wide set of stored hashes):
+
+| | pass 1 | pass 2 (new bytes on disk) |
+|---|---|---|
+| `pass_state` | 198,300 | 85,803 (60 of the 120 order rows changed state between the passes: the fake broker moved the waiting TP/SL legs to NEW; the 30 transactions, the other 60 orders and the 20 recommendations are not rewritten) |
+| `rules` | 77,289 | 0 (byte-identical payloads) |
+| `size` | 14,946 | 14,946 (its candidates carry a creation timestamp) |
+| total | 299,497 | 108,690 (-64%) |
+
+A pass that funds entries sees the previous pass' new positions as new rows (measured: 12 funded, second pass 201,511 of
+333,408 new). The dedupe is exact byte equality of a row, so it only helps for rows that did not change.
+
+Estimated growth, ~(passes/day x bytes): all passes cold 396 KB: 8080 ~100 passes = 40 MB/day, 8082 ~60 = 24 MB/day,
+8081 ~30 = 12 MB/day (before the cut: 62 / 37 / 19 MB). With the repeat-pass dedupe above (109-200 KB new per pass): 8080
+11-20 MB/day, 8082 7-12, 8081 3-6. Two costs the cut introduces and the numbers do not show: file count (every changed row is
+one object file; a worst-case repeat pass writes ~60-100 new files, each fsynced on the WRITER thread, not the pass thread)
+and the first pass of a session being larger in `pass_state` (198 vs 174 KB) because nothing dedupes within a pass.
+
+So a LOADED pass is still several times the old 30-150 KB estimate (the evaluation details in `rules`, 3.9 KB per
+recommendation, are the remaining bulk; they repeat each condition once more inside `rule_evaluations`, a further ~35% cut
+available there but it changes the stored `evaluation_details` shape, so it is NOT done). A pass with few recommendations
+and nothing funded is proportionally smaller (use the per-unit figures). The store has no GC (below), so retention is the
+first follow-up.
 
 * Passes: 8080 ~100 (enter + exit) per trading day, 8082 ~60, 8081 ~30 (audit numbers, unchanged). A pass record is only
   written when the pass reaches evaluation; early exits that are not decisions are discarded and COUNTED (section 2.4).

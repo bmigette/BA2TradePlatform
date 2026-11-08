@@ -17,9 +17,9 @@ import os
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
-from ba2_common.core.replay.codec import encode
+from ba2_common.core.replay.codec import content_hash, encode
 from ba2_common.core.replay.context import CaptureContext, CaptureHealth, use_capture_context
 from ba2_common.logger import logger
 
@@ -49,25 +49,50 @@ class DryRunStore:
         return _DRYRUN_SESSION
 
 
-def encoded_size(value: Any) -> int:
-    """Bytes the store would write for ``value`` (the object itself plus its frame side objects)."""
+def encoded_size(value: Any, seen: Optional[Set[str]] = None) -> int:
+    """Bytes the store would write for ``value`` (the object itself plus its side objects: frames and
+    shared rows). With ``seen`` (a set of object hashes already stored) a side object already in it costs
+    nothing -- the content-addressed store keeps one copy -- and the new ones are added to it (the object
+    itself included: two byte-identical payloads are one object)."""
     encoded = encode(value)
-    return len(encoded.data) + sum(len(side.data) for side in encoded.sides)
+    total = 0
+    for obj in (*encoded.sides, encoded):
+        if seen is not None:
+            key = content_hash(obj.kind, obj.data)
+            if key in seen:
+                continue
+            seen.add(key)
+        total += len(obj.data)
+    return total
 
 
-def measure_context(context: CaptureContext) -> Dict[str, Any]:
-    """What one finished (or dry) pass would have written, by step kind."""
+def measure_context(context: CaptureContext, stored_hashes: Optional[Set[str]] = None) -> Dict[str, Any]:
+    """What one finished (or dry) pass would have written, by step kind.
+
+    ``bytes`` / ``total_bytes`` are what the pass writes on its own (every side object counted once per pass
+    that holds it). ``stored_bytes`` is what is NEW on disk given the objects ``stored_hashes`` already holds
+    (the previous passes of the process): the dedupe of unchanged rows across passes. ``stored_hashes`` is
+    updated.
+    """
     by_kind: Dict[str, int] = defaultdict(int)
     steps: Dict[str, int] = defaultdict(int)
+    pass_seen: Set[str] = set()
+    disk_seen = stored_hashes if stored_hashes is not None else set()
+    stored = 0
+    stored_by_kind: Dict[str, int] = defaultdict(int)
     for pending in context.observations:
         if pending.observation.provider != "decision_step":
-            by_kind["other_observations"] += encoded_size(pending.payload)
-            continue
-        method = pending.observation.method
-        by_kind[method] += encoded_size(pending.payload)
-        steps[method] += 1
+            kind = "other_observations"
+        else:
+            kind = pending.observation.method
+            steps[kind] += 1
+        by_kind[kind] += encoded_size(pending.payload, pass_seen)
+        new = encoded_size(pending.payload, disk_seen)
+        stored += new
+        stored_by_kind[kind] += new
     objects = context.objects
-    by_kind["decision"] = encoded_size(objects["decision"]) if "decision" in objects else 0
+    by_kind["decision"] = encoded_size(objects["decision"], pass_seen) if "decision" in objects else 0
+    stored += encoded_size(objects["decision"], disk_seen) if "decision" in objects else 0
     ledger = context.decision_ledger
     return {
         "pass": context.meta["branch_flags"]["pass"],
@@ -76,6 +101,8 @@ def measure_context(context: CaptureContext) -> Dict[str, Any]:
         "steps": dict(steps),
         "bytes": dict(by_kind),
         "total_bytes": sum(by_kind.values()),
+        "stored_bytes": stored,
+        "stored_bytes_by_kind": dict(stored_by_kind),
         "record_ms": 1000.0 * (ledger["record_seconds"] if "record_seconds" in ledger else 0.0),
     }
 
@@ -86,6 +113,8 @@ class DryRunCounters:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.passes: List[Dict[str, Any]] = []
+        #: Hashes of every side object a measured pass has "stored": what a later pass dedupes against.
+        self.stored_hashes: Set[str] = set()
 
     def add(self, measurement: Dict[str, Any]) -> None:
         with self._lock:
@@ -94,6 +123,7 @@ class DryRunCounters:
     def reset(self) -> None:
         with self._lock:
             self.passes = []
+            self.stored_hashes = set()
 
     def snapshot(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -128,7 +158,7 @@ def dry_run_scope(meta):
             yield context
         finally:
             try:
-                measurement = measure_context(context)
+                measurement = measure_context(context, COUNTERS.stored_hashes)
                 COUNTERS.add(measurement)
                 logger.info(
                     "decision dry run: expert %s %s pass: %s, %d bytes %s, %d step(s) %s, "
