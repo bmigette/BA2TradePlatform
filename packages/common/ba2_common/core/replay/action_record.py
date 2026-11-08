@@ -359,6 +359,9 @@ class FrameRecorder:
     family: str = "action"
     #: True for a family whose frame collects the five account effect calls (``account_taps``).
     accepts_account_effects: bool = False
+    #: ``CaptureHealth`` kind a failure of this family is counted under (``None``: classified from the
+    #: exception, as every analysis-level failure is).
+    failure_kind: Optional[str] = None
 
     def __init__(self, action, context):
         self.action = action
@@ -387,6 +390,16 @@ class FrameRecorder:
     def collect_db_rows(self):
         raise NotImplementedError
 
+    def outcome_block(self, exc, encode) -> Dict[str, Any]:
+        """The ``outcome`` of the record (a family with another outcome shape overrides this)."""
+        return build_outcome(exc, self.result, self._frame, encode)
+
+    def _fail(self, message: str, exc: BaseException) -> None:
+        if self.failure_kind is None:
+            self.context.note_failure(message, exc)
+        else:
+            self.context.note_failure(message, exc, self.failure_kind)
+
     # --- lifecycle ---------------------------------------------------------
     def __enter__(self):
         self._tape_start = self.context.observation_position
@@ -399,7 +412,7 @@ class FrameRecorder:
             self._inputs = self.build_inputs()
             self._db_rows, self._redacted = self.collect_db_rows()
         except Exception as exc:
-            self.context.note_failure(f"{self.family} inputs not recorded", exc)
+            self._fail(f"{self.family} inputs not recorded", exc)
             return NOOP
         self._previous = current
         self._frame = Frame(self.action, self.accepts_account_effects)
@@ -415,13 +428,12 @@ class FrameRecorder:
             try:
                 self._record(exc)
             except Exception as record_exc:      # never change the recorded code's outcome
-                self.context.note_failure(f"{self.family} outcome not recorded", record_exc)
+                self._fail(f"{self.family} outcome not recorded", record_exc)
         return False
 
     def _record(self, exc):
-        outcome = build_outcome(
-            exc, self.result, self._frame,
-            lambda value, label: encodable(self.context, value, label, self.family))
+        outcome = self.outcome_block(
+            exc, lambda value, label: encodable(self.context, value, label, self.family))
         inputs = dict(self._inputs)
         inputs["redacted_setting_keys"] = self._redacted
         payload = {

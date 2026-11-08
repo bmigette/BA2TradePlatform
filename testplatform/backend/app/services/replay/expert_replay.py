@@ -34,6 +34,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay import (
     AnalysisRecord,
     CaptureContext,
@@ -508,6 +509,8 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     )
     with replay_isolation():
         for analysis in bundle.analyses:
+            if is_decision_pass(analysis):      # replayed by the decision capability, not as an expert
+                continue
             report.results.append(replay_analysis(bundle, analysis))
     # Running a capability IS the coverage fact, so it is written back into the
     # bundle: otherwise `replay inventory` still reports `not_run` for a

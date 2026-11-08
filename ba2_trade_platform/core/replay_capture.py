@@ -27,6 +27,8 @@ from typing import Any, Dict, Optional
 
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.interfaces.MarketExpertInterface import set_capture_batch_provider
+from ba2_common.core.replay.clock import host_timezone
+from ba2_common.core.replay.decision_record import DECISION_FAMILIES
 from ba2_common.core.replay import (
     ReplayStore,
     SessionRecord,
@@ -279,7 +281,13 @@ def _describe_instance() -> Dict[str, Any]:
         "source_revision": revision,
         "dirty": dirty,
         "config_hashes": {},
-        "capabilities": {"recorded_experts": list(RECORDED_EXPERTS)},
+        "capabilities": {
+            "recorded_experts": list(RECORDED_EXPERTS),
+            # What a session states it can replay besides expert analyses (design 2.2).
+            "decision_families": list(DECISION_FAMILIES),
+            # The recording host's timezone: "today" in a replayed decision is the day in THIS zone.
+            "host_timezone": host_timezone(),
+        },
     }
 
 

@@ -16,6 +16,9 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 
+# Imported BEFORE any test patches core.db.get_instance: TradeManager binds get_instance at import, and
+# a first import under the patch would keep the fake for the rest of the session.
+import ba2_trade_platform.core.TradeManager  # noqa: F401
 from ba2_trade_platform.ui import api_routes
 from tests.api_helpers import TOKEN, client_for, set_api_token
 import pytest
@@ -53,7 +56,8 @@ def _fake_trade_manager(monkeypatch, *, orders=(), raises=None):
     """Record what the route asks for; return ``orders`` (objects with ``.id``) or raise."""
     calls = []
 
-    def process(expert_instance_id, lookback_days=1):
+    def process(expert_instance_id, lookback_days=1, trigger=None):
+        assert trigger == "manual"          # the API route is a manual trigger of the decision pass
         calls.append((expert_instance_id, lookback_days))
         if raises is not None:
             raise raises

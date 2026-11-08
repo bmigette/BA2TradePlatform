@@ -106,6 +106,7 @@ from ba2_common.core.replay import (
     load_bundle,
 )
 from ba2_common.core.replay.codec import decode
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay.dependencies import (
     KIND_HISTORY,
     KIND_INDICATOR,
@@ -568,6 +569,8 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
     jobs: List[_Job] = []
     plans = _PlanCache(pinned)
     for analysis in bundle.analyses:
+        if is_decision_pass(analysis):          # not an expert analysis (replayed as a decision)
+            continue
         outcome = _preflight(bundle, analysis, pinned, plans)
         if isinstance(outcome, _Job):
             jobs.append(outcome)
@@ -589,7 +592,7 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
                 bundle, job, produced.get(attempt_id),
                 child["analyses"].get(attempt_id), decoder, child["timed_out"])
 
-    results = [decided[a.attempt_id] for a in bundle.analyses]
+    results = [decided[a.attempt_id] for a in bundle.analyses if not is_decision_pass(a)]
     report = ReplayReport(
         session_id=bundle.session.session_id,
         bundle_dir=str(Path(bundle_dir)),

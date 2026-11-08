@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from ba2_common.core.interfaces.MarketDataProviderInterface import ohlcv_identity
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import quote_identity
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay import (
     AnalysisRecord,
     ProviderObservation,
@@ -799,5 +800,7 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     )
     with replay_isolation():
         for analysis in bundle.analyses:
+            if is_decision_pass(analysis):      # not an expert analysis: no gather to replay
+                continue
             report.results.append(replay_gather(bundle, analysis))
     return finish_report(report, bundle, bundle_dir, out_dir)

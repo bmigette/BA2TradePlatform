@@ -5225,7 +5225,7 @@ class OrderRecommendationsTab:
                 
                 # Function to run in thread
                 def process_recommendations():
-                    return trade_manager.process_expert_recommendations_after_analysis(expert_id, lookback_days=days)
+                    return trade_manager.process_expert_recommendations_after_analysis(expert_id, lookback_days=days, trigger="manual")
                 
                 # Run in thread pool to avoid blocking UI
                 loop = asyncio.get_event_loop()
