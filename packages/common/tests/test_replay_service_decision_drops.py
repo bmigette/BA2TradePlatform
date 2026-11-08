@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from ba2_common.core.replay.context import CaptureHealth, capture_scope, current_capture
-from ba2_common.core.replay.decision_record import pass_summary
+from ba2_common.core.replay.decision_record import _ledger, pass_summary
 from ba2_common.core.replay.observe import record_observation
 from ba2_common.core.replay.schemas import ReplayStatus, SessionRecord
 from ba2_common.core.replay.service import ReplayStore
@@ -37,9 +37,7 @@ def _pass_submission(with_step=True):
         if with_step:
             oid = record_observation(provider="decision_step", method="rules",
                                      identity={"kind": "rules", "symbol": "AAPL"}, payload={"x": 1})
-            context.decision_ledger.update({
-                "symbols": {}, "steps": [{"kind": "rules", "symbol": "AAPL", "observation_id": oid}],
-                "steps_not_recorded": [], "errors": [], "effects_outside_steps": []})
+            _ledger(context)["steps"].append({"kind": "rules", "symbol": "AAPL", "observation_id": oid})
         context.set_decision(pass_summary(context))
     return recorder.submitted[0]
 
