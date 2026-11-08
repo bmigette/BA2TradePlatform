@@ -2873,9 +2873,24 @@ class TradeManager:
             logger.error(f"replay capture: could not persist the pass-not-recorded evidence: {e}",
                          exc_info=True)
 
-    def _finish_decision_pass(self, context, created_order_ids) -> None:
+    @staticmethod
+    def _created_order_ids(created) -> list:
+        """The entry pass' created orders as ids."""
+        return [o.id for o in created]
+
+    @staticmethod
+    def _created_result_order_ids(created) -> list:
+        """The exit pass' action results as the ids of the orders they created."""
+        ids = [(r.get("data") or {}).get("order_id") for r in created
+               if isinstance(r, dict) and r.get("success")]
+        return [i for i in ids if i]
+
+    def _finish_decision_pass(self, context, created, order_ids=None) -> None:
         """End a pass that ran to its end: freeze its summary as the ``decision`` outcome.
 
+        ``created`` is what the pass returns and ``order_ids`` extracts the ids from it: that
+        bookkeeping runs INSIDE the guard, because the orders were already sent by now and a failure
+        reading them must cost the record, never the caller's return value.
         A pass that already ended as a skip / error / discard keeps that outcome. Never raises.
         """
         if context is None:
@@ -2884,6 +2899,7 @@ class TradeManager:
             from ba2_common.core.replay.decision_record import pass_summary
 
             if not context.has_outcome and context.discard_reason is None:
+                created_order_ids = (self._created_order_ids if order_ids is None else order_ids)(created)
                 context.set_decision(pass_summary(context, created=created_order_ids))
             if not context.has_outcome and context.discard_reason is None:
                 raise RuntimeError("the decision pass ended without a recorded outcome")
@@ -2942,7 +2958,7 @@ class TradeManager:
         with self._decision_capture_scope(expert_instance_id, trigger=trigger) as pass_context:
             with market_condition_decision_scope(expert_instance_id=expert_instance_id):
                 created = self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
-            self._finish_decision_pass(pass_context, [o.id for o in created])
+            self._finish_decision_pass(pass_context, created)
             return created
 
     #: The per-expert processing locks, in the fixed order ``hold_expert_locks`` takes them.
@@ -3815,9 +3831,7 @@ class TradeManager:
         with self._decision_capture_scope(expert_instance_id, AnalysisUseCase.OPEN_POSITIONS,
                                           trigger=trigger) as pass_context:
             created = self._process_open_positions_recommendations(expert_instance_id, lookback_days)
-            created_ids = [(r.get("data") or {}).get("order_id") for r in created
-                           if isinstance(r, dict) and r.get("success")]
-            self._finish_decision_pass(pass_context, [i for i in created_ids if i])
+            self._finish_decision_pass(pass_context, created, self._created_result_order_ids)
             return created
 
     def _process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:

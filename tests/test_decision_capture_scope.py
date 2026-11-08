@@ -189,3 +189,45 @@ def test_the_capture_scope_opens_outside_the_market_condition_scope_on_the_exit_
     monkeypatch.setattr(mcl, "market_condition_decision_scope", _mc)
     _run(world["expert_id"])
     assert order.index("capture") < order.index("market") < order.index("capture-closed")
+
+
+# --- I4: the post-pass bookkeeping is part of the guarded finish -----------------------------------
+class _BadOrder:
+    @property
+    def id(self):
+        raise RuntimeError("order row detached")
+
+
+class _BadData:
+    def __bool__(self):
+        return True
+
+    def get(self, *a, **k):
+        raise RuntimeError("result data unreadable")
+
+
+def test_enter_pass_bookkeeping_failure_never_loses_the_return_value(store, monkeypatch):
+    """The orders were already sent; an error extracting their ids must not replace the return value."""
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    expert_id = _expert("FMPRating")
+    sent = [_BadOrder()]
+    monkeypatch.setattr(TradeManager, "_process_expert_recommendations_after_analysis",
+                        lambda self, *a, **k: sent)
+    monkeypatch.setattr(tm_mod.logger, "error", lambda *a, **k: None)
+    assert TradeManager().process_expert_recommendations_after_analysis(expert_id) is sent
+    assert store.health.count(CaptureHealth.PASS_NOT_RECORDED) == 1
+
+
+def test_exit_pass_bookkeeping_failure_never_loses_the_return_value(store, monkeypatch):
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    expert_id = _expert("FMPRating")
+    sent = [{"success": True, "data": _BadData()}]
+    monkeypatch.setattr(TradeManager, "_process_open_positions_recommendations",
+                        lambda self, *a, **k: sent)
+    monkeypatch.setattr(tm_mod.logger, "error", lambda *a, **k: None)
+    assert TradeManager().process_open_positions_recommendations(expert_id) is sent
+    assert store.health.count(CaptureHealth.PASS_NOT_RECORDED) == 1
