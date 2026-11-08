@@ -492,10 +492,31 @@ Where the build departs from, or pins down, the text above:
   `select_enter_candidates`. TradeManager calls them; so does the replay. What is still two copies: the enter loop's ORCHESTRATION (select, evaluate,
   gates, candidate, size, funded loop) in `TradeManager` and in `_PassReplay._enter`, and the backtest engine's own loop.
 * Comparison scope (named, not hidden): effects are compared with ids / timestamps / broker ids removed and transaction ids as ordinals; the order
-  view keeps only the main orders (protective legs are built by the broker ADAPTER) and the transaction view drops the fields the adapter writes
-  (`take_profit`, `stop_loss`, `meta_data`, `status`, `quantity`, prices); the TP/SL stage compares the prices handed to the account.
+  view keeps only the main orders (protective legs are built by the broker ADAPTER) and the transaction view drops only the fields the adapter writes from
+  broker state (`meta_data`, `status`, `quantity`, `open_price`, `close_price`, `created_at`); `take_profit` / `stop_loss` ARE compared (section 10); the TP/SL stage compares the prices handed to the account.
 * Not replayed yet: rules that read market-data providers (OHLCV / indicator / fundamentals conditions) report `missing_capture` because the
   isolation's provider resolver refuses and no tape-backed provider is wired for them (the RM's ATR read IS served from the tape when live recorded
   one); option entries/exits; Smart RM passes; the unsent-entry compensation path.
 * The tests are in the ROOT suite (`tests/test_decision_pass_replay.py`, trade venv): driving the real TradeManager needs the root harness and
   `langchain`, which the testplatform test venv does not have (`ModelFactory` import). They replay through `ba2test_launcher._cmd_replay`.
+
+## 10. Review fixes (2026-11-08, branch sdr/fix)
+
+* C1: the funded-entry loop binds `order` the moment `stage_funded_entry` knows it (the `on_executed` hook), BEFORE the persist, so a
+  failing `persist_funded_entry` / `stamp_leg_quantities` still reaches `_fail_unsent_entry` for THAT order (as before the refactor).
+* I1: an account effect inside a pass but outside every step frame (dependent TP/SL legs from `_check_all_waiting_trigger_orders`,
+  compensation, refresh) is kept in the pass summary's `effects_outside_steps` (capped at 200; beyond that counted `step_not_recorded`).
+* I2: a full queue / closed store hands the drop to the writer (`_drops`), never writes the index from the pass thread; with no live writer the
+  drop is written with a 250 ms index wait and counted/logged on failure.
+* I3: per-pass budget (`PASS_RECORD_SECONDS_BUDGET` 30 s of recorder time, `PASS_RECORD_FAILURE_BUDGET` 25 failures): later steps of that pass are
+  not recorded, each counted `step_not_recorded` and listed in `steps_not_recorded`; the summary says why (`recording_budget_exceeded`). Rollout
+  allow-list: AppSetting `replay_decision_pass_experts` (comma-separated expert classes; absent / blank / `*` = every expert, the default when capture
+  is on; the row is not auto-created). Experts not listed are counted as discards with reason `expert_not_allowed`.
+* I4: created-order-id bookkeeping runs inside `_finish_decision_pass`'s guard; the pass' return value always reaches the caller.
+* I5/I6/I7: the replay gates every payload `version` (`unsupported` naming it); `take_profit` / `stop_loss` of the transaction are compared (the tape
+  account stamps handed prices as the adapters do, only where the recorded transactions show the adapter stamped them); pass gaps use the `decision`
+  capability and per-step payload gaps are named in `steps_not_recorded`.
+* M4 (limit, not fixed): the capture context is a `ContextVar`, so account effects made on OTHER threads (worker threads spawned inside a pass,
+  the IBKR runtime's asyncio thread, broker callback threads) do not see the pass and are NOT recorded. The shared decision code calls the account on
+  the pass thread, which is what the tap records; adapter-internal threads are adapter behaviour (section 2.5).
+* M6: `BA2_REPLAY_DECISION_DRYRUN` is ignored (one ERROR) outside pytest unless `BA2_REPLAY_DECISION_DRYRUN_CONFIRM=dev` is also set.
