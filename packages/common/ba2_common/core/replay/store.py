@@ -562,11 +562,30 @@ class ReplayIndex:
             raise ReplayStoreError(f"session {session_id} is not in the index")
         return SessionRecord.from_mapping(json.loads(row["payload"]))
 
-    def analyses(self, session_id: str) -> List[AnalysisRecord]:
+    def analyses(self, session_id: str, *, skipped: Optional[List[Dict[str, str]]] = None
+                 ) -> List[AnalysisRecord]:
+        """The session's analyses. STRICT by default: a row this reader cannot parse (written by a
+        newer schema) raises, so export and retention never act on a partial view.
+
+        ``skipped``: a list to fill makes the LISTING tolerant per row. A row with fields this reader
+        does not know is left out and appended as ``{"analysis_id", "error"}``; nothing is dropped
+        silently (the caller reports ``skipped``).
+        """
         rows = self._connection().execute(
             "SELECT payload FROM analyses WHERE session_id = ? ORDER BY rowid", (session_id,)
         ).fetchall()
-        return [AnalysisRecord.from_mapping(json.loads(row["payload"])) for row in rows]
+        records: List[AnalysisRecord] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if skipped is None:
+                records.append(AnalysisRecord.from_mapping(payload))
+                continue
+            try:
+                records.append(AnalysisRecord.from_mapping(payload))
+            except ValueError as exc:
+                skipped.append({"analysis_id": str(payload["analysis_id"]) if "analysis_id" in payload else "",
+                                "error": str(exc)})
+        return records
 
     def observations(self, analysis_id: str) -> List[ProviderObservation]:
         rows = self._connection().execute(
