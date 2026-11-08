@@ -13,6 +13,7 @@ from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
+from ba2_common.core.replay.clock import replay_now
 from ba2_common.core.washtrade import (
     went_out_as_contended_complex, was_rejected_as_washtrade, stamp_rejection)
 # ONE constant, TWO readers: the OCO stop leg places its limit this far through the stop,
@@ -3107,7 +3108,12 @@ class TradeManager:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
             # The SPY regime the spy-trend / spy-vol entry gates read, from FINISHED sessions, BEFORE any
             # rule is evaluated (the pass can run outside a refresh).
-            self._publish_benchmark_regime()
+            # THE pass's decision instant: the ONE wall-clock read of this pass, taken through the
+            # evaluation-clock seam (the wall clock when no capture is open) BEFORE anything else could
+            # read it, so a replay finds it first. The regime publish and the recommendation cutoff
+            # below both use it.
+            decision_now = replay_now()
+            self._publish_benchmark_regime(now=decision_now)
             
             from sqlmodel import select
             from .db import get_db
@@ -3162,7 +3168,7 @@ class TradeManager:
             account = account_class(account_def.id)
 
             # Get recent recommendations based on lookback_days parameter
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            cutoff_time = decision_now - timedelta(days=lookback_days)
             from ba2_common.core.hold_entry import evaluate_hold_entries
             allow_hold = evaluate_hold_entries(expert.settings)
 
@@ -3997,7 +4003,7 @@ class TradeManager:
             account = account_class(account_def.id)
 
             # Get recent recommendations based on lookback_days parameter
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            # (the recommendation cutoff is taken inside the capture scope below, through the clock seam)
 
             # ONE market-condition decision pass for this expert's exit rules, mirroring the
             # entry pass (process_expert_recommendations_after_analysis). Without it a market
@@ -4011,6 +4017,9 @@ class TradeManager:
             # expert is gated or on an options account. A failure to OPEN the market-condition
             # scope never stops the exits: see _open_exit_pass_market_condition_scope.
             with self._decision_capture_scope(expert_instance_id, AnalysisUseCase.OPEN_POSITIONS),                     self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
+                # Recent recommendations by lookback_days. Read INSIDE the capture scope (opened on the line
+                # above), so the pass's decision instant is a recorded clock read and replays as such.
+                cutoff_time = replay_now() - timedelta(days=lookback_days)
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,

@@ -419,6 +419,7 @@ def _run_enter(expert, account, expert_instance_id):
     set_instance_resolver(_resolver_for(expert, account))
     try:
         with patch.object(_tm_mod, "datetime", _FrozenDatetime), \
+             patch.object(_tm_mod, "replay_now", lambda *a, **k: FROZEN_NOW), \
              patch.object(_tm_mod.TradeManager, "_ENTRY_SUBMIT_BACKOFF_S", 0.0), \
              patch("ba2_trade_platform.core.utils.get_expert_instance_from_id",
                    return_value=expert), \

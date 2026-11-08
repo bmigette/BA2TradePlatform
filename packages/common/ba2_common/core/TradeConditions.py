@@ -18,6 +18,8 @@ from ba2_common.core.db import get_db
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import replay_now
+from ba2_common.core.replay.context import current_capture
 from ba2_common.core import benchmark_regime as _br
 # The established vocabulary for "the broker's position fetch FAILED" — reused rather
 # than re-invented so the engine, the live service, the UI and the conditions all raise
@@ -152,6 +154,21 @@ def resolve_market_condition_context(account, instrument_name: str,
             f"market-condition context resolver returned {type(ctx).__name__}, "
             f"expected MarketConditionContext or None")
     return ctx
+
+
+
+def _wall_today() -> date:
+    """The live "today" of a condition, read through the evaluation-clock seam.
+
+    No capture context (production, an unrecorded pass): exactly ``date.today()``. Under capture
+    the instant is a ``replay_now()`` read (recorded in order; the recorded read in replay) and the
+    date is its LOCAL calendar day -- the same day ``date.today()`` names, so recording changes no
+    decision. A replay on a host in another timezone would name that host's local day of the
+    recorded instant.
+    """
+    if current_capture() is None:
+        return date.today()
+    return replay_now().astimezone().date()
 
 
 def _is_missing(value) -> bool:
@@ -428,7 +445,9 @@ class TradeCondition(ABC):
         as_of = self._simulated_as_of_date()
         if as_of is AS_OF_UNAVAILABLE:
             return None
-        return date.today() if as_of is None else as_of
+        if as_of is not None:
+            return as_of
+        return _wall_today()
 
 
     def has_expert_position(self) -> bool:
@@ -2253,7 +2272,7 @@ class DaysOpenedCondition(CompareCondition):
 
             # Sim-aware "now": the recommendation's as-of bar in a backtest, wall-clock
             # in live. Falls back to wall-clock only if no recommendation timestamp.
-            now = getattr(self.expert_recommendation, "created_at", None) or datetime.now(timezone.utc)
+            now = getattr(self.expert_recommendation, "created_at", None) or replay_now()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
 
@@ -2313,7 +2332,7 @@ class DaysSinceLastCloseCondition(CompareCondition):
             from ba2_common.core.trade_repository import get_trade_repository
 
             expert_id = getattr(self.expert_recommendation, "instance_id", None)
-            now = getattr(self.expert_recommendation, "created_at", None) or datetime.now(timezone.utc)
+            now = getattr(self.expert_recommendation, "created_at", None) or replay_now()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
 
