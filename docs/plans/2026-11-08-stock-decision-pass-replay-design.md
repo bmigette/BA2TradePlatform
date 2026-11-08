@@ -21,20 +21,45 @@ After this change, with capture ON (it is on in all three apps):
 | 8081 prod (live, stock) | analyses only | same as 8080. LIVE MONEY: the recorder is on the order path, see the failure policy below |
 | 8082 options (option + stock-route experts) | option passes only (21 error-stamped rows in 5 days) | + the stock-route entries/exits of the same experts; the option passes now end with a real outcome |
 
-Estimated cost (ESTIMATES from the audit numbers, to be replaced by the counters of Task 1 before anything ships):
-* Passes: 8080 ~100 (enter + exit) per trading day, 8082 ~60, 8081 ~30. A pass record is only written when the
-  pass reaches evaluation; early exits that are not decisions are discarded and COUNTED (section 2.4).
-* Size per pass 30-150 KB uncompressed (rules details 5-20 KB per recommendation, capital-holding DB rows
-  ~1 KB each, ~10-30 rows per expert). Store growth about +5-15 MB/day on 8080, +3-10 on 8082, +1-4 on 8081, on top
-  of today's 10-55 MB/day/app (audit section 1). The store has no GC (`ObjectStore.iter_orphans`, `store.py:149`, has
-  no caller); this change makes a retention policy more urgent, it does not create the problem.
-* Latency on the pass thread: 3-6 short read queries per step (5-30 ms) plus freeze of a small payload. Per pass
-  50-300 ms added to passes that already spend seconds on broker round trips and the sizing price fetch. Observation
-  writes go through the existing async queue (`store.submit`), not the pass thread.
+Measured cost (Task 1, `BA2_REPLAY_DECISION_DRYRUN=1`, `tests/test_decision_pass_sizing_counter.py::test_measure_realistic_pass`;
+the estimates this replaces were 30-150 KB and 50-300 ms per pass). Fixture: ONE enter-market pass of a classic-RM expert with
+20 recommendations (12 funded), 30 open transactions (entry + TP + SL order each), a four-condition entry ruleset with
+stop-loss and take-profit actions, ~3 KB of `data` and ~640 characters of `details` per recommendation (synthetic: the
+absolute figures scale with the real rows), fake account; median of 3 alternating off/on runs on the dev machine.
+
+| Part | Steps | Bytes (codec payload, uncompressed) | Per unit |
+|---|---|---|---|
+| `pass_state` | 1 | 171,818 | ~3.5 KB per recommendation fetched + ~3 KB per open transaction (with its orders) |
+| `rules` | 20 | 129,631 | 6.5 KB per recommendation |
+| `size` | 1 | 68,597 | 3.4 KB per candidate (incl. the RM's decisions + context) |
+| `execute` | 12 | 189,153 | 15.8 KB per funded entry (effects + raw rows_after + the normalised view) |
+| decision summary (`decision_object`) | 1 | 12,748 | |
+| broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | |
+| **Total per pass** | | **612,451** | |
+
+Time on the pass thread: the recorders took **51 ms** (inputs built, outcomes frozen); wall time 1.43 s without capture vs 1.51 s
+with the dry run (+79 ms, an upper bound: it includes the dry run's own encoding, which a live store does on the writer
+thread). Encoding to disk is not on the pass thread.
+
+So a LOADED pass is 4-10x the old size estimate: at ~100 such passes a day that is ~60 MB/day uncompressed per app, not 5-15
+MB; a pass with few recommendations and nothing funded is proportionally smaller (use the per-unit figures). The store has no GC (below), so
+this makes retention the first follow-up. Cheap reductions the numbers point at, NOT done (they change the payload shape the
+replay reads, owner's call): (a) drop the raw `rows_after` from `execute` and re-derive nothing (the view is the compared
+form) or the reverse; ~35% of `execute`; (b) reference the recommendation by id in `rules.inputs` instead of repeating the
+full row that `pass_state` already holds; ~45% of `rules`; (c) store each Transaction/Order/Recommendation row as its own
+content-addressed object so unchanged rows dedupe across passes (risk 5), which removes most of `pass_state` for
+a repeat pass.
+
+* Passes: 8080 ~100 (enter + exit) per trading day, 8082 ~60, 8081 ~30 (audit numbers, unchanged). A pass record is only
+  written when the pass reaches evaluation; early exits that are not decisions are discarded and COUNTED (section 2.4).
+* Store growth on top of today's 10-55 MB/day/app (audit section 1): see the measured size above times the pass count. The
+  store has no GC (`ObjectStore.iter_orphans`, `store.py:149`, has no caller).
+* Observation writes go through the existing async queue (`store.submit`), not the pass thread.
 * Decisions: unchanged. The recorder only reads, uses its own short-lived sessions (the enter loop's read-only
-  session invariant, `TradeManager.py:3175-3195`, is not touched) and never raises into the pass.
+  session invariant, `TradeManager.py:3175-3195`, is not touched) and never raises into the pass. Proven by
+  `tests/test_decision_pass_capture_roundtrip.py` (real passes, capture on == capture off, also with every recorder broken).
 * GA/backtest: not affected. Taps are passthrough outside a capture scope; the one shared-code edit that matters
-  (the `TradeConditions` clock seam, Task 3) is a no-op when `as_of` is given.
+  (the `TradeConditions` clock seam, Task 3) is a no-op when `as_of` is given. BT byte gate (row 2201): IDENTICAL.
 
 Failure policy (the owner rule "no silent failure"): recording is never a dependency of trading, but every failure
 to record is COUNTED, WRITTEN into the session and SHOWN (section 5). The `nullcontext()`-plus-log-line pattern at
@@ -383,3 +408,28 @@ Order: 1, 2, 3, 4 can run in parallel pairs; 5 before 6; 7 before 8; 9 any time 
    rather than a persisted "discarded" row per call (~300/day would be noise).
 9. Not verified here: whether `BacktestAccount` exposes the same effect methods with identical signatures (needed for Task 4
    guard and section 4); the exact set of sites in `TradeConditions` that call the wall clock beyond the 13 counted by grep.
+
+## 8. Implementation notes (Tasks 1, 5, 6 as built, 2026-11-08)
+
+Where the build departs from, or pins down, the text above:
+
+* Gates (`note_gate`): a gate verdict is taken AFTER the `rules` step has closed, so it cannot join that record. It is listed per
+  symbol in the pass' frozen summary (`decision_object`: `symbols[SYM].gates`, with `rules`, `size`, `execute` digests, the funded
+  set, created order ids, swallowed errors and `steps_not_recorded`); the replay's "Rules" stage reads it from there.
+* `execute` step: it spans execute + persist + broker submit for an entry (so the `submit_order` effect and the final stop price are
+  inside it) and execute for an exit. It is opened at the two TradeManager sites (the funded-entry loop and the exit execute), not
+  inside `TradeActionEvaluator.execute`, because only those callers compose the persist/submit tail. `rules` and `size` are taps in
+  the shared `TradeActionEvaluator.evaluate` / `TradeRiskManagement.size_candidate_orders` (passthrough outside a capture scope).
+  Option actions are skipped (the option action record covers them). Task 7 moves the entry composition into `trade_cycle`.
+* The exit pass' capture scope now opens in the public `process_open_positions_recommendations`, before the lock and the early
+  returns (the body moved to `_process_open_positions_recommendations`), so lock misses are counted discards and automation-off /
+  no-ruleset exits are recorded skips. The enter pass is wrapped the same way. The market-condition scope still opens inside it.
+* `pass_state` is written when the pass reaches evaluation (after the recommendation selection), not at scope open: the
+  recommendation set it must hold does not exist earlier. Per-step payloads store the normalised views (`rules_view`,
+  `sizing_view`, `execute_view` in `decision_record`) as their `outcome`, so the replay compares with the same functions.
+* Host timezone: `branch_flags["host_timezone"] = {name, utc_offset_seconds}` on every pass and `capabilities["host_timezone"]` on
+  the session. `TradeConditions._wall_today()` under replay takes the calendar day of the recorded instant in that zone (the fixed
+  offset when the host could not name its zone) and raises `ReplayMiss` when the record has none.
+* Schema 3 (`OUTCOME_DECISION`, `AnalysisRecord.decision_object`, health kinds `pass_not_recorded` / `pass_discarded` /
+  `step_not_recorded`; schemas 1 and 2 still load). `CaptureHealth.total` excludes discards (an accounted-for outcome).
+* The replay-side `experts`, `gather-tape` and `historical` capabilities skip decision-pass rows (Task 8 gives them their own).

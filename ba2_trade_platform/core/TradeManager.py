@@ -2873,7 +2873,22 @@ class TradeManager:
             pass_name = "enter-market" if uc == AnalysisUseCase.ENTER_MARKET else "open-positions"
             store = get_replay_store()
             if store is None:
-                yield None
+                from ba2_common.core.replay import decision_sizing
+
+                if not decision_sizing.dry_run_enabled():
+                    yield None
+                    return
+                # BA2_REPLAY_DECISION_DRYRUN=1 and no store: record into a throwaway context and only
+                # COUNT the bytes (design Task 1). The recorders are the read-only ones, nothing is written.
+                try:
+                    dry_meta = self._decision_pass_meta(
+                        decision_sizing.DryRunStore(), expert_instance_id, uc, pass_name, trigger)
+                except Exception as e:  # noqa: BLE001 -- the dry run must not stop a decision
+                    logger.error(f"decision dry run: pass meta not built: {e}", exc_info=True)
+                    yield None
+                    return
+                with decision_sizing.dry_run_scope(dry_meta) as dry_context:
+                    yield dry_context
                 return
             try:
                 meta = self._decision_pass_meta(store, expert_instance_id, uc, pass_name, trigger)
