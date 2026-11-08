@@ -532,6 +532,7 @@ class _PassReplay:
                 stack.enter_context(_scratch_trading_db(instances))
                 stack.enter_context(_resolver(_ScratchResolver(self.account, analysis_id)))
                 self._indicator_seam(stack)
+                self._provider_seam(stack)
                 if self.pass_name == "enter-market":
                     self._enter(inputs)
                 else:
@@ -557,6 +558,18 @@ class _PassReplay:
         previous = rm_module.get_indicator_provider_resolver()
         rm_module.set_indicator_provider_resolver(lambda _expert_id: shim)
         stack.callback(rm_module.set_indicator_provider_resolver, previous)
+
+    def _provider_seam(self, stack: ExitStack) -> None:
+        """Serve the market-data providers a RULE CONDITION resolves (OHLCV, company details) from the tape.
+
+        ``TradeConditions`` resolves them through its injected resolver; the isolation's resolver refuses.
+        Here the resolver hands out the gather tape's own actors, reading through the CURRENT step's tape.
+        """
+        from ba2_common.core import TradeConditions
+
+        previous = TradeConditions.get_provider_resolver()
+        TradeConditions.set_provider_resolver(_TapeProviderResolver(self))
+        stack.callback(TradeConditions.set_provider_resolver, previous)
 
     # -- one step ------------------------------------------------------------------------
     def _run_step(self, tape: SpanTape, context: CaptureContext, effects, body):
@@ -1036,6 +1049,81 @@ class _PassReplay:
 
 def _candidate_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in row.items() if k not in dr.VOLATILE_ORDER_FIELDS}
+
+
+class _CurrentStepTape:
+    """What the provider actors read: whichever step tape the account is using right now.
+
+    Names of the recorded actors (their class name is part of every recorded identity) come from the
+    pass' whole observation list, so the actors can be built once per pass.
+    """
+
+    def __init__(self, replay: "_PassReplay"):
+        self._replay = replay
+        self.analysis_id = replay.analysis.analysis_id
+
+    @property
+    def _tape(self):
+        return self._replay.account._tape
+
+    def take(self, provider, method, identity):
+        return self._tape.take(provider, method, identity)
+
+    def identities(self, provider, method):
+        return tuple(dict(o.request_identity) for o in self._replay.observations
+                     if o.provider == provider and o.method == method)
+
+    def has(self, provider, method):
+        return bool(self.identities(provider, method))
+
+    def note_miss(self, miss: ReplayMiss) -> None:
+        misses = getattr(self._tape, "misses", None)
+        if misses is not None:
+            misses.append(miss)
+
+
+#: The fundamentals-details methods a rule condition can call directly (provider-method taps).
+_RULE_DETAILS_BOUNDARIES = (
+    ("fundamentals_details", "get_past_earnings"),
+    ("fundamentals_details", "get_balance_sheet"),
+    ("fundamentals_details", "get_income_statement"),
+    ("fundamentals_details", "get_cashflow_statement"),
+    ("fundamentals_details", "get_earnings_estimates"),
+)
+
+
+class _TapeProviderResolver:
+    """The ``TradeConditions`` provider resolver of a decision replay: tape actors, or a typed miss.
+
+    ``ohlcv`` and ``fundamentals_details`` are the providers a shipped condition resolves; any other
+    category is refused (and counted in the step tape's misses, so a condition that swallows the
+    refusal still reports ``missing_capture``).
+    """
+
+    def __init__(self, replay: "_PassReplay"):
+        self._tape = _CurrentStepTape(replay)
+        self._actors: Dict[str, Any] = {}
+
+    def _actor(self, category: str):
+        from app.services.replay import gather_tape as gt
+
+        if category not in self._actors:
+            if category == "ohlcv":
+                name = gt._actor_name(self._tape, "market_data", "get_ohlcv_data", "provider")
+                self._actors[category] = gt._actor_class(gt._TapeOHLCVProvider, name)(self._tape)
+            else:
+                name = gt._actor_name_across(self._tape, "provider", *_RULE_DETAILS_BOUNDARIES)
+                self._actors[category] = gt._actor_class(gt._TapeStatementsProvider, name)(self._tape)
+        return self._actors[category]
+
+    def __call__(self, category, name=None, **kwargs):
+        if category in ("ohlcv", "fundamentals_details"):
+            return self._actor(category)
+        miss = refuse("provider", analysis_id=self._tape.analysis_id,
+                      request_identity={"category": category, "name": name},
+                      detail="a rule condition resolved a provider the decision replay has no tape actor for")
+        self._tape.note_miss(miss)
+        raise miss
 
 
 class _TapeIndicatorProvider:

@@ -72,6 +72,10 @@ def record(tmp_path: Path, test_engine, build, run) -> Path:
         store.close(timeout=5.0)
 
 
+def enter_bundle_of(tmp_path, test_engine, build, run):
+    return record(tmp_path, test_engine, build, run)
+
+
 def enter_bundle(tmp_path, test_engine, per_instrument_pct=None):
     return record(tmp_path, test_engine, _enter_world, lambda w: _run_enter(w[1], w[2], w[0].id))
 

@@ -730,7 +730,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             return f"# {statement_label} for {symbol}\n\nNo statements found.\n"
     
     @observe_provider("fundamentals_details", "get_past_earnings",
-                      identity=past_earnings_identity)
+                      identity=past_earnings_identity, record_errors=True)
     def get_past_earnings(
         self,
         symbol: str,

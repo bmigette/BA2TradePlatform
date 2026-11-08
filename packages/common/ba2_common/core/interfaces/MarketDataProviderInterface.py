@@ -1761,6 +1761,7 @@ class MarketDataProviderInterface(DataProviderInterface):
     @observe_provider(
         "market_data", "get_ohlcv_data",
         identity=ohlcv_identity,
+        record_errors=True,     # a rule condition swallows a failed read; the replay must see it fail the same way
         before=lambda a: _ohlcv_cache_counters(),
         provenance=lambda a, result, before: _ohlcv_provenance(a, before),
     )
