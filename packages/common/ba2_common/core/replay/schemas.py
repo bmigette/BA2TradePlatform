@@ -21,18 +21,23 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 #:
 #: * 1 -- first format; ``ProviderObservation.tap_depth`` was later added to it WITHOUT a bump
 #:   (a v1 reader built before that refuses a newer v1 bundle with "unknown field(s)").
-#: * 2 -- the recorded ``settings`` object is the expert's FULL resolved settings (every
+#: * 2 -- (a) the recorded ``settings`` object is the expert's FULL resolved settings (every
 #:   definition resolved with its default the way the live code resolves it, every stored key,
 #:   plus the ``instance.*`` decision columns), secrets dropped. v1 recordings hold only the
 #:   expert's own keys; they stay readable, and the tools that need the rest say so loudly
 #:   (``settings_record.explain_missing_setting``) instead of failing opaquely.
+#:   (b) ``SessionRecord`` gained ``provenance`` / ``provenance_error`` (the exact uncommitted
+#:   code a dirty session ran). Schema-1 sessions and bundles are still READ.
 SCHEMA_VERSION = 2
 #: Versions ``load_bundle`` accepts. N-1 stays readable.
 READABLE_SCHEMA_VERSIONS = (1, 2)
+#: Alias kept for the provenance readers; the same tuple.
+SUPPORTED_SCHEMA_VERSIONS = READABLE_SCHEMA_VERSIONS
 
 __all__ = [
     "SCHEMA_VERSION",
     "READABLE_SCHEMA_VERSIONS",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "ReplayStatus",
     "SessionRecord",
     "AnalysisRecord",
@@ -96,6 +101,10 @@ class ReplayStatus:
     # coverage.status
     COVERAGE_MATCH = "match"
     COVERAGE_DIFFERENCE = "difference"
+    #: A result that differs while the running code is NOT the code that was recorded
+    #: (other revision, other uncommitted patch, other package versions). Distinct from
+    #: ``difference`` so drift cannot be read as a parity break.
+    COVERAGE_CODE_DRIFT = "code_drift"
     COVERAGE_MISSING_CAPTURE = "missing_capture"
     COVERAGE_MISSING_HISTORY = "missing_history"
     COVERAGE_REVISION_UNKNOWN = "revision_unknown"
@@ -230,10 +239,27 @@ class SessionRecord(_Record):
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     status: str = ReplayStatus.SESSION_OPEN
     capabilities: Mapping[str, Any] = field(default_factory=dict)
+    #: The exact code this process ran (schema 2): ``patch_sha256`` / ``patch_object`` (the
+    #: ``git diff HEAD --binary`` of a dirty tree), ``untracked`` (path, sha256, size, optional
+    #: content object), ``versions``. Empty for a schema-1 session ("patch not recorded").
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    #: Why ``provenance`` could not be collected. Never silently omitted.
+    provenance_error: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
 
     _DATETIME_FIELDS = ("started_at", "ended_at")
-    _MAPPING_FIELDS = ("package_versions", "config_hashes", "capabilities")
+    _MAPPING_FIELDS = ("package_versions", "config_hashes", "capabilities", "provenance")
+
+    def object_hashes(self) -> Tuple[str, ...]:
+        """Content hashes of the provenance objects (patch, untracked file contents)."""
+        found = []
+        patch = self.provenance.get("patch_object")
+        if patch:
+            found.append(patch)
+        for entry in self.provenance.get("untracked", ()):
+            if entry.get("content_object"):
+                found.append(entry["content_object"])
+        return tuple(found)
 
 
 @dataclass(frozen=True, kw_only=True)

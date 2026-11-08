@@ -566,16 +566,37 @@ CASE_BUILDERS: Tuple[Tuple[str, Callable[[], Case]], ...] = (
 # --------------------------------------------------------------------------- #
 # Building and exporting the session
 # --------------------------------------------------------------------------- #
+def running_code_session(session_id=None, **overrides) -> SessionRecord:
+    """A session that claims EXACTLY the code running this test (revision, patch, versions).
+
+    Replay compares the running code with the recording's and relabels differences
+    `code_drift` when they differ; fixtures that test the comparison itself must record the
+    code they run on, or every difference would be (rightly) drift.
+    """
+    from ba2_common.core.replay import provenance as prov
+    from app.services.replay.provenance import running_repo
+
+    repo = running_repo()
+    snap = prov.snapshot_code(repo)
+    versions = prov.read_versions(repo)
+    fields = dict(
+        session_id=session_id or SESSION_ID, instance_id="replay-test-instance",
+        started_at=NOW, exchange_tz="America/New_York",
+        app_version=versions["app_version"],
+        package_versions={k: v for k, v in versions.items() if k.startswith("ba2_")},
+        source_revision=snap.revision, dirty=snap.dirty,
+        provenance={"patch_sha256": snap.patch_sha256,
+                    "untracked": [dict(e) for e in snap.untracked], "versions": versions})
+    fields.update(overrides)
+    return SessionRecord(**fields)
+
+
 def capture_session(store_root, export_dir, builders=None) -> Path:
     """Record every case into ``store_root`` and export them to ``export_dir``.
 
     ``builders``: ``(analysis_id, builder)`` pairs to record instead of :data:`CASE_BUILDERS`."""
     store = ReplayStore(store_root, writer="sync")
-    store.begin_session(SessionRecord(
-        session_id=SESSION_ID, instance_id="replay-test-instance",
-        started_at=NOW, exchange_tz="America/New_York",
-        app_version="test", package_versions={"ba2_common": "test"},
-        source_revision="0" * 40, dirty=False))
+    store.begin_session(running_code_session())
     set_replay_store(store)
     try:
         for _analysis_id, builder in (CASE_BUILDERS if builders is None else builders):

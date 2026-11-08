@@ -233,11 +233,9 @@ def capture_live_session(store_root, export_dir, *,
     market_analysis = _FakeMarketAnalysis(ANALYSIS_ID, SYMBOL)
 
     store = ReplayStore(store_root, writer="sync")
-    store.begin_session(SessionRecord(
-        session_id=session_id, instance_id="historical-test-instance",
-        started_at=EVAL, exchange_tz="America/New_York",
-        app_version="test", package_versions={"ba2_common": "test"},
-        source_revision="0" * 40, dirty=False))
+    from tests.replay import running_code_session
+    store.begin_session(running_code_session(
+        session_id, instance_id="historical-test-instance", started_at=EVAL))
     set_replay_store(store)
     try:
         with ExitStack() as stack:
@@ -969,7 +967,11 @@ def _fake_child(monkeypatch, behaviour):
     """Replace the child launch; ``behaviour(job, result_path)`` decides what happens."""
     import subprocess
 
+    real_run = subprocess.run
+
     def _run(argv, **kwargs):
+        if argv[0] == "git":      # the code-provenance comparison, not the child launch
+            return real_run(argv, **kwargs)
         job = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
         return behaviour(job, Path(job["result_path"]))
 

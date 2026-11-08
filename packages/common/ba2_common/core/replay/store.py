@@ -245,14 +245,17 @@ class ReplayIndex:
     capture thread and the writer thread.
     """
 
-    def __init__(self, db_path, *, busy_timeout_ms: int = 30000):
+    def __init__(self, db_path, *, busy_timeout_ms: int = 30000, read_only: bool = False):
         self.path = Path(db_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._local = threading.local()
         self._connections: Dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
-        self._create_schema()
+        if not read_only:
+            self._create_schema()
 
     # -- connections
 
@@ -260,11 +263,18 @@ class ReplayIndex:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
-        conn = sqlite3.connect(str(self.path), timeout=self._busy_timeout_ms / 1000.0)
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True,
+                timeout=self._busy_timeout_ms / 1000.0,
+            )
+        else:
+            conn = sqlite3.connect(str(self.path), timeout=self._busy_timeout_ms / 1000.0)
         conn.isolation_level = None  # explicit transactions only
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if not self.read_only:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         self._local.conn = conn
         with self._connections_lock:
@@ -324,6 +334,18 @@ class ReplayIndex:
                     _dumps(session.to_mapping()),
                 ),
             )
+
+    def register_objects(self, objects: Sequence[ObjectRef]) -> None:
+        """Record published objects that no analysis commit will carry."""
+        now = _now_iso()
+        conn = self._connection()
+        with _transaction(conn):
+            for ref in objects:
+                conn.execute(
+                    "INSERT OR IGNORE INTO objects (hash, kind, size, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ref.hash, ref.kind, ref.size, now),
+                )
 
     def update_session_status(self, session_id: str, status: str, ended_at=None) -> None:
         conn = self._connection()

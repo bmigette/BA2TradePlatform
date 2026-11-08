@@ -48,6 +48,7 @@ from ba2_common.core.types import Recommendation
 from ba2_common.logger import logger
 
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = [
@@ -512,7 +513,4 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     # bundle: otherwise `replay inventory` still reports `not_run` for a
     # capability that has just been run, and the two commands disagree about the
     # same session.
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)

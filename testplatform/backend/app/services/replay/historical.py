@@ -123,6 +123,7 @@ from app.services.replay.expert_replay import (
     compare_recommendations,
     compare_values,
 )
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import (
     AnalysisResult,
     FieldDiff,
@@ -606,10 +607,7 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
             "isolation": child["isolation"],
         }},
     )
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)
 
 
 def _stage_results(results: Sequence[AnalysisResult]) -> Dict[str, Dict[str, str]]:

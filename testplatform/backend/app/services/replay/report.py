@@ -12,7 +12,7 @@ never report 100% by dropping unavailable rows." (spec section 8)
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -40,6 +40,7 @@ __all__ = [
 STATUS_ORDER: Tuple[str, ...] = (
     ReplayStatus.COVERAGE_MATCH,
     ReplayStatus.COVERAGE_DIFFERENCE,
+    ReplayStatus.COVERAGE_CODE_DRIFT,
     ReplayStatus.COVERAGE_MISSING_CAPTURE,
     ReplayStatus.COVERAGE_MISSING_HISTORY,
     ReplayStatus.COVERAGE_REVISION_UNKNOWN,
@@ -341,6 +342,9 @@ class ReplayReport:
     #: whether anything tried to leave the machine -- and a reader that has only the
     #: report must be able to see them. Refused if it would overwrite a standard key.
     extra: Dict[str, Any] = field(default_factory=dict)
+    #: ``CodeComparison.to_mapping()`` of recorded vs running code, set by
+    #: :meth:`apply_code_comparison`. ``None`` = the comparison was not made.
+    code_provenance: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------- accessors
     @property
@@ -355,6 +359,28 @@ class ReplayReport:
                 raise ValueError(f"unknown replay status {result.status!r}")
             out[result.status] += 1
         return out
+
+    def apply_code_comparison(self, comparison: Any) -> None:
+        """Record recorded-vs-running code, and relabel results when the code DIFFERS.
+
+        When the running code is provably not the recorded code, a ``difference`` cannot be
+        told from drift, so it is reported as ``code_drift`` -- a distinct status, never merged
+        into ``difference`` (a real parity break on identical code).
+        """
+        self.code_provenance = comparison.to_mapping()
+        if not comparison.drift:
+            return
+        drift = ReplayStatus.COVERAGE_CODE_DRIFT
+        note = "code drift: " + "; ".join(comparison.reasons)
+        self.results = [
+            replace(r, status=drift, detail=(f"{r.detail} [{note}]" if r.detail else note))
+            if r.status == ReplayStatus.COVERAGE_DIFFERENCE else r
+            for r in self.results
+        ]
+        for per_stage in self.stage_results.values():
+            for key, status in per_stage.items():
+                if status == ReplayStatus.COVERAGE_DIFFERENCE:
+                    per_stage[key] = drift
 
     def by_status(self, status: str) -> List[AnalysisResult]:
         return [r for r in self.results if r.status == status]
@@ -438,6 +464,14 @@ class ReplayReport:
             f"Generated: {self.generated_at.isoformat()}",
             "",
         ]
+        if self.code_provenance is not None:
+            lines += [f"**Code:** {self.code_provenance['line']}", ""]
+            if self.code_provenance["drift"]:
+                lines += ["**CODE DRIFT:** " + "; ".join(self.code_provenance["reasons"])
+                          + ". Results that differ are labelled `code_drift`, not "
+                          "`difference`: they cannot be told from a parity break "
+                          "until replayed on the recorded code "
+                          "(`ba2-test replay checkout`).", ""]
         lines += self.header_lines()
         lines += ["", "## Totals", "", "| Status | Analyses |", "|---|---:|"]
         for status in STATUS_ORDER:
@@ -458,7 +492,8 @@ class ReplayReport:
                 f"{result.use_case} | {result.recorded_outcome} | {result.status} | "
                 f"{_cell(result.detail)} |")
 
-        differences = self.by_status(ReplayStatus.COVERAGE_DIFFERENCE)
+        differences = (self.by_status(ReplayStatus.COVERAGE_DIFFERENCE)
+                       + self.by_status(ReplayStatus.COVERAGE_CODE_DRIFT))
         if differences:
             lines += ["", "## Field differences", ""]
             for result in differences:
@@ -499,6 +534,8 @@ class ReplayReport:
             ],
             "results": [r.to_mapping() for r in self.results],
         }
+        if self.code_provenance is not None:
+            payload["code"] = self.code_provenance
         overlap = sorted(set(self.extra) & set(payload))
         if overlap:
             raise ValueError(

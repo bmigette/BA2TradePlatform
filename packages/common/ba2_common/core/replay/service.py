@@ -42,6 +42,7 @@ from ba2_common.core.replay.context import (
 from ba2_common.core.replay.schemas import (
     READABLE_SCHEMA_VERSIONS,
     SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
     AnalysisRecord,
     CoverageEntry,
     ProviderObservation,
@@ -172,12 +173,22 @@ class ReplayStore:
         *,
         writer: str = "sync",
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
+        read_only: bool = False,
     ):
         if writer not in ("sync", "thread"):
             raise ValueError(f"writer must be 'sync' or 'thread', got {writer!r}")
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.index = ReplayIndex(self.root / "index.sqlite")
+        if read_only:
+            # Safe next to a live writer: nothing is created, no pragma is written, the
+            # index is opened mode=ro. A missing store is an error, not an empty store.
+            if writer != "sync":
+                raise ValueError("a read-only store has no writer thread")
+            if not (self.root / "index.sqlite").is_file():
+                raise ReplayStoreError(f"{self.root} is not a replay store: no index.sqlite")
+            self.index = ReplayIndex(self.root / "index.sqlite", read_only=True)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.index = ReplayIndex(self.root / "index.sqlite")
         self.objects = ObjectStore(self.root, index=self.index)
         self.health = CaptureHealth()
         self.writer = writer
@@ -470,6 +481,16 @@ class ReplayStore:
         refs.append(ObjectRef(hash=object_hash, kind=encoded.kind, size=len(encoded.data)))
         return object_hash
 
+    def publish_session_object(self, value: Any) -> str:
+        """Publish a session-level object (a code patch, a file) and register it in the index.
+
+        Registered so the orphan sweep never reports it and ``export_session`` can ship it.
+        """
+        refs: List[ObjectRef] = []
+        object_hash = self._publish(value, refs)
+        self.index.register_objects(refs)
+        return object_hash
+
     # -- reading
 
     def decode_object(self, object_hash: str) -> Any:
@@ -491,7 +512,7 @@ class ReplayStore:
         observations = self.index.session_observations(session_id)
         coverage = self.index.coverage(session_id)
 
-        roots: List[str] = []
+        roots: List[str] = list(session.object_hashes())
         for analysis in analyses:
             roots.extend(analysis.object_hashes())
         for observation in observations:
