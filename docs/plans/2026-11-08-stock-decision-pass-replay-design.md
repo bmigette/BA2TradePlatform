@@ -29,13 +29,13 @@ absolute figures scale with the real rows), fake account; median of 3 alternatin
 
 | Part | Steps | Before the size cut | After the size cut | Per unit (after) |
 |---|---|---|---|---|
-| `pass_state` | 1 | 173,998 | 198,298 (a ~25 KB index plus the shared row objects) | ~1.0 KB per row object (~200 rows) |
+| `pass_state` | 1 | 173,998 | 198,495 (a ~25 KB index plus the shared row objects) | ~1.0 KB per row object (~200 rows) |
 | `rules` | 20 | 131,811 | 77,289 | ~3.9 KB per recommendation (the evaluation details) |
 | `size` | 1 | 71,009 | 21,652 | ~1.1 KB per candidate |
 | `execute` | 12 | 193,921 | 78,929 | ~6.6 KB per funded entry |
 | decision summary (`decision_object`) | 1 | 12,748 | 12,748 | |
-| broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | 7,097 (identical payloads are one object) | |
-| **Total per pass (first pass, nothing on disk yet)** | | **623,991** | **396,013 (-37%)** | |
+| broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | 7,265 (identical payloads are one object) | |
+| **Total per pass (first pass, nothing on disk yet)** | | **623,991** | **396,389 (-36%)** | |
 
 (Before = the Task 1 measurement redone on this fixture with distinct per-recommendation `data`, which is what
 real analyses carry; with identical payloads it was the 612,451 first quoted. Pass-thread cost is unchanged: 54 ms of
