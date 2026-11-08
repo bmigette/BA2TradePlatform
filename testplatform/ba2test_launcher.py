@@ -749,7 +749,7 @@ def _cmd_replay(args) -> int:
     """
     if args.replay_cmd == "warm":
         return _cmd_replay_warm(args)
-    if args.replay_cmd in ("checkout", "export"):
+    if args.replay_cmd in ("checkout", "export", "prune"):
         return _cmd_replay_code_tools(args)
 
     from app.services.replay import decision_pass, expert_replay, gather_tape, inventory, option_selection
@@ -813,6 +813,19 @@ def _cmd_replay_code_tools(args) -> int:
     from app.services.replay import provenance
 
     try:
+        if args.replay_cmd == "prune":
+            from ba2_common.core.replay import retention
+
+            store = _caller_path(args.store)
+            if args.dry_run:
+                plan = retention.preview_prune(store, args.keep_days)
+            else:
+                plan = retention.execute_prune(store, args.keep_days)
+            print(retention.format_plan(plan))
+            if args.dry_run:
+                print("-- dry run: nothing was deleted")
+            # A preview that would refuse is a failure: the operator must see it before running for real.
+            return 1 if plan["problems"] else 0
         if args.replay_cmd == "checkout":
             bundle = _caller_path(args.bundle)
             into = _caller_path(args.into)
@@ -11626,6 +11639,14 @@ def main(argv: "list | None" = None) -> int:
     rpx.add_argument("--store", required=True, help="Replay store directory (has index.sqlite).")
     rpx.add_argument("--session", required=True, help="Session id to export.")
     rpx.add_argument("--out", required=True, help="Bundle directory to write.")
+    rpp = rplsub.add_parser(
+        "prune",
+        help="Delete the sessions of a replay store older than --keep-days, then the object files no "
+             "remaining session reaches. Operator-run, never automatic; safe while the live app writes "
+             "(open sessions and young objects are never touched).")
+    rpp.add_argument("--store", required=True, help="Replay store directory (has index.sqlite).")
+    rpp.add_argument("--keep-days", required=True, type=int, help="Keep sessions that ended within this many days.")
+    rpp.add_argument("--dry-run", action="store_true", help="Print what would be deleted; delete nothing.")
     rpe = rplsub.add_parser("experts",
                             help="Re-run _process on each recorded bundle and diff the result.")
     rpe.add_argument("--bundle", required=True, help="Exported session directory.")

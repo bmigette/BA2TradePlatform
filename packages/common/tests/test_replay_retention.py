@@ -1,0 +1,206 @@
+"""Replay store retention: one shared prune, safe beside a live writer, nothing automatic."""
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from ba2_common.core.replay import retention
+from ba2_common.core.replay.context import capture_scope
+from ba2_common.core.replay.schemas import ReplayStatus, SessionRecord
+from ba2_common.core.replay.service import ReplayStore, load_bundle
+
+NOW = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+DAY = timedelta(days=1)
+
+
+def _session(session_id, started):
+    return SessionRecord(
+        session_id=session_id, instance_id="inst", started_at=started, exchange_tz="America/New_York",
+        app_version="x", package_versions={}, source_revision="abc", dirty=False)
+
+
+def _frame():
+    idx = pd.DatetimeIndex(["2026-09-08", "2026-09-09"], tz="America/New_York", name="ts")
+    return pd.DataFrame({"close": [1.5, 2.5]}, index=idx)
+
+
+def _record(store, session_id, analysis_id, started, marker):
+    """One analysis with a UNIQUE observation payload and a SHARED frame (same bytes in every session)."""
+    meta = {"analysis_id": analysis_id, "attempt_id": "att", "session_id": session_id,
+            "expert_class": "FMPRating", "expert_instance_id": 1, "symbol": "AAPL",
+            "use_case": ReplayStatus.USE_CASE_ENTER_MARKET, "scheduled_at": started, "started_at": started}
+    with capture_scope(store, meta) as ctx:
+        ctx.set_bundle({"symbol": "AAPL", "ohlcv": _frame(), "current_price": 1.0})
+        ctx.record_observation(provider="fmp", method="m", request_identity={"s": marker},
+                               payload=[{"unique": marker}], provenance=ReplayStatus.PROVENANCE_NETWORK)
+
+
+def _age_all_objects(store, when):
+    stamp = when.timestamp()
+    for path in (store.root / "objects").rglob("*"):
+        if path.is_file():
+            os.utime(path, (stamp, stamp))
+
+
+def _finish(store, session_id, ended):
+    store.index.update_session_status(session_id, ReplayStatus.SESSION_FINALIZED, ended_at=ended)
+
+
+@pytest.fixture
+def world(tmp_path):
+    """old (finalized 40d ago), recent (finalized 2d ago), live (open). The old session's objects are aged."""
+    store = ReplayStore(tmp_path / "store", writer="sync")
+    for sid, started in (("old", NOW - 40 * DAY), ("recent", NOW - 2 * DAY), ("live", NOW - timedelta(hours=1))):
+        store.begin_session(_session(sid, started))
+    _record(store, "old", "a-old", NOW - 40 * DAY, "old")
+    _finish(store, "old", NOW - 40 * DAY)
+    _age_all_objects(store, NOW - 40 * DAY)
+    _record(store, "recent", "a-recent", NOW - 2 * DAY, "recent")      # re-uses the shared frame: mtime refreshed
+    _finish(store, "recent", NOW - 2 * DAY)
+    _record(store, "live", "a-live", NOW - timedelta(hours=1), "live")
+    yield store
+    store.close(timeout=2.0)
+
+
+def _hashes(store):
+    return {p.stem for p in (store.root / "objects").rglob("*.*") if p.suffix in (".json", ".arrow")}
+
+
+def _later():
+    return datetime.now(timezone.utc)
+
+
+def test_preview_deletes_nothing_and_reports_what_execute_will_delete(world):
+    before = _hashes(world)
+    plan = retention.preview_prune(world.root, 30, now=_later())
+
+    assert [s["session_id"] for s in plan["sessions_delete"]] == ["old"]
+    assert plan["sessions_kept"] == 1 and plan["sessions_open_protected"] == ["live"]
+    assert plan["objects_delete"] > 0 and plan["bytes_delete"] > 0 and plan["problems"] == []
+    assert _hashes(world) == before
+    assert world.index.get_session("old")                      # still there
+
+
+def test_execute_deletes_old_session_and_its_unique_objects_and_keeps_everything_else(world):
+    now = _later()
+    plan = retention.preview_prune(world.root, 30, now=now)
+    old_unique = world.index.root_hashes("old") - world.index.root_hashes("recent") - world.index.root_hashes("live")
+    assert old_unique
+
+    result = retention.execute_prune(world.root, 30, now=now)
+
+    assert result["executed"] is True
+    assert result["objects_delete"] == plan["objects_delete"] and result["bytes_delete"] == plan["bytes_delete"]
+    assert not (old_unique & _hashes(world))                   # its unique payload is gone
+    assert sorted(s.session_id for s in world.index.list_sessions()) == ["live", "recent"]
+    # the kept sessions still export and load, hash-verified, with their shared frame intact
+    for sid in ("recent", "live"):
+        bundle = load_bundle(world.export_session(sid, world.root.parent / f"out-{sid}"))
+        assert len(bundle.analyses) == 1
+        assert bundle.decode(bundle.analyses[0].bundle_object)["ohlcv"] is not None
+    assert not any(world.index.has_object(h) for h in old_unique)
+    assert all(world.index.has_object(h) for h in world.index.root_hashes("recent"))
+
+
+def test_the_shared_object_survives_because_a_kept_session_reaches_it(world):
+    shared = world.index.root_hashes("old") & world.index.root_hashes("recent")
+    # the bundle object links to the shared frame: reachability follows the link, so look one level down
+    frames = {p.stem for p in (world.root / "objects").rglob("*.arrow")}
+    assert frames, "the fixture must publish a frame shared by an old and a kept session"
+    stamp = (NOW - 90 * DAY).timestamp()
+    for path in (world.root / "objects").rglob("*.arrow"):
+        os.utime(path, (stamp, stamp))             # old by AGE: only reachability (the $frame link) can save it
+    retention.execute_prune(world.root, 30, now=_later())
+    assert frames <= _hashes(world)
+    assert shared <= _hashes(world)
+
+
+def test_an_open_session_is_never_deleted_however_old(world):
+    result = retention.execute_prune(world.root, 1, now=_later() + 400 * DAY)
+    assert "live" in result["sessions_open_protected"]
+    assert any(s.session_id == "live" for s in world.index.list_sessions())
+    assert world.index.root_hashes("live") <= _hashes(world)
+
+
+def test_an_unreferenced_object_is_deleted_only_when_older_than_the_age_bound(world):
+    old_orphan = world.root / "objects" / "ab" / ("a" * 64 + ".json")
+    young_orphan = world.root / "objects" / "cd" / ("c" * 64 + ".json")
+    for path in (old_orphan, young_orphan):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"{}")
+    aged = (NOW - 90 * DAY).timestamp()
+    os.utime(old_orphan, (aged, aged))
+
+    result = retention.execute_prune(world.root, 30, now=_later())
+
+    assert not old_orphan.exists()                             # crash residue, long unreferenced
+    assert young_orphan.exists()                               # could be a live writer's, not yet committed
+    assert result["objects_kept_young"] >= 1
+
+
+def test_republishing_an_existing_object_refreshes_its_age(world):
+    path = next(p for p in (world.root / "objects").rglob("*.json"))
+    aged = (NOW - 90 * DAY).timestamp()
+    os.utime(path, (aged, aged))
+    world.objects.put("json", path.read_bytes())
+    assert path.stat().st_mtime > aged + DAY.total_seconds()
+
+
+def test_a_kept_session_with_a_missing_object_refuses_before_deleting_anything(world):
+    victim = next(iter(world.index.root_hashes("recent") - world.index.root_hashes("old")))
+    next(p for p in (world.root / "objects").rglob("*") if p.stem == victim).unlink()
+    before_sessions = [s.session_id for s in world.index.list_sessions()]
+
+    with pytest.raises(retention.RetentionRefused, match=victim):
+        retention.execute_prune(world.root, 30, now=_later())
+
+    assert [s.session_id for s in world.index.list_sessions()] == before_sessions
+    assert retention.preview_prune(world.root, 30)["problems"]            # the preview says so too
+
+
+@pytest.mark.parametrize("bad", [0, -3, 1.5, "30", None, True])
+def test_keep_days_must_be_a_whole_positive_number(world, bad):
+    with pytest.raises(retention.RetentionRefused, match="keep_days"):
+        retention.preview_prune(world.root, bad)
+    with pytest.raises(retention.RetentionRefused, match="keep_days"):
+        retention.execute_prune(world.root, bad)
+
+
+def test_a_directory_that_is_not_a_store_is_refused(tmp_path):
+    with pytest.raises(retention.RetentionRefused, match="not a replay store"):
+        retention.statistics(tmp_path)
+    with pytest.raises(retention.RetentionRefused, match="not a replay store"):
+        retention.execute_prune(tmp_path, 30)
+
+
+def test_a_second_prune_is_refused_while_the_lock_is_held(world):
+    (world.root / retention.LOCK_NAME).write_text("pid=1")
+    with pytest.raises(retention.RetentionRefused, match="another prune"):
+        retention.execute_prune(world.root, 30)
+    assert any(s.session_id == "old" for s in world.index.list_sessions())
+
+
+def test_a_file_that_cannot_be_deleted_is_raised_not_skipped(world, monkeypatch):
+    real_unlink = Path.unlink
+
+    def failing(self, *a, **k):
+        if self.suffix in (".json", ".arrow"):
+            raise PermissionError("locked")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", failing)
+    with pytest.raises(retention.RetentionError, match="could not be deleted"):
+        retention.execute_prune(world.root, 30, now=_later())
+    monkeypatch.undo()
+    assert not (world.root / retention.LOCK_NAME).exists()                # the lock is released regardless
+
+
+def test_statistics_report_sessions_objects_bytes_and_dates(world):
+    stats = retention.statistics(world.root)
+    assert stats["sessions"] == 3 and stats["sessions_by_status"] == {"finalized": 2, "open": 1}
+    assert stats["objects"] == len(_hashes(world)) and stats["object_bytes"] > 0
+    assert stats["total_bytes"] == stats["object_bytes"] + stats["index_bytes"]
+    assert stats["oldest_session"].startswith("2026-09-29") and stats["newest_session"].startswith("2026-11-08")
+    assert sum(stats["bytes_by_day"].values()) <= stats["object_bytes"]

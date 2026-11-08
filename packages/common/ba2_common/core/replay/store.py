@@ -104,6 +104,7 @@ class ObjectStore:
         object_hash = content_hash(kind, data)
         path = self.path_for(object_hash, kind)
         if path.exists():
+            self._touch(path)
             return object_hash
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f"{object_hash}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -127,6 +128,19 @@ class ObjectStore:
             if tmp.exists():
                 tmp.unlink()
         return object_hash
+
+    @staticmethod
+    def _touch(path: Path) -> None:
+        """Refresh the mtime of an object that was published again (content-addressed dedupe).
+
+        Retention (:mod:`ba2_common.core.replay.retention`) never deletes an object younger than its age
+        bound; without this an old object that a NEW analysis re-uses would still look old to it.
+        """
+        try:
+            os.utime(path, None)
+        except OSError as exc:
+            logger.error(f"replay store: could not refresh the age of {path.name} ({exc}); a retention "
+                         f"prune could treat this re-used object as old")
 
     def exists(self, object_hash: str) -> bool:
         return any(self.path_for(object_hash, kind).exists() for kind in _EXTENSIONS)
@@ -369,6 +383,47 @@ class ReplayIndex:
                 "UPDATE sessions SET status = ?, ended_at = ?, payload = ? WHERE session_id = ?",
                 (status, payload["ended_at"], _dumps(payload), session_id),
             )
+
+    def delete_sessions(self, session_ids: Sequence[str]) -> int:
+        """Delete sessions and everything the index holds for them, in ONE transaction.
+
+        Refuses (nothing is deleted) when any session is unknown or still ``open``: an open session is
+        being written by a live process. Returns the number of sessions deleted.
+        """
+        conn = self._connection()
+        with _transaction(conn):
+            for session_id in session_ids:
+                row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                if row is None:
+                    raise ReplayStoreError(f"session {session_id} is not in the index")
+                if row["status"] == ReplayStatus.SESSION_OPEN:
+                    raise ReplayStoreError(f"session {session_id} is open (a live process is writing it); refusing to delete it")
+            for session_id in session_ids:
+                conn.execute("DELETE FROM observation_links WHERE observation_id IN "
+                             "(SELECT observation_id FROM observations WHERE session_id = ?)", (session_id,))
+                conn.execute("DELETE FROM observations WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM analyses WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM coverage WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        return len(session_ids)
+
+    def delete_object_rows(self, hashes: Sequence[str]) -> None:
+        """Drop the registry rows of objects whose files were deleted."""
+        conn = self._connection()
+        with _transaction(conn):
+            conn.executemany("DELETE FROM objects WHERE hash = ?", [(h,) for h in hashes])
+
+    def root_hashes(self, session_id: str) -> Set[str]:
+        """Every object hash a session's own records reference directly (session, analyses, observations)."""
+        conn = self._connection()
+        found: Set[str] = set(self.get_session(session_id).object_hashes())
+        for analysis in self.analyses(session_id):
+            found.update(analysis.object_hashes())
+        for row in conn.execute("SELECT payload FROM observations WHERE session_id = ?", (session_id,)):
+            payload_object = json.loads(row["payload"])["payload_object"]
+            if payload_object is not None:
+                found.add(payload_object)
+        return found
 
     def mark_interrupted(self) -> List[str]:
         """Mark every still-open session interrupted; returns the ids marked.
