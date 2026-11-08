@@ -50,6 +50,7 @@ __all__ = [
     "encodable",
     "encodable_effect",
     "is_secret",
+    "note_account_effect",
     "note_effect",
     "note_record",
     "replay_effects",
@@ -95,10 +96,14 @@ NOOP_CONTEXT = _NoopContext()
 class Frame:
     """What one recorded span collects: its subject, the effects it submitted, its named records."""
 
-    __slots__ = ("action", "submits", "records")
+    __slots__ = ("action", "submits", "records", "accepts_account_effects")
 
-    def __init__(self, action):
+    def __init__(self, action, accepts_account_effects: bool = False):
         self.action = action
+        #: Whether the account EFFECT taps (``account_taps``) may record into this frame. The option
+        #: family says no: its submits are noted at the call sites, and a tapped ``submit_order``
+        #: reached from inside ``submit_option_order`` must not add a second, different entry.
+        self.accepts_account_effects = accepts_account_effects
         self.submits: List[Dict[str, Any]] = []
         self.records: Dict[str, Any] = {}
 
@@ -128,6 +133,19 @@ def note_effect(method: str, summarise_leg: Optional[Callable[[Any], Dict[str, A
             context.note_failure("option submit not noted", exc)
 
 
+def note_account_effect(method: str, **call) -> bool:
+    """Called by the account EFFECT taps. Records into the current frame only if it accepts them.
+
+    Returns whether an entry was recorded (False: no frame, or a frame of a family that notes its
+    own submits). Never raises.
+    """
+    frame = getattr(_tls, "frame", None)
+    if frame is None or not frame.accepts_account_effects:
+        return False
+    note_effect(method, **call)
+    return True
+
+
 def note_record(name: str, value: Any) -> None:
     """Called where shared code stamps a named record (``entry_record`` / ``exit_record``)."""
     frame = getattr(_tls, "frame", None)
@@ -137,7 +155,7 @@ def note_record(name: str, value: Any) -> None:
 
 
 @contextmanager
-def replay_effects(action):
+def replay_effects(action, accepts_account_effects: bool = False):
     """Offline replay: collect what one re-run submits and stamps.
 
     The live recorder is a no-op while replaying (it must never write into the tape it reads), but
@@ -145,7 +163,7 @@ def replay_effects(action):
     shape, so it installs the recorder's own frame without recording anything. Restores the
     previous frame on exit, exceptions included.
     """
-    frame = Frame(action)
+    frame = Frame(action, accepts_account_effects)
     previous = getattr(_tls, "frame", None)
     _tls.frame = frame
     try:
@@ -339,6 +357,8 @@ class FrameRecorder:
     provider: str = ""
     version: int = 0
     family: str = "action"
+    #: True for a family whose frame collects the five account effect calls (``account_taps``).
+    accepts_account_effects: bool = False
 
     def __init__(self, action, context):
         self.action = action
@@ -382,7 +402,7 @@ class FrameRecorder:
             self.context.note_failure(f"{self.family} inputs not recorded", exc)
             return NOOP
         self._previous = current
-        self._frame = Frame(self.action)
+        self._frame = Frame(self.action, self.accepts_account_effects)
         _tls.frame = self._frame
         self._active = True
         return self

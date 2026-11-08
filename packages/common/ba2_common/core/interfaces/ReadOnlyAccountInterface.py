@@ -18,6 +18,7 @@ from ba2_common.core.models import AccountSetting
 from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
     ExtendableSettingsInterface, coerce_bool)
+from ba2_common.core.replay.account_taps import tap_account_methods
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
 
@@ -218,6 +219,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     For trading-capable accounts, subclass AccountInterface instead (which inherits this).
     """
     SETTING_MODEL = AccountSetting
+
+    def __init_subclass__(cls, **kwargs):
+        # Replay capture: every concrete account OVERRIDES the sizing reads and the effect calls, so
+        # the taps are applied per subclass (see ba2_common.core.replay.account_taps for the rules).
+        super().__init_subclass__(**kwargs)
+        tap_account_methods(cls)
 
     #: True when ``get_account_snapshot()`` is built from the very broker read ``get_account_info()``
     #: makes (the base derives one from the other; AlpacaAccount's snapshot calls ``get_account_info``;
@@ -3063,3 +3070,8 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - equity_value (float): Equity/positions portion
         """
         pass
+
+
+# The concrete sizing helpers defined ON this interface are tapped here; __init_subclass__ only
+# runs for subclasses (AccountInterface and every broker).
+tap_account_methods(ReadOnlyAccountInterface)
