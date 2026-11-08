@@ -37,6 +37,27 @@ absolute figures scale with the real rows), fake account; median of 3 alternatin
 | broker-read observations now taken inside the pass (quote taps) | (not steps) | 40,504 | 7,265 (identical payloads are one object) | |
 | **Total per pass (first pass, nothing on disk yet)** | | **623,991** | **396,389 (-36%)** | |
 
+**Re-measured 2026-11-08 (branch sdr/fix2, same dry run, same fixture, one cold pass).** The recorder grew since the table above
+(gates, per-symbol digests, the pass summary); the figures to plan with are these. The second column is the same pass with two
+PROVIDER-reading conditions added to the entry rule (`percent_below_recent_high` on a distinct 36-bar OHLCV frame per symbol, and
+`days_to_earnings`; test `test_measure_pass_whose_rules_read_ohlcv_and_earnings`). Rules that read providers now replay from the
+tape (section 9), so those reads ARE recorded by the provider taps inside the pass.
+
+| Part | Rules read no provider | Rules read OHLCV + earnings |
+|---|---|---|
+| `pass_state` | 198,495 | 198,651 |
+| `rules` (20 steps) | 77,296 | 87,394 |
+| `size` | 21,653 | 16,437 |
+| `execute` (12 / 9 funded: the new conditions filter 3 candidates out) | 78,932 | 59,197 |
+| provider / broker-read observations taken inside the pass | 7,265 | 42,013 (+34.7 KB: 20 OHLCV frames at ~1.7 KB, the earnings calendar reads) |
+| decision summary (`decision_object`) | 94,731 | 92,862 |
+| **Total per cold pass** | **478,372** | **496,554** |
+
+Pass-thread recorder time 60 ms in both. Two corrections to the text above: the decision summary is now ~93 KB, not 12.7 KB (it
+carries the per-symbol gate / funded / digest entries; it was NOT re-investigated here, it is the part of a pass that grew most), and
+a provider-reading ruleset adds only ~35 KB per 20 symbols on top of that. Growth, cold passes: 8080 ~100/day = 48-50 MB/day, 8082
+~60 = 29-30, 8081 ~30 = 14-15 (repeat-pass dedupe cuts the pass_state and rules parts as measured below).
+
 (Before = the Task 1 measurement redone on this fixture with distinct per-recommendation `data`, which is what
 real analyses carry; with identical payloads it was the 612,451 first quoted. Pass-thread cost is unchanged: 54 ms of
 recording, wall 1.41 s without capture vs 1.59 s with the dry run.)
@@ -494,9 +515,11 @@ Where the build departs from, or pins down, the text above:
 * Comparison scope (named, not hidden): effects are compared with ids / timestamps / broker ids removed and transaction ids as ordinals; the order
   view keeps only the main orders (protective legs are built by the broker ADAPTER) and the transaction view drops only the fields the adapter writes from
   broker state (`meta_data`, `status`, `quantity`, `open_price`, `close_price`, `created_at`); `take_profit` / `stop_loss` ARE compared (section 10); the TP/SL stage compares the prices handed to the account.
-* Not replayed yet: rules that read market-data providers (OHLCV / indicator / fundamentals conditions) report `missing_capture` because the
-  isolation's provider resolver refuses and no tape-backed provider is wired for them (the RM's ATR read IS served from the tape when live recorded
-  one); option entries/exits; Smart RM passes; the unsent-entry compensation path.
+* Rules that read market-data providers (OHLCV / fundamentals conditions such as `percent_below_recent_high`, `days_to_earnings`) DO replay since
+  c2a16b1b: the decision replay installs a tape-backed `TradeConditions` provider resolver, the live provider taps record those reads inside the
+  pass scope (OHLCV and past-earnings also record FAILED reads), and a read the recording does not hold is `missing_capture` naming the provider
+  and method (`tests/test_decision_pass_replay_providers.py`). The RM's ATR read is served from the tape the same way. Still not replayed:
+  option entries/exits; Smart RM passes; the unsent-entry compensation path.
 * The tests are in the ROOT suite (`tests/test_decision_pass_replay.py`, trade venv): driving the real TradeManager needs the root harness and
   `langchain`, which the testplatform test venv does not have (`ModelFactory` import). They replay through `ba2test_launcher._cmd_replay`.
 

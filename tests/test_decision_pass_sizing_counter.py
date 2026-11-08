@@ -31,7 +31,7 @@ from tests.test_funded_entry_loop import FROZEN_NOW, _EnterExpert, _run_enter
 NOW = datetime(2026, 11, 8, 15, 0, tzinfo=timezone.utc)
 
 
-def realistic_enter_world(n_recs=20, n_open=30, confident=None):
+def realistic_enter_world(n_recs=20, n_open=30, confident=None, extra_triggers=None):
     """An expert with ``n_recs`` BUY recommendations and ``n_open`` OPENED positions (each with its entry
     order and TP/SL legs), a four-condition entry ruleset (bullish, confidence, expected profit, has no
     position) buying with a stop-loss and a take-profit. Recommendations carry a ~1.5 KB ``data`` payload
@@ -44,7 +44,7 @@ def realistic_enter_world(n_recs=20, n_open=30, confident=None):
                   "trigger_1": {"event_type": "confidence", "operator": ">=", "value": 60.0},
                   "trigger_2": {"event_type": "expected_profit_target_percent", "operator": ">=",
                                 "value": 5.0},
-                  "trigger_3": {"event_type": "has_no_position"}},
+                  "trigger_3": {"event_type": "has_no_position"}, **(extra_triggers or {})},
         actions={"action_0": {"action_type": ExpertActionType.BUY.value},
                  "action_1": {"action_type": ExpertActionType.ADJUST_STOP_LOSS.value,
                               "value": -5.0, "reference_value": "current_price"},
@@ -216,6 +216,48 @@ def test_measure_realistic_pass(test_engine, monkeypatch):
         with open(out, "w", encoding="utf-8") as handle:
             json.dump(result, handle, indent=2, default=str)
     assert last["total_bytes"] > 0
+
+
+def test_measure_pass_whose_rules_read_ohlcv_and_earnings(test_engine, monkeypatch):
+    """The same pass with two PROVIDER-reading conditions (OHLCV ``percent_below_recent_high``, fundamentals
+    ``days_to_earnings``): their reads are recorded by the provider taps inside the pass (design section 0).
+    Every symbol gets its OWN 36-bar frame (what the condition's 50-calendar-day lookback returns), so nothing
+    dedupes across symbols."""
+    import numpy as np
+    import pandas as pd
+
+    from tests.test_decision_pass_replay_providers import FakeDetails
+    from ba2_trade_platform.modules import dataproviders
+
+    from ba2_common.core.interfaces.MarketDataProviderInterface import ohlcv_identity
+    from ba2_common.core.replay.observe import observe_provider
+
+    class Tapped:
+        @observe_provider("market_data", "get_ohlcv_data", identity=ohlcv_identity)
+        def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d",
+                           use_cache=True, max_cache_age_hours=24, lookback_days=30):
+            rng = np.random.default_rng(sum(map(ord, symbol)))
+            close = 100 + np.cumsum(rng.normal(0, 1, 36))
+            days = pd.date_range(end=datetime(2026, 11, 6), periods=36, freq="B")
+            return pd.DataFrame({"Date": days, "Open": close - 0.3, "High": close + 1.1, "Low": close - 1.2,
+                                 "Close": close, "Volume": rng.integers(500_000, 5_000_000, 36)})
+
+    monkeypatch.setattr(dataproviders, "get_provider", lambda category, name, **kw: (
+        Tapped() if category == "ohlcv" else FakeDetails()))
+    FakeDetails.raises = False
+    monkeypatch.setenv(ds.DRYRUN_ENV, "1")
+    _reset(test_engine)
+    inst, expert, account = realistic_enter_world(extra_triggers={
+        "trigger_4": {"event_type": "percent_below_recent_high", "operator": ">=", "value": 0.0},
+        "trigger_5": {"event_type": "days_to_earnings", "operator": "<=", "value": 30}})
+    ds.COUNTERS.reset()
+    created = _run_enter(expert, account, inst.id)
+    (measurement,) = ds.COUNTERS.snapshot()
+    out = os.environ.get("BA2_DECISION_MEASURE_OUT")
+    if out:
+        with open(out + ".providers.json", "w", encoding="utf-8") as handle:
+            json.dump({"funded": len(created), "measurement": measurement}, handle, indent=2, default=str)
+    assert measurement["total_bytes"] > 0 and created
 
 
 def test_unchanged_rows_dedupe_across_two_consecutive_passes(test_engine, monkeypatch):
