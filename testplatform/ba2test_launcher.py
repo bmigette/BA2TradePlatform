@@ -331,7 +331,7 @@ def _cmd_prewarm(args) -> int:
         fetchers = PrewarmFetchers(fmp_key=keys["fmp"], end_date=end_date,
                                    finnhub_key=keys["finnhub"],
                                    estimates_source=_resolve_estimates_source(args, "prewarm"),
-                                   log=lambda msg: print(msg, flush=True))
+                                   log=lambda msg: print(msg, flush=True), start_date=start_date)
     except PrewarmConfigError as e:
         print(f"ba2-test prewarm: {e}")
         return 1
