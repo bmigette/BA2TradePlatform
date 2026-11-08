@@ -81,6 +81,11 @@ _SECRET_IN_VALUE = re.compile(
 _REDACTED = r"\1=REDACTED"
 
 
+def redact_text(text: str) -> str:
+    """``text`` with every ``key=value`` credential redacted (the value rule of :func:`sanitize_identity`)."""
+    return _SECRET_IN_VALUE.sub(_REDACTED, text)
+
+
 def _is_secret_key(name: Any) -> bool:
     text = str(name).lower()
     return any(token in text for token in SECRET_KEY_TOKENS)

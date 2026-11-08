@@ -53,7 +53,8 @@ from typing import Any, Callable, Dict, Mapping, Tuple
 
 from ba2_common.core.replay.action_record import dump_row, note_account_effect
 from ba2_common.core.replay.context import current_capture
-from ba2_common.core.replay.observe import observe_provider, tapped_boundary
+from ba2_common.core.replay.observe import observe_provider, redact_text, tapped_boundary
+from ba2_common.logger import logger
 from ba2_common.core.replay.option_taps import _account_identity, _with, account_only_identity
 
 __all__ = [
@@ -150,8 +151,12 @@ def effect_tap(method: str) -> Callable:
             try:
                 try:
                     result = fn(*args, **kwargs)
-                except Exception as raised:
-                    _note(context, method, call, error=repr(raised))
+                except BaseException as raised:
+                    # BaseException too (CancelledError, KeyboardInterrupt): the call may already have
+                    # reached the broker, so the attempt is recorded, then the exit is re-raised
+                    # unchanged. The text goes through the credential redaction (a broker error can
+                    # echo a URL with a key).
+                    _note(context, method, call, error=redact_text(repr(raised)))
                     raise
             finally:
                 _effect_state.active = False
@@ -203,13 +208,23 @@ def _still_abstract(cls) -> bool:
     return any(getattr(getattr(cls, name, None), "__isabstractmethod__", False) for name in names)
 
 
+#: (class, name) -> reason, for tapped names a class defines as something other than a plain method.
+#: Filled by ``_resolve`` (class creation), read by ``untapped_methods`` (the guard test fails on it).
+_UNTAPPABLE: Dict[Tuple[type, str], str] = {}
+
+
 def _resolve(cls, name):
     resolved = getattr(cls, name, None)
     if resolved is None or getattr(resolved, "__isabstractmethod__", False):
         return None
     if not inspect.isfunction(inspect.getattr_static(cls, name)):
-        # A classmethod/staticmethod/property would be silently left untapped.
-        raise TypeError(f"{cls.__name__}.{name} is not a plain method; it cannot carry the account tap")
+        # A classmethod/staticmethod/property cannot carry the tap. Raising here would break the IMPORT
+        # of the account module (and with it the app), so it is logged at ERROR and registered: the
+        # guard test (``untapped_methods``) fails on it, and the method stays untapped (visible).
+        reason = "is not a plain method; it cannot carry the account tap"
+        _UNTAPPABLE[(cls, name)] = reason
+        logger.error(f"replay account taps: {cls.__name__}.{name} {reason}; it is NOT recorded")
+        return None
     return resolved
 
 
@@ -255,6 +270,10 @@ def untapped_methods(cls) -> list:
         return problems
     abstract_cls = _still_abstract(cls)
     names = list(SIZING_READ_TAPPED_METHODS) + list(EFFECT_METHODS)
+    for klass in cls.__mro__:
+        for name in names:
+            if (klass, name) in _UNTAPPABLE:
+                problems.append(f"{klass.__name__}.{name} ({_UNTAPPABLE[(klass, name)]})")
 
     def carries_tap(fn):
         return tapped_boundary(fn) is not None or effect_boundary(fn) is not None

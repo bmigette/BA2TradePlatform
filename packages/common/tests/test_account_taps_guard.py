@@ -193,3 +193,23 @@ def test_a_read_that_raises_is_recorded_as_an_error_and_reraised():
             Failing().has_pending_closing_order(5)
     (obs,) = [o.observation for o in store.submitted[0][2]]
     assert obs.method == "has_pending_closing_order"
+
+
+# --- M1: a tapped name that is not a plain method must not break the import of the account ----------
+def test_a_staticmethod_named_like_a_tapped_method_is_logged_and_listed_never_raised(monkeypatch):
+    from ba2_common.core.replay import account_taps
+
+    errors = []
+    monkeypatch.setattr(account_taps.logger, "error", lambda msg, *a, **k: errors.append(msg))
+
+    class _Static(StubAccount):                    # class creation must NOT raise
+        @staticmethod
+        def get_balance():
+            return 1.0
+
+    try:
+        assert any("_Static.get_balance" in m for m in errors)
+        problems = untapped_methods(_Static)
+        assert any("_Static.get_balance" in p and "not a plain method" in p for p in problems), problems
+    finally:
+        _Static._replay_taps_exempt = True         # keep the process-wide "all classes tapped" guard clean

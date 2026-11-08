@@ -79,3 +79,43 @@ def test_an_analysis_context_is_unchanged():
     with capture_scope(store, _meta(kind="analysis")):
         _Acct().adjust_tp_sl(_txn(5), new_tp_price=1.0)
         assert current_capture().decision_ledger == {}
+
+
+# --- M2 / M3: what an effect records when it raises -----------------------------------------------
+class _Raising(StubAccount):
+    def __init__(self, exc):
+        super().__init__()
+        self._exc = exc
+
+    def adjust_tp_sl(self, transaction, new_tp_price=None, new_sl_price=None, source=""):
+        raise self._exc
+
+
+def test_a_base_exception_is_recorded_then_reraised():
+    """CancelledError-style exits: the call may have reached the broker, so the attempt is recorded."""
+    class _Cancelled(BaseException):
+        pass
+
+    store = RecordingStore()
+    with capture_scope(store, _meta()):
+        try:
+            _Raising(_Cancelled("cancelled mid-call")).adjust_tp_sl(_txn(5), new_tp_price=1.0)
+        except _Cancelled:
+            pass
+        else:
+            raise AssertionError("must re-raise")
+        (entry,) = pass_summary(current_capture())["effects_outside_steps"]
+    assert "cancelled mid-call" in entry["error"]
+
+
+def test_a_credential_in_the_error_text_is_redacted():
+    store = RecordingStore()
+    boom = RuntimeError("401 for https://x/y?apikey=SUPERSECRET123&symbol=AAPL token=abc999")
+    with capture_scope(store, _meta()):
+        try:
+            _Raising(boom).adjust_tp_sl(_txn(5), new_tp_price=1.0)
+        except RuntimeError:
+            pass
+        (entry,) = pass_summary(current_capture())["effects_outside_steps"]
+    assert "SUPERSECRET123" not in entry["error"] and "abc999" not in entry["error"]
+    assert "REDACTED" in entry["error"] and "symbol=AAPL" in entry["error"]
