@@ -529,10 +529,22 @@ class ReplayIndex:
                     )
             _write_coverage(conn, coverage)
 
-    def record_coverage(self, entries: Sequence[CoverageEntry]) -> None:
+    def record_coverage(self, entries: Sequence[CoverageEntry], *,
+                        busy_timeout_ms: Optional[int] = None) -> None:
+        """Write coverage rows. ``busy_timeout_ms`` bounds the wait for the write lock on THIS call
+        (a caller that must not block, e.g. a trading thread recording a drop); ``None`` keeps the
+        index's own timeout."""
         conn = self._connection()
-        with _transaction(conn):
-            _write_coverage(conn, entries)
+        if busy_timeout_ms is None:
+            with _transaction(conn):
+                _write_coverage(conn, entries)
+            return
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        try:
+            with _transaction(conn):
+                _write_coverage(conn, entries)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
 
     # -- reads
 
