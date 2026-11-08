@@ -250,8 +250,14 @@ def test_capture_health_snapshot_is_a_plain_dict():
         "disk_error": 0,
         "unsupported_type": 1,
         "other": 0,
+        "pass_not_recorded": 0,
+        "pass_discarded": 0,
+        "step_not_recorded": 0,
     }
     assert health.total == 3
+    health.record_discard("lock_busy")
+    assert health.total == 3                      # a discard is counted, but it is not a failure
+    assert health.discards() == {"lock_busy": 1}
 
 
 # --------------------------------------------------------------------------- clock

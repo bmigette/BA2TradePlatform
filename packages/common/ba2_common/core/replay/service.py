@@ -70,6 +70,7 @@ _ROLE_FIELDS = {
     "settings": "settings_object",
     "bundle": "bundle_object",
     "recommendation": "recommendation_object",
+    "decision": "decision_object",
 }
 
 MANIFEST_NAME = "manifest.json"
@@ -429,6 +430,10 @@ class ReplayStore:
                 )
                 if role == "bundle":
                     updates["bundle_capture_status"] = ReplayStatus.CAPTURE_UNSUPPORTED
+                if role == "decision":
+                    # Never a ``decision`` outcome without its object: say what is missing.
+                    updates["outcome"] = ReplayStatus.OUTCOME_ERROR
+                    updates["error"] = f"decision summary not recordable: {exc}"
         if "settings_object" in updates:
             updates["settings_hash"] = updates["settings_object"]
 

@@ -17,11 +17,12 @@ RECORDED = datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc)
 SYMBOL = "AAPL"
 
 
-def _replay(*reads):
+def _replay(*reads, host_timezone=None):
+    extra = {} if host_timezone is None else {"branch_flags": {"host_timezone": host_timezone}}
     return CaptureContext.for_replay(
         analysis_id="a1", clock_reads=[r.isoformat() for r in reads],
         clock_read_phases=[ReplayStatus.PHASE_PROCESS] * len(reads),
-        phase=ReplayStatus.PHASE_PROCESS)
+        phase=ReplayStatus.PHASE_PROCESS, **extra)
 
 
 class _Rec:
@@ -103,14 +104,32 @@ def test_days_since_last_close_reads_the_recorded_instant_under_replay(monkeypat
     assert cond.calculated_value == pytest.approx(3.0)
 
 
-def test_evaluation_date_is_the_recorded_day_under_replay():
+def _earnings_condition():
     from ba2_common.core.TradeConditions import DaysToEarningsCondition
-    cond = DaysToEarningsCondition(account=_NoClockAccount(), instrument_name=SYMBOL,
+    return DaysToEarningsCondition(account=_NoClockAccount(), instrument_name=SYMBOL,
                                    expert_recommendation=_Rec(), operator_str="<", value=5.0,
                                    existing_order=None)
+
+
+def test_evaluation_date_is_the_day_in_the_RECORDED_timezone_under_replay(monkeypatch):
+    """23:30 UTC on Nov 3 is already Nov 4 in Tokyo and still Nov 3 in New York: the recording host's
+    zone decides, whatever zone the replaying host is in."""
+    late = datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc)
+    for name, expected in (("Asia/Tokyo", date(2026, 11, 4)), ("America/New_York", date(2026, 11, 3))):
+        with use_capture_context(_replay(late, host_timezone={"name": name, "utc_offset_seconds": 0})):
+            assert _earnings_condition()._evaluation_date() == expected, name
+
+
+def test_evaluation_date_uses_the_fixed_recorded_offset_when_the_zone_has_no_name():
+    late = datetime(2026, 11, 3, 23, 30, tzinfo=timezone.utc)
+    with use_capture_context(_replay(late, host_timezone={"name": None, "utc_offset_seconds": 9 * 3600})):
+        assert _earnings_condition()._evaluation_date() == date(2026, 11, 4)
+
+
+def test_evaluation_date_without_a_recorded_timezone_is_a_loud_miss_not_the_replay_hosts_zone():
     with use_capture_context(_replay(RECORDED)):
-        got = cond._evaluation_date()
-    assert got == RECORDED.astimezone().date()
+        with pytest.raises(ReplayMiss, match="host_timezone"):
+            _earnings_condition()._evaluation_date()
 
 
 def test_evaluation_date_live_is_date_today():

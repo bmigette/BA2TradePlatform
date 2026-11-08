@@ -163,11 +163,17 @@ def _wall_today() -> date:
     No capture context (production, an unrecorded pass): exactly ``date.today()``. Under capture
     the instant is a ``replay_now()`` read (recorded in order; the recorded read in replay) and the
     date is its LOCAL calendar day -- the same day ``date.today()`` names, so recording changes no
-    decision. A replay on a host in another timezone would name that host's local day of the
-    recorded instant.
+    decision. UNDER REPLAY the day is the calendar day of the recorded instant in the RECORDING
+    host's timezone (``branch_flags["host_timezone"]`` of the pass), not the replaying host's: the
+    same recording must name the same day on any machine. A replay record without a timezone is a
+    loud ``ReplayMiss``.
     """
-    if current_capture() is None:
+    context = current_capture()
+    if context is None:
         return date.today()
+    if context.is_replay:
+        from ba2_common.core.replay.clock import wall_today_in_recorded_timezone
+        return wall_today_in_recorded_timezone(replay_now())
     return replay_now().astimezone().date()
 
 

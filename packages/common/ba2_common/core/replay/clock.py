@@ -24,7 +24,7 @@ from typing import Optional
 
 from ba2_common.core.replay.context import ReplayMiss, current_capture
 
-__all__ = ["replay_now", "ReplayMiss"]
+__all__ = ["replay_now", "host_timezone", "wall_today_in_recorded_timezone", "ReplayMiss"]
 
 
 def replay_now(as_of: Optional[datetime] = None) -> datetime:
@@ -44,3 +44,39 @@ def replay_now(as_of: Optional[datetime] = None) -> datetime:
     if context is not None:
         context.record_clock_read(now)
     return now
+
+
+def host_timezone(now: Optional[datetime] = None) -> dict:
+    """The RECORDING host's timezone: ``{"name": <IANA name or None>, "utc_offset_seconds": int}``.
+
+    ``name`` comes from ``tzlocal`` and is ``None`` when the host cannot name its zone (then the
+    offset is the only fact, and a replay uses that fixed offset -- exact for the recorded instant,
+    which is the only instant a decision pass reads "today" at). ``utc_offset_seconds`` is the offset
+    in force at ``now`` (default: the wall clock). Never raises: a host that cannot answer returns
+    ``name=None`` and the offset python derives from the local clock.
+    """
+    now = datetime.now(timezone.utc) if now is None else now
+    offset = int(now.astimezone().utcoffset().total_seconds())
+    try:
+        from tzlocal import get_localzone_name
+
+        name = get_localzone_name()
+    except Exception:  # noqa: BLE001 -- recording the zone must never stop a decision
+        name = None
+    return {"name": name or None, "utc_offset_seconds": offset}
+
+
+def wall_today_in_recorded_timezone(instant: datetime):
+    """The calendar day of ``instant`` in the zone the pass was RECORDED in (replay only).
+
+    Raises :class:`ReplayMiss` when the replay context carries no recorded timezone: naming the
+    replaying host's day instead would be a silent wrong answer that differs by host.
+    """
+    context = current_capture()
+    zone = None if context is None else context.recorded_timezone()
+    if zone is None:
+        raise ReplayMiss(
+            "host_timezone", analysis_id=None if context is None else context.analysis_id,
+            detail="the recording host's timezone is not in the pass metadata "
+                   "(branch_flags['host_timezone']); a replay will not use its own host's zone")
+    return instant.astimezone(zone).date()

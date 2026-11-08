@@ -28,9 +28,14 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 #:   (``settings_record.explain_missing_setting``) instead of failing opaquely.
 #:   (b) ``SessionRecord`` gained ``provenance`` / ``provenance_error`` (the exact uncommitted
 #:   code a dirty session ran). Schema-1 sessions and bundles are still READ.
-SCHEMA_VERSION = 2
-#: Versions ``load_bundle`` accepts. N-1 stays readable.
-READABLE_SCHEMA_VERSIONS = (1, 2)
+#: * 3 -- stock decision passes: ``ReplayStatus.OUTCOME_DECISION`` and ``AnalysisRecord.decision_object``
+#:   (the frozen pass summary), pass records carry the REAL expert class plus ``record_kind=decision_pass``
+#:   in ``branch_flags`` and the recording host's timezone (``host_timezone``); sessions state their
+#:   ``decision_families`` / ``host_timezone`` in ``capabilities``. Schema-1 and -2 bundles are still READ
+#:   (``decision_object`` is simply absent: ``None``).
+SCHEMA_VERSION = 3
+#: Versions ``load_bundle`` accepts. N-1 (and N-2) stay readable.
+READABLE_SCHEMA_VERSIONS = (1, 2, 3)
 #: Alias kept for the provenance readers; the same tuple.
 SUPPORTED_SCHEMA_VERSIONS = READABLE_SCHEMA_VERSIONS
 
@@ -70,6 +75,8 @@ class ReplayStatus:
     OUTCOME_RECOMMENDATION = "recommendation"
     OUTCOME_SKIP = "skip"
     OUTCOME_ERROR = "error"
+    #: A stock decision pass ran to its end (schema 3): ``decision_object`` holds the pass summary.
+    OUTCOME_DECISION = "decision"
 
     # analysis.use_case
     USE_CASE_ENTER_MARKET = "enter_market"
@@ -266,7 +273,7 @@ class SessionRecord(_Record):
 class AnalysisRecord(_Record):
     """One expert analysis attempt (spec section 3, "Analysis" row).
 
-    ``settings_object`` / ``bundle_object`` / ``recommendation_object`` are
+    ``settings_object`` / ``bundle_object`` / ``recommendation_object`` / ``decision_object`` are
     content hashes into the object store, or ``None`` when that piece was not
     captured -- ``bundle_capture_status`` says why for the bundle, and
     ``capture_gaps`` names every role (``settings``/``bundle``/``recommendation``/
@@ -302,6 +309,8 @@ class AnalysisRecord(_Record):
     clock_read_phases: Sequence[str] = ()
     outcome: str
     recommendation_object: Optional[str] = None
+    #: Schema 3: hash of the frozen pass summary of a stock decision pass (``outcome == "decision"``).
+    decision_object: Optional[str] = None
     skip_reason: Optional[str] = None
     error: Optional[str] = None
     observation_ids: Sequence[str] = ()
@@ -318,7 +327,8 @@ class AnalysisRecord(_Record):
         """Every object this record references, in a stable order."""
         return tuple(
             h
-            for h in (self.settings_object, self.bundle_object, self.recommendation_object)
+            for h in (self.settings_object, self.bundle_object, self.recommendation_object,
+                      self.decision_object)
             if h is not None
         )
 

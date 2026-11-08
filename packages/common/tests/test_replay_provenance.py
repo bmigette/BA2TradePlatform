@@ -43,7 +43,7 @@ def _session(store_root=None, **kw):
 
 
 def test_schema_version_bumped_and_old_session_reads():
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     old = {k: v for k, v in _session().to_mapping().items()
            if k not in ("provenance", "provenance_error")}
     old["schema_version"] = 1
