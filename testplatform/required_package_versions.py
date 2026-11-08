@@ -18,7 +18,7 @@
 # This file is read by TEXT (ast.literal_eval of the assignment), never imported: keep the value
 # a plain dict literal of str -> str.
 REQUIRED_PACKAGE_VERSIONS = {
-    "ba2_common": "2026.11.00037",
-    "ba2_providers": "2026.11.00023",
+    "ba2_common": "2026.11.00038",
+    "ba2_providers": "2026.11.00024",
     "ba2_experts": "2026.11.00014",
 }
