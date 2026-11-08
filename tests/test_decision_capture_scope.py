@@ -126,6 +126,7 @@ def test_a_failed_scope_is_persisted_as_an_error_row_naming_the_cause(store, mon
     assert row.outcome == ReplayStatus.OUTCOME_ERROR
     assert "pass not recorded" in row.error and "db hiccup" in row.error
     assert row.branch_flags["record_kind"] == "decision_pass" and row.expert_class == "FMPRating"
+    assert row.analysis_id.startswith(f"exit-decision-{expert_id}-")           # the pass's own id prefix
     assert store.health.count(CaptureHealth.PASS_NOT_RECORDED) == 1
 
 

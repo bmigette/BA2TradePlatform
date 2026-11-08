@@ -2795,6 +2795,13 @@ class TradeManager:
 
         return _scope()
 
+    @staticmethod
+    def _decision_id_prefix(use_case) -> str:
+        """The analysis-id prefix of a pass: ``decision`` (entry) or ``exit-decision`` (exit)."""
+        from ba2_common.core.types import AnalysisUseCase
+
+        return "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
+
     def _decision_pass_meta(self, store, expert_instance_id: int, use_case, pass_name: str,
                             trigger: str) -> Dict[str, Any]:
         """The analysis meta of a decision pass (design section 2.2)."""
@@ -2813,7 +2820,7 @@ class TradeManager:
             raise RuntimeError("replay capture is enabled but no session is open")
         instance = get_instance(ExpertInstance, expert_instance_id)
         started_at = datetime.now(timezone.utc)
-        id_prefix = "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
+        id_prefix = self._decision_id_prefix(use_case)
         return {
             # The pass is not a MarketAnalysis, so it carries an id of its own shape rather than
             # borrowing one analysis's id and colliding with that analysis's bundle.
@@ -2860,7 +2867,7 @@ class TradeManager:
                 expert_class = "unknown"
             now = datetime.now(timezone.utc)
             store.submit(AnalysisRecord(
-                analysis_id=f"decision-{expert_instance_id}-{uuid.uuid4().hex}",
+                analysis_id=f"{self._decision_id_prefix(use_case)}-{expert_instance_id}-{uuid.uuid4().hex}",
                 attempt_id=uuid.uuid4().hex, session_id=session_id,
                 expert_class=expert_class, expert_instance_id=expert_instance_id, symbol="",
                 use_case=str(use_case.value), started_at=now, finished_at=now,

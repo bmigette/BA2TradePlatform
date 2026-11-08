@@ -48,7 +48,9 @@ CAPTURE_SETTING_KEY = "replay_capture_enabled"
 #: whenever capture is on). The row is NOT created automatically; add it on the Settings page / DB to
 #: start with selected experts. A pass of an expert that is not listed is not recorded and is counted
 #: as a discard with reason ``expert_not_allowed`` (per expert in the capture-health surface). It
-#: changes what is recorded, never what is traded.
+#: changes what is recorded, never what is traded. An excluded expert loses MORE than its rules/size/execute
+#: steps: the market-condition windows and the option-action capture are read inside the same pass scope,
+#: so they are not recorded for it either (its backtest replay then has no tape for them).
 DECISION_PASS_EXPERTS_KEY = "replay_decision_pass_experts"
 
 #: Store layout version. A future incompatible layout gets its own directory

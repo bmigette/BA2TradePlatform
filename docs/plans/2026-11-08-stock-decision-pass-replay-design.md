@@ -511,7 +511,7 @@ Where the build departs from, or pins down, the text above:
 * I3: per-pass budget (`PASS_RECORD_SECONDS_BUDGET` 30 s of recorder time, `PASS_RECORD_FAILURE_BUDGET` 25 failures): later steps of that pass are
   not recorded, each counted `step_not_recorded` and listed in `steps_not_recorded`; the summary says why (`recording_budget_exceeded`). Rollout
   allow-list: AppSetting `replay_decision_pass_experts` (comma-separated expert classes; absent / blank / `*` = every expert, the default when capture
-  is on; the row is not auto-created). Experts not listed are counted as discards with reason `expert_not_allowed`.
+  is on; the row is not auto-created). Experts not listed are counted as discards with reason `expert_not_allowed`. An excluded expert also loses its market-condition window and option-action capture (they are read inside the same pass scope).
 * I4: created-order-id bookkeeping runs inside `_finish_decision_pass`'s guard; the pass' return value always reaches the caller.
 * I5/I6/I7: the replay gates every payload `version` (`unsupported` naming it); `take_profit` / `stop_loss` of the transaction are compared (the tape
   account stamps handed prices as the adapters do, only where the recorded transactions show the adapter stamped them); pass gaps use the `decision`
