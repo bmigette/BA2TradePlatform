@@ -181,3 +181,42 @@ def test_a_stop_the_ruleset_put_on_the_order_is_not_overwritten(file_db):
     assert (_row(order.id).quantity, _row(order.id).stop_price) == (7.0, 88.0)
     persist_funded_entry(order, 8.0, None)
     assert (_row(order.id).quantity, _row(order.id).stop_price) == (8.0, 88.0)
+
+
+# --------------------------------------------------------------------------------------------------
+# C1: a failure AFTER execute() created the order must still compensate THAT order
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("failing_step", ["persist_funded_entry", "stamp_leg_quantities"])
+def test_a_persist_failure_after_execute_compensates_the_unsent_entry(file_db, failing_step):
+    """execute() created the WAITING Transaction + PENDING order; the persist then raised (sqlite lock).
+    The enter loop's handler must still run _fail_unsent_entry for THAT order (pre-refactor it bound
+    ``order`` before persisting); otherwise the symbol+expert stays blocked by the WAITING safety check."""
+    from ba2_common.core import trade_cycle
+    from ba2_trade_platform.core.TradeManager import TradeManager
+
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+    real = getattr(trade_cycle, failing_step)
+    calls = []
+
+    def flaky(order, *args, **kwargs):
+        if order.symbol == "AAPL":
+            raise RuntimeError("database is locked")
+        return real(order, *args, **kwargs)
+
+    compensated = []
+    real_fail = TradeManager._fail_unsent_entry
+
+    def spy(self, order, reason):
+        compensated.append((order.symbol, order.id))
+        return real_fail(self, order, reason)
+
+    with patch.object(trade_cycle, failing_step, flaky), \
+            patch.object(TradeManager, "_fail_unsent_entry", spy):
+        created = _run_enter(expert, account, inst.id)
+
+    assert [s for s, _ in compensated] == ["AAPL"], compensated   # THAT order, not MSFT's, not nothing
+    aapl_entry = [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET][0]
+    assert compensated[0][1] == aapl_entry.id
+    assert [s["symbol"] for s in account.submits] == ["MSFT"]
+    assert [o.symbol for o in created] == ["MSFT"]

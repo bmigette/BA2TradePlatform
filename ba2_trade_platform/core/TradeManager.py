@@ -3340,8 +3340,16 @@ class TradeManager:
                             try:
                                 with record_execute(evaluator, candidate.symbol, recommendation, True) as step:
                                     def _executed(results, main_order, step=step):
+                                        nonlocal order
                                         step.result = results
                                         step.order = main_order
+                                        # Bind the order the moment it is KNOWN, before anything is
+                                        # persisted: execute() has already created the WAITING
+                                        # Transaction + PENDING order, so a raise in the persist /
+                                        # leg stamp must still reach the except handler's
+                                        # _fail_unsent_entry for THIS order (pre-refactor the loop
+                                        # bound it before persisting).
+                                        order = main_order
 
                                     # Execute (the real order + transaction + TP/SL bracket, ONLY for
                                     # funded symbols), fetch the main order DETACHED, write the RM-sized
@@ -3349,9 +3357,9 @@ class TradeManager:
                                     # anything and stamp the protective legs: ONE shared function
                                     # (trade_cycle.stage_funded_entry), the same the offline decision
                                     # replay calls. Its docstrings carry the history of each step.
-                                    order = stage_funded_entry(
+                                    stage_funded_entry(
                                         evaluator, candidate.symbol, fo.quantity, fo.stop_price or None,
-                                        on_executed=_executed).order
+                                        on_executed=_executed)
                                     if order is None:
                                         continue
 
