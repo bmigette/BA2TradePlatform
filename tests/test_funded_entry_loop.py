@@ -679,7 +679,8 @@ def test_compensation_refuses_when_only_the_ON_DISK_row_shows_broker_contact(fil
     acct = factories.create_account_definition(provider="MockAccount")
     order = factories.create_trading_order(
         account_id=acct.id, symbol="WSC", quantity=7.0, status=OrderStatus.PENDING)
-    fresh = get_trade_manager()._row_or_none(TradingOrder, order.id)
+    from ba2_common.core.trade_cycle import row_or_none
+    fresh = row_or_none(TradingOrder, order.id)
     fresh.status = OrderStatus.NEW
     fresh.broker_order_id = "alpaca-committed"
     update_instance(fresh)
@@ -980,7 +981,8 @@ def test_a_stop_the_ruleset_already_set_is_not_overwritten(file_db):
         account_id=acct.id, symbol="WSC", quantity=0.0, status=OrderStatus.PENDING,
         stop_price=88.0)
 
-    get_trade_manager()._persist_funded_entry(order, quantity=7.0, stop_price=93.0)
+    from ba2_common.core.trade_cycle import persist_funded_entry
+    persist_funded_entry(order, quantity=7.0, stop_price=93.0)
 
     with get_db() as s:
         row = s.get(TradingOrder, order.id)
@@ -1035,18 +1037,19 @@ def test_only_THIS_orders_dependents_are_cancelled(file_db):
 
 
 def test_a_real_db_error_during_compensation_is_not_swallowed(file_db):
-    """``_row_or_none`` absorbs exactly one thing: "that row does not exist". A lock, a schema
+    """``row_or_none`` absorbs exactly one thing: "that row does not exist". A lock, a schema
     error or a corrupt file are not answers, and silently treating them as "no row" would turn
     a failed compensation into a silent no-op — the same blindness this whole change is about."""
     from sqlalchemy.exc import OperationalError
     from ba2_trade_platform.core.TradeManager import get_trade_manager
 
     boom = OperationalError("SELECT tradingorder", {}, Exception("disk I/O error"))
-    # ``_row_or_none`` is ``trade_cycle.row_or_none`` now (shared with the decision replay); it reads
+    # ``row_or_none`` is ``trade_cycle.row_or_none`` (shared with the decision replay); it reads
     # ``get_instance`` from ba2_common.core.db.
+    from ba2_common.core.trade_cycle import row_or_none
     with patch.object(_pkg_db, "get_instance", side_effect=boom):
         with pytest.raises(OperationalError):
-            get_trade_manager()._row_or_none(TradingOrder, 1)
+            row_or_none(TradingOrder, 1)
 
 
 def test_an_unfunded_candidate_is_never_submitted(file_db):

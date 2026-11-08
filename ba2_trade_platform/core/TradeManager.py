@@ -15,7 +15,7 @@ from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenTy
 from .db import get_instance, get_all_instances, add_instance, update_instance
 from ba2_common.core.replay.clock import replay_now
 from ba2_common.core.trade_cycle import (
-    entry_submit_stop, persist_funded_entry, row_or_none, select_enter_candidates, stage_funded_entry,
+    entry_submit_stop, row_or_none, select_enter_candidates, stage_funded_entry,
     submit_funded_entry)
 from ba2_common.core.replay.decision_record import (
     note_funded, note_gate, note_pass_error, note_selection, pass_discard, pass_fail, pass_skip,
@@ -1431,7 +1431,7 @@ class TradeManager:
                 sl_price = None
                 if (order.order_type == OrderType.MARKET and not is_closing
                         and not order.depends_on_order):
-                    sl_price = self._entry_submit_stop(order, order.stop_price or None)
+                    sl_price = entry_submit_stop(order, order.stop_price or None)
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
@@ -1520,12 +1520,6 @@ class TradeManager:
             f"the entry signal is stale and this blocker may never clear",
         )
 
-    @staticmethod
-    def _row_or_none(model_class, row_id):
-        """``get_instance`` that answers None instead of raising InstanceNotFound
-        (``trade_cycle.row_or_none``)."""
-        return row_or_none(model_class, row_id)
-
     def _fail_unsent_entry(self, order, reason: str) -> bool:
         """Cancel an entry that never reached the broker, and release everything behind it.
 
@@ -1557,7 +1551,7 @@ class TradeManager:
             self.logger.error(f"Cannot compensate an unsaved entry order ({reason})")
             return False
 
-        on_disk = self._row_or_none(TradingOrder, order_id)
+        on_disk = row_or_none(TradingOrder, order_id)
         if on_disk is None:
             self.logger.warning(
                 f"Order {order_id} no longer exists — nothing to compensate ({reason})")
@@ -1620,7 +1614,7 @@ class TradeManager:
             dependent_ids = [d.id for d in dependents]
         cancelled = 0
         for dep_id in dependent_ids:
-            dep = self._row_or_none(TradingOrder, dep_id)
+            dep = row_or_none(TradingOrder, dep_id)
             if dep and dep.status == OrderStatus.WAITING_TRIGGER:
                 dep.status = OrderStatus.CANCELED
                 update_instance(dep)
@@ -1646,7 +1640,7 @@ class TradeManager:
 
         if not transaction_id:
             return False
-        txn = self._row_or_none(Transaction, transaction_id)
+        txn = row_or_none(Transaction, transaction_id)
         if not txn or txn.status != TransactionStatus.WAITING:
             return False
         txn.status = TransactionStatus.FAILED
@@ -1689,7 +1683,7 @@ class TradeManager:
             child_ids = [c.id for c in children if c.id not in entry_ids]
 
         for child_id in child_ids:
-            child = self._row_or_none(TradingOrder, child_id)
+            child = row_or_none(TradingOrder, child_id)
             if child is None or child.status in terminal or child.status == OrderStatus.FILLED:
                 continue
             broker_id = getattr(child, 'broker_order_id', None)
@@ -1758,7 +1752,7 @@ class TradeManager:
             self.logger.error(f"Cannot give up on an unsaved entry order ({reason})")
             return False
 
-        on_disk = self._row_or_none(TradingOrder, entry_id)
+        on_disk = row_or_none(TradingOrder, entry_id)
         if on_disk is None:
             self.logger.warning(
                 f"Order {entry_id} no longer exists — nothing to give up on ({reason})")
@@ -1812,7 +1806,7 @@ class TradeManager:
         self._cancel_waiting_trigger_dependents(entry_id)
         failed = self._fail_waiting_transaction(txn.id, reason)
         if not failed:
-            current = self._row_or_none(Transaction, txn.id)
+            current = row_or_none(Transaction, txn.id)
             self.logger.info(
                 f"Transaction {txn.id} was no longer WAITING when the give-up path reached "
                 f"it (now {current.status if current else 'gone'})")
@@ -1855,7 +1849,7 @@ class TradeManager:
 
         for txn_id in waiting_ids:
             try:
-                txn = self._row_or_none(Transaction, txn_id)
+                txn = row_or_none(Transaction, txn_id)
                 if txn is None or txn.status != TransactionStatus.WAITING:
                     continue  # changed since we listed it
 
@@ -1912,12 +1906,12 @@ class TradeManager:
 
                 # verdict == "dead"
                 entry_id, account_id, _ = entry_rows[-1]
-                entry = self._row_or_none(TradingOrder, entry_id)
+                entry = row_or_none(TradingOrder, entry_id)
                 if entry is None:
                     continue
                 account = account_cache.get(account_id)
                 if account is None:
-                    account_def = self._row_or_none(AccountDefinition, account_id)
+                    account_def = row_or_none(AccountDefinition, account_id)
                     account_class = (
                         get_account_class(account_def.provider) if account_def else None)
                     if account_class is None:
@@ -1956,19 +1950,9 @@ class TradeManager:
             ages.append((datetime.now(timezone.utc) - created_at).total_seconds() / 60.0)
         return min(ages) if ages else None
 
-    def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
-        """Write the RM's decision onto the entry row BEFORE the broker is called
-        (``trade_cycle.persist_funded_entry``, shared with the offline decision replay)."""
-        persist_funded_entry(order, quantity, stop_price)
-
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
     _ENTRY_SUBMIT_BACKOFF_S = 2.0
-
-    @staticmethod
-    def _entry_submit_stop(order, safeguard_sl):
-        """The stop handed to the broker for an entry (``trade_cycle.entry_submit_stop``)."""
-        return entry_submit_stop(order, safeguard_sl)
 
     def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
         """Submit a funded entry, retrying when the DB (not the broker) is what failed
