@@ -1926,6 +1926,9 @@ class ExpertSettingsTab:
                     detail.append(planned.problem)
                 else:
                     detail.append(f'{planned.settings_changed} setting(s) changed')
+                    if planned.account_change:
+                        detail.append('MOVES TO ACCOUNT: '
+                                      f'{planned.account_change[0]} -> {planned.account_change[1]}')
                     if planned.ruleset_names:
                         detail.append('rulesets: ' + ', '.join(planned.ruleset_names))
                 ui.label('   ' + ' | '.join(detail)).classes('text-xs text-grey-6 mb-1')
