@@ -75,7 +75,7 @@ def test_continue_processing_and_multi_action_exit_survive():
 def test_stop_processing_guard_survives():
     rules = [
         {"name": "guard", "subtype": "enter_market", "order_index": 0,
-         "triggers": {"t0": {"event_type": "high_volatility"}},
+         "triggers": {"t0": {"event_type": "bearish"}},
          "actions": {"a0": {"action_type": "stop_processing"}},
          "continue_processing": False},
         _tier_rule("BUY", 1, 70, -5, -10),
