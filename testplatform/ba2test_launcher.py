@@ -5244,8 +5244,16 @@ _OPTION_DTE_EXIT_BANDS = {
     "O_PMCC":  (150, 90, 240, 30),   # 6
     "O_CBS":   (30, 20, 45, 5),      # 6: design §2 "exit DTE floor 20-45"
     "O_PBS":   (30, 20, 45, 5),      # 6
-    # O_ERN keeps the DEFAULT band: its expiry is 7-30 DTE, which is exactly the range the
-    # 0..21 band was authored for, and its real exit is the event exit below.
+    # O_ERN (review fix 2026-11-09): the DEFAULT band (21, 0..21) is WRONG here. The expiry is
+    # 7-30 DTE (authored window 14..28, decoded dte_min 7..16) and the selector takes the
+    # EARLIEST expiry at/after dte_min, so entry DTE ~ 7..~22: ``days_to_expiry <= 21`` is
+    # already true at entry for the authored genome and the straddle was closed on the first
+    # manage pass, never holding through the print. Its real exit is the event exit below
+    # (days_after_event 0-2); the DTE exit is only an expiry-week safety close. The print is
+    # up to 5 days after entry, so the lowest DTE ON the print day is 7 - 5 = 2: a ceiling of
+    # 1 (0 or 1 DTE) cannot fire before the print. Pinned by ``_assert_entry_dte_clears_exit_floor``
+    # (lead = the entry gene's 5-day ceiling) and test_option_grid_foundations.py.
+    "O_ERN":   (0, 0, 1, 1),         # 2
     # CONVEX-HARVEST (plan Task 13): the convex-harvest design §2 states no explicit roll/exit
     # DTE floor, but O_CONVEX's own entry DTE (180-540, decoded windows as low as [180,300])
     # has the SAME shape as O_LEAPC's problem above -- the platform default (0..21) sits well
@@ -5257,7 +5265,7 @@ _OPTION_DTE_EXIT_BANDS = {
 }
 
 
-def _assert_entry_dte_clears_exit_floor(kind: str, member_keys) -> None:
+def _assert_entry_dte_clears_exit_floor(kind: str, member_keys, lead_days: int = 0) -> None:
     """The roll/exit DTE floor (``_OPTION_DTE_EXIT_BANDS``) must never be reachable AT ENTRY.
 
     Both genes are searched INDEPENDENTLY -- the entry window centre and the exit floor
@@ -5286,12 +5294,16 @@ def _assert_entry_dte_clears_exit_floor(kind: str, member_keys) -> None:
         cfg = _OPTION_STRATS[member]
         base_min, base_max = int(cfg["option_dte_min"]), int(cfg["option_dte_max"])
         hw = max(int((base_max - base_min) // 2) if base_max > base_min else 0, 7)
-        lowest_entry_dte = max(0, int(cfg["option_dte_min_range"]) - hw)
+        # ``lead_days``: an EVENT thesis (O_ERN) must still be open at the event, up to
+        # ``lead_days`` after entry, so the DTE on that day (entry DTE - lead) is what the
+        # exit floor must stay below.
+        lowest_entry_dte = max(0, int(cfg["option_dte_min_range"]) - hw) - int(lead_days)
         if lowest_entry_dte <= dte_hi:
             raise RuntimeError(
                 f"{kind}/{member}: the entry option_dte gene can decode to dte_min="
                 f"{lowest_entry_dte} (option_dte_min_range={cfg['option_dte_min_range']} minus "
-                f"the half-width {hw}), which is NOT strictly greater than the exit/roll DTE "
+                f"the half-width {hw} and the {lead_days}-day pre-event lead), which is NOT "
+                f"strictly greater than the exit/roll DTE "
                 f"floor's own ceiling {dte_hi} (_OPTION_DTE_EXIT_BANDS[{kind!r}][2]). Such a "
                 f"genome would exit the same day (or before) it entered -- a silent no-op "
                 f"trade. Raise option_dte_min_range, widen the authored window, or lower the "
@@ -5300,6 +5312,13 @@ def _assert_entry_dte_clears_exit_floor(kind: str, member_keys) -> None:
 
 _assert_entry_dte_clears_exit_floor("O_LEAP", _LEAP_MEMBER_KEYS)
 _assert_entry_dte_clears_exit_floor("O_PMCC", ["O_PMCC"])
+# O_ERN is an EVENT hold: ``_EVENT_ENTRY_DAYS`` (defined further down, hence the literal ceiling
+# of its value_max is re-asserted against it in the test) is the days-before-print lead.
+_ERN_ENTRY_LEAD_DAYS = 5
+_assert_entry_dte_clears_exit_floor("O_ERN", ["O_ERN"], lead_days=_ERN_ENTRY_LEAD_DAYS)
+# The other hold-thesis keys: their bands already clear (60 > 45), now pinned at import too.
+_assert_entry_dte_clears_exit_floor("O_CBS", ["O_CBS"])
+_assert_entry_dte_clears_exit_floor("O_PBS", ["O_PBS"])
 
 
 # TAKE PROFIT AS A MULTIPLE OF THE PREMIUM PAID (``profit_multiple_of_premium``, plan Task 4).
