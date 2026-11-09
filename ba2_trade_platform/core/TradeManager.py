@@ -29,9 +29,41 @@ from ..modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
 
 
 # Serializes account refreshes across all entry points (scheduled job, immediate job,
-# manual triggers). Dependent-order submission funnels through refresh_accounts; running
-# two refreshes concurrently could submit the same dependent order twice.
+# manual triggers). It does NOT serialize WAITING_TRIGGER submission on its own: every
+# expert's entry pass also calls _check_all_waiting_trigger_orders, outside this lock --
+# that is what the per-order claim below is for.
 _REFRESH_LOCK = threading.Lock()
+
+# Per-ORDER claim on the submission of a WAITING_TRIGGER dependent order. The scheduled
+# refresh and any number of entry passes run _check_all_waiting_trigger_orders concurrently,
+# each submitting from its own Phase-1 snapshot; without this, two of them could send the
+# same protective leg twice (a duplicate stop at the broker, or a 40310000 rejection written
+# back as ERROR over the leg the first one placed). A claim is held from the fresh re-read of
+# the row until its outcome is in the DB, so a later claimant re-reads that outcome and skips.
+#
+# Why not a DB claim (UPDATE ... WHERE status=WAITING_TRIGGER): the only "being submitted"
+# status is PENDING, and a PENDING row with depends_on_order is exactly what
+# AlpacaAccount._check_and_submit_dependent_orders submits -- the claim itself would invite
+# a second submit. Why not one lock around the method: the entry pass would have to skip
+# (its just-filled position unprotected until the next refresh) or wait behind slow broker
+# calls. The guard below is held only for a set operation, never across I/O.
+# In-process only: one live process owns a DB.
+_DEPENDENT_SUBMIT_CLAIMS: set = set()
+_DEPENDENT_SUBMIT_CLAIMS_GUARD = threading.Lock()
+
+
+def _claim_dependent_submit(order_id: int) -> bool:
+    """Claim the right to submit WAITING_TRIGGER order ``order_id``; False if another thread holds it."""
+    with _DEPENDENT_SUBMIT_CLAIMS_GUARD:
+        if order_id in _DEPENDENT_SUBMIT_CLAIMS:
+            return False
+        _DEPENDENT_SUBMIT_CLAIMS.add(order_id)
+        return True
+
+
+def _release_dependent_submit(order_id: int) -> None:
+    with _DEPENDENT_SUBMIT_CLAIMS_GUARD:
+        _DEPENDENT_SUBMIT_CLAIMS.discard(order_id)
 
 # Market-regime benchmark + its once-per-day classification cache (see
 # TradeManager._publish_market_regime). SPY: the classifier in ba2_common.core.market_regime was
@@ -2358,7 +2390,29 @@ class TradeManager:
             # PHASE 2: Process all order submissions OUTSIDE of session context
             submitted_count = 0
             for dependent_order, parent_order_id in orders_to_submit:
+                # ONE submitter per order (see _DEPENDENT_SUBMIT_CLAIMS). The claim is
+                # released in the `finally` below, after every outcome write of this order.
+                if not _claim_dependent_submit(dependent_order.id):
+                    self.logger.debug(
+                        f"Dependent order {dependent_order.id} is being submitted by another "
+                        f"thread; skipping it in this pass")
+                    continue
                 try:
+                    # Phase 1 read this row before the claim: another pass may have submitted,
+                    # failed, deferred-and-rechained or cancelled it since. Act only if it is
+                    # still the row Phase 1 decided on; otherwise the next pass re-evaluates it.
+                    current = row_or_none(TradingOrder, dependent_order.id)
+                    if (current is None or current.status != OrderStatus.WAITING_TRIGGER
+                            or current.broker_order_id
+                            or current.depends_on_order != dependent_order.depends_on_order
+                            or current.depends_order_status_trigger
+                            != dependent_order.depends_order_status_trigger):
+                        self.logger.debug(
+                            f"Dependent order {dependent_order.id} changed since this pass read "
+                            f"it (now {getattr(current, 'status', 'deleted')}, broker id "
+                            f"{getattr(current, 'broker_order_id', None)}); not submitting it here")
+                        continue
+
                     account_def = get_instance(AccountDefinition, dependent_order.account_id)
                     if not account_def:
                         self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
@@ -2475,7 +2529,9 @@ class TradeManager:
                         update_instance(fresh)
                     except Exception as update_error:
                         self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
-            
+                finally:
+                    _release_dependent_submit(dependent_order.id)
+
             if submitted_count > 0:
                 self.logger.info(f"Processed {submitted_count} waiting trigger orders")
                 
