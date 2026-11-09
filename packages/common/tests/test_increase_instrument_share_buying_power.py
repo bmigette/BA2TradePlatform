@@ -90,9 +90,15 @@ class _FakeExpert:
     def get_virtual_balance(self):
         return 10000.0
 
+    def get_setting_with_interface_default(self, setting_key, log_warning=True):
+        """An expert with NO declared interface default: the stored value or None."""
+        return self.settings.get(setting_key)
+
 
 class _FakeResolver:
-    def get_expert_instance(self, expert_id): return _FakeExpert()
+    expert_cls = _FakeExpert
+
+    def get_expert_instance(self, expert_id): return self.expert_cls()
     def get_account_instance(self, account_id): return None
     def get_account_instance_from_transaction(self, transaction): return None
 
@@ -109,9 +115,11 @@ def _action(account):
     return action
 
 
-def _run(action):
+def _run(action, expert_cls=_FakeExpert):
     previous = instance_resolver.get_instance_resolver()
-    instance_resolver.set_instance_resolver(_FakeResolver())
+    resolver = _FakeResolver()
+    resolver.expert_cls = expert_cls
+    instance_resolver.set_instance_resolver(resolver)
     try:
         return action.execute()
     finally:
@@ -207,3 +215,118 @@ def test_increase_share_refuses_to_size_when_buying_power_is_unknown():
 
     assert result["success"] is False
     assert "buying power" in result["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# An unreadable position is not a flat position; an unset cap is not 10%
+# ---------------------------------------------------------------------------
+
+def _holding(quantity):
+    """A real open long Transaction for expert 42, read through the genuine store path."""
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.types import OrderDirection, TransactionStatus
+    add_instance(Transaction(symbol="AAPL", quantity=quantity, side=OrderDirection.BUY,
+                             status=TransactionStatus.OPENED, expert_id=42))
+
+
+def _failing_store_read():
+    raise OSError("disk I/O error")       # a benign (absorbed) failure of the store read
+
+
+def test_a_failed_position_read_is_refused_not_read_as_flat(monkeypatch):
+    """100 shares held, the store read fails. get_expert_position() used to swallow the
+    error and return None, which this action read as 0.0 -- so it bought the FULL target
+    again on top of the 100 already held. Now: no order, a refusal naming the reason, and
+    an ERROR log line."""
+    from ba2_common.core import TradeActions as mod
+    from ba2_common.core import trade_store as ts
+
+    errors = []
+    monkeypatch.setattr(mod.logger, "error", lambda msg, *a, **k: errors.append(msg))
+    with ts.inmem_trades():
+        _holding(100.0)
+        action = _action(_AlpacaShapedAccount(1))
+        action._own_equity_transactions = _failing_store_read
+        orders = []
+        action.create_order_record = lambda **kw: orders.append(kw) or 1
+
+        result = _run(action)
+
+    assert result["success"] is False
+    assert "position" in result["message"].lower()
+    assert "could not be read" in result["message"].lower()
+    assert orders == [], "no order may be created from an unreadable position"
+    assert result["data"].get("order_id") is None
+    assert any("AAPL" in m and "position" in m.lower() for m in errors), errors
+
+
+def test_get_expert_position_raises_on_a_failed_read_instead_of_returning_none():
+    """None keeps meaning ONE thing (no owning expert); a failed read raises, the same
+    contract get_current_position() has for the broker book."""
+    from ba2_common.core.portfolio_allocation import PositionFetchFailed
+
+    action = _action(_AlpacaShapedAccount(1))
+    action._own_equity_transactions = _failing_store_read
+    with pytest.raises(PositionFetchFailed):
+        action.get_expert_position()
+
+
+def test_genuinely_no_position_still_buys_the_full_target():
+    """Flat (the read SUCCEEDED and found nothing) is unchanged: 15% of 10000 at 100 = 15."""
+    from ba2_common.core import trade_store as ts
+
+    with ts.inmem_trades():
+        result = _run(_action(_AlpacaShapedAccount(1)))
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["quantity"] == 15.0
+
+
+def test_a_normal_increase_tops_up_the_real_holding():
+    """5 held (500), target 15% of 10000 = 1500: buy the 10-share difference."""
+    from ba2_common.core import trade_store as ts
+
+    with ts.inmem_trades():
+        _holding(5.0)
+        result = _run(_action(_AlpacaShapedAccount(1)))
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["quantity"] == 10.0
+    assert result["data"]["side"] == "BUY"
+
+
+def test_an_unset_cap_setting_is_refused_never_assumed_to_be_ten_percent():
+    """No hidden money default (CLAUDE.md): the cap used to be read with
+    ``.get(..., 10.0)``. With no stored value and no declared default the action must
+    refuse; the old code bought 10 shares (10% of 10000 at 100)."""
+    class _NoCap(_FakeExpert):
+        settings = {}
+
+    orders = []
+    action = _action(_AlpacaShapedAccount(1))
+    action.create_order_record = lambda **kw: orders.append(kw) or 1
+
+    result = _run(action, expert_cls=_NoCap)
+
+    assert result["success"] is False
+    assert "max_virtual_equity_per_instrument_percent" in result["message"]
+    assert orders == []
+
+
+def test_the_cap_resolves_through_the_interface_default():
+    """The cap is read the way TradeRiskManagement sizes with it: the stored value, else
+    the expert's DECLARED interface default. A stored None (an unset row) with a declared
+    default of 12 caps a 15% target at 12% -> 12 shares."""
+    class _DeclaredDefault(_FakeExpert):
+        settings = {"max_virtual_equity_per_instrument_percent": None}
+
+        def get_setting_with_interface_default(self, setting_key, log_warning=True):
+            assert setting_key == "max_virtual_equity_per_instrument_percent"
+            return 12.0
+
+    result = _run(_action(_AlpacaShapedAccount(1)), expert_cls=_DeclaredDefault)
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["quantity"] == 12.0
+    assert result["data"]["target_percent"] == 12.0
