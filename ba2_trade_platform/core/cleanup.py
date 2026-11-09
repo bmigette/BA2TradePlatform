@@ -198,6 +198,27 @@ def execute_cleanup(
     
     try:
         with get_db() as session:
+            # Step 0: Resolve the protection set FIRST. If this query fails it raises and the
+            # outer handler aborts the run before anything is deleted (never an empty set).
+            query = select(MarketAnalysis).where(MarketAnalysis.created_at < cutoff_date)
+
+            # Add status filter if provided
+            if statuses:
+                query = query.where(MarketAnalysis.status.in_(statuses))
+
+            # Add expert filter if provided
+            if expert_instance_id:
+                query = query.where(MarketAnalysis.expert_instance_id == expert_instance_id)
+
+            old_analyses = session.exec(query).all()
+
+            logger.info(f"Cleanup: Found {len(old_analyses)} analyses older than {days_to_keep} days")
+
+            # Batch query: IDs of analyses whose position is still held (WAITING/OPENED/CLOSING)
+            all_analysis_ids = [a.id for a in old_analyses]
+            protected_ids = _get_analysis_ids_with_open_transactions(session, all_analysis_ids)
+            logger.info(f"Cleanup: {len(protected_ids)} analyses have open transactions and will be protected")
+
             # Step 1: Clean up orphaned trade_action_result records (with NULL expert_recommendation_id)
             try:
                 orphaned_results = session.exec(
@@ -236,26 +257,6 @@ def execute_cleanup(
                 logger.warning(f"Cleanup: Could not clean orphaned analysis output records: {e}")
                 session.rollback()
             
-            # Step 2: Build base query for old analyses
-            query = select(MarketAnalysis).where(MarketAnalysis.created_at < cutoff_date)
-            
-            # Add status filter if provided
-            if statuses:
-                query = query.where(MarketAnalysis.status.in_(statuses))
-            
-            # Add expert filter if provided
-            if expert_instance_id:
-                query = query.where(MarketAnalysis.expert_instance_id == expert_instance_id)
-            
-            old_analyses = session.exec(query).all()
-
-            logger.info(f"Cleanup: Found {len(old_analyses)} analyses older than {days_to_keep} days")
-
-            # Batch query: get all analysis IDs that have open transactions (single query)
-            all_analysis_ids = [a.id for a in old_analyses]
-            protected_ids = _get_analysis_ids_with_open_transactions(session, all_analysis_ids)
-            logger.info(f"Cleanup: {len(protected_ids)} analyses have open transactions and will be protected")
-
             for analysis in old_analyses:
                 # Create a new session context for each analysis to avoid rollback cascade issues
                 try:
@@ -365,6 +366,11 @@ def execute_cleanup(
     }
 
 
+#: Transactions that still hold a position (or a pending entry); their analyses must survive cleanup.
+_PROTECTING_TRANSACTION_STATUSES = (
+    TransactionStatus.WAITING, TransactionStatus.OPENED, TransactionStatus.CLOSING)
+
+
 def _get_analysis_ids_with_open_transactions(session: Session, analysis_ids: List[int]) -> set:
     """
     Get set of MarketAnalysis IDs that have linked open transactions (batch query).
@@ -383,8 +389,9 @@ def _get_analysis_ids_with_open_transactions(session: Session, analysis_ids: Lis
 
     try:
         logger.debug(f"[_get_analysis_ids_with_open_transactions] Checking {len(analysis_ids)} analyses")
-        # Single efficient query: join through the chain and filter for OPENED transactions
-        # MarketAnalysis -> ExpertRecommendation -> TradingOrder -> Transaction (OPENED)
+        # Single efficient query: join through the chain and filter for held positions.
+        # MarketAnalysis -> ExpertRecommendation -> TradingOrder -> Transaction
+        # WAITING (entry unfilled), OPENED and CLOSING (exit resting) all still hold a position.
         stmt = (
             select(ExpertRecommendation.market_analysis_id)
             .distinct()
@@ -392,16 +399,17 @@ def _get_analysis_ids_with_open_transactions(session: Session, analysis_ids: Lis
             .join(Transaction, Transaction.id == TradingOrder.transaction_id)
             .where(
                 ExpertRecommendation.market_analysis_id.in_(analysis_ids),
-                Transaction.status == TransactionStatus.OPENED
+                Transaction.status.in_(_PROTECTING_TRANSACTION_STATUSES)
             )
         )
         result = session.exec(stmt).all()
         logger.debug(f"[_get_analysis_ids_with_open_transactions] Found {len(result)} with open transactions")
         return set(result)
     except Exception as e:
+        # FAIL CLOSED: an empty set would read as "nothing is protected" and let the caller delete
+        # records open positions still reference. Propagate so the run stops loudly.
         logger.error(f"Error checking open transactions for analyses: {e}", exc_info=True)
-        # If we can't determine, return empty set (analyses won't be protected)
-        return set()
+        raise
 
 
 def get_cleanup_statistics(expert_instance_id: Optional[int] = None) -> Dict[str, Any]:
