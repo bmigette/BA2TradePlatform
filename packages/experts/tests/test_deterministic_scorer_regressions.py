@@ -292,7 +292,7 @@ def test_yield_curve_and_sahm_inputs_are_actually_wired():
         },
         "index_closes": pd.Series(range(1, 301), dtype=float),
     }
-    regime = e._build_regime(bundle, {})
+    regime = e._build_regime(bundle, {"yc_scale": 0.5})
     used = set(regime["components"])
     for key in ("yield_curve", "sahm", "credit"):
         assert key in used, f"{key} never contributes (dead macro input)"

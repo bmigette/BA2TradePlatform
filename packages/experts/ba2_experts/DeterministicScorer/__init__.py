@@ -287,8 +287,13 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                          "description": "VIX at/below this = calm (+1)"},
             "vix_stress": {"type": "float", "required": False, "default": 30.0,
                            "description": "VIX at/above this = stressed (-1)"},
-            "yc_scale": {"type": "float", "required": False, "default": 0.005,
-                         "description": "Yield-curve spread (decimal) saturating the tanh"},
+            # 0.5 since 2026-11-09 (it said 0.005 before, which saturated the tanh on ~96% of
+            # days). Every instance and stored backtest from before keeps 0.005: the alembic
+            # migration c4e7a9d2f1b8 pins the live instances, and
+            # ba2_common.core.legacy_setting_defaults pins stored backtest configs.
+            "yc_scale": {"type": "float", "required": False, "default": DEF_YC_SCALE,
+                         "description": "10y-3m spread in PERCENT at which the yield-curve "
+                                        "tanh reaches 0.76 (0.5 = 50bp)"},
             "index_symbol": {"type": "str", "required": False, "default": "SPY",
                              "description": "Index symbol for the macro trend input"},
             # ---- targets / exits ----
@@ -824,7 +829,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             "credit": credit_score(mi.get("oas_series")),
             "yield_curve": yield_curve_score(
                 mi.get("spread_10y3m_series"),
-                scale=float(settings.get("yc_scale", DEF_YC_SCALE))),
+                scale=float(settings["yc_scale"])),
             "sahm": sahm_score(mi.get("unrate_series")),
         }
         weights = {k: float(settings.get(f"mw_{k}", DEF_MW[k]))
