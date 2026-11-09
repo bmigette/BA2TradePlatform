@@ -325,7 +325,11 @@ class ConditionGroup(BaseModel):
     def to_canonical_dict(self) -> Dict[str, Any]:
         op = str(self.operator or "AND").upper()
         if op not in ("AND", "OR"):
-            op = "AND"
+            # Coercing a NOT (or any other boolean) to AND used to happen HERE, silently: the rule
+            # then fired exactly when its author said it must not. Refused, by the same named
+            # error the converters raise (``rule_builders.condition_group_operator``).
+            from ba2_common.core.rule_builders import condition_group_operator
+            condition_group_operator({"id": self.id, "operator": op}, "condition tree")
         out: Dict[str, Any] = {
             "operator": op,
             "type": op,  # engine _gate_trigger_groups reads 'type' (or 'operator')
@@ -345,6 +349,10 @@ def _node_to_canonical(node: Any) -> Dict[str, Any]:
     if not isinstance(node, dict):
         return ConditionGroup().to_canonical_dict()
     if _is_group(node):
+        if node.get("operator") and node.get("type"):
+            # Both spellings present and different: refuse rather than let ``operator`` win.
+            from ba2_common.core.rule_builders import condition_group_operator
+            condition_group_operator(node, "condition tree")
         return ConditionGroup.model_validate(node).to_canonical_dict()
     return ConditionLeaf.model_validate(node).to_canonical_dict()
 

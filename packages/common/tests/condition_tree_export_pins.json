@@ -1,0 +1,282 @@
+{
+ "legacy": {
+  "export_type": "rulesets",
+  "export_version": "1.0",
+  "rulesets": [
+   {
+    "name": "pin enter_market",
+    "rules": [
+     {
+      "actions": {
+       "act": {
+        "action_type": "buy"
+       },
+       "tp0": {
+        "action_type": "adjust_take_profit",
+        "reference_value": "order_open_price",
+        "value": 12
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-buy-1",
+      "order_index": 0,
+      "subtype": "enter_market",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bullish"
+       },
+       "cond_1": {
+        "event_type": "confidence",
+        "operator": ">=",
+        "value": 70
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "act": {
+        "action_type": "buy"
+       },
+       "tp0": {
+        "action_type": "adjust_take_profit",
+        "reference_value": "order_open_price",
+        "value": 12
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-buy-2",
+      "order_index": 1,
+      "subtype": "enter_market",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bullish"
+       },
+       "cond_1": {
+        "event_type": "long_term"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "act": {
+        "action_type": "sell"
+       },
+       "tp0": {
+        "action_type": "adjust_take_profit",
+        "reference_value": "order_open_price",
+        "value": 12
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-sell",
+      "order_index": 2,
+      "subtype": "enter_market",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bearish"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     }
+    ],
+    "subtype": "enter_market",
+    "type": "trading_recommendation_rule"
+   },
+   {
+    "name": "pin open_positions",
+    "rules": [
+     {
+      "actions": {
+       "act": {
+        "action_type": "close"
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-exit-0",
+      "order_index": 0,
+      "subtype": "open_positions",
+      "triggers": {
+       "cond_0": {
+        "event_type": "profit_loss_percent",
+        "operator": ">",
+        "value": 12
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "act": {
+        "action_type": "adjust_stop_loss",
+        "reference_value": "order_open_price",
+        "value": -8
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-exit-1",
+      "order_index": 1,
+      "subtype": "open_positions",
+      "triggers": {
+       "cond_0": {
+        "event_type": "has_position"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     }
+    ],
+    "subtype": "open_positions",
+    "type": "trading_recommendation_rule"
+   }
+  ]
+ },
+ "unified": {
+  "export_type": "rulesets",
+  "export_version": "1.0",
+  "rulesets": [
+   {
+    "name": "pin enter_market",
+    "rules": [
+     {
+      "actions": {
+       "a0": {
+        "action_type": "buy"
+       },
+       "a1": {
+        "action_type": "adjust_take_profit",
+        "reference_value": "order_open_price",
+        "value": 10
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "enter-buy",
+      "order_index": 0,
+      "subtype": "enter_market",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bullish"
+       },
+       "cond_1": {
+        "event_type": "has_no_position"
+       },
+       "cond_2": {
+        "event_type": "confidence",
+        "operator": ">=",
+        "value": 60
+       },
+       "cond_3": {
+        "event_type": "expected_profit_target_percent",
+        "operator": ">=",
+        "value": 4
+       },
+       "cond_4": {
+        "event_type": "long_term"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "a0": {
+        "action_type": "sell"
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "enter-sell",
+      "order_index": 1,
+      "subtype": "enter_market",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bearish"
+       },
+       "cond_1": {
+        "event_type": "has_no_position"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     }
+    ],
+    "subtype": "enter_market",
+    "type": "trading_recommendation_rule"
+   },
+   {
+    "name": "pin open_positions",
+    "rules": [
+     {
+      "actions": {
+       "a0": {
+        "action_type": "close"
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-open_positions-0",
+      "order_index": 0,
+      "subtype": "open_positions",
+      "triggers": {
+       "cond_0": {
+        "event_type": "profit_loss_percent",
+        "operator": ">",
+        "value": 10
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "a0": {
+        "action_type": "adjust_stop_loss",
+        "reference_value": "current_price",
+        "value": -5
+       }
+      },
+      "continue_processing": true,
+      "extra_parameters": {},
+      "name": "pin-open_positions-1",
+      "order_index": 1,
+      "subtype": "open_positions",
+      "triggers": {
+       "cond_0": {
+        "event_type": "has_position"
+       },
+       "cond_1": {
+        "event_type": "days_opened",
+        "operator": ">=",
+        "value": 5
+       }
+      },
+      "type": "trading_recommendation_rule"
+     },
+     {
+      "actions": {
+       "a0": {
+        "action_type": "close"
+       }
+      },
+      "continue_processing": false,
+      "extra_parameters": {},
+      "name": "pin-open_positions-2",
+      "order_index": 2,
+      "subtype": "open_positions",
+      "triggers": {
+       "cond_0": {
+        "event_type": "bearish"
+       }
+      },
+      "type": "trading_recommendation_rule"
+     }
+    ],
+    "subtype": "open_positions",
+    "type": "trading_recommendation_rule"
+   }
+  ]
+ }
+}

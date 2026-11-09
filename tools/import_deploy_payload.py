@@ -312,7 +312,10 @@ def main() -> int:
         #     sits under OR/NOT, is refused (``assert_market_rule_actions``);
         #   * an unresolved optimizer template on EITHER side is refused.
         # ``trade_rules_to_live_export`` below runs the last two again, but only AFTER a new
-        # instance has been created -- a refusal there would leave that instance behind.
+        # instance has been created -- a refusal there would leave that instance behind. So it
+        # also runs here as a DRY RUN (pure, writes nothing): a NOT group, a condition tree too
+        # wide to expand into AND-rules, or a rule that would convert always-true is refused
+        # before anything is written.
         try:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
@@ -320,6 +323,7 @@ def main() -> int:
             assert_market_rule_actions(exit_rules, f"{label}: exit rules")
             assert_market_conditions_resolved(entry_rules, f"{label}: entry rules")
             assert_market_conditions_resolved(exit_rules, f"{label}: exit rules")
+            trade_rules_to_live_export(entry_rules, exit_rules, name=label)
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1

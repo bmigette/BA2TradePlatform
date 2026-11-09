@@ -423,18 +423,19 @@ def derive_export_payload(
             entry_rules = converted["entry_rules"]
             exit_rules = converted["exit_rules"]
 
-        # The exit list as STORED is checked too: normalizing coerces an unknown group operator
-        # (a NOT) to AND, which would hide exactly the nesting the action check refuses.
+        # The exit list as STORED is checked too (it used to be the only place a NOT was seen:
+        # normalizing coerced it to AND; since 2026-11-09 normalizing refuses it as well).
         raw_exit_rules = exit_rules if isinstance(exit_rules, list) else []
-        entry_rules = normalize_trade_rules(entry_rules or [])
-        exit_rules = normalize_trade_rules(exit_rules or [])
         # MARKET-CONDITION GATES (design 2026-09-15 section 5). An export is what a deploy reads,
         # so it is the first place an undeployable ruleset can be caught: an UNRESOLVED mode gene
         # (entry OR exit) is the optimizer's search template, not a rule (live would have no
         # operator to apply), and a market gate on an open-positions rule may only close, reduce
         # or adjust TP/SL, from a top-level AND (plan 2026-09-24 Task B2). All are 400s, not
-        # 500s: the payload is wrong, the server is fine.
+        # 500s: the payload is wrong, the server is fine -- the normalization's own refusal of a
+        # NOT / unknown group operator included.
         try:
+            entry_rules = normalize_trade_rules(entry_rules or [])
+            exit_rules = normalize_trade_rules(exit_rules or [])
             assert_market_conditions_resolved(entry_rules, f"backtest {backtest.id} entry_rules")
             assert_market_conditions_resolved(exit_rules, f"backtest {backtest.id} exit_rules")
             assert_market_rule_actions(raw_exit_rules, f"backtest {backtest.id} exit_rules")

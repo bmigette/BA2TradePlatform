@@ -18,6 +18,7 @@ here keeps the reverse direction independent of that.)
 """
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ba2_common.core.rule_order import rules_in_precedence
@@ -33,7 +34,10 @@ from ba2_common.core.rule_builders import (
     action_from_rule,
     assert_market_fields_mappable,
     checked_entry_tag,
+    condition_group_operator,
+    rule_trigger_sets_from_tree,
     rule_triggers_from_tree,
+    trigger_sets_from_condition_tree,
     triggers_from_condition_tree,
 )
 from ba2_common.core.types import (
@@ -74,7 +78,24 @@ __all__ = [
     "live_export_to_trade_rules",
     "trade_rules_to_live_export",
     "live_actions_from_trade_rule",
+    "live_rules_for_branches",
+    "branch_rule_name",
+    "continue_processing_of",
+    "UnknownTriggerEventTypeError",
+    "MissingTriggerOperatorError",
 ]
+
+
+class UnknownTriggerEventTypeError(ValueError):
+    """A live trigger whose ``event_type`` is missing or not an ``ExpertEventType``. Live
+    (``TradeActionEvaluator._evaluate_conditions``) FAILS such a rule -- it never fires -- so
+    skipping the trigger on import would make the backtest copy fire without it (and a rule whose
+    triggers were all unknown would import as an always-true empty AND)."""
+
+
+class MissingTriggerOperatorError(ValueError):
+    """A live NUMERIC trigger with no ``operator``/``op``. Live cannot build the comparison (the
+    rule does not fire); inventing ``">"`` on import would give the backtest a gate live never ran."""
 
 
 def opt_range(value: Any) -> Tuple[float, float, float]:
@@ -95,23 +116,42 @@ def opt_range(value: Any) -> Tuple[float, float, float]:
     return (lo, hi, step)
 
 
-def _operator_of(trig: dict) -> str:
-    """Operator from a trigger, tolerant of v1.0 ``operator`` and v1.1 ``op``."""
-    return trig.get("operator") or trig.get("op") or ">"
+def _operator_of(trig: dict, where: str = "trigger") -> str:
+    """Operator from a NUMERIC trigger, tolerant of v1.0 ``operator`` and v1.1 ``op``.
+
+    No operator is REFUSED (:class:`MissingTriggerOperatorError`), never defaulted: live cannot
+    evaluate such a trigger (``TradeConditions.create_condition`` needs one), so the rule never
+    fires there, and a ``">"`` invented here would be a gate only the backtest runs."""
+    op = trig.get("operator") or trig.get("op")
+    if not op:
+        raise MissingTriggerOperatorError(
+            f"{where}: numeric trigger {trig.get('event_type')!r} has no operator. Live cannot "
+            f"evaluate it (the rule never fires), so it is refused rather than imported as '>'. "
+            f"Fix the rule's trigger.")
+    return op
 
 
-def trigger_to_leaf(idx: int, trig: dict) -> Optional[dict]:
-    """Convert ONE live trigger to a backtester ConditionBase-shaped leaf dict, or None.
+def trigger_to_leaf(idx: int, trig: dict, where: str = "trigger") -> dict:
+    """Convert ONE live trigger to a backtester ConditionBase-shaped leaf dict.
 
     Flag triggers (event_type in FLAG_EVENT_VALUES) become value-less ``{id, field, field_type:
     "flag"}`` leaves; numeric triggers (in NUMERIC_EVENT_VALUES) carry field/comparison/value and
-    are marked optimizable with a default ±50% range. Unknown event types are skipped (return
-    None) so a partial live rule never breaks the import. ``field`` is the RAW event_type value.
+    are marked optimizable with a default ±50% range. ``field`` is the RAW event_type value.
+
+    REFUSED, not skipped: a trigger with a missing or unknown ``event_type``
+    (:class:`UnknownTriggerEventTypeError`) and a numeric trigger without an operator
+    (:class:`MissingTriggerOperatorError`). Live fails a rule carrying either, so dropping the
+    trigger -- what this used to do -- imported a backtest rule that fires where live never does
+    (and a rule whose triggers were all unknown as an always-true empty AND).
 
     This is the SINGLE leaf converter used by BOTH exit and entry conversion (resolving the old
     entry/exit inconsistency where entry used a lossy inverse map). Reads both v1.0 ``operator``
     and v1.1 ``op``.
     """
+    if not isinstance(trig, dict):
+        raise UnknownTriggerEventTypeError(
+            f"{where}: trigger {idx} is not a mapping ({type(trig).__name__}); live fails a rule "
+            f"carrying it, so it is refused rather than skipped.")
     et = trig.get("event_type")
     leaf_id = f"c{idx}"
     if et in FLAG_EVENT_VALUES:
@@ -123,7 +163,7 @@ def trigger_to_leaf(idx: int, trig: dict) -> Optional[dict]:
             "id": leaf_id,
             "field": et,
             "field_type": "numeric",
-            "comparison": _operator_of(trig),
+            "comparison": _operator_of(trig, where),
             "value": value,
             "optimize": True,
             "optimize_enabled": True,
@@ -131,19 +171,16 @@ def trigger_to_leaf(idx: int, trig: dict) -> Optional[dict]:
             "value_max": vmax,
             "value_step": vstep,
         }
-    return None
+    raise UnknownTriggerEventTypeError(
+        f"{where}: trigger {idx} has event_type {et!r}, which this installation does not know. "
+        f"Live fails a rule carrying it (it never fires); importing the rule without it would "
+        f"make the backtest fire where live does not. Update this installation or fix the rule.")
 
 
-def _leaves_from_triggers(triggers: dict) -> List[dict]:
-    """All recognizable leaves from a triggers dict (skipping unknown event types)."""
-    leaves: List[dict] = []
-    for i, trig in enumerate((triggers or {}).values()):
-        if not isinstance(trig, dict):
-            continue
-        leaf = trigger_to_leaf(i, trig)
-        if leaf is not None:
-            leaves.append(leaf)
-    return leaves
+def _leaves_from_triggers(triggers: dict, where: str = "rule") -> List[dict]:
+    """Every trigger of a triggers dict as a leaf, in order (an unconvertible one is REFUSED,
+    see :func:`trigger_to_leaf`)."""
+    return [trigger_to_leaf(i, trig, where) for i, trig in enumerate((triggers or {}).values())]
 
 
 def eventaction_to_exit_rule(
@@ -167,7 +204,7 @@ def eventaction_to_exit_rule(
         return None
     action = action_cfg["action_type"]
 
-    leaves = _leaves_from_triggers(triggers)
+    leaves = _leaves_from_triggers(triggers, f"open_positions rule {name!r}")
 
     rule: dict = {
         "id": f"live-{ea_id}",
@@ -199,12 +236,12 @@ def eventaction_to_entry_group(ea_id: Any, triggers: dict) -> Optional[Tuple[dic
     """Convert one live enter_market EventAction's triggers into an AND-group of tree leaves.
 
     Returns ``(group, leaves)`` where ``group`` is ``{id, operator:"AND", conditions:[leaves]}``,
-    or None if the EventAction yields no recognizable leaves (so an all-unknown rule is dropped
-    rather than emitting an empty group). Uses the shared ``trigger_to_leaf`` (raw enum value
+    or None if the EventAction has no trigger at all. An unconvertible trigger is REFUSED
+    (``trigger_to_leaf``), never dropped. Uses the shared ``trigger_to_leaf`` (raw enum value
     field, derived from ``ExpertEventType`` itself) so a numeric enum is PRESERVED even if it
     were ever missing from the forward ``FIELD_EVENT`` map.
     """
-    leaves = _leaves_from_triggers(triggers)
+    leaves = _leaves_from_triggers(triggers, f"enter_market rule {ea_id!r}")
     if not leaves:
         return None
     group = {"id": f"grp-{ea_id}", "operator": "AND", "conditions": leaves}
@@ -271,8 +308,11 @@ def live_export_to_strategy(payload: dict) -> dict:
       * ``open_positions`` -> exit rules via ``eventaction_to_exit_rule`` (None -> skipped).
 
     Returns ``{"buy_entry_conditions": tree|None, "sell_entry_conditions": tree|None,
-    "exit_conditions": [rule, ...], "summary": {...}}``. Never raises on an unknown
-    event_type/action (it is skipped) so a partial/edited file still imports.
+    "exit_conditions": [rule, ...], "summary": {...}}``. An unknown ACTION is skipped (the rule
+    is counted in ``skipped_rules``). An unknown trigger ``event_type`` or a numeric trigger with
+    no operator is REFUSED (``UnknownTriggerEventTypeError`` / ``MissingTriggerOperatorError``):
+    live fails such a rule, so importing it without the trigger would backtest a rule that fires
+    where live never does.
 
     RULE ORDER is each ruleset's precedence as ``rule_order.rules_in_precedence`` reads it --
     the SAME reading the live importer (``RulesImporter``) writes its links from, so a file whose
@@ -432,7 +472,7 @@ def live_export_to_trade_rules(payload: dict) -> dict:
                 skipped += 1
                 continue
 
-            leaves = _leaves_from_triggers(triggers)
+            leaves = _leaves_from_triggers(triggers, f"{subtype} rule {name!r}")
             conditions = (
                 {"id": f"grp-{ea_id}", "operator": "AND", "conditions": leaves}
                 if leaves else None
@@ -533,6 +573,46 @@ def live_actions_from_trade_rule(rule: dict) -> Optional[Dict[str, dict]]:
     return actions or None
 
 
+def continue_processing_of(rule: dict) -> bool:
+    """A rule's ``continue_processing`` flag, in either spelling (absent = False)."""
+    return bool(rule.get("continue_processing") or rule.get("continueProcessing") or False)
+
+
+def branch_rule_name(name: str, branch: int, n_branches: int) -> str:
+    """The name of the live rule written for OR-branch ``branch`` (0-based) of a rule called
+    ``name``: unchanged for a one-branch rule, ``<name>-or<k>`` (1-based) otherwise. Shared by the
+    exporters and the backtest seeder so a split rule carries the same names on both sides."""
+    return name if n_branches <= 1 else f"{name}-or{branch + 1}"
+
+
+def live_rules_for_branches(name: str, subtype: str, trigger_sets: List[Dict[str, dict]],
+                            actions: Dict[str, dict], continue_processing: bool,
+                            first_order_index: int) -> List[dict]:
+    """The live export rules for ONE tree rule: one per AND-branch (``trigger_sets``, from
+    ``rule_builders.rule_trigger_sets_from_tree`` / ``trigger_sets_from_condition_tree``), each
+    with the SAME actions and ``continue_processing``, at consecutive ``order_index``.
+
+    Why that is the tree's meaning under ``TradeActionEvaluator`` (first match wins,
+    ``continue_processing`` falls through, an action already generated this pass is not
+    generated again): with ``continue_processing`` False the first matching branch fires and
+    stops, which is the tree rule firing and stopping; with True every matching branch builds
+    the same action configs, the evaluator keeps the first, and evaluation goes on to the next
+    rule. Pinned against the real evaluator on every input in
+    ``packages/common/tests/test_condition_tree_or_export.py``.
+    """
+    n = len(trigger_sets)
+    return [{
+        "name": branch_rule_name(name, j, n),
+        "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+        "subtype": subtype,
+        "triggers": triggers,
+        "actions": copy.deepcopy(actions),
+        "extra_parameters": {},
+        "continue_processing": bool(continue_processing),
+        "order_index": first_order_index + j,
+    } for j, triggers in enumerate(trigger_sets)]
+
+
 def trade_rules_to_live_export(
     entry_rules: Optional[List[dict]] = None,
     exit_rules: Optional[List[dict]] = None,
@@ -540,10 +620,12 @@ def trade_rules_to_live_export(
 ) -> dict:
     """Reverse of ``live_export_to_trade_rules``: TradeRule lists -> a live export-file dict.
 
-    One live rule per TradeRule, ALL actions preserved in order (keys ``a0``..``aN``),
-    ``continue_processing`` carried through, rule order becomes ``order_index``. Rules whose
-    actions all fail to convert are dropped (counted nowhere — same convention as the legacy
-    exporter's silent skip).
+    One live rule per AND-branch of each TradeRule's condition tree (one rule for an AND-only
+    tree, the common case; see ``live_rules_for_branches`` for why a split rule keeps its
+    meaning), ALL actions preserved in order (keys ``a0``..``aN``), ``continue_processing``
+    carried through, rule order becomes ``order_index``. A NOT group, or a tree wider than
+    ``rule_builders.MAX_DNF_BRANCHES`` branches, is REFUSED. Rules whose actions all fail to
+    convert are dropped (counted nowhere — same convention as the legacy exporter's silent skip).
     """
     # DEPLOY-PATH REFUSALS for market-condition gates (design sections 5/6, plan Task 8). This is
     # the ONE converter both the deploy importer and the live-export path go through, so it is
@@ -569,18 +651,10 @@ def trade_rules_to_live_export(
             where = f"{subtype} rule {rule.get('id') or i!r}"
             if conds:
                 assert_market_fields_mappable(conds, where)
-            triggers = rule_triggers_from_tree(conds, where)
-            out.append({
-                "name": rule.get("name") or f"{name}-{subtype}-{i}",
-                "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
-                "subtype": subtype,
-                "triggers": triggers,
-                "actions": actions,
-                "extra_parameters": {},
-                "continue_processing": bool(rule.get("continue_processing")
-                                            or rule.get("continueProcessing") or False),
-                "order_index": len(out),
-            })
+            out.extend(live_rules_for_branches(
+                rule.get("name") or f"{name}-{subtype}-{i}", subtype,
+                rule_trigger_sets_from_tree(conds, where), actions,
+                continue_processing_of(rule), len(out)))
         return out
 
     enter = _rules_for(entry_rules, AnalysisUseCase.ENTER_MARKET.value)
@@ -604,45 +678,39 @@ def trade_rules_to_live_export(
     return {"export_version": "1.0", "export_type": "rulesets", "rulesets": rulesets}
 
 
-def _entry_rule(
+def _entry_rules(
     name: str,
     side_action: str,
     tree: dict,
     order_index: int,
     extra_actions: Optional[Dict[str, dict]] = None,
-) -> Optional[dict]:
-    """Build one enter_market export rule from a condition tree, or None if it has no triggers.
+) -> List[dict]:
+    """The enter_market export rule(s) for ONE top-level entry branch: one per AND-branch of its
+    tree (``trigger_sets_from_condition_tree``), none when the branch has no trigger at all.
 
     ``extra_actions`` (e.g. entry-time ``adjust_take_profit``/``adjust_stop_loss`` brackets)
     are attached alongside the open action — live's per-rule bracket shape: each enter_market
     EventAction carries its own buy/sell + adjust_* actions."""
-    triggers = triggers_from_condition_tree(tree)
-    if not triggers:
-        return None
-    return {
-        "name": name,
-        "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
-        "subtype": AnalysisUseCase.ENTER_MARKET.value,
-        "triggers": triggers,
-        "actions": {"act": {"action_type": side_action}, **(extra_actions or {})},
-        "extra_parameters": {},
-        "continue_processing": False,
-        "order_index": order_index,
-    }
+    sets = trigger_sets_from_condition_tree(tree, f"enter_market rule {name!r}")
+    if len(sets) == 1 and not sets[0]:
+        return []
+    return live_rules_for_branches(
+        name, AnalysisUseCase.ENTER_MARKET.value, sets,
+        {"act": {"action_type": side_action}, **(extra_actions or {})},
+        False, order_index)
 
 
 def _or_branches(tree: Optional[dict]) -> List[dict]:
-    """Top-level OR branches of an entry tree, each an AND-group -> ONE live rule.
+    """Top-level OR branches of an entry tree -> one export NAME each (``<name>-<side>-<k>``).
 
-    The live model expresses OR via MULTIPLE rules in a ruleset (any rule's ANDed triggers match
-    -> enter); within a rule triggers are ANDed. ``triggers_from_condition_tree`` flattens ALL
-    leaves of a tree into one ANDed dict, so a top-level OR of N AND-groups MUST be split into N
-    rules here — otherwise the whole strategy collapses into one rule with every trigger ANDed,
-    which never matches. Mirrors the forward ``groups_to_tree`` (which OR-combines N groups).
-    AND/leaf trees yield a single branch (the tree itself)."""
+    Within a branch a nested OR is expanded by ``_entry_rules`` (one rule per AND-branch, names
+    ``...-or<k>``). The split here is kept so a top-level OR of N groups keeps the rule names and
+    per-branch trigger numbering it always had. Mirrors the forward ``groups_to_tree`` (which
+    OR-combines N groups). AND/leaf trees yield a single branch (the tree itself). A top-level
+    NOT is refused (``rule_builders.condition_group_operator``)."""
     if not tree:
         return []
-    op = str(tree.get("operator") or tree.get("type") or "AND").upper()
+    op = condition_group_operator(tree, "enter_market tree") if tree.get("conditions") else "AND"
     if op == "OR":
         return [b for b in (tree.get("conditions") or []) if b]
     return [tree]
@@ -687,9 +755,8 @@ def strategy_to_live_export(
             # One live rule PER OR-branch (suffix only when there's more than one, to keep names
             # stable for single-group strategies).
             rname = f"{name}-{side}" + (f"-{j + 1}" if len(branches) > 1 else "")
-            r = _entry_rule(rname, side_action, branch, len(enter_rules), entry_action_cfgs)
-            if r is not None:
-                enter_rules.append(r)
+            enter_rules.extend(_entry_rules(rname, side_action, branch, len(enter_rules),
+                                            entry_action_cfgs))
 
     op_rules: List[dict] = []
     for i, rule in enumerate(exit_rules or []):
@@ -698,20 +765,15 @@ def strategy_to_live_export(
         actions = action_from_rule(rule)
         if actions is None:
             continue
-        conds = rule.get("conditions")
-        triggers = triggers_from_condition_tree(conds) if conds else {}
-        op_rules.append(
-            {
-                "name": rule.get("name") or f"{name}-exit-{i}",
-                "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
-                "subtype": AnalysisUseCase.OPEN_POSITIONS.value,
-                "triggers": triggers,
-                "actions": actions,
-                "extra_parameters": {},
-                "continue_processing": False,
-                "order_index": i,
-            }
-        )
+        rname = rule.get("name") or f"{name}-exit-{i}"
+        # ``order_index`` keeps the row index while no rule splits (byte-identical to the old
+        # export), and stays consecutive once one does. ``continue_processing`` is the row's own
+        # (the backtest's legacy seeder honours it the same way).
+        op_rules.extend(live_rules_for_branches(
+            rname, AnalysisUseCase.OPEN_POSITIONS.value,
+            trigger_sets_from_condition_tree(rule.get("conditions"),
+                                             f"open_positions rule {rule.get('id') or i!r}"),
+            actions, continue_processing_of(rule), max(i, len(op_rules))))
 
     rulesets: List[dict] = []
     if enter_rules:

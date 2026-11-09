@@ -155,28 +155,30 @@ def _resolve_rule_lists(payload) -> tuple:
     from ba2_common.core.market_condition_rules import assert_market_rule_actions
     from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 
-    if payload.entry_rules is not None or payload.exit_rules is not None:
-        raw_exits = payload.exit_rules
-        entry, exits = (normalize_trade_rules(payload.entry_rules or []),
-                        normalize_trade_rules(payload.exit_rules or []))
-    elif any(getattr(payload, f, None) is not None for f in
-             ("entry_conditions", "buy_entry_conditions", "sell_entry_conditions",
-              "exit_conditions", "entry_actions")):
-        converted = trade_rules_from_legacy(
-            buy_tree=payload.buy_entry_conditions or payload.entry_conditions,
-            sell_tree=payload.sell_entry_conditions,
-            entry_actions=payload.entry_actions,
-            exit_conditions=payload.exit_conditions,
-        )
-        raw_exits = payload.exit_conditions
-        entry, exits = converted["entry_rules"], converted["exit_rules"]
-    else:
-        return None, None
     try:
-        # The list as SENT as well: normalizing coerces an unknown group operator (a NOT) to AND,
-        # which would hide exactly the nesting the check refuses.
-        if isinstance(raw_exits, list):
-            assert_market_rule_actions(raw_exits, "exit_rules")
+        # Normalizing refuses a NOT / unknown group operator (ValueError -> the 400 below; it used
+        # to coerce it to AND silently, so the list as SENT is still checked as well).
+        if payload.entry_rules is not None or payload.exit_rules is not None:
+            raw_exits = payload.exit_rules
+            if isinstance(raw_exits, list):
+                assert_market_rule_actions(raw_exits, "exit_rules")
+            entry, exits = (normalize_trade_rules(payload.entry_rules or []),
+                            normalize_trade_rules(payload.exit_rules or []))
+        elif any(getattr(payload, f, None) is not None for f in
+                 ("entry_conditions", "buy_entry_conditions", "sell_entry_conditions",
+                  "exit_conditions", "entry_actions")):
+            raw_exits = payload.exit_conditions
+            if isinstance(raw_exits, list):
+                assert_market_rule_actions(raw_exits, "exit_rules")
+            converted = trade_rules_from_legacy(
+                buy_tree=payload.buy_entry_conditions or payload.entry_conditions,
+                sell_tree=payload.sell_entry_conditions,
+                entry_actions=payload.entry_actions,
+                exit_conditions=payload.exit_conditions,
+            )
+            entry, exits = converted["entry_rules"], converted["exit_rules"]
+        else:
+            return None, None
         assert_market_rule_actions(exits, "exit_rules")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

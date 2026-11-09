@@ -24,6 +24,7 @@ Trigger/action JSON shapes verified against ba2_common:
 """
 from __future__ import annotations
 
+import copy
 from typing import List
 
 from sqlmodel import Session
@@ -39,7 +40,9 @@ from ba2_common.core.rule_builders import (
     tree_leaves,
     triggers_from_condition_tree,
     action_from_rule,
+    rule_trigger_sets_from_tree,
     rule_triggers_from_tree,
+    trigger_sets_from_condition_tree,
 )
 from ba2_common.core.types import (
     AnalysisUseCase,
@@ -98,7 +101,9 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
     """Seed a ruleset 1:1 from a TradeRule LIST (the unified EventAction-shaped model);
     return its id.
 
-    One ordered ``EventAction`` per rule, VERBATIM: the rule's conditions tree becomes the
+    One ordered ``EventAction`` per rule -- or, for a tree with a real OR, one per AND-branch of
+    it (``rule_builders.rule_trigger_sets_from_tree``, the expansion the live export writes; a
+    NOT group is refused) -- VERBATIM: the rule's conditions become the
     ANDed triggers (no implicit base gates — builders/converters make bullish+flat explicit),
     the rule's ordered ``actions`` list converts via the shared
     ``live_actions_from_trade_rule`` (same conversion the live export uses, so a rule seeds
@@ -107,10 +112,14 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
 
     A rule with no convertible action is skipped. Returns the ruleset id (possibly with no
     event actions if every rule was skipped). A rule whose leaves produce no trigger at all, or
-    that loses a market-condition leaf, is REFUSED (``rule_builders.rule_triggers_from_tree``,
-    the same check the live export runs): its triggers would be always true or ungated.
+    that loses a market-condition leaf, is REFUSED (``rule_builders.rule_trigger_sets_from_tree``,
+    the same check the live export runs, per branch): its triggers would be always true or ungated.
     """
-    from ba2_common.core.rules_convert import live_actions_from_trade_rule
+    from ba2_common.core.rules_convert import (
+        branch_rule_name,
+        continue_processing_of,
+        live_actions_from_trade_rule,
+    )
 
     ruleset = Ruleset(
         name=name,
@@ -127,22 +136,29 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
         actions = live_actions_from_trade_rule(rule)
         if not actions:
             continue
-        triggers = rule_triggers_from_tree(
+        # One EventAction per AND-branch of the rule's tree, the SAME expansion the live export
+        # (``rules_convert.trade_rules_to_live_export``) writes: an AND-only tree is one EventAction
+        # exactly as before; an OR tree is N consecutive ones with the same actions and flag.
+        trigger_sets = rule_trigger_sets_from_tree(
             rule.get("conditions"), f"{name}: {getattr(subtype, 'value', subtype)} rule {rule.get('id') or idx!r}")
-        ea_name = rule.get("name") or f"{name}-rule-{idx}"
-        ea_id = _make_event_action(
-            name=ea_name,
-            triggers=triggers,
-            actions=actions,
-            subtype=subtype,
-            continue_processing=bool(rule.get("continue_processing")
-                                     or rule.get("continueProcessing") or False),
-        )
-        ea_ids.append(ea_id)
-        if subtype == AnalysisUseCase.ENTER_MARKET:
-            # Read-only telemetry: which leaf each positional trigger key came from (entry gate counter).
-            register_entry_rule(ea_id, ea_name, str(rule.get("id") or ea_name),
-                                trigger_leaf_ids(rule.get("conditions")))
+        base_name = rule.get("name") or f"{name}-rule-{idx}"
+        leaf_ids = (trigger_leaf_ids(rule.get("conditions"))
+                    if subtype == AnalysisUseCase.ENTER_MARKET else None)
+        for branch, triggers in enumerate(trigger_sets):
+            ea_name = branch_rule_name(base_name, branch, len(trigger_sets))
+            ea_id = _make_event_action(
+                name=ea_name,
+                triggers=triggers,
+                actions=copy.deepcopy(actions),
+                subtype=subtype,
+                continue_processing=continue_processing_of(rule),
+            )
+            ea_ids.append(ea_id)
+            if leaf_ids is not None:
+                # Read-only telemetry: which leaf each positional trigger key came from (entry
+                # gate counter). Keys are whole-tree positions, so one map labels every branch.
+                register_entry_rule(ea_id, ea_name, str(rule.get("id") or base_name),
+                                    {k: v for k, v in leaf_ids.items() if k in triggers})
     if ea_ids:
         _link(ruleset_id, ea_ids)
     return ruleset_id
@@ -179,24 +195,32 @@ def seed_open_positions_ruleset(exit_rules, name: str = "backtest-open-positions
     )
     ruleset_id = add_instance(ruleset)
 
+    from ba2_common.core.rules_convert import branch_rule_name, continue_processing_of
+
     ea_ids = []
     for idx, rule in enumerate(exit_rules or []):
         # Build via the SHARED rule-builder core: ``action_from_rule`` accepts both the seeding
         # shape (``action_type``/``action_value``) AND the API/UI shape (``action``/``value``);
-        # ``triggers_from_condition_tree`` reconciles a leaf's ``comparison`` with ``op``/
-        # ``operator``. This is the fix for API exit rules being silently skipped.
+        # the shared trigger walk reconciles a leaf's ``comparison`` with ``op``/``operator``.
+        # This is the fix for API exit rules being silently skipped.
         action = action_from_rule(rule)
         if action is None:
             continue
-        triggers = triggers_from_condition_tree(rule.get("conditions"))
-        ea_ids.append(
-            _make_event_action(
-                name=f"{name}-rule-{idx}",
-                triggers=triggers,
-                actions=action,
-                subtype=AnalysisUseCase.OPEN_POSITIONS,
+        # One EventAction per AND-branch of the tree (the live legacy exporter,
+        # ``rules_convert.strategy_to_live_export``, expands the same way) and the row's own
+        # ``continue_processing``, which both sides used to drop (hard-coded False).
+        trigger_sets = trigger_sets_from_condition_tree(
+            rule.get("conditions"), f"{name}: open_positions rule {rule.get('id') or idx!r}")
+        for branch, triggers in enumerate(trigger_sets):
+            ea_ids.append(
+                _make_event_action(
+                    name=branch_rule_name(f"{name}-rule-{idx}", branch, len(trigger_sets)),
+                    triggers=triggers,
+                    actions=copy.deepcopy(action),
+                    subtype=AnalysisUseCase.OPEN_POSITIONS,
+                    continue_processing=continue_processing_of(rule),
+                )
             )
-        )
     if ea_ids:
         _link(ruleset_id, ea_ids)
     return ruleset_id
@@ -216,20 +240,26 @@ def _gate_triggers(tree) -> dict:
 
 
 def _gate_trigger_groups(tree) -> list:
-    """One ANDed gate-trigger set per top-level OR group, preserving OR semantics (ANY group
-    enters). The flattening ``triggers_from_condition_tree`` ANDs all leaves, which is correct
-    WITHIN a group but wrong across an OR of groups (e.g. an imported live ruleset with several
-    alternative entry conditions — long_term-group OR short_term-group). So when the tree is a
-    top-level OR of groups we emit a separate gate set per group (the caller makes one BUY rule
-    each); otherwise a single gate set. A leaf-only or AND tree yields one set unchanged."""
-    if isinstance(tree, dict):
-        op = str(tree.get("type") or tree.get("operator") or "AND").upper()
-        children = tree.get("conditions") or []
-        if op == "OR" and children and all(
-            isinstance(c, dict) and c.get("conditions") is not None for c in children
-        ):
-            return [_gate_triggers(c) for c in children]
-    return [_gate_triggers(tree)]
+    """One ANDed gate-trigger set per AND-branch of the buy tree, preserving OR semantics (ANY
+    branch enters) -- the SAME expansion the live legacy exporter
+    (``rules_convert.strategy_to_live_export``) writes: the tree's top-level OR children first
+    (``rules_convert._or_branches``, numbered from ``gate_0`` within each, as before), then any
+    OR nested inside one of them (``trigger_sets_from_condition_tree``). A leaf-only or AND tree
+    yields one set unchanged. A NOT group is refused.
+
+    Until 2026-11-09 only a top-level OR whose children were ALL groups was split here, and a
+    nested OR was flattened into an AND of every leaf (live split a top-level OR of leaves too:
+    the two sides disagreed on ``OR[leaf, leaf]``)."""
+    from ba2_common.core.rules_convert import _or_branches
+
+    if not isinstance(tree, dict):
+        return [_gate_triggers(tree)]
+    branches = _or_branches(tree) or [tree]
+    out = []
+    for branch in branches:
+        for triggers in trigger_sets_from_condition_tree(branch, "enter_market buy tree"):
+            out.append({key.replace("cond_", "gate_", 1): cfg for key, cfg in triggers.items()})
+    return out
 
 
 def _entry_actions(side: str, entry_action: "dict | None" = None,

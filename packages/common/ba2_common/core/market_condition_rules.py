@@ -174,9 +174,11 @@ _TREE_ONLY_REFUSAL = {
         "dropped from the live export and the market exit would silently not exist live"),
 }
 
-#: The only boolean group a market leaf may sit under. A nested OR is flattened to AND on the
-#: live export (``rule_builders.tree_leaves``), and a NOT -- or any other operator -- would turn
-#: "unknown -> does not fire" into "unknown -> fires".
+#: The only boolean group a market leaf may sit under on an EXIT rule. (Historically a nested OR
+#: was flattened to AND on the live export; since 2026-11-09 the converters expand an OR into one
+#: rule per branch -- ``rule_builders.condition_tree_branches`` -- and refuse NOT. This stricter
+#: exit-side rule is kept: "write each OR branch as its own rule" stays the reviewable form.) A NOT
+#: -- or any other operator -- would turn "unknown -> does not fire" into "unknown -> fires".
 _MARKET_LEAF_GROUP = "AND"
 
 
@@ -315,8 +317,8 @@ def assert_market_rule_actions(rules: Any, where: str) -> None:
             raise ValueError(
                 f"{where}: rule {rule_label!r} nests market-condition leaf/leaves under a "
                 f"non-AND group ({shown}). A market leaf may only sit in a top-level AND of "
-                f"leaves: a nested OR is flattened to AND on the live export, and a NOT (or any "
-                f"other operator) would turn 'unknown -> does not fire' into 'unknown -> fires'. "
+                f"leaves (an OR is not reviewed as a market exit), and a NOT (or any other "
+                f"operator) would turn 'unknown -> does not fire' into 'unknown -> fires'. "
                 f"Write each OR branch as its own rule.")
         _refuse_market_rule_actions(where, rule_label, [label for label, _l, _o in found],
                                     _tree_rule_action_types(rule), MARKET_RULE_ACTIONS_TREE)
