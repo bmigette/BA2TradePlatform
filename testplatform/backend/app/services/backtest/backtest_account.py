@@ -3289,9 +3289,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
              limit; STOP -> only if the bar crosses the stop (then fills at stop ±slippage).
           3. CANCEL the OCO sibling when one OCO/TP/SL leg fills (first-leg-wins close).
 
-        Activation runs first so a leg whose parent filled on THIS same bar (a same-bar
-        MARKET entry) can be evaluated against the next bar on the following call — never
-        on the entry bar (no look-ahead within a bar).
+        TP/SL brackets of an OPEN transaction are tested in ``_apply_bracket_exits`` below. An
+        entry that fills in THIS call is still WAITING here; the remainder of its fill bar
+        (fill at the open -> the bar's high/low/close) is tested after the roll, in
+        ``refresh_transactions`` (``_apply_fill_bar_brackets``), and later bars by the next calls.
 
         Step 0 is the OPTION DAY-ORDER sweep (``_expire_stale_option_limits``), which runs
         BEFORE the fill loop so an aged-out limit cannot trade on the bar it dies.
@@ -4684,8 +4685,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if parent.id is not None:
             self._fill_dates[parent.id] = as_of
 
-    def _apply_bracket_exits(self, as_of) -> bool:
+    def _apply_bracket_exits(self, as_of, only_txn_ids: Optional[set] = None) -> bool:
         """Lean TP/SL bracket exits — the replacement for WAITING_TRIGGER/OCO leg orders.
+
+        ``only_txn_ids`` restricts the pass to those transactions (the FILL-BAR pass,
+        ``_apply_fill_bar_brackets``); None = every OPEN transaction (the per-bar pass).
 
         For each OPEN transaction of THIS account carrying a ``take_profit`` and/or ``stop_loss``,
         if the current bar crosses the level, synthesize the closing order at that level (STOP wins
@@ -4704,6 +4708,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         opened = [
             (t.id, t.take_profit, t.stop_loss)
             for t in transactions_where(status=TransactionStatus.OPENED)
+            if only_txn_ids is None or t.id in only_txn_ids
         ]
 
         filled_any = False
@@ -4787,8 +4792,65 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self._apply_fill(persisted, fill_px, as_of)
                 self.invalidate_order_cache()  # a close order was persisted -> reload next bar
                 filled_any = True
+                if only_txn_ids is not None and persisted.status == OrderStatus.FILLED:
+                    c = self.fill_bar_exit_counters
+                    c["exits_on_fill_bar"] += 1
+                    c["stop_loss" if leg == "SL" else "take_profit"] += 1
                 break  # SL-first: at most one bracket close per txn per bar
         return filled_any
+
+    # ---------------------------------------------------------------------------------------------
+    # The ENTRY'S OWN FILL BAR (review 2026-11-09)
+    #
+    # A MARKET entry decided on clock D fills at the OPEN of next_bar(D). Its transaction is still
+    # WAITING when the per-bar bracket pass above runs (that pass reads OPENED transactions only),
+    # the WAITING -> OPENED roll comes after refresh_orders, and the NEXT pass tests the bar after
+    # that. So the remainder of the fill bar (open -> high/low/close) was never tested against the
+    # entry's stop / target, while live the protective legs rest at the broker from the fill and
+    # trigger on that same bar. On the daily clock that is the whole first session; on the 5-minute
+    # clock one 5-minute bar. The backtest was optimistic exactly where a fresh entry is stopped out
+    # on day one.
+    #
+    # The fix runs the SAME bracket function (same _evaluate_fill gap/slippage rules, same SL-first
+    # rule on a bar that spans both levels) once more, after the roll, for the transactions whose
+    # entry filled on that pass, against the bar the entry filled on (``next_bar(fill as_of)``,
+    # recorded at the fill so a roll at a later clock can never test a later bar). Nothing past the
+    # fill bar is read. ``same_bar_close`` fills AT the bar's close, so it has no remainder to test.
+    # ---------------------------------------------------------------------------------------------
+    @property
+    def fill_bar_exit_counters(self) -> Dict[str, int]:
+        """How many trades the fill-bar pass closed (``results["fill_bar_exits"]``)."""
+        return self.__dict__.setdefault(
+            "_fill_bar_exit_counters", {"exits_on_fill_bar": 0, "stop_loss": 0, "take_profit": 0})
+
+    def _note_entry_fill_bar(self, order, as_of) -> None:
+        """Remember that ``order`` OPENED its transaction on the bar after ``as_of`` (equity entry,
+        next-bar-open fill), so ``refresh_transactions`` tests that bar's remainder after the roll.
+        A scale-in on an already OPENED transaction is not noted: the per-bar pass tested it."""
+        if self._cfg["fill_model"] == "same_bar_close":
+            return
+        txn = get_instance(Transaction, order.transaction_id)
+        if txn is None or txn.status != TransactionStatus.WAITING:
+            return
+        if not txn.take_profit and not txn.stop_loss:
+            return
+        self.__dict__.setdefault("_entry_fill_bar_pending", {})[order.transaction_id] = as_of
+
+    def _apply_fill_bar_brackets(self) -> bool:
+        """Test each transaction noted by ``_note_entry_fill_bar`` against the remainder of its
+        entry's fill bar, through ``_apply_bracket_exits`` (one code path). Returns whether any
+        closed. Run after the WAITING -> OPENED roll; consumes the pending set."""
+        pending = self.__dict__.pop("_entry_fill_bar_pending", None)
+        if not pending:
+            return False
+        by_clock: Dict[Any, set] = {}
+        for txn_id, fill_as_of in pending.items():
+            by_clock.setdefault(fill_as_of, set()).add(txn_id)
+        closed_any = False
+        for fill_as_of in sorted(by_clock):
+            if self._apply_bracket_exits(fill_as_of, only_txn_ids=by_clock[fill_as_of]):
+                closed_any = True
+        return closed_any
 
     def refresh_transactions(self) -> bool:
         """Roll order state into transactions, then fix ``open_date``/``close_date`` to sim time.
@@ -4807,8 +4869,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             entry order's simulated fill bar (``_fill_dates[entry.id]``);
           * ``close_date`` of every transaction CLOSED on THIS bar to the current sim clock
             (the closing leg fills on the current bar; ``refresh_orders`` ran just before).
+
+        Between the roll and the re-stamp, a transaction OPENED by this roll is tested against the
+        remainder of its entry's fill bar (``_apply_fill_bar_brackets``); when that closes one, the
+        roll runs once more so the transaction is CLOSED on this same bar, as live would be.
         """
         ok = super().refresh_transactions()
+        if self._apply_fill_bar_brackets():
+            ok = super().refresh_transactions() and ok
         sim_now = self._price.now()
 
         # ---- open_date: re-stamp to the entry's SIM fill bar (overwrite wall-clock). ----
@@ -7882,6 +7950,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # An ENTRY's protective levels were built before the fill; live re-bases them to the real
         # fill the moment the entry is FILLED (TradeManager). Same function here (see below).
         if order.depends_on_order is None and order.transaction_id is not None:
+            self._note_entry_fill_bar(order, as_of)
             self._rebase_levels_at_entry_fill(order, fill_px)
 
     #: MEASUREMENT HOOK ONLY (tools/measure_variant.py ``+norebase``; tests). Never set it in a

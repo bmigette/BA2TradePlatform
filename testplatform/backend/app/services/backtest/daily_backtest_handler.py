@@ -1286,6 +1286,9 @@ def run_daily_backtest(
             # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
             results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
             results["fill_rebase"] = fill_rebase
+            # Trades closed by their stop/target on the bar the entry FILLED on (review 2026-11-09):
+            # before that fix the fill bar was never tested, so these trades survived into the next bar.
+            results["fill_bar_exits"] = dict(engine.account.fill_bar_exit_counters)
             _su_rec = engine.screener_universe_record()
             if _su_rec is not None:
                 results["screener_universe"] = _su_rec

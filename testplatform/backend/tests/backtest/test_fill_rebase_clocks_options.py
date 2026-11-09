@@ -44,7 +44,8 @@ def test_the_trade_row_carries_the_levels_after_and_before_the_fill(monkeypatch)
 def _intraday_bars():
     """5-minute bars. The decision at 09:40 prices at the close of the bar that ENDED at 09:40
     (stamped 09:35: 100); the order fills at the OPEN of the next bar (09:45: 103, +3%); the fill bar
-    is not tested; the 09:50 bar trades down to 94 (below the re-based 94.76, above the pre-fill 92)."""
+    (low 102) reaches neither level; the 09:50 bar trades down to 94 (below the re-based 94.76, above
+    the pre-fill 92)."""
     prior = [(datetime(2023, 12, 29, 9, 30 + 5 * i), 100, 100.5, 99.5, 100) for i in range(4)]
     day = [
         (datetime(2024, 1, 2, 9, 30), 100, 100.5, 99.5, 100),
