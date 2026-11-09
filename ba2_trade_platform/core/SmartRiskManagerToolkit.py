@@ -7,6 +7,7 @@ All tools are wrappers around existing platform functionality.
 
 import functools
 import json
+import math
 from typing import Dict, Any, List, Optional, Annotated
 from datetime import datetime, timedelta, timezone
 from sqlmodel import Session, select
@@ -27,6 +28,17 @@ from .interfaces import MarketExpertInterface
 from ba2_common.core.interfaces.MarketExpertInterface import log_capital_mapping
 from .TransactionHelper import TransactionHelper
 from .SmartRiskManagerPrompts import NETTING_RULE_SENTENCE
+
+
+# Marker for an open position whose live price could not be read. LIVE DATA, NO FALLBACKS:
+# the position is still listed (hiding it from the risk manager is worse), but its price,
+# P&L and value are None and every renderer prints this marker instead of a number.
+PRICE_UNAVAILABLE = "PRICE UNAVAILABLE"
+
+
+def position_price_unavailable(pos: Dict[str, Any]) -> bool:
+    """True when an ``open_positions`` entry carries no live price (see PRICE_UNAVAILABLE)."""
+    return pos.get("price_available") is False or pos.get("current_price") is None
 
 
 class SmartRiskManagerToolkit:
@@ -217,15 +229,36 @@ class SmartRiskManagerToolkit:
                 total_position_value = 0.0
                 total_pending_value = 0.0
                 largest_position_value = 0.0
-                
+                # Positions listed WITHOUT a live price: excluded from the totals above,
+                # which are then reported as partial (never as if those positions were flat).
+                price_unavailable_positions = []
+
                 for trans in transactions:
-                    # Get current price
+                    # Get current price. LIVE DATA, NO FALLBACKS: a failed lookup leaves the
+                    # price unknown -- substituting the entry price showed the risk manager a
+                    # stale price and a 0.00% P&L that it then decided closes and TP/SL on.
+                    price_error = None
                     try:
                         current_price = self.account.get_instrument_current_price(trans.symbol)
                     except Exception as e:
-                        logger.error(f"Failed to get current price for {trans.symbol}: {e}")
-                        current_price = trans.open_price  # Fallback
-                    
+                        current_price = None
+                        price_error = f"{type(e).__name__}: {e}"
+                    if price_error is None:
+                        try:
+                            usable = float(current_price)
+                        except (TypeError, ValueError):
+                            usable = None
+                        if usable is None or not math.isfinite(usable) or usable <= 0:
+                            price_error = f"no usable price returned ({current_price!r})"
+                            current_price = None
+                        else:
+                            current_price = usable
+                    if price_error is not None:
+                        logger.error(
+                            f"Smart RM: live price for {trans.symbol} (transaction #{trans.id}) "
+                            f"is unavailable ({price_error}); the position is listed with "
+                            f"{PRICE_UNAVAILABLE} and excluded from the P&L/exposure totals")
+
                     # Get actual quantity from filled orders
                     # abs() because get_current_open_qty() returns signed qty (negative for shorts)
                     # and direction is already handled separately in the P&L if/else below
@@ -241,18 +274,43 @@ class SmartRiskManagerToolkit:
                     if not direction or not trans.open_price or quantity == 0:
                         logger.warning(f"Skipping transaction {trans.id} ({trans.symbol}) - direction={direction}, open_price={trans.open_price}, quantity={quantity}")
                         continue
-                    
+
+                    # Get TP/SL order dicts - handles OCO, SELL_LIMIT/SELL_STOP, BUY_LIMIT/BUY_STOP
+                    tpsl_dicts = TransactionHelper.get_tpsl_order_dicts(trans, session)
+
+                    if current_price is None:
+                        # Listed, but with NO price, P&L or value: an explicit unknown.
+                        open_positions.append({
+                            "transaction_id": trans.id,
+                            "symbol": trans.symbol,
+                            "direction": direction.value,
+                            "quantity": quantity,
+                            "entry_price": trans.open_price,
+                            "current_price": None,
+                            "price_available": False,
+                            "price_status": (f"{PRICE_UNAVAILABLE} (live price lookup failed: "
+                                             f"{price_error}); P&L and value unknown"),
+                            "unrealized_pnl": None,
+                            "unrealized_pnl_pct": None,
+                            "position_value": None,
+                            "tp_order": tpsl_dicts["tp_order"],
+                            "sl_order": tpsl_dicts["sl_order"]
+                        })
+                        price_unavailable_positions.append({
+                            "transaction_id": trans.id,
+                            "symbol": trans.symbol,
+                            "error": price_error,
+                        })
+                        continue
+
                     # Calculate P&L
                     if direction == OrderDirection.BUY:
                         unrealized_pnl = (current_price - trans.open_price) * quantity
                     else:  # SELL
                         unrealized_pnl = (trans.open_price - current_price) * quantity
-                    
+
                     unrealized_pnl_pct = (unrealized_pnl / (trans.open_price * quantity)) * 100 if trans.open_price > 0 else 0.0
                     position_value = current_price * quantity
-                    
-                    # Get TP/SL order dicts - handles OCO, SELL_LIMIT/SELL_STOP, BUY_LIMIT/BUY_STOP
-                    tpsl_dicts = TransactionHelper.get_tpsl_order_dicts(trans, session)
 
                     position_data = {
                         "transaction_id": trans.id,
@@ -261,13 +319,14 @@ class SmartRiskManagerToolkit:
                         "quantity": quantity,
                         "entry_price": trans.open_price,
                         "current_price": current_price,
+                        "price_available": True,
                         "unrealized_pnl": round(unrealized_pnl, 2),
                         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
                         "position_value": round(position_value, 2),
                         "tp_order": tpsl_dicts["tp_order"],
                         "sl_order": tpsl_dicts["sl_order"]
                     }
-                    
+
                     open_positions.append(position_data)
                     total_unrealized_pnl += unrealized_pnl
                     total_position_value += position_value
@@ -325,7 +384,17 @@ class SmartRiskManagerToolkit:
                 balance_pct_available = (available_balance / virtual_balance * 100) if virtual_balance > 0 else 0.0
                 largest_position_pct = (largest_position_value / virtual_balance * 100) if virtual_balance > 0 else 0.0
                 pending_value_pct = (total_pending_value / virtual_balance * 100) if virtual_balance > 0 else 0.0
-                
+
+                totals_partial = bool(price_unavailable_positions)
+                if totals_partial:
+                    missing = ", ".join(f"{p['symbol']} (#{p['transaction_id']})"
+                                        for p in price_unavailable_positions)
+                    totals_note = (f"PARTIAL: total_unrealized_pnl, total_position_value and "
+                                   f"largest_position_pct EXCLUDE {len(price_unavailable_positions)} "
+                                   f"position(s) whose live price is unavailable: {missing}")
+                else:
+                    totals_note = "complete: every open position has a live price"
+
                 result = {
                     "account_virtual_equity": round(virtual_balance, 2),
                     "account_available_balance": round(available_balance, 2),
@@ -336,14 +405,18 @@ class SmartRiskManagerToolkit:
                     "pending_positions": pending_positions,
                     "total_unrealized_pnl": round(total_unrealized_pnl, 2),
                     "total_position_value": round(total_position_value, 2),
+                    "totals_partial": totals_partial,
+                    "totals_note": totals_note,
+                    "price_unavailable_positions": price_unavailable_positions,
                     "risk_metrics": {
                         "largest_position_pct": round(largest_position_pct, 2),
+                        "largest_position_pct_partial": totals_partial,
                         "num_positions": len(open_positions),
                         "num_pending": len(pending_positions)
                     }
                 }
-                
-                logger.debug(f"Portfolio status: {len(open_positions)} open positions, {len(pending_positions)} pending, virtual_balance=${virtual_balance:,.2f}, available_balance=${available_balance:,.2f}, pending_value=${total_pending_value:,.2f}, unrealized_pnl={total_unrealized_pnl}")
+
+                logger.debug(f"Portfolio status: {len(open_positions)} open positions, {len(pending_positions)} pending, virtual_balance=${virtual_balance:,.2f}, available_balance=${available_balance:,.2f}, pending_value=${total_pending_value:,.2f}, unrealized_pnl={total_unrealized_pnl} (totals {totals_note})")
                 return result
                 
         except Exception as e:
@@ -397,6 +470,9 @@ class SmartRiskManagerToolkit:
                 "account_available_balance": portfolio_status["account_available_balance"],
                 "filled_positions": portfolio_status["open_positions"],
                 "pending_positions": portfolio_status["pending_positions"],
+                "totals_partial": portfolio_status["totals_partial"],
+                "totals_note": portfolio_status["totals_note"],
+                "price_unavailable_positions": portfolio_status["price_unavailable_positions"],
                 "future_transactions": []
             }
             
@@ -438,15 +514,23 @@ class SmartRiskManagerToolkit:
         filled = transactions_data.get("filled_positions", [])
         md.append(f"## Filled Positions ({len(filled)} total)")
         md.append("")
+        if transactions_data.get("totals_partial"):
+            md.append(f"⚠️ **{transactions_data['totals_note']}**")
+            md.append("")
         if filled:
             for pos in filled:
                 md.append(f"### Transaction #{pos['transaction_id']}: {pos['symbol']}")
                 md.append(f"- **Direction:** {pos['direction'].upper()}")
                 md.append(f"- **Quantity:** {pos['quantity']} shares")
                 md.append(f"- **Entry Price:** ${pos['entry_price']:.2f}")
-                md.append(f"- **Current Price:** ${pos['current_price']:.2f}")
-                md.append(f"- **P&L:** {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:,.2f})")
-                md.append(f"- **Position Value:** ${pos['position_value']:,.2f}")
+                if position_price_unavailable(pos):
+                    md.append(f"- **Current Price:** ⚠️ {pos.get('price_status') or PRICE_UNAVAILABLE}")
+                    md.append(f"- **P&L:** UNKNOWN ({PRICE_UNAVAILABLE} - do NOT assume 0%)")
+                    md.append(f"- **Position Value:** UNKNOWN ({PRICE_UNAVAILABLE})")
+                else:
+                    md.append(f"- **Current Price:** ${pos['current_price']:.2f}")
+                    md.append(f"- **P&L:** {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:,.2f})")
+                    md.append(f"- **Position Value:** ${pos['position_value']:,.2f}")
                 
                 tp_order = pos.get("tp_order")
                 sl_order = pos.get("sl_order")
@@ -1531,6 +1615,79 @@ class SmartRiskManagerToolkit:
                 "new_quantity": new_quantity
             }
 
+    def _check_tp_sl_update(
+        self,
+        session,
+        transaction_id: int,
+        new_tp_price: Optional[float] = None,
+        new_sl_price: Optional[float] = None,
+    ) -> "tuple[Optional[Transaction], Optional[str]]":
+        """The checks EVERY take-profit / stop-loss update must pass before anything reaches the
+        broker -- ONE implementation for ``update_stop_loss``, ``update_take_profit`` and the
+        combined ``update_tp_sl``:
+
+          1. the transaction belongs to this expert (``_validate_transaction_ownership``);
+          2. it exists and is WAITING or OPENED;
+          3. it has an entry order (whose side says long or short);
+          4. a live current price is available (no price -> refuse, never guess);
+          5. each new price is on the correct side of the current price: a long's SL below
+             and TP above it, reversed for a short.
+
+        Returns ``(transaction, None)`` when every check passes. On a refusal returns
+        ``(transaction_or_None, message)``: the transaction is None for checks 1-3 (they run
+        before its current TP/SL are read, so callers report no old price, as before) and set
+        for checks 4-5. An exception from the price lookup propagates to the caller's handler.
+        """
+        if new_tp_price is not None and new_sl_price is not None:
+            leg = "TP/SL"
+        elif new_sl_price is not None:
+            leg = "SL"
+        else:
+            leg = "TP"
+
+        # SECURITY CHECK: Validate transaction belongs to this expert
+        try:
+            self._validate_transaction_ownership(transaction_id)
+        except ValueError as e:
+            logger.error(f"Transaction ownership validation failed: {e}")
+            return None, str(e)
+
+        transaction = session.get(Transaction, transaction_id)
+        if not transaction:
+            return None, f"Transaction {transaction_id} not found"
+
+        # Allow modification for WAITING or OPENED transactions
+        if transaction.status not in [TransactionStatus.WAITING, TransactionStatus.OPENED]:
+            return None, f"Cannot modify {leg} for {transaction.status} transaction. Only WAITING or OPENED allowed."
+
+        # Get entry order
+        if not transaction.trading_orders:
+            return None, f"Transaction has no orders - cannot update {leg}"
+        entry_order = transaction.trading_orders[0]
+
+        # Validate the new price(s) against the LIVE price
+        current_price = self.account.get_instrument_current_price(transaction.symbol)
+        if current_price is None or current_price <= 0:
+            return transaction, f"Could not get current price for {transaction.symbol}"
+
+        refusals = []
+        if entry_order.side == OrderDirection.BUY:
+            # Long: SL below and TP above the current price
+            if new_sl_price is not None and new_sl_price >= current_price:
+                refusals.append(f"Stop loss price {new_sl_price:.2f} must be below current price {current_price:.2f} for long position")
+            if new_tp_price is not None and new_tp_price <= current_price:
+                refusals.append(f"Take profit price {new_tp_price:.2f} must be above current price {current_price:.2f} for long position")
+        else:  # SELL
+            # Short: SL above and TP below the current price
+            if new_sl_price is not None and new_sl_price <= current_price:
+                refusals.append(f"Stop loss price {new_sl_price:.2f} must be above current price {current_price:.2f} for short position")
+            if new_tp_price is not None and new_tp_price >= current_price:
+                refusals.append(f"Take profit price {new_tp_price:.2f} must be below current price {current_price:.2f} for short position")
+        if refusals:
+            return transaction, "; ".join(refusals)
+
+        return transaction, None
+
     def update_stop_loss(
         self,
         transaction_id: Annotated[int, "ID of the position to update stop loss for"],
@@ -1554,86 +1711,21 @@ class SmartRiskManagerToolkit:
         """
         try:
             logger.info(f"Updating stop loss for transaction {transaction_id} to {new_sl_price}. Reason: {reason}")
-            
-            # SECURITY CHECK: Validate transaction belongs to this expert
-            try:
-                self._validate_transaction_ownership(transaction_id)
-            except ValueError as e:
-                logger.error(f"Transaction ownership validation failed: {e}")
-                return {
-                    "success": False,
-                    "message": str(e),
-                    "order_id": None,
-                    "old_sl_price": None,
-                    "new_sl_price": new_sl_price
-                }
-            
+
             with get_db() as session:
-                transaction = session.get(Transaction, transaction_id)
-                if not transaction:
+                # Ownership, existence, status, entry order, live price and side checks.
+                transaction, refusal = self._check_tp_sl_update(session, transaction_id,
+                                                                new_sl_price=new_sl_price)
+                if refusal is not None:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} not found",
+                        "message": refusal,
                         "order_id": None,
-                        "old_sl_price": None,
+                        "old_sl_price": transaction.stop_loss if transaction is not None else None,
                         "new_sl_price": new_sl_price
                     }
-                
-                # Allow modification for WAITING or OPENED transactions
-                if transaction.status not in [TransactionStatus.WAITING, TransactionStatus.OPENED]:
-                    return {
-                        "success": False,
-                        "message": f"Cannot modify SL for {transaction.status} transaction. Only WAITING or OPENED allowed.",
-                        "order_id": None,
-                        "old_sl_price": None,
-                        "new_sl_price": new_sl_price
-                    }
-                
-                # Get entry order
-                if not transaction.trading_orders:
-                    return {
-                        "success": False,
-                        "message": "Transaction has no orders - cannot update SL",
-                        "order_id": None,
-                        "old_sl_price": None,
-                        "new_sl_price": new_sl_price
-                    }
-                
-                entry_order = transaction.trading_orders[0]
                 old_sl_price = transaction.stop_loss
-                
-                # Validate new SL price
-                current_price = self.account.get_instrument_current_price(transaction.symbol)
-                if current_price is None:
-                    return {
-                        "success": False,
-                        "message": f"Could not get current price for {transaction.symbol}",
-                        "order_id": None,
-                        "old_sl_price": old_sl_price,
-                        "new_sl_price": new_sl_price
-                    }
-                
-                if entry_order.side == OrderDirection.BUY:
-                    # For long positions, SL must be below current price
-                    if new_sl_price >= current_price:
-                        return {
-                            "success": False,
-                            "message": f"Stop loss price {new_sl_price:.2f} must be below current price {current_price:.2f} for long position",
-                            "order_id": None,
-                            "old_sl_price": old_sl_price,
-                            "new_sl_price": new_sl_price
-                        }
-                else:  # SELL
-                    # For short positions, SL must be above current price
-                    if new_sl_price <= current_price:
-                        return {
-                            "success": False,
-                            "message": f"Stop loss price {new_sl_price:.2f} must be above current price {current_price:.2f} for short position",
-                            "order_id": None,
-                            "old_sl_price": old_sl_price,
-                            "new_sl_price": new_sl_price
-                        }
-                
+
                 # Use AccountInterface's adjust_sl method - stateless operation that determines action based on current state
                 try:
                     success = self.account.adjust_sl(transaction, new_sl_price, source="smart_risk_manager")
@@ -1698,86 +1790,21 @@ class SmartRiskManagerToolkit:
         """
         try:
             logger.info(f"Updating take profit for transaction {transaction_id} to {new_tp_price}. Reason: {reason}")
-            
-            # SECURITY CHECK: Validate transaction belongs to this expert
-            try:
-                self._validate_transaction_ownership(transaction_id)
-            except ValueError as e:
-                logger.error(f"Transaction ownership validation failed: {e}")
-                return {
-                    "success": False,
-                    "message": str(e),
-                    "order_id": None,
-                    "old_tp_price": None,
-                    "new_tp_price": new_tp_price
-                }
-            
+
             with get_db() as session:
-                transaction = session.get(Transaction, transaction_id)
-                if not transaction:
+                # Ownership, existence, status, entry order, live price and side checks.
+                transaction, refusal = self._check_tp_sl_update(session, transaction_id,
+                                                                new_tp_price=new_tp_price)
+                if refusal is not None:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} not found",
+                        "message": refusal,
                         "order_id": None,
-                        "old_tp_price": None,
+                        "old_tp_price": transaction.take_profit if transaction is not None else None,
                         "new_tp_price": new_tp_price
                     }
-                
-                # Allow modification for WAITING or OPENED transactions
-                if transaction.status not in [TransactionStatus.WAITING, TransactionStatus.OPENED]:
-                    return {
-                        "success": False,
-                        "message": f"Cannot modify TP for {transaction.status} transaction. Only WAITING or OPENED allowed.",
-                        "order_id": None,
-                        "old_tp_price": None,
-                        "new_tp_price": new_tp_price
-                    }
-                
-                # Get entry order
-                if not transaction.trading_orders:
-                    return {
-                        "success": False,
-                        "message": "Transaction has no orders - cannot update TP",
-                        "order_id": None,
-                        "old_tp_price": None,
-                        "new_tp_price": new_tp_price
-                    }
-                
-                entry_order = transaction.trading_orders[0]
                 old_tp_price = transaction.take_profit
-                
-                # Validate new TP price
-                current_price = self.account.get_instrument_current_price(transaction.symbol)
-                if current_price is None:
-                    return {
-                        "success": False,
-                        "message": f"Could not get current price for {transaction.symbol}",
-                        "order_id": None,
-                        "old_tp_price": old_tp_price,
-                        "new_tp_price": new_tp_price
-                    }
-                
-                if entry_order.side == OrderDirection.BUY:
-                    # For long positions, TP must be above current price
-                    if new_tp_price <= current_price:
-                        return {
-                            "success": False,
-                            "message": f"Take profit price {new_tp_price:.2f} must be above current price {current_price:.2f} for long position",
-                            "order_id": None,
-                            "old_tp_price": old_tp_price,
-                            "new_tp_price": new_tp_price
-                        }
-                else:  # SELL
-                    # For short positions, TP must be below current price
-                    if new_tp_price >= current_price:
-                        return {
-                            "success": False,
-                            "message": f"Take profit price {new_tp_price:.2f} must be below current price {current_price:.2f} for short position",
-                            "order_id": None,
-                            "old_tp_price": old_tp_price,
-                            "new_tp_price": new_tp_price
-                        }
-                
+
                 # Use AccountInterface's adjust_tp method - stateless operation that determines action based on current state
                 try:
                     success = self.account.adjust_tp(transaction, new_tp_price, source="smart_risk_manager")
@@ -1818,6 +1845,71 @@ class SmartRiskManagerToolkit:
                 "old_tp_price": None,
                 "new_tp_price": new_tp_price
             }
+
+    def update_tp_sl(
+        self,
+        transaction_id: Annotated[int, "ID of the position to update take profit and stop loss for"],
+        new_tp_price: Annotated[float, "New take profit price"],
+        new_sl_price: Annotated[float, "New stop loss price"],
+        reason: Annotated[str, "Reason for updating take profit and stop loss"]
+    ) -> Dict[str, Any]:
+        """
+        Update BOTH take profit and stop loss of a position in ONE broker call.
+
+        Runs exactly the checks ``update_stop_loss`` and ``update_take_profit`` run (shared
+        ``_check_tp_sl_update``: ownership, status, entry order, live price, side of each
+        price); on any refusal nothing is sent to the broker.
+
+        Returns:
+            Result dict with success, message, transaction_id, order_id, old/new TP and SL prices
+        """
+        def _result(success, message, old_tp=None, old_sl=None):
+            return {
+                "success": success,
+                "message": message,
+                "transaction_id": transaction_id,
+                "order_id": None,  # adjust_tp_sl doesn't return order ID
+                "old_tp_price": old_tp,
+                "new_tp_price": new_tp_price,
+                "old_sl_price": old_sl,
+                "new_sl_price": new_sl_price
+            }
+
+        try:
+            logger.info(f"Updating TP to {new_tp_price} and SL to {new_sl_price} for transaction {transaction_id}. Reason: {reason}")
+
+            if new_tp_price is None or new_sl_price is None:
+                return _result(False, f"update_tp_sl needs both prices (got TP={new_tp_price}, SL={new_sl_price})")
+
+            with get_db() as session:
+                transaction, refusal = self._check_tp_sl_update(
+                    session, transaction_id, new_tp_price=new_tp_price, new_sl_price=new_sl_price)
+                if refusal is not None:
+                    logger.warning(f"Refused TP/SL update for transaction {transaction_id}: {refusal}")
+                    if transaction is None:
+                        return _result(False, refusal)
+                    return _result(False, refusal, transaction.take_profit, transaction.stop_loss)
+
+                old_tp_price = transaction.take_profit
+                old_sl_price = transaction.stop_loss
+                try:
+                    success = self.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price,
+                                                        source="smart_risk_manager")
+                except Exception as e:
+                    logger.error(f"Error calling account.adjust_tp_sl: {e}", exc_info=True)
+                    return _result(False, f"Error updating TP/SL: {str(e)}", old_tp_price, old_sl_price)
+
+                if success:
+                    logger.info(f"Successfully updated both TP and SL for transaction {transaction_id}")
+                    return _result(True, f"Updated both TP to ${new_tp_price:.2f} and SL to ${new_sl_price:.2f}",
+                                   old_tp_price, old_sl_price)
+                logger.warning(f"Failed to update TP/SL for transaction {transaction_id}")
+                return _result(False, f"Failed to update TP/SL for transaction {transaction_id} - likely entry order not yet filled",
+                               old_tp_price, old_sl_price)
+
+        except Exception as e:
+            logger.error(f"Error updating TP/SL for transaction {transaction_id}: {e}", exc_info=True)
+            return _result(False, f"Error: {str(e)}")
 
     def open_buy_position(
         self,
