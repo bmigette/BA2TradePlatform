@@ -4550,14 +4550,14 @@ def _option_entry_action_for(kind: str) -> dict:
     so it was inert and the selector kept handing the fill engine contracts it would reject.
     """
     cfg = dict(_OPTION_STRATS[kind])
-    # FIXED, not a gene (plan 2026-09-24 Task 8, stage-1 relaunch): a budget that rounds to 0
-    # contracts buys 1 when it fits under the per-instrument cap, instead of refusing ~half the
-    # expensive-premium entries (the O_LP diagnosis). Shared live/backtest sizing reads it.
-    # EXCEPT every O_CONVEX* key (operator decision 2026-09-25): convex harvest is "many small
-    # tickets at ~1% sizing, no single ticket may dominate", and the floor would let one ticket
-    # the budget cannot afford grow to the per-instrument cap (searched up to 50%).
-    if not kind.startswith("O_CONVEX"):
-        cfg.setdefault("option_min_one_contract", True)
+    # The 1-contract floor (``option_min_one_contract``) is OFF for every grid job (owner decision
+    # 2026-11-09). From 2026-09-24 (plan Task 8) to 2026-11-09 the launcher set it True on every
+    # key except O_CONVEX*: a budget that rounded to 0 contracts bought 1 up to the per-instrument
+    # cap. Live (8082 inst 3) that let ONE MU bull call spread take 39% of a 5%-sized instrument,
+    # 64% of its equity across four floored spreads. A contract the sizing budget cannot afford is
+    # now refused, in the backtest and live alike; the wider sizing band (_OPTION_SIZING_BANDS 5.0
+    # row, 1-15%) lets the GA choose a bigger size openly instead. Runs launched before this change
+    # carried the floor; the shared sizing still honours an explicit ``option_min_one_contract``.
     _apply_option_min_volume(cfg)
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)
@@ -4666,7 +4666,9 @@ def _apply_option_min_arc_gene(cfg: dict) -> dict:
 # covered would silently keep a frozen size while every sibling searched one.
 _OPTION_SIZING_BANDS = {
     #  authored: (min, max, step)
-    5.0:  (1.0, 10.0, 1.0),    # long premium: floor at 1% (a real 1-contract bet), cap at 2x
+    # long premium: floor at 1% (a real 1-contract bet). Ceiling 10% (2x) until 2026-11-09, then 15%
+    # when the 1-contract floor went OFF, so expensive names are reached by an explicit size.
+    5.0:  (1.0, 15.0, 1.0),
     8.0:  (2.0, 16.0, 2.0),    # butterfly
     15.0: (5.0, 30.0, 2.5),    # defined-risk / skewed credit
     # neutral credit + full-notional. The 50% top is set by the full-notional structures: a

@@ -18,11 +18,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 19,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -220,11 +219,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 15,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -414,11 +412,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 15,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -608,13 +605,12 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 16,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_short_dte_max": 45,
       "option_short_dte_min": 30,
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -2619,7 +2615,7 @@
     "type": "float"
    },
    "entry:o_cbs-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -2715,7 +2711,7 @@
     "type": "float"
    },
    "entry:o_leapc-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -2745,7 +2741,7 @@
     "type": "float"
    },
    "entry:o_leapp-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -2775,7 +2771,7 @@
     "type": "float"
    },
    "entry:o_pmcc-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -3091,11 +3087,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 13,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -3239,11 +3234,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 13,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -3419,11 +3413,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 12,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -3553,11 +3546,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 12,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -3719,11 +3711,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 4,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -3928,7 +3919,6 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 5,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 8.0,
@@ -4132,11 +4122,10 @@
       "option_entry_cross_optimize": true,
       "option_entry_cross_step": 0.05,
       "option_entry_tag": 1,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "debit",
       "option_sizing": 5.0,
-      "option_sizing_max": 10.0,
+      "option_sizing_max": 15.0,
       "option_sizing_min": 1.0,
       "option_sizing_optimize": true,
       "option_sizing_step": 1.0,
@@ -5686,7 +5675,7 @@
     "type": "float"
    },
    "entry:o_bullcs-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -5732,7 +5721,7 @@
     "type": "float"
    },
    "entry:o_lc-entry:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -5778,7 +5767,7 @@
     "type": "float"
    },
    "entry:o_strd-entry-hold:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -5802,7 +5791,7 @@
     "type": "float"
    },
    "entry:o_strd-entry-low_confidence:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -5826,7 +5815,7 @@
     "type": "float"
    },
    "entry:o_strg-entry-hold:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -5872,7 +5861,7 @@
     "type": "float"
    },
    "entry:o_strg-entry-low_confidence:a0:option_sizing": {
-    "max": 10.0,
+    "max": 15.0,
     "min": 1.0,
     "step": 1.0,
     "type": "float"
@@ -6213,7 +6202,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.05,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 20.0,
@@ -6430,7 +6418,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.05,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 20.0,
@@ -6647,7 +6634,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.5,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 15.0,
@@ -6861,7 +6847,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.05,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 20.0,
@@ -7073,7 +7058,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.05,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 15.0,
@@ -7573,7 +7557,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.5,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 20.0,
@@ -7721,7 +7704,6 @@
       "option_min_arc_min": 0.0,
       "option_min_arc_optimize": true,
       "option_min_arc_step": 0.5,
-      "option_min_one_contract": true,
       "option_min_volume": 25,
       "option_selection_half": "credit",
       "option_sizing": 20.0,

@@ -7,8 +7,10 @@ These pin the WIRING, because the failure this project keeps hitting is a knob t
 stored and logged at every layer and then dropped by one whitelist, so the grid runs without it
 while every log says it is on (memory: "trial-config whitelist drops new knobs").
 
-It is a FIXED param for the stage-1 relaunch, NOT a gene: the plan decided the floor, the GA
-does not get to search whether to use it.
+It was a FIXED param from the stage-1 relaunch (2026-09-24) to 2026-11-09; the owner then turned it
+OFF for every grid job (live 8082 inst 3: one floored MU spread took 39% of a 5%-sized instrument).
+The launcher no longer authors it, but the shared path must still carry an EXPLICIT value (old
+stored rows, deploys), so the wiring tests below set it on the action by hand.
 """
 import importlib.util
 import os
@@ -39,10 +41,11 @@ def test_the_convex_exclusion_is_not_vacuous():
     assert _FLOORED
 
 
-@pytest.mark.parametrize("kind", _FLOORED)
-def test_every_non_convex_pure_option_entry_carries_the_floor_as_a_fixed_param(kind):
+@pytest.mark.parametrize("kind", _SINGLES)
+def test_no_pure_option_entry_carries_the_floor_any_more(kind):
+    """OFF for every grid job since 2026-11-09 (owner): a contract the budget cannot afford is refused."""
     cfg = mod._option_entry_action_for(kind)
-    assert cfg["option_min_one_contract"] is True
+    assert "option_min_one_contract" not in cfg, cfg
 
 
 @pytest.mark.parametrize("kind", _CONVEX)
@@ -82,7 +85,14 @@ def test_the_overlay_actions_do_not_carry_it():
 
 
 def _decoded_entry_action(kind):
+    """The floor set EXPLICITLY on the authored entry action (the launcher no longer authors it)."""
     strat = mod._build_strategy_option(kind)
+    for rule in strat.entry_rules:
+        for a in rule.get("actions") or []:
+            if isinstance(a, dict) and "option_sizing" in a:
+                a["option_min_one_contract"] = True
+    if isinstance(getattr(strat, "entry_action", None), dict):
+        strat.entry_action["option_min_one_contract"] = True
     decoded = decode_params(strat, {})
     actions = [a for r in decoded["entry_rules"] for a in (r.get("actions") or [])
                if isinstance(a, dict) and a.get("option_min_one_contract") is not None]

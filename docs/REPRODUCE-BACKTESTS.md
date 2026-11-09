@@ -696,7 +696,7 @@ What the discovery profile runs:
 | Job-name suffix | `STAGE1_SUFFIX=-st1fix` (the current run) | env |
 | Robust fitness (concentration × Monte Carlo × spread) | on by default; `STAGE1_ROBUST=0` opts out and needs its own suffix | env |
 | Fill-volume sizing | `--option-size-within-fill-volume` (always passed by the script) | flag |
-| 1-contract floor | `option_min_one_contract=True` on every entry except `O_CONVEX*` | code default, `ba2test_launcher.py:3422` |
+| 1-contract floor | `option_min_one_contract=True` on every entry except `O_CONVEX*` for runs launched before TEST 2026.11.0187; OFF for every entry from TEST 0187 (2026-11-09), when the 5% sizing band went 1-10 -> 1-15 | code default, `ba2test_launcher.py` `_option_entry_action_for` |
 | Entry cross 0.75-1.0 (step 0.05) | `_OPTION_ENTRY_CROSS_BAND` gene | code default, `ba2test_launcher.py:3682` |
 | DS `macro_short_side="mirror"` on option jobs | spec `option_fixed_settings` (part of the job digest) | code, `ba2test_launcher.py:1363` |
 | Market-condition gates | `MARKET_CONDITION_PROFILE=ohlcv-v1,ta-structure-v1`, `MARKET_CONDITION_MANIFEST=ohlcv-v1=<d>,ta-structure-v1=<d>` | env |
