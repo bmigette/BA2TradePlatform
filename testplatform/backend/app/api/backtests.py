@@ -431,7 +431,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     Fail-early validation (``backend/CLAUDE.md``): the expert class must be supported, and a
     ``static`` universe must be non-empty.
     """
-    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS, new_job_expert_settings
 
     expert = backtest.expert or {}
     expert_class = expert.get("class")
@@ -442,7 +442,10 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
             status_code=400,
             detail=f"unsupported expert '{expert_class}'; supported: {sorted(_SUPPORTED_EXPERTS)}",
         )
-    expert_settings = expert.get("settings") or {}
+    # A NEW run states the current default of every setting whose default changed after results
+    # were produced (stored on the row as expertSettings, so a re-run/deploy reads it back); an
+    # unstated one would be read as a pre-change run (ba2_common.core.legacy_setting_defaults).
+    expert_settings = new_job_expert_settings(expert_class, expert.get("settings") or {})
 
     universe = backtest.universe or {}
     mode = universe.get("mode")
@@ -740,6 +743,8 @@ def create_daily_backtest(
     new row id.
     The ``daily_backtest`` handler runs the engine and persists the results onto the row.
     """
+    from app.services.backtest.daily_backtest_handler import new_job_expert_specs
+
     # Validate fail-early (no defaults).
     if not request.enabled_instruments:
         raise HTTPException(status_code=400, detail="enabled_instruments must be non-empty")
@@ -790,7 +795,8 @@ def create_daily_backtest(
             'backtest_id': db_backtest.id,
             'name': request.name,
             'enabled_instruments': request.enabled_instruments,
-            'experts': request.experts,
+            # a NEW run states every changed default (ba2_common.core.legacy_setting_defaults)
+            'experts': new_job_expert_specs(request.experts),
             'start_date': request.start_date,
             'end_date': request.end_date,
             'initial_capital': request.initial_capital,

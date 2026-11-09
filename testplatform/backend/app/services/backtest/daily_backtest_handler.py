@@ -1646,13 +1646,57 @@ def _build_experts(
     return out
 
 
+def new_job_expert_settings(class_name: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """The expert settings a NEW job records: ``settings`` plus the CURRENT definition default of
+    every setting whose default changed after results were produced
+    (``ba2_common.core.legacy_setting_defaults``). Without it the job's config would not state the
+    key, and ``_expert_decision_settings`` reads an unstated changed key as the LEGACY value.
+
+    Call it where a job/run config is CREATED (launcher optimize/optimize-batch, the optimize and
+    backtest APIs), never on a stored config. Experts without a changed default come back
+    unchanged (a copy), without being resolved."""
+    import importlib
+    from ba2_common.core.legacy_setting_defaults import materialise_current_defaults
+
+    def _definitions(name: str) -> Dict[str, Any]:
+        module = importlib.import_module(_SUPPORTED_EXPERTS[name])
+        return getattr(module, name).get_settings_definitions()
+
+    return materialise_current_defaults(class_name, settings, _definitions)
+
+
+def new_job_expert_specs(specs: List[Any]) -> List[Any]:
+    """A NEW job's ``experts`` list with :func:`new_job_expert_settings` applied to each spec. A bare
+    class-name spec becomes ``{"class", "settings"}`` only when that expert has a changed default;
+    every other spec is returned as given (an unknown class is left for the handler to refuse)."""
+    out: List[Any] = []
+    for spec in specs:
+        if isinstance(spec, dict) and spec.get("class"):
+            settings = spec.get("settings") or {}
+            stated = new_job_expert_settings(spec["class"], settings)
+            out.append(spec if stated == settings else {**spec, "settings": stated})
+        elif isinstance(spec, str):
+            stated = new_job_expert_settings(spec, {})
+            out.append({"class": spec, "settings": stated} if stated else spec)
+        else:
+            out.append(spec)
+    return out
+
+
 def _expert_decision_settings(expert_cls: Any, overrides: Dict[str, Any]) -> Dict[str, Any]:
     """Resolve the expert's decision settings dict: declared defaults overlaid by overrides.
 
     Pulls each ``_SETTING_KEYS`` entry from the class's ``get_settings_definitions`` default,
     then applies the payload overrides. The defaults belong to the EXPERT (its own contract),
     not the host — fail-early if a key has neither a default nor an override.
+
+    A key whose definition default CHANGED after results were produced
+    (``ba2_common.core.legacy_setting_defaults``) and that the config does not state resolves
+    its LEGACY value: such a config predates the change (new jobs state the current default),
+    so a re-run, TOP-N rebuild or resumed job reproduces what was measured.
     """
+    from ba2_common.core.legacy_setting_defaults import pin_legacy_setting_defaults
+    overrides = pin_legacy_setting_defaults(expert_cls.__name__, overrides)
     defs = expert_cls.get_settings_definitions()
     keys = getattr(expert_cls, "_SETTING_KEYS", tuple(defs.keys()))
     settings: Dict[str, Any] = {}

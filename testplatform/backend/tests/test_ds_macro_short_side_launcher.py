@@ -289,9 +289,12 @@ def test_every_option_fixed_setting_is_in_the_checkpoint_identity():
         for key in spec.get("option_fixed_settings") or {}:
             assert key in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS, (name, key)
     from ba2_experts.MLForecast import MLForecast
+    from ba2_common.core.legacy_setting_defaults import LEGACY_SETTING_DEFAULTS
     defs = {**MLForecast.get_settings_definitions(), **DeterministicScorer.get_settings_definitions()}
+    # the value an UNSTATED key resolves to in the engine: the legacy value of a changed default
+    legacy = {k: v for keys in LEGACY_SETTING_DEFAULTS.values() for k, v in keys.items()}
     for key, default in H.CHECKPOINT_IDENTITY_EXPERT_SETTINGS.items():
-        assert defs[key]["default"] == default
+        assert legacy.get(key, defs[key]["default"]) == default
 
 
 def test_the_handler_folds_the_run_settings_into_its_checkpoint_fingerprint():

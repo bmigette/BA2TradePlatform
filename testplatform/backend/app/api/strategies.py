@@ -664,6 +664,12 @@ def _stamp_new_optimization_source(cfg: dict, strategy_id: int, db: Session) -> 
         bt[ESTIMATES_SOURCE_KEY] = resolve_job_estimates_source(bt)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"optimization create: {e}")
+    # A NEW job states the current default of every setting whose default changed after results
+    # were produced (ba2_common.core.legacy_setting_defaults): a stored block WITHOUT the key is
+    # read as a pre-change job and resolves the legacy value.
+    if bt.get("experts"):
+        from app.services.backtest.daily_backtest_handler import new_job_expert_specs
+        bt["experts"] = new_job_expert_specs(bt["experts"])
     out["backtest"] = bt
     return out
 

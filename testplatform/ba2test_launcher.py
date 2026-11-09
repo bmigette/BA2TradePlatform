@@ -1433,6 +1433,19 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     return settings
 
 
+def _new_job_expert_run_settings(expert: str, spec: dict, universe: list,
+                                 overrides: "dict | None" = None, **kwargs) -> dict:
+    """``_expert_run_settings`` for a job being CREATED: it also states the current default of
+    every setting whose default changed after results were produced (DeterministicScorer
+    ``yc_scale`` 0.005 -> 0.5, 2026-11-09; see ``ba2_common.core.legacy_setting_defaults``).
+
+    A stored block that does not state such a key resolves the LEGACY value in the backtest engine
+    and in the deploy export -- that is what keeps a pre-change row reproducible -- so a new job
+    must state the new value or it would run (and later re-run) as a legacy one."""
+    from app.services.backtest.daily_backtest_handler import new_job_expert_settings
+    return new_job_expert_settings(expert, _expert_run_settings(spec, universe, overrides, **kwargs))
+
+
 def _sizing_overrides(args) -> "dict | None":
     """``{"sizing_mode": ...}`` when --sizing-mode was given, else None (spec default stands)."""
     mode = getattr(args, "sizing_mode", None)
@@ -9817,8 +9830,8 @@ def _cmd_optimize(args) -> int:
         backtest_block = {
             "engine": "daily",
             "enabled_instruments": universe,
-            "experts": [{"class": expert, "settings": _expert_run_settings(
-                spec, universe, _sizing_overrides(args),
+            "experts": [{"class": expert, "settings": _new_job_expert_run_settings(
+                expert, spec, universe, _sizing_overrides(args),
                 strategy_kind=None if bypass else args.strategy,
                 rm_toggles_unpinned=rm_toggles_unpinned,
                 sizing_mode_searched=_SEARCH_SIZING_MODE)}],
@@ -10308,8 +10321,8 @@ def _cmd_optimize_batch(args) -> int:
             backtest_block = {
                 "engine": "daily",
                 "enabled_instruments": universe,
-                "experts": [{"class": expert, "settings": _expert_run_settings(
-                    spec, universe, _sizing_overrides(args),
+                "experts": [{"class": expert, "settings": _new_job_expert_run_settings(
+                    expert, spec, universe, _sizing_overrides(args),
                     strategy_kind=None if bypass else strat_kind,
                     rm_toggles_unpinned=rm_toggles_unpinned,
                     sizing_mode_searched=_SEARCH_SIZING_MODE)}],

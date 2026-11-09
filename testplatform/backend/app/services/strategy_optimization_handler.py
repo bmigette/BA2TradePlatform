@@ -3698,7 +3698,10 @@ def _report_trial_result(on_result, idx: int, fitness: float) -> None:
 #: to the default scores exactly like an absent key, so it is not folded -- an explicit "same"
 #: from a UI-built config must not orphan a checkpoint written without the key.
 #: ``rank_universe`` (MLForecast, strategy MLR): the ranked symbol set; the same genes score differently on another one.
-CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": ""}
+#: ``yc_scale`` (DeterministicScorer, 2026-11-09): mapped to 0.005, NOT the definition's new 0.5 -- the value an
+#: UNSTATED key resolves to in the backtest engine (``ba2_common.core.legacy_setting_defaults``). Every job before the
+#: change ran 0.005 and keeps its fingerprint; a new job states 0.5 and can never resume a 0.005 checkpoint.
+CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": "", "yc_scale": 0.005}
 
 
 def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
