@@ -611,6 +611,48 @@ def test_a_two_lot_structure_is_priced_and_closed_at_its_real_size(wired):
         f"the close was sized {sorted(o.quantity for o in children)}, not 2 contracts"
 
 
+def test_a_single_leg_close_is_sized_by_the_order_quantity_not_ratio_qty(wired):
+    """One held leg has no child rows, so the PARENT row's quantity is what the broker
+    sends (AlpacaAccount._build_option_order_request ignores ratio_qty). A 5-lot long call
+    must therefore close with quantity=5 and ratio_qty=1, not quantity=1 x ratio_qty=5."""
+    account, expert, expert_row = wired
+    txn = open_long_call(account, expert_row, debit=3.00, qty=5)
+    c = _contract("ACN", EXPIRY_FAR, OptionRight.CALL, 100.0, bid=9.0, ask=9.2, delta=0.5)
+    account.chain[c.symbol] = c
+
+    result = run(expert_row)
+
+    assert len(result.submitted) == 1, [d.reason for d in result.decisions]
+    sub = result.submitted[0]
+    assert [l.side for l in sub.legs] == [OrderDirection.SELL]
+    order = close_orders(txn.id)[0]
+    assert order.quantity == 5, f"the close was sized {order.quantity}, not 5 contracts"
+
+
+def test_a_multi_leg_close_keeps_quantity_one_and_per_leg_ratios(wired):
+    """An unbalanced structure (legs 5 and 3) closes each leg at its own netted size."""
+    account, expert, expert_row = wired
+    txn, parent, short, long = open_credit_spread(account, expert_row, qty=5)
+    # The long wing was partially sold back mid-life: 5 held short, 2 sold -> 3 long left.
+    create_trading_order(
+        account.id, symbol=long.contract_symbol, quantity=2, side=OrderDirection.SELL,
+        order_type=OrderType.MARKET, status=OrderStatus.FILLED, transaction_id=txn.id,
+        asset_class=AssetClass.OPTION, multiplier=100,
+        contract_symbol=long.contract_symbol, option_type=OptionRight.PUT, strike=95.0,
+        expiry=EXPIRY_FAR, underlying_symbol="ACN", open_price=0.60, filled_qty=2)
+    quote_spread(account, short_px=1.00, long_px=0.10)
+
+    result = run(expert_row)
+
+    assert len(result.submitted) == 1, [d.reason for d in result.decisions]
+    sub = result.submitted[0]
+    assert sorted(l.ratio_qty for l in sub.legs) == [3, 5]
+    assert close_orders(txn.id)[0].quantity == 1
+    from ba2_common.core.trade_store import orders_where
+    children = orders_where(parent_order_id=sub.order.id)
+    assert sorted(o.quantity for o in children) == [3, 5]
+
+
 def test_the_close_is_a_market_order_tagged_close_on_the_same_transaction(wired):
     """Three properties of the closing order, each load-bearing.
 
