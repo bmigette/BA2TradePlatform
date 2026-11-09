@@ -3154,12 +3154,27 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         PROBE TRAP (docs/WASHTRADE-LOCK.md): a 40410000 also appears when the id belongs
         to a DIFFERENT Alpaca account. Callers must only pass ids of orders whose
         ``account_id`` is this account's, which is what makes ``absent`` meaningful.
+
+        HOW ABSENCE IS READ. From the HTTP status alpaca-py attaches to the error
+        (``APIError.status_code``, taken from the HTTPError it wraps), never from a
+        substring of the body: a 5xx whose text happens to contain "not found" or "404"
+        is a failure to ask, not an answer. Only an APIError carrying NO HTTP response
+        (alpaca-py's REST client always attaches one) falls back to the structured Alpaca
+        error code in the JSON body; a body that is not that JSON is not an answer either.
         """
         try:
             raw = self.client.get_order_by_id(broker_order_id)
         except APIError as e:
-            text = str(e).lower()
-            if "40410000" in text or "not found" in text or "404" in text:
+            http_status = e.status_code
+            if http_status is not None:
+                if http_status == 404:
+                    return None, True
+                raise
+            try:
+                alpaca_code = e.code
+            except (ValueError, KeyError, TypeError):
+                raise e
+            if str(alpaca_code) == "40410000":
                 return None, True
             raise
         return self.alpaca_order_to_tradingorder(raw), False
@@ -3665,13 +3680,29 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         # CRITICAL: Before marking as CANCELED, try to verify order status at broker
                         # Alpaca's get_orders() API has retention limits and may not return old orders
                         # We should only mark as CANCELED if we can explicitly confirm the order is canceled
-                        broker_order = None
-                        verification_failed = False
+                        # NOT get_order(): it collapses every failure into None, so a network error
+                        # or a 429 read as "the broker does not know this order" and a live order
+                        # (a protective stop included) was written off as CANCELED. Only a CONFIRMED
+                        # absence (HTTP 404) may lead there; an unknown outcome changes nothing.
                         try:
-                            broker_order = self.get_order(db_order.broker_order_id)
+                            broker_order, absent = self._get_broker_order_or_absent(db_order.broker_order_id)
+                        except (APIError, OSError) as check_err:
+                            logger.warning(
+                                f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) is missing "
+                                f"from the Alpaca order listing and the by-id lookup FAILED "
+                                f"({type(check_err).__name__}: {check_err}) - its broker status is UNKNOWN, "
+                                f"leaving it unchanged; retrying next refresh"
+                            )
+                            continue
                         except Exception as check_err:
-                            logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
-                            verification_failed = True
+                            logger.error(
+                                f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) is missing "
+                                f"from the Alpaca order listing and the by-id lookup raised an unexpected "
+                                f"{type(check_err).__name__}: {check_err} - its broker status is UNKNOWN, "
+                                f"leaving it unchanged",
+                                exc_info=True
+                            )
+                            continue
 
                         # If we successfully retrieved the order from broker, update to match broker status
                         if broker_order:
@@ -3733,10 +3764,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                         updated_count += 1
                                 continue
 
-                        # If verification failed or order not found at broker:
+                        # The broker CONFIRMED it does not know this order (HTTP 404):
                         # DON'T automatically mark as CANCELED - this could be an old order beyond retention period
                         # Only mark as CANCELED if it's recent (less than 30 days old)
-                        if verification_failed or broker_order is None:
+                        if absent:
                             if db_order.created_at:
                                 created_at = db_order.created_at
                                 if created_at.tzinfo is None:
