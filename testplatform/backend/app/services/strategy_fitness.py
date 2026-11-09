@@ -1438,6 +1438,15 @@ def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
     # stresses again -- unbounded recursion. Passing 0.0 explicitly is not enough, because the
     # config-echo fallback in _min_with_stressed consults the dict when the argument is 0.
     out["stress_spread_bps"] = 0.0
+    # MUST clear the robustness request too, for the same config-echo reason: _min_with_stressed
+    # re-scores this copy with robust=None, so _maybe_robust would read robust_fitness=True back
+    # off it and multiply the STRESSED score by concentration x Monte Carlo, and the outer
+    # _maybe_robust then multiplies the min by them again (both applied twice whenever the
+    # adjusted stressed score undercut the base -- nearly always once conc x mc < 1, even for a
+    # metric this function does not restate; fixed 2026-11-09). The factors belong once, outside:
+    # min(base, stressed) x conc x mc x spread. robustness_metrics' spread screen reads only
+    # annualized_return off this copy, so it is unaffected.
+    out["robust_fitness"] = False
     car = metrics.get("annualized_return")
     out["annualized_return"] = car
     # Overwrite BOTH: _consistent_annual_return prefers the adjusted figure whenever a profit

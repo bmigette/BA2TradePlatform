@@ -831,6 +831,7 @@ recovers. So:
 | Option fitness family | `option_consistent_annual_return`, `option_car_over_risk`, `option_car_target`, `option_car_target_soft30` and `option_convex` are mutually incomparable |
 | FMPRating window | Starts 2022; never mix it with full-window rows in per-year comparisons |
 | OHLCV history source fmp -> alpaca, **2026-10-20** (§4.0) | Equity jobs stamp `ohlcv_history_source`; a row without the stamp ran on the FMP cache. Different price history, so never compare across it |
+| Robust x stress double count fixed, **2026-11-09** (TEST <NEXT>) | With BOTH `robust_fitness` and `stress_spread_bps` on, the stressed re-score applied concentration × Monte Carlo itself and the outer adjustment applied them again. Fitness is now min(raw, stressed) × concentration × Monte Carlo × spread. Runs with both flags on are not comparable across it; runs with only one flag on are unchanged |
 
 ### 6.4 Determinism caveats
 

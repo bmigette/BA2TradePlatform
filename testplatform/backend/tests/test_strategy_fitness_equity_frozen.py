@@ -45,6 +45,17 @@ NOTE for the next person: ``tools/run_screener_capband_matrix.py`` DEFAULTS to
 ``--fitness calmar_ratio``, so a run of that driver started before this commit is on the old
 scale -- do not compare its results across it.
 
+*** NOT COMPARABLE ACROSS THIS COMMIT EITHER (2026-11-09) ***
+SIXTEEN literals, all in ``stress_mid_concentration`` (the only case with BOTH
+``robust_fitness`` and ``stress_spread_bps`` on), were deliberately re-frozen. The stressed copy
+built by ``stressed_results`` still carried ``robust_fitness=True``, so the inner re-score in
+``_min_with_stressed`` applied concentration x Monte Carlo to the stressed score and the outer
+``_maybe_robust`` applied them again: min(base, stressed x conc x mc) x conc x mc x spread.
+``stressed_results`` now clears the robustness request, so the value is min(base, stressed) x
+conc x mc x spread. Every other case (one flag or neither) is bit-identical. The arithmetic for
+each moved key is beside it below; tests/test_fitness_robust_stress_composition.py asserts the
+composition from the component functions.
+
 COVERAGE IS THE WHOLE VALUE HERE. A case the corpus does not contain is a change this file
 cannot see -- the first version of it missed the profit-cap switch (no case had an adjusted
 figure present with no cap active), and a mutation of that branch passed. When you add a
@@ -704,38 +715,45 @@ GOLDEN = {
     'robust_on|sqn': '0.0',
     'robust_on|total_return': '0.0',
     'robust_on|win_rate': '0.0',
-    'stress_mid_concentration|CAR': '0.11538690082780359',
-    'stress_mid_concentration|Goal': '0.11538690082780359',
-    # RE-FROZEN 2026-09-02 (see the header). The stressed pass now restates calmar from
-    # the stressed path's own components -- car 5.774429649249924 / max(|dd 0.0|, 1.0) =
+    # RE-FROZEN 2026-11-09 (see the header): every non-drawdown stress_mid_concentration value
+    # is now min(base, stressed) x f, f = conc 0.24557815336672534 x mc 1.0 x spread
+    # 0.1924809883083308 = 0.04726912566696213, applied ONCE. The old values carried conc x mc
+    # a second time (old / new = 0.24557815336672534 wherever the stressed arm won).
+    # CAR family: stressed CAR 9.940064676147616 < 30.0 -> 9.940064676147616 x f.
+    'stress_mid_concentration|CAR': '0.46985816631455285',
+    'stress_mid_concentration|Goal': '0.46985816631455285',
+    # RE-FROZEN 2026-09-02, and again 2026-11-09. The stressed pass restates calmar from the
+    # stressed path's own components -- car 5.774429649249924 / max(|dd 0.0|, 1.0) =
     # 5.774429649249924 -- instead of re-reading the copied 1.5. It goes UP here, and that
     # is the corpus, not the metric: _base()'s calmar_ratio 1.5 is self-consistent with the
     # corpus's OWN scalars (annualized_return 30.0 / max(|max_drawdown 20.0|, 1.0) = 1.5) but
     # inconsistent with the _C3 curve and the _TR_MID trade list this case also carries, which
     # is what the stressed pass recomputes from. So the stressed (computed) figure is the
-    # larger of the two and min() keeps the inner robustness-adjusted value. Ratio checks:
-    # 5.774429649249924
-    # / 1.5 = 3.8496, and 0.06703110723957173 / 0.017412396888828355 = 3.8496.
-    'stress_mid_concentration|calmar': '0.06703110723957173',
-    'stress_mid_concentration|calmar_ratio': '0.06703110723957173',
-    'stress_mid_concentration|car': '0.11538690082780359',
-    'stress_mid_concentration|consistent_annual_return': '0.11538690082780359',
+    # larger of the two and min() keeps the BASE 1.5: 1.5 x f = 0.0709036885004432. (Until
+    # 2026-11-09 the inner re-score was itself robustness-adjusted, 5.7744 x 0.24558 = 1.4181 <
+    # 1.5, so min() kept that and the old 0.06703110723957173 = 1.4181 x f.)
+    'stress_mid_concentration|calmar': '0.0709036885004432',
+    'stress_mid_concentration|calmar_ratio': '0.0709036885004432',
+    'stress_mid_concentration|car': '0.46985816631455285',
+    'stress_mid_concentration|consistent_annual_return': '0.46985816631455285',
     'stress_mid_concentration|drawdown': '20.0',
-    'stress_mid_concentration|goal': '0.11538690082780359',
+    'stress_mid_concentration|goal': '0.46985816631455285',
     'stress_mid_concentration|max_dd': '20.0',
     'stress_mid_concentration|max_drawdown': '20.0',
-    'stress_mid_concentration|profit_factor': '0.020894876266594028',
-    # RE-FROZEN 2026-09-02: stressed total_return (18.29285463353683) x the same robustness
-    # factors the unstressed 119.7 was multiplied by; 0.21234829673919076 / 1.389509271728503
-    # = 0.15281 = 18.29285463353683 / 119.7.
-    'stress_mid_concentration|return': '0.21234829673919076',
-    'stress_mid_concentration|sharpe': '0.016251570429573134',
-    'stress_mid_concentration|sharpe_ratio': '0.016251570429573134',
-    'stress_mid_concentration|sortino': '0.0243773556443597',
-    'stress_mid_concentration|sortino_ratio': '0.0243773556443597',
-    'stress_mid_concentration|sqn': '0.02785983502212537',
-    'stress_mid_concentration|total_return': '0.21234829673919076',
-    'stress_mid_concentration|win_rate': '0.7081041401456865',
+    # profit_factor, sharpe, sortino, sqn, win_rate: stressed_results does not restate them, so
+    # stressed == base and the value is base x f (1.8 x f, 1.4 x f, ...). Before 2026-11-09 the
+    # robustness-adjusted inner copy always won the min here, i.e. base x conc x f.
+    'stress_mid_concentration|profit_factor': '0.08508442620053183',
+    # RE-FROZEN 2026-09-02 and 2026-11-09: stressed total_return 18.29285463353683 < 119.7,
+    # x f = 0.8646872444801228.
+    'stress_mid_concentration|return': '0.8646872444801228',
+    'stress_mid_concentration|sharpe': '0.06617677593374698',
+    'stress_mid_concentration|sharpe_ratio': '0.06617677593374698',
+    'stress_mid_concentration|sortino': '0.09926516390062047',
+    'stress_mid_concentration|sortino_ratio': '0.09926516390062047',
+    'stress_mid_concentration|sqn': '0.1134459016007091',
+    'stress_mid_concentration|total_return': '0.8646872444801228',
+    'stress_mid_concentration|win_rate': '2.8834166656846896',
     'stress_on_thin|CAR': '-100000000.0',
     'stress_on_thin|Goal': '-100000000.0',
     'stress_on_thin|calmar': '1.5',
