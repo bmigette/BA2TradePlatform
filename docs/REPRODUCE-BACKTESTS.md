@@ -832,6 +832,7 @@ recovers. So:
 | FMPRating window | Starts 2022; never mix it with full-window rows in per-year comparisons |
 | OHLCV history source fmp -> alpaca, **2026-10-20** (§4.0) | Equity jobs stamp `ohlcv_history_source`; a row without the stamp ran on the FMP cache. Different price history, so never compare across it |
 | Robust x stress double count fixed, **2026-11-09** (TEST <NEXT>) | With BOTH `robust_fitness` and `stress_spread_bps` on, the stressed re-score applied concentration × Monte Carlo itself and the outer adjustment applied them again. Fitness is now min(raw, stressed) × concentration × Monte Carlo × spread. Runs with both flags on are not comparable across it; runs with only one flag on are unchanged |
+| DeterministicScorer `yc_scale` 0.005 -> 0.5, **2026-11-09** | Every DS backtest, GA run and live instance before it used `yc_scale` 0.005, which saturates the yield-curve tanh (a near-binary input). Macro-on DS results (`macro_mode` multiply/gate/input) before and after are not comparable; `macro_mode=off` is unaffected. A job created after it states `yc_scale` in its expert settings; a stored config without the key re-runs and deploys at 0.005 (`ba2_common.core.legacy_setting_defaults`) |
 
 ### 6.4 Determinism caveats
 
