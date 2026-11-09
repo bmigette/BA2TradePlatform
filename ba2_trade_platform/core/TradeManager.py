@@ -251,6 +251,42 @@ def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> b
     return available_qty < required_qty
 
 
+# The comment ``AccountInterface.submit_close_order_for_transaction`` writes on every FULL
+# close it creates (its only writer). A trim ("Partial close order ...") is not a full close.
+_FULL_CLOSE_COMMENT_PREFIX = "Closing position for transaction"
+
+
+def is_staged_full_close(order) -> bool:
+    """A full-position MARKET close of a transaction, staged by ``close_transaction``."""
+    return bool(order.order_type == OrderType.MARKET and order.transaction_id
+                and (order.comment or "").startswith(_FULL_CLOSE_COMMENT_PREFIX))
+
+
+def _measured_qty(value):
+    """A broker-reported quantity as a finite float, or None when it is not one.
+    (Alpaca hands ``filled_qty`` over as a string.)"""
+    if value is None:
+        return None
+    try:
+        qty = float(value)
+    except (TypeError, ValueError):
+        return None
+    return qty if math.isfinite(qty) else None
+
+
+def _as_order_status(value):
+    """``value`` as an OrderStatus, or None when it is not a recognisable one."""
+    if isinstance(value, OrderStatus):
+        return value
+    raw = str(getattr(value, "value", value))
+    for candidate in (raw, raw.lower()):
+        try:
+            return OrderStatus(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 # The re-base rules live in ba2_common (shared with the backtest). rebase_price_to_fill is
 # re-exported here because it has long been importable from TradeManager.
 from ba2_common.core.tpsl_fill_rebase import (  # noqa: E402,F401
@@ -908,6 +944,11 @@ class TradeManager:
                     f"stop exit did not fill — force-closing at market."
                 )
 
+                # close_transaction cancels the resting exit legs and STAGES the market close
+                # on their cancel; it is not sent from here. The trigger sweep sends it only
+                # once the broker confirms the legs final, sized to what they left unsold
+                # (_size_staged_full_close) -- a leg that fills while being cancelled must not
+                # be sold a second time (NVDA transaction 468, 2026-11-09).
                 result = account.close_transaction(txn_id)
                 if not isinstance(result, dict):
                     raise ValueError(
@@ -2054,6 +2095,103 @@ class TradeManager:
                 f"entry {parent_order_id}'s leg(s) {[leg.id for leg in legs]}, which hold the shares")
         return True
 
+    def _size_staged_full_close(self, account, close_order):
+        """How many shares a staged full close may sell NOW, measured at the broker.
+
+        WHY. ``close_transaction`` cancels a transaction's resting exit legs and stages the
+        close (WAITING_TRIGGER on the last cancelled leg's CANCELED) at the quantity the DB
+        held at that moment. A leg can fill -- partly or wholly -- between that moment and the
+        cancel landing, and the close was then submitted unchanged. Dev 8080 NVDA transaction
+        468, 2026-11-09: long 4; the stop leg sold 1 at 14:30:59, the breached-stop safety net
+        cancelled it at 14:31:27 and staged a close for 4; when the leg synced CANCELED (filled
+        1) this sweep sent the 4: 5 sold for a 4-share position, the 5th taken from another
+        NVDA transaction on the account. A leg that FILLED instead of cancelling also reaches
+        "submit" (``classify_waiting_trigger``), which would have sold the whole size again.
+        ``TransactionHelper.reconcile_canceled_partial_fill`` resizes staged dependents only
+        on an OPENED transaction; ``close_transaction`` has already made this one CLOSING.
+
+        THE RULE. Every EXIT-side order of the transaction that was just cancelled (the
+        trigger order and its OCO family) or that the DB still believes is working is re-read
+        AT THE BROKER, and must be final there (terminal or FILLED) with a measurable filled
+        quantity. What may be sold is the transaction's filled entry quantity minus every
+        exit fill (broker figures for the re-read orders, the DB's settled figures for the
+        rest), and never more than the staged quantity.
+
+        Returns ``(verdict, quantity, detail)``:
+            ("submit", qty, detail) -- send the close for ``qty`` (<= the staged quantity);
+            ("flat", 0.0, detail)   -- nothing is left to sell: do NOT send it;
+            ("defer", None, reason) -- the broker state is unknown: do NOT send it this pass.
+
+        THE TRADE-OFF in "defer": the stop has already been breached, so waiting one more
+        refresh can cost slippage on a still-open position. Sending a market order whose size
+        rests on an unconfirmed cancel can sell shares this transaction does not own -- they
+        come out of another position, silently, and leave the ledger wrong. One more pass is
+        recoverable; an oversell is not, so unknown never sends.
+        """
+        from ba2_common.core.trade_store import orders_where
+
+        txn = get_instance(Transaction, close_order.transaction_id)
+        if txn.side == OrderDirection.BUY:
+            exit_side = OrderDirection.SELL
+        elif txn.side == OrderDirection.SELL:
+            exit_side = OrderDirection.BUY
+        else:
+            return "defer", None, f"transaction {txn.id} has an unrecognised side {txn.side!r}"
+        orders = [o for o in orders_where(transaction_id=txn.id) if o.id != close_order.id]
+
+        terminal = OrderStatus.get_terminal_statuses()
+        executed = OrderStatus.get_executed_statuses()
+        final = terminal | {OrderStatus.FILLED}
+
+        # The order the close waits on, and its OCO family (parent row and child legs):
+        # close_transaction cancelled them together, and any of them may have traded.
+        trigger = next((o for o in orders if o.id == close_order.depends_on_order), None)
+        family = set()
+        if trigger is not None:
+            roots = {trigger.id} | ({trigger.parent_order_id} if trigger.parent_order_id else set())
+            family = roots | {o.id for o in orders if o.parent_order_id in roots}
+
+        held = 0.0
+        read_at_broker = []
+        for o in orders:
+            status, filled = o.status, _measured_qty(o.filled_qty)
+            if (o.broker_order_id and o.side == exit_side
+                    and (o.id in family or o.status not in final)):
+                broker_order = account.get_order(o.broker_order_id)
+                if broker_order is None:
+                    return "defer", None, (
+                        f"exit order {o.id} (broker {o.broker_order_id}) could not be read at "
+                        f"the broker, so whether it sold shares is unknown")
+                status = _as_order_status(getattr(broker_order, "status", None))
+                if status not in final:
+                    return "defer", None, (
+                        f"exit order {o.id} (broker {o.broker_order_id}) is "
+                        f"{getattr(status, 'value', status)!s} at the broker -- its cancel is not "
+                        f"confirmed and it can still sell")
+                filled = _measured_qty(getattr(broker_order, "filled_qty", None))
+                if filled is None:
+                    return "defer", None, (
+                        f"the broker reports no usable filled quantity for exit order {o.id} "
+                        f"(broker {o.broker_order_id}): {getattr(broker_order, 'filled_qty', None)!r}")
+                read_at_broker.append(f"{o.id}={status.value}/{filled:g}")
+            if status not in executed and status not in terminal:
+                continue   # still working / never sent: nothing traded that is final
+            if filled is None:
+                if status in executed:
+                    return "defer", None, (
+                        f"order {o.id} is {status.value} but its filled quantity is unrecorded")
+                continue
+            if o.side == txn.side:
+                held += filled
+            elif o.side == exit_side:
+                held -= filled
+
+        detail = (f"entry fills minus exit fills = {held:g}; broker re-read: "
+                  f"{', '.join(read_at_broker) or 'none'}")
+        if held <= 1e-9:
+            return "flat", 0.0, detail
+        return "submit", min(float(close_order.quantity), held), detail
+
     def _check_all_waiting_trigger_orders(self):
         """
         Check all orders in WAITING_TRIGGER status to see if their parent orders have reached the trigger status.
@@ -2450,6 +2588,44 @@ class TradeManager:
 
                     if self._rechain_behind_entry_legs(account, dependent_order, parent_order_id):
                         continue
+
+                    # A staged FULL close is sized NOW, from the broker's final word on the
+                    # legs it waited on -- never from the quantity it was staged at (see
+                    # _size_staged_full_close: NVDA transaction 468 sold 5 for 4).
+                    if is_staged_full_close(dependent_order):
+                        verdict, close_qty, detail = self._size_staged_full_close(
+                            account, dependent_order)
+                        if verdict == "defer":
+                            self.logger.error(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) NOT "
+                                f"submitted this pass: {detail}. A market close sized on an "
+                                f"unconfirmed cancel can sell shares this transaction does not "
+                                f"own; it stays WAITING_TRIGGER and is retried next pass.")
+                            continue
+                        if verdict == "flat":
+                            fresh = get_instance(TradingOrder, dependent_order.id)
+                            fresh.status = OrderStatus.CLOSED
+                            note = "not sent: transaction already flat at the broker"
+                            fresh.comment = (f"{fresh.comment} | {note}" if fresh.comment
+                                             else note)[:500]
+                            update_instance(fresh)
+                            self.logger.warning(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) NOT "
+                                f"sent: the position is already flat -- its exit legs sold it "
+                                f"before their cancel landed ({detail}). The fills close the "
+                                f"transaction on the next transaction refresh.")
+                            continue
+                        if close_qty < float(dependent_order.quantity) - 1e-9:
+                            self.logger.warning(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) "
+                                f"resized {dependent_order.quantity:g} -> {close_qty:g}: its exit "
+                                f"legs sold part of the position before their cancel landed "
+                                f"({detail}).")
+                            dependent_order.quantity = close_qty
+                            update_instance(dependent_order)
 
                     # Gate cancel-and-replace orders (e.g. a trailing-stop OCO swap): only
                     # submit once the broker has ACTUALLY released the prior order's qty.

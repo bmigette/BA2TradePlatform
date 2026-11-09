@@ -460,6 +460,14 @@ def _confirm_cancel_and_release(expert, account, oco):
     row = get_instance(TradingOrder, oco.id)
     row.status = OrderStatus.CANCELED
     update_instance(row)
+    # The broker's own final word on the cancelled OCO, which the sweep re-reads before it
+    # sizes the close (TradeManager._size_staged_full_close): cancelled, nothing filled.
+    side = "sell" if row.side == OrderDirection.SELL else "buy"
+    account.client.get_order_by_id.side_effect = lambda broker_id: SimpleNamespace(
+        id=broker_id, symbol=row.symbol, qty=str(row.quantity), side=side, type="limit",
+        status="canceled", time_in_force="gtc", order_class="oco", legs=None,
+        filled_qty="0", filled_avg_price=None, created_at=None, limit_price=None,
+        stop_price=None)
     with _wired(expert, account) as tm:
         tm._check_all_waiting_trigger_orders()
 
