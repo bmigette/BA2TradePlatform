@@ -2,8 +2,9 @@
 
   A. NO ORPHANED STOCK AT EXPIRY (``settle_single_leg_expiry`` /
      ``process_pending_assignment_liquidations``):
-       * an ITM LONG option is NEVER exercised — it is sold to close at the expiry bar's
-         premium close (intrinsic fallback), cash credited once, NO share position;
+       * an ITM LONG option is NEVER exercised — it is settled for cash at intrinsic
+         (review 2026-11-09: no longer the expiry bar's premium close), cash credited
+         once, NO share position;
        * an ITM SHORT option is still physically assigned at the strike, but the assigned
          stock (long from a short put, short from a naked call) is liquidated in FULL at
          the next bar's open — no stock rides unmanaged beyond one bar.
@@ -305,9 +306,10 @@ def _open_long_call(tmp_path, name, extra_rows):
     return acct, ps, ctx
 
 
-def test_long_itm_call_expiry_sold_to_close_at_premium_no_stock(tmp_path):
-    """Expiry-day premium bar close 95.5 (intrinsic 95): credited at the PREMIUM, the leg
-    booked exactly once, ZERO equity/shares position created."""
+def test_long_itm_call_expiry_settles_at_intrinsic_not_premium_no_stock(tmp_path):
+    """Expiry-day premium bar close 95.5 (intrinsic 95): credited at INTRINSIC -- no time
+    value is left at expiry (review 2026-11-09; this pinned the 95.5 premium before) -- the
+    leg booked exactly once, ZERO equity/shares position created."""
     acct, ps, ctx = _open_long_call(
         tmp_path, "exprem",
         [_bar_row(_CALL105, "2024-03-15", 95.5, "call", 105.0, _EXP_0315)])
@@ -318,10 +320,10 @@ def test_long_itm_call_expiry_sold_to_close_at_premium_no_stock(tmp_path):
 
         assert acct.get_option_positions() == []
         assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []  # NO stock
-        assert acct._cash == pytest.approx(cash_after_entry + 95.5 * 100.0, abs=1.0)
+        assert acct._cash == pytest.approx(cash_after_entry + 95.0 * 100.0, abs=1.0)
         closes = [o for o in acct.get_orders() if o.comment == "option_expiry_close"]
         assert len(closes) == 1                            # leg booked exactly once
-        assert closes[0].open_price == pytest.approx(95.5)
+        assert closes[0].open_price == pytest.approx(95.0)
         assert closes[0].filled_qty == pytest.approx(1.0)
     finally:
         ctx.__exit__(None, None, None)

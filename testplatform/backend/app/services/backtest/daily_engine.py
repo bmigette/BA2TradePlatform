@@ -409,7 +409,7 @@ def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
 
     NOTE: the engine settles through ``BacktestAccount.settle_single_leg_expiry``, which
     applies the no-orphaned-stock backtest policy on top of this theoretical outcome (a
-    long ITM is NEVER exercised — always sold to close at the expiry premium/intrinsic;
+    long ITM is NEVER exercised — always settled for cash at intrinsic;
     shorts always physically assign, with the assigned stock liquidated at the next bar's
     open). This helper remains the pure ITM/side contract."""
     from ba2_common.core.types import OptionRight, OrderDirection
@@ -2162,8 +2162,8 @@ class DailyBacktestEngine:
 
         # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
         #     backtest policy — see BacktestAccount.settle_single_leg_expiry): OTM ->
-        #     worthless; ITM long -> NEVER exercised, sold to close at the expiry
-        #     premium (intrinsic fallback) — no shares; ITM short -> ALWAYS physically
+        #     worthless; ITM long -> NEVER exercised, settled for cash at intrinsic
+        #     from the expiry close — no shares; ITM short -> ALWAYS physically
         #     assigned (shares at the strike), with the assigned stock liquidated at
         #     the next bar's open (4a-pre above).
         #     Defined-risk combos unit-settle as a group instead. Runs after the
@@ -2234,8 +2234,8 @@ class DailyBacktestEngine:
         no-orphaned-stock backtest policy):
 
           * worthless -> close the option transaction at premium 0 (realise the entry P&L).
-          * ITM long -> NEVER exercised: sold to close at the expiry bar's premium close
-            (intrinsic fallback) — no share position, cash credited at the premium.
+          * ITM long -> NEVER exercised: settled for cash at INTRINSIC from the same expiry
+            close the combos use — no share position, cash credited at intrinsic.
           * ITM short -> ALWAYS physically assigned (shares at the STRIKE); the assigned
             stock is unmanaged in a backtest, so it is liquidated in full at the next
             bar's open (``process_pending_assignment_liquidations``) — unless the run sets

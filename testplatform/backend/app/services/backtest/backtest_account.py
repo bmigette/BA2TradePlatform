@@ -173,6 +173,16 @@ def _owner_rank(order) -> int:
     return _OWNER_PENDING_OPEN
 
 
+def _expiry_intrinsic(strike: float, is_call: bool, spot: float) -> float:
+    """Per-share INTRINSIC value an option settles at on its expiry date, from the
+    underlying settlement price ``spot``: ``max(0, spot - strike)`` for a call,
+    ``max(0, strike - spot)`` for a put. The ONE formula both expiry paths use -- the
+    single-leg settlement (``settle_single_leg_expiry``) and the defined-risk combo unit
+    settlement (``settle_defined_risk_combo_expiry``) -- so the two cannot diverge."""
+    strike, spot = float(strike), float(spot)
+    return max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
+
+
 def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
     """The OCC event an expiring leg resolves by: OTM -> expired; ITM short -> assigned;
     ITM long -> exercised (the live OPEXP / OPASN / OPEXC)."""
@@ -6936,10 +6946,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         to 67-85% of final equity was the OS1 blow-up. Concretely:
 
           * OTM -> worthless (transaction closed at premium 0) — unchanged.
-          * LONG ITM (call or put): NEVER exercised. SELL-TO-CLOSE at the expiry bar's
-            premium close (intrinsic when the sparse cache has no bar — near expiry the
-            premium converges to intrinsic). NO share position is created; cash is credited
-            premium x multiplier x contracts exactly once.
+          * LONG ITM (call or put): NEVER exercised. Settled for cash at INTRINSIC from the
+            underlying settlement price ``spot`` (``_expiry_intrinsic``, the formula the
+            combo path uses) -- never the expiry bar's premium close, which can carry time
+            value that does not exist at expiry. NO share position is created; cash is
+            credited intrinsic x multiplier x contracts exactly once, and only when the
+            settlement found the leg's transaction.
           * SHORT ITM (call or put): ALWAYS physical assignment at the strike, covered or
             naked — the share leg is the real-world outcome and keeps the assignment loss
             in the book. But the assigned stock is unmanaged here, so EVERY assignment
@@ -6950,22 +6962,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             ``hold_assigned_stock`` (the WHEEL) opts out of that last step only — the
             assignment itself is identical, the shares are simply kept.
 
-        Assignment cash always moves at the STRIKE; the sell-to-close credit is the only
-        premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
+        Assignment cash always moves at the STRIKE; the long's cash settlement at intrinsic
+        is the only premium leg. Deterministic at-expiry settlement — no slippage/commission,
         matching ``settle_option_expiry``. Defined-risk combos must NOT be routed here (they
         unit-settle via ``settle_defined_risk_combo_expiry``).
         """
         strike = float(position.strike)
         is_call = position.option_type == OptionRight.CALL
-        itm = (spot > strike) if is_call else (spot < strike)
-        if not itm:
+        intrinsic = _expiry_intrinsic(strike, is_call, spot)
+        if intrinsic <= 0.0:   # OTM (or exactly at the money)
             return self.settle_option_expiry(position, close_premium=0.0,
                                              trigger=OptionCloseReason.EXPIRED_OTM)
 
         contracts = float(position.quantity)
         multiplier = float(position.multiplier or 100)
         shares = int(position.quantity) * int(multiplier)
-        intrinsic = (spot - strike) if is_call else (strike - spot)
 
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
@@ -7012,33 +7023,35 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 )
             return ok
 
-        # LONG ITM -> SELL-TO-CLOSE, never exercise: the strategy's exits only manage
-        # options, so exercised stock would ride unmanaged to the end of the run. Price at
-        # the expiry bar's premium close; intrinsic when the cache has no bar (near expiry
-        # the premium converges to intrinsic). Cash is credited at the premium; NO share
-        # position is created.
-        # A bar in another share basis than the lot's is a different contract reusing the
-        # OCC string after a split (Task 1a): the lot settles at its own-basis intrinsic.
-        bar = self._option_bar(position.contract_symbol) if self._options else None
-        if bar and bar.get("close") is not None:
-            # The expiry bar's print can be junk (the arb guard's own documented class: a
-            # $0.01 call against $50+ of intrinsic) and this credit is REALISED cash, not
-            # a mark — clamp it into the same no-arb bounds the guard enforces on fills
-            # (floor at intrinsic, cap at spot for a call / strike for a put). Spot is a
-            # parameter here, so the bounds always resolve. (Review 2026-08-30 F1.)
-            premium = self._clamp_premium_to_no_arb(float(bar["close"]), strike, is_call, spot)
-        else:
-            premium = float(intrinsic)
+        # LONG ITM -> SETTLED FOR CASH AT INTRINSIC, never exercised: the strategy's exits
+        # only manage options, so exercised stock would ride unmanaged to the end of the
+        # run. NO share position is created.
+        #
+        # INTRINSIC, not the expiry bar's premium close (review 2026-11-09). On the expiry
+        # date the contract has no time value left; the day's last print of a thin contract
+        # can still carry some, and booking it (it used to be ``max(close, intrinsic)``)
+        # paid long single legs a premium nobody receives at expiry -- while a defined-risk
+        # combo settled at pure intrinsic and a short leg was assigned at the strike. The
+        # intrinsic comes from the SAME underlying settlement price and the SAME formula
+        # (``_expiry_intrinsic``) the combo path uses. ``spot`` is in the lot's own share
+        # basis (Task 1a), so a split never mixes contracts here. A bar-priced close remains
+        # only for a NON-expiry forced liquidation (``_liquidate_option_lot``).
+        premium = float(intrinsic)
+        # The EVENT is the live OPEXC (an ITM long resolved at expiry); only the settlement
+        # differs (intrinsic cash, no shares) -- see OptionCloseReason.EXERCISED.
+        ok = self.settle_option_expiry(position, close_premium=premium,
+                                       trigger=OptionCloseReason.EXERCISED)
+        if not ok:
+            # No transaction to settle against: nothing was booked, so no cash moves either
+            # (crediting first used to pay the premium for a leg that stayed held).
+            return False
         self._cash += premium * multiplier * contracts
         logger.warning(
-            "[backtest] long %s %s ITM at expiry — sold to close at %.4f (backtests never "
-            "exercise; intrinsic %.4f).",
-            "call" if is_call else "put", position.contract_symbol, premium, intrinsic,
+            "[backtest] long %s %s ITM at expiry — settled for cash at intrinsic %.4f "
+            "(backtests never exercise).",
+            "call" if is_call else "put", position.contract_symbol, premium,
         )
-        # The EVENT is the live OPEXC (an ITM long resolved at expiry); only the settlement
-        # differs (premium, no shares) -- see OptionCloseReason.EXERCISED.
-        return self.settle_option_expiry(position, close_premium=premium,
-                                         trigger=OptionCloseReason.EXERCISED)
+        return True
 
     def process_pending_assignment_liquidations(self) -> bool:
         """Broker-style liquidation of stock orphaned by a short-option assignment.
@@ -7174,8 +7187,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         net_payoff = 0.0
         strikes: List[float] = []
         for pos in positions:
-            is_call = pos.option_type == OptionRight.CALL
-            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            intrinsic = _expiry_intrinsic(pos.strike, pos.option_type == OptionRight.CALL, spot)
             sign = 1.0 if pos.side == OrderDirection.BUY else -1.0
             mult = float(pos.multiplier or 100)
             net_payoff += sign * intrinsic * mult * float(pos.quantity)
@@ -7212,8 +7224,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # expired_otm) -- the SAME rule the live reconciler applies, independent of leg order.
         leg_triggers = []
         for pos in positions:
-            is_call = pos.option_type == OptionRight.CALL
-            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            intrinsic = _expiry_intrinsic(pos.strike, pos.option_type == OptionRight.CALL, spot)
             trigger = _expiry_trigger(pos.side, intrinsic > 0.0)
             leg_triggers.append(trigger)
             self._record_option_expiry_close(txn, pos, float(intrinsic), trigger=trigger)

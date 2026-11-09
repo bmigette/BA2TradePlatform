@@ -695,10 +695,11 @@ def test_long_itm_call_never_exercised_even_when_affordable(tmp_path):
         ctx.__exit__(None, None, None)
 
 
-def test_long_itm_call_unaffordable_sold_to_close_at_premium(tmp_path):
-    """(b) Sold to close at the expiry bar's PREMIUM close when one exists (20.5, not
-    intrinsic 20.0); cash credited, NO share position. (Affordability no longer matters —
-    a long ITM leg is never exercised.)"""
+def test_long_itm_call_unaffordable_settles_at_intrinsic_not_the_premium_close(tmp_path):
+    """(b) Settled for cash at INTRINSIC (20.0) even when the expiry bar prints a premium
+    close above it (20.5): no time value is left at expiry (review 2026-11-09; this pinned
+    20.5 before). Cash credited, NO share position. (Affordability no longer matters — a
+    long ITM leg is never exercised.)"""
     ps = _make_ps("AAPL", _f8_bars(200, 200), datetime(2024, 3, 5))
     bar_rows = [_bar(_LC180, "2024-03-06", 4.0, "call", 180.0),
                 _bar(_LC180, "2024-03-15", 20.5, "call", 180.0)]
@@ -711,10 +712,10 @@ def test_long_itm_call_unaffordable_sold_to_close_at_premium(tmp_path):
 
         assert acct.get_option_positions() == []
         assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []  # NO shares
-        assert acct._cash == pytest.approx(9_600.0 + 20.5 * 100.0, abs=1.0)
+        assert acct._cash == pytest.approx(9_600.0 + 20.0 * 100.0, abs=1.0)
         closes = [o for o in acct.get_orders() if o.comment == "option_expiry_close"]
         assert len(closes) == 1
-        assert closes[0].open_price == pytest.approx(20.5)  # synthetic close at the premium
+        assert closes[0].open_price == pytest.approx(20.0)  # synthetic close at intrinsic
     finally:
         ctx.__exit__(None, None, None)
 
