@@ -477,8 +477,9 @@ def handle_rerun_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         record_option_spread_model(db, bt, config)
 
         def progress(pct: float, msg: str) -> None:
-            if tq.is_task_paused(task_id):
-                raise _Paused(msg)
+            reason = tq.stop_reason(task_id)
+            if reason:
+                raise _Paused(msg, reason)
             tq.update_progress(task_id, pct, msg)
 
         results = run_daily_backtest(config, progress_cb=progress)
@@ -494,8 +495,8 @@ def handle_rerun_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         return {"status": "completed", "backtest_id": backtest_id, "results": results}
 
     except _Paused as e:
-        _fail(db, bt, f"paused: {e}")
-        return {"status": "failed", "error": "paused"}
+        _fail(db, bt, f"{e.reason}: {e}")
+        return {"status": e.reason}
     except Exception as e:  # noqa: BLE001 — any failure fails the row, not the worker
         logger.error(f"Re-run backtest {backtest_id} failed: {e}", exc_info=True)
         try:

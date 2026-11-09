@@ -1062,6 +1062,10 @@ class GeneticOptimizer:
             try:
                 fitness = fitness_function(params)
                 return (fitness,)
+            except InterruptedError:
+                # pause/cancel of the task: end the generation now, do not score the genome at
+                # the failure sentinel and carry on to the end of the generation.
+                raise
             except Exception as e:
                 from app.services.job_fatal import job_fatal
                 if job_fatal(e):

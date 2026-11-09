@@ -22,6 +22,9 @@ from app.models.task_queue import TaskQueue, TaskStatus, TaskPriority
 
 logger = logging.getLogger(__name__)
 
+STOP_PAUSED = "paused"
+STOP_CANCELLED = "cancelled"
+
 
 class TaskQueueService:
     """
@@ -366,13 +369,30 @@ class TaskQueueService:
 
         Returns:
             True if task should pause
+
+        This is PAUSE only. A handler that must also stop on cancel uses ``stop_reason``.
+        """
+        return self.stop_reason(task_id) == STOP_PAUSED
+
+    def stop_reason(self, task_id: str) -> Optional[str]:
+        """Why a running handler must stop now: ``"paused"``, ``"cancelled"`` or ``None``.
+
+        ``cancel_task`` writes CANCELLED and ``pause_task`` writes PAUSED; both are requests the
+        handler only learns of by polling the row, so every long-running handler polls this (not
+        ``is_task_paused``) and treats the two differently: a pause keeps the checkpoint and the
+        row ends PAUSED (resumable); a cancel discards the run and the row stays CANCELLED.
+        A row that no longer exists reads as ``None`` (handlers are also run directly, off-queue).
         """
         db = SessionLocal()
         try:
             task = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
-            if task:
-                return task.status == TaskStatus.PAUSED.value
-            return False
+            if task is None:
+                return None
+            if task.status == TaskStatus.PAUSED.value:
+                return STOP_PAUSED
+            if task.status == TaskStatus.CANCELLED.value:
+                return STOP_CANCELLED
+            return None
         finally:
             db.close()
 
@@ -723,24 +743,39 @@ class TaskQueueService:
 
             db_task = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
             if db_task:
-                db_task.result = result
-                db_task.completed_at = datetime.now()
-                db_task.progress = 100.0
-
-                if result_status == 'failed':
-                    # Handler returned a failure status - mark task as failed
-                    db_task.status = TaskStatus.FAILED.value
-                    error_msg = result.get('error', 'Task handler returned failed status')
-                    db_task.error_message = error_msg
-                    logger.warning(f"Task {task_id} marked as failed: {error_msg}")
-                elif result_status == 'partial':
-                    # Partial success - still mark as completed but with warning
-                    db_task.status = TaskStatus.COMPLETED.value
-                    logger.warning(f"Task {task_id} partially completed")
+                # Re-read: pause_task / cancel_task wrote this row while the handler ran, and the
+                # handler's return value must never overwrite that with COMPLETED.
+                db.refresh(db_task)
+                current = db_task.status
+                if current == TaskStatus.CANCELLED.value or result_status == STOP_CANCELLED:
+                    # A cancelled run keeps no result; cancel_task already stamped completed_at.
+                    if current != TaskStatus.CANCELLED.value:
+                        db_task.status = TaskStatus.CANCELLED.value
+                        db_task.completed_at = datetime.now()
+                    logger.info(f"Task {task_id} cancelled (handler result: {result_status})")
+                elif current == TaskStatus.PAUSED.value or result_status == STOP_PAUSED:
+                    # Paused: resumable, so no completed_at and no 100% progress.
+                    db_task.status = TaskStatus.PAUSED.value
+                    logger.info(f"Task {task_id} paused (handler result: {result_status})")
                 else:
-                    # Success
-                    db_task.status = TaskStatus.COMPLETED.value
-                    logger.info(f"Task {task_id} completed successfully")
+                    db_task.result = result
+                    db_task.completed_at = datetime.now()
+                    db_task.progress = 100.0
+
+                    if result_status == 'failed':
+                        # Handler returned a failure status - mark task as failed
+                        db_task.status = TaskStatus.FAILED.value
+                        error_msg = result.get('error', 'Task handler returned failed status')
+                        db_task.error_message = error_msg
+                        logger.warning(f"Task {task_id} marked as failed: {error_msg}")
+                    elif result_status == 'partial':
+                        # Partial success - still mark as completed but with warning
+                        db_task.status = TaskStatus.COMPLETED.value
+                        logger.warning(f"Task {task_id} partially completed")
+                    else:
+                        # Success
+                        db_task.status = TaskStatus.COMPLETED.value
+                        logger.info(f"Task {task_id} completed successfully")
 
                 db.commit()
 
@@ -749,7 +784,11 @@ class TaskQueueService:
 
             # Handle failure
             db_task = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
-            if db_task:
+            if db_task and db_task.status in (TaskStatus.CANCELLED.value, TaskStatus.PAUSED.value):
+                # Stopped by the user while the handler ran: a crash on the way out must not
+                # re-queue (retry) or fail the row.
+                logger.info(f"Task {task_id} is {db_task.status}; not retrying after: {e}")
+            elif db_task:
                 db_task.error_message = str(e)
 
                 # Check for retry

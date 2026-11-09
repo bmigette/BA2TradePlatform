@@ -62,7 +62,7 @@ from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
 from app.services.chain_seed import (  # noqa: E402
     CHAIN_SEED_KEY, SEEDED_FROM_KEY, ChainSeedError,
     build_chain_seed_population, final_population_record, stored_record)
-from app.services.task_queue import get_task_queue
+from app.services.task_queue import STOP_CANCELLED, get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
@@ -1751,6 +1751,24 @@ def _final_status(all_results: list) -> str:
     return "no_measurements" if all_results else "failed"
 
 
+class TaskStopRequested(InterruptedError):
+    """The task row was paused or cancelled while this handler ran (``reason`` says which)."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"task {reason}")
+        self.reason = reason
+
+
+def _raise_if_stop_requested(tq: Any, task_id: str) -> None:
+    """The ONE stop check of a run: raises TaskStopRequested on pause OR cancel.
+
+    ``tq.is_task_paused`` alone sees PAUSED only, so a cancelled run used to go on to the end and
+    then be recorded as completed."""
+    reason = tq.stop_reason(task_id)
+    if reason:
+        raise TaskStopRequested(reason)
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -1925,8 +1943,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 logger.debug(f"live opt persist skipped: {e}")
 
         def fitness_function(decoded_flat: Dict[str, Any]) -> float:
-            if tq.is_task_paused(task_id):
-                raise InterruptedError("paused/cancelled")
+            _raise_if_stop_requested(tq, task_id)
             decoded = decode_params(strategy, decoded_flat)
             key = trial_key(
                 {
@@ -2031,8 +2048,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             row.all_results = all_results
             db.commit()
             push_optimization(row, db)
-            if tq.is_task_paused(task_id):
-                raise InterruptedError("paused/cancelled")
+            _raise_if_stop_requested(tq, task_id)
 
         # Checkpoints are keyed on the JOB (its name), not this row's id, so a relaunch of an
         # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
@@ -2120,8 +2136,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 checkpoint the population MID-generation instead of only at the boundary.
                 """
                 nonlocal _pool          # rebound by the batch-end recycle at the bottom
-                if tq.is_task_paused(task_id):
-                    raise InterruptedError("paused/cancelled")
+                _raise_if_stop_requested(tq, task_id)
                 fits: list = [None] * len(param_dicts)
                 tally = _TrialErrorTally()
                 jobs = []  # (idx, decoded_flat, key, config)
@@ -2328,8 +2343,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     # DistributedEvaluator (its broker is cleared of this optimization's pending
                     # trials). Trials already running finish and are discarded, as a GA pause
                     # discards its interrupted generation.
-                    if brute_force and done < total_in_batch and tq.is_task_paused(task_id):
-                        raise InterruptedError("paused/cancelled")
+                    if brute_force and done < total_in_batch:
+                        _raise_if_stop_requested(tq, task_id)
                 # RECYCLE, DISTRIBUTED PATH. With --workers the trials run through
                 # DistributedEvaluator, whose consumer threads submit to the pool continuously --
                 # _local_execute_jobs (and its per-chunk rebuild) is never called, so without this
@@ -2774,6 +2789,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             "best_params": result["best_params"],
         }
 
+    except TaskStopRequested as stop:
+        if stop.reason == STOP_CANCELLED:
+            # Cancelled: the run is abandoned (no checkpoint is written for it, no result kept)
+            # and the row must not keep reading "running". The task row is already CANCELLED.
+            try:
+                row = db.query(StrategyOptimization).filter(
+                    StrategyOptimization.id == opt_id).first()
+                if row is not None:
+                    row.status = "cancelled"
+                    row.completed_at = datetime.now()
+                    db.commit()
+                    push_optimization(row, db)
+            except Exception as e:  # noqa: BLE001 -- the cancel itself already happened
+                db.rollback()
+                logger.warning(f"strategy_optimization {opt_id}: could not mark the row cancelled: {e}")
+            logger.warning(f"strategy_optimization {opt_id}: CANCELLED")
+            return {"status": "cancelled", "optimization_id": opt_id}
+        return {"status": "paused"}
     except InterruptedError:
         return {"status": "paused"}
     except Exception as e:  # noqa: BLE001 — any crash must fail the row, not the worker

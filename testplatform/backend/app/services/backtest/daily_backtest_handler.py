@@ -334,8 +334,13 @@ def derive_warmup_days(expert_specs: List[Any]) -> int:
 
 
 class _Paused(Exception):
-    """Raised from the progress callback when the task is paused (surfaces as a failure
-    with a clear message — the queue's pause/resume re-queues the task)."""
+    """Raised from the progress callback when the task is paused OR cancelled (``reason`` says
+    which; the backtest row is closed as failed with a clear message, and the handler returns
+    that reason so the queue keeps the task PAUSED / CANCELLED instead of finalising it)."""
+
+    def __init__(self, msg: str, reason: str = "paused"):
+        super().__init__(msg)
+        self.reason = reason
 
 
 def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -365,8 +370,9 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         record_option_spread_model(db, bt, config)
 
         def progress(pct: float, msg: str) -> None:
-            if tq.is_task_paused(task_id):
-                raise _Paused(msg)
+            reason = tq.stop_reason(task_id)
+            if reason:
+                raise _Paused(msg, reason)
             tq.update_progress(task_id, pct, msg)
 
         results = run_daily_backtest(config, progress_cb=progress)
@@ -384,8 +390,8 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
     except _Paused as e:
         # Leave the row 'running' status untouched? No — surface paused as a failure so the
         # row is not stuck; the queue handles re-queue on resume independently.
-        _fail(db, bt, f"paused: {e}")
-        return {"status": "failed", "error": "paused"}
+        _fail(db, bt, f"{e.reason}: {e}")
+        return {"status": e.reason}
     except Exception as e:  # noqa: BLE001 — any engine failure must fail the row, not crash the worker
         logger.error(f"Daily backtest {backtest_id} failed: {e}", exc_info=True)
         try:
