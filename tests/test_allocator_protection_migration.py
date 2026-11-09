@@ -98,7 +98,9 @@ def test_the_revision_chains_onto_the_previous_head_and_keeps_a_single_head():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert script.get_heads() == ["b8d1f4a29c63"]
+    assert len(script.get_heads()) == 1
+    # b8d1f4a29c63 is no longer the head (c4e7a9d2f1b8 chains onto it) but stays on the one line
+    assert "b8d1f4a29c63" in {r.revision for r in script.walk_revisions()}
     assert script.get_revision("b8d1f4a29c63").down_revision == "a7c3e91d5b24"
     assert script.get_revision("a7c3e91d5b24").down_revision == "d9e3b72a10fc"
 
