@@ -135,6 +135,13 @@ _WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 _PRICE_MAP_MEM: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
 
+#: LIVE-only counterpart of ``_PRICE_MAP_MEM`` (which is backtest-only): ``{sym: (fetched_at, map)}``
+#: with a short TTL so a long-lived live process neither serves a stale map nor refetches the full
+#: history once per disclosure. Never holds an empty map.
+_LIVE_PRICE_MAP_MEM: Dict[str, Any] = {}
+_LIVE_PRICE_MAP_TTL_S = 600.0
+_LIVE_PRICE_MAP_MAX = 256
+
 #: How many HELD-BACK symbols a live basket analysis keeps in its state row.
 #:
 #: A cycle scans the whole disclosure feed -- measured on prod 2026-09-15 at up to ~250 symbols,
@@ -153,6 +160,7 @@ _ESTIMATES_UNAVAILABLE = object()
 def clear_price_map_memo() -> None:
     """Drop the projection memo (tests / between unrelated universes)."""
     _PRICE_MAP_MEM.clear()
+    _LIVE_PRICE_MAP_MEM.clear()
 
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
@@ -1651,17 +1659,41 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if _is_ttl_frozen():
             raise ValueError(msg) from None
 
+    def _live_price_map(self, sym: str) -> Dict[str, Any]:
+        """LIVE ``{date: open}`` map for ``sym``, memoised for ``_LIVE_PRICE_MAP_TTL_S`` only.
+
+        ``_gather`` resolves one price per trade, so a symbol with N disclosures would pull its
+        full (~3 MB) history N times per analysis with no memo; the TTL collapses that to one
+        fetch per symbol per window while a long-lived live process still sees new sessions.
+        An EMPTY result (a failed fetch returns ``[]``) is never stored, so the next call retries.
+        """
+        now = time.time()
+        hit = _LIVE_PRICE_MAP_MEM.get(sym)
+        if hit is not None and (now - hit[0]) < _LIVE_PRICE_MAP_TTL_S:
+            return hit[1]
+        hist = self._fetch_price_history_uncached(sym) or []
+        smap = {row.get("date"): row.get("open") for row in hist if row.get("date")}
+        if not smap:
+            _LIVE_PRICE_MAP_MEM.pop(sym, None)
+            return smap
+        _LIVE_PRICE_MAP_MEM[sym] = (now, smap)
+        while len(_LIVE_PRICE_MAP_MEM) > _LIVE_PRICE_MAP_MAX:
+            _LIVE_PRICE_MAP_MEM.pop(next(iter(_LIVE_PRICE_MAP_MEM)))
+        return smap
+
     def _get_price_at_date(self, symbol: str, date: datetime) -> Optional[float]:
         """Opening price for ``symbol`` on ``date`` (or None if not a trading day / unavailable).
 
-        The per-symbol FULL daily history is fetched ONCE and disk-cached (backtest-only, via
-        ``fmp_history_disk_cached``) so spawned grid workers read it from disk instead of
-        re-hitting FMP for every (symbol, exec-date) on every analysis bar — the dominant cold
-        cost of a Senate backtest. The per-date open is byte-identical to the old single-day
-        ``from=to=date`` query; the live path (freeze flag off) passes through to a fresh fetch
-        exactly as before.
+        BACKTEST (TTL freeze flag on): the per-symbol FULL daily history is fetched ONCE and
+        disk-cached (via ``fmp_history_disk_cached``) so spawned grid workers read it from disk
+        instead of re-hitting FMP for every (symbol, exec-date) on every analysis bar — the
+        dominant cold cost of a Senate backtest. The per-date open is byte-identical to the old
+        single-day ``from=to=date`` query. WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY
+        THAT — see ``_PRICE_MAP_MEM``.
 
-        WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY THAT — see ``_PRICE_MAP_MEM``.
+        LIVE (freeze flag off): never reads or writes ``_PRICE_MAP_MEM`` (it would serve the
+        first-built map for the life of the process); uses ``_live_price_map``, a short-TTL memo
+        that never stores an empty map.
         """
         if not self._api_key:
             return None
@@ -1670,6 +1702,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         sym = self._normalize_ticker(symbol)
         if not sym:
             return None
+
+        from ba2_providers.fmp_common import _is_ttl_frozen
+        if not _is_ttl_frozen():
+            return self._live_price_map(sym).get(date.strftime("%Y-%m-%d"))
 
         smap = _PRICE_MAP_MEM.get(sym)
         if smap is None:
