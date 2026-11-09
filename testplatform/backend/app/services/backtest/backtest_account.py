@@ -103,7 +103,8 @@ logger = logging.getLogger(__name__)
 
 # ``TradingOrder.data`` key marking a book-keeping fill that moved no cash commission (option
 # expiry/assignment closes, the assignment-created stock lot, forced stock liquidations).
-# ``get_round_trip_trades`` skips these when charging commission per fill.
+# ``get_round_trip_trades`` skips these when charging commission per fill. The post-assignment
+# next-bar liquidation is NOT one of them: it pays an equity market fill's costs.
 SYNTHETIC_FILL_KEY = "synthetic_fill"
 
 #: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
@@ -2793,10 +2794,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _record_stock_liquidation_close(
         self, symbol: str, qty: float, was_long: bool, px: float,
-        comment: str = "margin_call_liquidation",
+        comment: str = "margin_call_liquidation", *, commission_paid: bool = False,
     ) -> None:
         """Persist a synthetic FILLED closing order for a forced STOCK liquidation
         (margin call, or the post-assignment next-bar liquidation — ``comment`` names which).
+
+        ``commission_paid``: the caller charged ``commission_per_trade`` on this fill (the
+        assignment liquidation does, like any equity market fill). The order then does NOT
+        carry ``SYNTHETIC_FILL_KEY`` -- that flag means "moved no commission", and
+        ``get_round_trip_trades`` must charge the row exactly what the cash ledger paid.
 
         BOOK-KEEPING only (the caller already moved cash + ledger). Linked to the symbol's
         OPENED equity transaction when one resolves — the entry order's side must match the
@@ -2835,7 +2841,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment=comment,
             created_at=as_of,
-            data={SYNTHETIC_FILL_KEY: True},
+            data=(None if commission_paid else {SYNTHETIC_FILL_KEY: True}),
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -5119,6 +5125,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # transaction``, ``_record_stock_liquidation_close``) are book-keeping rows written
             # AFTER cash moved without a commission; they carry ``SYNTHETIC_FILL_KEY`` in
             # ``order.data``. Charging them overcharged the rows against the cash ledger.
+            # (The post-assignment ``assignment_liquidation`` pays a commission in cash and
+            # is written WITHOUT the flag, so its row is charged here like any fill.)
             comm = commission * sum(
                 1 for o in (*entries, *exits)
                 if not (isinstance(o.data, dict) and o.data.get(SYNTHETIC_FILL_KEY)))
@@ -7062,8 +7070,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         NEXT bar's OPEN — never more than was assigned, never more than is still held in
         that direction (a pre-existing position the strategy opened itself is untouched,
         and an assignment that merely offset an opposite position leaves nothing to do).
-        Each liquidation persists a synthetic FILLED closing order (comment
-        ``assignment_liquidation``) so the equity move is a visible trade. A symbol with
+        Each liquidation is priced and charged like an ordinary equity MARKET fill of its
+        side -- the open through ``_slip`` (slippage + half the spread, adverse) plus
+        ``commission_per_trade`` -- and persists a FILLED closing order (comment
+        ``assignment_liquidation``, at the slipped price, NOT flagged ``SYNTHETIC_FILL_KEY``
+        because it paid a commission) so the equity move is a visible trade. A symbol with
         no bar this tick stays pending for the next bar. One dict check when nothing is
         pending; equity-only runs never schedule anything — and neither do runs that set
         ``hold_assigned_stock`` (the wheel), for which this method is a permanent no-op
@@ -7116,15 +7127,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     continue  # stays queued: retry once the short call releases its cover
                 to_close = float(sellable)
             signed = -to_close if assigned > 0 else to_close  # sell long / buy back short
-            self._cash -= signed * px
-            self._update_position(symbol, signed, px)
+            # The liquidation is an ordinary equity MARKET fill of its side and pays what one
+            # pays (review 2026-11-09): ``_slip`` (slippage + half the spread, adverse -- a
+            # sale fills below the open, a buy-back above it) and ``commission_per_trade``,
+            # exactly as ``_apply_fill`` charges. It used to trade at the raw open for free.
+            # With all three costs at zero this is the old arithmetic, value for value.
+            fill_px = self._slip(px, side_is_buy=(assigned < 0))
+            commission = float(self._cfg["commission_per_trade"])
+            self._cash -= signed * fill_px
+            self._cash -= commission
+            self._update_position(symbol, signed, fill_px)
             self._record_stock_liquidation_close(
-                symbol, to_close, was_long=(assigned > 0), px=px, comment="assignment_liquidation"
+                symbol, to_close, was_long=(assigned > 0), px=fill_px,
+                comment="assignment_liquidation", commission_paid=True,
             )
             logger.warning(
-                "[backtest] assignment_liquidation: %s %g x %s @ %.4f (next-bar open) — "
-                "assigned stock is unmanaged in a backtest; cash now $%.2f.",
-                "sold" if assigned > 0 else "bought back", to_close, symbol, px, self._cash,
+                "[backtest] assignment_liquidation: %s %g x %s @ %.4f (next-bar open %.4f "
+                "after slippage/spread; commission $%.2f) — assigned stock is unmanaged in a "
+                "backtest; cash now $%.2f.",
+                "sold" if assigned > 0 else "bought back", to_close, symbol, fill_px, px,
+                commission, self._cash,
             )
             if locked_out > 0:
                 # Only the PLEDGED remainder stays queued. Popping it here (what the
