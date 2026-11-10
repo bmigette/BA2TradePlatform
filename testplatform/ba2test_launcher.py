@@ -1871,6 +1871,24 @@ _EXPERT_OPT = {
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
+    # PullbackReversion (goal2027 design 2026-11-10 part 4): LONG ONLY. Short-horizon RSI dip in an
+    # uptrend. Its own signal is the entry (BUY) and the exit_mode exit (SELL -> the strategy's
+    # exit_bearish rule); the stop / take-profit / time exits come from the S-strategy's standard exit
+    # rules, so no exit is generated here. Ranges are the expert's own validation bounds
+    # (PullbackReversion.pullback_signal: rsi_period 2-5, entry_threshold 1-30, rsi_exit 50-90).
+    # Choice ORDER is a persisted contract (the GA stores the index): it follows the expert's tuples.
+    "PullbackReversion": {
+        "expert_params": {
+            "rsi_period": {"optimize": True, "min": 2, "max": 5, "step": 1, "type": "int"},
+            "entry_threshold": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
+            "trend_gate": {"optimize": True, "type": "choice",
+                           "choices": ["sma200", "slope_ohlcv_v1", "sma200_and_spy"]},
+            "exit_mode": {"optimize": True, "type": "choice",
+                          "choices": ["sma5", "rsi", "sma5_or_choch", "time"]},
+            "rsi_exit": {"optimize": True, "min": 50.0, "max": 90.0, "step": 10.0, "type": "float"},
+        },
+        "fixed_settings": {"sizing_mode": "risk_atr", "direction": "long"},
+    },
     # DeterministicScorer — LLM-free multi-section scorer. Gene choices stay PARSIMONIOUS
     # on purpose (memo §5.3: free-weight sweeps over many signals overfit fast): section
     # weights, decision thresholds, ATR multiples, and the analyst-section switch (the
@@ -6176,6 +6194,51 @@ def _benchmark_regime_gates(m: str) -> list:
     return benchmark_regime_leaves(m)
 
 
+#: ``--pullback-gates`` (goal2027 design 2026-11-10 part 3): append the per-symbol pullback entry
+#: leaves (RSI 2-5, below the 20-day high, vs SMA200) to every equity S1-S7 entry tree. OFF by
+#: default = today's rules, genes and job identity byte for byte.
+_PULLBACK_GATES: bool = False
+
+
+def _resolve_pullback_gates(raw, command: str) -> bool:
+    """Parse ``--pullback-gates``; sets the module global and returns it."""
+    global _PULLBACK_GATES
+    _PULLBACK_GATES = bool(raw)
+    return _PULLBACK_GATES
+
+
+def _pullback_gates(m: str) -> list:
+    """The pullback entry leaves for rule prefix ``m`` ([] unless the flag is on)."""
+    if not _PULLBACK_GATES:
+        return []
+    from ba2_common.core.market_condition_templates import pullback_gate_leaves
+
+    return pullback_gate_leaves(m)
+
+
+def _check_pullback_gates(command: str, strat, kind: str = "") -> None:
+    """Refuse ``--pullback-gates`` for a job that would be labelled gated and search no such gene."""
+    if not _PULLBACK_GATES:
+        return
+    if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --pullback-gates: {kind!r} emits no pullback gates "
+                 f"(gated keys: {sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). Drop the flag for this job.")
+    from ba2_common.core.market_condition_templates import PULLBACK_GATE_SPECS
+
+    fields = {spec[1] for spec in PULLBACK_GATE_SPECS}
+
+    def _has_gate(node) -> bool:
+        if isinstance(node, list):
+            return any(_has_gate(n) for n in node)
+        if isinstance(node, dict):
+            return node.get("field") in fields or any(_has_gate(v) for v in node.values())
+        return False
+
+    if not _has_gate(getattr(strat, "entry_rules", None) or []):
+        sys.exit(f"{command}: --pullback-gates: the built strategy carries no pullback gate "
+                 f"(a bypass expert builds no entry rules); drop the flag for this job")
+
+
 def _market_condition_gates(m: str) -> list:
     """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
 
@@ -7387,6 +7450,34 @@ def _append_equity_benchmark_regime_gates(strategy, kind: str):
              and r["conditions"].get("conditions")]
     if not trees:
         raise ValueError(f"{kind}: no entry rule with a condition tree to carry the SPY regime gates")
+    for rule in trees:
+        tree = rule["conditions"]
+        tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
+    strategy.entry_rules = normalize_trade_rules(rules)
+    return strategy
+
+
+def _append_equity_pullback_gates(strategy, kind: str):
+    """Append the pullback ENTRY leaves (``<kind>-pb-rsi2..5``, ``<kind>-pb-below-high``,
+    ``<kind>-pb-vs-sma200``) LAST to every initial-entry AND tree of an equity strategy (S1-S7),
+    never to an exit rule (goal2027 design 2026-11-10 part 3).
+
+    Same shape and sharing as ``_append_equity_market_condition_gates``: S1's three conviction tiers
+    get the SAME leaf ids, so one set of genes drives all three. Appended after the market and SPY
+    leaves, so every existing leaf keeps its index. Each leaf has its own ``off`` mode: the search
+    space contains today's behaviour. A no-op with ``--pullback-gates`` off."""
+    gates = _pullback_gates(kind.lower())
+    if not gates:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    trees = [r for r in rules if isinstance(r, dict) and isinstance(r.get("conditions"), dict)
+             and r["conditions"].get("conditions")]
+    if not trees:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to carry the pullback gates")
     for rule in trees:
         tree = rule["conditions"]
         tree["conditions"] = list(tree["conditions"]) + [copy.deepcopy(g) for g in gates]
@@ -9216,6 +9307,7 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         # further per-kind splicing to interact with.
         strat = _append_equity_market_condition_gates(strat, kind)
         strat = _append_equity_benchmark_regime_gates(strat, kind)   # goal2027 2.3; no-op flag off
+        strat = _append_equity_pullback_gates(strat, kind)           # goal2027 part 3; no-op flag off
         strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
@@ -9658,6 +9750,7 @@ def _cmd_optimize(args) -> int:
     # Read BEFORE _build_strategy too: the market gates are appended by the same builders.
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
     _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False), "optimize")
+    _resolve_pullback_gates(getattr(args, "pullback_gates", False), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
@@ -10071,6 +10164,7 @@ def _cmd_optimize(args) -> int:
         # pass -- exactly the silent miss this check exists to prevent.
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
+        _check_pullback_gates("optimize", strat, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # Weekdays only under EVERY policy (_WEEKDAY_SCHEDULE_DAY_OPT drops the 2 weekend genes:
@@ -10234,6 +10328,7 @@ def _cmd_optimize_batch(args) -> int:
                                        "optimize-batch")
     _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False),
                                     "optimize-batch")
+    _resolve_pullback_gates(getattr(args, "pullback_gates", False), "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
@@ -10426,6 +10521,7 @@ def _cmd_optimize_batch(args) -> int:
             # sits after every block that can still rewrite enabled_instruments.
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
             _apply_benchmark_regime("optimize-batch", backtest_block, strat, strat_kind)
+            _check_pullback_gates("optimize-batch", strat, strat_kind)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,
@@ -11501,6 +11597,13 @@ def _add_market_condition_args(p) -> None:
                         "per member; population/generations are NOT scaled). The SPY series is "
                         "the job's own ohlcv history source. Folds into the job identity in "
                         "tools/run_options_matrix.py. Absent = today's rules and genes.")
+    p.add_argument("--pullback-gates", action="store_true", default=False,
+                   help="OPT-IN, equity S1-S7 only (goal2027 design 2026-11-10 part 3; refused for any "
+                        "other key). Append the per-symbol pullback entry gates to every entry tree: "
+                        "<kind>-pb-rsi2..5 (Wilder RSI of finished daily closes), <kind>-pb-below-high "
+                        "(percent below the 20-day high) and <kind>-pb-vs-sma200 (price vs SMA200 in "
+                        "percent), each with an off/below/above mode gene and a threshold gene (12 "
+                        "added genes per strategy; S1's tiers share them). Absent = today's rules.")
     p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
                    help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
                         "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."

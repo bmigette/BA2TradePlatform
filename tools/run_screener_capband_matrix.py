@@ -98,6 +98,11 @@ _PLACEHOLDER_UNIVERSE = ("AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD
 # settle lower than the truth. That biases one gene, not the run.
 _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "DeterministicScorer"]
 _RANKER = "FactorRanker"
+# goal2027 design 2026-11-10 part 4: PullbackReversion (long only) runs on the cap bands like a classic expert, but
+# only when --pullback-strategies names its strategies (opt-in per invocation: the shared strategy plan is also read
+# by other grids, so it is not extended, and every existing command runs exactly the jobs it ran before). It needs
+# no per-band data exclusion.
+_PULLBACK_EXPERT = "PullbackReversion"
 # goal2027 runs Senate INSIDE the grid (owner 2026-11-02: no separate Senate grid). Its cells live on
 # the pseudo-band ``senate``: a STATIC disclosure-derived universe (--senate-universe-file), not a
 # cap-band screen -- congressional trades are too sparse per symbol to split by cap. Only Senate runs
@@ -239,6 +244,15 @@ def benchmark_regime_tokens(args, strat) -> list:
     return []
 
 
+def pullback_gate_tokens(args, strat) -> list:
+    """`--pullback-gates` for an S1-S7 job when the matrix searches the per-symbol pullback entry gates (goal2027 design
+    2026-11-10 part 3), else []. A bypass job (``strat is None``) has no entry rules and SQM takes no such genes: both
+    are refused by the launcher, so neither is given the flag (the caller prints a NOTE)."""
+    if getattr(args, "pullback_gates", False) and strat in SPY_GATE_STRATEGIES:
+        return ["--pullback-gates"]
+    return []
+
+
 def exploration_range_tokens(args, expert, strat) -> list:
     """`--search-exploration-ranges` for a job whose (expert, strategy) pair the flag is defined for (goal2027 item
     2.9), else []. The launcher refuses the flag for any other pair, so it is not forwarded (the caller prints a
@@ -371,7 +385,7 @@ def _completed_names() -> set:
 
 
 def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix="",
-          strategy_plan=None):
+          strategy_plan=None, pullback_strategies=()):
     """Yield (name, expert, strategy_or_None, band) in priority order.
 
     ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
@@ -434,6 +448,9 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
                 if EXPERT_ONLY_STRATEGIES.get(s, expert) != expert:
                     continue  # e.g. SQM is DeterministicScorer's recipe only
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
+        if pullback_strategies and _eligible(band, _PULLBACK_EXPERT):
+            for s in pullback_strategies:
+                yield (f"scr-{band}-{_PULLBACK_EXPERT}-{s}{name_suffix}", _PULLBACK_EXPERT, s, band)
         if _RANKER not in skip_experts:
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
 
@@ -728,6 +745,14 @@ def main() -> int:
                     help="Search the SPY regime ENTRY gates (spy-trend, spy-vol mode genes with an off value; goal2027 "
                          "2.3) on every S1-S7 job. REQUIRES --name-suffix to contain 'spyreg'. Not forwarded to the "
                          "FactorRanker job (bypass) or SQM (no SPY genes).")
+    ap.add_argument("--pullback-strategies", default="",
+                    help="Comma list of S1-S7 strategies to run PullbackReversion (long only; goal2027 design "
+                         "2026-11-10 part 4) with on every cap band, e.g. 'S2'. Default empty = the expert is not run. "
+                         "'--skip-experts PullbackReversion' drops it again.")
+    ap.add_argument("--pullback-gates", action="store_true", default=False,
+                    help="Search the per-symbol PULLBACK entry gates (RSI 2-5, below the 20-day high, price vs SMA200; "
+                         "each with an off value; goal2027 design 2026-11-10 part 3) on every S1-S7 job. REQUIRES "
+                         "--name-suffix to contain 'pullback'. Not forwarded to the FactorRanker job (bypass) or SQM.")
     ap.add_argument("--search-exploration-ranges", action="store_true", default=False,
                     help="Widen the time-exit lattices and add the FMPEarningsDrift S5 time exit so every "
                          "exploration phase-1 timeout and its control is searchable (goal2027 item 2.9). REQUIRES "
@@ -905,6 +930,15 @@ def main() -> int:
         ap.error(f"--benchmark-regime-gates requires --name-suffix to contain 'spyreg' (got {args.name_suffix!r}): its "
                  f"gene space differs from an ungated run's, so it must not share a job name. "
                  f"Example: --name-suffix goal2027-spyreg")
+    _pb_strats = [t.strip() for t in args.pullback_strategies.split(",") if t.strip()]
+    _bad_pb = sorted(set(_pb_strats) - (SPY_GATE_STRATEGIES | {"SQM"}) )
+    if _bad_pb or "SQM" in _pb_strats or len(set(_pb_strats)) != len(_pb_strats):
+        ap.error(f"--pullback-strategies {args.pullback_strategies!r}: unknown, repeated or unsupported strategies "
+                 f"(allowed: {sorted(SPY_GATE_STRATEGIES)})")
+    if args.pullback_gates and "pullback" not in args.name_suffix.replace("_", "").lower():
+        ap.error(f"--pullback-gates requires --name-suffix to contain 'pullback' (got {args.name_suffix!r}): its "
+                 f"gene space differs from an ungated run's, so it must not share a job name. "
+                 f"Example: --name-suffix goal2027-pullback")
     if args.search_market_profile:
         _need = ("ohlcv-v1", "ta-structure-v1")
         _profiles = [t.strip() for t in (args.market_condition_profile or "").split(",") if t.strip()]
@@ -982,8 +1016,9 @@ def main() -> int:
         strategy_plan = load_strategy_plan(args.strategy_plan, skip_experts)
         print(f"strategy plan {args.strategy_plan}: "
               + "; ".join(f"{e} {','.join(s)}" for e, s in sorted(strategy_plan.items())))
+    pullback_strategies = tuple(t.strip() for t in args.pullback_strategies.split(",") if t.strip())
     jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix,
-                      strategy_plan))
+                      strategy_plan, pullback_strategies))
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
@@ -1168,6 +1203,12 @@ def main() -> int:
         if args.benchmark_regime_gates and not spy_tokens:
             print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no SPY regime gate, flag not applied",
                   flush=True)
+        # --pullback-gates (goal2027 part 3): appended after the SPY gates; digest on its own. Same scope as the SPY gates.
+        pb_tokens = pullback_gate_tokens(args, strat)
+        cmd += pb_tokens
+        if args.pullback_gates and not pb_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no pullback gate, flag not applied",
+                  flush=True)
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names. Under
@@ -1180,7 +1221,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
             job_name = _job_name(name, ident + wf_tokens)

@@ -30,9 +30,10 @@
 #
 # STEPS (design 4.2 run order; STEPS="..." runs a subset, in the order given):
 #   fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small
-#   sqm-xl rank-large rank-mid rank-small senate
+#   sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small
 # (fr = FMPRating, ds = DeterministicScorer, ed = FMPEarningsDrift, icb = FMPInsiderClusterBuy,
-#  sqm = DeterministicScorer SQM on the xl screen, rank = FactorRanker, senate = FMPSenateTraderWeight.)
+#  sqm = DeterministicScorer SQM on the xl screen, rank = FactorRanker, senate = FMPSenateTraderWeight,
+#  pb = PullbackReversion, long only, strategy S2: RSI-dip entries in an uptrend, exit_mode genes.)
 # One driver call per step: names carry only the gene tokens that step really searches, and the
 # per-band spread is a per-call flag. Every call adds to ONE summary under $WF_REPORT_DIR.
 #
@@ -80,14 +81,16 @@ SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-${REPO_ROOT}/docs/strategy_researc
 WORKERS="${WORKERS-remote227}"
 PARALLEL="${PARALLEL-0}"
 export BA2_MAX_REMOTE_SLOTS="${BA2_MAX_REMOTE_SLOTS:-28}"
-POPULATION="${POPULATION:-200}"
+# Budget 2026-11-10 (design goal2027-pullback-downmarket "Grid budget"): population 200 -> 300 and later folds
+# 15 -> 20 generations, because the pullback leaves and the down-trend scales add genes.
+POPULATION="${POPULATION:-300}"
 WF_FIRST_GENERATIONS="${WF_FIRST_GENERATIONS:-30}"
-WF_NEXT_GENERATIONS="${WF_NEXT_GENERATIONS:-15}"
+WF_NEXT_GENERATIONS="${WF_NEXT_GENERATIONS:-20}"
 WF_TOP_N="${WF_TOP_N:-3}"
 EARLY_STOP="${EARLY_STOP:-5}"
 EARLY_STOP_MIN_REL="${EARLY_STOP_MIN_REL:-0.01}"
 SUFFIX_BASE="${SUFFIX_BASE:--goal2027}"
-ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate"
+ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small"
 STEPS="${STEPS:-$ALL_STEPS}"
 
 # Spread = measured Alpaca SIP median per band; stress = the p90 - median widening (driver's
@@ -99,9 +102,10 @@ expert_of() {
   case "$1" in
     fr) echo FMPRating ;; ds|sqm) echo DeterministicScorer ;; ed) echo FMPEarningsDrift ;;
     icb) echo FMPInsiderClusterBuy ;; rank) echo FactorRanker ;; senate) echo FMPSenateTraderWeight ;;
+    pb) echo PullbackReversion ;;
   esac
 }
-ALL_EXPERTS="FMPRating DeterministicScorer FMPEarningsDrift FMPInsiderClusterBuy FactorRanker FMPSenateTraderWeight"
+ALL_EXPERTS="FMPRating DeterministicScorer FMPEarningsDrift FMPInsiderClusterBuy FactorRanker FMPSenateTraderWeight PullbackReversion"
 skip_all_but() { local out=""; for e in $ALL_EXPERTS; do [ "$e" = "$1" ] || out="${out:+$out,}$e"; done; echo "$out"; }
 
 data_end() { case "${PHASE:-}" in A) echo 2025-12-31 ;; B) echo "" ;; esac; }
@@ -286,16 +290,19 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
     args+=(--senate-universe-file "$SENATE_UNIVERSE_FILE")
   fi
   case "$kind" in
-    fr|ds|ed|icb|senate)
+    fr|ds|ed|icb|senate|pb)
       args+=(--strategy-plan "$PLAN_FILE" --decision-times split --search-sizing-mode
              --rm-toggle-policy atr-regime-searched
              --market-condition-profile ohlcv-v1,ta-structure-v1
              --market-condition-manifest "ohlcv-v1=${mc_o},ta-structure-v1=${mc_t}"
              --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
-             --benchmark-regime-gates --exclude-symbols "@$EXCLUDE_FILE")
-      suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg"
+             --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
+      suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
+      # PullbackReversion (long only) runs S2 on the cap bands; its entry is a daily dip, so the screener
+      # cadence is daily (the weekday genes still pick the scan days). The matrix runs it only when asked.
+      if [ "$kind" = "pb" ]; then args+=(--pullback-strategies S2 --cadence-days 1); fi
       if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
-      if [ "$kind" != "senate" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
+      if [ "$kind" != "senate" ] && [ "$kind" != "pb" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
     sqm)
       args+=(--strategies SQM --decision-times split --search-sizing-mode --search-ds-factor-weights
              --search-exploration-ranges --exclude-symbols "@$EXCLUDE_FILE")
