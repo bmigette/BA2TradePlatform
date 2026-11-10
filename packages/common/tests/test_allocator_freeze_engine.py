@@ -138,3 +138,49 @@ def test_multi_label_frozen_symbol_is_taken_out_of_every_label():
     assert _row(plan, "A").target_notional == pytest.approx(40_000.0)
     assert _row(plan, "B").target_notional == pytest.approx(40_000.0)
     assert _row(plan, "C").delta_quantity == 0.0
+
+
+# ---------------------------------------------------------------- INVEST_LABEL (compute_label_investment)
+
+def _invest(current, amount=10_000.0, frozen=None, labels=None):
+    return pa.compute_label_investment(
+        (labels or _labels())[0], amount, current, {}, available_buying_power=1_000_000.0,
+        allow_fractional=True, default_bp_factor=1.0, valuation_mode=MARKET, frozen_symbols=frozen)
+
+
+def _priced():
+    return {s: _pos(s, 100.0) for s in "ABC"}
+
+
+def test_invest_label_shares_the_amount_among_the_unfrozen_members():
+    plan = _invest(_priced(), frozen={"C"})
+    assert _row(plan, "A").target_notional == pytest.approx(6_250.0)
+    assert _row(plan, "B").target_notional == pytest.approx(3_750.0)
+    # orders are whole shares here (no margin info says fractionable): 62.5 -> 63, 37.5 -> 37
+    assert _row(plan, "A").delta_quantity > 0 and _row(plan, "B").delta_quantity > 0
+    c =_row(plan, "C")
+    assert c.frozen and c.side is None and c.delta_quantity == 0.0 and pa.REASON_FROZEN in c.reasons
+    assert plan.total_buy_value == pytest.approx(10_000.0, abs=100.0)
+
+
+def test_invest_label_with_every_member_frozen_buys_nothing_and_says_so():
+    plan = _invest(_priced(), frozen={"A", "B", "C"})
+    assert all(r.side is None and r.delta_quantity == 0.0 and r.frozen for r in plan.rows)
+    assert plan.total_buy_value == 0.0
+    assert any("every symbol of label 'core' is frozen" in w for w in plan.warnings)
+
+
+def test_invest_label_nothing_frozen_is_identical_to_before():
+    old = pa.compute_label_investment(_labels()[0], 10_000.0, _priced(), {},
+                                      available_buying_power=1_000_000.0, allow_fractional=True,
+                                      default_bp_factor=1.0, valuation_mode=MARKET)
+    for frozen in (None, set(), {"NOTINLABEL"}):
+        assert _invest(_priced(), frozen=frozen).to_dict() == old.to_dict()
+    assert _row(old, "C").target_notional == pytest.approx(2_000.0)
+
+
+def test_frozen_notional_survives_precheck_resolve_and_row_filtering():
+    plan = _solve({"C": _pos("C", 100.0, quantity=300.0), "A": _pos("A", 100.0), "B": _pos("B", 100.0)},
+                  frozen={"C"})
+    assert pa.apply_order_impacts(plan, {}, available_buying_power=1_000_000.0).frozen_notional == 30_000.0
+    assert pa.filter_plan_rows(plan, ["A", "B"]).frozen_notional == 30_000.0

@@ -490,6 +490,9 @@ WARNING_FROZEN_EXCEEDS_FMT = ("frozen positions are worth {frozen:,.2f}, which e
 #: (no invented price) and contributes nothing to the frozen total.
 WARNING_FROZEN_NO_PRICE_FMT = ("{symbol} is frozen and held but has no price - skipped; its value "
                                "could not be taken out of the money being allocated")
+#: INVEST_LABEL where every member of the label is frozen: nothing can be invested.
+WARNING_FROZEN_LABEL_ALL_FMT = ("every symbol of label '{label}' is frozen - nothing can be invested "
+                                "in it; unfreeze a symbol or pick another label")
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
 
 # Validation messages from ``validate_label_targets``. Pinned so the UI and the
@@ -2675,8 +2678,16 @@ def compute_label_investment(label: LabelTarget, amount: float,
                              margin: Dict[str, MarginInfo], *,
                              available_buying_power: float, allow_fractional: bool,
                              default_bp_factor: float,
-                             valuation_mode: str) -> AllocationPlan:
+                             valuation_mode: str,
+                             frozen_symbols: Optional[Set[str]] = None) -> AllocationPlan:
     """Solve an INVEST_LABEL run: put ``amount`` into ONE label. Buys only.
+
+    ``frozen_symbols`` (case-insensitive; ``None``/empty == today's behaviour exactly): a frozen
+    member gets a no-op row (``frozen``, ``REASON_FROZEN``, no side, delta 0) and ``amount`` is shared
+    by the UNFROZEN members in proportion to their weights, renormalised among them (the label's
+    total weight is kept, so a 60% set still leaves 40% as cash). The frozen position's value is not
+    subtracted: ``amount`` is new money on top of what is held. Every member frozen -> no orders and
+    ``WARNING_FROZEN_LABEL_ALL_FMT``.
 
     NO RESERVE APPLIES HERE, and there is deliberately no keyword to pass one. The
     portfolio-level ``unallocated_pct`` is a share of the BASE -- buying power plus
@@ -2754,11 +2765,36 @@ def compute_label_investment(label: LabelTarget, amount: float,
         # independent orders for the same symbol in one run, which nothing
         # downstream expects. validate_symbol_weights is what REPORTS the duplicate.
         weights[st.symbol] = weights.get(st.symbol, 0.0) + float(st.weight_pct or 0.0)
+    frozen_norm = {(f or "").strip().upper() for f in (frozen_symbols or ())}
+    frozen = {s for s in weights if s.strip().upper() in frozen_norm}
+    scale = 1.0
+    if frozen:
+        unfrozen_w = sum(w for s, w in weights.items() if s not in frozen)
+        if unfrozen_w > 0:
+            scale = sum(weights.values()) / unfrozen_w
+        else:
+            scale = 0.0
+            plan.warnings.append(WARNING_FROZEN_LABEL_ALL_FMT.format(label=label.label))
+            logger.warning(plan.warnings[-1])
+        plan.warnings.append(WARNING_FROZEN_NOTE_FMT.format(
+            symbols=", ".join(sorted(frozen)), frozen=sum(
+                current_value(current.get(s), valuation_mode) for s in frozen)))
     for symbol, weight in weights.items():
-        target_notional = budget * weight / 100.0
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=[label.label])
+        if symbol in frozen:
+            row.frozen = True
+            row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
+            _carry_margin_facts(row, m)
+            row.current_quantity = float(ps.quantity) if ps is not None else 0.0
+            row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
+            row.price = ps.price if ps is not None else None
+            row.target_quantity = row.current_quantity
+            row.reasons.append(REASON_FROZEN)
+            plan.rows.append(row)
+            continue
+        target_notional = budget * weight * scale / 100.0
         row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
@@ -2813,7 +2849,8 @@ def compute_label_investment(label: LabelTarget, amount: float,
         row.bp_cost = row.estimated_value * row.bp_factor
         plan.rows.append(row)
     redistribute_label_residuals(
-        plan, {label.label: {sym: budget * w / 100.0 for sym, w in weights.items()}},
+        plan, {label.label: {sym: (0.0 if sym in frozen else budget * w * scale / 100.0)
+                             for sym, w in weights.items()}},
         margin, allow_fractional=allow_fractional)
     plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
                                           allow_fractional=allow_fractional, margin=margin)
@@ -2870,6 +2907,7 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
         unallocatable_pct=plan.unallocatable_pct,
         reserved_pct=plan.reserved_pct,
         reserved_notional=plan.reserved_notional,
+        frozen_notional=plan.frozen_notional,
         allow_fractional=plan.allow_fractional,
         valuation_mode=plan.valuation_mode,
         allocation_basis=plan.allocation_basis,
@@ -3725,6 +3763,7 @@ def filter_plan_rows(plan: "AllocationPlan", selected_symbols: List[str]) -> "Al
         # a plan as fully deployed when the user deliberately left cash aside.
         reserved_pct=plan.reserved_pct,
         reserved_notional=plan.reserved_notional,
+        frozen_notional=plan.frozen_notional,
         total_buy_value=buy_value,
         total_sell_value=sell_value,
         allow_fractional=plan.allow_fractional,

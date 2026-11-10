@@ -447,7 +447,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             scope, float(amount), current, margin,
             available_buying_power=base.available_buying_power,
             allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
-            valuation_mode=valuation_mode)
+            valuation_mode=valuation_mode,
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
     else:
         # ``unsellable_symbols`` is deliberately NOT populated from untracked broker
         # holdings: those are sold directly as closing orders (ACTION_SELL_UNTRACKED),
