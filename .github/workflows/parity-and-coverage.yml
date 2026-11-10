@@ -36,6 +36,11 @@ jobs:
           # ../../BA2Trade*): those are replaced by the packages/* installs above.
           grep -vE '^\s*-e\s+\.\./\.\./BA2Trade' testplatform/backend/requirements.txt > /tmp/be-reqs.txt || true
           pip install -r /tmp/be-reqs.txt
+          # sqlmodel 0.0.45+ maps every `datetime` column to UTCDateTime and REFUSES naive datetimes
+          # ("Datetime values must have timezone information"); the backtest clock is naive and every
+          # real environment (local venvs, remote workers) runs 0.0.38/0.0.39. Test what runs. The
+          # same bound belongs in packages/common/pyproject.toml (lands with the next ba2_common bump).
+          pip install "sqlmodel>=0.0.22,<0.0.45"
           # pytest-github-actions-annotate-failures turns every failure into a ::error::
           # annotation. That matters for more than tidiness: downloading a run's LOGS needs
           # ADMIN rights on the repo and returns 403 otherwise, while the annotations API is

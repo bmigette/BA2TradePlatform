@@ -26,6 +26,8 @@ _STATUS_ICON = {STATUS_OFF: "grey", STATUS_NO_POSITION: "grey", STATUS_PROTECTED
 #: The exclusion eye: orange when excluded, muted grey when included.
 EXCLUDED_HEX = "#fb923c"
 INCLUDED_HEX = "#94a3b8"
+FROZEN_HEX = "#38bdf8"
+UNFROZEN_HEX = "#94a3b8"
 
 
 def protection_icon_color(code: str, failure_alert: bool = False) -> str:
@@ -107,6 +109,29 @@ def exclusion_fields(exclusion: Any) -> Dict[str, Any]:
         tip += f" ({note})"
     tip += ". Click to include again."
     return {"excluded": True, "excl_tip": tip, "excl_icon": "visibility_off", "excl_hex": EXCLUDED_HEX}
+
+
+def freeze_fields(frozen: Any) -> Dict[str, Any]:
+    """The flat row fields of the freeze (snowflake) button and its badge. Pure.
+
+    ``frozen`` is an ``AllocatorFrozen`` (or anything with ``since`` / ``note``) or None. Blue
+    snowflake when frozen, muted grey when not; the tooltip says what clicking does. ``frozen_badge``
+    is the short text drawn in the row ('' when not frozen: Quasar prints a bare ``null`` otherwise).
+    """
+    if frozen is None:
+        return {"frozen": False, "frz_tip": "Click to freeze: no orders for it on rebalance, its current "
+                                            "value is taken out of the money the others share",
+                "frz_icon": "ac_unit", "frz_hex": UNFROZEN_HEX, "frozen_badge": ""}
+    since = getattr(frozen, "since", None)
+    note = getattr(frozen, "note", None)
+    tip = "Frozen (no orders on rebalance; its current value is fixed outside the allocation maths)"
+    if since:
+        tip += f" since {since:%Y-%m-%d}"
+    if note:
+        tip += f" ({note})"
+    tip += ". Click to unfreeze."
+    return {"frozen": True, "frz_tip": tip, "frz_icon": "ac_unit", "frz_hex": FROZEN_HEX,
+            "frozen_badge": "frozen"}
 
 
 def effective_weight_text(weight_pct: Optional[float], effective_pct: Optional[float]) -> str:

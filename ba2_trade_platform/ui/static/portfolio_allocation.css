@@ -124,6 +124,9 @@
     .pf-row-excluded td { opacity: 0.55; }
     .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
     .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+    /* A FROZEN ROW keeps its colours (it is still part of the maths) and gets a blue left edge. */
+    .pf-row-frozen td:first-child { box-shadow: inset 3px 0 0 #38bdf8; }
+    .pf-sym-card--frozen { box-shadow: inset 3px 0 0 #38bdf8; }
 
 @media (max-width: 639px) {
 

@@ -16,6 +16,8 @@
 GA_NEUTRAL_GLOBS = [
     "packages/common/ba2_common/core/ibkr_*.py",
     "packages/common/ba2_common/core/protective_legs.py",
+    # the manual portfolio allocator (live page only; no backtest or GA trial calls compute_allocation)
+    "packages/common/ba2_common/core/portfolio_allocation.py",
     "packages/common/tests/test_ibkr_*.py",
     # PennyMomentumTrader live price fetch (vendor_live_price=fmp): intraday live trader, never run by GA/backtest.
     "packages/experts/ba2_experts/PennyMomentumTrader/data_gathering.py",

@@ -14,8 +14,11 @@ from ba2_trade_platform.core import allocator_protection_models  # noqa: F401 --
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REVISION_FILE = ROOT / "alembic/versions/a7c3e91d5b24_add_allocator_protection_tables.py"
 EXPECTED_QTY_FILE = ROOT / "alembic/versions/b8d1f4a29c63_allocator_protection_expected_qty.py"
+FROZEN_FILE = ROOT / "alembic/versions/d5a1f93e2c70_add_allocator_frozen_table.py"
 TABLES = ["allocator_protection", "allocator_protection_order", "allocator_exclusion",
           "allocator_weight_change"]
+#: the freeze table has its own (later) revision; the first-revision tests above build TABLES only
+ALL_TABLES = TABLES + ["allocator_frozen"]
 
 
 def _load(path=None):
@@ -37,14 +40,15 @@ def migrated(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'm.sqlite'}")
     _run(engine, "upgrade")
     _run(engine, "upgrade", EXPECTED_QTY_FILE)
+    _run(engine, "upgrade", FROZEN_FILE)
     return engine
 
 
 def test_creates_every_table(migrated):
-    assert sorted(t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")) == sorted(TABLES)
+    assert sorted(t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")) == sorted(ALL_TABLES)
 
 
-@pytest.mark.parametrize("table", TABLES)
+@pytest.mark.parametrize("table", ALL_TABLES)
 def test_columns_and_indexes_match_the_model(migrated, table):
     inspector = inspect(migrated)
     assert {c["name"] for c in inspector.get_columns(table)} == \
@@ -89,6 +93,7 @@ def test_upgrade_twice_is_harmless(migrated):
 
 
 def test_downgrade_drops_every_table_and_tolerates_a_gap(migrated):
+    _run(migrated, "downgrade", FROZEN_FILE)
     _run(migrated, "downgrade")
     assert [t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")] == []
     _run(migrated, "downgrade")        # nothing left: still fine
@@ -137,3 +142,20 @@ def test_no_package_imports_the_in_tree_protection_modules():
         if "allocator_protection" in text and "tests" not in path.parts:
             offenders.append(str(path))
     assert offenders == []
+
+
+def test_frozen_revision_chains_on_the_previous_head_and_is_the_single_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    assert script.get_heads() == ["d5a1f93e2c70"]
+    assert script.get_revision("d5a1f93e2c70").down_revision == "c4e7a9d2f1b8"
+
+
+def test_frozen_revision_is_idempotent_and_has_one_row_per_account_and_symbol(migrated):
+    _run(migrated, "upgrade", FROZEN_FILE)          # twice is harmless
+    unique = {tuple(u["column_names"]) for u in inspect(migrated).get_unique_constraints("allocator_frozen")}
+    assert ("account_id", "symbol") in unique
+    _run(migrated, "downgrade", FROZEN_FILE)
+    assert "allocator_frozen" not in inspect(migrated).get_table_names()
+    _run(migrated, "downgrade", FROZEN_FILE)        # nothing left: still fine

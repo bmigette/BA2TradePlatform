@@ -112,6 +112,7 @@ from sqlmodel import select
 from ...config import get_app_setting
 from ...core import allocator_csv
 from ...core import allocator_exclusion as exclusion_store
+from ...core import allocator_freeze as freeze_store
 from ...core import allocator_protection_service as protect_svc
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
@@ -446,7 +447,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             scope, float(amount), current, margin,
             available_buying_power=base.available_buying_power,
             allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
-            valuation_mode=valuation_mode)
+            valuation_mode=valuation_mode,
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
     else:
         # ``unsellable_symbols`` is deliberately NOT populated from untracked broker
         # holdings: those are sold directly as closing orders (ACTION_SELL_UNTRACKED),
@@ -456,7 +458,10 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
             default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode,
-            unallocated_pct=unallocated_pct)
+            unallocated_pct=unallocated_pct,
+            # THE FREEZE: read from the DB at solve time (like the exclusions), so a freeze set after
+            # the dialog opened still applies to the Refresh re-solve.
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
     # ``margin`` is REQUIRED and is the SAME dict the plan above was solved with:
     # the precheck may re-solve, and a re-solve without it rebuilds a bare
     # MarginInfo per fractional row and rounds on the default 4dp grid, losing
@@ -819,7 +824,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
                     symbol_facts: Optional[Dict[str, Any]] = None,
                     symbol_stats: Optional[Dict[str, Any]] = None,
                     protection: Optional[Dict[str, Any]] = None,
-                    exclusions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    exclusions: Optional[Dict[str, Any]] = None,
+                    frozen: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -842,6 +848,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'protection': protection or {'supported': False, 'items': {}, 'quantities': {}},
         # {SYMBOL: AllocatorExclusion}: the operator's manual disables.
         'exclusions': {(k or '').strip().upper(): v for k, v in (exclusions or {}).items()},
+        # {SYMBOL: AllocatorFrozen}: the operator's freezes (no orders, value fixed outside the maths).
+        'frozen': {(k or '').strip().upper(): v for k, v in (frozen or {}).items()},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -2514,6 +2522,15 @@ SYMBOL_CHIPS_TEMPLATE = r'''
                        @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
                 </q-btn>
+                <q-btn dense flat round size="sm" :icon="props.row.frz_icon" class="pf-frz-icon"
+                       :aria-label="props.row.frozen ? 'Unfreeze' : 'Freeze'"
+                       :style="{ color: props.row.frz_hex }"
+                       @click="() => $parent.$emit('freezeToggle', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.frz_tip }}</q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frozen_badge" class="text-caption text-weight-bold pf-frozen-badge"
+                      style="color:#38bdf8;background:rgba(56,189,248,0.15);border-radius:4px;padding:0 4px;
+                             line-height:1.25;white-space:nowrap">{{ props.row.frozen_badge }}</span>
             </div>
 '''
 
@@ -2528,6 +2545,7 @@ PROTECT_CHECK_CONFIRM = (
     'It never re-places an order you cancelled on the broker\'s site. Continue?')
 MARKER_PROTECT_CHECK = 'pf-protect-check'
 MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
+MARKER_FREEZE_TOGGLE = 'pf-freeze-toggle'
 MARKER_LABEL_EXTRAS = 'pf-label-extras'
 MARKER_LABEL_SEGMENTS = 'pf-label-segments'
 MARKER_SEGMENT_PREFIX = 'pf-label-seg-'
@@ -2713,7 +2731,7 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
     return (
         '<div class="col-12" style="width:100%">'
         '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected, '
-        '\'pf-sym-card--excl\': props.row.excluded}">'
+        '\'pf-sym-card--excl\': props.row.excluded, \'pf-sym-card--frozen\': props.row.frozen}">'
         '<div class="pf-sym-head">'
         '<q-checkbox v-model="props.selected" />'
         '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
@@ -2837,6 +2855,9 @@ PROTECT_CSS = r"""
     .pf-row-excluded td { opacity: 0.55; }
     .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
     .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+    /* A FROZEN ROW keeps its colours (it is still part of the maths) and gets a blue left edge. */
+    .pf-row-frozen td:first-child { box-shadow: inset 3px 0 0 #38bdf8; }
+    .pf-sym-card--frozen { box-shadow: inset 3px 0 0 #38bdf8; }
 """
 
 PROTECT_PHONE_CSS = phone_media("""
@@ -3005,6 +3026,61 @@ async def apply_exclusion_change(account_id: int, symbol: str, currently_exclude
               type='positive')
     await refresh()
     return True
+
+
+async def apply_freeze_change(account_id: int, symbol: str, currently_frozen: bool,
+                              note: Optional[str], refresh) -> bool:
+    """Write the freeze / unfreeze decision, tell the operator, redraw. Returns whether it was
+    written (a failure is shown and logged, never swallowed)."""
+    symbol = symbol.strip().upper()
+    try:
+        if currently_frozen:
+            await asyncio.to_thread(freeze_store.unfreeze_symbol, account_id, symbol)
+        else:
+            await asyncio.to_thread(freeze_store.freeze_symbol, account_id, symbol, note=note)
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'Toggling freeze of {symbol} failed: {e}', exc_info=True)
+        ui.notify(f'Could not change {symbol}: {e}', type='negative')
+        return False
+    ui.notify(f"{symbol} {'unfrozen' if currently_frozen else 'frozen'}", type='positive')
+    await refresh()
+    return True
+
+
+def _open_freeze_dialog(account_id: int, symbol: str, frozen: Dict[str, Any], refresh) -> None:
+    """Freeze / unfreeze ONE symbol. Always confirmed: it changes what the next rebalance trades.
+
+    Freezing does not touch protective TP/SL orders; unfreezing is explicit."""
+    symbol = symbol.strip().upper()
+    currently = symbol in frozen
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-[520px]'):
+        if currently:
+            ui.label(f'Unfreeze {symbol}?').classes('text-h6')
+            ui.label('Rebalancing may buy or sell it again and its share counts in the label maths '
+                     'as normal at the next rebalance.').classes('text-xs text-secondary-custom')
+            note = None
+        else:
+            ui.label(f'Freeze {symbol}?').classes('text-h6')
+            ui.label('A rebalance will place NO order for it (no buy, sell or resize) and protective '
+                     'TP/SL orders stay exactly as they are. Its CURRENT value is fixed and taken out of '
+                     'the money the other symbols share, in proportion to their shares. Its stored '
+                     'share is kept, so unfreezing restores the original targets.'
+                     ).classes('text-xs text-secondary-custom')
+            note = ui.input('Note (optional)', placeholder='e.g. waiting for earnings') \
+                .props('dense outlined').classes('w-full')
+
+        async def _go() -> None:
+            done = await apply_freeze_change(
+                account_id, symbol, currently,
+                (note.value or None) if note is not None else None, refresh)
+            if done:
+                dialog.close()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-2 pf-actions'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Unfreeze' if currently else 'Freeze', on_click=_go) \
+                .props('color=primary').mark(MARKER_FREEZE_TOGGLE)
+    dialog.open()
 
 
 def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, Any], refresh) -> None:
@@ -3198,6 +3274,9 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         **_protection_fields(live['protection'], r.symbol, r.quantity),
         # The operator's manual disable: badge, toggle, tooltip. An excluded row is greyed.
         **protect_view.exclusion_fields(live['exclusions'].get(r.symbol)),
+        # The operator's freeze: snowflake button + 'frozen' badge. A frozen row's TARGET is its current
+        # value and its 'eff.' share its current share of the label (see ``build_label_views(frozen=)``).
+        **protect_view.freeze_fields(live['frozen'].get(r.symbol)),
         # The share an ENABLED row is really solved with when its label has an excluded symbol.
         'eff_weight_pct': r.effective_weight_pct,
         'eff_weight': protect_view.effective_weight_text(r.weight_pct, r.effective_weight_pct),
@@ -3324,7 +3403,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
              lambda e: _open_exclusion_dialog(account_id, str(emitted_value(e)),
                                               live['exclusions'], refresh))
     # An excluded row is greyed (Quasar's ``table-row-class-fn``); its toggle stays readable.
-    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : \'\'"')
+    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : '
+                '(row.frozen ? \'pf-row-frozen\' : \'\')"')
+    table.on('freezeToggle',
+             lambda e: _open_freeze_dialog(account_id, str(emitted_value(e)),
+                                           live['frozen'], refresh))
     if live['protection']['supported']:
         table.on('protectClick',
                  lambda e: open_protection_dialog(account_id, str(emitted_value(e)), refresh))
@@ -3857,7 +3940,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                            symbol_facts=payload.get('symbol_facts') or {},
                            symbol_stats=payload.get('symbol_stats') or {},
                            protection=payload.get('protection'),
-                           exclusions=payload.get('exclusions'))
+                           exclusions=payload.get('exclusions'),
+                           frozen=payload.get('frozen'))
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
