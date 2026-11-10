@@ -888,9 +888,36 @@ def _config_uses_benchmark_regime(config: Any) -> bool:
     return bool(named_field_leaves_in(config, {TREND_FIELD, VOL_FIELD}))
 
 
+def _config_uses_downtrend_overlay(config: Any) -> bool:
+    """True when ANY expert in the run has ``downtrend_overlay_enabled`` switched on.
+
+    The down-trend trigger of the regime overlay reads the published SPY benchmark regime
+    (``regime_overlay.is_downtrend_now``), which is built only for a run that needs it. Reading the
+    expert settings here (the same dicts the engine builds its experts from) makes the calendar
+    exist whenever the trigger CAN fire, with the spy gate flag off. Settings may arrive as 0/1/"1"
+    from the GA, hence ``coerce_bool``.
+    """
+    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+
+    if not isinstance(config, dict):
+        return False
+    for spec in config.get("experts") or []:
+        settings = spec.get("settings") if isinstance(spec, dict) else None
+        if not settings or "downtrend_overlay_enabled" not in settings:
+            continue
+        if coerce_bool(settings["downtrend_overlay_enabled"]):
+            return True
+    return False
+
+
+def _run_needs_benchmark_regime(config: Any) -> bool:
+    """The benchmark calendar is required when the run is gated on SPY OR a down-trend overlay is on."""
+    return _config_uses_benchmark_regime(config) or _config_uses_downtrend_overlay(config)
+
+
 def _benchmark_calendar_for_run(raw_ohlcv: Any, config: Dict[str, Any]):
-    """The benchmark calendar when this run is gated, else None WITHOUT touching the cache."""
-    if not _config_uses_benchmark_regime(config):
+    """The benchmark calendar when this run needs it, else None WITHOUT touching the cache."""
+    if not _run_needs_benchmark_regime(config):
         return None
     return _build_benchmark_regime_calendar(
         raw_ohlcv, config["start_date"], config["end_date"], resolve_job_history_source(config))
@@ -1226,7 +1253,7 @@ def run_daily_backtest(
                     raw_ohlcv, config["start_date"], config["end_date"],
                     resolve_job_history_source(config)),
                 benchmark_calendar=_benchmark_calendar_for_run(raw_ohlcv, config),
-                benchmark_regime_required=_config_uses_benchmark_regime(config),
+                benchmark_regime_required=_run_needs_benchmark_regime(config),
                 market_condition_record=market_condition_record,
             )
             # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
@@ -1363,7 +1390,8 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     import importlib
 
     out: Dict[str, float] = {}
-    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year",
+                "car_min_trades_each_year"):
         explicit = config.get(key)
         if explicit is not None:
             out[key] = float(explicit)

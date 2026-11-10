@@ -93,6 +93,14 @@ _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above
 # its ratios, so it is excluded rather than ranked.
 _CAR_HARD_MIN_TRADES_PER_YEAR = 12.0
 
+# PER-CALENDAR-YEAR trade floor (design 2026-11-10-goal2027-pullback-downmarket, section 1). The two
+# per-year-AVERAGE thresholds above let a genome that trades 40 times in one year and not at all in
+# the next score as "20 a year". year_gate = clamp(min over calendar-year buckets of
+# structures_opened_in_bucket / (floor x fraction_of_a_year_the_bucket_covers), 0, 1), a SOFT factor on
+# a positive base only. Per-run override: ``car_min_trades_each_year`` in results (same resolution as
+# ``car_min_trades_per_year``).
+_CAR_MIN_TRADES_EACH_YEAR = 12.0
+
 # Ceiling on the drawdown reward. dd_guard is 20/dd, i.e. base x dd_guard IS 20 x Calmar, so an
 # unbounded guard lets a tiny-drawdown config buy its way past a materially better one: measured
 # at dd 3.86% it collected 5.18x. Capping at 2.0 keeps the full Calmar gradient down to a 10%
@@ -1510,6 +1518,9 @@ def _consistent_annual_return(results: dict) -> float:
 
     fitness = base x dd_guard x consistency x trade_gate, where:
 
+    * year_gate -- ``_year_gate``: weakest calendar-year bucket's structures opened / floor (12, pro-rated
+      for a partial bucket), clamped to [0, 1]; a silent year is 0. 1.0 when no trade list / curve.
+
     * base — ``adjusted_annualized_return`` when a profit cap is active (same adjusted-metric
       switch as the other return metrics: a lucky mega-winner must not win the search), else
       ``annualized_return``. Both are %/yr.
@@ -1568,6 +1579,9 @@ def _consistent_annual_return(results: dict) -> float:
         return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
     trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
 
+    # Per-calendar-year floor: recorded for every run that reaches here, APPLIED to a positive base only.
+    year_gate = _year_gate(results)
+
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign
 
@@ -1625,7 +1639,7 @@ def _consistent_annual_return(results: dict) -> float:
             "has an uneven year)."
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
-    return base * dd_guard * consistency * trade_gate
+    return base * dd_guard * consistency * trade_gate * (1.0 if year_gate is None else year_gate)
 
 
 def _option_dd_penalty(dd: float) -> float:
@@ -2484,12 +2498,14 @@ def _consistency_factor(year_returns: list) -> float:
     return min(max(worst / mean, _CAR_CONSISTENCY_FLOOR), 1.0)
 
 
-def _calendar_year_returns(equity_curve) -> list:
-    """Per-calendar-year returns (%) from an equity curve of ``{date, equity}`` points.
+def _calendar_year_segments(equity_curve) -> list:
+    """The calendar-year buckets of an equity curve: ``[start_dt, end_dt, start_eq, end_eq]`` each.
 
     Year boundaries are calendar (Dec 31 close -> Dec 31 close, measured at the LAST equity
-    point of each year). A partial year at the start/end of the run counts as its own year only
-    if it spans >= ~6 months; shorter stubs are merged into their neighbor year.
+    point of each year). A partial year at the start/end of the run counts as its own bucket
+    only if it spans >= ~6 months; shorter stubs are merged into their neighbor bucket. ``[]``
+    when the curve has fewer than two usable points. ONE bucketing, shared by
+    ``_calendar_year_returns`` (consistency) and ``_year_trade_buckets`` (per-year trade floor).
     """
     pts = []
     for p in equity_curve or []:
@@ -2527,7 +2543,90 @@ def _calendar_year_returns(equity_curve) -> list:
     if len(segs) >= 2 and (segs[-1][1] - segs[-1][0]).total_seconds() < min_secs:
         segs[-2][1], segs[-2][3] = segs[-1][1], segs[-1][3]
         segs.pop()
-    return [(e_eq / s_eq - 1.0) * 100.0 for _s_dt, _e_dt, s_eq, e_eq in segs]
+    return segs
+
+
+def _calendar_year_returns(equity_curve) -> list:
+    """Per-calendar-year returns (%) from an equity curve of ``{date, equity}`` points.
+
+    Buckets come from ``_calendar_year_segments`` (partial years under ~6 months merge into
+    their neighbor).
+    """
+    return [(e_eq / s_eq - 1.0) * 100.0
+            for _s_dt, _e_dt, s_eq, e_eq in _calendar_year_segments(equity_curve)]
+
+
+def _year_trade_buckets(results: dict):
+    """Per calendar-year bucket: ``[{"label", "years", "structures"}, ...]`` or None.
+
+    Buckets are the equity curve's (``_calendar_year_segments``), so a year with no trades is a
+    bucket holding ZERO -- it cannot vanish for lack of trades. ``years`` is the fraction of a year
+    the bucket covers (~1.0 for a whole year, snapped within 0.04; a merged stub makes it > 1).
+    Structures are counted by ENTRY date with the ``_structure_count`` partition (legs of one
+    structure are one bet). Returns the stored ``results["trades_by_year"]`` when the trade list is
+    absent (a re-scored DB row), and None when neither is available (nothing to measure).
+    """
+    trades = results.get("trades")
+    segs = _calendar_year_segments(results.get("equity_curve"))
+    if trades is None:
+        stored = results.get("trades_by_year")
+        return stored if isinstance(stored, list) and stored else None
+    if not segs:
+        return None
+    if trades and not any(isinstance(t, dict) and (t.get("entry_time") or t.get("date")) for t in trades):
+        # Rows with no entry date at all are not a trade LOG (the engine's rows always carry
+        # entry_time); there is nothing to bucket, so the year gate is unmeasurable. A list where only
+        # SOME rows lack a date is corrupt and raises below.
+        return None
+    # calendar-year range of each bucket: from the year after the previous bucket's last year
+    ranges = []
+    prev_end = None
+    for s_dt, e_dt, _s, _e in segs:
+        ys = s_dt.year if prev_end is None else prev_end + 1
+        ranges.append((ys, e_dt.year))
+        prev_end = e_dt.year
+    members = [[] for _ in segs]
+    for t in trades:
+        if not isinstance(t, dict):
+            raise ValueError(f"year gate: trade row is not a dict: {t!r}")
+        raw = t.get("entry_time", t.get("date"))
+        d = _parse_dt(raw)
+        if d is None:
+            raise ValueError(f"year gate: trade has no parseable entry_time ({raw!r})")
+        idx = len(segs) - 1
+        for i, (_ys, ye) in enumerate(ranges):
+            if d.year <= ye:
+                idx = i
+                break
+        members[idx].append(t)
+    out = []
+    for (s_dt, e_dt, _s, _e), (ys, ye), mem in zip(segs, ranges, members):
+        frac = (e_dt - s_dt).total_seconds() / (365.25 * 86400.0)
+        n = round(frac)
+        if n >= 1 and abs(frac - n) <= 0.04:
+            frac = float(n)
+        out.append({"label": str(ys) if ys == ye else f"{ys}-{ye}",
+                    "years": round(frac, 4),
+                    "structures": int(_structure_count(mem) or 0)})
+    return out
+
+
+def _year_gate(results: dict) -> Optional[float]:
+    """clamp(min over buckets of structures / (floor x bucket years), 0, 1); None = unmeasurable.
+
+    Records ``fitness_year_gate`` and ``trades_by_year`` in ``results`` (as the other fitness
+    components are recorded) so a persisted row can be decomposed.
+    """
+    buckets = _year_trade_buckets(results)
+    if not buckets:
+        results["fitness_year_gate"] = None
+        results["trades_by_year"] = None
+        return None
+    floor = float(results.get("car_min_trades_each_year") or _CAR_MIN_TRADES_EACH_YEAR)
+    gate = min(min(max(b["structures"] / (floor * b["years"]), 0.0), 1.0) for b in buckets)
+    results["fitness_year_gate"] = gate
+    results["trades_by_year"] = buckets
+    return gate
 
 
 def _years_spanned_by_curve(equity_curve) -> float:

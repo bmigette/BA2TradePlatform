@@ -388,7 +388,20 @@ class TradeManager:
             for ruleset_id in (expert.enter_market_ruleset_id, expert.open_positions_ruleset_id):
                 if ruleset_id is not None and benchmark_leaves_in_ruleset(ruleset_id):
                     return True
+            if self._expert_has_downtrend_overlay(expert):
+                return True
         return False
+
+    def _expert_has_downtrend_overlay(self, expert) -> bool:
+        """True when this enabled expert instance has ``downtrend_overlay_enabled`` on: the down-trend
+        trigger of the regime overlay reads the published SPY regime even with no spy_* ruleset leaf
+        (the backtest builds the same calendar via ``_run_needs_benchmark_regime``)."""
+        from ba2_common.core.regime_overlay import downtrend_enabled
+
+        from .utils import get_expert_instance_from_id
+
+        instance = get_expert_instance_from_id(expert.id)
+        return downtrend_enabled(instance)
 
     def _fetch_benchmark_daily(self, now):
         """``(dates, closes)`` of SPY DAILY bars up to ``now`` from the history provider.

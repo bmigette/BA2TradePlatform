@@ -2131,6 +2131,20 @@ _REGIME_OPT = {
     "regime_risk_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_stop_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_tp_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+    # Down-trend trigger (SPY below its 200-day average): OFF under every policy but
+    # atr-regime-searched. It is OFF by its interface default (False) and, being a new setting no
+    # stored genome carries, needs no INERT pin (a pin would also need a BACKTEST_FORCED_SETTINGS
+    # row for the deploy export). The toggle is a non-gene here; it and its three scale genes are
+    # searched ONLY in _RM_OPT_ATR_REGIME_SEARCHED, so the pinned/atr-searched genome shape (gene
+    # count and order) is unchanged for every existing run.
+    "downtrend_overlay_enabled": {"optimize": False, "min": 0, "max": 1, "step": 1, "type": "int"},
+}
+
+#: The down-trend scale genes, same range as the regime_* ones (0.5-2.0 step 0.25).
+_DOWNTREND_OPT = {
+    "downtrend_risk_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+    "downtrend_stop_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+    "downtrend_tp_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
 }
 
 _RM_OPT = {
@@ -2188,6 +2202,9 @@ _RM_OPT_ATR_REGIME_SEARCHED = {
     "regime_risk_scale": _REGIME_OPT["regime_risk_scale"],
     "regime_stop_scale": _REGIME_OPT["regime_stop_scale"],
     "regime_tp_scale": _REGIME_OPT["regime_tp_scale"],
+    # Down-trend trigger: a real 0/1 gene here (the policy unpins it) plus its three scales.
+    "downtrend_overlay_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    **_DOWNTREND_OPT,
 }
 
 #: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.

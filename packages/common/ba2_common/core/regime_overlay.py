@@ -42,6 +42,11 @@ NEUTRAL_SCALE = 1.0
 
 _SCALE_SETTINGS = ("regime_risk_scale", "regime_stop_scale", "regime_tp_scale")
 
+#: The down-trend trigger's sibling of each regime_* scale (same consumer, second trigger).
+_DOWNTREND_SIBLING = {"regime_risk_scale": "downtrend_risk_scale",
+                      "regime_stop_scale": "downtrend_stop_scale",
+                      "regime_tp_scale": "downtrend_tp_scale"}
+
 # ---------------------------------------------------------------------------------------------
 # Per-bar regime state (the "computed once, read many" seam).
 #
@@ -106,24 +111,55 @@ def overlay_enabled(expert) -> bool:
         return False
 
 
-def regime_scale(expert, setting_name: str, is_stressed_now: Optional[bool]) -> float:
-    """The multiplier to apply for ``setting_name`` right now.
+def downtrend_enabled(expert) -> bool:
+    """True only when the genome explicitly turned the down-trend trigger on (absent -> False)."""
+    if expert is None:
+        return False
+    try:
+        return bool(expert.get_setting_with_interface_default(
+            "downtrend_overlay_enabled", log_warning=False))
+    except Exception:  # noqa: BLE001
+        return False
 
-    Returns NEUTRAL_SCALE (1.0, an exact no-op) unless ALL of:
-      * the overlay is enabled on this expert,
-      * ``is_stressed_now`` is exactly True -- ``None`` means the regime could not be classified
-        (insufficient benchmark history) and is treated as NOT stressed, matching
-        ``market_regime.is_stressed``'s own fail-closed contract: an unclassifiable market must
-        not silently trigger scaling,
-      * the setting resolves to a usable number.
+
+def is_downtrend_now() -> bool:
+    """True when the PUBLISHED benchmark regime has SPY below its 200-day average.
+
+    Reads ``benchmark_regime.get_benchmark_regime()`` -- the per-bar seam the backtest engine and
+    live TradeManager already publish -- and the existing ``below_200`` mode of ``MODE_STATES``
+    (bear_rally, down); nothing re-derives the SMA200. Nothing published, or an unknown trend
+    (insufficient history) is NOT a downtrend: an unclassifiable market must not trigger scaling.
+    """
+    from ba2_common.core import benchmark_regime as br
+
+    regime = br.get_benchmark_regime()
+    if regime is None or regime.trend is None:
+        return False
+    return regime.trend in br.MODE_STATES[br.TREND_FIELD]["below_200"]
+
+
+def regime_scale(expert, setting_name: str, is_stressed_now: Optional[bool]) -> float:
+    """The multiplier to apply for ``setting_name`` right now: the PRODUCT of the active triggers.
+
+    Two independent triggers, each 1.0 (an exact no-op) unless active:
+
+    * STRESSED: ``is_stressed_now`` is exactly True (``None`` = unclassifiable = NOT stressed,
+      matching ``market_regime.is_stressed``'s fail-closed contract), the overlay is enabled on
+      this expert (``regime_overlay_enabled``), and ``setting_name`` resolves to a usable number.
+    * DOWN-TREND: ``downtrend_overlay_enabled`` is on and SPY is below its 200-day average
+      (``is_downtrend_now``); applies the matching ``downtrend_*_scale``.
+
+    Both can hold at once; the result is the product. With default settings (both switches off)
+    every call returns exactly what it returned before the second trigger existed.
     """
     if setting_name not in _SCALE_SETTINGS:
         raise ValueError(f"unknown regime scale setting: {setting_name!r}")
-    if is_stressed_now is not True:
-        return NEUTRAL_SCALE
-    if not overlay_enabled(expert):
-        return NEUTRAL_SCALE
-    return _setting(expert, setting_name, NEUTRAL_SCALE)
+    scale = NEUTRAL_SCALE
+    if is_stressed_now is True and overlay_enabled(expert):
+        scale *= _setting(expert, setting_name, NEUTRAL_SCALE)
+    if downtrend_enabled(expert) and is_downtrend_now():
+        scale *= _setting(expert, _DOWNTREND_SIBLING[setting_name], NEUTRAL_SCALE)
+    return scale
 
 
 def _as_date(value: Any) -> date:

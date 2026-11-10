@@ -691,7 +691,8 @@ class DailyBacktestEngine:
         if self._benchmark_regime_required and self._benchmark_calendar is None:
             wanted = [eid for _expert, eid, _s, _r in self.experts]
             raise RuntimeError(
-                f"the run is gated on the SPY benchmark regime (spy-trend / spy-vol) for expert "
+                f"the run needs the SPY benchmark regime (spy-trend / spy-vol gates, or "
+                f"downtrend_overlay_enabled) for expert "
                 f"instance(s) {wanted} but no benchmark regime calendar could be built: no SPY daily "
                 f"history could be read from the {resolve_job_history_source(self.config)} cache; the "
                 f"gates would read unknown everywhere and the GA would search dead genes. "
