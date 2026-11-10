@@ -6891,8 +6891,9 @@ def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forw
     other key stay the stored run's. Applied by ``_persist_top_backtests(data_rebase=)`` AFTER the window
     override, so the manifest checks run on the TEST window.
 
-    * universe: a static run takes the current ``--universe``; a screener run keeps its stored superset
-      (the train job's, as every out-of-sample re-run does) and reads the current ``--screener-store``;
+    * universe: a static run takes the current ``--universe``; a screener run reads the current
+      ``--screener-store`` (its superset is then recomputed for the test window by
+      ``_test_window_static_universe``, with these exclusions);
     * exclusions: the stored list PLUS the current one, removed from the universe (an exclusion is
       never lifted by a rebase);
     * market-condition manifests: the current digest per profile, validated for coverage and window
@@ -10747,6 +10748,37 @@ def _topn_export_slots(parallel, n_specs: int, remote_workers: list) -> tuple:
     return n_local, ["local"] * n_local + list(remote_workers)
 
 
+def _test_window_static_universe(bt_block: dict, parameter_ranges, opt_id, name_prefix: str) -> dict:
+    """``bt_block`` (window already overridden) with the screener static universe of ITS OWN window.
+
+    A screener job's ``enabled_instruments`` is the loosest-filter superset over the scans visible in the
+    job's window (rule superset-v1): the TRAIN window's for a stored optimization. A re-run on another
+    window (a walk-forward out-of-sample test) can select names that only became selectable there (a 2024
+    listing tested after a 2022-2023 train); with the train superset they are not loaded and the gate
+    refuses the whole run (``ScreenerGateRefusal``: "candidates but have no bars in this run's price
+    source"). The superset is therefore recomputed for the test window by the SAME function the launch
+    uses (``rerun_handler.recompute_static_universe``: declared gene ranges, stored base settings, panel
+    and exclusions). A symbol without cached bars is excluded from the screen and NAMED here and on the
+    row (``screener_universe_recompute_note``) -- one uncached name does not void the test.
+
+    Untouched: a non-screener block, and a block from before the superset rule (its legacy list is kept,
+    as every re-run of such a row does)."""
+    from ba2_providers.screener import universe_superset as _us
+    if not bt_block.get("screener_opt") or bt_block.get("screener_universe_rule") != _us.RULE_ID:
+        return bt_block
+    from app.services.backtest.rerun_handler import recompute_static_universe
+    out = recompute_static_universe(bt_block, parameter_ranges, row_id=f"opt {opt_id} {name_prefix}")
+    note = out["_universe_recompute_note"]
+    print(f"    {name_prefix}: static universe recomputed for the test window "
+          f"{str(out['start_date'])[:10]}..{str(out['end_date'])[:10]}: {note['previous_size']} (train window) -> "
+          f"{note['static_universe_size']} symbols (rule {_us.RULE_ID})")
+    if note["excluded_for_missing_cache"]:
+        print(f"    !! {name_prefix}: {len(note['excluded_for_missing_cache'])} selectable symbol(s) have no cached "
+              f"bars and are EXCLUDED from this test (recorded on the row): "
+              f"{', '.join(note['excluded_for_missing_cache'])}")
+    return out
+
+
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
                             last_gen_full_results: Optional[Dict[str, Any]] = None, *,
                             candidates: Optional[List[tuple]] = None,
@@ -10775,7 +10807,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
       * ``window`` -- ``(start, end)`` ISO dates that REPLACE the optimization's own run window
         for every re-run (walk-forward out-of-sample tests, tools/run_walk_forward.py). Nothing
         else about the trial changes (same ``decode_params`` + ``_build_daily_trial_config``,
-        the screener hoisted state is derived from the overridden window). The GA-fitness
+        the screener hoisted state is derived from the overridden window), except that a screener
+        job's static universe is recomputed for that window (``_test_window_static_universe``). The GA-fitness
         fidelity gate is skipped: it compares against a score earned on a DIFFERENT window.
         NOT an optimize path -- ``_assert_option_window_excludes_holdout`` guards only the
         optimize CLI handlers and is deliberately not consulted here (a re-run is a single
@@ -10818,6 +10851,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             bt_block["start_date"], bt_block["end_date"] = str(window[0]), str(window[1])
         if data_rebase is not None:
             bt_block = _rebase_run_data(bt_block, data_rebase)
+        if window is not None:
+            bt_block = _test_window_static_universe(bt_block, opt.parameter_ranges, opt_id, name_prefix)
         # Apply the SAME screener hoisted state the GA scored each individual with, so the persisted
         # top-N are the actual optimized SCREENER runs (universe_source=screener + the per-individual
         # screener genes) — not static-universe runs. Without this the persisted top-N silently
@@ -10873,6 +10908,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted,
                                                   option_trade_records=True)  # persisted top-N
             trial_cfg["name"] = f"{name_prefix}{rank}-{opt.name or expert}"
+            if bt_block.get("_universe_recompute_note"):      # a test window's own superset: on the row's results
+                trial_cfg["screener_universe_recompute_note"] = bt_block["_universe_recompute_note"]
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
@@ -10917,6 +10954,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             if not out or not out.get("ok"):
                 print(f"    {name_prefix}{rank} re-run failed: {(out or {}).get('error', 'no result')}")
                 return False
+            if trial_cfg.get("screener_universe_recompute_note") and isinstance(out.get("results"), dict):
+                out["results"]["screener_universe_recompute_note"] = trial_cfg["screener_universe_recompute_note"]
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
