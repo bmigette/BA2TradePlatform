@@ -273,6 +273,9 @@ REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
 REASON_FRACTIONAL_UNKNOWN = "fractionable unknown - whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
+#: The operator FROZE this symbol: no order of any kind, its current value is fixed and is
+#: taken out of the money the other members share (``compute_allocation(frozen_symbols=)``).
+REASON_FROZEN = "frozen - left as it is, its current value is outside the money being allocated"
 
 #: A reduction this planner cannot submit, because the shares at the broker have
 #: no local transaction behind them at all (review PA-05, 2026-09-07).
@@ -475,6 +478,14 @@ REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX = (
 #: second sends the user hunting for a box holding a percentage nobody typed.
 WARNING_EMPTY_LABEL_FMT = ("label '{label}' has no symbols - its {pct:.2f}% weight "
                            "({base_pct:.2f}% of the base) can absorb nothing")
+#: Frozen positions are worth MORE than the money being allocated: the unfrozen members get 0
+#: (held ones are closed) -- loud, because it looks like a bug on the page otherwise.
+WARNING_FROZEN_EXCEEDS_FMT = ("frozen positions are worth {frozen:,.2f}, which exceeds the {investable:,.2f} "
+                              "being allocated - every unfrozen member's target is clamped to 0")
+#: A frozen symbol that is held but cannot be priced: its value is unknown, so it is skipped
+#: (no invented price) and contributes nothing to the frozen total.
+WARNING_FROZEN_NO_PRICE_FMT = ("{symbol} is frozen and held but has no price - skipped; its value "
+                               "could not be taken out of the money being allocated")
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
 
 # Validation messages from ``validate_label_targets``. Pinned so the UI and the
@@ -812,6 +823,10 @@ class AllocationRow:
     #: delta is zeroed and the size lands in ``unmet_notional``; see
     #: ``is_untracked_holding`` and review PA-05.
     untracked_unsellable: bool = False
+    #: The operator FROZE this symbol. The row is a no-op by construction (no side, delta 0,
+    #: ``target_notional`` = the CURRENT value taken as fixed); it stays in the plan so the dry run
+    #: can show it and so totals still add up.
+    frozen: bool = False
     #: The broker precheck's own fee estimate, when one was run and accepted
     #: (``OrderImpact.estimated_fees``). ``None`` means "not prechecked", never
     #: "free" -- no fallback value for a number the broker did not supply.
@@ -877,6 +892,7 @@ class AllocationRow:
             "margin_source": self.margin_source,
             "fractional": self.fractional,
             "skipped": self.skipped,
+            "frozen": self.frozen,
             "estimated_fees": self.estimated_fees,
             "unmet_notional": self.unmet_notional,
             "sizing_outcome": self.sizing_outcome,
@@ -977,6 +993,9 @@ class AllocationPlan:
     total_sell_value: float = 0.0
     allow_fractional: bool = False
     valuation_mode: str = VALUATION_MODE_MARKET
+    #: Total current value (in ``valuation_mode``) of the FROZEN positions that were taken out of
+    #: the investable money before the other members divided it. 0.0 when nothing is frozen.
+    frozen_notional: float = 0.0
     #: What every ``target_notional`` in ``rows`` MEANS -- ``ALLOCATION_BASIS_POSITION``
     #: for a REBALANCE (the desired post-trade holding value) or
     #: ``ALLOCATION_BASIS_BUDGET`` for an INVEST_LABEL run (money to deploy on top of
@@ -1064,6 +1083,7 @@ class AllocationPlan:
             "total_sell_value": self.total_sell_value,
             "allow_fractional": self.allow_fractional,
             "valuation_mode": self.valuation_mode,
+            "frozen_notional": self.frozen_notional,
             "allocation_basis": self.allocation_basis,
             "labels": [{"label": lt.label, "target_pct": lt.target_pct,
                         "symbols": [{"symbol": st.symbol, "weight_pct": st.weight_pct}
@@ -2246,8 +2266,24 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        default_bp_factor: float,
                        valuation_mode: str,
                        unallocated_pct: float = 0.0,
-                       unsellable_symbols: Optional[Set[str]] = None) -> AllocationPlan:
+                       unsellable_symbols: Optional[Set[str]] = None,
+                       frozen_symbols: Optional[Set[str]] = None) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
+
+    ``frozen_symbols`` (matched case-insensitively; ``None``/empty == today's behaviour exactly)
+    are symbols the operator FROZE. A frozen symbol gets NO order of any kind: its row is a
+    no-op (``AllocationRow.frozen``, delta 0, target = its CURRENT value in ``valuation_mode``).
+    That current value is FIXED money: it is subtracted from the investable amount, and the
+    remaining money is shared by the unfrozen symbols in proportion to their effective weights
+    (label % x symbol %), i.e. renormalised among the unfrozen ones::
+
+        remaining      = investable - sum(current value of frozen symbols)
+        unfrozen_i     = remaining * share_i / sum(share_j over unfrozen j)
+
+    Equity 100k, A 50 / B 30 / C 20, C frozen at 30k -> A 43.75k, B 26.25k. A frozen symbol with no
+    position contributes 0. If the frozen value is >= the investable money the unfrozen targets are
+    clamped to 0 and ``WARNING_FROZEN_EXCEEDS_FMT`` is recorded. A frozen symbol held without a
+    price is skipped with ``REASON_NO_PRICE`` and a warning (value unknown, never invented).
 
     ``unsellable_symbols`` are symbols whose REDUCTION this caller already knows
     it cannot submit -- live, a broker holding with no local transaction behind it
@@ -2411,11 +2447,49 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             per_label[st.symbol] = (per_label.get(st.symbol, 0.0)
                                     + investable * share / 100.0)
 
+    frozen = {s for s in targets
+              if s.strip().upper() in {(f or "").strip().upper() for f in (frozen_symbols or ())}}
+    if frozen:
+        frozen_values = {s: current_value(current.get(s), valuation_mode) for s in frozen}
+        plan.frozen_notional = sum(frozen_values.values())
+        unfrozen_total = sum(v for s, v in targets.items() if s not in frozen)
+        remaining = investable - plan.frozen_notional
+        if unfrozen_total > 0:
+            scale = max(0.0, remaining) / unfrozen_total
+            if remaining <= 0:
+                plan.warnings.append(WARNING_FROZEN_EXCEEDS_FMT.format(
+                    frozen=plan.frozen_notional, investable=investable))
+                logger.warning(plan.warnings[-1])
+            for s in targets:
+                if s not in frozen:
+                    targets[s] *= scale
+            for per_label in label_targets.values():
+                for s in list(per_label):
+                    per_label[s] = 0.0 if s in frozen else per_label[s] * scale
+
     unsellable = set(unsellable_symbols or ())
     for symbol, target_notional in targets.items():
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
+        if symbol in frozen:
+            row.frozen = True
+            row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
+            _carry_margin_facts(row, m)
+            row.current_quantity = float(ps.quantity) if ps is not None else 0.0
+            row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
+            row.price = ps.price if ps is not None else None
+            row.target_quantity = row.current_quantity
+            row.target_notional = frozen_values[symbol]
+            row.reasons.append(REASON_FROZEN)
+            if len(row.labels) > 1:
+                row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
+            if (row.price is None or row.price <= 0) and row.current_quantity > 0:
+                row.skipped = True
+                row.reasons.append(REASON_NO_PRICE)
+                plan.warnings.append(WARNING_FROZEN_NO_PRICE_FMT.format(symbol=symbol))
+            plan.rows.append(row)
+            continue
         row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
@@ -4655,7 +4729,7 @@ def redistribute_label_residuals(plan: "AllocationPlan",
         # this label alone owns. A multi-label symbol is out of the scheme entirely,
         # target and projection together, so the arithmetic stays self-consistent.
         members = [r for r in plan.rows
-                   if len(r.labels) == 1 and r.labels[0] == label
+                   if len(r.labels) == 1 and r.labels[0] == label and not r.frozen
                    and not r.skipped and r.price is not None and r.price > 0]
         if not members:
             continue
