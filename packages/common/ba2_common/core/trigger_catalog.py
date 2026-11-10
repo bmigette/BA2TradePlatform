@@ -147,7 +147,8 @@ _OPTIONS = (
 #: point of this pass: the fifteen fields were unreachable from the editor at all.
 _MARKET = (
     'relative_volume', 'percent_below_recent_high', 'percent_above_recent_low',
-    'iv_to_realized_vol',
+    'iv_to_realized_vol', 'pullback_rsi_2', 'pullback_rsi_3', 'pullback_rsi_4', 'pullback_rsi_5',
+    'price_vs_sma200_percent',
 ) + tuple(sorted(market_condition_fields()))
 
 _TIMING = (

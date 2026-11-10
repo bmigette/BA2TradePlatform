@@ -9,12 +9,14 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
+import numpy as np
 import threading
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation
 from ba2_common.core.types import OrderRecommendation, ExpertEventType, RiskLevel, TimeHorizon
 from ba2_common.core.db import get_db
+from ba2_common.core.rsi import wilder_rsi
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
@@ -2589,6 +2591,142 @@ class PercentBelowRecentHighCondition(CompareCondition):
         return f"{self.calculated_value:+.2f}%"
 
 
+class _PullbackHistoryCondition(CompareCondition):
+    """Base of the pullback entry gates (goal2027 design 2026-11-10, part 3): reads the FINISHED
+    daily closes through the clamped OHLCV provider (``_as_of_fetch_end``, as
+    ``PercentBelowRecentHighCondition``) and "now" from the ACCOUNT price, never from a bar.
+
+    Missing or too-short history, a corrupt close or an unreadable clock leave
+    ``calculated_value`` None and the condition False for every operator (UNKNOWN, never a
+    default value).
+    """
+
+    #: Closes the measurement needs, and the calendar-day fetch that covers them with margin.
+    MIN_CLOSES = 0
+    LOOKBACK_DAYS = 0
+
+    def _finished_closes(self):
+        """``(closes, ok)``: ndarray of the finished daily closes, or ``(None, False)``."""
+        end_date, clock_ok = self._as_of_fetch_end()
+        if not clock_ok:
+            return None, False
+        df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+            self.instrument_name, interval="1d", end_date=end_date,
+            lookback_days=self.LOOKBACK_DAYS)
+        if df is None or df.empty or "Close" not in df:
+            logger.warning(f"No OHLCV data for {self.instrument_name}")
+            return None, False
+        closes = df["Close"].to_numpy(dtype=float)
+        if len(closes) < self.MIN_CLOSES:
+            logger.warning(f"Only {len(closes)} finished daily closes for {self.instrument_name}; "
+                           f"{type(self).__name__} needs {self.MIN_CLOSES}")
+            return None, False
+        if not np.isfinite(closes).all() or (closes <= 0).any():
+            logger.warning(f"Invalid close in the history of {self.instrument_name}")
+            return None, False
+        return closes, True
+
+
+class PullbackRsiCondition(_PullbackHistoryCondition):
+    """Wilder RSI(``PERIOD``) of the finished daily closes (shared ``ba2_common.core.rsi``).
+
+    One subclass per period (2-5): a rule leaf carries no second parameter, so the period is
+    part of the field name (``pullback_rsi_<n>``). An RSI that is undefined (no price change in
+    the whole history) is UNKNOWN.
+    """
+
+    PERIOD = 0
+    RSI_WINDOW = 100      # bound the recursion: a backtest's memoized provider ignores lookback_days
+    MIN_CLOSES = 60       # decay of the recursion's seed: 0.8**60 is negligible even at period 5
+    LOOKBACK_DAYS = 150
+
+    def evaluate(self) -> bool:
+        try:
+            closes, ok = self._finished_closes()
+            if not ok:
+                self.calculated_value = None
+                return False
+            try:
+                self.calculated_value = float(wilder_rsi(closes[-self.RSI_WINDOW:], self.PERIOD))
+            except ValueError as e:
+                logger.warning(f"RSI({self.PERIOD}) undefined for {self.instrument_name}: {e}")
+                self.calculated_value = None
+                return False
+            logger.info(f"RSI({self.PERIOD}) for {self.instrument_name}: {self.calculated_value:.2f}")
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating pullback RSI condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the RSI({self.PERIOD}) of {self.instrument_name} is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.1f}"
+
+
+class PullbackRsi2Condition(PullbackRsiCondition):
+    PERIOD = 2
+
+
+class PullbackRsi3Condition(PullbackRsiCondition):
+    PERIOD = 3
+
+
+class PullbackRsi4Condition(PullbackRsiCondition):
+    PERIOD = 4
+
+
+class PullbackRsi5Condition(PullbackRsiCondition):
+    PERIOD = 5
+
+
+class PriceVsSma200Condition(_PullbackHistoryCondition):
+    """(current price - SMA200) / SMA200 * 100: the SMA200 is the mean of the last 200 FINISHED
+    daily closes, the price is the ACCOUNT's current price (the same call live and in a
+    backtest). Fewer than 200 closes is UNKNOWN."""
+
+    SMA_WINDOW = 200
+    MIN_CLOSES = 200
+    LOOKBACK_DAYS = 400
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+            closes, ok = self._finished_closes()
+            if not ok:
+                self.calculated_value = None
+                return False
+            sma = float(closes[-self.SMA_WINDOW:].mean())
+            self.calculated_value = (current_price - sma) / sma * 100
+            logger.info(f"Price vs SMA200 for {self.instrument_name}: price=${current_price:.2f}, "
+                        f"sma200=${sma:.2f}, diff={self.calculated_value:+.2f}%")
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating price vs SMA200 condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} is {self.operator_str} {self.value}% "
+                f"from its 200-day average")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
 class PercentAboveRecentLowCondition(CompareCondition):
     """Compare how far (in percent) the current price is above the recent low.
 
@@ -4760,6 +4898,11 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
     ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
     ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
+    ExpertEventType.N_PULLBACK_RSI_2: PullbackRsi2Condition,
+    ExpertEventType.N_PULLBACK_RSI_3: PullbackRsi3Condition,
+    ExpertEventType.N_PULLBACK_RSI_4: PullbackRsi4Condition,
+    ExpertEventType.N_PULLBACK_RSI_5: PullbackRsi5Condition,
+    ExpertEventType.N_PRICE_VS_SMA200_PERCENT: PriceVsSma200Condition,
     ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
     ExpertEventType.N_IV_RANK: IVRankCondition,
     ExpertEventType.N_RELATIVE_VOLUME: RelativeVolumeCondition,

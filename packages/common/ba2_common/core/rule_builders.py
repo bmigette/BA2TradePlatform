@@ -80,6 +80,12 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "instrument_account_share": ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE,
     "percent_below_recent_high": ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH,
     "percent_above_recent_low": ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW,
+    # Pullback entry gates (goal2027 part 3). Listed here or the leaf is silently dropped.
+    "pullback_rsi_2": ExpertEventType.N_PULLBACK_RSI_2,
+    "pullback_rsi_3": ExpertEventType.N_PULLBACK_RSI_3,
+    "pullback_rsi_4": ExpertEventType.N_PULLBACK_RSI_4,
+    "pullback_rsi_5": ExpertEventType.N_PULLBACK_RSI_5,
+    "price_vs_sma200_percent": ExpertEventType.N_PRICE_VS_SMA200_PERCENT,
     "iv_rank": ExpertEventType.N_IV_RANK,
     # Volume / volatility entry gates. Both are UNEVALUABLE (never a plausible-looking
     # default) when the underlying measurement is missing -- see their condition classes.

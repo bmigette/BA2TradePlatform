@@ -418,6 +418,36 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Confirm a rebound when percent_above_recent_low >= 15 (price 15%+ above its recent low)"
         },
+        ExpertEventType.N_PULLBACK_RSI_2.value: {
+            "name": "Pullback RSI(2)",
+            "description": "Wilder RSI with period 2 of the finished daily closes (0-100). Low values mean an oversold pullback. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy the dip when pullback_rsi_2 <= 25"
+        },
+        ExpertEventType.N_PULLBACK_RSI_3.value: {
+            "name": "Pullback RSI(3)",
+            "description": "Wilder RSI with period 3 of the finished daily closes (0-100). Low values mean an oversold pullback. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy the dip when pullback_rsi_3 <= 25"
+        },
+        ExpertEventType.N_PULLBACK_RSI_4.value: {
+            "name": "Pullback RSI(4)",
+            "description": "Wilder RSI with period 4 of the finished daily closes (0-100). Low values mean an oversold pullback. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy the dip when pullback_rsi_4 <= 25"
+        },
+        ExpertEventType.N_PULLBACK_RSI_5.value: {
+            "name": "Pullback RSI(5)",
+            "description": "Wilder RSI with period 5 of the finished daily closes (0-100). Low values mean an oversold pullback. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy the dip when pullback_rsi_5 <= 25"
+        },
+        ExpertEventType.N_PRICE_VS_SMA200_PERCENT.value: {
+            "name": "Price vs SMA200",
+            "description": "Percentage distance of the current price from the 200-day simple average of finished daily closes: (price - SMA200) / SMA200 * 100. Positive = above the long-term trend.",
+            "type": "numeric",
+            "example": "Only buy pullbacks in an uptrend: price_vs_sma200_percent >= 0"
+        },
         ExpertEventType.N_IV_RANK.value: {
             "name": "IV Rank",
             "description": "Implied-volatility percentile (0-100) over the stored trailing ATM-IV window. Low IV rank favors buying premium (long calls/spreads); high IV rank favors selling premium (covered calls). Used with numeric comparisons.",
