@@ -127,5 +127,6 @@ def test_the_revision_chains_onto_the_previous_head_and_keeps_a_single_head():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert script.get_heads() == ["c4e7a9d2f1b8"]
+    # d5a1f93e2c70 (allocator_frozen) chains onto it now; still exactly one head
+    assert script.get_heads() == ["d5a1f93e2c70"]
     assert script.get_revision("c4e7a9d2f1b8").down_revision == "b8d1f4a29c63"
