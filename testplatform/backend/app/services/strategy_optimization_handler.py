@@ -3421,6 +3421,8 @@ def _build_daily_trial_config(
         # ``_car_trade_thresholds_for_experts`` on its expert/default resolution exactly.
         "car_hard_min_trades_per_year": backtest_cfg.get("car_hard_min_trades_per_year"),
         "car_min_trades_per_year": backtest_cfg.get("car_min_trades_per_year"),
+        # Per-calendar-year trade floor override (strategy_fitness._year_gate); same whitelist reason.
+        "car_min_trades_each_year": backtest_cfg.get("car_min_trades_each_year"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already

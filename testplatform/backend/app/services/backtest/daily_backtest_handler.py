@@ -1363,7 +1363,8 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     import importlib
 
     out: Dict[str, float] = {}
-    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year",
+                "car_min_trades_each_year"):
         explicit = config.get(key)
         if explicit is not None:
             out[key] = float(explicit)
