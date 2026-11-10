@@ -948,6 +948,36 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "volatility awareness the take-profit has; the stop is already "
                                "ATR-scaled. 1.0 = no change. Requires regime_overlay_enabled."
                 },
+                # Down-trend trigger of the regime overlay (ba2_common.core.regime_overlay): the SAME
+                # three consumers as the regime_* scales, active while SPY is BELOW its 200-day
+                # average (benchmark_regime trend bear_rally/down). Independent of regime_overlay_enabled
+                # and multiplied with the stressed scale when both hold. Default OFF = exact no-op.
+                "downtrend_overlay_enabled": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Scale risk/stop/take-profit while SPY is below its 200-day average",
+                    "tooltip": "Master switch for the down-trend trigger. When off (default) the three "
+                               "downtrend_*_scale settings are ignored entirely. When on they take "
+                               "effect on bars the benchmark trend is bear_rally or down, and "
+                               "multiply with the regime_*_scale values when the market is also stressed."
+                },
+                "downtrend_risk_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Position-SIZE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_risk_scale. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
+                },
+                "downtrend_stop_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Stop-loss DISTANCE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_stop_scale. <1 tightens. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
+                },
+                "downtrend_tp_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Take-profit DISTANCE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_tp_scale. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
+                },
                 # Ruleset stop policy (TradeActions.ruleset_stop_policy). Off = the ratchet every
                 # expert has always had: a ruleset stop only tightens. Deliberately NOT a forced
                 # backtest setting (deploy_parity) nor an inert toggle: a genome may set it, and

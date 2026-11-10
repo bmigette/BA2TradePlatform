@@ -71,8 +71,10 @@ class TestSearchSpaceUnderThePolicy:
     def test_everything_else_is_the_atr_searched_block(self):
         rgov = _M._rm_opt_for("S1", atr_searched=True, regime_searched=True)
         atr = _M._rm_opt_for("S1", atr_searched=True)
-        assert {k: v for k, v in rgov.items() if k not in _SCALES + ("regime_overlay_enabled",)} \
-            == {k: v for k, v in atr.items() if k != "regime_overlay_enabled"}
+        _own = _SCALES + ("regime_overlay_enabled", "downtrend_overlay_enabled",
+                          "downtrend_risk_scale", "downtrend_stop_scale", "downtrend_tp_scale")
+        assert {k: v for k, v in rgov.items() if k not in _own} \
+            == {k: v for k, v in atr.items() if k not in _own}
 
     def test_the_option_override_still_applies(self):
         block = _M._rm_opt_for("O_CSP", atr_searched=True, regime_searched=True)
