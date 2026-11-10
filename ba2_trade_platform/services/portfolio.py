@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from sqlmodel import select
 
 from ..core import allocator_exclusion as exclusion_store
+from ..core import allocator_freeze as freeze_store
 from ..core import allocator_protection_service as protect_svc
 from ..core import portfolio_allocation_service as svc
 from ..core.db import get_db
@@ -192,6 +193,9 @@ def load_view_payload(account_id: int, valuation_mode: str,
     # not in any label, nor in the investable base below.
     exclusions = exclusion_store.get_exclusions(account_id)
     enabled_symbols = exclusion_store.split_included(symbols, exclusions)
+    # THE OPERATOR'S FREEZES: a frozen symbol stays in the base and in its label (unlike an excluded
+    # one); only the displayed targets change (see ``build_label_views(frozen=)``).
+    frozen = freeze_store.get_frozen(account_id)
 
     if account is None:
         account = get_account_instance_from_id(account_id)
@@ -377,6 +381,7 @@ def load_view_payload(account_id: int, valuation_mode: str,
                                    dividends_by_symbol=cash_dividends_by_symbol(dividends),
                                    unallocated_pct=unallocated_pct,
                                    excluded=exclusions,
+                                   frozen=frozen,
                                    freed_labels=exclusion_store.labels_with_weight_changes(account_id)),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -404,6 +409,8 @@ def load_view_payload(account_id: int, valuation_mode: str,
         'protection': protection,
         #: ``{SYMBOL: AllocatorExclusion}`` -- the symbols the operator switched off.
         'exclusions': exclusions,
+        #: ``{SYMBOL: AllocatorFrozen}`` -- the symbols the operator froze.
+        'frozen': frozen,
         'account_id': account_id,
         #: False when the snapshot read failed (base / buying power / account value are then None).
         'snapshot_available': snapshot_available,

@@ -478,6 +478,10 @@ REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX = (
 #: second sends the user hunting for a box holding a percentage nobody typed.
 WARNING_EMPTY_LABEL_FMT = ("label '{label}' has no symbols - its {pct:.2f}% weight "
                            "({base_pct:.2f}% of the base) can absorb nothing")
+#: Always shown when something is frozen, so the dry run (which lists order rows only) still says
+#: that frozen symbols exist and how much money they take out of the allocation.
+WARNING_FROZEN_NOTE_FMT = ("frozen, no orders: {symbols} - their current value ({frozen:,.2f}) is fixed "
+                           "and outside the money the other symbols share")
 #: Frozen positions are worth MORE than the money being allocated: the unfrozen members get 0
 #: (held ones are closed) -- loud, because it looks like a bug on the page otherwise.
 WARNING_FROZEN_EXCEEDS_FMT = ("frozen positions are worth {frozen:,.2f}, which exceeds the {investable:,.2f} "
@@ -2452,6 +2456,8 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     if frozen:
         frozen_values = {s: current_value(current.get(s), valuation_mode) for s in frozen}
         plan.frozen_notional = sum(frozen_values.values())
+        plan.warnings.append(WARNING_FROZEN_NOTE_FMT.format(
+            symbols=", ".join(sorted(frozen)), frozen=plan.frozen_notional))
         unfrozen_total = sum(v for s, v in targets.items() if s not in frozen)
         remaining = investable - plan.frozen_notional
         if unfrozen_total > 0:

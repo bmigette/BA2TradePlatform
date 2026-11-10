@@ -798,6 +798,13 @@ class SymbolRow:
     excluded_reason: Optional[str] = None
     excluded_since: Any = None
     excluded_note: Optional[str] = None
+    #: The operator FROZE this symbol (``allocator_freeze``): it stays in its label and in the base,
+    #: but a rebalance orders nothing for it and its CURRENT value is fixed outside the money the other
+    #: symbols share. ``target_value`` is then its current value and ``effective_weight_pct`` its
+    #: current share of the label's money.
+    frozen: bool = False
+    frozen_since: Any = None
+    frozen_note: Optional[str] = None
     #: The share this ENABLED row is really solved with when its label has an excluded symbol:
     #: ``weight_pct x T / N`` (T = the label's stored total, N = the enabled symbols' total).
     #: ``None`` when nothing is excluded in the label -- then ``weight_pct`` IS the share.
@@ -876,7 +883,8 @@ def build_label_views(managed,
                       dividends_by_symbol=None,
                       unallocated_pct: float = 0.0,
                       excluded=None,
-                      freed_labels=None) -> List[LabelView]:
+                      freed_labels=None,
+                      frozen=None) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
     ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
@@ -930,6 +938,12 @@ def build_label_views(managed,
             they total what the label's STORED shares total (``weight x T / N``): the
             excluded share is redistributed over the enabled symbols, but a shortfall that
             is NOT an excluded share (a freed TP/SL share) stays unallocated.
+        frozen: ``{SYMBOL: freeze}`` of the symbols the operator froze
+            (``allocator_freeze.get_frozen``); optional. Mirrors the engine
+            (``compute_allocation(frozen_symbols=)``): a frozen row's target is its CURRENT value and
+            the other symbols' targets are ``(investable - frozen value)`` shared in proportion to their
+            (effective) shares, so the displayed targets sum to the investable money. Nothing frozen
+            changes nothing.
         freed_labels: labels that have an automatic TP/SL weight-change record; only for those
             is a stored total below 100 reported as ``freed_pct``.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
@@ -963,6 +977,7 @@ def build_label_views(managed,
     dividends = dividends_by_symbol or {}
     excl = {(k or '').strip().upper(): v for k, v in (excluded or {}).items()}
     freed_set = set(freed_labels or [])
+    frozen_map = {(k or '').strip().upper(): v for k, v in (frozen or {}).items()}
 
     def _pnl_of(sym: str) -> UnrealisedPnL:
         """One symbol's unrealised P&L, on the LIVE quote in either mode.
@@ -1030,6 +1045,37 @@ def build_label_views(managed,
 
     total_value = sum(_value_of(sym) for sym in membership if sym not in excl)
 
+    # THE FREEZE, solved once across the labels exactly as the engine does: every unfrozen symbol's
+    # money (label money x effective share) is scaled by ``(investable - frozen value) / unfrozen
+    # money``, clamped at 0. ``None`` when nothing in a managed label is frozen (then nothing changes).
+    freeze_scale: Optional[float] = None
+    frozen_here_all = {s for s in membership if s in frozen_map and s not in excl}
+    if frozen_here_all and investable is not None:
+        money: Dict[str, float] = {}
+        for entry in managed:
+            syms = _clean(entry.label)
+            en = [s for s in syms if s not in excl]
+            res = resolve_symbol_weights(
+                syms, saved=weights_by_label.get(entry.label) or {},
+                values={s: _value_of(s) for s in syms},
+                unmeasurable=[s for s in syms if _is_unmeasurable(s)])
+            st_total = sum(float(res[s].weight_pct) for s in syms if res[s].weight_pct is not None)
+            en_total = sum(float(res[s].weight_pct) for s in en if res[s].weight_pct is not None)
+            sc = (st_total / en_total) if (len(en) != len(syms) and en_total > 0) else 1.0
+            lt_value = investable * float(entry.target_pct or 0.0) / 100.0
+            for s in en:
+                if res[s].weight_pct is not None:
+                    money[s] = money.get(s, 0.0) + lt_value * float(res[s].weight_pct) * sc / 100.0
+        unfrozen_money = sum(v for s, v in money.items() if s not in frozen_here_all)
+        frozen_value = sum(_value_of(s) for s in frozen_here_all)
+        if unfrozen_money > 0:
+            freeze_scale = max(0.0, investable - frozen_value) / unfrozen_money
+        else:
+            freeze_scale = 0.0
+        freeze_money = money
+    else:
+        freeze_money = {}
+
     views: List[LabelView] = []
     for entry in managed:
         symbols = _clean(entry.label)
@@ -1077,6 +1123,15 @@ def build_label_views(managed,
                 market_value = None
 
             row_value = _value_of(sym)
+            is_frozen = sym in frozen_here_all
+            frozen_target: Optional[float] = None
+            frozen_effective: Optional[float] = None
+            if freeze_scale is not None and not is_excluded and sym in freeze_money:
+                frozen_target = row_value if is_frozen else freeze_money[sym] * freeze_scale
+                if label_target_value:
+                    # A symbol in several labels carries its whole money in one row; the label
+                    # share shown is against THIS label's money, like every other column here.
+                    frozen_effective = (row_value if is_frozen else freeze_money[sym] * freeze_scale)                         / label_target_value * 100.0
             rows.append(SymbolRow(
                 symbol=sym,
                 # Blank -> None: an empty string would render as a name that is simply
@@ -1103,7 +1158,8 @@ def build_label_views(managed,
                 weight_pct=resolved[sym].weight_pct,
                 weight_source=resolved[sym].source,
                 measurable=not _is_unmeasurable(sym),
-                target_value=(None if (is_excluded or label_target_value is None
+                target_value=(frozen_target if frozen_target is not None else
+                              None if (is_excluded or label_target_value is None
                                        or resolved[sym].weight_pct is None)
                               else label_target_value
                               * float(effective[sym] if effective.get(sym) is not None
@@ -1114,7 +1170,11 @@ def build_label_views(managed,
                 excluded_reason=(getattr(excl[sym], 'excluded_reason', None) if is_excluded else None),
                 excluded_since=(getattr(excl[sym], 'since', None) if is_excluded else None),
                 excluded_note=(getattr(excl[sym], 'note', None) if is_excluded else None),
-                effective_weight_pct=effective.get(sym),
+                effective_weight_pct=(frozen_effective if frozen_effective is not None
+                                      else effective.get(sym)),
+                frozen=is_frozen,
+                frozen_since=(getattr(frozen_map[sym], 'since', None) if is_frozen else None),
+                frozen_note=(getattr(frozen_map[sym], 'note', None) if is_frozen else None),
             ))
 
         rows.sort(key=lambda r: (-r.current_value, r.symbol))

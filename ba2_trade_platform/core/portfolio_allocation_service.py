@@ -2126,6 +2126,10 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
 EXCLUDED_BY_OPERATOR_FMT = (
     "{symbol} is excluded from allocation (disabled by you{since}{note}): no buys, no sells, "
     "and its value is outside the label maths. Include it again on the allocation page.")
+FROZEN_BY_OPERATOR_FMT = (
+    "{symbol} is frozen (by you{since}{note}): no buys, no sells, its protective TP/SL orders are left "
+    "as they are, and its current value is fixed outside the money being allocated. Unfreeze it on the "
+    "allocation page.")
 PROTECTION_CANCEL_BLOCK_FMT = (
     "{symbol}: not traded -- {why}.")
 PROTECTION_FILL_SKIP_FMT = (
@@ -2166,6 +2170,37 @@ def _strip_excluded_symbols(account, plan: AllocationPlan) -> Tuple[AllocationPl
     logger.warning(f"Allocation for account {account.id}: excluded by the operator, not traded: "
                    f"{', '.join(in_plan)}")
     return _drop_symbols(plan, in_plan), outcomes
+
+
+def _strip_frozen_symbols(account, plan: AllocationPlan) -> Tuple[AllocationPlan, List[RowOutcome]]:
+    """Remove every row that would ORDER something for a symbol the operator FROZE. DB only; every broker.
+
+    The solver already makes a frozen row a no-op (``compute_allocation(frozen_symbols=)``), so on a
+    plan solved after the freeze this finds nothing. It is the boundary guarantee for a plan that was
+    solved BEFORE the freeze (a dialog left open, a cached re-solve): such a plan still carries the
+    order and the other rows were sized against the symbol's old target, but the frozen symbol itself
+    must never be traded. The removed rows come back as SKIPPED outcomes so the run says why.
+    """
+    from .allocator_freeze import get_frozen
+    frozen = get_frozen(account.id)
+    if not frozen:
+        return plan, []
+    ordering = [r.symbol for r in plan.rows
+                if r.symbol.strip().upper() in frozen and (r.side is not None or r.delta_quantity)]
+    if not ordering:
+        return plan, []
+    outcomes = [RowOutcome(symbol=sym, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
+                           message=_frozen_message(sym, frozen[sym.strip().upper()]))
+                for sym in ordering]
+    logger.warning(f"Allocation for account {account.id}: frozen by the operator, not traded: "
+                   f"{', '.join(ordering)}")
+    return _drop_symbols(plan, ordering), outcomes
+
+
+def _frozen_message(symbol: str, frozen) -> str:
+    since = f" on {frozen.since:%Y-%m-%d}" if getattr(frozen, "since", None) else ""
+    note = f", note: {frozen.note}" if getattr(frozen, "note", None) else ""
+    return FROZEN_BY_OPERATOR_FMT.format(symbol=symbol, since=since, note=note)
 
 
 def mark_excluded_rows_skipped(account, plan: AllocationPlan) -> AllocationPlan:
@@ -2330,6 +2365,9 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
     # An EXCLUDED symbol (the operator's manual disable) is never traded. Stripped FIRST so every
     # gate below judges the plan that will really be sent.
     plan, excluded_outcomes = _strip_excluded_symbols(account, plan)
+    # A FROZEN symbol is never ordered either (a plan solved before the freeze may still carry one).
+    plan, frozen_outcomes = _strip_frozen_symbols(account, plan)
+    excluded_outcomes = excluded_outcomes + frozen_outcomes
 
     # Market-hours gate, FIRST, before anything is written. Disabling the Submit
     # button is a courtesy; this is the enforcement -- the wizard can sit open across
