@@ -165,9 +165,8 @@ def resolve_market_condition_context(account, instrument_name: str,
 # ---------------------------------------------------------------------------------------------
 #: ``(id(provider), symbol, measurement, lookback_days, session)`` -> the computed number, or ``None``
 #: (the UNKNOWN outcome). ``session`` is the clamped fetch end ``_as_of_fetch_end()`` returns (the
-#: simulated bar's day in a backtest) or, in live (where that is None by design), today's local date,
-#: so the memo rolls over every session and a later session can never serve an earlier decision or
-#: vice versa. Only the history part is memoised: the CURRENT price is read fresh on every
+#: simulated bar's day in a backtest), so a later session can never serve an earlier decision or
+#: vice versa. LIVE, where that is None by design, is never memoised (see ``_finished_measure``). Only the history part is memoised: the CURRENT price is read fresh on every
 #: evaluation, never cached. Bounded LRU; the backtest engine clears it between runs (next to
 #: ``reset_benchmark_regime``). The code path is identical live and in a backtest.
 _FINISHED_MEASURE_MEMO: "OrderedDict" = OrderedDict()
@@ -476,10 +475,14 @@ class TradeCondition(ABC):
         if not clock_ok:
             return None, False
         provider = _get_provider("ohlcv", "yfinance")
-        session = end_date if end_date is not None else date.today()
-        key = (id(provider), self.instrument_name, measure, lookback_days, session)
+        # LIVE (end_date None) IS NEVER MEMOISED: the live frame is whatever the provider returns
+        # now, so a transient empty answer would stay UNKNOWN for the whole day and a frame that
+        # moves intraday would be frozen at its first read. Only a CLAMPED session is a pure
+        # function of (symbol, session), which is the backtest/GA case the memo exists for.
+        memoise = FINISHED_MEASURE_MEMO_ENABLED and end_date is not None
+        key = (id(provider), self.instrument_name, measure, lookback_days, end_date)
         FINISHED_MEASURE_STATS["evaluations"] += 1
-        if FINISHED_MEASURE_MEMO_ENABLED:
+        if memoise:
             with _FINISHED_MEASURE_MEMO_LOCK:
                 if key in _FINISHED_MEASURE_MEMO:
                     _FINISHED_MEASURE_MEMO.move_to_end(key)
@@ -488,7 +491,7 @@ class TradeCondition(ABC):
         df = provider.get_ohlcv_data(self.instrument_name, interval="1d", end_date=end_date,
                                      lookback_days=lookback_days)
         value = compute(df)
-        if FINISHED_MEASURE_MEMO_ENABLED:
+        if memoise:
             with _FINISHED_MEASURE_MEMO_LOCK:
                 _FINISHED_MEASURE_MEMO[key] = value
                 while len(_FINISHED_MEASURE_MEMO) > _FINISHED_MEASURE_MEMO_MAX:
