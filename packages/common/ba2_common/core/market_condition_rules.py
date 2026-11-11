@@ -348,6 +348,9 @@ def _unresolved_reason(leaf: Mapping) -> str:
     """Why this leaf is not a concrete live condition ("" when it is one)."""
     if leaf.get("mode_optimize") or leaf.get("modeOptimize"):
         return "it still carries mode_optimize (an optimizer template, not a resolved rule)"
+    if (leaf.get("field_optimize") or leaf.get("fieldOptimize")
+            or leaf.get("field_choices") or leaf.get("fieldChoices")):
+        return "it still carries field_optimize/field_choices (an optimizer template, not a resolved rule)"
     mode = leaf.get("mode")
     if mode is None:
         return ""

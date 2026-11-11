@@ -151,6 +151,13 @@ class ConditionLeaf(BaseModel):
     mode: Optional[str] = None
     mode_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("mode_optimize", "modeOptimize"))
     mode_choices: Optional[List[str]] = Field(default=None, validation_alias=AliasChoices("mode_choices", "modeChoices"))
+    #: FIELD GENE metadata (goal2027 pullback RSI period): ``field_optimize`` asks the optimizer for a
+    #: categorical ``cond:<id>:field`` gene over ``field_choices`` (condition field names); the decode
+    #: writes the winner into ``field`` and REMOVES both keys, so a decoded leaf is an ordinary concrete
+    #: leaf. Only meaningful beside ``mode_optimize`` (an ``off`` mode removes the leaf and the field gene
+    #: is inert). DECLARED for the same reason as the mode keys: to_canonical_dict rebuilds from declared fields.
+    field_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("field_optimize", "fieldOptimize"))
+    field_choices: Optional[List[str]] = Field(default=None, validation_alias=AliasChoices("field_choices", "fieldChoices"))
 
     def _label(self) -> str:
         return repr(self.id or self.field)
@@ -212,6 +219,24 @@ class ConditionLeaf(BaseModel):
                 f"value besides {MODE_OFF!r}"
             )
 
+    def _check_field_metadata(self) -> None:
+        choices = self.field_choices
+        if choices is None:
+            if self.field_optimize:
+                raise ValueError(f"condition {self._label()}: field_optimize requires field_choices")
+            return
+        if not choices:
+            raise ValueError(f"condition {self._label()}: field_choices must not be empty")
+        if len(set(choices)) != len(choices):
+            raise ValueError(f"condition {self._label()}: field_choices has duplicates: {choices!r}")
+        if self.field not in choices:
+            raise ValueError(
+                f"condition {self._label()}: field {self.field!r} (the authored seed) is not one of "
+                f"field_choices {choices!r}")
+        if self.field_optimize and not self.mode_optimize:
+            raise ValueError(
+                f"condition {self._label()}: field_optimize is only supported beside mode_optimize")
+
     def _check_resolved_mode(self, kind: Optional[str]) -> None:
         """The resolved ``mode`` token and the categorical ``value`` rule.
 
@@ -251,6 +276,7 @@ class ConditionLeaf(BaseModel):
         kind = self._mode_kind()
         self._check_optimize_metadata(kind)
         self._check_resolved_mode(kind)
+        self._check_field_metadata()
         return self
 
     def to_canonical_dict(self) -> Dict[str, Any]:
@@ -307,6 +333,12 @@ class ConditionLeaf(BaseModel):
         if self.mode_choices is not None:
             out["modeChoices"] = list(self.mode_choices)
             out["mode_choices"] = list(self.mode_choices)
+        if self.field_optimize is not None:
+            out["fieldOptimize"] = self.field_optimize
+            out["field_optimize"] = self.field_optimize
+        if self.field_choices is not None:
+            out["fieldChoices"] = list(self.field_choices)
+            out["field_choices"] = list(self.field_choices)
         if self.id is None:
             out.pop("id")
         return out

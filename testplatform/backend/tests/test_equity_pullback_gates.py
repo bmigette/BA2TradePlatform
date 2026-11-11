@@ -1,7 +1,7 @@
 """goal2027 design 2026-11-10 parts 3 and 4: the pullback entry gates on S1-S7, the matrix flag that
 carries them, and PullbackReversion's gene space.
 
-Gates: ``--pullback-gates`` appends ``<kind>-pb-rsi2..5`` / ``-pb-below-high`` / ``-pb-vs-sma200`` LAST
+Gates: ``--pullback-gates`` appends ``<kind>-pb-rsi`` (period gene) / ``-pb-below-high`` / ``-pb-vs-sma200`` LAST
 to every S1-S7 ENTRY tree (S1's three tiers share one set of genes), never to an exit rule; flag off =
 byte-identical rules; ``off`` mode reproduces the tree without the leaf; every leaf resolves to a
 registered condition (an unmapped field is silently dropped by ``triggers_from_condition_tree``).
@@ -27,7 +27,7 @@ for _p in (_ROOT, _TOOLS, os.path.dirname(os.path.abspath(__file__))):
 
 from ba2_common.core.rule_builders import triggers_from_condition_tree  # noqa: E402
 from ba2_common.core.rule_models import MODE_OFF  # noqa: E402
-from ba2_common.core.market_condition_templates import PULLBACK_GATE_SPECS  # noqa: E402
+from ba2_common.core.market_condition_templates import PULLBACK_GATE_SPECS, PULLBACK_RSI_FIELDS  # noqa: E402
 
 from app.services.strategy_param_space import (  # noqa: E402
     _collect_expert, collect_param_space, decode_params)
@@ -40,7 +40,7 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES)
-FIELDS = {spec[1] for spec in PULLBACK_GATE_SPECS}
+FIELDS = {spec[1] for spec in PULLBACK_GATE_SPECS} | set(PULLBACK_RSI_FIELDS)
 SUFFIXES = [spec[0] for spec in PULLBACK_GATE_SPECS]
 
 
@@ -113,8 +113,12 @@ def test_exit_rules_never_carry_the_gates(kind, gates_on):
 def test_mode_and_value_genes_per_leaf(kind, gates_on):
     genes = collect_param_space(_built(kind))
     k = kind.lower()
+    assert SUFFIXES == ["pb-rsi", "pb-below-high", "pb-vs-sma200"]
     assert _pb_genes(_built(kind)) == sorted(
-        [f"cond:{k}-{s}:mode" for s in SUFFIXES] + [f"cond:{k}-{s}:value" for s in SUFFIXES])
+        [f"cond:{k}-{s}:mode" for s in SUFFIXES] + [f"cond:{k}-{s}:value" for s in SUFFIXES]
+        + [f"cond:{k}-pb-rsi:field"])
+    assert not [g for g in genes if "-pb-rsi" in g and any(g.startswith(f"cond:{k}-pb-rsi{p}:") for p in "2345")]
+    assert genes[f"cond:{k}-pb-rsi:field"]["choices"] == list(PULLBACK_RSI_FIELDS)
     for s in SUFFIXES:
         assert genes[f"cond:{k}-{s}:mode"]["choices"] == ["off", "below", "above"]
 
@@ -124,7 +128,7 @@ def test_s1_conviction_tiers_share_one_set_of_genes(gates_on):
     trees = _entry_trees(s1)
     assert len(trees) == 3
     assert len(_pb_leaves(s1.entry_rules)) == len(SUFFIXES) * 3
-    assert len(_pb_genes(s1)) == 2 * len(SUFFIXES)       # not 3x
+    assert len(_pb_genes(s1)) == 2 * len(SUFFIXES) + 1   # not 3x (mode+value per leaf, one field gene)
 
 
 def test_decode_off_reproduces_the_tree_without_the_leaf(monkeypatch):
@@ -143,13 +147,65 @@ def test_decode_resolves_a_mode_to_an_operator(gates_on):
     flat = {f"cond:s6-{s}:mode": MODE_OFF for s in SUFFIXES}
     flat["cond:s6-pb-below-high:mode"] = "above"
     flat["cond:s6-pb-below-high:value"] = 8.0
-    flat["cond:s6-pb-rsi3:mode"] = "below"
-    flat["cond:s6-pb-rsi3:value"] = 15.0
+    flat["cond:s6-pb-rsi:mode"] = "below"
+    flat["cond:s6-pb-rsi:value"] = 15.0
+    flat["cond:s6-pb-rsi:field"] = "pullback_rsi_3"
     out = decode_params(_built("S6"), flat)
     leaves = {x["id"]: x for x in _pb_leaves(out["entry_rules"])}
-    assert set(leaves) == {"s6-pb-below-high", "s6-pb-rsi3"}
+    assert set(leaves) == {"s6-pb-below-high", "s6-pb-rsi"}
     assert leaves["s6-pb-below-high"]["op"] == ">" and leaves["s6-pb-below-high"]["value"] == 8.0
-    assert leaves["s6-pb-rsi3"]["op"] == "<" and leaves["s6-pb-rsi3"]["value"] == 15.0
+    rsi = leaves["s6-pb-rsi"]
+    assert rsi["op"] == "<" and rsi["value"] == 15.0 and rsi["field"] == "pullback_rsi_3"
+
+
+@pytest.mark.parametrize("field", PULLBACK_RSI_FIELDS)
+def test_each_field_choice_decodes_to_a_concrete_leaf(field, gates_on):
+    flat = {f"cond:s2-{s}:mode": MODE_OFF for s in SUFFIXES}
+    flat.update({"cond:s2-pb-rsi:mode": "above", "cond:s2-pb-rsi:value": 30.0, "cond:s2-pb-rsi:field": field})
+    out = decode_params(_built("S2"), flat)
+    (leaf,) = {id(x): x for x in _pb_leaves(out["entry_rules"])}.values()
+    assert leaf["field"] == field and leaf["op"] == ">"
+    assert not [k for k in leaf if k in ("field_optimize", "field_choices", "fieldOptimize", "fieldChoices", "mode_optimize", "mode_choices", "modeOptimize", "modeChoices")]
+
+
+def test_a_field_gene_given_as_an_index_resolves_and_off_removes_the_leaf(gates_on):
+    flat = {f"cond:s2-{s}:mode": MODE_OFF for s in SUFFIXES}
+    flat.update({"cond:s2-pb-rsi:mode": "below", "cond:s2-pb-rsi:value": 10.0, "cond:s2-pb-rsi:field": 2})
+    out = decode_params(_built("S2"), flat)
+    assert {x["field"] for x in _pb_leaves(out["entry_rules"])} == {"pullback_rsi_4"}
+    flat["cond:s2-pb-rsi:mode"] = MODE_OFF
+    assert _pb_leaves(decode_params(_built("S2"), flat)["entry_rules"]) == []
+
+
+@pytest.mark.parametrize("bad", ["pullback_rsi_9", 7, -1, True, None, 2.5])
+def test_an_invalid_field_choice_raises(bad, gates_on):
+    flat = {f"cond:s2-{s}:mode": MODE_OFF for s in SUFFIXES}
+    flat.update({"cond:s2-pb-rsi:mode": "below", "cond:s2-pb-rsi:value": 10.0, "cond:s2-pb-rsi:field": bad})
+    with pytest.raises(ValueError):
+        decode_params(_built("S2"), flat)
+
+
+def test_an_undecoded_template_leaf_is_refused_by_the_live_resolver_check(gates_on):
+    from ba2_common.core.market_condition_rules import _unresolved_reason
+
+    (leaf,) = [x for x in _pb_leaves(_built("S2").entry_rules) if x["id"].endswith("pb-rsi")][:1]
+    leaf = dict(leaf)
+    leaf.pop("mode_optimize"), leaf.pop("modeOptimize", None)
+    assert "field_choices" in _unresolved_reason(leaf)
+
+
+def test_memo_key_drops_the_inert_field_gene_of_an_off_leaf(gates_on):
+    from app.services.strategy_optimization_handler import canonical_trial_params, mode_anchor_index
+
+    strat = _built("S2")
+    anchors = mode_anchor_index(strat)
+    base = {f"cond:s2-{s}:mode": MODE_OFF for s in SUFFIXES}
+    keys = {tuple(sorted(canonical_trial_params(anchors, {**base, "cond:s2-pb-rsi:field": f}).items()))
+            for f in PULLBACK_RSI_FIELDS}
+    assert len(keys) == 1
+    on = {**base, "cond:s2-pb-rsi:mode": "below"}
+    assert len({tuple(sorted(canonical_trial_params(anchors, {**on, "cond:s2-pb-rsi:field": f}).items()))
+                for f in PULLBACK_RSI_FIELDS}) == 4
 
 
 @pytest.mark.parametrize("kind", EQUITY)
@@ -159,15 +215,19 @@ def test_every_pullback_leaf_resolves_to_a_trigger(kind, gates_on):
     flat = {}
     for s in SUFFIXES:
         flat[f"cond:{k}-{s}:mode"] = "above"
-    out = decode_params(_built(kind), flat)
-    for rule in out["entry_rules"]:
-        tree = rule.get("conditions")
-        if not (isinstance(tree, dict) and tree.get("conditions")):
-            continue
-        leaf_fields = {x["field"] for x in _pb_leaves(tree)}
-        assert leaf_fields == FIELDS
-        events = {t["event_type"] for t in triggers_from_condition_tree(tree).values()}
-        assert FIELDS <= events
+    # every RSI period resolves, one decode per choice
+    for rsi_field in PULLBACK_RSI_FIELDS:
+        flat[f"cond:{k}-pb-rsi:field"] = rsi_field
+        out = decode_params(_built(kind), flat)
+        want = (FIELDS - set(PULLBACK_RSI_FIELDS)) | {rsi_field}
+        for rule in out["entry_rules"]:
+            tree = rule.get("conditions")
+            if not (isinstance(tree, dict) and tree.get("conditions")):
+                continue
+            leaf_fields = {x["field"] for x in _pb_leaves(tree)}
+            assert leaf_fields == want
+            events = {t["event_type"] for t in triggers_from_condition_tree(tree).values()}
+            assert want <= events
 
 
 def test_gates_follow_the_spy_and_market_gates(monkeypatch):

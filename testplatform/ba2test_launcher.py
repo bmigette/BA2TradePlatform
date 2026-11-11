@@ -6240,9 +6240,9 @@ def _check_pullback_gates(command: str, strat, kind: str = "") -> None:
     if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
         sys.exit(f"{command}: --pullback-gates: {kind!r} emits no pullback gates "
                  f"(gated keys: {sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). Drop the flag for this job.")
-    from ba2_common.core.market_condition_templates import PULLBACK_GATE_SPECS
+    from ba2_common.core.market_condition_templates import PULLBACK_GATE_SPECS, PULLBACK_RSI_FIELDS
 
-    fields = {spec[1] for spec in PULLBACK_GATE_SPECS}
+    fields = {spec[1] for spec in PULLBACK_GATE_SPECS} | set(PULLBACK_RSI_FIELDS)
 
     def _has_gate(node) -> bool:
         if isinstance(node, list):
@@ -7475,7 +7475,7 @@ def _append_equity_benchmark_regime_gates(strategy, kind: str):
 
 
 def _append_equity_pullback_gates(strategy, kind: str):
-    """Append the pullback ENTRY leaves (``<kind>-pb-rsi2..5``, ``<kind>-pb-below-high``,
+    """Append the pullback ENTRY leaves (``<kind>-pb-rsi`` with its period gene, ``<kind>-pb-below-high``,
     ``<kind>-pb-vs-sma200``) LAST to every initial-entry AND tree of an equity strategy (S1-S7),
     never to an exit rule (goal2027 design 2026-11-10 part 3).
 
@@ -11617,9 +11617,9 @@ def _add_market_condition_args(p) -> None:
     p.add_argument("--pullback-gates", action="store_true", default=False,
                    help="OPT-IN, equity S1-S7 only (goal2027 design 2026-11-10 part 3; refused for any "
                         "other key). Append the per-symbol pullback entry gates to every entry tree: "
-                        "<kind>-pb-rsi2..5 (Wilder RSI of finished daily closes), <kind>-pb-below-high "
+                        "<kind>-pb-rsi (period 2-5 gene; Wilder RSI of finished daily closes), <kind>-pb-below-high "
                         "(percent below the 20-day high) and <kind>-pb-vs-sma200 (price vs SMA200 in "
-                        "percent), each with an off/below/above mode gene and a threshold gene (12 "
+                        "percent), each with an off/below/above mode gene and a threshold gene (7 "
                         "added genes per strategy; S1's tiers share them). Absent = today's rules.")
     p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
                    help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "

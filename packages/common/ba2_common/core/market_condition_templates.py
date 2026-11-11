@@ -57,30 +57,39 @@ def benchmark_regime_leaves(prefix: str) -> list:
             for spec in BENCHMARK_FIELDS.values()]
 
 
+#: The RSI periods the pullback gate may read; each is a registered condition field
+#: ``pullback_rsi_<period>`` (a rule leaf carries no second parameter, so the period is part of the
+#: field name). ONE leaf searches over them through its ``cond:<id>:field`` choice gene.
+PULLBACK_RSI_PERIODS = (2, 3, 4, 5)
+PULLBACK_RSI_FIELDS = tuple(f"pullback_rsi_{p}" for p in PULLBACK_RSI_PERIODS)
+
 #: goal2027 design 2026-11-10 part 3: per-symbol PULLBACK entry gates. (leaf suffix, field, authored
 #: op, authored value, min, max, step). The authored op/value is only the seed; the mode gene
-#: (off/below/above) picks ``<`` / ``>`` and the value gene the threshold. A rule leaf carries no
-#: second parameter, so the RSI period is part of the field name: one leaf per period 2-5.
+#: (off/below/above) picks ``<`` / ``>`` and the value gene the threshold. The RSI leaf's ``field`` is
+#: the authored seed too: its ``field`` gene picks the period (see :data:`PULLBACK_RSI_FIELDS`).
 PULLBACK_GATE_SPECS = (
-    ("pb-rsi2", "pullback_rsi_2", "<", 25.0, 5.0, 50.0, 5.0),
-    ("pb-rsi3", "pullback_rsi_3", "<", 25.0, 5.0, 50.0, 5.0),
-    ("pb-rsi4", "pullback_rsi_4", "<", 25.0, 5.0, 50.0, 5.0),
-    ("pb-rsi5", "pullback_rsi_5", "<", 25.0, 5.0, 50.0, 5.0),
+    ("pb-rsi", PULLBACK_RSI_FIELDS[0], "<", 25.0, 5.0, 50.0, 5.0),
     ("pb-below-high", "percent_below_recent_high", ">", 6.0, 2.0, 20.0, 2.0),
     ("pb-vs-sma200", "price_vs_sma200_percent", ">", 0.0, -10.0, 10.0, 2.5),
 )
 
 
 def pullback_gate_leaves(prefix: str) -> list:
-    """The pullback ENTRY gates for rule prefix ``prefix``: ``<prefix>-pb-rsi<2-5>``,
-    ``<prefix>-pb-below-high``, ``<prefix>-pb-vs-sma200``. Each is a numeric leaf with a mode gene
-    (``off`` removes it, so today's behaviour stays inside the search space) and a threshold gene."""
+    """The pullback ENTRY gates for rule prefix ``prefix``: ``<prefix>-pb-rsi`` (period searched by
+    its ``field`` gene), ``<prefix>-pb-below-high``, ``<prefix>-pb-vs-sma200``. Each is a numeric leaf
+    with a mode gene (``off`` removes it, so today's behaviour stays inside the search space) and a
+    threshold gene."""
     from ba2_common.core.rule_models import NUMERIC_MODE_CHOICES
 
-    return [{"id": f"{prefix}-{suffix}", "field": field, "field_type": "numeric", "mode_optimize": True,
-             "op": op, "value": value, "optimize": True, "value_min": lo, "value_max": hi,
-             "value_step": step, "mode_choices": list(NUMERIC_MODE_CHOICES)}
-            for suffix, field, op, value, lo, hi, step in PULLBACK_GATE_SPECS]
+    leaves = []
+    for suffix, field, op, value, lo, hi, step in PULLBACK_GATE_SPECS:
+        leaf = {"id": f"{prefix}-{suffix}", "field": field, "field_type": "numeric", "mode_optimize": True,
+                "op": op, "value": value, "optimize": True, "value_min": lo, "value_max": hi,
+                "value_step": step, "mode_choices": list(NUMERIC_MODE_CHOICES)}
+        if field in PULLBACK_RSI_FIELDS:
+            leaf.update(field_optimize=True, field_choices=list(PULLBACK_RSI_FIELDS))
+        leaves.append(leaf)
+    return leaves
 
 
 #: The kinds :func:`market_exit_rules` can build, in emission order.

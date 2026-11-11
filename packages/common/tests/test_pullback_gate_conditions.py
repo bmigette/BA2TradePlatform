@@ -174,3 +174,22 @@ def test_every_pullback_event_is_registered_everywhere():
             {"id": "x", "field": f, "op": "<", "comparison": "<", "value": 10.0, "field_type": "numeric"}]}
         (trig,) = triggers_from_condition_tree(tree).values()
         assert trig["event_type"] == f
+
+
+def test_the_pullback_rsi_template_has_one_field_leaf_and_validates_its_choices():
+    import pytest
+    from ba2_common.core.market_condition_templates import PULLBACK_RSI_FIELDS, pullback_gate_leaves
+    from ba2_common.core.rule_models import ConditionLeaf
+
+    leaves = pullback_gate_leaves("x")
+    assert [l["id"] for l in leaves] == ["x-pb-rsi", "x-pb-below-high", "x-pb-vs-sma200"]
+    rsi = ConditionLeaf.model_validate(leaves[0]).to_canonical_dict()
+    assert rsi["field_choices"] == list(PULLBACK_RSI_FIELDS) and rsi["field_optimize"] is True
+    assert "field_choices" not in leaves[1]
+    for bad in ({"field_choices": ["pullback_rsi_3"]},          # authored field not among the choices
+                {"field_choices": []},
+                {"field_choices": ["pullback_rsi_2", "pullback_rsi_2"]},
+                {"field_choices": None, "field_optimize": True},
+                {"mode_optimize": None, "mode_choices": None}):
+        with pytest.raises(ValueError):
+            ConditionLeaf.model_validate({**leaves[0], **bad})

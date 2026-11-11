@@ -1609,9 +1609,18 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     out: Optional[Dict[str, Any]] = None
     for cid, (choices, anchor) in anchors.items():
         mode_key, value_key = f"cond:{cid}:mode", f"cond:{cid}:value"
-        if mode_key not in decoded_flat or value_key not in decoded_flat or anchor is None:
+        field_key = f"cond:{cid}:field"
+        if mode_key not in decoded_flat:
             continue
         if mode_token(decoded_flat[mode_key], choices, cid) != MODE_OFF:
+            continue
+        # An off leaf is removed: its field gene (the pullback RSI period) is inert too. Dropped from
+        # the memo key (never from the config the trial runs), so every period shares one key.
+        if field_key in decoded_flat:
+            if out is None:
+                out = dict(decoded_flat)
+            del out[field_key]
+        if value_key not in decoded_flat or anchor is None:
             continue
         if decoded_flat[value_key] == anchor:
             continue
