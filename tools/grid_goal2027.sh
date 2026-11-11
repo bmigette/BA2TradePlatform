@@ -298,6 +298,11 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
              --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
              --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
       suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
+      # Optional: ONE ruleset with a SPY-above-200 section and a SPY-below-200 section (launcher --regime-split-entry).
+      # G27_REGIME_SPLIT = context | entry | all. Unset = today's commands, names and labels unchanged.
+      if [ -n "${G27_REGIME_SPLIT:-}" ]; then
+        args+=(--regime-split-entry "$G27_REGIME_SPLIT"); suffix="${suffix}-regsplit-${G27_REGIME_SPLIT}"
+      fi
       # PullbackReversion (long only) runs S2 on the cap bands; its entry is a daily dip, so the screener
       # cadence is daily and the entry scan runs every weekday (no weekday genes: _daily_entry in the launcher). The matrix runs it only when asked.
       if [ "$kind" = "pb" ]; then args+=(--pullback-strategies S2 --cadence-days 1); fi

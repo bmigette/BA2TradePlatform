@@ -253,6 +253,16 @@ def pullback_gate_tokens(args, strat) -> list:
     return []
 
 
+def regime_split_tokens(args, strat) -> list:
+    """`--regime-split-entry SCOPE` for an S1-S7 job when the matrix splits the entry rules by the SPY 200-day regime
+    (goal2027 design 2026-11-10 down-market follow-up), else []. Same scope as the SPY gates it pins; a bypass job
+    (``strat is None``) and SQM are given nothing (the caller prints a NOTE)."""
+    scope = getattr(args, "regime_split_entry", None)
+    if scope and strat in SPY_GATE_STRATEGIES:
+        return ["--regime-split-entry", scope]
+    return []
+
+
 def exploration_range_tokens(args, expert, strat) -> list:
     """`--search-exploration-ranges` for a job whose (expert, strategy) pair the flag is defined for (goal2027 item
     2.9), else []. The launcher refuses the flag for any other pair, so it is not forwarded (the caller prints a
@@ -753,6 +763,11 @@ def main() -> int:
                     help="Search the per-symbol PULLBACK entry gates (RSI 2-5, below the 20-day high, price vs SMA200; "
                          "each with an off value; goal2027 design 2026-11-10 part 3) on every S1-S7 job. REQUIRES "
                          "--name-suffix to contain 'pullback'. Not forwarded to the FactorRanker job (bypass) or SQM.")
+    ap.add_argument("--regime-split-entry", default=None, choices=("context", "entry", "all"), metavar="SCOPE",
+                    help="Split every S1-S7 entry rule into a SPY-above-200 rule and a SPY-below-200 rule with their "
+                         "own '-dn' genes (launcher --regime-split-entry; SCOPE context|entry|all). REQUIRES "
+                         "--benchmark-regime-gates and --name-suffix to contain 'regsplit'. Not forwarded to the "
+                         "FactorRanker job (bypass) or SQM. Absent = today's commands.")
     ap.add_argument("--search-exploration-ranges", action="store_true", default=False,
                     help="Widen the time-exit lattices and add the FMPEarningsDrift S5 time exit so every "
                          "exploration phase-1 timeout and its control is searchable (goal2027 item 2.9). REQUIRES "
@@ -939,6 +954,13 @@ def main() -> int:
         ap.error(f"--pullback-gates requires --name-suffix to contain 'pullback' (got {args.name_suffix!r}): its "
                  f"gene space differs from an ungated run's, so it must not share a job name. "
                  f"Example: --name-suffix goal2027-pullback")
+    if args.regime_split_entry:
+        if not args.benchmark_regime_gates:
+            ap.error("--regime-split-entry requires --benchmark-regime-gates (it pins the SPY trend leaf that flag adds)")
+        if "regsplit" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--regime-split-entry requires --name-suffix to contain 'regsplit' (got {args.name_suffix!r}): "
+                     f"its gene space differs from an unsplit run's, so it must not share a job name. "
+                     f"Example: --name-suffix goal2027-regsplit-context")
     if args.search_market_profile:
         _need = ("ohlcv-v1", "ta-structure-v1")
         _profiles = [t.strip() for t in (args.market_condition_profile or "").split(",") if t.strip()]
@@ -1209,6 +1231,12 @@ def main() -> int:
         if args.pullback_gates and not pb_tokens:
             print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no pullback gate, flag not applied",
                   flush=True)
+        # --regime-split-entry: appended after the pullback gates; digest on its own. Same scope as the SPY gates.
+        rs_tokens = regime_split_tokens(args, strat)
+        cmd += rs_tokens
+        if args.regime_split_entry and not rs_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no regime split, flag not applied",
+                  flush=True)
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names. Under
@@ -1221,7 +1249,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
             job_name = _job_name(name, ident + wf_tokens)
