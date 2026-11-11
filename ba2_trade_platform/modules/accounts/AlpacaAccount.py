@@ -39,6 +39,8 @@ from ba2_common.core.assignment_hold import assigned_stock_entry_data, decide_li
 from ba2_common.core.assignment_liquidation import pending_meta, sweep_pending_liquidations
 from ba2_common.core.entry_tag import order_entry_tag
 from sqlmodel import Session, select, or_
+from .alpaca_cover_protection import (
+    CoverProtectionMixin, PROTECTION_SUSPENDED_KEY, is_protection_suspended)
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
 # from the broker's own DIV activity id or from the symbol/date fallback. Keeps the
@@ -302,7 +304,7 @@ def alpaca_api_retry(func):
 
 
 
-class AlpacaAccount(AccountInterface, OptionsAccountInterface):
+class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterface):
     """
     A class that implements the AccountInterface for interacting with Alpaca trading accounts.
     This class provides methods for managing orders, positions, and account information through
@@ -1408,6 +1410,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"{trading_order.broker_order_id} — skipping re-submission"
             )
             return trading_order
+
+        # A protective SELL on a lot whose shares are pledged to an open short call is never
+        # sent: the broker would count them as held for the order and the call would be
+        # uncovered (alpaca_cover_protection). The net under every path that writes a leg.
+        if self._protective_leg_blocked_by_suspension(trading_order):
+            return None
 
         from sqlmodel import Session
         from ...core.db import add_instance
@@ -4701,6 +4709,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     transaction_in_session.stop_loss = new_sl_price
                 session.add(transaction_in_session)
                 session.commit()
+
+                # 4b. The shares are pledged to an open short call (alpaca_cover_protection):
+                # the values above ARE stored (the source of truth, re-staged when the call is
+                # gone) but nothing may be put on the shares meanwhile. Not a failure.
+                if is_protection_suspended(transaction_in_session):
+                    logger.warning(
+                        f"Transaction {transaction.id} ({transaction_in_session.symbol}): "
+                        f"TP={transaction_in_session.take_profit} SL={transaction_in_session.stop_loss} "
+                        f"stored{source_label} but NOT staged at the broker -- the shares are "
+                        f"pledged to an open short call (protection suspended until it is gone)")
+                    return True
 
                 # 5. Find the existing exit orders: the position's resting PROTECTION that is
                 # still working (see the C1 note above). A FILLED leg is excluded -- it fired,
@@ -8137,6 +8156,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         from ...core.types import TransactionStatus
 
         meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+        # The lot's covered-call protection marker is the LOT's: the shares it describes were
+        # just called away and the remainder carries no stop/take-profit of its own to re-arm.
+        meta.pop(PROTECTION_SUSPENDED_KEY, None)
         meta["split_from_transaction_id"] = held.id
         meta["split_reason"] = "called_away"
         meta["split_activity_id"] = activity_id

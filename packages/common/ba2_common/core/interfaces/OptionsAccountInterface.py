@@ -565,12 +565,58 @@ class OptionsAccountInterface(ABC):
                 child_id = add_instance(child, expunge_after_flush=True)
                 leg_orders.append(get_instance(TradingOrder, child_id))
 
+        # THE COVER RELEASE (see ``_release_cover_protection_for_short_calls``). Inside the try
+        # so a refused release unwinds the rows exactly like a rejected submission, and
+        # AFTER the rows exist so a refresh in the window cannot see a call-less pledge.
+        release = None
         try:
-            return self._submit_option_order_impl(parent, legs, leg_orders or None)
+            if (option_strategy or "").strip().lower() == COVERED_CALL_STRATEGY:
+                release = self._release_cover_protection_for_short_calls(
+                    legs, quantity, option_strategy)
+            order = self._submit_option_order_impl(parent, legs, leg_orders or None)
         except Exception as e:
             logger.error(f"Option order submission failed for {parent.symbol}: {e}", exc_info=True)
             self._unwind_failed_option_submission(parent, leg_orders, e)
+            self._finish_cover_release(release, None, f"submission failed: {e}")
             return None
+        self._finish_cover_release(
+            release, order, None if order is not None else "the broker returned no order")
+        return order
+
+    def _release_cover_protection_for_short_calls(self, legs: List[OptionLeg], quantity: int,
+                                                  option_strategy: Optional[str]) -> Optional[Any]:
+        """Free the shares a ``covered_call`` is about to pledge. THE DEFAULT RELEASES NOTHING.
+
+        Called by :meth:`submit_option_order` for a ``covered_call`` after its rows exist and
+        before the broker call. An account whose broker holds shares for the platform's OWN
+        resting protective orders (Alpaca: a resting stop leaves ``qty_available`` 0, so the
+        broker rejects the call as uncovered, 40310000) overrides it to cancel those legs and
+        wait until the shares are available. It returns a token with ``confirm(order)`` (the
+        call was accepted) and ``abort(why)`` (it was not: re-stage the protection), or None
+        when there was nothing to release; it RAISES to refuse the call (nothing may be left
+        cancelled when it does).
+
+        The backtest account holds no resting broker orders and IBKR / TastyTrade have
+        unverified hold rules, so they inherit this no-op and are unchanged.
+        """
+        return None
+
+    @staticmethod
+    def _finish_cover_release(release: Optional[Any], order: Optional[Any],
+                              failure: Optional[str]) -> None:
+        """``confirm`` the release on a submitted call, ``abort`` it otherwise. Never raises: a
+        failure here must not mask the submission's own outcome, and is logged at ERROR."""
+        if release is None:
+            return
+        from ba2_common.logger import logger
+        try:
+            if failure is None:
+                release.confirm(order)
+            else:
+                release.abort(failure)
+        except Exception as e:  # noqa: BLE001 -- reported; the account's refresh retries
+            logger.error(f"covered-call cover release could not be "
+                         f"{'confirmed' if failure is None else 'aborted'}: {e}", exc_info=True)
 
     def _unwind_failed_option_submission(self, parent, leg_orders, error) -> None:
         """Terminalise the rows a FAILED submission left behind — but only if nothing
@@ -2364,14 +2410,25 @@ class OptionsAccountInterface(ABC):
         selling the lot could uncover a call. A row for ANOTHER symbol is never inspected,
         so it cannot poison the answer.
 
-        KNOWN GAP, the ENTRY face of the one recorded in
-        :meth:`equity_shares_working_to_sell` — read that one for the whole story. This
-        reads ``qty``, the FULL holding, NOT ``qty_available`` ("total shares minus open
-        orders"). Shares already committed to a resting SELL_STOP therefore still count as
-        cover, so writing the equity stop first and the covered call second — the normal
-        ordering — lets :meth:`check_cover_for_covered_call` admit a call against shares the
-        stop can sell. Pinned by
-        ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
+        A RESTING PROTECTIVE LEG STILL COUNTS AS COVER HERE, AND THAT IS NOW A DECISION, not a
+        gap (it was recorded as the ENTRY face of the KNOWN GAP in
+        :meth:`equity_shares_working_to_sell`). This reads ``qty``, the FULL holding, NOT
+        ``qty_available`` ("total shares minus open orders"), so shares committed to a resting
+        SELL_STOP are still offered as cover and :meth:`check_cover_for_covered_call` admits a
+        call against them -- the normal ordering, since equity positions here are routinely
+        opened with TP/SL. What makes that safe is the WRITE seam, not this read:
+        :meth:`submit_option_order` calls :meth:`_release_cover_protection_for_short_calls`
+        for a ``covered_call``, and on Alpaca (``alpaca_cover_protection``) that cancels the
+        platform's own resting protective legs on the pledging equity transaction(s), waits
+        for the broker to report the shares available, and only then sends the call; the stored
+        ``stop_loss`` / ``take_profit`` stay, the transaction carries
+        ``meta_data["protection_suspended"]``, and the legs are re-staged when the call is gone.
+        This matches the backtest, which never sells shares pledged to an open short call.
+        Reading ``qty_available`` here instead would REFUSE exactly the call the seam can
+        free the shares for. IBKR and TastyTrade keep the default seam (no release): their
+        hold rules for a resting leg are unverified and their behaviour is unchanged. Pinned by
+        ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__the_write_seam_releases_it``
+        and ``tests/test_covered_call_releases_stop.py``.
         """
         from ba2_common.core.failure_modes import absorb_if_benign
         from ba2_common.core.types import OrderDirection
@@ -2462,38 +2519,35 @@ class OptionsAccountInterface(ABC):
         a protective leg is never one (a TP is ``SELL_LIMIT``, an SL ``SELL_STOP``, both
         together an ``OCO``).
 
-        KNOWN GAP — A RESTING PROTECTIVE LEG IS INVISIBLE TO THE COVER ARITHMETIC IN BOTH
-        DIRECTIONS. Recorded rather than papered over, and it is ONE gap with two faces:
+        A RESTING PROTECTIVE LEG IS NOT COUNTED HERE, BY DESIGN -- ON ALPACA IT CANNOT COEXIST
+        WITH A PLEDGE. (This was a recorded KNOWN GAP with two faces; the live Alpaca bug it
+        described -- a covered call rejected 40310000 because the platform's own stop held every
+        share -- is fixed by SUSPENSION, see :meth:`_release_cover_protection_for_short_calls`.)
 
-        * THE EXIT face, here. A stop-loss on the covering shares can strip a call, and it
-          is not counted as "already committed to sell". It WAS counted, and was reverted
-          (828e65a9): ``close_transaction`` cancels a transaction's legs AT THE BROKER
-          without terminalising the DB rows (they clear on the next ``refresh_orders``),
-          so every later exit on the ticker refused on the strength of orders that no
-          longer existed — a guard that blocks every exit is its own incident, and the
-          finding that prompted this accessor is about closes the run itself authorised.
-          ``MARKET`` is therefore the test for "a sale already decided".
-        * THE ENTRY face, in :meth:`held_shares_for_cover` and so in
-          :meth:`check_cover_for_covered_call`. ``held`` is read from the position row's ``qty``,
-          which is the full holding — shares already committed to a resting SELL_STOP
-          included. Write the equity stop FIRST and the covered call SECOND (the normal
-          ordering, since equity positions here are routinely opened with TP/SL) and the
-          write is admitted against shares the stop can sell out from under it. Naming the
-          remedy as belonging "where the stop is WRITTEN" does not cover this: that ordering
-          never reaches the stop-writing seam with the call already open.
+        * THE EXIT face: a stop-loss on the covering shares used to be able to strip a call.
+          On Alpaca the legs of the pledging lot are cancelled when the call is written and
+          nothing re-stages or sends a sell on those shares while the call is open (the
+          ``_adjust_tpsl_internal`` gate, the ``_submit_order_impl`` net, the breached-stop
+          safety net's skip), so there is no resting leg to count. Counting legs here was tried
+          and reverted (828e65a9): ``close_transaction`` cancels a transaction's legs AT THE
+          BROKER without terminalising the DB rows (they clear on the next ``refresh_orders``),
+          so every later exit on the ticker refused on the strength of orders that no longer
+          existed -- a guard that blocks every exit is its own incident. ``MARKET`` stays the
+          test for "a sale already decided", which every close path on this platform satisfies
+          and no protective leg does.
+        * THE ENTRY face, in :meth:`held_shares_for_cover`: ``held`` is the full holding, so
+          the call is admitted against shares a resting stop holds; the write seam then frees
+          them (above).
 
-        ``qty_available`` IS THE FIELD THAT WOULD ANSWER BOTH — "total shares minus open
-        orders", the number Alpaca actually enforces (``models.Position.qty_available``;
-        ``AlpacaAccount.get_positions`` populates it, ``TastyTradeAccount`` and
-        ``IBKRAccount`` mirror ``qty`` into it). Reading it instead of ``qty`` would
-        subtract a resting leg at the source, on live broker state rather than on DB rows
-        the platform is known to leave stale — which is what made counting the legs
-        unworkable at the exit face. It is not done here because a tri-state accessor
-        cannot treat an adapter that does not publish the field as "nothing is available",
-        and closing that properly means fixing the adapters first. Until then the gap is
-        tracked, in both directions, by
-        ``test_a_RESTING_PROTECTIVE_LEG_is_not_netted__a_recorded_gap`` and
-        ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
+        STILL OPEN: IBKR and TastyTrade do not release anything (their hold rules are
+        unverified), so a resting leg there is still invisible to this arithmetic and can still
+        sell pledged shares. ``qty_available`` (``models.Position.qty_available``; Alpaca
+        populates it, ``TastyTradeAccount`` and ``IBKRAccount`` mirror ``qty`` into it) would
+        answer both faces from live broker state, but a tri-state accessor cannot treat an
+        adapter that does not publish the field as "nothing is available", so those adapters
+        come first. Pinned by
+        ``test_a_RESTING_PROTECTIVE_LEG_is_not_counted_as_working__suspension_frees_it_on_alpaca``
+        and ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__the_write_seam_releases_it``.
 
         ACCOUNT-WIDE, not per transaction, for the same reason cover itself is account-
         wide (see :meth:`held_shares_for_cover`): the broker does not care which

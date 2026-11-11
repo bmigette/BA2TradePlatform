@@ -26,6 +26,7 @@ from ba2_common.core.washtrade import (
 # and _force_close_breached_stops below decides a stop was jumped by the same number. See
 # the constant's own comment in AlpacaAccount for why they can never be allowed to drift.
 from ..modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
+from ..modules.accounts.alpaca_cover_protection import is_protection_suspended
 
 
 # Serializes account refreshes across all entry points (scheduled job, immediate job,
@@ -703,6 +704,26 @@ class TradeManager:
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)
 
+                    # A covered call SUSPENDS the resting stop on the shares it pledges
+                    # (AlpacaAccount, see alpaca_cover_protection). The option events just
+                    # reconciled above are what end a call (expiry / buy-back / assignment),
+                    # so this is where the stored stop / take-profit is put back under shares
+                    # that are still held. Before the breached-stop sweep below, which skips
+                    # a lot that is still suspended. Isolated: a failure here must not cost
+                    # the rest of the refresh (the next refresh retries).
+                    if hasattr(account, 'reconcile_suspended_protection'):
+                        try:
+                            rearmed = account.reconcile_suspended_protection()
+                            if rearmed:
+                                self.logger.info(
+                                    f"Re-armed protection on {rearmed} lot(s) whose covered "
+                                    f"call ended for {account_def.name}")
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error re-arming suspended protection for {account_def.name}: "
+                                f"{e}", exc_info=True,
+                            )
+
                     # SAFETY NET: a stop-LIMIT exit leg that a gap jumped can never fill,
                     # leaving an open position with no stop under it. Force-close those at
                     # market. Runs LAST, on the freshly-refreshed order/position/transaction
@@ -852,6 +873,16 @@ class TradeManager:
                 if txn.asset_class == AssetClass.OPTION or txn.multiplier not in (None, 1):
                     continue
                 if txn.stop_loss is None or not txn.symbol:
+                    continue
+                # Shares pledged to an open short call are never sold (the backtest's
+                # ``_pledged_share_lock``): the protection was SUSPENDED when the call was
+                # written and is re-armed when it is gone. A market sell here would strip the
+                # call of its cover (and ``close_transaction`` refuses it anyway, every pass).
+                if is_protection_suspended(txn):
+                    self.logger.info(
+                        f"[Account {account.id}] breached-stop check: {txn.symbol} transaction "
+                        f"{txn.id} skipped -- its shares are pledged to an open short call, so "
+                        f"its stop {txn.stop_loss} is not enforced until the call is gone")
                     continue
                 # Plain tuples, so nothing below depends on a live ORM session.
                 watched.append((txn.id, txn.symbol, txn.side, float(txn.stop_loss)))
@@ -1044,6 +1075,11 @@ class TradeManager:
         terminal = OrderStatus.get_terminal_statuses()
         for txn in self._equity_transactions_of(account, TransactionStatus.OPENED):
             if txn.stop_loss is None:
+                continue
+            if is_protection_suspended(txn):
+                self.logger.info(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id}: not re-protected "
+                    f"-- its shares are pledged to an open short call (protection suspended)")
                 continue
             try:
                 orders = orders_where(transaction_id=txn.id)
