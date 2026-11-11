@@ -57,6 +57,22 @@ def benchmark_regime_leaves(prefix: str) -> list:
             for spec in BENCHMARK_FIELDS.values()]
 
 
+def pinned_benchmark_leaf(leaf_id: str, field: str, token: str) -> dict:
+    """A SPY benchmark leaf PINNED to one regime value (``field == code(token)``): no mode gene, so it can
+    never be ``off``, and already in the resolved shape the GA decode writes (``mode`` = the token), so it
+    passes ``market_condition_rules._unresolved_reason``. ``--regime-split-entry`` pins ``spy_trend_regime``
+    to ``above_200`` / ``below_200``; an unknown regime matches neither (the leaf's own behaviour)."""
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, field_codes
+
+    if field not in BENCHMARK_FIELDS:
+        raise ValueError(f"pinned_benchmark_leaf: {field!r} is not a benchmark field "
+                         f"(have {sorted(BENCHMARK_FIELDS)!r})")
+    if token not in field_codes(field):
+        raise ValueError(f"pinned_benchmark_leaf: {token!r} is not a value of {field!r} "
+                         f"(have {sorted(field_codes(field))!r})")
+    return _fixed_categorical_leaf(leaf_id, field, token)
+
+
 #: The RSI periods the pullback gate may read; each is a registered condition field
 #: ``pullback_rsi_<period>`` (a rule leaf carries no second parameter, so the period is part of the
 #: field name). ONE leaf searches over them through its ``cond:<id>:field`` choice gene.

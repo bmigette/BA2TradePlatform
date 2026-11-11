@@ -31,3 +31,21 @@ def test_leaves_validate_as_condition_leaves():
     for leaf in benchmark_regime_leaves("x"):
         model = ConditionLeaf(**leaf)
         assert model.field == leaf["field"] and model.mode_optimize is True
+
+
+def test_pinned_benchmark_leaf_is_resolved_gene_free_and_live_acceptable():
+    import pytest
+    from ba2_common.core.market_condition_rules import _unresolved_reason
+    from ba2_common.core.market_condition_templates import pinned_benchmark_leaf
+    from ba2_common.core.rule_models import normalize_tree
+
+    leaf = pinned_benchmark_leaf("x-spy-trend", "spy_trend_regime", "below_200")
+    assert leaf["op"] == "==" and leaf["mode"] == "below_200" and leaf["value"] == 6.0
+    assert not leaf.get("mode_optimize") and not leaf.get("mode_choices")
+    assert _unresolved_reason(leaf) == ""
+    kept = normalize_tree(dict(leaf))
+    assert kept["value"] == 6.0 and kept["field"] == "spy_trend_regime"
+    with pytest.raises(ValueError):
+        pinned_benchmark_leaf("x", "spy_trend_regime", "sideways")
+    with pytest.raises(ValueError):
+        pinned_benchmark_leaf("x", "adx", "up")
