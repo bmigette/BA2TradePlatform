@@ -135,3 +135,22 @@ def test_unparseable_entry_time_raises():
     r = _r([{"entry_time": "garbage", "transaction_id": 1}] * 40)
     with pytest.raises(ValueError):
         compute_fitness("consistent_annual_return", r)
+
+
+def _stress_trade(entry, exit_, tid):
+    return {"entry_time": entry, "exit_time": exit_, "pnl": 300.0, "pnl_pct": 0.3,
+            "entry_price": 100.0, "exit_price": 103.0, "quantity": 100.0, "transaction_id": tid}
+
+
+def test_stressed_pass_keeps_the_runs_year_buckets():
+    """The spread stress changes no trade, so its year gate is the unstressed run's (2026-11-11).
+
+    Two exits five minutes apart used to make a zero-length bucket on the curve the stress pass
+    synthesizes from trade exits (ZeroDivisionError), and a silent year vanished from that curve.
+    """
+    trades = [_stress_trade("2022-03-01T10:00:00", "2022-03-02T10:00:00", 1),
+              _stress_trade("2022-03-01T10:05:00", "2022-03-02T10:05:00", 2)]
+    r = _r(trades, initial_capital=100_000.0, stress_spread_bps=4.0, avg_trades_per_year=100.0)
+    fit = compute_fitness("consistent_annual_return", r, 4.0)
+    assert fit == pytest.approx(0.0)  # 2023 is silent in the run -> gate 0 in both passes
+    assert [b["structures"] for b in r["trades_by_year"]] == [2, 0]

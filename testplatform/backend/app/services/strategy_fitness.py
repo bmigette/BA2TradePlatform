@@ -1510,6 +1510,12 @@ def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
         pts.append({"date": ts, "equity": equity})
     if pts:
         out["equity_curve"] = pts
+    # The per-year trade floor counts WHICH trades were opened in each calendar year, and a wider
+    # spread changes none of them. Pin the buckets of the REAL curve: the synthesized curve above
+    # starts at the first exit and ends at the last, so a silent year vanishes from it and two
+    # exits minutes apart make a zero-length bucket (ZeroDivisionError in _year_gate, 56 trials of
+    # the goal2027 run on 2026-11-11).
+    out[_PINNED_YEAR_BUCKETS] = _year_trade_buckets(results)
     return out
 
 
@@ -2556,6 +2562,10 @@ def _calendar_year_returns(equity_curve) -> list:
             for _s_dt, _e_dt, s_eq, e_eq in _calendar_year_segments(equity_curve)]
 
 
+#: ``stressed_results`` stores the unstressed run's year buckets under this key (None = unmeasurable).
+_PINNED_YEAR_BUCKETS = "_year_buckets_of_unstressed_run"
+
+
 def _year_trade_buckets(results: dict):
     """Per calendar-year bucket: ``[{"label", "years", "structures"}, ...]`` or None.
 
@@ -2566,6 +2576,8 @@ def _year_trade_buckets(results: dict):
     structure are one bet). Returns the stored ``results["trades_by_year"]`` when the trade list is
     absent (a re-scored DB row), and None when neither is available (nothing to measure).
     """
+    if _PINNED_YEAR_BUCKETS in results:
+        return results[_PINNED_YEAR_BUCKETS]  # a stressed copy: the buckets of the run it restates
     trades = results.get("trades")
     segs = _calendar_year_segments(results.get("equity_curve"))
     if trades is None:
