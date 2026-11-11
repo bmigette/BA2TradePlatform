@@ -996,14 +996,60 @@ def test_emfile_taking_the_build_lock_raises_instead_of_spinning(tmp_path, monke
 
 
 def test_acquire_reports_busy_for_every_other_oserror(tmp_path, monkeypatch):
-    """Only exhaustion changes: a read-only tree or a vanished directory still reads as "not
-    mine to build", which is what keeps a degraded host from stampeding."""
+    """Exhaustion and "may not write here" are loud; anything else (a vanished directory, an I/O
+    hiccup) still reads as "not mine to build", which is what keeps a degraded host from
+    stampeding."""
     store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
     lock = tmp_path / "nope" / "sig.lock"
 
     monkeypatch.setattr(os, "open", lambda *a, **k: (_ for _ in ()).throw(
-        OSError(errno.EACCES, "Permission denied")))
+        OSError(errno.EIO, "Input/output error")))
     assert store._acquire(lock) is False
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM, errno.EROFS])
+def test_a_lock_this_user_may_not_create_is_loud_not_a_spin(tmp_path, monkeypatch, code):
+    """remote227, 2026-11-11: key directories created by the worker user without group write.
+    The lock could not be created, _acquire said "busy", nobody held a lock, and build_or_open
+    spun without sleeping for 2 x LOCK_STALE_S -- silently, and again on every retry."""
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    calls = []
+    real_open = os.open
+
+    def deny_lock(path, flags, *a, **k):
+        if str(path).endswith(".lock"):
+            raise OSError(code, os.strerror(code))
+        return real_open(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", deny_lock)
+    monkeypatch.setattr(SA, "LOCK_STALE_S", 0.2)   # a regression fails fast instead of hanging
+
+    t0 = time.monotonic()
+    with pytest.raises(PermissionError, match="may not write"):
+        store.build_or_open("AAPL", [src], lambda: calls.append(1) or _arrays())
+    assert time.monotonic() - t0 < 1.0, "must fail immediately, not spin"
+    assert calls == [], "nothing may be built without the lock"
+
+
+def test_a_stale_lock_this_user_may_not_remove_is_loud(tmp_path, monkeypatch):
+    store = SA.DerivedArrayStore(tmp_path / "_derived" / "X")
+    src = _src(tmp_path)
+    lock = store.lock_path("AAPL", [src])
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("dead pid")
+    _age(lock)
+    monkeypatch.setattr(SA, "LOCK_STALE_S", 60.0)
+    real_unlink = Path.unlink
+
+    def deny(self, *a, **k):
+        if self.name.endswith(".lock"):
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", deny)
+    with pytest.raises(PermissionError, match="may not write"):
+        store.build_or_open("AAPL", [src], _arrays)
 
 
 def test_fd_exhausted_is_a_runtimeerror_so_old_handlers_still_catch_it():

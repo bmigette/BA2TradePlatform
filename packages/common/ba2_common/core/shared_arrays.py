@@ -210,6 +210,26 @@ def _raise_if_exhausted(exc: OSError, path: PathLike) -> None:
     ) from exc
 
 
+def _raise_if_not_permitted(exc: OSError, lock: PathLike) -> None:
+    """Re-raise ``exc`` as a ``PermissionError`` naming the directory if this user may not write it.
+
+    A build lock that cannot be CREATED (or a stale one that cannot be removed) because the key
+    directory belongs to another user is not "somebody else is building": nobody holds it and
+    nobody ever will. Answering it with False sent ``build_or_open`` into the same sleepless outer
+    loop as descriptor exhaustion did -- 2 x LOCK_STALE_S of hot spin, then the same again on the
+    caller's retry, with nothing in any log (remote227, 2026-11-11: four re-runs spun for 1h45 on
+    key directories the worker user had created without group write).
+    """
+    if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+        return
+    raise PermissionError(
+        exc.errno,
+        f"shared_arrays: cannot take the build lock {lock}: {exc.strerror} -- this user may not "
+        f"write {os.path.dirname(os.fspath(lock))}. Give the directory group write (it was "
+        "probably created by another user sharing this cache); waiting cannot fix it.",
+    ) from exc
+
+
 def enabled() -> bool:
     """True unless ``BA2_SHARED_ARRAYS`` is set to a falsey value (the escape hatch)."""
     return os.getenv("BA2_SHARED_ARRAYS", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -780,10 +800,12 @@ class DerivedArrayStore:
                     continue                # somebody else broke it; race for it again
                 except OSError as e:
                     _raise_if_exhausted(e, lock)
+                    _raise_if_not_permitted(e, lock)
                     return False
                 continue
             except OSError as e:
                 _raise_if_exhausted(e, lock)
+                _raise_if_not_permitted(e, lock)
                 return False
             with os.fdopen(fd, "w") as f:
                 f.write(str(os.getpid()))
