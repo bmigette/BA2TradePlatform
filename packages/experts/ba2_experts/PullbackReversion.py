@@ -248,6 +248,9 @@ BACKTEST_WARMUP_BARS = math.ceil(FETCH_DAYS / 1.45)
 
 SKIP_INSUFFICIENT_HISTORY = "insufficient_history"
 SKIP_STOPPED_TRADING = "symbol_stopped_trading"
+#: ``sma200_and_spy`` only: the symbol has no completed bar on SPY's last session (a halt or a data
+#: gap of at most MAX_STALE_DAYS), so the stock and the market regime cannot be read on one session.
+SKIP_NO_SESSION_BAR = "no_bar_on_decision_session"
 
 
 def _utc_now() -> datetime:
@@ -576,6 +579,17 @@ class PullbackReversion(MarketExpertInterface):
                 f"window ending {session}, under {GAP_WARN_RATIO:.0%} of {SPY_SYMBOL}'s "
                 f"{len(reference)} (gaps or halts); evaluated anyway")
         spy_bars = reference if settings["trend_gate"] == "sma200_and_spy" else None
+        if spy_bars is not None and len(spy_bars) and bars.index[-1] < spy_bars.index[-1]:
+            # pullback_signal refuses misaligned frames (it cannot tell a halt from look-ahead).
+            # Here both frames are clipped to the data session, so this is a symbol that missed
+            # sessions: skipped for this decision, logged once, never a run abort (GSK had no bars
+            # on 2022-07-19..21 and aborted a whole screener run before 2026-11-11).
+            return self._skip(
+                symbol, SKIP_NO_SESSION_BAR,
+                f"{symbol} has no completed bar on {spy_bars.index[-1].date()} (last "
+                f"{bars.index[-1].date()}); trend_gate sma200_and_spy reads the stock and "
+                f"{SPY_SYMBOL} on one session",
+                close, raw_first, last, reference)
         result = pullback_signal(bars, settings, spy_bars)  # validates every setting it reads
         long = settings["direction"] == "long"
         action = result["action"]

@@ -775,3 +775,17 @@ def test_live_registry_does_not_list_it():
     assert "PullbackReversion" not in names
     assert "PullbackReversion" not in source
     assert not (path.parent / "PullbackReversion.py").exists()  # no alias shim either
+
+
+def test_a_symbol_without_a_bar_on_spys_last_session_is_skipped_under_the_spy_gate():
+    """A halted symbol (GSK, 2022-07-19..21) must not abort the run: under sma200_and_spy the
+    stock and SPY cannot be read on one session, so the symbol is skipped for that decision."""
+    from ba2_experts.PullbackReversion import SKIP_NO_SESSION_BAR
+
+    halted = provider_frame(long_dip()).iloc[:-2].reset_index(drop=True)
+    frames = {"AAA": halted, "SPY": provider_frame(uptrend())}
+    rec, _ = analyze(frames, settings_for(trend_gate="sma200_and_spy"))
+    assert rec.skip is True and rec.skip_reason == SKIP_NO_SESSION_BAR
+    # The other gates still evaluate the symbol on its own last bar (unchanged behaviour).
+    rec, _ = analyze(frames, settings_for(trend_gate="sma200"))
+    assert rec.skip is not True
