@@ -233,9 +233,12 @@ class ConditionLeaf(BaseModel):
             raise ValueError(
                 f"condition {self._label()}: field {self.field!r} (the authored seed) is not one of "
                 f"field_choices {choices!r}")
-        if self.field_optimize and not self.mode_optimize:
+        # beside a mode gene (``off`` removes the leaf), or on a FIXED leaf (a resolved non-off ``mode`` and no
+        # mode gene: the market exit rules' leaves, whose RULE-level toggle makes the field gene inert)
+        if self.field_optimize and not self.mode_optimize and self.mode in (None, MODE_OFF):
             raise ValueError(
-                f"condition {self._label()}: field_optimize is only supported beside mode_optimize")
+                f"condition {self._label()}: field_optimize is only supported beside mode_optimize "
+                f"(or on a fixed leaf with a resolved non-off mode)")
 
     def _check_resolved_mode(self, kind: Optional[str]) -> None:
         """The resolved ``mode`` token and the categorical ``value`` rule.

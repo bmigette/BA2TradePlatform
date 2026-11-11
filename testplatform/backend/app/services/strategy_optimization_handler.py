@@ -1601,6 +1601,9 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
     from app.services.strategy_param_space import neutralise_market_profile_genes
     decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)
+    # --market-exit rsi|spy: the genes of a rule toggled off (identity without such a rule).
+    from app.services.strategy_param_space import neutralise_independent_exit_genes
+    decoded_flat = neutralise_independent_exit_genes(decoded_flat)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token

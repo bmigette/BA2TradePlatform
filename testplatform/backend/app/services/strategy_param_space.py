@@ -299,6 +299,26 @@ def neutralise_market_profile_genes(flat_params: Dict[str, Any], members: Option
     return flat_params if out == flat_params else out
 
 
+def neutralise_independent_exit_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome for the TRIAL MEMO KEY: a ``--market-exit rsi|spy`` rule whose toggle
+    decoded to 0 is absent from the run, so its threshold / RSI-period / stop-percent genes describe nothing and
+    are REMOVED from the key (never from the config the trial runs): two genomes differing only there share one
+    key. The rules are found by id suffix (``market_condition_templates.INDEPENDENT_EXIT_RULE_SUFFIXES``): rule
+    genes are ``exit:<rid>:enabled`` / ``exit:<rid>:a*``, leaf genes ``cond:<rid>-*``.
+
+    Returns ``flat_params`` ITSELF when there is no such rule (every older job) or nothing changes."""
+    from ba2_common.core.market_condition_templates import INDEPENDENT_EXIT_RULE_SUFFIXES
+
+    off = [k[len("exit:"):-len(":enabled")] for k, v in flat_params.items()
+           if k.startswith("exit:") and k.endswith(":enabled") and v == 0
+           and k[len("exit:"):-len(":enabled")].endswith(INDEPENDENT_EXIT_RULE_SUFFIXES)]
+    if not off:
+        return flat_params
+    dead = tuple(f"exit:{rid}:a" for rid in off) + tuple(f"cond:{rid}-" for rid in off)
+    out = {k: v for k, v in flat_params.items() if not k.startswith(dead)}
+    return flat_params if len(out) == len(flat_params) else out
+
+
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
 # drop the whole rule.)
@@ -483,8 +503,9 @@ def _collect_field_gene(cond: Dict[str, Any], cid: str, out: Dict[str, Any]) -> 
     what makes the field gene inert (and lets the memo key drop it)."""
     if "conditions" in cond:
         raise ValueError(f"condition {cid!r}: field_optimize is only valid on a leaf, not a group")
-    if not cond.get("mode_optimize"):
-        raise ValueError(f"condition {cid!r}: field_optimize is only supported beside mode_optimize")
+    if not cond.get("mode_optimize") and cond.get("mode") in (None, MODE_OFF):
+        raise ValueError(f"condition {cid!r}: field_optimize is only supported beside mode_optimize "
+                         f"(or on a fixed leaf with a resolved non-off mode)")
     choices = list(cond.get("field_choices") or cond.get("fieldChoices") or [])
     if not choices:
         raise ValueError(f"condition {cid!r}: field_optimize requires field_choices")

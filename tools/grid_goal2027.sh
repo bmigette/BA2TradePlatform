@@ -295,9 +295,12 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
              --rm-toggle-policy atr-regime-searched
              --market-condition-profile ohlcv-v1,ta-structure-v1
              --market-condition-manifest "ohlcv-v1=${mc_o},ta-structure-v1=${mc_t}"
-             --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
+             --search-market-profile --market-exit "${G27_MARKET_EXIT:-exit,stop,tp}" --search-sl-loosen
              --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
       suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
+      # Optional: override the --market-exit kinds (exit,stop,tp,rsi,spy; rsi/spy add the RSI-recovery close and the
+      # SPY-below-200 stop). Unset = exit,stop,tp, today's commands and names unchanged; set = its own name token.
+      if [ -n "${G27_MARKET_EXIT:-}" ]; then suffix="${suffix}-mx-${G27_MARKET_EXIT//,/_}"; fi
       # Optional: ONE ruleset with a SPY-above-200 section and a SPY-below-200 section (launcher --regime-split-entry).
       # G27_REGIME_SPLIT = context | entry | all. Unset = today's commands, names and labels unchanged.
       if [ -n "${G27_REGIME_SPLIT:-}" ]; then

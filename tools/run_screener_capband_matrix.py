@@ -663,8 +663,9 @@ def main() -> int:
                     help="Forward --market-condition-manifest to every job. Folds into the "
                          "job's name digest.")
     ap.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
-                    help="Forward --market-exit to every job (equity S1-S7 only; requires "
-                         "--market-condition-profile). Folds into the job's name digest.")
+                    help="Forward --market-exit to every job (equity S1-S7 only; kinds exit,stop,tp,rsi,spy: "
+                         "exit/stop/tp require --market-condition-profile, spy requires --benchmark-regime-gates, "
+                         "rsi needs neither). Folds into the job's name digest.")
     ap.add_argument("--market-condition-mode", default=None, choices=("searched", "all-off"),
                     help="Forward --market-condition-mode to every job ('searched' is the "
                          "launcher default and is NOT forwarded, so it never folds into the "
@@ -954,6 +955,15 @@ def main() -> int:
         ap.error(f"--pullback-gates requires --name-suffix to contain 'pullback' (got {args.name_suffix!r}): its "
                  f"gene space differs from an ungated run's, so it must not share a job name. "
                  f"Example: --name-suffix goal2027-pullback")
+    if args.market_exit:
+        from ba2_common.core.market_condition_templates import ALL_MARKET_EXIT_KINDS, MARKET_EXIT_KINDS
+        _mx = [t.strip() for t in args.market_exit.split(",") if t.strip()]
+        if not _mx or set(_mx) - set(ALL_MARKET_EXIT_KINDS) or len(set(_mx)) != len(_mx):
+            ap.error(f"--market-exit {args.market_exit!r}: takes distinct kinds from {','.join(ALL_MARKET_EXIT_KINDS)}")
+        if "spy" in _mx and not args.benchmark_regime_gates:
+            ap.error("--market-exit spy requires --benchmark-regime-gates (the rule reads the SPY regime that flag publishes)")
+        if set(_mx) & set(MARKET_EXIT_KINDS) and not args.market_condition_profile:
+            ap.error("--market-exit exit/stop/tp require --market-condition-profile (the rules read market conditions)")
     if args.regime_split_entry:
         if not args.benchmark_regime_gates:
             ap.error("--regime-split-entry requires --benchmark-regime-gates (it pins the SPY trend leaf that flag adds)")

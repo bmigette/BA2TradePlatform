@@ -6418,6 +6418,17 @@ def _regime_split_down_tree(tree: dict, prefix: str, scope: str) -> dict:
     return tree
 
 
+def _tag_entry_buys(rule: dict, tag: int, kind: str) -> None:
+    """Stamp ``entry_tag`` on the ``buy`` action(s) of an equity entry rule (in place); refuse a rule that has none."""
+    tagged = 0
+    for action in rule.get("actions") or []:
+        if isinstance(action, dict) and str(action.get("action_type") or action.get("action") or "") == "buy":
+            action["entry_tag"] = int(tag)
+            tagged += 1
+    if not tagged:
+        raise ValueError(f"{kind}: entry rule {rule.get('id')!r} has no 'buy' action to carry the entry tag")
+
+
 def _append_equity_regime_split(strategy, kind: str):
     """``--regime-split-entry``: replace every initial-entry rule that carries a condition tree by TWO adjacent
     rules, UP first then DOWN (S1: tier1-up, tier1-down, tier2-up, ...), mutually exclusive by their pinned
@@ -6450,6 +6461,12 @@ def _append_equity_regime_split(strategy, kind: str):
             out.append(rule)
             continue
         up, down = copy.deepcopy(rule), copy.deepcopy(rule)
+        if "spy" in _MARKET_EXIT_KINDS_SELECTED:
+            # ``--market-exit spy``: stamp which section opened the position (entry_tag on the entry order, read
+            # back by EntryTagCondition in the spy stop rule); only then, so a split without it is unchanged.
+            from ba2_common.core.market_condition_templates import SPY_DOWN_ENTRY_TAG, SPY_UP_ENTRY_TAG
+            _tag_entry_buys(up, SPY_UP_ENTRY_TAG, kind)
+            _tag_entry_buys(down, SPY_DOWN_ENTRY_TAG, kind)
         up["conditions"] = _regime_split_pin_trend(up["conditions"], prefix, "above_200", rename=False)
         down["conditions"] = _regime_split_down_tree(down["conditions"], prefix, scope)
         base_id = rule.get("id")
@@ -7324,24 +7341,59 @@ def _resolve_market_exit_kinds(raw, command: str) -> tuple:
     requires the ``searched`` arm (the all-off control cannot carry searched exit genes -- design
     section 6, "identical except every market gene frozen off")."""
     global _MARKET_EXIT_KINDS_SELECTED
-    from ba2_common.core.market_condition_templates import MARKET_EXIT_KINDS
+    from ba2_common.core.market_condition_templates import (
+        ALL_MARKET_EXIT_KINDS, INDEPENDENT_EXIT_KINDS, MARKET_EXIT_KINDS)
 
     tokens = tuple(t.strip() for t in str(raw or "").split(",") if t.strip())
     if not tokens:
         _MARKET_EXIT_KINDS_SELECTED = ()
         return _MARKET_EXIT_KINDS_SELECTED
-    unknown = [t for t in tokens if t not in MARKET_EXIT_KINDS]
+    unknown = [t for t in tokens if t not in ALL_MARKET_EXIT_KINDS]
     if unknown or len(set(tokens)) != len(tokens):
         sys.exit(f"{command}: --market-exit takes distinct kinds from "
-                 f"{','.join(MARKET_EXIT_KINDS)}; got {list(tokens)!r}")
-    if not _MARKET_CONDITION_PROFILES:
-        sys.exit(f"{command}: --market-exit requires --market-condition-profile (the rules read "
-                 f"market conditions)")
-    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
-        sys.exit(f"{command}: --market-exit adds searched genes; --market-condition-mode "
-                 f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry them")
-    _MARKET_EXIT_KINDS_SELECTED = tuple(k for k in MARKET_EXIT_KINDS if k in tokens)
+                 f"{','.join(ALL_MARKET_EXIT_KINDS)}; got {list(tokens)!r}")
+    if any(t in MARKET_EXIT_KINDS for t in tokens):
+        # exit/stop/tp read market conditions; rsi/spy read their own registries and need neither
+        if not _MARKET_CONDITION_PROFILES:
+            sys.exit(f"{command}: --market-exit {','.join(t for t in tokens if t in MARKET_EXIT_KINDS)} "
+                     f"requires --market-condition-profile (the rules read market conditions)")
+        if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+            sys.exit(f"{command}: --market-exit adds searched genes; --market-condition-mode "
+                     f"{_MARKET_CONDITION_MODE!r} is the no-impact control and cannot carry them")
+    if "spy" in tokens and not _BENCHMARK_REGIME_GATES:
+        sys.exit(f"{command}: --market-exit spy requires --benchmark-regime-gates (the rule reads the SPY "
+                 f"regime that flag makes the run publish; without it the rule would never evaluate)")
+    # (the rsi kind reads the per-symbol pullback RSI fields, served by every run's condition registry; the
+    # S1-S7 / non-bypass requirement --pullback-gates has is enforced by _check_market_exit_independent)
+    _MARKET_EXIT_KINDS_SELECTED = tuple(k for k in ALL_MARKET_EXIT_KINDS if k in tokens)
     return _MARKET_EXIT_KINDS_SELECTED
+
+
+def _check_market_exit_independent(command: str, strat, kind: str = "") -> None:
+    """Refuse ``--market-exit rsi|spy`` for a job whose built strategy carries no such rule: it would be
+    labelled with the kind and search no such gene (a bypass expert builds no exit rules; for ``spy`` the
+    stop is also dropped where a catch-all exit rule adjusts the stop-loss on every bar, see
+    ``_insert_equity_market_exit_rules``). The same two checks ``--pullback-gates`` has:
+    equity S1-S7 only, and a requested rule must really be in the built strategy."""
+    from ba2_common.core.market_condition_templates import (
+        INDEPENDENT_EXIT_KINDS, RSI_EXIT_RULE_SUFFIX, SPY_STOP_RULE_SUFFIX)
+
+    wanted = [k for k in _MARKET_EXIT_KINDS_SELECTED if k in INDEPENDENT_EXIT_KINDS]
+    if not wanted:
+        return
+    if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --market-exit {','.join(wanted)}: {kind!r} is not an equity S1-S7 strategy "
+                 f"(keys: {sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). Drop the kind for this job.")
+    suffix = {"rsi": RSI_EXIT_RULE_SUFFIX, "spy": SPY_STOP_RULE_SUFFIX}
+    ids = [str(r.get("id")) for r in (getattr(strat, "exit_rules", None) or []) if isinstance(r, dict)]
+    missing = [k for k in wanted if not any(i.endswith(suffix[k]) for i in ids)]
+    if len(missing) == len(wanted):
+        # PARTIAL omission stays allowed and printed (``_insert_equity_market_exit_rules`` drops the spy stop,
+        # like the market stop, where a catch-all rule adjusts the stop-loss every bar); a job with NONE of the
+        # requested rules would be labelled with the kinds and search no such gene.
+        sys.exit(f"{command}: --market-exit {','.join(missing)}: the built strategy carries no such exit rule "
+                 f"(a bypass expert builds no exit rules, or a catch-all exit rule that adjusts the stop-loss "
+                 f"every bar dropped the spy stop); drop the kind for this job")
 
 
 def _resolve_search_sl_loosen(raw, command: str) -> bool:
@@ -7756,12 +7808,17 @@ def _insert_equity_market_exit_rules(exit_rules, new_rules) -> tuple:
     omitted: dict = {}
     kept = list(new_rules)
     if at < len(rules) and _equity_market_exit_adjusts_stop_loss(rules[at]):
+        why = (f"catch-all exit rule {rules[at].get('id')!r} adjusts the "
+               f"stop-loss after it on every bar, and a pass keeps only its "
+               f"last stop-loss action")
         stop_ids = [r["id"] for r in kept if "-mkt-stop" in r["id"]]
         if stop_ids:
-            omitted["stop"] = (f"catch-all exit rule {rules[at].get('id')!r} adjusts the "
-                               f"stop-loss after it on every bar, and a pass keeps only its "
-                               f"last stop-loss action")
+            omitted["stop"] = why
             kept = [r for r in kept if r["id"] not in stop_ids]
+        spy_ids = [r["id"] for r in kept if r["id"].endswith("-spy-stop")]
+        if spy_ids:
+            omitted["spy"] = why
+            kept = [r for r in kept if r["id"] not in spy_ids]
     if kept:
         rules[at:at] = kept
     return rules, omitted
@@ -7778,28 +7835,45 @@ def _append_equity_market_exit_rules(strategy, kind: str):
     """
     if not _MARKET_EXIT_KINDS_SELECTED:
         return strategy
-    if _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
-        raise ValueError(f"{kind}: market exit rules requested with a non-searched "
-                         f"market-condition mode {_MARKET_CONDITION_MODE!r}")
     from ba2_common.core.market_condition_rules import assert_market_rule_actions
-    from ba2_common.core.market_condition_templates import market_exit_rules
+    from ba2_common.core.market_condition_templates import (
+        INDEPENDENT_EXIT_KINDS, MARKET_EXIT_KINDS, SPY_UP_ENTRY_TAG, independent_exit_rules,
+        market_exit_rules)
     from ba2_common.core.rule_models import normalize_trade_rules
 
+    profile_kinds = tuple(k for k in _MARKET_EXIT_KINDS_SELECTED if k in MARKET_EXIT_KINDS)
+    independent_kinds = tuple(k for k in _MARKET_EXIT_KINDS_SELECTED if k in INDEPENDENT_EXIT_KINDS)
+    if profile_kinds and _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
+        raise ValueError(f"{kind}: market exit rules requested with a non-searched "
+                         f"market-condition mode {_MARKET_CONDITION_MODE!r}")
+
     direction = _equity_strategy_direction(strategy, kind)
-    profiles = _market_condition_setting_profiles()
     prefix = kind.lower()
-    rules = market_exit_rules(prefix, profiles, direction, _MARKET_EXIT_KINDS_SELECTED)
-    if not rules:
-        raise ValueError(f"{kind}: --market-exit {','.join(_MARKET_EXIT_KINDS_SELECTED)} "
-                         f"produced no rule for the selected profile(s) {','.join(profiles)}")
-    # OPT-IN MARKER for the master gene -- see the matching comment in
-    # _append_equity_market_condition_gates. Rule-level (these rules have no mode-gened leaves
-    # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
-    for rule in rules:
-        rule["market_master_gene"] = True
-        if _SEARCH_MARKET_PROFILE:
-            rule["market_profile_gene"] = True   # goal2027 2.2
+    rules = []
+    if profile_kinds:
+        profiles = _market_condition_setting_profiles()
+        rules = market_exit_rules(prefix, profiles, direction, profile_kinds)
+        if not rules:
+            raise ValueError(f"{kind}: --market-exit {','.join(profile_kinds)} "
+                             f"produced no rule for the selected profile(s) {','.join(profiles)}")
+        # OPT-IN MARKER for the master gene -- see the matching comment in
+        # _append_equity_market_condition_gates. Rule-level (these rules have no mode-gened leaves
+        # to stamp anyway -- market_exit_rules' leaves are fixed/resolved, design section 5.2).
+        for rule in rules:
+            rule["market_master_gene"] = True
+            if _SEARCH_MARKET_PROFILE:
+                rule["market_profile_gene"] = True   # goal2027 2.2
+    if independent_kinds:
+        # rsi / spy read registries independent of the market-condition profile: NO master/profile marker.
+        # With --regime-split-entry the spy stop is scoped to positions the SPY-UP section opened (entry_tag,
+        # stamped by _append_equity_regime_split): the DOWN section opens while SPY is below its 200-day, so an
+        # unscoped stop would pull every DOWN entry's stop to ~breakeven at once.
+        rules = rules + independent_exit_rules(
+            prefix, direction, independent_kinds,
+            spy_up_tag=SPY_UP_ENTRY_TAG if _REGIME_SPLIT_ENTRY else None)
     merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
+    if "spy" in omitted and not [r for r in rules if not r["id"].endswith("-spy-stop")]:
+        raise ValueError(f"{kind}: --market-exit spy adds no rule: {omitted['spy']}")
     strategy.exit_rules = normalize_trade_rules(merged)
     assert_market_rule_actions(strategy.exit_rules, f"{kind} exit rules")
     if omitted:
@@ -10396,6 +10470,7 @@ def _cmd_optimize(args) -> int:
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
         _check_pullback_gates("optimize", strat, args.strategy)
+        _check_market_exit_independent("optimize", strat, args.strategy)
         _check_regime_split_entry("optimize", strat, args.strategy)
         _apply_regime_split(backtest_block)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
@@ -10755,6 +10830,7 @@ def _cmd_optimize_batch(args) -> int:
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
             _apply_benchmark_regime("optimize-batch", backtest_block, strat, strat_kind)
             _check_pullback_gates("optimize-batch", strat, strat_kind)
+            _check_market_exit_independent("optimize-batch", strat, strat_kind)
             _check_regime_split_entry("optimize-batch", strat, strat_kind)
             _apply_regime_split(backtest_block)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
@@ -11851,8 +11927,12 @@ def _add_market_condition_args(p) -> None:
                         "MARKET_EXIT_KINDS) to the strategy's exit list, AFTER its existing "
                         "exits (but before a terminal catch-all floor stop, which would "
                         "otherwise shadow them). Each rule is off by default behind its own "
-                        "rule-level toggle gene. Requires --market-condition-profile and "
-                        "--market-condition-mode searched (the default).")
+                        "rule-level toggle gene. exit,stop,tp require --market-condition-profile and "
+                        "--market-condition-mode searched (the default). Two more kinds need neither: "
+                        "'rsi' (close when the pullback RSI, period searched, has recovered above 50..90; shorts "
+                        "mirror) and 'spy' (REQUIRES --benchmark-regime-gates: while SPY is below its 200-day, "
+                        "adjust the stop from the open price by -2..0%%; shorts mirror; with --regime-split-entry "
+                        "it only touches positions the SPY-up section opened).")
     p.add_argument("--market-condition-mode", default=_MARKET_CONDITION_MODE_SEARCHED,
                    choices=(_MARKET_CONDITION_MODE_SEARCHED, _MARKET_CONDITION_MODE_ALL_OFF),
                    help="'searched' (default): the market entry gates and any --market-exit "
