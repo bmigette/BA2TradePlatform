@@ -444,7 +444,7 @@ class TransactionHelper:
         of the entry-side orders ever sent (``_recalculate_transaction_quantity``), so a trim
         never lowers it, and an add raises it before the add has filled. This is:
 
-            net filled quantity (every executed order, BUY +, SELL -)
+            net filled quantity (every executed order, and the partial fill of a CANCELED/EXPIRED one; BUY +, SELL -)
           + the unfilled remainder of every working order that is NOT resting protection
             (an add, a trim, a close someone submitted), signed the same way
 
@@ -458,6 +458,7 @@ class TransactionHelper:
         ``orders``: the transaction's orders (any status).
         """
         executed = OrderStatus.get_executed_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
         working = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
                    | {OrderStatus.PARTIALLY_FILLED})
         net = 0.0
@@ -468,6 +469,12 @@ class TransactionHelper:
                     raise ValueError(
                         f"transaction {transaction.id}: order {order.id} is {order.status} with "
                         f"no filled_qty -- the position size is unmeasurable")
+                net += sign * float(order.filled_qty)
+            elif order.status in terminal and order.filled_qty:
+                # CANCELED/EXPIRED after a PARTIAL fill: those shares traded (dev 2026-11-10
+                # NVDA txn 95, PRG 2026-10-28). Skipping them sized the replacement stop on the
+                # pre-fill position and the broker refused it. Same rule as
+                # Transaction.get_current_open_qty.
                 net += sign * float(order.filled_qty)
             if order.status in working and not TransactionHelper.is_resting_protection(order):
                 if order.quantity is None or (order.status == OrderStatus.PARTIALLY_FILLED

@@ -60,3 +60,16 @@ def test_an_executed_order_with_no_filled_qty_is_unmeasurable():
 def test_a_partially_filled_working_order_without_its_fill_is_unmeasurable():
     with pytest.raises(ValueError, match="unmeasurable"):
         _qty([ENTRY, _o(BUY, 5, OrderStatus.PARTIALLY_FILLED, filled=None)])
+
+
+def test_a_cancelled_order_s_partial_fill_counts():
+    """Dev 2026-11-10 NVDA txn 95 / PRG 2026-10-28: a stop sold part of the position, then was
+    cancelled. Those shares traded. Ignoring them sized the replacement stop on the PRE-fill
+    position (3 instead of 2) and the broker rejected it for insufficient qty, leaving the
+    remainder with no stop. get_current_open_qty already counts them."""
+    sl = _o(SELL, 10, OrderStatus.CANCELED, OrderType.SELL_STOP, filled=4, comment=MARKED_SL, oid=2)
+    assert _qty([ENTRY, sl]) == 6
+    trim = _o(SELL, 6, OrderStatus.EXPIRED, filled=1, oid=3)
+    assert _qty([ENTRY, trim]) == 9
+    add = _o(BUY, 5, OrderStatus.CANCELED, filled=2, oid=4)
+    assert _qty([ENTRY, add]) == 12

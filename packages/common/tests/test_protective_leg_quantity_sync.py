@@ -129,3 +129,19 @@ def test_zero_quantity_protective_leg_is_refused_not_silently_cancelled(monkeypa
     with pytest.raises(ValueError, match="quantity"):
         acct.submit_order(orphan)
     assert not acct.submitted, "a zero-quantity protective leg must never reach the broker"
+
+
+def test_replacement_chained_on_a_cancelled_stop_keeps_its_own_quantity(monkeypatch):
+    """Dev 2026-11-10 NVDA txn 95: the position fell 3 -> 2, the 3-share stop was cancelled and
+    a 2-share replacement staged on that cancel. The sync copied the CANCELLED stop's 3 onto it
+    and Alpaca refused it (insufficient qty), leaving the position with no stop. A same-side
+    parent is never the entry: the leg keeps the size it was built with."""
+    acct = _account(monkeypatch)
+    old_stop_id, txn_id = _entry("NVDA", 3.0, side=OrderDirection.SELL, order_type=OrderType.SELL_STOP)
+
+    repl = TradingOrder(account_id=1, symbol="NVDA", quantity=2.0, side=OrderDirection.SELL,
+                        order_type=OrderType.SELL_STOP, status=OrderStatus.PENDING,
+                        stop_price=6.97, depends_on_order=old_stop_id, transaction_id=txn_id)
+    acct.submit_order(repl)
+
+    assert acct.submitted[0].quantity == 2.0
