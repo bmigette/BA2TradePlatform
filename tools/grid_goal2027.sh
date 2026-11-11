@@ -299,7 +299,7 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
              --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
       suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
       # PullbackReversion (long only) runs S2 on the cap bands; its entry is a daily dip, so the screener
-      # cadence is daily (the weekday genes still pick the scan days). The matrix runs it only when asked.
+      # cadence is daily and the entry scan runs every weekday (no weekday genes: _daily_entry in the launcher). The matrix runs it only when asked.
       if [ "$kind" = "pb" ]; then args+=(--pullback-strategies S2 --cadence-days 1); fi
       if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
       if [ "$kind" != "senate" ] && [ "$kind" != "pb" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;

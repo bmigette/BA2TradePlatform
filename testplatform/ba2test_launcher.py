@@ -1878,6 +1878,10 @@ _EXPERT_OPT = {
     # (PullbackReversion.pullback_signal: rsi_period 2-5, entry_threshold 1-30, rsi_exit 50-90).
     # Choice ORDER is a persisted contract (the GA stores the index): it follows the expert's tuples.
     "PullbackReversion": {
+        # A daily dip signal (RSI extreme): entry is scanned EVERY weekday, the weekday genes are not
+        # searched (see _daily_entry). Measured 2026-11-11: on a searched weekly cadence 11 of 11
+        # genomes opened zero trades over 2022-2023.
+        "daily_entry": True,
         "expert_params": {
             "rsi_period": {"optimize": True, "min": 2, "max": 5, "step": 1, "type": "int"},
             "entry_threshold": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
@@ -2388,6 +2392,32 @@ _SCHEDULE_DAY_OPT = {
 _WEEKDAY_SCHEDULE_DAY_OPT = {
     day: spec for day, spec in _SCHEDULE_DAY_OPT.items() if day not in ("saturday", "sunday")
 }
+
+
+def _daily_entry(spec) -> bool:
+    """True for an expert spec whose entry scan runs every weekday by construction
+    (``"daily_entry": True``): no ``schedule:<day>`` genes, and a static all-weekdays schedule."""
+    return bool(spec and spec.get("daily_entry"))
+
+
+def _weekday_schedule_genes(spec) -> dict:
+    """The ``schedule:<day>`` weekday genes for a ruleset expert; none for a daily-entry expert."""
+    if _daily_entry(spec):
+        return {}
+    return {f"schedule:{k}": v for k, v in _WEEKDAY_SCHEDULE_DAY_OPT.items()}
+
+
+def _entry_run_schedule(spec, run_sched):
+    """``run_sched`` with every weekday ON for a daily-entry expert (its genome carries no day
+    genes, so this static schedule IS the schedule). Requires the weekly schedule shape (a fixed
+    decision time): ``--run-schedule daily`` has no schedule to widen and is refused."""
+    if not _daily_entry(spec):
+        return run_sched
+    if run_sched is None:
+        sys.exit("ba2-test: a daily-entry expert (PullbackReversion) needs --run-schedule weekly "
+                 "(it pins the decision time; the entry days are forced to every weekday)")
+    days = {d: d in _WEEKDAY_SCHEDULE_DAY_OPT for d in run_sched["days"]}
+    return {**run_sched, "days": days}
 
 # Screener-settings genes (only added to the search when --screener is passed). The STATIC cap
 # range is kept small — its loosest bound sizes the metric store's shortlist superset — while the
@@ -9862,6 +9892,7 @@ def _cmd_optimize(args) -> int:
         # bar), not the session's first bar: a decision there sees only the PRIOR close.
         from ba2_common.core.knowability import DEFAULT_DECISION_TIME
         run_sched = {"days": days, "times": [DEFAULT_DECISION_TIME]}
+    run_sched = _entry_run_schedule(spec, run_sched)
     # Open-positions MANAGEMENT runs DAILY (mirrors live, which schedules open_positions far more
     # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
     # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
@@ -10186,8 +10217,7 @@ def _cmd_optimize(args) -> int:
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # Weekdays only under EVERY policy (_WEEKDAY_SCHEDULE_DAY_OPT drops the 2 weekend genes:
         # no session, so they never change a daily-clock trial).
-        _sched_opt = _WEEKDAY_SCHEDULE_DAY_OPT
-        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _sched_opt.items()}
+        schedule_genes = {} if bypass else _weekday_schedule_genes(spec)
         schedule_genes.update(_decision_time_gene(          # after the days: no index shift
             decision_times, split=_decision_times_is_split(getattr(args, "decision_times", None))))
         cfg = {
@@ -10481,7 +10511,7 @@ def _cmd_optimize_batch(args) -> int:
                 "warmup_days": derive_warmup_days([expert]),
                 "seed": int(args.seed),
                 "subtype": "daily_expert",
-                "run_schedule_override": run_sched,
+                "run_schedule_override": _entry_run_schedule(spec, run_sched),
                 "manage_schedule_override": _daily_manage_schedule(),
                 "execution_interval": args.interval,
                 # Which OHLCV history every trial of this job reads (see _cmd_optimize).
@@ -10558,8 +10588,7 @@ def _cmd_optimize_batch(args) -> int:
                                         **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args),
                                                      atr_searched=_policy_searches_atr(rm_toggle_policy),
                                                      regime_searched=_policy_searches_regime(rm_toggle_policy)),
-                                        **{f"schedule:{k}": v for k, v in
-                                           _WEEKDAY_SCHEDULE_DAY_OPT.items()},
+                                        **_weekday_schedule_genes(spec),
                                         **_decision_time_gene(
                                             decision_times,
                                             split=_decision_times_is_split(getattr(args, "decision_times", None))),

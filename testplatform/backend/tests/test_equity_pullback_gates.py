@@ -348,3 +348,35 @@ def test_pullback_reversion_gene_space_decodes_to_settings_the_expert_accepts():
         s = {**base, "trend_gate": combo[0], "exit_mode": combo[1], "rsi_period": combo[2],
              "entry_threshold": combo[3]}
         pullback_signal(bars, s, spy)
+
+
+# ---- daily-entry experts (PullbackReversion): every weekday, no weekday genes -----------------------
+
+def test_daily_entry_expert_has_no_weekday_genes_and_scans_every_weekday():
+    import ba2test_launcher as L
+
+    pb = L._EXPERT_OPT["PullbackReversion"]
+    fr = L._EXPERT_OPT["FMPRating"]
+    assert L._daily_entry(pb) and not L._daily_entry(fr)
+    assert L._weekday_schedule_genes(pb) == {}
+    assert sorted(L._weekday_schedule_genes(fr)) == sorted(
+        f"schedule:{d}" for d in ("monday", "tuesday", "wednesday", "thursday", "friday"))
+
+    monday_only = {"days": {d: d == "monday" for d in
+                            ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")},
+                   "times": ["10:00"]}
+    out = L._entry_run_schedule(pb, monday_only)
+    assert out["days"] == {"monday": True, "tuesday": True, "wednesday": True, "thursday": True,
+                           "friday": True, "saturday": False, "sunday": False}
+    assert out["times"] == ["10:00"]
+    assert monday_only["days"]["tuesday"] is False          # input not mutated
+    assert L._entry_run_schedule(fr, monday_only) is monday_only
+
+
+def test_daily_entry_expert_refuses_a_run_without_a_pinned_schedule():
+    import ba2test_launcher as L
+    import pytest as _pytest
+
+    with _pytest.raises(SystemExit):
+        L._entry_run_schedule(L._EXPERT_OPT["PullbackReversion"], None)
+    assert L._entry_run_schedule(L._EXPERT_OPT["FMPRating"], None) is None
