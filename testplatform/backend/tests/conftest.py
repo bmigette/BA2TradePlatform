@@ -186,3 +186,12 @@ def _strict_estimates_source(request):
     _ESTIMATES_STRICT["on"] = request.node.get_closest_marker("strict_estimates_source") is not None
     yield
     _ESTIMATES_STRICT["on"] = False
+
+
+@pytest.fixture(autouse=True)
+def _reset_finished_measure_memo():
+    """The finished-history measure memo is process-global: no test inherits another test's values."""
+    from ba2_common.core.TradeConditions import reset_finished_measure_memo
+    reset_finished_measure_memo()
+    yield
+    reset_finished_measure_memo()

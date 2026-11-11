@@ -75,6 +75,7 @@ from ba2_common.core.OptionRiskManagement import (
     option_risk_manager_enabled, update_sleeve_breaker,
 )
 from ba2_common.core.benchmark_regime import reset_benchmark_regime, set_benchmark_regime
+from ba2_common.core.TradeConditions import reset_finished_measure_memo
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
 
@@ -765,6 +766,7 @@ class DailyBacktestEngine:
         # never reached its own reset.
         reset_stressed()
         reset_benchmark_regime()
+        reset_finished_measure_memo()
 
         self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
@@ -1076,6 +1078,7 @@ class DailyBacktestEngine:
         # bar before its own first set_stressed.
         reset_stressed()
         reset_benchmark_regime()
+        reset_finished_measure_memo()
         # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
         # the transactions, the final equity from the ledger).
         if (hasattr(self.account, "check_option_ledger")

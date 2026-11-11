@@ -11,6 +11,7 @@ from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
 import numpy as np
 import threading
+from collections import OrderedDict
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation
@@ -157,6 +158,32 @@ def resolve_market_condition_context(account, instrument_name: str,
             f"expected MarketConditionContext or None")
     return ctx
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-process memo of measurements that depend ONLY on finished daily history
+# ---------------------------------------------------------------------------------------------
+#: ``(id(provider), symbol, measurement, lookback_days, session)`` -> the computed number, or ``None``
+#: (the UNKNOWN outcome). ``session`` is the clamped fetch end ``_as_of_fetch_end()`` returns (the
+#: simulated bar's day in a backtest) or, in live (where that is None by design), today's local date,
+#: so the memo rolls over every session and a later session can never serve an earlier decision or
+#: vice versa. Only the history part is memoised: the CURRENT price is read fresh on every
+#: evaluation, never cached. Bounded LRU; the backtest engine clears it between runs (next to
+#: ``reset_benchmark_regime``). The code path is identical live and in a backtest.
+_FINISHED_MEASURE_MEMO: "OrderedDict" = OrderedDict()
+_FINISHED_MEASURE_MEMO_MAX = 8192
+_FINISHED_MEASURE_MEMO_LOCK = threading.Lock()
+FINISHED_MEASURE_STATS = {"evaluations": 0, "computations": 0}
+#: Test/diagnostic switch: False bypasses the memo entirely (the uncached path).
+FINISHED_MEASURE_MEMO_ENABLED = True
+
+
+def reset_finished_measure_memo() -> None:
+    """Clear the memo and counters. Call between runs so one trial cannot inherit another's values."""
+    with _FINISHED_MEASURE_MEMO_LOCK:
+        _FINISHED_MEASURE_MEMO.clear()
+        FINISHED_MEASURE_STATS["evaluations"] = 0
+        FINISHED_MEASURE_STATS["computations"] = 0
 
 
 def _wall_today() -> date:
@@ -437,6 +464,36 @@ class TradeCondition(ABC):
         if as_of is None:
             return None, True
         return datetime.combine(as_of, _time.max, tzinfo=timezone.utc), True
+
+    def _finished_measure(self, measure: str, lookback_days: int, compute):
+        """``(value, ok)``: ``compute(df)`` over the clamped daily OHLCV frame, memoised per
+        (provider, symbol, measure, lookback, session).
+
+        ``compute`` returns a float, or ``None`` for UNKNOWN (it logs why). ``ok`` is False only when
+        the simulated clock is unreadable (nothing is fetched). A raised exception is NOT memoised.
+        The price part of a condition never goes through here."""
+        end_date, clock_ok = self._as_of_fetch_end()
+        if not clock_ok:
+            return None, False
+        provider = _get_provider("ohlcv", "yfinance")
+        session = end_date if end_date is not None else date.today()
+        key = (id(provider), self.instrument_name, measure, lookback_days, session)
+        FINISHED_MEASURE_STATS["evaluations"] += 1
+        if FINISHED_MEASURE_MEMO_ENABLED:
+            with _FINISHED_MEASURE_MEMO_LOCK:
+                if key in _FINISHED_MEASURE_MEMO:
+                    _FINISHED_MEASURE_MEMO.move_to_end(key)
+                    return _FINISHED_MEASURE_MEMO[key], True
+        FINISHED_MEASURE_STATS["computations"] += 1
+        df = provider.get_ohlcv_data(self.instrument_name, interval="1d", end_date=end_date,
+                                     lookback_days=lookback_days)
+        value = compute(df)
+        if FINISHED_MEASURE_MEMO_ENABLED:
+            with _FINISHED_MEASURE_MEMO_LOCK:
+                _FINISHED_MEASURE_MEMO[key] = value
+                while len(_FINISHED_MEASURE_MEMO) > _FINISHED_MEASURE_MEMO_MAX:
+                    _FINISHED_MEASURE_MEMO.popitem(last=False)
+        return value, True
 
     def _evaluation_date(self) -> Optional[date]:
         """The condition's "today" as a concrete ``date``, or ``None`` when unmeasurable.
@@ -2544,25 +2601,21 @@ class PercentBelowRecentHighCondition(CompareCondition):
             # MemoizedOHLCVProvider — which discards lookback_days — returns the ENTIRE
             # [start - warmup, run end] window, so tail(RECENT_WINDOW) below was the high of
             # the last 20 days of the whole RUN: a number out of the simulated future that
-            # fabricates dips that never happened. None in live (unchanged call).
-            end_date, clock_ok = self._as_of_fetch_end()
-            if not clock_ok:
-                self.calculated_value = None
-                return False
+            # fabricates dips that never happened. ``_finished_measure`` clamps the fetch
+            # (``_as_of_fetch_end``) and memoises the high per symbol per session.
+            def _high(df):
+                if df is None or df.empty:
+                    logger.warning(f"No OHLCV data for {self.instrument_name}")
+                    return None
+                high = float(df.tail(self.RECENT_WINDOW)["High"].max())
+                if high <= 0:
+                    logger.warning(f"Invalid recent high for {self.instrument_name}: {high}")
+                    return None
+                return high
 
-            # Resolve the OHLCV provider via the host-injected resolver
-            # (ba2_common never imports ba2_providers).
-            df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d", end_date=end_date,
-                lookback_days=self.RECENT_WINDOW * 2 + 10)
-            if df is None or df.empty:
-                logger.warning(f"No OHLCV data for {self.instrument_name}")
-                self.calculated_value = None
-                return False
-
-            recent_high = float(df.tail(self.RECENT_WINDOW)["High"].max())
-            if recent_high <= 0:
-                logger.warning(f"Invalid recent high for {self.instrument_name}: {recent_high}")
+            recent_high, clock_ok = self._finished_measure(
+                f"high{self.RECENT_WINDOW}", self.RECENT_WINDOW * 2 + 10, _high)
+            if not clock_ok or recent_high is None:
                 self.calculated_value = None
                 return False
 
@@ -2605,26 +2658,24 @@ class _PullbackHistoryCondition(CompareCondition):
     MIN_CLOSES = 0
     LOOKBACK_DAYS = 0
 
-    def _finished_closes(self):
-        """``(closes, ok)``: ndarray of the finished daily closes, or ``(None, False)``."""
-        end_date, clock_ok = self._as_of_fetch_end()
-        if not clock_ok:
-            return None, False
-        df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-            self.instrument_name, interval="1d", end_date=end_date,
-            lookback_days=self.LOOKBACK_DAYS)
-        if df is None or df.empty or "Close" not in df:
-            logger.warning(f"No OHLCV data for {self.instrument_name}")
-            return None, False
-        closes = df["Close"].to_numpy(dtype=float)
-        if len(closes) < self.MIN_CLOSES:
-            logger.warning(f"Only {len(closes)} finished daily closes for {self.instrument_name}; "
-                           f"{type(self).__name__} needs {self.MIN_CLOSES}")
-            return None, False
-        if not np.isfinite(closes).all() or (closes <= 0).any():
-            logger.warning(f"Invalid close in the history of {self.instrument_name}")
-            return None, False
-        return closes, True
+    def _finished_close_measure(self, measure: str, compute_from_closes):
+        """``(value, ok)`` of ``compute_from_closes(closes)`` over the finished daily closes,
+        memoised per symbol per session (``_finished_measure``). ``value`` None = UNKNOWN."""
+        def _compute(df):
+            if df is None or df.empty or "Close" not in df:
+                logger.warning(f"No OHLCV data for {self.instrument_name}")
+                return None
+            closes = df["Close"].to_numpy(dtype=float)
+            if len(closes) < self.MIN_CLOSES:
+                logger.warning(f"Only {len(closes)} finished daily closes for {self.instrument_name}; "
+                               f"{type(self).__name__} needs {self.MIN_CLOSES}")
+                return None
+            if not np.isfinite(closes).all() or (closes <= 0).any():
+                logger.warning(f"Invalid close in the history of {self.instrument_name}")
+                return None
+            return compute_from_closes(closes)
+
+        return self._finished_measure(measure, self.LOOKBACK_DAYS, _compute)
 
 
 class PullbackRsiCondition(_PullbackHistoryCondition):
@@ -2642,16 +2693,18 @@ class PullbackRsiCondition(_PullbackHistoryCondition):
 
     def evaluate(self) -> bool:
         try:
-            closes, ok = self._finished_closes()
-            if not ok:
+            def _rsi(closes):
+                try:
+                    return float(wilder_rsi(closes[-self.RSI_WINDOW:], self.PERIOD))
+                except ValueError as e:
+                    logger.warning(f"RSI({self.PERIOD}) undefined for {self.instrument_name}: {e}")
+                    return None
+
+            value, ok = self._finished_close_measure(f"rsi{self.PERIOD}w{self.RSI_WINDOW}", _rsi)
+            if not ok or value is None:
                 self.calculated_value = None
                 return False
-            try:
-                self.calculated_value = float(wilder_rsi(closes[-self.RSI_WINDOW:], self.PERIOD))
-            except ValueError as e:
-                logger.warning(f"RSI({self.PERIOD}) undefined for {self.instrument_name}: {e}")
-                self.calculated_value = None
-                return False
+            self.calculated_value = value
             logger.info(f"RSI({self.PERIOD}) for {self.instrument_name}: {self.calculated_value:.2f}")
             return self.operator_func(self.calculated_value, self.value)
         except Exception as e:
@@ -2702,11 +2755,11 @@ class PriceVsSma200Condition(_PullbackHistoryCondition):
                 logger.error(f"Cannot get current price for {self.instrument_name}")
                 self.calculated_value = None
                 return False
-            closes, ok = self._finished_closes()
-            if not ok:
+            sma, ok = self._finished_close_measure(
+                f"sma{self.SMA_WINDOW}", lambda closes: float(closes[-self.SMA_WINDOW:].mean()))
+            if not ok or sma is None:
                 self.calculated_value = None
                 return False
-            sma = float(closes[-self.SMA_WINDOW:].mean())
             self.calculated_value = (current_price - sma) / sma * 100
             logger.info(f"Price vs SMA200 for {self.instrument_name}: price=${current_price:.2f}, "
                         f"sma200=${sma:.2f}, diff={self.calculated_value:+.2f}%")
