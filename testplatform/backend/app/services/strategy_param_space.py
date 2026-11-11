@@ -705,12 +705,23 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
         out[key] = spec
 
 
+#: Rule-level marker (``--regime-split-entry``): the rule's rule/action genes are keyed by THIS id instead of
+#: its own ``id``, so two rules (the SPY-up and SPY-down copies of one entry rule) can share one gene set.
+#: Rule-level on purpose: ``normalize_trade_rules`` keeps unknown RULE keys (not leaf keys); stripped on decode.
+GENE_RULE_ID_MARKER = "gene_rule_id"
+
+
+def _gene_rule_id(rule: Dict[str, Any]):
+    """The id a rule's own ``entry:``/``exit:`` genes are keyed by: its ``gene_rule_id`` marker, else its ``id``."""
+    return rule.get(GENE_RULE_ID_MARKER) or rule.get("geneRuleId") or rule.get("id")
+
+
 def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
     """cond:* + rule/action genes across ONE TradeRule list (ns = 'entry' or 'exit')."""
     for rule in (rules or []):
         if not isinstance(rule, dict):
             continue
-        rid = rule.get("id")
+        rid = _gene_rule_id(rule)
         if rid and rule.get("toggle_optimize"):
             out[f"{ns}:{rid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
         if rid:
@@ -1300,7 +1311,7 @@ def _decode_rule_list(rules, ns: str,
         if not isinstance(rule, dict):
             out.append(rule)
             continue
-        rid = rule.get("id")
+        rid = _gene_rule_id(rule)
         genes = rule_genes.get(rid or "", {})
         gene_enabled = genes.get("enabled")
         if rule.get("enabled") is False:
@@ -1354,6 +1365,8 @@ def _decode_rule_list(rules, ns: str,
         rule.pop("marketMasterGene", None)
         rule.pop("market_profile_gene", None)
         rule.pop("marketProfileGene", None)
+        rule.pop(GENE_RULE_ID_MARKER, None)
+        rule.pop("geneRuleId", None)
         out.append(rule)
     return out
 
@@ -1699,7 +1712,7 @@ def authored_genome(strategy, space: Dict[str, Any], *, lattice_anchor: str = "z
     for ns, attr in (("entry", "entry_rules"), ("exit", "exit_rules")):
         rules = [r for r in (getattr(strategy, attr, None) or []) if isinstance(r, dict)]
         for rule in rules:
-            rid = rule.get("id")
+            rid = _gene_rule_id(rule)
             tree = rule.get("conditions")
             authored_abs: Dict[str, Any] = {}
             _collect_authored_values(tree, authored_abs)

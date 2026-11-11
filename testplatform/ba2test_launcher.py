@@ -6286,6 +6286,187 @@ def _check_pullback_gates(command: str, strat, kind: str = "") -> None:
                  f"(a bypass expert builds no entry rules); drop the flag for this job")
 
 
+#: ``--regime-split-entry`` (goal2027 design 2026-11-10, down-market follow-up): ONE ruleset, TWO sections. Every
+#: equity initial-entry rule that carries a condition tree becomes an UP rule (``spy-trend`` pinned to
+#: ``above_200``) followed by a DOWN rule (pinned to ``below_200``) with its own condition genes. ``None`` (default)
+#: = today's rules, genes and job identity byte for byte; otherwise the SCOPE of the separate DOWN genes.
+_REGIME_SPLIT_SCOPES = ("context", "entry", "all")
+_REGIME_SPLIT_ENTRY: "str | None" = None
+_REGIME_SPLIT_UP_SUFFIX = " [SPY up]"
+_REGIME_SPLIT_DOWN_SUFFIX = " [SPY down]"
+_REGIME_SPLIT_DN = "dn"
+
+
+def _resolve_regime_split_entry(raw, command: str) -> "str | None":
+    """Parse ``--regime-split-entry``; sets the module global and returns it. Refused without
+    ``--benchmark-regime-gates``: the split pins the SPY trend leaf that flag appends. Call AFTER
+    ``_resolve_benchmark_regime_gates``."""
+    global _REGIME_SPLIT_ENTRY
+    if raw in (None, ""):
+        _REGIME_SPLIT_ENTRY = None
+        return None
+    if raw not in _REGIME_SPLIT_SCOPES:
+        sys.exit(f"{command}: --regime-split-entry {raw!r}: expected one of {list(_REGIME_SPLIT_SCOPES)}")
+    if not _BENCHMARK_REGIME_GATES:
+        sys.exit(f"{command}: --regime-split-entry requires --benchmark-regime-gates (the split pins the SPY "
+                 f"trend leaf that flag appends); add it or drop --regime-split-entry")
+    _REGIME_SPLIT_ENTRY = raw
+    return raw
+
+
+def _check_regime_split_entry(command: str, strat, kind: str = "") -> None:
+    """Refuse ``--regime-split-entry`` for a job that would be labelled split and carry no DOWN rule."""
+    if not _REGIME_SPLIT_ENTRY:
+        return
+    if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
+        sys.exit(f"{command}: --regime-split-entry: {kind!r} is not an equity S1-S7 strategy "
+                 f"(split keys: {sorted(_EQUITY_MARKET_CONDITION_STRATEGIES)}). Drop the flag for this job.")
+    if not any(str(r.get("name", "")).endswith(_REGIME_SPLIT_DOWN_SUFFIX)
+               for r in (getattr(strat, "entry_rules", None) or []) if isinstance(r, dict)):
+        sys.exit(f"{command}: --regime-split-entry: the built strategy carries no SPY-down entry rule "
+                 f"(a bypass expert builds no entry rules); drop the flag for this job")
+
+
+def _apply_regime_split(backtest_block: dict) -> None:
+    """Record the split scope on a run's backtest block (nothing is written with the flag off)."""
+    if _REGIME_SPLIT_ENTRY:
+        backtest_block["regime_split_entry"] = _REGIME_SPLIT_ENTRY
+
+
+def _declares_own_gene(node) -> bool:
+    """True when this condition node declares any gene of its own (value / toggle / mode / field / bars)."""
+    if any(node.get(k) for k in ("optimize", "optimize_enabled", "optimizeEnabled", "toggle_optimize",
+                                 "toggleOptimize", "mode_optimize", "modeOptimize", "field_optimize",
+                                 "fieldOptimize")):
+        return True
+    return any(node.get(k) is not None for k in ("confirmation_bars_min", "confirmationBarsMin"))
+
+
+def _dn_leaf_id(leaf_id: str, prefix: str) -> str:
+    """The DOWN twin's id: ``<m>-dn-<rest>`` for a ``<m>-<rest>`` gate leaf, else ``<id>-dn``."""
+    if leaf_id.startswith(prefix + "-"):
+        return f"{prefix}-{_REGIME_SPLIT_DN}-{leaf_id[len(prefix) + 1:]}"
+    return f"{leaf_id}-{_REGIME_SPLIT_DN}"
+
+
+def _regime_split_pin_trend(tree: dict, prefix: str, token: str, rename: bool) -> dict:
+    """``tree`` (not copied) with its ``<prefix>-spy-trend`` leaf replaced by the leaf pinned to ``token``
+    (a DOWN twin gets the ``-dn`` id). Exactly one such leaf must exist."""
+    from ba2_common.core.benchmark_regime import TREND_FIELD
+    from ba2_common.core.market_condition_templates import pinned_benchmark_leaf
+
+    found = []
+
+    def walk(node):
+        if isinstance(node, list):
+            return [walk(n) for n in node]
+        if not isinstance(node, dict):
+            return node
+        if "conditions" in node:
+            node["conditions"] = walk(node["conditions"])
+        if node.get("field") == TREND_FIELD:
+            if node.get("id") != f"{prefix}-spy-trend":
+                raise ValueError(f"{prefix}: unexpected SPY trend leaf {node.get('id')!r}; the split pins "
+                                 f"{prefix}-spy-trend only")
+            found.append(node["id"])
+            return pinned_benchmark_leaf(_dn_leaf_id(node["id"], prefix) if rename else node["id"],
+                                         TREND_FIELD, token)
+        return node
+
+    out = walk(tree)
+    if len(found) != 1:
+        raise ValueError(f"{prefix}: expected exactly one {prefix}-spy-trend leaf in the entry tree, "
+                         f"found {len(found)} (is --benchmark-regime-gates on?)")
+    return out
+
+
+def _regime_split_down_tree(tree: dict, prefix: str, scope: str) -> dict:
+    """A deep copy of an entry tree for the SPY-down section: ``spy-trend`` pinned to ``below_200`` and the
+    leaves the scope separates renamed to their ``-dn`` twin (so they collect and decode their own genes)."""
+    import copy
+
+    tree = _regime_split_pin_trend(copy.deepcopy(tree), prefix, "below_200", rename=True)
+    renamed: dict = {}
+
+    def separated(node, cid) -> bool:
+        context = (cid.startswith(f"{prefix}-market-") or cid.startswith(f"{prefix}-pb-")
+                   or cid == f"{prefix}-spy-vol")
+        return context or (scope in ("entry", "all") and _declares_own_gene(node))
+
+    def rename(node):
+        if isinstance(node, list):
+            for n in node:
+                rename(n)
+        elif isinstance(node, dict):
+            rename(node.get("conditions"))
+            cid = node.get("id")
+            if cid and cid != f"{prefix}-{_REGIME_SPLIT_DN}-spy-trend" and separated(node, cid):
+                renamed[cid] = node["id"] = _dn_leaf_id(cid, prefix)
+
+    def rewrite_refs(node):
+        if isinstance(node, list):
+            for n in node:
+                rewrite_refs(n)
+        elif isinstance(node, dict):
+            for k in ("value_offset_from", "valueOffsetFrom"):
+                if node.get(k) in renamed:
+                    node[k] = renamed[node[k]]
+            rewrite_refs(node.get("conditions"))
+
+    rename(tree)
+    rewrite_refs(tree)
+    return tree
+
+
+def _append_equity_regime_split(strategy, kind: str):
+    """``--regime-split-entry``: replace every initial-entry rule that carries a condition tree by TWO adjacent
+    rules, UP first then DOWN (S1: tier1-up, tier1-down, tier2-up, ...), mutually exclusive by their pinned
+    ``spy-trend`` leaf (``above_200`` / ``below_200``; an unknown regime matches neither).
+
+    SCOPE of the separate DOWN genes (``_REGIME_SPLIT_SCOPES``):
+      * ``context``: the leaves the three gate functions append (market-condition leaves, ``spy-vol``, the
+        pullback leaves); everything else, entry action parameters and the rule toggle stay shared;
+      * ``entry``: also every other optimizable leaf of the entry tree (the expert's own signal thresholds);
+      * ``all``: also the entry rule's own genes (rule toggle and action parameters). NOT section-specific
+        exits: exit rules stay shared.
+    Shared genes are shared mechanically: the DOWN rule carries ``gene_rule_id`` (its UP twin's id), which
+    ``strategy_param_space`` keys the rule/action genes by. A no-op with the flag off."""
+    scope = _REGIME_SPLIT_ENTRY
+    if not scope:
+        return strategy
+    import copy
+
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    from app.services.strategy_param_space import GENE_RULE_ID_MARKER
+
+    prefix = kind.lower()
+    rules = list(getattr(strategy, "entry_rules", None) or [])
+    out = []
+    split = 0
+    for rule in rules:
+        if not (isinstance(rule, dict) and isinstance(rule.get("conditions"), dict)
+                and rule["conditions"].get("conditions")):
+            out.append(rule)
+            continue
+        up, down = copy.deepcopy(rule), copy.deepcopy(rule)
+        up["conditions"] = _regime_split_pin_trend(up["conditions"], prefix, "above_200", rename=False)
+        down["conditions"] = _regime_split_down_tree(down["conditions"], prefix, scope)
+        base_id = rule.get("id")
+        label = rule.get("name") or base_id
+        up["name"] = f"{label}{_REGIME_SPLIT_UP_SUFFIX}"
+        down["name"] = f"{label}{_REGIME_SPLIT_DOWN_SUFFIX}"
+        down["id"] = f"{base_id}-{_REGIME_SPLIT_DN}"
+        if scope != "all":
+            down[GENE_RULE_ID_MARKER] = base_id
+        out.extend([up, down])
+        split += 1
+    if not split:
+        raise ValueError(f"{kind}: no entry rule with a condition tree to split by SPY regime")
+    strategy.entry_rules = normalize_trade_rules(out)
+    return strategy
+
+
 def _market_condition_gates(m: str) -> list:
     """The market-condition entry leaves for rule prefix ``m`` ([] with no profile selected).
 
@@ -9355,6 +9536,7 @@ def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="le
         strat = _append_equity_market_condition_gates(strat, kind)
         strat = _append_equity_benchmark_regime_gates(strat, kind)   # goal2027 2.3; no-op flag off
         strat = _append_equity_pullback_gates(strat, kind)           # goal2027 part 3; no-op flag off
+        strat = _append_equity_regime_split(strat, kind)             # --regime-split-entry; no-op flag off
         strat = _append_equity_market_exit_rules(strat, kind)
     if neutral_entry_mode != "legacy":
         _configure_neutral_entry(strat, kind, neutral_entry_mode)
@@ -9798,6 +9980,7 @@ def _cmd_optimize(args) -> int:
     _resolve_market_condition_profiles(getattr(args, "market_condition_profile", None), "optimize")
     _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False), "optimize")
     _resolve_pullback_gates(getattr(args, "pullback_gates", False), "optimize")
+    _resolve_regime_split_entry(getattr(args, "regime_split_entry", None), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
@@ -10213,6 +10396,8 @@ def _cmd_optimize(args) -> int:
         _apply_market_conditions("optimize", backtest_block, strat, args.strategy)
         _apply_benchmark_regime("optimize", backtest_block, strat, args.strategy)
         _check_pullback_gates("optimize", strat, args.strategy)
+        _check_regime_split_entry("optimize", strat, args.strategy)
+        _apply_regime_split(backtest_block)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # Weekdays only under EVERY policy (_WEEKDAY_SCHEDULE_DAY_OPT drops the 2 weekend genes:
@@ -10376,6 +10561,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_benchmark_regime_gates(getattr(args, "benchmark_regime_gates", False),
                                     "optimize-batch")
     _resolve_pullback_gates(getattr(args, "pullback_gates", False), "optimize-batch")
+    _resolve_regime_split_entry(getattr(args, "regime_split_entry", None), "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
@@ -10569,6 +10755,8 @@ def _cmd_optimize_batch(args) -> int:
             _apply_market_conditions("optimize-batch", backtest_block, strat, strat_kind)
             _apply_benchmark_regime("optimize-batch", backtest_block, strat, strat_kind)
             _check_pullback_gates("optimize-batch", strat, strat_kind)
+            _check_regime_split_entry("optimize-batch", strat, strat_kind)
+            _apply_regime_split(backtest_block)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,
@@ -11650,6 +11838,13 @@ def _add_market_condition_args(p) -> None:
                         "(percent below the 20-day high) and <kind>-pb-vs-sma200 (price vs SMA200 in "
                         "percent), each with an off/below/above mode gene and a threshold gene (7 "
                         "added genes per strategy; S1's tiers share them). Absent = today's rules.")
+    p.add_argument("--regime-split-entry", default=None, choices=_REGIME_SPLIT_SCOPES, metavar="SCOPE",
+                   help="OPT-IN, equity S1-S7 only; REQUIRES --benchmark-regime-gates. ONE ruleset with TWO "
+                        "sections: every initial-entry rule becomes an UP rule (spy-trend pinned to above_200) "
+                        "followed by a DOWN rule (pinned to below_200), mutually exclusive, the DOWN copy with "
+                        "its own '-dn' genes. SCOPE: 'context' = the market/spy-vol/pullback leaves; 'entry' = "
+                        "also the expert's own signal-threshold leaves; 'all' = also the entry rule's own "
+                        "toggle and action parameters (exits stay shared). Absent = today's rules.")
     p.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
                    help="EQUITY (S1-S7) ONLY. Append market-condition EXIT/STOP/TP rules "
                         "(kinds: exit,stop,tp -- ba2_common.core.market_condition_templates."
