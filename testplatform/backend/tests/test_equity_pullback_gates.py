@@ -39,7 +39,8 @@ _spec = importlib.util.spec_from_file_location("ba2test_launcher_pullback", _LAU
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
-EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES)
+# S8/S9 imply the SPY gates and a split (flag-off identity / "gates last" do not apply): test_equity_strategy_s8.py covers them
+EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES - set(mod._IMPLIED_RULE_SHAPE))
 FIELDS = {spec[1] for spec in PULLBACK_GATE_SPECS} | set(PULLBACK_RSI_FIELDS)
 SUFFIXES = [spec[0] for spec in PULLBACK_GATE_SPECS]
 

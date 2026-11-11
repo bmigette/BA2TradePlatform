@@ -90,7 +90,11 @@ WF_TOP_N="${WF_TOP_N:-3}"
 EARLY_STOP="${EARLY_STOP:-5}"
 EARLY_STOP_MIN_REL="${EARLY_STOP_MIN_REL:-0.01}"
 SUFFIX_BASE="${SUFFIX_BASE:--goal2027}"
-ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small"
+# LATE STEPS (owner: S8/S9 run after EVERY other cell so they can still be vetoed; S9 before S8, S8 last of all). sN-<expert>-<band>
+# runs ONLY strategy SN (the matrix's --late-strategy: the plan's late_strategies section) for FMPRating (fr) and
+# DeterministicScorer (ds). Their split scope and rsi+spy exits are implied by the key, so their names carry no
+# -regsplit/-mx token; G27_REGIME_SPLIT is refused for them (the key already says the scope).
+ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small s9-fr-large s9-ds-large s9-fr-mid s9-ds-mid s9-fr-small s9-ds-small s8-fr-large s8-ds-large s8-fr-mid s8-ds-mid s8-fr-small s8-ds-small"
 STEPS="${STEPS:-$ALL_STEPS}"
 
 # Spread = measured Alpaca SIP median per band; stress = the p90 - median widening (driver's
@@ -264,8 +268,12 @@ EOF
 
 # ------------------------------------------------------------------------------------------- one step
 run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
-  local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}"
+  local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}" late=""
   [ "$step" = "senate" ] && { kind=senate; band=senate; }
+  case "$step" in s8-*|s9-*)
+    late="S${step:1:1}"; band="${step#*-}"; kind="${band%%-*}"; band="${band#*-}"
+    [ -z "${G27_REGIME_SPLIT:-}" ] || { echo "FATAL: $step: G27_REGIME_SPLIT is set, but $late implies its own split scope" >&2; return 2; } ;;
+  esac
   local expert; expert="$(expert_of "$kind")"
   local end; end="$(data_end)"
   local sp st; sp="$(spread_for "$band")"; st="$(stress_for "$band")"
@@ -298,9 +306,13 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
              --search-market-profile --market-exit "${G27_MARKET_EXIT:-exit,stop,tp}" --search-sl-loosen
              --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
       suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
-      # Optional: override the --market-exit kinds (exit,stop,tp,rsi,spy; rsi/spy add the RSI-recovery close and the
-      # SPY-below-200 stop). Unset = exit,stop,tp, today's commands and names unchanged; set = its own name token.
-      if [ -n "${G27_MARKET_EXIT:-}" ]; then suffix="${suffix}-mx-${G27_MARKET_EXIT//,/_}"; fi
+      # --market-exit kinds (exit,stop,tp,rsi,spy; rsi/spy add the RSI-recovery close and the SPY-below-200 stop).
+      # G27_MARKET_EXIT set = that list for every strategy, its own name token. Unset = exit,stop,tp widened PER
+      # STRATEGY by the matrix (--market-exit-per-strategy: S1/S2 +rsi, S6 +rsi,spy; S3/S5/... unchanged); a job whose
+      # kinds differ from exit,stop,tp carries '-mx-<kinds>' in its name, so it never resumes an older job.
+      if [ -n "${G27_MARKET_EXIT:-}" ]; then suffix="${suffix}-mx-${G27_MARKET_EXIT//,/_}"; else args+=(--market-exit-per-strategy); fi
+      # S8/S9 (late steps): only that strategy, from the plan's late_strategies section; its split + rsi/spy are implied.
+      if [ -n "$late" ]; then args+=(--late-strategy "$late"); fi
       # Optional: ONE ruleset with a SPY-above-200 section and a SPY-below-200 section (launcher --regime-split-entry).
       # G27_REGIME_SPLIT = context | entry | all. Unset = today's commands, names and labels unchanged.
       if [ -n "${G27_REGIME_SPLIT:-}" ]; then

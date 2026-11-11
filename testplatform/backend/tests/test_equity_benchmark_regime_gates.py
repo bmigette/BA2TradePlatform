@@ -33,7 +33,8 @@ _spec.loader.exec_module(mod)
 
 TREND = ["off", "up", "pullback", "bear_rally", "down", "above_200", "below_200"]
 VOL = ["off", "calm", "normal", "stressed", "not_stressed", "not_calm"]
-EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES)
+# S8/S9 imply the SPY gates and a split (flag-off identity / "gates last" do not apply): test_equity_strategy_s8.py covers them
+EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES - set(mod._IMPLIED_RULE_SHAPE))
 FIELDS = ("spy_trend_regime", "spy_vol_regime")
 
 

@@ -2821,6 +2821,26 @@ def _build_strategy_S6(name: str):
                                 exit_conditions=exit_conditions, entry_actions=entry_actions)
 
 
+#: THE BASE of the S8/S9 family: the one line to change to put them on another strategy's rules.
+_S8_S9_BASE_BUILDER = _build_strategy_S6
+
+
+def _build_strategy_S8(name: str):
+    """S8 -- S6's rules with the SPY-regime split (scope ``all``: separate DOWN-section signal thresholds AND entry
+    toggle / bracket / size genes) and the RSI-recovery close + SPY-below-200 stop, as one named strategy.
+
+    The split scope and the rsi/spy exit kinds are IMPLIED by the key (``_IMPLIED_RULE_SHAPE``) and attached by
+    ``_build_strategy`` like every other equity key's gates; this builder only returns the BASE rules, via the single
+    line ``_S8_S9_BASE_BUILDER`` so the base can be swapped later without touching anything else."""
+    return _S8_S9_BASE_BUILDER(name)
+
+
+def _build_strategy_S9(name: str):
+    """S9 -- S8 with the split scope ``entry`` (separate DOWN-section signal thresholds, shared entry toggle / bracket /
+    size genes). Same base line as S8 (``_S8_S9_BASE_BUILDER``); only the implied scope differs."""
+    return _S8_S9_BASE_BUILDER(name)
+
+
 def _build_strategy_S7(name: str):
     """S7 — FAITHFUL REPLICA of the archived pre-tp/sl-rework S2-large winner (backtest #91,
     opt 23: 186.53% return, 181.07% adjusted, 149 trades/49.78 per yr, calmar 3.66, dd -11.52%
@@ -6296,6 +6316,51 @@ _REGIME_SPLIT_UP_SUFFIX = " [SPY up]"
 _REGIME_SPLIT_DOWN_SUFFIX = " [SPY down]"
 _REGIME_SPLIT_DN = "dn"
 
+#: Strategy keys whose rule SHAPE is implied by the key itself (S8/S9, built on S6): ``kind -> (regime split scope,
+#: implied market-exit kinds)``. THE one table: the split scope, the rsi/spy exit kinds, the refusals and the recorded
+#: backtest block all read it through ``_effective_regime_split`` / ``_effective_market_exit_kinds`` /
+#: ``_check_implied_strategy_flags`` at the point of use, so the module globals ``_REGIME_SPLIT_ENTRY`` and
+#: ``_MARKET_EXIT_KINDS_SELECTED`` (which hold ONLY what the command line said) are never mutated and an optimize-batch
+#: mixing S6 / S8 / S9 builds each job from its own rules, in any order.
+_IMPLIED_RULE_SHAPE: "dict[str, tuple[str, tuple[str, ...]]]" = {
+    "S8": ("all", ("rsi", "spy")),
+    "S9": ("entry", ("rsi", "spy")),
+}
+
+
+def _effective_regime_split(kind: str = "") -> "str | None":
+    """The split scope this strategy builds with: the key's implied scope (S8/S9), else the command line's."""
+    if kind in _IMPLIED_RULE_SHAPE:
+        return _IMPLIED_RULE_SHAPE[kind][0]
+    return _REGIME_SPLIT_ENTRY
+
+
+def _effective_market_exit_kinds(kind: str = "") -> "tuple[str, ...]":
+    """The ``--market-exit`` kinds this strategy builds with: the command line's, plus the key's implied kinds
+    (S8/S9: rsi, spy), in the canonical ``ALL_MARKET_EXIT_KINDS`` order."""
+    if kind not in _IMPLIED_RULE_SHAPE:
+        return _MARKET_EXIT_KINDS_SELECTED
+    from ba2_common.core.market_condition_templates import ALL_MARKET_EXIT_KINDS
+
+    wanted = set(_MARKET_EXIT_KINDS_SELECTED) | set(_IMPLIED_RULE_SHAPE[kind][1])
+    return tuple(k for k in ALL_MARKET_EXIT_KINDS if k in wanted)
+
+
+def _check_implied_strategy_flags(kind: str, command: str) -> None:
+    """Refuse an S8/S9 job whose command line cannot carry its implied rules (no-op for any other key):
+    ``--benchmark-regime-gates`` is REQUIRED (the split and the SPY stop read the SPY regime it publishes), and a
+    ``--regime-split-entry`` scope other than the key's own contradicts it (the key's own scope is redundant, accepted)."""
+    if kind not in _IMPLIED_RULE_SHAPE:
+        return
+    scope = _IMPLIED_RULE_SHAPE[kind][0]
+    if not _BENCHMARK_REGIME_GATES:
+        sys.exit(f"{command}: strategy {kind} requires --benchmark-regime-gates (its regime split and its SPY-below-200 "
+                 f"stop read the SPY regime that flag publishes); add the flag or drop {kind} from this job")
+    if _REGIME_SPLIT_ENTRY not in (None, "") and _REGIME_SPLIT_ENTRY != scope:
+        sys.exit(f"{command}: strategy {kind} implies --regime-split-entry {scope}; the command line says "
+                 f"--regime-split-entry {_REGIME_SPLIT_ENTRY}. Drop the flag (or pass {scope}) for {kind}, or run the "
+                 f"other scope in a job of its own")
+
 
 def _resolve_regime_split_entry(raw, command: str) -> "str | None":
     """Parse ``--regime-split-entry``; sets the module global and returns it. Refused without
@@ -6316,7 +6381,7 @@ def _resolve_regime_split_entry(raw, command: str) -> "str | None":
 
 def _check_regime_split_entry(command: str, strat, kind: str = "") -> None:
     """Refuse ``--regime-split-entry`` for a job that would be labelled split and carry no DOWN rule."""
-    if not _REGIME_SPLIT_ENTRY:
+    if not _effective_regime_split(kind):
         return
     if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
         sys.exit(f"{command}: --regime-split-entry: {kind!r} is not an equity S1-S7 strategy "
@@ -6327,10 +6392,12 @@ def _check_regime_split_entry(command: str, strat, kind: str = "") -> None:
                  f"(a bypass expert builds no entry rules); drop the flag for this job")
 
 
-def _apply_regime_split(backtest_block: dict) -> None:
-    """Record the split scope on a run's backtest block (nothing is written with the flag off)."""
-    if _REGIME_SPLIT_ENTRY:
-        backtest_block["regime_split_entry"] = _REGIME_SPLIT_ENTRY
+def _apply_regime_split(backtest_block: dict, kind: str = "") -> None:
+    """Record the EFFECTIVE split scope of ``kind`` on a run's backtest block (nothing is written with no split):
+    S8/S9 record their implied scope, so a stored row names the rules it was built with."""
+    scope = _effective_regime_split(kind)
+    if scope:
+        backtest_block["regime_split_entry"] = scope
 
 
 def _declares_own_gene(node) -> bool:
@@ -6442,7 +6509,7 @@ def _append_equity_regime_split(strategy, kind: str):
         exits: exit rules stay shared.
     Shared genes are shared mechanically: the DOWN rule carries ``gene_rule_id`` (its UP twin's id), which
     ``strategy_param_space`` keys the rule/action genes by. A no-op with the flag off."""
-    scope = _REGIME_SPLIT_ENTRY
+    scope = _effective_regime_split(kind)
     if not scope:
         return strategy
     import copy
@@ -6461,7 +6528,7 @@ def _append_equity_regime_split(strategy, kind: str):
             out.append(rule)
             continue
         up, down = copy.deepcopy(rule), copy.deepcopy(rule)
-        if "spy" in _MARKET_EXIT_KINDS_SELECTED:
+        if "spy" in _effective_market_exit_kinds(kind):
             # ``--market-exit spy``: stamp which section opened the position (entry_tag on the entry order, read
             # back by EntryTagCondition in the spy stop rule); only then, so a split without it is unchanged.
             from ba2_common.core.market_condition_templates import SPY_DOWN_ENTRY_TAG, SPY_UP_ENTRY_TAG
@@ -6763,7 +6830,7 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
 #: ``--market-exit``) the EXIT/STOP/TP rules through ``_append_equity_market_exit_rules`` -- both
 #: called once, generically, from ``_build_strategy``'s dispatch, unlike the option builders
 #: (which call ``_append_market_condition_gates``/``_option_entry_rule`` themselves).
-_EQUITY_MARKET_CONDITION_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7"}
+_EQUITY_MARKET_CONDITION_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"}
 
 #: The strategy keys whose builders actually EMIT market-condition leaves: every pure-option
 #: structure (through ``_option_entry_rule``), the two equity-entry option overlays (through
@@ -7378,7 +7445,7 @@ def _check_market_exit_independent(command: str, strat, kind: str = "") -> None:
     from ba2_common.core.market_condition_templates import (
         INDEPENDENT_EXIT_KINDS, RSI_EXIT_RULE_SUFFIX, SPY_STOP_RULE_SUFFIX)
 
-    wanted = [k for k in _MARKET_EXIT_KINDS_SELECTED if k in INDEPENDENT_EXIT_KINDS]
+    wanted = [k for k in _effective_market_exit_kinds(kind) if k in INDEPENDENT_EXIT_KINDS]
     if not wanted:
         return
     if kind and kind not in _EQUITY_MARKET_CONDITION_STRATEGIES:
@@ -7833,7 +7900,8 @@ def _append_equity_market_exit_rules(strategy, kind: str):
     ``_MARKET_EXIT_KINDS_SELECTED`` is guaranteed empty whenever the mode is ``all-off``; the
     guard here is defensive, not load-bearing.
     """
-    if not _MARKET_EXIT_KINDS_SELECTED:
+    selected_kinds = _effective_market_exit_kinds(kind)
+    if not selected_kinds:
         return strategy
     from ba2_common.core.market_condition_rules import assert_market_rule_actions
     from ba2_common.core.market_condition_templates import (
@@ -7841,8 +7909,8 @@ def _append_equity_market_exit_rules(strategy, kind: str):
         market_exit_rules)
     from ba2_common.core.rule_models import normalize_trade_rules
 
-    profile_kinds = tuple(k for k in _MARKET_EXIT_KINDS_SELECTED if k in MARKET_EXIT_KINDS)
-    independent_kinds = tuple(k for k in _MARKET_EXIT_KINDS_SELECTED if k in INDEPENDENT_EXIT_KINDS)
+    profile_kinds = tuple(k for k in selected_kinds if k in MARKET_EXIT_KINDS)
+    independent_kinds = tuple(k for k in selected_kinds if k in INDEPENDENT_EXIT_KINDS)
     if profile_kinds and _MARKET_CONDITION_MODE != _MARKET_CONDITION_MODE_SEARCHED:
         raise ValueError(f"{kind}: market exit rules requested with a non-searched "
                          f"market-condition mode {_MARKET_CONDITION_MODE!r}")
@@ -7870,7 +7938,7 @@ def _append_equity_market_exit_rules(strategy, kind: str):
         # unscoped stop would pull every DOWN entry's stop to ~breakeven at once.
         rules = rules + independent_exit_rules(
             prefix, direction, independent_kinds,
-            spy_up_tag=SPY_UP_ENTRY_TAG if _REGIME_SPLIT_ENTRY else None)
+            spy_up_tag=SPY_UP_ENTRY_TAG if _effective_regime_split(kind) else None)
     merged, omitted = _insert_equity_market_exit_rules(strategy.exit_rules, rules)
     if "spy" in omitted and not [r for r in rules if not r["id"].endswith("-spy-stop")]:
         raise ValueError(f"{kind}: --market-exit spy adds no rule: {omitted['spy']}")
@@ -9458,6 +9526,9 @@ _STRATEGY_BUILDERS = {
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
+    "S8": _build_strategy_S8,   # (name) — S6 base + SPY-regime split scope "all" + rsi/spy market exits, all implied
+                                #          by the key; REQUIRES --benchmark-regime-gates (see _IMPLIED_RULE_SHAPE)
+    "S9": _build_strategy_S9,   # (name) — as S8 with split scope "entry"
     "SQM": _build_strategy_SQM, # (name) — DeterministicScorer only: exploration quality-momentum (stop/target/time exit)
     "MLH": _build_strategy_MLH, # (name) — MLForecast only: hold for a fixed time, no TP (custom-ML fair test)
     "MLF": _build_strategy_MLF, # (name) — MLForecast only: MLH + take-profit at the forecast's own target
@@ -9579,13 +9650,14 @@ def _clamp_confidence_genes(strat, expert: str):
     return strat
 
 
-def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="legacy"):
+def _build_strategy(kind: str, name: str, expert: str, *, neutral_entry_mode="legacy", command: str = "optimize"):
     """Dispatch to the right strategy builder.
 
     Every S-strategy is EXPERT-AGNOSTIC (2026-08-17): S1 used to load a per-expert live/default
     JSON and died for any expert without one; it now builds from the same kind of code template as
     S2-S7, with the expert contributing its own default settings. The only expert-specific step
     left is clamping confidence gates to what the expert can actually emit."""
+    _check_implied_strategy_flags(kind, command)          # S8/S9: needs the SPY gates, no contradicting split scope
     if kind == "S1":
         strat = _STRATEGY_BUILDERS[kind](name, expert)
     elif kind in _OPTION_STRATEGY_KEYS:
@@ -10472,7 +10544,7 @@ def _cmd_optimize(args) -> int:
         _check_pullback_gates("optimize", strat, args.strategy)
         _check_market_exit_independent("optimize", strat, args.strategy)
         _check_regime_split_entry("optimize", strat, args.strategy)
-        _apply_regime_split(backtest_block)
+        _apply_regime_split(backtest_block, args.strategy)
         # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
         # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
         # Weekdays only under EVERY policy (_WEEKDAY_SCHEDULE_DAY_OPT drops the 2 weekend genes:
@@ -10737,7 +10809,7 @@ def _cmd_optimize_batch(args) -> int:
             if bypass and neutral_mode != "legacy":
                 raise ValueError("Neutral option entry experiments require a ruleset expert")
             strat = _build_strategy_minimal(name) if bypass else _build_strategy(
-                strat_kind, name, expert, neutral_entry_mode=neutral_mode)
+                strat_kind, name, expert, neutral_entry_mode=neutral_mode, command="optimize-batch")
             # Pure-option kinds carry a transient `entry_action`; capture before commit/refresh.
             strat_entry_action = getattr(strat, "entry_action", None)
             db.add(strat); db.commit(); db.refresh(strat)
@@ -10832,7 +10904,7 @@ def _cmd_optimize_batch(args) -> int:
             _check_pullback_gates("optimize-batch", strat, strat_kind)
             _check_market_exit_independent("optimize-batch", strat, strat_kind)
             _check_regime_split_entry("optimize-batch", strat, strat_kind)
-            _apply_regime_split(backtest_block)
+            _apply_regime_split(backtest_block, strat_kind)
             pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
                 "populationSize": pop_for_strat,

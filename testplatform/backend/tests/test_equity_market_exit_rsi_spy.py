@@ -44,7 +44,8 @@ _spec = importlib.util.spec_from_file_location("ba2test_launcher_mx_rsi_spy", _L
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
-EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES)
+# S8/S9 imply their split and rsi/spy exits (flag-off identity does not apply): test_equity_strategy_s8.py covers them
+EQUITY = sorted(mod._EQUITY_MARKET_CONDITION_STRATEGIES - set(mod._IMPLIED_RULE_SHAPE))
 PROFILES = ("ohlcv-v1", "ta-structure-v1")
 OLD_KINDS = ("exit", "stop", "tp")
 
