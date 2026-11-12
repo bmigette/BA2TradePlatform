@@ -64,6 +64,19 @@ def _provider(account_id: int):
     return history_provider_for_account(account_id)
 
 
+def redact_message(text: str) -> str:
+    """``text`` with credentials masked: FMP's ``apikey=`` (``fmp_common.redact``) and every other URL / header
+    secret the platform log redaction knows (``log_redaction.redact_text``). Idempotent."""
+    from ba2_providers.fmp_common import redact
+    from ..log_redaction import redact_text
+    return redact_text(redact(str(text)))
+
+
+def _redacted(exc: BaseException) -> str:
+    """``"<Type>: <message>"``, redacted."""
+    return redact_message(f"{type(exc).__name__}: {exc}")
+
+
 class Closes(dict):
     """``{symbol: {date: close}}`` plus how complete it is: ``timed_out`` (the deadline passed with symbols still
     unfetched) and ``unfetched`` (those symbols). A symbol that is simply absent is unpriced."""
@@ -72,7 +85,8 @@ class Closes(dict):
 
 
 def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
-                 deadline_s: Optional[float] = None) -> Closes:
+                 deadline_s: Optional[float] = None,
+                 errors: Optional[Dict[str, str]] = None) -> Closes:
     """``{symbol: {date: close}}`` from ``start`` through today, each account's symbols from that account's history
     source.
 
@@ -84,7 +98,11 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
     A symbol whose fetch raises something other than a network error, or returns nothing, is absent (unpriced). If
     EVERY symbol failed with a network error the source is unreachable (``PriceSourceUnreachable``). At the deadline
     the symbols already fetched are returned with ``timed_out`` set and the rest in ``unfetched``; only if nothing at
-    all finished is it ``PriceSourceUnreachable``."""
+    all finished is it ``PriceSourceUnreachable``.
+
+    ``errors``: OPT-IN. A caller that must tell "the fetch FAILED" from "the source has nothing" passes a dict; every
+    symbol whose provider call raised (before the deadline) is recorded in it as ``{symbol: "<Type>: <message>"}``,
+    credentials redacted. The returned ``Closes`` is identical either way, so a caller passing nothing sees no change."""
     deadline = PRICE_DEADLINE_S if deadline_s is None else deadline_s
     jobs = [(aid, sym) for aid, syms in by_account.items() for sym in syms]
     out = Closes()
@@ -101,6 +119,7 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
     lock = threading.Lock()
     queue = list(jobs)
     state = {"stop": False, "net_failed": 0, "failed": 0}
+    failures: Dict[str, str] = {}
 
     def worker():
         try:
@@ -113,8 +132,10 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
                     closes = closes_from_frame(providers[aid].get_ohlcv_data(
                         sym, start_date=begin, end_date=now, interval='1d'))
                 except Exception as e:  # noqa: BLE001 -- a provider raises its own types; one symbol's failure = unpriced
-                    logger.warning(f"price history fetch failed for {sym}: {type(e).__name__}: {e}")
+                    reason = _redacted(e)
+                    logger.warning(f"price history fetch failed for {sym}: {reason}")
                     with lock:
+                        failures[sym] = reason
                         state["failed"] += 1
                         if isinstance(e, OSError):
                             state["net_failed"] += 1
@@ -139,6 +160,8 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
         result.timed_out = timed_out
         result.unfetched = sorted({sym for _aid, sym in queue})
         failed, net_failed = state["failed"], state["net_failed"]
+        if errors is not None:
+            errors.update(failures)
     if timed_out and not result:
         raise PriceSourceUnreachable(f"The price source did not answer within {deadline:.0f}s",
                                      {"symbols": len(jobs)})

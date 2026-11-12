@@ -16,20 +16,40 @@ WHERE THE NUMBERS COME FROM, AND WHY THEY ARE ON ONE BASIS
   split; NVDA 2020-06-04: 0.16 / 0.004 after 4:1 and 10:1). The as-declared ``dividend`` is NEVER used: across a split
   it is on another basis. A row without ``adjDividend`` stays unknown (``None``) and the simulator reports it.
 
-A failed distribution fetch is recorded per symbol (``DistributionHistory(events=None, error=...)``) and makes the
-price + distributions figure unknown, loudly; a price source that is unreachable, busy or past its deadline raises
-``PriceSourceUnreachable`` and the dialog shows it.
+FAILURE IS NEVER ABSENCE
+* A price download that FAILED for any one symbol (the provider raised: a 5xx after retries, a timeout, ...) refuses the
+  whole result with ``PriceSourceUnreachable`` naming the symbol and the reason. Reporting it as "no price history"
+  would park its slice in cash at 0% and dilute every horizon's headline under a false label. (Only a symbol the source
+  answered EMPTY for is "no price history".) Same for a source that is busy, past its deadline, or empty for every
+  symbol.
+* A distribution fetch that failed, or did not answer within ``DIVIDEND_DEADLINE_S``, is recorded per symbol
+  (``DistributionHistory(events=None, error=...)``) and makes the price + distributions figure unknown, with the reason.
+* The distribution downloads run on the SAME process-wide download slots as the price path
+  (``price_history._SLOTS``, ``MAX_CONCURRENT``): this feature never adds load on the FMP key live trading uses beyond
+  that cap. No free slot = every distribution unknown ("busy").
+* Every reason shown or logged goes through ``redacted_reason`` (FMP ``apikey=`` plus the platform log redaction:
+  URL secrets, Authorization / Bearer, ``sk-`` keys, JWTs).
 """
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from ..logger import logger
 from ..ui.utils.label_growth_sim import DistributionHistory, history_start
 from . import price_history
 from .errors import PriceSourceUnreachable
+
+#: The whole distribution download is bounded like the price download.
+DIVIDEND_DEADLINE_S = price_history.PRICE_DEADLINE_S
+
+
+def redacted_reason(exc: BaseException) -> str:
+    """``"<Type>: <message>"`` with credentials masked -- for anything shown in the dialog or logged."""
+    return price_history._redacted(exc)
 
 
 @dataclass
@@ -77,7 +97,14 @@ def fetch_label_growth_inputs(account_id: int, symbols: Iterable[str], *, as_of:
     source = _history_source(account_id)
     if not wanted:
         return LabelGrowthInputs(as_of, start, {}, {}, source)
-    closes = price_history.fetch_closes({account_id: wanted}, start)
+    failures: Dict[str, str] = {}
+    closes = price_history.fetch_closes({account_id: wanted}, start, errors=failures)
+    if failures:
+        detail = price_history.redact_message('; '.join(f"{sym}: {failures[sym]}" for sym in sorted(failures)))
+        raise PriceSourceUnreachable(
+            f"The price fetch failed for {len(failures)} of {len(wanted)} symbol(s), so no total would be complete "
+            f"-- price fetch failed for {detail}. Try again.",
+            {"failed": {k: price_history.redact_message(v) for k, v in failures.items()}})
     if closes.timed_out:
         raise PriceSourceUnreachable(
             f"The price source did not answer for {', '.join(closes.unfetched)} within "
@@ -93,16 +120,68 @@ def fetch_label_growth_inputs(account_id: int, symbols: Iterable[str], *, as_of:
     if missing:
         logger.warning(f"label growth: account {account_id} ({source}) has no price history for {missing}; "
                        f"reported as unmeasurable")
-    distributions: Dict[str, DistributionHistory] = {}
-    from ba2_providers.symbol_info import FMPError, fetch_dividends
-    for sym in wanted:
-        try:
-            distributions[sym] = DistributionHistory(events=distribution_events_from_fmp(fetch_dividends(api_key, sym)))
-        except (FMPError, OSError, ValueError) as e:
-            logger.error(f"label growth: distribution history for {sym} could not be fetched: {e}", exc_info=True)
-            distributions[sym] = DistributionHistory(events=None, error=f"{type(e).__name__}: {e}")
+    distributions = fetch_distributions(api_key, [s for s in wanted if s in closes])
     return LabelGrowthInputs(as_of=as_of, start=start, closes={s: dict(closes[s]) for s in wanted if s in closes},
                              distributions=distributions, price_source=source)
+
+
+def fetch_distributions(api_key: str, symbols: List[str], *,
+                        deadline_s: Optional[float] = None) -> Dict[str, DistributionHistory]:
+    """``{SYMBOL: DistributionHistory}`` for ``symbols``, on the price path's download slots, within a deadline.
+
+    A symbol whose fetch failed, that was still running at the deadline, or that never got a slot (all busy) gets
+    ``events=None`` and the reason. Results that arrive after the deadline are ignored."""
+    from ba2_providers.symbol_info import FMPError, fetch_dividends
+    deadline = DIVIDEND_DEADLINE_S if deadline_s is None else deadline_s
+    out: Dict[str, DistributionHistory] = {}
+    if not symbols:
+        return out
+    slots_ = price_history._SLOTS
+    slots = sum(1 for _ in range(min(price_history.WORKERS, len(symbols))) if slots_.acquire(blocking=False))
+    if slots == 0:
+        why = (f"the download slots shared with the price history are all in use (busy, "
+               f"{price_history.MAX_CONCURRENT} max); try again")
+        logger.error(f"label growth: distributions not fetched for {symbols}: {why}")
+        return {s: DistributionHistory(events=None, error=why) for s in symbols}
+    lock = threading.Lock()
+    queue = list(symbols)
+    state = {"closed": False}
+
+    def worker():
+        try:
+            while True:
+                with lock:
+                    if state["closed"] or not queue:
+                        return
+                    sym = queue.pop(0)
+                try:
+                    found = DistributionHistory(events=distribution_events_from_fmp(fetch_dividends(api_key, sym)))
+                except (FMPError, OSError, ValueError) as e:
+                    reason = redacted_reason(e)
+                    logger.error(f"label growth: distribution history for {sym} could not be fetched: {reason}")
+                    found = DistributionHistory(events=None, error=reason)
+                with lock:
+                    if not state["closed"]:
+                        out[sym] = found
+        finally:
+            slots_.release()
+
+    threads = [threading.Thread(target=worker, daemon=True, name="label-growth-dividends") for _ in range(slots)]
+    for t in threads:
+        t.start()
+    end_at = time.monotonic() + deadline
+    for t in threads:
+        t.join(max(0.0, end_at - time.monotonic()))
+    with lock:
+        state["closed"] = True                  # late answers are dropped; running calls still free their slot
+        result = dict(out)
+    late = [s for s in symbols if s not in result]
+    if late:
+        why = f"no answer within {deadline:g}s"
+        logger.error(f"label growth: distribution history for {late}: {why}")
+        for s in late:
+            result[s] = DistributionHistory(events=None, error=why)
+    return result
 
 
 def symbols_to_fetch(shares: Mapping[str, float]) -> list:

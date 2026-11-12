@@ -7,7 +7,9 @@ cash; a per-symbol breakdown and a line chart for the selected horizon.
 The arithmetic is ``ui/utils/label_growth_sim.py`` (pure); the fetch is ``services/label_growth.py`` and runs ONCE per
 opening, in ``asyncio.to_thread``; changing the amount only re-runs the arithmetic. READ-ONLY: nothing here writes to
 the database or touches an order, and nothing on the page behind it changes. Every refusal or provider error is drawn
-IN the dialog. CSS: none of its own (inline styles and utility classes only), so nothing here can be dropped by the
+IN the dialog -- a failure while drawing included, never a spinner left turning -- and every message shown or logged
+is redacted (``services.label_growth.redacted_reason``). Closing the dialog deletes it; a load that finishes after the
+dialog (or the browser tab) is gone draws nothing. CSS: none of its own (inline styles and utility classes only), so nothing here can be dropped by the
 page's after-await rule.
 """
 import asyncio
@@ -17,7 +19,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from nicegui import ui
 
 from ...logger import logger
-from ...services.label_growth import fetch_label_growth_inputs, symbols_to_fetch
+from ...services.label_growth import fetch_label_growth_inputs, redacted_reason, symbols_to_fetch
 from ..utils import label_growth_sim as sim
 
 MARKER_SIM_DIALOG = 'pf-sim-dialog'
@@ -95,6 +97,9 @@ class LabelGrowthDialog:
     # -- layout ------------------------------------------------------------------------------------------------
     def _build(self) -> None:
         self.dialog = ui.dialog().mark(MARKER_SIM_DIALOG)
+        # Deleted on close (the close button, Esc or a click outside): each click builds a fresh one, and a closed
+        # dialog left in the tree would pile up for the life of the page.
+        self.dialog.on_value_change(lambda e: None if e.value else self._dispose())
         with self.dialog:
             with ui.card().classes('flex flex-col flex-nowrap min-h-0 overflow-hidden').style(CARD_STYLE):
                 with ui.row().classes('w-full items-center justify-between p-2 shrink-0'):
@@ -121,6 +126,14 @@ class LabelGrowthDialog:
     def close(self) -> None:
         self.dialog.close()
 
+    def _dispose(self) -> None:
+        if not self.dialog.is_deleted:
+            self.dialog.delete()
+
+    def _gone(self) -> bool:
+        """The dialog (or the whole client) was deleted while the fetch ran: nothing left to draw into."""
+        return self.dialog.is_deleted or self.body.is_deleted
+
     # -- data ------------------------------------------------------------------------------------------------------
     async def load(self) -> None:
         """Validate the split, fetch off the event loop, then draw. Never raises to the caller: every failure is
@@ -128,15 +141,21 @@ class LabelGrowthDialog:
         try:
             sim.simulate_label_growth(sim.DEFAULT_AMOUNT, self.shares, {}, {}, as_of=self.as_of, horizons=('ytd',))
         except ValueError as e:                          # shares over 100 / negative: nothing to fetch for
-            self._render_error('The simulation cannot run on this split.', str(e))
+            self._render_error('The simulation cannot run on this split.', _message(e))
             return
         try:
-            self.inputs = await asyncio.to_thread(self._fetch, self.account_id, symbols_to_fetch(self.shares),
-                                                  as_of=self.as_of, api_key=self.api_key)
+            inputs = await asyncio.to_thread(self._fetch, self.account_id, symbols_to_fetch(self.shares),
+                                             as_of=self.as_of, api_key=self.api_key)
         except Exception as e:  # noqa: BLE001 -- any provider failure is SHOWN in the dialog, and logged
-            logger.error(f"label growth simulator: loading {self.label} failed: {e}", exc_info=True)
-            self._render_error('The prices or distributions could not be loaded.', f"{type(e).__name__}: {e}")
+            reason = redacted_reason(e)
+            logger.error(f"label growth simulator: loading {self.label} failed: {reason}")
+            if not self._gone():
+                self._render_error('The prices or distributions could not be loaded.', reason)
             return
+        if self._gone():
+            logger.info(f"label growth simulator: {self.label} closed before its data arrived; nothing drawn")
+            return
+        self.inputs = inputs
         self._recompute()
 
     def _amount_changed(self, value) -> None:
@@ -147,7 +166,7 @@ class LabelGrowthDialog:
     def _select(self, horizon: str) -> None:
         self.horizon = horizon
         if self.result is not None:
-            self._render()
+            self._draw_safely()
 
     def _recompute(self) -> None:
         try:
@@ -156,9 +175,28 @@ class LabelGrowthDialog:
         except ValueError as e:
             self.result = None
             self._render_error('Enter a positive amount.' if 'amount' in str(e).lower()
-                               else 'The simulation cannot run on this split.', str(e))
+                               else 'The simulation cannot run on this split.', _message(e))
             return
-        self._render()
+        except Exception as e:  # noqa: BLE001 -- an arithmetic defect is SHOWN, never a frozen spinner
+            self.result = None
+            self._failed('The simulation failed.', e)
+            return
+        self._draw_safely()
+
+    def _draw_safely(self) -> None:
+        """``_render``, with any failure drawn as an error card instead of a half-drawn body or a spinner."""
+        if self._gone():
+            return
+        try:
+            self._render()
+        except Exception as e:  # noqa: BLE001 -- shown in the dialog and logged; nothing is retried
+            self._failed('The results could not be drawn.', e)
+
+    def _failed(self, headline: str, exc: BaseException) -> None:
+        reason = redacted_reason(exc)
+        logger.error(f"label growth simulator: {self.label}: {headline} {reason}")
+        if not self._gone():
+            self._render_error(headline, reason)
 
     # -- drawing ---------------------------------------------------------------------------------------------------
     def _render_error(self, headline: str, detail: str) -> None:
@@ -218,6 +256,8 @@ class LabelGrowthDialog:
                     .classes('text-xs').style(_WARN)
             if h.no_history_symbols:
                 ui.label(f"{len(h.no_history_symbols)} unmeasurable (held as cash)").classes('text-xs').style(_WARN)
+            if h.gap_symbols:
+                ui.label(f"{len(h.gap_symbols)} with a data gap at the start").classes('text-xs').style(_WARN)
 
 
 def open_label_growth(account_id: int, label: str, shares: Mapping[str, float], *, api_key: str, as_of: date,
@@ -229,4 +269,20 @@ def open_label_growth(account_id: int, label: str, shares: Mapping[str, float], 
                                unset=unset, fetch=fetch)
     dialog.open()
     dialog.load_task = asyncio.create_task(dialog.load())
+    dialog.load_task.add_done_callback(_retrieve)
     return dialog
+
+
+def _message(exc: BaseException) -> str:
+    """A refusal's own sentence, redacted, without the exception type in front."""
+    return redacted_reason(exc).split(': ', 1)[-1]
+
+
+def _retrieve(task: asyncio.Task) -> None:
+    """``load`` never raises by design; should that ever break, the exception is logged here instead of being left as
+    an unretrieved task exception (the click handler that started the task does not await it)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(f"label growth simulator: load task failed: {redacted_reason(exc)}")

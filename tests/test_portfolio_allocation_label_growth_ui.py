@@ -138,15 +138,47 @@ def test_the_icon_opens_the_simulator_with_the_default_amount(monkeypatch, niceg
     assert [r['share'] for r in table.rows] == ['60.00%', '40.00%']
 
 
-def test_opening_the_simulator_writes_nothing(monkeypatch, nicegui_client, account_id):
+def test_opening_the_simulator_writes_nothing(monkeypatch, nicegui_client, account_id, test_engine):
+    """Read-only, PROVEN: every statement the database sees while the icon is clicked and the dialog loads, recomputes
+    and switches horizon is a SELECT, and no table changes size -- orders, transactions and allocation rows included.
+    A real write anywhere on that path fails this."""
+    from sqlalchemy import event, func, select
+    from sqlmodel import Session, SQLModel
+
     set_managed_label(account_id, 'ARK26', target_pct=40.0)
     pagetests._fmp_key(monkeypatch)
     _fake_fetch(monkeypatch, _inputs(CLOSES))
     root = pagetests._draw(nicegui_client, account_id,
                            pagetests._one_label(account_id, weights={'AAPL': 60.0, 'MSFT': 40.0}))
-    before = {k: v.weight_pct for k, v in get_symbol_rows(account_id, 'ARK26').items()}
-    _click_and_settle(nicegui_client, pagetests._marked(root, page.MARKER_LABEL_GROWTH_SIM)[0])
-    assert {k: v.weight_pct for k, v in get_symbol_rows(account_id, 'ARK26').items()} == before
+
+    def counts():
+        with Session(test_engine) as session:
+            return {t.name: session.exec(select(func.count()).select_from(t)).one()[0]
+                    for t in SQLModel.metadata.sorted_tables}
+
+    tables = {t.name for t in SQLModel.metadata.sorted_tables}
+    assert {'tradingorder', 'transaction'} <= tables
+    assert any('alloc' in t for t in tables)
+    before = counts()
+    writes = []
+
+    def spy(conn, cursor, statement, parameters, context, executemany):
+        verb = statement.lstrip().split(None, 1)[0].upper() if statement.strip() else ''
+        if verb not in ('SELECT', 'PRAGMA', 'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'RELEASE'):
+            writes.append(statement)
+
+    event.listen(test_engine, 'before_cursor_execute', spy)
+    try:
+        _click_and_settle(nicegui_client, pagetests._marked(root, page.MARKER_LABEL_GROWTH_SIM)[0])
+        dialog_amount = _marked_anywhere(nicegui_client, dlg.MARKER_SIM_AMOUNT)[0]
+        with nicegui_client:
+            pagetests._drive_value(dialog_amount, 25_000.0)
+            for card in _marked_anywhere(nicegui_client, dlg.MARKER_SIM_HORIZON_CARD)[:1]:
+                pagetests._fire(card)
+    finally:
+        event.remove(test_engine, 'before_cursor_execute', spy)
+    assert writes == []
+    assert counts() == before
 
 
 def test_without_an_fmp_key_it_says_so_and_opens_nothing(monkeypatch, nicegui_client, account_id):
@@ -261,3 +293,84 @@ def test_late_and_unmeasurable_symbols_are_visible_in_the_dialog(nicegui_client)
     by = {r['symbol']: r for r in table.rows}
     assert by['NEW']['status'] == 'Late start' and '2024-06-03' in by['NEW']['note']
     assert by['GONE']['status'] == 'Unmeasurable (cash)'
+
+
+# ---------------------------------------------------------------------------
+# review 2026-11-12
+# ---------------------------------------------------------------------------
+
+def test_a_failure_while_drawing_the_results_is_shown_not_left_on_the_spinner(nicegui_client, monkeypatch):
+    errors = []
+    monkeypatch.setattr(dlg.logger, 'error', lambda msg, *a, **k: errors.append(str(msg)))
+
+    def broken(h):
+        raise RuntimeError('chart options broke')
+
+    monkeypatch.setattr(dlg.sim, 'growth_chart_options', broken)
+    d = _open(nicegui_client, {'AAPL': 100.0}, lambda *a, **k: _inputs(CLOSES))
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_SIM_ERROR)
+    assert any('chart options broke' in t for t in _texts(nicegui_client))
+    assert not any('Loading' in t for t in _texts(nicegui_client))
+    assert errors
+    assert d.load_task.done() and d.load_task.exception() is None
+
+
+def test_a_failure_on_an_amount_change_is_shown_too(nicegui_client, monkeypatch):
+    d = _open(nicegui_client, {'AAPL': 100.0}, lambda *a, **k: _inputs(CLOSES))
+    monkeypatch.setattr(dlg.logger, 'error', lambda msg, *a, **k: None)
+    monkeypatch.setattr(dlg.sim, 'table_rows', lambda h: (_ for _ in ()).throw(KeyError('row')))
+    with nicegui_client:
+        pagetests._drive_value(d.amount_input, 12_000.0)
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_SIM_ERROR)
+
+
+def test_a_dialog_closed_during_the_fetch_finishes_quietly(nicegui_client, monkeypatch):
+    """The browser tab closed (or the dialog dismissed) while the prices were downloading: the load must end without
+    drawing into deleted elements and without an exception left on the task."""
+    errors = []
+    monkeypatch.setattr(dlg.logger, 'error', lambda msg, *a, **k: errors.append(str(msg)))
+    holder = {}
+
+    def fetch(*a, **k):
+        holder['d'].dialog.delete()
+        return _inputs(CLOSES)
+
+    async def _run():
+        with nicegui_client:
+            holder['d'] = dlg.open_label_growth(1, 'ARK26', {'AAPL': 100.0}, api_key='K', as_of=AS_OF,
+                                                fetch=fetch)
+            await asyncio.gather(holder['d'].load_task, return_exceptions=True)
+    asyncio.run(_run())
+    task = holder['d'].load_task
+    assert task.done() and task.exception() is None
+    assert holder['d'].result is None
+    assert errors == []
+
+
+def test_shown_and_logged_errors_are_redacted(nicegui_client, monkeypatch):
+    errors = []
+    monkeypatch.setattr(dlg.logger, 'error', lambda msg, *a, **k: errors.append(str(msg)))
+
+    def fetch(*a, **k):
+        raise RuntimeError('GET https://data.example/v2/bars?apikey=SECRET123&token=TOKEN456 failed')
+
+    _open(nicegui_client, {'AAPL': 100.0}, fetch)
+    shown = ' '.join(_texts(nicegui_client))
+    assert 'failed' in shown
+    for secret in ('SECRET123', 'TOKEN456'):
+        assert secret not in shown
+        assert not any(secret in m for m in errors)
+
+
+def test_closing_the_dialog_deletes_it(nicegui_client):
+    d = _open(nicegui_client, {'AAPL': 100.0}, lambda *a, **k: _inputs(CLOSES))
+    with nicegui_client:
+        d.close()
+    assert d.dialog.is_deleted
+
+
+def test_the_card_shows_a_data_gap(nicegui_client):
+    closes = {'AAPL': CLOSES['AAPL'], 'HALT': {'2025-09-01': 50.0, '2026-11-11': 60.0}}
+    _open(nicegui_client, {'AAPL': 50.0, 'HALT': 50.0}, lambda *a, **k: _inputs(closes))
+    texts = _texts(nicegui_client)
+    assert any('data gap' in t.lower() for t in texts)

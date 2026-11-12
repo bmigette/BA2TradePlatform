@@ -15,9 +15,13 @@ the SAME basis -- the service (``services/label_growth.py``) hands in FMP ``clos
 reason. Nothing here adjusts anything: amounts are used exactly as given.
 
 RULES THAT ARE NOT ARITHMETIC
-* The base close of a horizon is the last bar ON OR BEFORE its start date. A symbol with no bar that early did not
-  exist for the whole period: its slice is held as CASH until its first bar, invested at that close, and the row and
-  the horizon both say so ("N of M symbols did not exist for the whole period").
+* The base close of a horizon is the last bar ON OR BEFORE its start date. History is fetched from a full year before
+  the longest horizon (``FETCH_BUFFER_DAYS``), so a symbol with no bar between that fetch start and a horizon's start
+  had no price for at least a year before it: it did not exist (or did not trade) for the whole period. Its slice is
+  held as CASH until its first bar, invested at that close, and the row (with the dates actually observed) and the
+  horizon both say so ("N of M symbols did not exist for the whole period").
+* A base close more than ``GAP_DAYS`` before the start is a DATA GAP (a halt, a hole in the store), not a late start:
+  the slice is invested at that last real close and the row and the horizon flag the gap with its dates.
 * A symbol with no price history at all is UNMEASURABLE: its slice stays cash, clearly marked, never priced.
 * A distribution counts when its ex-date is AFTER the buy bar (a buy at the ex-date's close is already ex) and on or
   before the symbol's last bar. A distribution whose amount is unknown, or a history that could not be fetched, makes
@@ -45,17 +49,25 @@ HORIZONS: Tuple[str, ...] = ('ytd', '1y', '3y', '5y')
 HORIZON_NAMES = {'ytd': 'YTD', '1y': '1 year', '3y': '3 years', '5y': '5 years'}
 _YEARS_BACK = {'1y': 1, '3y': 3, '5y': 5}
 
-#: Calendar days fetched before the longest horizon's start, so that its base bar (the last one on or before the start
-#: date) is in the fetched window across a weekend plus a holiday.
-FETCH_BUFFER_DAYS = 14
+#: Calendar days fetched before the longest horizon's start. A YEAR, not a holiday weekend: "no bar between the fetch
+#: start and the horizon start" must mean the symbol had no price for a long time (it did not exist or did not trade),
+#: not that it was halted for two weeks -- with 14 days a short halt read as "did not exist".
+FETCH_BUFFER_DAYS = 366
+
+#: A base close older than this (calendar days before the start) is reported as a data gap. Seven covers the longest
+#: ordinary closure before a start date (a weekend plus Christmas / New Year).
+GAP_DAYS = 7
 
 #: Shares are stored on a cent grid; a total within this of 100 is 100.
 SHARE_TOLERANCE_PCT = 0.005
 
 STATUS_INVESTED = 'invested'
 STATUS_LATE = 'late'
+STATUS_GAP = 'gap'
 STATUS_NO_HISTORY = 'no_history'
 STATUS_ZERO_SHARE = 'zero_share'
+#: The statuses that hold shares (the rest hold cash or nothing).
+ACTIVE_STATUSES = (STATUS_INVESTED, STATUS_LATE, STATUS_GAP)
 
 SERIES_PRICE = 'Price only'
 SERIES_TOTAL = 'Price + distributions (cash)'
@@ -150,6 +162,7 @@ class HorizonResult:
     invested_count: int
     late_symbols: List[str]
     no_history_symbols: List[str]
+    gap_symbols: List[str] = field(default_factory=list)
     distributions_unknown: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     series_dates: List[str] = field(default_factory=list)
@@ -213,7 +226,7 @@ def _gain_pct(value: Optional[float], invested: float) -> Optional[float]:
 
 
 def _simulate_symbol(symbol: str, share: float, slice_: float, bars: List[Tuple[str, float]], dropped: int,
-                     payouts: Optional[DistributionHistory], start_iso: str,
+                     payouts: Optional[DistributionHistory], start_iso: str, history_from: str,
                      unknown: List[str]) -> SymbolOutcome:
     notes: List[str] = []
     if dropped:
@@ -233,10 +246,16 @@ def _simulate_symbol(symbol: str, share: float, slice_: float, bars: List[Tuple[
         else:
             break
     late = base is None
+    gap = False
     if late:
         base = bars[0]
-        notes.insert(0, f"Did not exist at the start: held as cash until its first price on {base[0]}, "
-                        f"invested then")
+        notes.insert(0, f"No price on or before the start ({start_iso}) in the history fetched from "
+                        f"{history_from}: did not exist or did not trade then; held as cash until its first price "
+                        f"on {base[0]}, invested then")
+    elif (date.fromisoformat(start_iso) - date.fromisoformat(base[0])).days > GAP_DAYS:
+        gap = True
+        notes.insert(0, f"Data gap: no price between {base[0]} and the start ({start_iso}); bought at the "
+                        f"{base[0]} close, the last real price before the start")
     buy_date, buy_price = base
     last_date, last_price = bars[-1]
     qty = slice_ / buy_price
@@ -262,7 +281,7 @@ def _simulate_symbol(symbol: str, share: float, slice_: float, bars: List[Tuple[
     dist = None if per_share is None else qty * per_share
     total = None if dist is None else price_value + dist
     return SymbolOutcome(
-        symbol, share, slice_, STATUS_LATE if late else STATUS_INVESTED,
+        symbol, share, slice_, STATUS_LATE if late else (STATUS_GAP if gap else STATUS_INVESTED),
         buy_date=buy_date, buy_price=buy_price, last_date=last_date, last_price=last_price, quantity=qty,
         price_value=price_value, distributions_per_share=per_share, distributions=dist, total_value=total,
         price_gain_pct=_gain_pct(price_value, slice_), total_gain_pct=_gain_pct(total, slice_),
@@ -273,7 +292,7 @@ def _series(rows: List[SymbolOutcome], bars_by: Dict[str, List[Tuple[str, float]
             payouts_by: Mapping[str, DistributionHistory], start_iso: str, end_iso: Optional[str],
             constant_cash: float, totals_known: bool) -> Tuple[List[str], List[float], Optional[List[float]]]:
     """The label's simulated value on every bar date in (start, end], plus a first point at the start date."""
-    active = [r for r in rows if r.status in (STATUS_INVESTED, STATUS_LATE)]
+    active = [r for r in rows if r.status in ACTIVE_STATUSES]
     cash = constant_cash + sum(r.invested for r in rows if r.status == STATUS_NO_HISTORY)
     dates = sorted({d for r in active for d, _c in bars_by[r.symbol] if start_iso < d <= (end_iso or start_iso)})
     dates = [start_iso] + dates
@@ -318,6 +337,7 @@ def simulate_horizon(horizon: str, amount: float, shares: Mapping[str, float],
     amount, shares, share_total = _validate(amount, shares)
     as_of_iso = as_of.isoformat()
     start_iso = horizon_start(horizon, as_of).isoformat()
+    history_from = history_start(as_of).isoformat()
     unassigned_pct = max(0.0, 100.0 - share_total)
     if unassigned_pct < SHARE_TOLERANCE_PCT:
         unassigned_pct = 0.0
@@ -332,9 +352,9 @@ def simulate_horizon(horizon: str, amount: float, shares: Mapping[str, float],
         bars, dropped = _usable_bars(upper.get(symbol), as_of_iso)
         bars_by[symbol] = bars
         rows.append(_simulate_symbol(symbol, share, amount * share / 100.0, bars, dropped,
-                                     payouts_by.get(symbol), start_iso, unknown))
+                                     payouts_by.get(symbol), start_iso, history_from, unknown))
 
-    active = [r for r in rows if r.status in (STATUS_INVESTED, STATUS_LATE)]
+    active = [r for r in rows if r.status in ACTIVE_STATUSES]
     end_iso = max((r.last_date for r in active), default=None)
     for r in active:
         if end_iso and r.last_date < end_iso:
@@ -351,11 +371,16 @@ def simulate_horizon(horizon: str, amount: float, shares: Mapping[str, float],
     invested = [r for r in rows if r.status != STATUS_ZERO_SHARE]
     late = [r.symbol for r in rows if r.status == STATUS_LATE]
     blind = [r.symbol for r in rows if r.status == STATUS_NO_HISTORY]
+    gaps = [r.symbol for r in rows if r.status == STATUS_GAP]
     notes: List[str] = []
     if late:
         first = ', '.join(f"{r.symbol} from {r.buy_date}" for r in rows if r.status == STATUS_LATE)
         notes.append(f"{len(late)} of {len(invested)} symbols did not exist for the whole period: their slice was "
                      f"held as cash until their first price ({first}).")
+    if gaps:
+        first = ', '.join(f"{r.symbol} last priced {r.buy_date}" for r in rows if r.status == STATUS_GAP)
+        notes.append(f"{len(gaps)} of {len(invested)} symbols have a data gap at the start (no price in the "
+                     f"{GAP_DAYS} days before it): bought at their last earlier close ({first}).")
     if blind:
         notes.append(f"{len(blind)} of {len(invested)} symbols have no price history at all ({', '.join(blind)}): "
                      f"unmeasurable, their slice is held as cash.")
@@ -379,7 +404,7 @@ def simulate_horizon(horizon: str, amount: float, shares: Mapping[str, float],
         distributions=distributions_total, total_value=total_value,
         total_gain=None if total_value is None else total_value - amount,
         total_gain_pct=_gain_pct(total_value, amount),
-        rows=rows, invested_count=len(invested), late_symbols=late, no_history_symbols=blind,
+        rows=rows, invested_count=len(invested), late_symbols=late, no_history_symbols=blind, gap_symbols=gaps,
         distributions_unknown=unknown, notes=notes,
         series_dates=dates, series_price=series_price, series_total=series_total)
 
@@ -432,8 +457,8 @@ def gain_color(value: Optional[float]) -> str:
     return '#00d4aa' if value > 0 else '#ff6b6b'
 
 
-STATUS_TEXT = {STATUS_INVESTED: 'Held', STATUS_LATE: 'Late start', STATUS_NO_HISTORY: 'Unmeasurable (cash)',
-               STATUS_ZERO_SHARE: '0% share'}
+STATUS_TEXT = {STATUS_INVESTED: 'Held', STATUS_LATE: 'Late start', STATUS_GAP: 'Data gap at start',
+               STATUS_NO_HISTORY: 'Unmeasurable (cash)', STATUS_ZERO_SHARE: '0% share'}
 
 
 def table_rows(h: HorizonResult) -> List[Dict[str, Any]]:

@@ -378,3 +378,41 @@ def test_money_and_percent_formatting():
     assert sim.fmt_signed_pct(12.346) == '+12.35%'
     assert sim.fmt_signed_pct(-0.5) == '-0.50%'
     assert sim.fmt_signed_pct(None) == 'n/a'
+
+
+# ---------------------------------------------------------------------------
+# review 2026-11-12: "late start" must be truthful; a stale base is a data gap
+# ---------------------------------------------------------------------------
+
+def test_history_is_fetched_a_full_year_before_the_longest_horizon():
+    """A symbol with no bar in the fetched window before a start date then has had no price for at least a year,
+    so 'did not trade before X' is true; with a 14-day buffer a two-week halt read as 'did not exist'."""
+    assert sim.FETCH_BUFFER_DAYS >= 365
+    assert history_start(AS_OF) <= date(2020, 11, 12)
+
+
+def test_a_late_starter_note_says_what_was_actually_observed():
+    closes = {'NEW': {'2024-06-03': 20.0, '2026-11-11': 30.0}}
+    row = _run({'NEW': 100.0}, closes, horizons=('3y',)).horizons['3y'].rows[0]
+    assert row.status == STATUS_LATE
+    assert history_start(AS_OF).isoformat() in row.note          # "no price since <fetch start>"
+    assert '2024-06-03' in row.note
+
+
+def test_a_base_close_far_before_the_start_is_flagged_as_a_data_gap_not_hidden():
+    closes = {'HALT': {'2025-09-01': 50.0, '2026-02-02': 55.0, '2026-11-11': 60.0},
+              'AAA': {'2025-11-12': 10.0, '2026-11-11': 11.0}}
+    h = _run({'HALT': 50.0, 'AAA': 50.0}, closes, horizons=('1y',)).horizons['1y']
+    halt = {r.symbol: r for r in h.rows}['HALT']
+    assert halt.status == sim.STATUS_GAP
+    assert halt.buy_date == '2025-09-01' and halt.buy_price == 50.0      # the last REAL close, never invented
+    assert 'gap' in halt.note.lower() and '2025-09-01' in halt.note
+    assert h.gap_symbols == ['HALT']
+    assert any('HALT' in n and 'gap' in n.lower() for n in h.notes)
+    assert h.price_value == pytest.approx(5_000.0 / 50.0 * 60.0 + 5_500.0)   # still invested, from that close
+
+
+def test_a_holiday_weekend_before_the_start_is_not_a_gap():
+    closes = {'AAA': {'2025-12-24': 100.0, '2026-11-11': 110.0}}          # 31 Dec base 7 days back: Christmas week
+    row = _run({'AAA': 100.0}, closes, horizons=('ytd',)).horizons['ytd'].rows[0]
+    assert row.status == STATUS_INVESTED
