@@ -186,3 +186,13 @@ def test_wire_all_seams_installs_both_resolvers():
     src = inspect.getsource(seam_wiring.wire_all_seams)
     assert "set_live_history_resolver(account_history.history_spec_for_expert)" in src
     assert "set_indicator_provider_resolver(account_history.indicator_provider_for_expert)" in src
+
+
+# ---- rule conditions (realised vol, relative volume, recent high) ---------------------------------
+def test_live_wiring_points_rule_conditions_at_the_accounts_history():
+    from ba2_common.core import TradeConditions as TC
+    from ba2_trade_platform.core.seam_wiring import wire_all_seams
+    wire_all_seams()
+    assert TC.get_account_history_provider_resolver() is AH.history_provider_for_account
+    f = account("fmp")
+    assert type(TC._history_ohlcv_provider(SimpleNamespace(id=f.id))).__name__ == "FMPOHLCVProvider"

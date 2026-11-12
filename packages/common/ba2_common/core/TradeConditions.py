@@ -232,6 +232,38 @@ def _get_provider(category, name, **kwargs):
     return _provider_resolver(category, name, **kwargs)
 
 
+#: Host seam: ``fn(account_id) -> OHLCV provider`` of the HISTORY a LIVE account's rule conditions read (the
+#: account's ``ohlcv_history_source``; live wires ``account_history.history_provider_for_account``). Unwired (the
+#: test platform, a replay, the packages alone) a condition asks the provider resolver for ``LIVE_OHLCV_PROVIDER``,
+#: and a backtest's resolver returns the run's own history whatever name is asked.
+_account_history_provider_resolver: Optional[Callable[[int], Any]] = None
+
+
+def set_account_history_provider_resolver(fn: Optional[Callable[[int], Any]]) -> None:
+    global _account_history_provider_resolver
+    _account_history_provider_resolver = fn
+
+
+def get_account_history_provider_resolver() -> Optional[Callable[[int], Any]]:
+    return _account_history_provider_resolver
+
+
+def _history_ohlcv_provider(account) -> Any:
+    """The daily-history provider a rule condition reads its window from (realised volatility, relative
+    volume, distance from the recent high).
+
+    Until 2026-11-12 these sites asked for ``"yfinance"`` by name. Live that meant Yahoo's DIVIDEND-adjusted
+    bars while the backtest of the same rule read the run's split-adjusted history: two price bases for one
+    condition, and a refused cache top-up at every ex-dividend larger than the guard's tolerance (IBM
+    2026-11-10, SCCO 2026-11-03), which failed every entry rule on the symbol. Now the ACCOUNT's history
+    source answers, the same source its experts decide on. A failing resolver propagates: there is no
+    fallback to another vendor's prices."""
+    if _account_history_provider_resolver is not None:
+        return _account_history_provider_resolver(account.id)
+    from ba2_common.core.backtest_context import LIVE_OHLCV_PROVIDER
+    return _get_provider("ohlcv", LIVE_OHLCV_PROVIDER)
+
+
 class TradeCondition(ABC):
     """
     Base class for all trading conditions.
@@ -474,7 +506,7 @@ class TradeCondition(ABC):
         end_date, clock_ok = self._as_of_fetch_end()
         if not clock_ok:
             return None, False
-        provider = _get_provider("ohlcv", "yfinance")
+        provider = _history_ohlcv_provider(self.account)
         # LIVE (end_date None) IS NEVER MEMOISED: the live frame is whatever the provider returns
         # now, so a transient empty answer would stay UNKNOWN for the whole day and a frame that
         # moves intraday would be frozen at its first read. Only a CLAMPED session is a pure
@@ -2809,7 +2841,7 @@ class PercentAboveRecentLowCondition(CompareCondition):
 
             # Resolve the OHLCV provider via the host-injected resolver
             # (ba2_common never imports ba2_providers).
-            df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+            df = _history_ohlcv_provider(self.account).get_ohlcv_data(
                 self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.RECENT_WINDOW * 2 + 10)
             if df is None or df.empty:
@@ -3070,7 +3102,7 @@ class RelativeVolumeCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
-            df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+            df = _history_ohlcv_provider(self.account).get_ohlcv_data(
                 self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.BASELINE_WINDOW * 2 + 10)
             if df is None or df.empty or "Volume" not in df:
@@ -3212,7 +3244,7 @@ class IVToRealizedVolCondition(CompareCondition):
         end_date, clock_ok = self._as_of_fetch_end()
         if not clock_ok:
             return None
-        df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+        df = _history_ohlcv_provider(self.account).get_ohlcv_data(
             self.instrument_name, interval="1d", end_date=end_date,
             lookback_days=self.REALIZED_WINDOW * 2 + 10)
         if df is None or df.empty or "Close" not in df:

@@ -132,6 +132,11 @@ def wire_all_seams() -> None:
         from ..modules.dataproviders import get_provider
 
         TradeConditions.set_provider_resolver(get_provider)
+        #    ... and the HISTORY its data conditions read is the account's own (ohlcv_history_source),
+        #    not a vendor named in the condition.
+        from .account_history import history_provider_for_account
+
+        TradeConditions.set_account_history_provider_resolver(history_provider_for_account)
 
         # 4b) Per-account live OHLCV history source (plan 2026-10-24-history-source-task11): the expert bundle's
         #     OHLCV provider and the classic RM's ATR provider follow the expert's account setting.
