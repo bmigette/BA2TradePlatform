@@ -909,7 +909,8 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
                          target_value=row.get('target_value'),
                          current_value=row.get('current_value'),
                          quantity=row.get('quantity'),
-                         price=row.get('price'))
+                         price=row.get('price'),
+                         cost_valued=row['cost_valued'])
     row['share_delta'] = format_delta(delta.share, suffix='pp')
     row['share_delta_color'] = delta_color(delta.share)
     row['value_delta'] = format_delta(delta.value)
@@ -921,7 +922,10 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     # The shares that target buys. ``None`` stays None all the way to the cell --
     # an unpriced row prints nothing rather than a 0 that claims a target of none.
     target_qty = symbol_target_quantity(target_value=row.get('target_value'),
-                                        price=row.get('price'))
+                                        price=row.get('price'),
+                                        current_value=row.get('current_value'),
+                                        quantity=row.get('quantity'),
+                                        cost_valued=row['cost_valued'])
     row['target_quantity'] = None if target_qty is None else round(target_qty, 4)
 
 
@@ -3330,6 +3334,9 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         'weight_key': 0,
         'quantity': round(r.quantity, 4),
         'cost_basis': round(r.cost_basis, 2),
+        # ``cost`` valuation mode: ``current_value`` above is the cost basis, and the
+        # share columns must convert the way the engine does (``symbol_target_quantity``).
+        'cost_valued': view.valuation_mode == VALUATION_MODE_COST,
         'price': None if r.price is None else round(r.price, 4),
         'market_value': None if r.market_value is None else round(r.market_value, 2),
         'comment': r.comment or '',

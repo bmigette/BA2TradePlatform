@@ -867,6 +867,10 @@ class LabelView:
     #: Share of the label freed by automatic TP/SL weight reductions and left UNALLOCATED:
     #: ``100 - total of the stored shares``, reported only for a label that has such a record.
     freed_pct: float = 0.0
+    #: The valuation mode these figures were measured in (``cost`` | ``market``). Carried so
+    #: the table converts a money gap into shares the way the engine does -- see
+    #: ``symbol_target_quantity``.
+    valuation_mode: str = VALUATION_MODE_MARKET
 
 
 def build_label_views(managed,
@@ -1189,6 +1193,7 @@ def build_label_views(managed,
             pct_of_base=(label_value / base * 100.0) if base else None,
             target_value=label_target_value,
             color=entry.color,
+            valuation_mode=valuation_mode,
             previous_target_pct=entry.previous_target_pct,
             # ONE call over the whole membership, deliberately NOT a combination of
             # the rows' own figures: the engine sums market value and gross cost
@@ -1813,8 +1818,19 @@ def emitted_value(event) -> Any:
 
 
 def symbol_target_quantity(*, target_value: Optional[float],
-                           price: Optional[float]) -> Optional[float]:
+                           price: Optional[float],
+                           current_value: Optional[float] = None,
+                           quantity: Optional[float] = None,
+                           cost_valued: bool = False) -> Optional[float]:
     """The shares a target's MONEY buys at this price. Pure. ``None`` when unknown.
+
+    ``cost_valued`` (the account is in ``cost`` valuation mode, so ``current_value`` is
+    the COST BASIS) converts the way ``portfolio_allocation.compute_allocation`` does:
+    the target is ``held shares + gap / unit``, where ``gap = target - cost basis`` and
+    the unit is the market PRICE for a buy (a bought share adds its price to the basis)
+    but the AVERAGE COST for a trim (a sold share removes its average cost). Dividing the
+    whole target by the price there compares cost with market: on a position that is
+    under water it printed "buy more" under a money column that said "over target".
 
     Derived from the money rather than from the share, because the money is what
     the engine actually solves for: dividing the same number the Target value
@@ -1826,12 +1842,26 @@ def symbol_target_quantity(*, target_value: Optional[float],
     """
     if target_value is None or price is None or not float(price):
         return None
-    return float(target_value) / float(price)
+    if not cost_valued:
+        return float(target_value) / float(price)
+    if current_value is None or quantity is None:
+        return None
+    held = float(quantity)
+    gap = float(target_value) - float(current_value)
+    if gap >= 0:
+        return held + gap / float(price)
+    avg_cost = float(current_value) / held if held > 0 else 0.0
+    if avg_cost <= 0:
+        # No usable average cost (no shares, or a non-positive basis): the engine trims
+        # nothing here, and neither does this column.
+        return held
+    return held + gap / avg_cost
 
 
 def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
                  target_value: Optional[float], current_value: Optional[float],
-                 quantity: Optional[float], price: Optional[float]) -> SymbolDelta:
+                 quantity: Optional[float], price: Optional[float],
+                 cost_valued: bool = False) -> SymbolDelta:
     """The three live deltas for one row: share points, money, and shares. Pure.
 
     ``share`` is in PERCENTAGE POINTS of the label (typed target minus held share), not
@@ -1855,7 +1885,9 @@ def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
     # THROUGH the same helper the Target qty COLUMN is written from, never a second
     # copy of the division: the column and the change printed under it are the same
     # subtraction seen from both ends, and two divisions would let them drift.
-    target_qty = symbol_target_quantity(target_value=target_value, price=price)
+    target_qty = symbol_target_quantity(target_value=target_value, price=price,
+                                        current_value=current_value, quantity=quantity,
+                                        cost_valued=cost_valued)
     qty = (None if target_qty is None or quantity is None
            else target_qty - float(quantity))
     return SymbolDelta(share=share, value=value, quantity=qty)
