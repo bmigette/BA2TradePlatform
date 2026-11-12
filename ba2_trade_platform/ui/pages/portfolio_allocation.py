@@ -82,6 +82,11 @@ rows ticked in one label's table. Both go through ``_open_symbol_info``, so the
 FMP-key and empty-selection refusals exist once, and the panel is built ON CLICK
 -- never at render -- because it fetches over the network.
 
+The chart icon on each label's header opens the label GROWTH SIMULATOR
+(``label_growth_dialog.py``): what an amount put into the label YTD / 1 / 3 / 5
+years ago, split by its current effective shares, would be worth today. Read-only,
+fetched on click.
+
 This repo uses no ``ui.refreshable`` / ``ui.stepper`` / ``ui.aggrid``: refresh is
 ``container.clear()`` followed by rebuilding inside ``with container:``. Blocking
 broker work goes through ``asyncio.to_thread``.
@@ -193,6 +198,7 @@ from ..utils import allocator_protection_view as protect_view
 from ..utils.allocator_protection_view import label_badge_segments, label_extras_text
 from ..utils.portfolio_allocation_view import effective_symbol_weights
 from .allocator_protection_dialog import open_protection_dialog
+from .label_growth_dialog import open_label_growth
 from .portfolio_allocation_wizard import (
     notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
@@ -651,6 +657,10 @@ MARKER_LABEL_PNL_DIV = 'pf-label-pnl-div'
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
 MARKER_LABEL_ICON = 'pf-label-icon'
+#: The chart icon among the header's controls (pencil, chart, info): opens the label growth simulator.
+MARKER_LABEL_GROWTH_SIM = 'pf-label-growth-sim'
+LABEL_GROWTH_SIM_TOOLTIP = ('Growth simulator: what an amount (default $10,000) put into this label YTD, 1, 3 or '
+                            '5 years ago, split by its current shares, would be worth today')
 #: The orange count beside that icon: symbols in the label whose share is 0% or
 #: unset. Marked because its text is a bare integer that repeats all over the row.
 MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
@@ -2365,6 +2375,37 @@ def _open_symbol_info(symbols) -> None:
                      display_names=_display_names_for(symbols))
 
 
+def label_growth_split(live: Dict[str, Any], label: str):
+    """``(shares, excluded, unset)`` of one label AS THE TABLE SHOWS IT NOW: ``shares`` is the effective share of the
+    label per symbol (``effective_symbol_weights`` over the live, possibly just-edited weights -- defaults and even
+    splits included, excluded symbols out and their share spread over the rest), ``excluded`` / ``unset`` the label's
+    symbols that are not in it. Reads ``live`` only."""
+    view = live['view_by_label'][label]
+    weights = live['weights'][label] if label in live['weights'] else {}
+    shares = effective_symbol_weights(weights, live['exclusions'])
+    symbols = [(r.symbol or '').strip().upper() for r in view.rows]
+    stored = {(k or '').strip().upper() for k in weights}
+    excluded = [s for s in symbols if s in live['exclusions']]
+    unset = [s for s in symbols if s not in stored and s not in live['exclusions']]
+    return shares, excluded, unset
+
+
+def _open_label_growth(account_id: int, live: Dict[str, Any], label: str) -> None:
+    """The chart icon on a label's header: open the growth simulator on the label's CURRENT effective split.
+
+    Read-only. Not a coroutine, like ``_open_symbol_info``: the dialog starts its own fetch task on the running loop,
+    and the fetch itself runs in ``asyncio.to_thread``. The distributions come from FMP, so with no key it says
+    which setting is missing instead of opening an empty dialog."""
+    api_key = get_app_setting('FMP_API_KEY')
+    if not api_key:
+        ui.notify('FMP API key not configured. Please set FMP_API_KEY in '
+                  'Settings > App Settings.', type='warning')
+        return
+    shares, excluded, unset = label_growth_split(live, label)
+    open_label_growth(account_id, label, shares, api_key=api_key, as_of=date.today(),
+                      excluded=excluded, unset=unset)
+
+
 def _display_names_for(symbols) -> Dict[str, str]:
     """``{SYMBOL: company name}`` for the info panel, fetching what is not on file.
 
@@ -2767,7 +2808,8 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
         height: 1px; background: rgba(255,255,255,0.22); margin: 2px 0 4px; }
     .pf-bar-row.pf-bar-row > * { width: auto !important; min-width: 0 !important;
         max-width: 100% !important; }
-    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
+    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-sim,
+    .pf-bar-row > .pf-b-info {
         padding: 8px; box-sizing: content-box; font-size: 24px; }
     /* ONE CARD, not a box in a box: the expansion's header row and its container each
        painted their own translucent panel and padding inside the card above. */
@@ -2776,7 +2818,7 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
     .q-expansion-item:has(.pf-bar-row) .q-item { background: transparent !important;
         padding: 8px 6px 8px 10px !important; }
     /* LINE 1: the FULL label name, bold, wrapping allowed (never an ellipsis).
-       LINE 2: colour tag, badges, symbol count, edit, info -- 40px tap targets. */
+       LINE 2: colour tag, badges, symbol count, edit, simulator, info -- 40px tap targets. */
     .pf-bar-row.pf-bar-row > .pf-b-name { order: 1; flex: 1 1 100% !important;
         font-size: 1.1rem; font-weight: 700 !important; line-height: 1.25;
         white-space: normal !important; overflow: visible !important;
@@ -2786,6 +2828,7 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
     .pf-bar-row > .pf-b-warn { order: 2; }
     .pf-bar-row > .pf-b-count { order: 3; }
     .pf-bar-row > .pf-b-edit { order: 4; margin-left: auto; }
+    .pf-bar-row > .pf-b-sim { order: 4; }
     .pf-bar-row > .pf-b-info { order: 5; }
     .pf-bar-row.pf-bar-row > .pf-b-value { order: 10; flex: 1 1 auto !important;
         text-align: left; font-size: 1rem; font-weight: 600; }
@@ -3851,6 +3894,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 .on('click.stop',
                     lambda _e=None, lbl=view.label: _focus_label_target(live, lbl)) \
                 .tooltip('Edit this label’s portfolio target')
+            # The growth simulator. ``click.stop`` like the pencil: it must not fold the label.
+            ui.icon('show_chart').classes('cursor-pointer text-secondary-custom pf-b-sim') \
+                .mark(MARKER_LABEL_GROWTH_SIM) \
+                .on('click.stop',
+                    lambda _e=None, lbl=view.label: _open_label_growth(account_id, live, lbl)) \
+                .tooltip(LABEL_GROWTH_SIM_TOOLTIP)
             # The ⓘ that took the long clause off the header line. Its tooltip is
             # created ONCE and re-texted on every redraw: calling ``.tooltip()``
             # again would add a second tooltip element, and by the tenth keystroke
