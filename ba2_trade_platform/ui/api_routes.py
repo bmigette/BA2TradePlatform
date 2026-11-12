@@ -112,10 +112,10 @@ def run_schedule(expert_instance_id: int, subtype_text: str, dry_run: bool = Fal
     operator re-run TODAY'S occurrence immediately (e.g. after fixing a bug that caused it
     to return nothing) without touching the schedule itself.
 
-    Looks up the LIVE APScheduler job for (expert_instance_id, subtype) to recover the
-    exact ``symbol`` argument the schedule resolved when it was registered (a special
-    placeholder -- SCREENER/DYNAMIC/EXPERT/OPEN_POSITIONS -- or a static symbol), then
-    submits it through the SAME job_manager.submit_market_analysis() path the UI button
+    Looks up the LIVE APScheduler jobs for (expert_instance_id, subtype) to recover the
+    exact ``symbol`` argument each resolved when it was registered (a special
+    placeholder -- SCREENER/DYNAMIC/EXPERT/OPEN_POSITIONS -- or, for a static universe, one
+    job per symbol: ALL of them are fired), then submits each through the SAME job_manager.submit_market_analysis() path the UI button
     calls (bypass_balance_check/bypass_transaction_check=True, matching a manual trigger).
     404s if no matching job is currently scheduled (e.g. the expert is disabled, or this
     subtype isn't configured for it).
@@ -133,14 +133,19 @@ def run_schedule(expert_instance_id: int, subtype_text: str, dry_run: bool = Fal
         )
 
     jm = get_job_manager()
-    match = None
+    # EVERY registered job of this expert + subtype, in registration order. An expert on a
+    # placeholder universe (SCREENER / DYNAMIC / EXPERT / OPEN_POSITIONS) has one job; an
+    # expert on a STATIC list has one job PER SYMBOL. Taking the first match only -- what this
+    # did until 2026-11-12 -- ran a 97-name expert on its first name alone and answered 200,
+    # so "run the schedule now" silently analysed 1% of it.
+    symbols = []
     for job in jm._scheduled_jobs.values():
         args = getattr(job, "args", None) or []
-        if len(args) >= 3 and args[0] == expert_instance_id and args[2] == subtype:
-            match = args
-            break
+        if len(args) >= 3 and args[0] == expert_instance_id and args[2] == subtype \
+                and args[1] not in symbols:
+            symbols.append(args[1])
 
-    if match is None:
+    if not symbols:
         raise HTTPException(
             status_code=404,
             detail=f"No currently-scheduled job found for expert_instance_id="
@@ -148,42 +153,57 @@ def run_schedule(expert_instance_id: int, subtype_text: str, dry_run: bool = Fal
                    f"(is the expert enabled? does it have this schedule configured?)",
         )
 
-    expert_instance_id, symbol, resolved_subtype = match[0], match[1], match[2]
     if dry_run:
         return {
             "status": "dry_run",
             "would_submit": True,
             "expert_instance_id": expert_instance_id,
-            "symbol": symbol,
-            "subtype": resolved_subtype.value,
+            "symbol": symbols[0],
+            "symbols": symbols,
+            "subtype": subtype.value,
         }
-    try:
-        task_id = jm.submit_market_analysis(
-            expert_instance_id, symbol, subtype=resolved_subtype,
-            bypass_balance_check=True, bypass_transaction_check=True,
-        )
-    except ValueError as e:
-        # e.g. expert disabled/not found since the schedule was registered, or ENTER_MARKET
-        # skipped because a transaction already exists for this expert+symbol.
-        raise HTTPException(status_code=409, detail=str(e))
+    tasks, skipped = [], []
+    for symbol in symbols:
+        try:
+            task_id = jm.submit_market_analysis(
+                expert_instance_id, symbol, subtype=subtype,
+                bypass_balance_check=True, bypass_transaction_check=True,
+            )
+        except ValueError as e:
+            # e.g. expert disabled/not found since the schedule was registered, or ENTER_MARKET
+            # skipped because a transaction already exists for this expert+symbol. One symbol's
+            # refusal must not hide the others: it is reported, never dropped.
+            skipped.append({"symbol": symbol, "reason": str(e)})
+            continue
+        if task_id is None:
+            skipped.append({"symbol": symbol, "reason": "analysis skipped (e.g. an existing "
+                            "transaction already covers this expert+symbol)"})
+            continue
+        tasks.append({"symbol": symbol, "task_id": task_id})
 
-    if task_id is None:
+    if not tasks:
         raise HTTPException(
             status_code=409,
-            detail="Analysis skipped (e.g. an existing transaction already covers this "
-                   "expert+symbol) -- nothing was queued.",
+            detail="Nothing was queued: " + "; ".join(
+                f"{s['symbol']}: {s['reason']}" for s in skipped),
         )
 
     logger.info(
         f"run_schedule_now: manually triggered expert={expert_instance_id} "
-        f"symbol={symbol} subtype={resolved_subtype.value} -> task_id={task_id}"
+        f"subtype={subtype.value} -> {len(tasks)} task(s) "
+        f"{[(t['symbol'], t['task_id']) for t in tasks]}"
+        + (f", {len(skipped)} skipped {skipped}" if skipped else "")
     )
+    # ``task_id`` / ``symbol`` are the FIRST queued job's (the whole answer for a one-job
+    # expert, kept for existing callers); ``tasks`` and ``skipped`` account for every symbol.
     return {
         "status": "ok",
-        "task_id": task_id,
+        "task_id": tasks[0]["task_id"],
         "expert_instance_id": expert_instance_id,
-        "symbol": symbol,
-        "subtype": resolved_subtype.value,
+        "symbol": tasks[0]["symbol"],
+        "subtype": subtype.value,
+        "tasks": tasks,
+        "skipped": skipped,
     }
 
 
