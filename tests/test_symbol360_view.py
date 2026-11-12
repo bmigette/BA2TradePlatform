@@ -257,9 +257,9 @@ def test_dated_price_targets_become_a_details_table_newest_first():
         {"fmp": _fmp(analyst_count=1, buy=1),
          "price_targets": [
              {"publishedDate": "2026-08-01T00:00", "analystCompany": "A", "analystName": "x",
-              "priceTarget": 200},
+              "priceTarget": 200, "adjPriceTarget": 200},
              {"publishedDate": "2026-09-01T00:00", "analystCompany": "B", "analystName": "y",
-              "priceTarget": 210}]},
+              "priceTarget": 210, "adjPriceTarget": 210}]},
         current_price=190.0)
 
     table = card.tables[0]

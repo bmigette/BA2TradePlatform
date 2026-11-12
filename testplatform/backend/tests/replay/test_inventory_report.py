@@ -89,9 +89,13 @@ def test_a_capability_with_no_rows_is_not_run_for_every_analysis(session):
     report = inventory.run(session)
     coverage = report["coverage_by_capability"]
 
+    assert coverage[ReplayStatus.CAPABILITY_HISTORICAL][ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS), (
+        "historical has no rows and must read not_run, not vanish")
+    # The decision capability answers for stock DECISION PASSES (tests/test_decision_pass_replay.py); this
+    # session holds expert analyses only, so none is owed a decision replay -- but the capability still
+    # appears, with every status key.
+    assert coverage[ReplayStatus.CAPABILITY_DECISION][ReplayStatus.COVERAGE_NOT_RUN] == 0
     for capability in (ReplayStatus.CAPABILITY_HISTORICAL, ReplayStatus.CAPABILITY_DECISION):
-        assert coverage[capability][ReplayStatus.COVERAGE_NOT_RUN] == len(ALL_IDS), (
-            f"{capability} has no rows and must read not_run, not vanish")
         assert set(coverage[capability]) == set(STATUS_ORDER)
 
 

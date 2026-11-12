@@ -381,3 +381,349 @@ def test_market_open_is_consulted_before_any_close():
 
     assert account.market_open_calls == 1
     assert account.closed == [txn.id]
+
+
+# --------------------------------------------------------------------------- #
+# The forced close never sells more than THIS transaction still holds
+#
+# Dev 8080 NVDA transaction 468, 2026-11-09: long 4; its OCO stop leg (order 1560) sold 1
+# share at 14:30:59 and was then cancelled by this safety net at 14:31:27, which staged the
+# close (WAITING_TRIGGER on 1560's CANCELED) at the 4 the DB still believed were held. When
+# the refresh synced 1560 CANCELED with filled_qty 1, the trigger sweep submitted the close
+# for 4: 5 shares sold for a 4-share position, the 5th out of another NVDA transaction.
+#
+# These run the REAL chain: the safety net -> AccountInterface.close_transaction (cancel the
+# legs, stage the close) -> the refresh confirms the cancel -> the WAITING_TRIGGER sweep sizes
+# and submits the close. The broker is a fake order book; nothing reaches a real API.
+# --------------------------------------------------------------------------- #
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from ba2_trade_platform.core.db import update_instance  # noqa: E402
+from ba2_trade_platform.core.models import TradingOrder  # noqa: E402
+from tests.conftest import MockAccount  # noqa: E402
+
+NVDA_STOP = 178.71
+NVDA_BREACH_PRICE = 171.96
+T0 = datetime(2026, 11, 9, 14, 0, tzinfo=timezone.utc)
+
+
+class _BrokerBook(MockAccount):
+    """``MockAccount`` (so ``close_transaction`` / ``submit_close_order_for_transaction`` are
+    the real AccountInterface code) whose broker side is a dict order book.
+
+    ``book`` maps broker_order_id -> {"status": OrderStatus, "filled_qty": float}; a missing
+    id (or None) means the broker could not be read for that order."""
+
+    def __init__(self, account_id, *, book, held=10.0, price=NVDA_BREACH_PRICE):
+        super().__init__(account_id)
+        self._prices = {"NVDA": price}
+        self._held = held
+        self.book = book
+        self.cancels = []
+        self.sent = []
+        self.order_reads = []
+
+    def is_market_open(self, *, now=None):
+        return True
+
+    def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
+        if isinstance(symbol_or_symbols, str):
+            return self._prices[symbol_or_symbols]
+        return {s: self._prices[s] for s in symbol_or_symbols}
+
+    def get_signed_position_quantity(self, symbol):
+        return self._held
+
+    def get_available_position_quantity(self, symbol):
+        return 1_000.0
+
+    def cancel_order(self, order_id):
+        """What a broker adapter does: request the cancel, mark the row PENDING_CANCEL."""
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        self.cancels.append(order_id)
+        with get_db() as session:
+            row = session.exec(select(TradingOrder).where(
+                TradingOrder.broker_order_id == order_id)).first()
+            row.status = OrderStatus.PENDING_CANCEL
+            session.add(row)
+            session.commit()
+        return True
+
+    def get_order(self, order_id):
+        self.order_reads.append(order_id)
+        state = self.book.get(order_id)
+        if state is None:
+            return None
+        return TradingOrder(broker_order_id=order_id, symbol="NVDA",
+                            status=state["status"], filled_qty=state["filled_qty"])
+
+    def submit_order(self, order, is_closing_order=False):
+        self.sent.append((order.side, float(order.quantity), is_closing_order))
+        row = get_instance(TradingOrder, order.id)
+        row.quantity = order.quantity
+        row.broker_order_id = f"brk-close-{order.id}"
+        row.status = OrderStatus.ACCEPTED
+        update_instance(row)
+        return row
+
+
+def _nvda_long_with_oco(acct_def):
+    """Transaction 468's shape: long 4, a FILLED entry, an Alpaca OCO (parent row = the TP
+    limit, child row = the stop leg) resting at the broker."""
+    txn = create_transaction(symbol="NVDA", side=OrderDirection.BUY, quantity=4.0,
+                             status=TransactionStatus.OPENED, open_price=207.775,
+                             stop_loss=NVDA_STOP, take_profit=240.0)
+    entry = create_trading_order(
+        account_id=acct_def.id, symbol="NVDA", quantity=4.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, status=OrderStatus.FILLED, filled_qty=4.0,
+        open_price=207.775, transaction_id=txn.id, broker_order_id="brk-entry",
+        created_at=T0)
+    oco = create_trading_order(
+        account_id=acct_def.id, symbol="NVDA", quantity=4.0, side=OrderDirection.SELL,
+        order_type=OrderType.OCO, status=OrderStatus.ACCEPTED, filled_qty=0.0,
+        limit_price=240.0, stop_price=NVDA_STOP, transaction_id=txn.id,
+        depends_on_order=entry.id, depends_order_status_trigger=OrderStatus.FILLED,
+        broker_order_id="brk-oco", created_at=T0 + timedelta(minutes=1))
+    stop_leg = create_trading_order(
+        account_id=acct_def.id, symbol="NVDA", quantity=4.0, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_STOP, status=OrderStatus.ACCEPTED, filled_qty=0.0,
+        stop_price=NVDA_STOP, transaction_id=txn.id, parent_order_id=oco.id,
+        broker_order_id="brk-stop", created_at=T0 + timedelta(minutes=2))
+    return txn, entry, oco, stop_leg
+
+
+def _set(order_id, status, filled_qty):
+    row = get_instance(TradingOrder, order_id)
+    row.status = status
+    row.filled_qty = filled_qty
+    update_instance(row)
+
+
+def _deferred_close_row(txn, exclude):
+    rows = [o for o in _orders_of(txn.id)
+            if o.order_type == OrderType.MARKET and o.id not in exclude
+            and (o.comment or "").startswith("Closing position for transaction")]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def _orders_of(txn_id):
+    from sqlmodel import select
+    from ba2_common.core.db import get_db
+    with get_db() as session:
+        rows = session.exec(select(TradingOrder).where(
+            TradingOrder.transaction_id == txn_id)).all()
+        for r in rows:
+            session.expunge(r)
+        return rows
+
+
+def _breach_and_stage(monkeypatch, account):
+    """Pass 1: the safety net fires; close_transaction cancels both OCO rows and stages the
+    close behind the stop leg's cancel. Nothing may reach the broker yet."""
+    import ba2_trade_platform.modules.accounts as accounts
+    monkeypatch.setattr(accounts, "get_account_class", lambda provider: (lambda _id: account))
+    monkeypatch.setattr("ba2_common.core.utils.log_close_order_activity", lambda **kw: None)
+    _run(account)
+    assert sorted(account.cancels) == ["brk-oco", "brk-stop"]
+    assert account.sent == []
+
+
+def _sweep(account):
+    """Pass 2: the WAITING_TRIGGER sweep (refresh step 2)."""
+    tm = TradeManager()
+    rec = _LogRecorder()
+    tm.logger = rec
+    tm._check_all_waiting_trigger_orders()
+    return rec
+
+
+@pytest.mark.parametrize("db_saw_the_fill", [False, True])
+def test_partial_stop_fill_found_after_the_cancel_closes_only_the_remainder(
+        monkeypatch, db_saw_the_fill):
+    """1 of 4 sold by the stop leg before the cancel landed -> the market close is for 3.
+
+    ``db_saw_the_fill`` False: the refresh marked the leg CANCELED but the DB copy of its
+    filled_qty is stale -- the broker's own final figure must be what sizes the close."""
+    acct_def = create_account_definition()
+    txn, _entry, oco, stop_leg = _nvda_long_with_oco(acct_def)
+    book = {"brk-entry": {"status": OrderStatus.FILLED, "filled_qty": 4.0},
+            "brk-oco": {"status": OrderStatus.CANCELED, "filled_qty": 0.0},
+            "brk-stop": {"status": OrderStatus.CANCELED, "filled_qty": 1.0}}
+    account = _BrokerBook(acct_def.id, book=book)
+    _breach_and_stage(monkeypatch, account)
+    close = _deferred_close_row(txn, exclude=())
+    assert close.status == OrderStatus.WAITING_TRIGGER
+    assert close.depends_on_order == stop_leg.id
+    assert close.quantity == pytest.approx(4.0)   # staged before the fill was known
+
+    # The refresh confirms both cancels.
+    _set(oco.id, OrderStatus.CANCELED, 0.0)
+    _set(stop_leg.id, OrderStatus.CANCELED, 1.0 if db_saw_the_fill else 0.0)
+
+    rec = _sweep(account)
+
+    assert account.sent == [(OrderDirection.SELL, pytest.approx(3.0), True)]
+    assert "brk-stop" in account.order_reads and "brk-oco" in account.order_reads
+    assert get_instance(TradingOrder, close.id).quantity == pytest.approx(3.0)
+    assert any("3" in m and str(txn.id) in m for m in rec.warning_msgs)
+
+
+def test_stop_fully_filled_during_the_cancel_race_sends_no_market_order(monkeypatch):
+    """The stop leg filled all 4 before the cancel reached it: the position is already flat,
+    so the staged close must never be sent (it would sell 4 shares of OTHER positions)."""
+    acct_def = create_account_definition()
+    txn, _entry, oco, stop_leg = _nvda_long_with_oco(acct_def)
+    book = {"brk-entry": {"status": OrderStatus.FILLED, "filled_qty": 4.0},
+            "brk-oco": {"status": OrderStatus.CANCELED, "filled_qty": 0.0},
+            "brk-stop": {"status": OrderStatus.FILLED, "filled_qty": 4.0}}
+    account = _BrokerBook(acct_def.id, book=book)
+    _breach_and_stage(monkeypatch, account)
+    close = _deferred_close_row(txn, exclude=())
+
+    _set(oco.id, OrderStatus.CANCELED, 0.0)
+    _set(stop_leg.id, OrderStatus.FILLED, 4.0)
+
+    rec = _sweep(account)
+    _sweep(account)   # and it stays unsent on every later pass
+
+    assert account.sent == []
+    row = get_instance(TradingOrder, close.id)
+    assert row.status == OrderStatus.CLOSED
+    assert row.broker_order_id is None
+    assert any(str(txn.id) in m and "flat" in m.lower() for m in rec.warning_msgs)
+    # The fills alone now close the transaction on the next transaction refresh.
+    assert get_instance(Transaction, txn.id).get_current_open_qty() == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("broker_state", [
+    None,                                                          # unreadable
+    {"status": OrderStatus.PENDING_CANCEL, "filled_qty": 1.0},     # cancel not confirmed
+])
+def test_cancel_outcome_unknown_sends_nothing_this_pass_and_logs_error(
+        monkeypatch, broker_state):
+    """The DB says the stop leg is CANCELED, but the broker cannot confirm its final state.
+    No market order this pass (an oversell is worse than one more pass), an ERROR, and the
+    close stays staged so the next pass retries it."""
+    acct_def = create_account_definition()
+    txn, _entry, oco, stop_leg = _nvda_long_with_oco(acct_def)
+    book = {"brk-entry": {"status": OrderStatus.FILLED, "filled_qty": 4.0},
+            "brk-oco": {"status": OrderStatus.CANCELED, "filled_qty": 0.0},
+            "brk-stop": broker_state}
+    account = _BrokerBook(acct_def.id, book=book)
+    _breach_and_stage(monkeypatch, account)
+    close = _deferred_close_row(txn, exclude=())
+
+    _set(oco.id, OrderStatus.CANCELED, 0.0)
+    _set(stop_leg.id, OrderStatus.CANCELED, 0.0)
+
+    rec = _sweep(account)
+
+    assert account.sent == []
+    assert get_instance(TradingOrder, close.id).status == OrderStatus.WAITING_TRIGGER
+    assert any(str(close.id) in m and str(txn.id) in m for m in rec.error_msgs)
+
+    # Next pass: the broker answers (CANCELED after selling 1) -> close the remaining 3.
+    book["brk-stop"] = {"status": OrderStatus.CANCELED, "filled_qty": 1.0}
+    _sweep(account)
+    assert account.sent == [(OrderDirection.SELL, pytest.approx(3.0), True)]
+
+
+def test_leg_still_pending_cancel_in_the_db_is_not_released():
+    """The refresh has not confirmed the cancel yet: the staged close keeps waiting (this
+    already held before the fix; pinned so the new sizing step cannot bypass it)."""
+    acct_def = create_account_definition()
+    txn, _entry, _oco, stop_leg = _nvda_long_with_oco(acct_def)
+    close = create_trading_order(
+        account_id=acct_def.id, symbol="NVDA", quantity=4.0, side=OrderDirection.SELL,
+        order_type=OrderType.MARKET, status=OrderStatus.WAITING_TRIGGER,
+        transaction_id=txn.id, depends_on_order=stop_leg.id,
+        depends_order_status_trigger=OrderStatus.CANCELED,
+        comment=f"Closing position for transaction {txn.id}")
+    _set(stop_leg.id, OrderStatus.PENDING_CANCEL, 0.0)
+
+    sent = []
+
+    class _Never(MockAccount):
+        def submit_order(self, order, is_closing_order=False):
+            sent.append(order.id)
+
+    import ba2_trade_platform.modules.accounts as accounts
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(accounts, "get_account_class", lambda provider: _Never)
+        _sweep(None)
+
+    assert sent == []
+    assert get_instance(TradingOrder, close.id).status == OrderStatus.WAITING_TRIGGER
+
+
+def _oversold_transaction(acct_def):
+    """Transaction 468 AFTER the incident: bought 4, the stop leg sold 1 before its cancel,
+    the forced close sold 4 -> 5 sold, the transaction CLOSING."""
+    txn, entry, oco, stop_leg = _nvda_long_with_oco(acct_def)
+    _set(oco.id, OrderStatus.CANCELED, 0.0)
+    _set(stop_leg.id, OrderStatus.CANCELED, 1.0)
+    create_trading_order(
+        account_id=acct_def.id, symbol="NVDA", quantity=4.0, side=OrderDirection.SELL,
+        order_type=OrderType.MARKET, status=OrderStatus.FILLED, filled_qty=4.0,
+        open_price=174.32, transaction_id=txn.id, depends_on_order=stop_leg.id,
+        depends_order_status_trigger=OrderStatus.CANCELED, broker_order_id="brk-close",
+        comment=f"Closing position for transaction {txn.id}",
+        created_at=T0 + timedelta(minutes=30))
+    row = get_instance(Transaction, txn.id)
+    row.status = TransactionStatus.CLOSING
+    update_instance(row)
+    return txn
+
+
+def test_an_oversold_transaction_is_reported_once_and_not_rewritten_by_abs(monkeypatch):
+    """refresh_transactions used to log "NEGATIVE calculated_quantity ... Using abs() as
+    safety measure" on EVERY refresh and write quantity = abs(-1) = 1: a 1-share LONG that
+    does not exist. Now: one ERROR per transaction per process naming the oversell, and the
+    quantity is left alone."""
+    import sys
+    from unittest.mock import MagicMock
+    ro = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    log = MagicMock()
+    monkeypatch.setattr(ro, "logger", log)
+    monkeypatch.setattr(ro, "_OVERSOLD_REPORTED", set(), raising=False)
+
+    acct_def = create_account_definition()
+    txn = _oversold_transaction(acct_def)
+    account = MockAccount(acct_def.id)
+
+    account.refresh_transactions()
+    account.refresh_transactions()
+    account.refresh_transactions()
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    oversold = [m for m in errors if "OVERSOLD" in m and f"transaction {txn.id}" in m]
+    assert len(oversold) == 1, errors
+    assert "sold 5" in oversold[0] and "bought 4" in oversold[0]
+    assert not any("abs()" in m for m in errors)
+    row = get_instance(Transaction, txn.id)
+    assert row.quantity == pytest.approx(4.0), "the oversell must not be rewritten as a long"
+    assert row.status == TransactionStatus.CLOSING
+
+
+def test_normal_breach_with_no_fills_still_closes_all_four(monkeypatch):
+    """The ordinary case is unchanged: nothing filled before the cancel -> close all 4."""
+    acct_def = create_account_definition()
+    txn, _entry, oco, stop_leg = _nvda_long_with_oco(acct_def)
+    book = {"brk-entry": {"status": OrderStatus.FILLED, "filled_qty": 4.0},
+            "brk-oco": {"status": OrderStatus.CANCELED, "filled_qty": 0.0},
+            "brk-stop": {"status": OrderStatus.CANCELED, "filled_qty": 0.0}}
+    account = _BrokerBook(acct_def.id, book=book)
+    _breach_and_stage(monkeypatch, account)
+    close = _deferred_close_row(txn, exclude=())
+
+    _set(oco.id, OrderStatus.CANCELED, 0.0)
+    _set(stop_leg.id, OrderStatus.CANCELED, 0.0)
+
+    rec = _sweep(account)
+
+    assert account.sent == [(OrderDirection.SELL, pytest.approx(4.0), True)]
+    assert get_instance(TradingOrder, close.id).quantity == pytest.approx(4.0)
+    assert rec.error_msgs == []

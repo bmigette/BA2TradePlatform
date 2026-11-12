@@ -735,8 +735,9 @@ def _counting_failing_build(dispatcher, monkeypatch, exc):
 
 def test_after_a_failed_scope_leaves_answer_with_the_guards_cause_and_never_rebuild(
         world, dispatcher, instances, clock, activities, monkeypatch):
-    """I2: at most the capture scope's lookup plus the guard's attempt build the resolver. Every leaf of that
-    expert then reads no_context with the guard's cause, without retrying the lookup."""
+    """I2: only the guard's attempt builds the resolver (the decision capture scope no longer looks it up: it
+    opens for every expert). Every leaf of that expert then reads no_context with the guard's cause, without
+    retrying the lookup."""
     monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
     instances[world["expert_id"]] = "ohlcv-v1"
     builds = _counting_failing_build(dispatcher, monkeypatch, RuntimeError("reader build failed"))
@@ -747,9 +748,8 @@ def test_after_a_failed_scope_leaves_answer_with_the_guards_cause_and_never_rebu
     world["recorder"].leaf = _two_leaves
     result = _run_with(world["expert_id"], _LogSpy())
 
-    # The replay-capture scope (opened first) looks the resolver up once and fails; the guard then
-    # makes its own attempt. Nothing more: in particular no retry per leaf.
-    assert len(builds) == 2
+    # The guard makes ONE attempt and fails. Nothing more: in particular no retry per leaf.
+    assert len(builds) == 1
     (call,) = world["recorder"].calls
     expected = live.no_scope_open_reason(world["expert_id"], "RuntimeError: reader build failed",
                                          live.UNRESOLVED_SCOPE_FAILED)

@@ -122,8 +122,14 @@ def _tt_position(symbol="AAPL", quantity="10", direction="Long", average_open_pr
 def _placed_order(order_id=987654, symbol="AAPL", status=TTOrderStatus.RECEIVED,
                   order_type=TTOrderType.MARKET, action=OrderAction.BUY_TO_OPEN,
                   size="10", external_identifier=None, fills=None, price=None,
-                  time_in_force=OrderTimeInForce.DAY):
-    """A REAL tastytrade PlacedOrder -- the mapping code must survive its validators."""
+                  time_in_force=OrderTimeInForce.DAY, received_at=None):
+    """A REAL tastytrade PlacedOrder -- the mapping code must survive its validators.
+
+    ``received_at`` defaults to a fixed 2026-08-20 stamp. ``refresh_orders`` only ADOPTS a
+    broker order for a row without a broker id when the order is not older than the row,
+    so a first-sync test must pass a fresh ``received_at`` (see ``_now_utc``)."""
+    if received_at is None:
+        received_at = datetime(2026, 8, 20, 14, 29, tzinfo=timezone.utc)
     leg = Leg(instrument_type=TTInstrumentType.EQUITY, symbol=symbol,
               action=action, quantity=Decimal(size), fills=fills)
     return PlacedOrder(
@@ -136,8 +142,8 @@ def _placed_order(order_id=987654, symbol="AAPL", status=TTOrderStatus.RECEIVED,
         cancellable=True,
         editable=False,
         edited=False,
-        updated_at=datetime(2026, 8, 20, 14, 30, tzinfo=timezone.utc),
-        received_at=datetime(2026, 8, 20, 14, 29, tzinfo=timezone.utc),
+        updated_at=max(received_at, datetime(2026, 8, 20, 14, 30, tzinfo=timezone.utc)),
+        received_at=received_at,
         legs=[leg],
         id=order_id,
         size=Decimal(size),
@@ -1713,22 +1719,32 @@ def test_refresh_orders_promotes_a_filled_order_and_records_the_fill():
     assert stored.open_price == pytest.approx(150.25)
 
 
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
 def test_refresh_orders_backfills_broker_order_id_from_external_identifier():
-    """external_identifier is our own row id -- TastyTrade's client_order_id."""
+    """external_identifier is our own row id -- TastyTrade's client_order_id. The legitimate
+    first sync: the row has no broker id yet (submit outcome unknown) and the broker order
+    was received AFTER the row was created, so it is adopted."""
     from ba2_trade_platform.core.db import get_instance
     from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
 
     account_def, order = _tt_trading_order(quantity=10.0)
     acct = _bare_account()
     acct.id = account_def.id
     acct._account.get_order_history = AsyncMock(return_value=[
         _placed_order(order_id=987654, status=TTOrderStatus.LIVE, size="10",
-                      external_identifier=str(order.id)),
+                      external_identifier=str(order.id),
+                      received_at=_now_utc() + timedelta(seconds=1)),
     ])
 
     acct.refresh_orders()
 
-    assert get_instance(TradingOrder, order.id).broker_order_id == "987654"
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.broker_order_id == "987654"
+    assert stored.status == OrderStatus.ACCEPTED
 
 
 def test_refresh_orders_leaves_an_order_absent_from_the_response_untouched():
@@ -1900,6 +1916,177 @@ def test_refresh_orders_returns_false_when_the_fetch_fails():
     acct._account.get_order_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
 
     assert acct.refresh_orders() is False
+
+
+# --- Recycled row ids --------------------------------------------------------
+#
+# external_identifier is our row id, refresh_orders walks the WHOLE broker history, and
+# SQLite recycles tradingorder ids after a delete. A months-old broker order tagged "123"
+# must never be applied to a NEW row 123.
+
+def _capture_levels(monkeypatch):
+    """``{"warning": [...], "debug": [...]}`` from this module's logger (see
+    ``_capture_errors`` for why caplog cannot be used)."""
+    import sys
+    TT = sys.modules[TastyTradeAccount.__module__]
+    seen = {"warning": [], "debug": []}
+    monkeypatch.setattr(TT.logger, "warning", lambda msg, *a, **k: seen["warning"].append(str(msg)))
+    monkeypatch.setattr(TT.logger, "debug", lambda msg, *a, **k: seen["debug"].append(str(msg)))
+    return seen
+
+
+def test_refresh_orders_does_not_apply_an_old_broker_order_that_reuses_the_row_id():
+    """The row already tracks broker order 555000; an OLD broker order 111 carries the same
+    external_identifier (the row id was recycled). It must not touch the row."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="555000",
+                                           status=OrderStatus.ACCEPTED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=111, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id),
+                      fills=[_fill(quantity="10", fill_price="99.50")]),
+    ])
+
+    assert acct.refresh_orders() is True
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ACCEPTED
+    assert stored.broker_order_id == "555000"
+    assert stored.open_price is None
+    assert not stored.filled_qty
+
+
+def test_refresh_orders_warns_about_a_working_broker_order_whose_id_the_row_does_not_track(
+        monkeypatch):
+    """A still-WORKING broker order we do not track is worth knowing about: WARNING."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="555000",
+                                           status=OrderStatus.FILLED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=112, status=TTOrderStatus.LIVE, size="10",
+                      external_identifier=str(order.id)),
+    ])
+    seen = _capture_levels(monkeypatch)
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.FILLED
+    assert any("112" in m for m in seen["warning"]), seen
+
+
+def test_refresh_orders_does_not_adopt_a_broker_order_older_than_the_row():
+    """No broker id yet (submit outcome unknown): a broker order received BEFORE the row
+    existed belongs to an earlier, deleted row that had the same id."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, status=OrderStatus.PENDING)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=113, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id),
+                      fills=[_fill(quantity="10", fill_price="99.50")],
+                      received_at=_now_utc() - timedelta(days=90)),
+    ])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.broker_order_id is None
+    assert stored.status == OrderStatus.PENDING
+    assert stored.open_price is None
+
+
+@pytest.mark.parametrize("tracked_first", [True, False])
+def test_refresh_orders_tracks_the_broker_order_whose_id_the_row_stores(tracked_first):
+    """Two broker orders share the row's identifier (an earlier REJECTED one and the one
+    the row stores). The row follows the stored one, whatever the iteration order."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="700002",
+                                           status=OrderStatus.ACCEPTED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    tracked = _placed_order(order_id=700002, status=TTOrderStatus.FILLED, size="10",
+                            external_identifier=str(order.id),
+                            fills=[_fill(quantity="10", fill_price="150.25")])
+    other = _placed_order(order_id=700001, status=TTOrderStatus.REJECTED, size="10",
+                          external_identifier=str(order.id))
+    acct._account.get_order_history = AsyncMock(
+        return_value=[tracked, other] if tracked_first else [other, tracked])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.FILLED
+    assert stored.broker_order_id == "700002"
+    assert stored.open_price == pytest.approx(150.25)
+
+
+@pytest.mark.parametrize("live_first", [True, False])
+def test_refresh_orders_adopts_the_working_one_of_two_fresh_candidates(live_first):
+    """No broker id yet and two FRESH broker orders carry the row's identifier: the choice
+    is deterministic (the working one), independent of iteration order."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, status=OrderStatus.PENDING)
+    acct = _bare_account()
+    acct.id = account_def.id
+    fresh = _now_utc() + timedelta(seconds=1)
+    live = _placed_order(order_id=800002, status=TTOrderStatus.LIVE, size="10",
+                         external_identifier=str(order.id), received_at=fresh)
+    rejected = _placed_order(order_id=800001, status=TTOrderStatus.REJECTED, size="10",
+                             external_identifier=str(order.id),
+                             received_at=fresh + timedelta(seconds=1))
+    acct._account.get_order_history = AsyncMock(
+        return_value=[live, rejected] if live_first else [rejected, live])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.broker_order_id == "800002"
+    assert stored.status == OrderStatus.ACCEPTED
+
+
+def test_refresh_orders_does_not_write_unknown_over_a_known_status(monkeypatch):
+    """A broker status the adapter cannot map must not overwrite a good status with
+    UNKNOWN; it is skipped and named in a WARNING, once per order."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="987001",
+                                           status=OrderStatus.ACCEPTED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    raw = _placed_order(order_id=987001, status=TTOrderStatus.LIVE, size="10",
+                        external_identifier=str(order.id))
+    object.__setattr__(raw, "status", "Partially Filled")
+    acct._account.get_order_history = AsyncMock(return_value=[raw])
+    seen = _capture_levels(monkeypatch)
+
+    acct.refresh_orders()
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ACCEPTED
+    naming = [m for m in seen["warning"] if "Partially Filled" in m and "987001" in m]
+    assert len(naming) == 1, seen["warning"]
 
 
 # ---------------------------------------------------------------------------

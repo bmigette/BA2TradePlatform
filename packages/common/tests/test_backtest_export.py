@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
+from ba2_common.core.deploy_parity import BacktestRunFacts, deploy_expert_settings
 from ba2_common.export import backtest_export as be
 
 
@@ -15,7 +15,7 @@ def _bt(**kw):
     return SimpleNamespace(**base)
 
 
-GATES = forced_expert_settings(BacktestRunFacts(enable_short=False, hold_assigned_stock=False,
+GATES = deploy_expert_settings(BacktestRunFacts(enable_short=False, hold_assigned_stock=False,
                                                 entry_action=None))
 
 

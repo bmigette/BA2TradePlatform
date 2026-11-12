@@ -185,10 +185,9 @@ def record_session(store_root: Path, export_dir: Path,
     ``scenario`` returns whatever the test wants back (action results, accounts).
     """
     store = ReplayStore(store_root, writer="sync")
-    store.begin_session(SessionRecord(
-        session_id=SESSION_ID, instance_id="option-test", started_at=NOW,
-        exchange_tz="America/New_York", app_version="test",
-        package_versions={"ba2_common": "test"}, source_revision="0" * 40, dirty=False))
+    from tests.replay import running_code_session
+    store.begin_session(running_code_session(
+        SESSION_ID, instance_id="option-test", started_at=NOW))
     try:
         with _scratch_trading_db([]):
             if seed is not None:

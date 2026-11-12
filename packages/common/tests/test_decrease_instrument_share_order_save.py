@@ -176,6 +176,54 @@ def test_a_holding_smaller_than_one_share_produces_no_order_rather_than_a_short(
     assert result["data"].get("order_id") is None
 
 
+def test_a_failed_position_read_is_refused_as_unreadable_not_as_no_position(monkeypatch):
+    """The store read fails while 20 shares are held. The old path already placed no order
+    (None read as "No position to decrease"), but that is a confident claim about a book
+    nobody managed to read. Now: no order, a refusal that says the position could not be
+    read, and an ERROR log line."""
+    from ba2_common.core import TradeActions as mod
+
+    errors = []
+    monkeypatch.setattr(mod.logger, "error", lambda msg, *a, **k: errors.append(msg))
+    action = _action()
+
+    def _failing_store_read():
+        raise OSError("disk I/O error")
+
+    action._own_equity_transactions = _failing_store_read
+    orders = []
+    action.create_order_record = lambda **kw: orders.append(kw) or 1
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(_FakeResolver())
+    try:
+        with ts.inmem_trades():
+            add_instance(Transaction(symbol="AAPL", quantity=20.0, side=OrderDirection.BUY,
+                                     status=TransactionStatus.OPENED, expert_id=42))
+            result = action.execute()
+    finally:
+        instance_resolver.set_instance_resolver(previous)
+
+    assert result["success"] is False
+    assert "could not be read" in result["message"].lower()
+    assert orders == []
+    assert any("AAPL" in m and "position" in m.lower() for m in errors), errors
+
+
+def test_a_flat_expert_is_still_no_position_to_decrease():
+    """The read SUCCEEDED and found nothing: unchanged refusal."""
+    action = _action()
+    previous = instance_resolver.get_instance_resolver()
+    instance_resolver.set_instance_resolver(_FakeResolver())
+    try:
+        with ts.inmem_trades():
+            result = action.execute()
+    finally:
+        instance_resolver.set_instance_resolver(previous)
+
+    assert result["success"] is False
+    assert result["message"] == "No position to decrease"
+
+
 def test_the_reduction_is_floored_so_a_ragged_trim_never_oversells():
     """25.4 held, target 5% of 10000 = 500 at 100 => reduce by 20.4 shares' worth.
     round() would sell 20 here by luck; the sweep below is what pins the rule."""

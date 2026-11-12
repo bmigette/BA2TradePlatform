@@ -361,6 +361,9 @@ def test_the_wrapper_records_the_windows_a_replay_of_the_decision_needs(
     from ba2_common.core.replay import load_bundle
     from ba2_trade_platform.core.TradeManager import TradeManager
 
+    from tests.factories import create_account_definition, create_expert_instance
+    # The decision pass records the REAL expert class of the instance, so the instance must exist.
+    expert_id = create_expert_instance(account_id=create_account_definition().id).id
     seen = {}
 
     def body(self, expert_instance_id, lookback_days=1):
@@ -372,7 +375,7 @@ def test_the_wrapper_records_the_windows_a_replay_of_the_decision_needs(
 
     monkeypatch.setattr(TradeManager, "_process_expert_recommendations_after_analysis", body)
     tm = TradeManager.__new__(TradeManager)
-    assert tm.process_expert_recommendations_after_analysis(1) == []
+    assert tm.process_expert_recommendations_after_analysis(expert_id) == []
 
     # The decision pass ran INSIDE a capture scope, so the reader was the capturing one.
     assert seen["recorder"] is not None

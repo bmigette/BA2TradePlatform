@@ -48,7 +48,7 @@ def test_tp_distance_from_the_fill_is_independent_of_the_days_later_close(day_cl
     ps = _ps(day_close)
     T = _wall(2024, 1, 3, 10, 0)
     ps.set_clock(T)
-    bundle = _BacktestProviderBundle(lambda *a, **k: None, ps)
+    bundle = _BacktestProviderBundle(lambda *a, **k: None, ps, "fmp")
     with intraday_decisions(True):
         price_at_date = bundle.price_at_date("X", T)
         tp = price_at_date * (1 + epp / 100)           # EXPERT_TARGET_PRICE: price_at_date x (1 + epp)

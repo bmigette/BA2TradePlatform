@@ -237,7 +237,9 @@ def test_a_malformed_row_surfaces_and_a_non_finite_gap_logs_an_error(caplog):
 
 
 def test_assigned_put_cycle_ties_to_the_cent_with_commission(tmp_path):
-    """Settlement and the assignment liquidation charge no commission, so the rows must not."""
+    """Settlement charges no commission; the assignment liquidation pays one like any equity
+    market fill (review 2026-11-09: it used to be free, 100,599 / 599). The rows charge
+    exactly what the cash ledger paid."""
     cfg = {**_BASE_CFG, "commission_per_trade": 1.0}
     acct, ps, ctx = _build(tmp_path, "rowcomm1", 86, cfg)
     try:
@@ -246,8 +248,8 @@ def test_assigned_put_cycle_ties_to_the_cent_with_commission(tmp_path):
         ps.set_clock(datetime(2024, 3, 11))
         assert acct.process_pending_assignment_liquidations() is True
         acct.refresh_transactions()
-        assert acct._cash == pytest.approx(100_599.0)         # the put sale paid $1; nothing else
-        assert _row_sum(acct) == pytest.approx(599.0)
+        assert acct._cash == pytest.approx(100_598.0)         # the put sale + the stock sale, $1 each
+        assert _row_sum(acct) == pytest.approx(598.0)
         assert _row_sum(acct) == pytest.approx(acct.equity() - _START)
     finally:
         ctx.__exit__(None, None, None)

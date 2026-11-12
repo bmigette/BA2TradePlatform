@@ -41,6 +41,8 @@ __all__ = [
     "ForcedSetting",
     "BACKTEST_FORCED_SETTINGS",
     "forced_expert_settings",
+    "deploy_expert_settings",
+    "legacy_hold_settings",
     "backtest_only_settings",
     "reportable_backtest_only",
     "live_settings_from_universe",
@@ -109,6 +111,10 @@ class ForcedSetting:
     #: (e.g. no member-scoped hold, no option entry action), so the deploy report omits it rather
     #: than print it on every deploy. Set per row, never as a blanket "skip None".
     silent_when_none: bool = False
+    #: False for a row the BACKTEST never reads as an expert setting (its engine takes the fact from
+    #: the account config). ``forced_expert_settings`` (the handler's reader) skips such a row so a
+    #: backtest stays byte-identical; ``deploy_expert_settings`` (the export's reader) carries it.
+    applied_in_backtest: bool = True
 
     def value(self, facts: BacktestRunFacts) -> Any:
         return _VALUES[self.key](facts)
@@ -183,35 +189,28 @@ BACKTEST_FORCED_SETTINGS = (
     ),
     ForcedSetting(
         key="hold_assigned_stock",
-        live_setting=None,
+        live_setting="hold_assigned_stock",
         source="ba2test_launcher._hold_assigned_stock -> account_settings; consumed by "
                "BacktestAccount at assignment reconciliation",
         why="review V5. True only for the wheel family; every other option key SELLS stock "
-            "delivered by assignment, so backtested P&L assumes a de-risking action.",
-        why_no_live_analogue=
-            "live never sells assigned stock -- AlpacaAccount.reconcile_option_assignments opens "
-            "the equity long and stops. Closing this is a change to a live BROKER class, which "
-            "deploy tooling must not make; it is an operator decision.",
+            "delivered by assignment. LIVE now makes the same decision per instance "
+            "(assignment_hold.decide_live_assigned_stock, AlpacaAccount.reconcile_option_assignments) "
+            "and liquidates a not-held lot with a market SELL swept on every refresh "
+            "(assignment_liquidation). The deployed instance MUST carry it: with no stored value "
+            "live holds the stock and logs an ERROR.",
+        applied_in_backtest=False,
     ),
     ForcedSetting(
         key="hold_assigned_stock_tags",
-        live_setting=None,
+        live_setting="hold_assigned_stock_tags",
         source="BacktestAccount account_settings['hold_assigned_stock_tags'] (stage-2 E2; the "
                "style launcher, Task 7) -> assignment_hold.holds_assigned_stock per assignment",
         why="plan 2026-09-25 option-stage2-build E2: in a style run only the wheel member "
             "keeps its assigned stock; a CSP / jade-lizard / ratio-spread member's assignment "
             "is liquidated at the next bar's open, decided from the assigned position's entry "
-            "tag.",
-        why_no_live_analogue=
-            "live has no hold/liquidate decision at all -- it never sells assigned stock "
-            "(AlpacaAccount.reconcile_option_assignments opens the equity long and stops), so a "
-            "run that LIQUIDATED some members' assignments describes behaviour live cannot "
-            "reproduce. Unlike hold_assigned_stock this is not merely recorded: "
-            "refuse_undeployable refuses the export of such a run. Closing it needs a live "
-            "liquidation step keyed on the member tag, an operator decision.",
-        # None = the run had no member-scoped hold (every deployable payload: one that had it
-        # is refused), so there is nothing to report.
-        silent_when_none=True,
+            "tag. Live decides from the same tag through the same function. None (no member "
+            "scope) is not written.",
+        applied_in_backtest=False,
     ),
     ForcedSetting(
         key="entry_action",
@@ -306,13 +305,34 @@ def complete_screener_settings(expert_params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def forced_expert_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
-    """{live setting: value} for every row that HAS a live analogue.
+    """{live setting: value} for every row that HAS a live analogue AND that the backtest applies
+    to its own expert (``applied_in_backtest``) -- the handler's reader.
 
-    Applied last by the handler (so a payload override cannot turn a gate off) and merged last
-    into the export payload's ``expert_params`` for the same reason.
+    Applied last by the handler (so a payload override cannot turn a gate off).
     """
     return {row.live_setting: row.value(facts)
-            for row in BACKTEST_FORCED_SETTINGS if row.live_setting is not None}
+            for row in BACKTEST_FORCED_SETTINGS
+            if row.live_setting is not None and row.applied_in_backtest}
+
+
+def deploy_expert_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
+    """{live setting: value} for EVERY row with a live analogue -- the export's reader: the
+    handler's forced settings plus the facts the backtest takes from its account config
+    (assigned-stock policy). A None value (no member scope) is omitted: it states nothing and a
+    None must not be written as a setting. Merged last into the export's ``expert_params``."""
+    return {row.live_setting: v
+            for row in BACKTEST_FORCED_SETTINGS if row.live_setting is not None
+            for v in (row.value(facts),) if v is not None}
+
+
+def legacy_hold_settings(backtest_only: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The assigned-stock policy settings of a payload exported BEFORE live carried them: the facts
+    sat under ``backtest_only`` ("carried, never applied"). Returns the non-None ones so an importer
+    can apply them -- live now implements both, and an instance without them is undecided."""
+    keys = [r.live_setting for r in BACKTEST_FORCED_SETTINGS
+            if r.live_setting is not None and not r.applied_in_backtest]
+    return {k: (backtest_only or {})[k] for k in keys
+            if (backtest_only or {}).get(k) is not None}
 
 
 def backtest_only_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
@@ -327,8 +347,11 @@ def reportable_backtest_only(backtest_only: Optional[Dict[str, Any]]) -> Dict[st
     table row declares ``silent_when_none`` (None states no behaviour for the run). A None on
     any other row, or on a key the table does not know, is reported: never a blanket skip."""
     silent = {row.key for row in BACKTEST_FORCED_SETTINGS if row.silent_when_none}
+    # A key live now CARRIES (the assigned-stock policy) is not "not applied": a legacy payload
+    # still lists it here and the importer applies it (``legacy_hold_settings``).
+    carried = {row.key for row in BACKTEST_FORCED_SETTINGS if row.live_setting is not None}
     return {k: v for k, v in (backtest_only or {}).items()
-            if not (v is None and k in silent)}
+            if k not in carried and not (v is None and k in silent)}
 
 
 def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -412,17 +435,13 @@ class UndeployableRunRefused(ValueError):
 def refuse_undeployable(facts: BacktestRunFacts) -> None:
     """Raise ``UndeployableRunRefused`` when the run cannot be deployed as it was scored.
 
-    Today one fact: a member-scoped assigned-stock hold (``hold_assigned_stock_tags``). Its
-    ``backtest_only`` record would say what the run did, but the export's other fields would
-    still describe a deployable run, and the importer would apply them -- to an account that
-    holds EVERY assignment. Refusing is the only answer that is not a different strategy.
+    NOTHING is refused today. It used to refuse a member-scoped assigned-stock hold
+    (``hold_assigned_stock_tags``) because live never liquidated assigned stock; live now makes
+    that decision itself (``assignment_hold.decide_live_assigned_stock``), so the export carries
+    the policy instead. The hook stays so the exporter's call site has one place to add the next
+    behaviour live genuinely cannot express.
     """
-    if facts.hold_assigned_stock_tags:
-        raise UndeployableRunRefused(
-            f"this run held assigned stock only for style members "
-            f"hold_assigned_stock_tags={sorted(facts.hold_assigned_stock_tags)} and liquidated "
-            f"every other member's assignment; live never liquidates assigned stock, so no "
-            f"live ExpertInstance can run it as scored -- refusing to export it")
+    return None
 
 
 def member_hold_tags_fact(raw: Any) -> Optional[Tuple[int, ...]]:

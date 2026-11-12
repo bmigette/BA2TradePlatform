@@ -4,7 +4,8 @@
       no-arbitrage bounds the arb guard (``_arb_fill_reject_reason``) already encodes —
       floor at intrinsic, cap at the upper bound (spot for a call, strike for a put):
         * long-ITM expiry settlement (``settle_single_leg_expiry``) — a $0.01 junk print
-          against $50 of intrinsic must NOT be realised into cash;
+          against $50 of intrinsic must NOT be realised into cash (since review 2026-11-09
+          the settlement no longer reads the print at all: it is pure intrinsic);
         * the margin-liquidation buyback (``_liquidate_option_lot``) when a bar EXISTS
           (the no-bar branch already books max(intrinsic, entry));
         * the per-tick mark (``_option_positions_mtm``) when a bar exists but is junk.
@@ -104,7 +105,8 @@ def _ubar(d, px):
 
 
 # ---------------------------------------------------------------------------
-# F1 — long-ITM expiry settlement is clamped to [intrinsic, upper bound]
+# F1 — long-ITM expiry settlement: pure INTRINSIC whatever the expiry bar prints
+#      (review 2026-11-09; it was the print clamped to [intrinsic, upper bound])
 # ---------------------------------------------------------------------------
 def _long_itm_call_account(tmp_path, tag, expiry_close):
     """Buy 1 AAPL 90 call @10.5 (spot 100). Spot 140 at expiry (intrinsic 50); the expiry
@@ -146,28 +148,30 @@ def test_long_itm_expiry_junk_low_close_settles_at_intrinsic(tmp_path):
         ctx.__exit__(None, None, None)
 
 
-def test_long_itm_expiry_junk_high_close_capped_at_spot(tmp_path):
-    """The mirror junk print: a call premium ABOVE the spot (a call can never cost more
-    than the stock) is capped at the upper bound — 140 x 100, not 500 x 100."""
+def test_long_itm_expiry_junk_high_close_settles_at_intrinsic(tmp_path):
+    """The mirror junk print: a call premium ABOVE the spot is ignored like any other
+    print — intrinsic 50 x 100. (Before review 2026-11-09 it was capped at the upper bound,
+    140 x 100.)"""
     acct, ps, ctx = _long_itm_call_account(tmp_path, "f1hi", expiry_close=500.0)
     try:
         ps.set_clock(datetime(2024, 3, 15))
         pos = acct.get_option_positions()[0]
         assert acct.settle_single_leg_expiry(pos, spot=140.0) is True
-        assert acct._cash == pytest.approx(8_950.0 + 14_000.0, abs=1.0)
+        assert acct._cash == pytest.approx(8_950.0 + 5_000.0, abs=1.0)
     finally:
         ctx.__exit__(None, None, None)
 
 
-def test_long_itm_expiry_sane_close_unchanged(tmp_path):
-    """Regression: a SANE expiry print inside the bounds settles at the print, exactly as
-    before (50.75 is above intrinsic 50 and below spot 140)."""
+def test_long_itm_expiry_sane_close_above_intrinsic_settles_at_intrinsic(tmp_path):
+    """A sane-looking expiry print with time value left in it (50.75 vs intrinsic 50) is
+    NOT realised: no time value exists at expiry, so the leg settles at 50 x 100. (Before
+    review 2026-11-09 it settled at the print, 5,075.)"""
     acct, ps, ctx = _long_itm_call_account(tmp_path, "f1ok", expiry_close=50.75)
     try:
         ps.set_clock(datetime(2024, 3, 15))
         pos = acct.get_option_positions()[0]
         assert acct.settle_single_leg_expiry(pos, spot=140.0) is True
-        assert acct._cash == pytest.approx(8_950.0 + 5_075.0, abs=1.0)
+        assert acct._cash == pytest.approx(8_950.0 + 5_000.0, abs=1.0)
     finally:
         ctx.__exit__(None, None, None)
 

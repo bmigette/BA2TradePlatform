@@ -219,6 +219,22 @@ def published_known(raw: Any, decision: Any) -> bool:
     return known_at(filing_visible_from(raw), decision)
 
 
+#: How far ahead a company's NEXT earnings report date is public. Companies announce their report
+#: date roughly 2-6 weeks ahead, but the cached calendar holds the REALIZED date for every row,
+#: so a backtest that reads it out to months ahead knows a date the live platform could not.
+#: A future report date is visible only when it falls within this many days of the evaluation
+#: day; beyond it the system sees "no scheduled report". One constant, applied by the single
+#: reader used live and in backtests (``DaysToEarningsCondition._next_scheduled_report`` and
+#: ``FMPEarningsEvent``); do not read the calendar past it anywhere else.
+EARNINGS_ANNOUNCE_HORIZON_DAYS = 30
+
+
+def earnings_visible_horizon_days(requested: int) -> int:
+    """The look-ahead actually allowed for an earnings report date: ``requested`` capped at
+    ``EARNINGS_ANNOUNCE_HORIZON_DAYS`` (a wider request would read dates not yet announced)."""
+    return min(int(requested), EARNINGS_ANNOUNCE_HORIZON_DAYS)
+
+
 def known_at(visible_from: Optional[datetime], decision: Any) -> bool:
     """``visible_from <= decision`` on naive wall clocks; an unknown ``visible_from`` is NOT known
     (an item whose publication cannot be established is never silently admitted)."""

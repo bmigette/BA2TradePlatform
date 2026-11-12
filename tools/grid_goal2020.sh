@@ -303,7 +303,7 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
       stress_args=(--stress-spread-bps "$st")
     fi
     echo; echo "=== $mode / $band  (spread ${sp} bps round-trip${st:+, stress +${st}})  $(date)"
-    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       --parallel "$PARALLEL"       "$@"
+    "$PY" "$DRIVER" "${COMMON[@]}" --estimates-source fmp       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       --parallel "$PARALLEL"       "$@"
     echo "=== $mode / $band  done rc=$? $(date)"
   done
 }

@@ -17,10 +17,32 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+#: Bundle/record schema history (bump on EVERY additive field or recorded-content change):
+#:
+#: * 1 -- first format; ``ProviderObservation.tap_depth`` was later added to it WITHOUT a bump
+#:   (a v1 reader built before that refuses a newer v1 bundle with "unknown field(s)").
+#: * 2 -- (a) the recorded ``settings`` object is the expert's FULL resolved settings (every
+#:   definition resolved with its default the way the live code resolves it, every stored key,
+#:   plus the ``instance.*`` decision columns), secrets dropped. v1 recordings hold only the
+#:   expert's own keys; they stay readable, and the tools that need the rest say so loudly
+#:   (``settings_record.explain_missing_setting``) instead of failing opaquely.
+#:   (b) ``SessionRecord`` gained ``provenance`` / ``provenance_error`` (the exact uncommitted
+#:   code a dirty session ran). Schema-1 sessions and bundles are still READ.
+#: * 3 -- stock decision passes: ``ReplayStatus.OUTCOME_DECISION`` and ``AnalysisRecord.decision_object``
+#:   (the frozen pass summary), pass records carry the REAL expert class plus ``record_kind=decision_pass``
+#:   in ``branch_flags`` and the recording host's timezone (``host_timezone``); sessions state their
+#:   ``decision_families`` / ``host_timezone`` in ``capabilities``. Schema-1 and -2 bundles are still READ
+#:   (``decision_object`` is simply absent: ``None``).
+SCHEMA_VERSION = 3
+#: Versions ``load_bundle`` accepts. N-1 (and N-2) stay readable.
+READABLE_SCHEMA_VERSIONS = (1, 2, 3)
+#: Alias kept for the provenance readers; the same tuple.
+SUPPORTED_SCHEMA_VERSIONS = READABLE_SCHEMA_VERSIONS
 
 __all__ = [
     "SCHEMA_VERSION",
+    "READABLE_SCHEMA_VERSIONS",
+    "SUPPORTED_SCHEMA_VERSIONS",
     "ReplayStatus",
     "SessionRecord",
     "AnalysisRecord",
@@ -53,6 +75,8 @@ class ReplayStatus:
     OUTCOME_RECOMMENDATION = "recommendation"
     OUTCOME_SKIP = "skip"
     OUTCOME_ERROR = "error"
+    #: A stock decision pass ran to its end (schema 3): ``decision_object`` holds the pass summary.
+    OUTCOME_DECISION = "decision"
 
     # analysis.use_case
     USE_CASE_ENTER_MARKET = "enter_market"
@@ -84,6 +108,10 @@ class ReplayStatus:
     # coverage.status
     COVERAGE_MATCH = "match"
     COVERAGE_DIFFERENCE = "difference"
+    #: A result that differs while the running code is NOT the code that was recorded
+    #: (other revision, other uncommitted patch, other package versions). Distinct from
+    #: ``difference`` so drift cannot be read as a parity break.
+    COVERAGE_CODE_DRIFT = "code_drift"
     COVERAGE_MISSING_CAPTURE = "missing_capture"
     COVERAGE_MISSING_HISTORY = "missing_history"
     COVERAGE_REVISION_UNKNOWN = "revision_unknown"
@@ -218,17 +246,34 @@ class SessionRecord(_Record):
     config_hashes: Mapping[str, str] = field(default_factory=dict)
     status: str = ReplayStatus.SESSION_OPEN
     capabilities: Mapping[str, Any] = field(default_factory=dict)
+    #: The exact code this process ran (schema 2): ``patch_sha256`` / ``patch_object`` (the
+    #: ``git diff HEAD --binary`` of a dirty tree), ``untracked`` (path, sha256, size, optional
+    #: content object), ``versions``. Empty for a schema-1 session ("patch not recorded").
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    #: Why ``provenance`` could not be collected. Never silently omitted.
+    provenance_error: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
 
     _DATETIME_FIELDS = ("started_at", "ended_at")
-    _MAPPING_FIELDS = ("package_versions", "config_hashes", "capabilities")
+    _MAPPING_FIELDS = ("package_versions", "config_hashes", "capabilities", "provenance")
+
+    def object_hashes(self) -> Tuple[str, ...]:
+        """Content hashes of the provenance objects (patch, untracked file contents)."""
+        found = []
+        patch = self.provenance.get("patch_object")
+        if patch:
+            found.append(patch)
+        for entry in self.provenance.get("untracked", ()):
+            if entry.get("content_object"):
+                found.append(entry["content_object"])
+        return tuple(found)
 
 
 @dataclass(frozen=True, kw_only=True)
 class AnalysisRecord(_Record):
     """One expert analysis attempt (spec section 3, "Analysis" row).
 
-    ``settings_object`` / ``bundle_object`` / ``recommendation_object`` are
+    ``settings_object`` / ``bundle_object`` / ``recommendation_object`` / ``decision_object`` are
     content hashes into the object store, or ``None`` when that piece was not
     captured -- ``bundle_capture_status`` says why for the bundle, and
     ``capture_gaps`` names every role (``settings``/``bundle``/``recommendation``/
@@ -264,6 +309,8 @@ class AnalysisRecord(_Record):
     clock_read_phases: Sequence[str] = ()
     outcome: str
     recommendation_object: Optional[str] = None
+    #: Schema 3: hash of the frozen pass summary of a stock decision pass (``outcome == "decision"``).
+    decision_object: Optional[str] = None
     skip_reason: Optional[str] = None
     error: Optional[str] = None
     observation_ids: Sequence[str] = ()
@@ -280,7 +327,8 @@ class AnalysisRecord(_Record):
         """Every object this record references, in a stable order."""
         return tuple(
             h
-            for h in (self.settings_object, self.bundle_object, self.recommendation_object)
+            for h in (self.settings_object, self.bundle_object, self.recommendation_object,
+                      self.decision_object)
             if h is not None
         )
 

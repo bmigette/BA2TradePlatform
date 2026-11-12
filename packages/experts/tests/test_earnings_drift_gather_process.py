@@ -245,41 +245,56 @@ def test_analyze_as_of_equals_live_process():
 # --------------------------------------------------------------------------- #
 # expected_profit_mode='model' (ba2_experts.analyst_target_model, opt-in, default off)
 # --------------------------------------------------------------------------- #
+def _reported(ttm_eps, base_eps, quarters=9):
+    """Newest-first reported quarters for the point-in-time 'reported' method: 4 quarters at
+    ttm_eps then base_eps (growth = ttm_eps / base_eps)."""
+    return ([{"report_date": "2026-06-10", "reported_eps": ttm_eps, "time": "bmo"}] * 4
+            + [{"report_date": "2025-06-10", "reported_eps": base_eps, "time": "bmo"}] * (quarters - 4))
+
+
 class FakeDetailsWithEstimates(FakeDetails):
-    """Adds get_earnings_estimates -- the second fetch fetch_estimator_inputs needs, only ever
-    called when expected_profit_mode='model' (see the opt-in-I/O test below)."""
-    def __init__(self, estimates=None):
+    """Adds get_earnings_estimates and the model's reported-quarters history -- the fetches
+    fetch_estimator_inputs makes, only ever called when expected_profit_mode='model' (see the
+    opt-in-I/O test below). The expert's own signal fetch asks for 1 quarter."""
+    def __init__(self, estimates=None, model_rows=None):
         self._estimates = estimates if estimates is not None else [
             {"estimated_eps_avg": 5.0}, {"estimated_eps_avg": 6.0}]
+        self._model_rows = model_rows if model_rows is not None else _reported(1.2, 1.0)
+
+    def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+        if lookback_periods == 1:
+            return super().get_past_earnings(symbol, frequency, end_date, lookback_periods, format_type)
+        return {"earnings": self._model_rows[:lookback_periods]}
 
     def get_earnings_estimates(self, symbol, frequency, as_of_date, lookback_periods, format_type, **kw):
         return {"estimates": self._estimates}
 
 
-def _model_provider(estimates=None):
-    details = FakeDetailsWithEstimates(estimates)
+def _model_provider(estimates=None, model_rows=None):
+    details = FakeDetailsWithEstimates(estimates, model_rows)
     return lambda c, n, **k: {"fundamentals_details": details, "ohlcv": FakeOHLCV()}[c]
 
 
 def test_process_model_mode_uses_the_estimator():
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(LiveProviderBundle(_model_provider()), as_of=NOW)
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.signal == OrderRecommendation.BUY
-    # current_price=100, anchor P/E = 100/5.0 = 20x, following EPS 6.0 -> target 120 -> +20%
+    # current_price=100, TTM 4.8 vs prior 4.0 -> growth 1.2 -> target 120 -> +20%
     assert rec.expected_profit_percent == pytest.approx(20.0)
 
 
 def test_process_model_mode_falls_back_to_flat_percent_when_uncomputable():
-    """Insufficient estimate coverage (only 1 period, model needs 2 for 'forward') -> the
-    model returns None -> falls back to expected_profit_percent, exactly like this expert
-    behaved before 'model' mode existed."""
+    """Shrinking reported EPS (no bullish target) -> the model returns None -> falls back to
+    expected_profit_percent, exactly like this expert behaved before 'model' mode existed."""
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
-    bundle = e._gather(LiveProviderBundle(_model_provider(estimates=[{"estimated_eps_avg": 5.0}])),
+    e._gather_model_target_method = "reported"
+    bundle = e._gather(LiveProviderBundle(_model_provider(model_rows=_reported(0.9, 1.0))),
                        as_of=NOW)
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.signal == OrderRecommendation.BUY
@@ -290,22 +305,42 @@ def test_process_model_mode_respects_the_shared_max_expected_profit_percent_cap(
     """The SAME max_expected_profit_percent setting caps 'model' mode too -- no separate
     cap setting, per the explicit design decision."""
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model", "max_expected_profit_percent": 10.0}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "max_expected_profit_percent": 10.0,
+                "model_target_method": "reported"}
     e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = "reported"
     bundle = e._gather(LiveProviderBundle(_model_provider()), as_of=NOW)  # uncapped would be +20%
     rec = e._process(bundle, settings, as_of=NOW)
     assert rec.expected_profit_percent == pytest.approx(10.0)
 
 
-def test_process_model_target_method_trailing_is_selectable():
+def test_process_model_target_method_reported_2y_is_selectable():
     e = _expert()
-    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "trailing"}
+    settings = {**SETTINGS, "expected_profit_mode": "model", "model_target_method": "reported_2y"}
     e._gather_expected_profit_mode = "model"
-    # FakeDetails.get_past_earnings (via FakeDetailsWithEstimates) returns ONE earnings row,
-    # not four -- 'trailing' needs 4 quarters, so this exercises the fallback path too.
+    e._gather_model_target_method = "reported_2y"
+    # The fake history holds 9 quarters; 'reported_2y' needs 12, so this exercises the fallback.
     bundle = e._gather(LiveProviderBundle(_model_provider()), as_of=NOW)
     rec = e._process(bundle, settings, as_of=NOW)
-    assert rec.expected_profit_percent == 8.0  # falls back: only 1 quarter of trailing earnings
+    assert rec.expected_profit_percent == 8.0
+
+
+@pytest.mark.parametrize("method", ["forward", "trailing"])
+def test_backtest_gather_refuses_estimate_based_methods(method):
+    from ba2_experts.analyst_target_model import EstimatesNotPointInTime
+    e = _expert()
+    e._gather_expected_profit_mode = "model"
+    e._gather_model_target_method = method
+    from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+
+    class _Refusing(FakeDetailsWithEstimates):      # what the hermetic FMP provider does
+        def get_earnings_estimates(self, symbol, frequency, as_of_date, lookback_periods, format_type, **kw):
+            refuse_if_not_point_in_time(as_of_date, hermetic=True, what="fake FMP")
+
+    refusing = _Refusing()
+    provider = lambda c, n, **k: {"fundamentals_details": refusing, "ohlcv": FakeOHLCV()}[c]  # noqa: E731
+    with pytest.raises(EstimatesNotPointInTime):
+        e._gather(LiveProviderBundle(provider), as_of=NOW)
 
 
 def test_gather_does_not_fetch_estimator_inputs_when_mode_is_not_model():

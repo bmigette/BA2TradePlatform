@@ -103,8 +103,10 @@ class ObjectStore:
         """
         object_hash = content_hash(kind, data)
         path = self.path_for(object_hash, kind)
-        if path.exists():
+        if path.exists() and self._touch(path):
             return object_hash
+        # Absent -- or deleted by a retention prune between the check and the touch: (re)write it. ``put``
+        # returns only once the file is on disk with a fresh age.
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f"{object_hash}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
@@ -127,6 +129,25 @@ class ObjectStore:
             if tmp.exists():
                 tmp.unlink()
         return object_hash
+
+    @staticmethod
+    def _touch(path: Path) -> bool:
+        """Refresh the mtime of an object that was published again (content-addressed dedupe).
+
+        Returns False when the file vanished (a retention prune deleted it): the caller rewrites it.
+
+        Retention (:mod:`ba2_common.core.replay.retention`) never deletes an object younger than its age
+        bound; without this an old object that a NEW analysis re-uses would still look old to it.
+        """
+        try:
+            os.utime(path, None)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            logger.error(f"replay store: could not refresh the age of {path.name} ({exc}); a retention "
+                         f"prune could treat this re-used object as old")
+            return True
 
     def exists(self, object_hash: str) -> bool:
         return any(self.path_for(object_hash, kind).exists() for kind in _EXTENSIONS)
@@ -245,14 +266,17 @@ class ReplayIndex:
     capture thread and the writer thread.
     """
 
-    def __init__(self, db_path, *, busy_timeout_ms: int = 30000):
+    def __init__(self, db_path, *, busy_timeout_ms: int = 30000, read_only: bool = False):
         self.path = Path(db_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._local = threading.local()
         self._connections: Dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
-        self._create_schema()
+        if not read_only:
+            self._create_schema()
 
     # -- connections
 
@@ -260,11 +284,18 @@ class ReplayIndex:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
-        conn = sqlite3.connect(str(self.path), timeout=self._busy_timeout_ms / 1000.0)
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True,
+                timeout=self._busy_timeout_ms / 1000.0,
+            )
+        else:
+            conn = sqlite3.connect(str(self.path), timeout=self._busy_timeout_ms / 1000.0)
         conn.isolation_level = None  # explicit transactions only
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        if not self.read_only:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         self._local.conn = conn
         with self._connections_lock:
@@ -325,7 +356,20 @@ class ReplayIndex:
                 ),
             )
 
-    def update_session_status(self, session_id: str, status: str, ended_at=None) -> None:
+    def register_objects(self, objects: Sequence[ObjectRef]) -> None:
+        """Record published objects that no analysis commit will carry."""
+        now = _now_iso()
+        conn = self._connection()
+        with _transaction(conn):
+            for ref in objects:
+                conn.execute(
+                    "INSERT OR IGNORE INTO objects (hash, kind, size, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (ref.hash, ref.kind, ref.size, now),
+                )
+
+    def update_session_status(self, session_id: str, status: str, ended_at=None,
+                              capabilities_update: Optional[Dict[str, Any]] = None) -> None:
         conn = self._connection()
         with _transaction(conn):
             row = conn.execute(
@@ -335,6 +379,9 @@ class ReplayIndex:
                 raise ReplayStoreError(f"session {session_id} is not in the index")
             payload = json.loads(row["payload"])
             payload["status"] = status
+            if capabilities_update:
+                payload["capabilities"] = {**(payload["capabilities"] if "capabilities" in payload else {}),
+                                           **capabilities_update}
             if ended_at is not None:
                 if ended_at.tzinfo is None:
                     raise ValueError("ended_at must be timezone-aware")
@@ -343,6 +390,61 @@ class ReplayIndex:
                 "UPDATE sessions SET status = ?, ended_at = ?, payload = ? WHERE session_id = ?",
                 (status, payload["ended_at"], _dumps(payload), session_id),
             )
+
+    def delete_sessions(self, session_ids: Sequence[str], batch_size: int = 5) -> int:
+        """Delete sessions and everything the index holds for them, ``batch_size`` sessions per transaction.
+
+        Short transactions on purpose: the live writer waits at most its busy timeout (30 s) for the index,
+        and one transaction over a month of sessions can outlast that. Refuses (nothing is deleted) when any
+        session is unknown or still ``open`` -- an open session is being written by a live process -- and
+        re-checks ``open`` inside each batch. Returns the number of sessions deleted.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        session_ids = list(session_ids)
+        conn = self._connection()
+        for session_id in session_ids:
+            self._require_deletable(conn, session_id)
+        for start in range(0, len(session_ids), batch_size):
+            with _transaction(conn):
+                batch = session_ids[start:start + batch_size]
+                for session_id in batch:
+                    self._require_deletable(conn, session_id)
+                for session_id in batch:
+                    conn.execute("DELETE FROM observation_links WHERE observation_id IN "
+                                 "(SELECT observation_id FROM observations WHERE session_id = ?)", (session_id,))
+                    conn.execute("DELETE FROM observations WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM analyses WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM coverage WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        return len(session_ids)
+
+    @staticmethod
+    def _require_deletable(conn, session_id: str) -> None:
+        row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise ReplayStoreError(f"session {session_id} is not in the index")
+        if row["status"] == ReplayStatus.SESSION_OPEN:
+            raise ReplayStoreError(f"session {session_id} is open (a live process is writing it); refusing to delete it")
+
+    def delete_object_rows(self, hashes: Sequence[str]) -> None:
+        """Drop the registry rows of objects whose files were deleted."""
+        conn = self._connection()
+        with _transaction(conn):
+            conn.executemany("DELETE FROM objects WHERE hash = ?", [(h,) for h in hashes])
+
+    def root_hashes(self, session_id: str) -> Set[str]:
+        """Every object hash a session's own records reference directly (session, analyses, observations)."""
+        conn = self._connection()
+        found: Set[str] = set(self.get_session(session_id).object_hashes())
+        for analysis in self.analyses(session_id):
+            found.update(analysis.object_hashes())
+        # Extracted by SQLite: the observation payloads (which can be large) are not parsed in Python.
+        for row in conn.execute("SELECT json_extract(payload, '$.payload_object') AS payload_object "
+                                "FROM observations WHERE session_id = ?", (session_id,)):
+            if row["payload_object"] is not None:
+                found.add(row["payload_object"])
+        return found
 
     def mark_interrupted(self) -> List[str]:
         """Mark every still-open session interrupted; returns the ids marked.
@@ -448,10 +550,22 @@ class ReplayIndex:
                     )
             _write_coverage(conn, coverage)
 
-    def record_coverage(self, entries: Sequence[CoverageEntry]) -> None:
+    def record_coverage(self, entries: Sequence[CoverageEntry], *,
+                        busy_timeout_ms: Optional[int] = None) -> None:
+        """Write coverage rows. ``busy_timeout_ms`` bounds the wait for the write lock on THIS call
+        (a caller that must not block, e.g. a trading thread recording a drop); ``None`` keeps the
+        index's own timeout."""
         conn = self._connection()
-        with _transaction(conn):
-            _write_coverage(conn, entries)
+        if busy_timeout_ms is None:
+            with _transaction(conn):
+                _write_coverage(conn, entries)
+            return
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        try:
+            with _transaction(conn):
+                _write_coverage(conn, entries)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
 
     # -- reads
 
@@ -469,11 +583,30 @@ class ReplayIndex:
             raise ReplayStoreError(f"session {session_id} is not in the index")
         return SessionRecord.from_mapping(json.loads(row["payload"]))
 
-    def analyses(self, session_id: str) -> List[AnalysisRecord]:
+    def analyses(self, session_id: str, *, skipped: Optional[List[Dict[str, str]]] = None
+                 ) -> List[AnalysisRecord]:
+        """The session's analyses. STRICT by default: a row this reader cannot parse (written by a
+        newer schema) raises, so export and retention never act on a partial view.
+
+        ``skipped``: a list to fill makes the LISTING tolerant per row. A row with fields this reader
+        does not know is left out and appended as ``{"analysis_id", "error"}``; nothing is dropped
+        silently (the caller reports ``skipped``).
+        """
         rows = self._connection().execute(
             "SELECT payload FROM analyses WHERE session_id = ? ORDER BY rowid", (session_id,)
         ).fetchall()
-        return [AnalysisRecord.from_mapping(json.loads(row["payload"])) for row in rows]
+        records: List[AnalysisRecord] = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if skipped is None:
+                records.append(AnalysisRecord.from_mapping(payload))
+                continue
+            try:
+                records.append(AnalysisRecord.from_mapping(payload))
+            except ValueError as exc:
+                skipped.append({"analysis_id": str(payload["analysis_id"]) if "analysis_id" in payload else "",
+                                "error": str(exc)})
+        return records
 
     def observations(self, analysis_id: str) -> List[ProviderObservation]:
         rows = self._connection().execute(

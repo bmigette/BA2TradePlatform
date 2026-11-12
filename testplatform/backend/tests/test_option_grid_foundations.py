@@ -1851,6 +1851,45 @@ def test_the_earnings_entry_dte_windows_stay_inside_the_designed_7_to_30_band():
     assert windows == {(7, 21), (10, 24), (13, 27), (16, 30)}
 
 
+def test_the_earnings_straddle_dte_exit_cannot_fire_before_the_print():
+    """Review finding 2026-11-09: O_ERN inherited the default opt_dte band (21, 0..21), so the
+    authored genome (entry window 14..28 DTE, earliest expiry picked) was closed on the first
+    manage pass and never held through earnings. The DTE exit must stay below the lowest DTE
+    the position can have ON the print day: lowest decoded entry dte_min minus the entry
+    gene's days-before-earnings ceiling."""
+    m = _launcher()
+    lowest_entry = min(lo for lo, _ in _decoded_dte_windows(m, "O_ERN"))
+    lead = int(m._EVENT_ENTRY_DAYS["value_max"])
+    assert m._ERN_ENTRY_LEAD_DAYS == lead
+    opt_dte = next(r for r in m._option_exit_rules("O_ERN") if r["id"] == "opt_dte")
+    leaf = opt_dte["conditions"]["conditions"][0]
+    assert leaf["op"] == "<="
+    # authored default AND every searchable value stay strictly below the print-day DTE
+    assert leaf["value"] < lowest_entry - lead
+    assert leaf["value_max"] < lowest_entry - lead
+    assert m._OPTION_DTE_EXIT_BANDS["O_ERN"][2] == leaf["value_max"]
+    # and the authored (not just decoded) entry window clears the default threshold
+    cfg = m._OPTION_STRATS["O_ERN"]
+    assert int(cfg["option_dte_min"]) - lead > leaf["value"]
+
+
+def test_the_exit_floor_guard_refuses_an_event_band_that_reaches_the_print_day():
+    """The guard must refuse the pre-fix O_ERN table (default 0..21 band) and accept today's."""
+    m = _launcher()
+    orig = m._OPTION_DTE_EXIT_BANDS["O_ERN"]
+    m._OPTION_DTE_EXIT_BANDS["O_ERN"] = (21, 0, 21, 3)
+    try:
+        with pytest.raises(RuntimeError, match="silent no-op trade"):
+            m._assert_entry_dte_clears_exit_floor("O_ERN", ["O_ERN"], lead_days=5)
+        # without the lead the old arithmetic would not even see the problem at the floor
+        m._OPTION_DTE_EXIT_BANDS["O_ERN"] = (0, 0, 2, 1)   # 7 - 5 = 2 <= 2: print-day close
+        with pytest.raises(RuntimeError, match="silent no-op trade"):
+            m._assert_entry_dte_clears_exit_floor("O_ERN", ["O_ERN"], lead_days=5)
+    finally:
+        m._OPTION_DTE_EXIT_BANDS["O_ERN"] = orig
+    m._assert_entry_dte_clears_exit_floor("O_ERN", ["O_ERN"], lead_days=5)
+
+
 @pytest.mark.parametrize("rule_id,field,op", [
     ("pmcc_roll_dte", "short_leg_days_to_expiry", "<="),
     ("pmcc_roll_buyback", "credit_decayed_pct", ">="),

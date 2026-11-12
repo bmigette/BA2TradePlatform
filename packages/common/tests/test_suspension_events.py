@@ -81,3 +81,29 @@ def test_loader_still_validates_symbols_when_an_undecided_block_is_present(tmp_p
     d = _write(tmp_path, {"X": [["2024-05-31", None, "weird", 90, None]]}, undecided={})
     with pytest.raises(ValueError, match="malformed"):
         load_suspension_events(d)
+
+
+def test_delisting_terminals_load_validate_and_match_the_suspension_build(tmp_path):
+    import json
+    from datetime import date
+    from ba2_common.core import suspension_events as se
+    meta = tmp_path / "_meta"
+    meta.mkdir()
+    (meta / "suspensions.json").write_text(json.dumps({"build": "B1", "rule": {}, "symbols": {}}))
+    assert se.load_delisting_terminals(str(tmp_path)) == {}                                  # no file: feature off
+
+    def put(build, symbols):
+        (meta / "delisting_terminals.json").write_text(json.dumps({"build": build, "symbols": symbols}))
+    put("B1", {"sivb": {"last_session": "2023-03-09", "kind": "worthless", "price": 0.0, "source": "tag"},
+               "TWTR": {"last_session": "2022-10-27", "kind": "cash_merger", "price": 54.2, "source": "x"}})
+    t = se.load_delisting_terminals(str(tmp_path))
+    assert se.terminal_exit("SIVB", date(2023, 3, 9), t) == (0.0, "worthless")
+    assert se.terminal_exit("TWTR", date(2022, 10, 27), t) == (54.2, "cash_merger")
+    assert se.terminal_exit("TWTR", date(2020, 1, 1), t) == (None, "unknown")                # another delisting's terminal
+    assert se.terminal_exit("NONE", date(2020, 1, 1), t) == (None, "unknown")
+    put("OTHER", {})
+    with pytest.raises(ValueError, match="malformed"):
+        se.load_delisting_terminals(str(tmp_path))
+    put("B1", {"X": {"last_session": "2023-03-09", "kind": "worthless", "price": 5.0, "source": "x"}})
+    with pytest.raises(ValueError, match="malformed"):
+        se.load_delisting_terminals(str(tmp_path))

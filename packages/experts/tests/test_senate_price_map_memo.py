@@ -20,8 +20,12 @@ FMPSenateTraderWeight = mod.FMPSenateTraderWeight
 
 @pytest.fixture(autouse=True)
 def _clean_memo():
+    """These tests pin the BACKTEST (frozen) path; the live path is covered at the bottom."""
+    import ba2_providers.fmp_common as fc
     mod.clear_price_map_memo()
+    fc.set_ttl_frozen(True)
     yield
+    fc.set_ttl_frozen(False)
     mod.clear_price_map_memo()
 
 
@@ -135,4 +139,63 @@ def test_the_ticker_is_normalised_before_the_cache_key(expert, monkeypatch):
     expert._get_price_at_date('BRK/B', datetime(2020, 1, 1))
     expert._get_price_at_date('BRK-B', datetime(2020, 1, 1))
 
+    assert len(calls) == 1
+
+
+# --- LIVE path: no process-lifetime memo, no stored empty map ---------------------------------
+
+@pytest.fixture()
+def live(monkeypatch):
+    """Freeze flag OFF (the live process) with a fake raw fetcher and a controllable clock."""
+    import ba2_providers.fmp_common as fc
+    fc.set_ttl_frozen(False)
+    state = {"calls": 0, "payload": _history(), "now": 1000.0}
+
+    def _fetch(self, symbol):
+        state["calls"] += 1
+        return state["payload"]
+
+    monkeypatch.setattr(FMPSenateTraderWeight, '_fetch_price_history_uncached', _fetch)
+    monkeypatch.setattr(mod.time, 'time', lambda: state["now"])
+    return state
+
+
+def test_live_never_touches_the_process_lifetime_memo(expert, live):
+    expert._get_price_at_date('AAPL', datetime(2020, 1, 1))
+
+    assert 'AAPL' not in mod._PRICE_MAP_MEM
+
+
+def test_live_a_later_date_sees_a_refreshed_map(expert, live):
+    assert expert._get_price_at_date('AAPL', datetime(2020, 1, 5)) is None
+    live["payload"] = _history(n=6)          # a new session has printed since
+    live["now"] += mod._LIVE_PRICE_MAP_TTL_S + 1
+
+    assert expert._get_price_at_date('AAPL', datetime(2020, 1, 5)) == 104.0
+    assert live["calls"] == 2
+
+
+def test_live_many_dates_of_one_symbol_share_one_fetch_inside_the_ttl(expert, live):
+    for d in (1, 2, 3):
+        expert._get_price_at_date('AAPL', datetime(2020, 1, d))
+
+    assert live["calls"] == 1
+
+
+def test_live_a_failed_fetch_is_retried_not_remembered_as_no_prices(expert, live):
+    live["payload"] = []
+    assert expert._get_price_at_date('AAPL', datetime(2020, 1, 1)) is None
+    live["payload"] = _history()
+
+    assert expert._get_price_at_date('AAPL', datetime(2020, 1, 1)) == 100.0
+    assert live["calls"] == 2
+
+
+def test_frozen_many_dates_one_fetch_and_same_values(expert, monkeypatch):
+    """Pins the backtest path: one provider read, identical values."""
+    calls = _patch_history(monkeypatch, [])
+
+    got = [expert._get_price_at_date('AAPL', datetime(2020, 1, d)) for d in (1, 2, 3, 9)]
+
+    assert got == [100.0, 101.0, 102.0, None]
     assert len(calls) == 1

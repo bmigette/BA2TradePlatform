@@ -49,6 +49,7 @@ from ba2_common.core.trigger_catalog import (
 )
 from functools import partial
 from ..components.refresh_button import refresh_button
+from ba2_common.core.replay import retention as replay_retention
 from ..utils import phone_sections as _phone_sections
 from ..utils.secret_mask import SECRET_INPUT_CLASS, is_secret_setting
 from ..utils.phone_sections import (expert_card_template,
@@ -875,6 +876,7 @@ class AppSettingsTab:
         'worker_count': 'worker_count_input',
         'account_refresh_interval': 'account_refresh_interval_input',
         'scheduled_session_guard_enabled': 'session_guard_input',
+        'data_provider_estimates': 'estimates_provider_input',
     }
 
     def _shown_value(self, key: str):
@@ -1006,6 +1008,10 @@ class AppSettingsTab:
             self.finnhub_input = _secret_input(label='Finnhub API Key', value=self._shown_value('finnhub_api_key')).classes('w-full')
             self.fred_input = _secret_input(label='FRED API Key', value=self._shown_value('fred_api_key')).classes('w-full')
             self.alpha_vantage_input = _secret_input(label='Alpha Vantage API Key', value=self._shown_value('alpha_vantage_api_key')).classes('w-full')
+            self.estimates_provider_input = ui.select(
+                APP_SETTINGS_DEFINITIONS['data_provider_estimates']['choices'],
+                label='Analyst estimates provider (live)',
+                value=self._shown_value('data_provider_estimates')).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
                 self.fmp_input = _secret_input(label='Financial Modeling Prep (FMP) API Key', value=self._shown_value('FMP_API_KEY')).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
@@ -1751,6 +1757,9 @@ class ExpertSettingsTab:
             
             self.experts_table.add_slot('body-cell-actions', """
                 <q-td :props="props">
+                    <q-btn v-if="props.row.expert === 'DeterministicScorer'" :href="'/style/' + props.row.id" target="_blank" icon="view_list" flat dense color='purple'>
+                        <q-tooltip>Style view (read-only option members)</q-tooltip>
+                    </q-btn>
                     <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'>
                         <q-tooltip>Edit Expert</q-tooltip>
                     </q-btn>
@@ -1917,6 +1926,9 @@ class ExpertSettingsTab:
                     detail.append(planned.problem)
                 else:
                     detail.append(f'{planned.settings_changed} setting(s) changed')
+                    if planned.account_change:
+                        detail.append('MOVES TO ACCOUNT: '
+                                      f'{planned.account_change[0]} -> {planned.account_change[1]}')
                     if planned.ruleset_names:
                         detail.append('rulesets: ' + ', '.join(planned.ruleset_names))
                 ui.label('   ' + ' | '.join(detail)).classes('text-xs text-grey-6 mb-1')
@@ -7815,6 +7827,10 @@ class BatchCleanupTab:
         self.tar_blank_days_input = None
         self.tar_delete_days_input = None
         self.tar_preview_container = None
+        # replay recordings (the live decision recorder's store)
+        self.replay_days_input = None
+        self.replay_stats_container = None
+        self.replay_preview_container = None
         self.render()
     
     def render(self):
@@ -7945,6 +7961,7 @@ class BatchCleanupTab:
                     ).props('color=warning outline')
 
             self._render_trade_action_result_retention()
+            self._render_replay_retention()
 
             # Preview results container
             with ui.card().classes('w-full mb-4'):
@@ -8553,6 +8570,192 @@ class BatchCleanupTab:
             ui.notify(f"{result['rows_undated']} row(s) have no timestamp, so their age is "
                       f"unknown and they were left untouched.", type='warning')
         self._preview_trade_action_result_retention()
+
+    # -----------------------------------------------------------------
+    # Replay recordings (the live decision recorder's store)
+    #
+    # The prune logic is ONE function in ba2_common (replay.retention); `ba2-test replay prune` calls
+    # the same one. The work runs in the executor, off the UI event loop. The running app's OWN open
+    # session and every object a kept session (or a live writer) can reach are never deleted; an
+    # inconsistent store is refused loudly (the reason is shown, not swallowed).
+    # -----------------------------------------------------------------
+
+    def _replay_store_root(self) -> str:
+        """The running app's recording store: ``<CACHE_FOLDER>/replay/v1``."""
+        from ...core.replay_capture import store_root
+        return store_root()
+
+    def _render_replay_retention(self):
+        """Render the replay recordings card."""
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Replay Recordings').classes('text-subtitle2 mb-2')
+            ui.label(
+                'The live decision recorder keeps every recorded pass on disk and never deletes anything '
+                'by itself. Sessions older than the window below are removed, then the object files no '
+                'remaining session uses.'
+            ).classes('text-body2 mb-2')
+            ui.label(
+                '⚠️ The running session is never deleted, nor any object a kept session reaches or that '
+                'was written within the last day. Deleted recordings cannot be replayed.'
+            ).classes('text-caption text-orange mb-4')
+
+            self.replay_stats_container = ui.column().classes('w-full mb-2')
+            with self.replay_stats_container:
+                ui.label('Click "Refresh Replay Stats" to see what is stored.').classes('text-body2 text-grey')
+            refresh_button(self._refresh_replay_stats, label='Refresh Replay Stats').classes('mb-4')
+
+            self.replay_days_input = ui.number(
+                label='Keep recordings of the last (days)',
+                value=30, min=replay_retention.MIN_KEEP_DAYS, max=3650, step=1, format='%.0f',
+            ).classes('w-full').props('outlined')
+
+            self.replay_preview_container = ui.column().classes('w-full mt-2')
+            with self.replay_preview_container:
+                ui.label('Click "Preview Replay Cleanup" to see what would be deleted.').classes('text-body2 text-grey')
+
+            with ui.row().classes('w-full gap-2 justify-end mt-2'):
+                ui.button('Preview Replay Cleanup', icon='visibility',
+                          on_click=self._preview_replay_prune).props('outline')
+                ui.button('Delete Old Recordings', icon='delete_sweep',
+                          on_click=self._confirm_replay_prune).props('color=warning')
+
+    def _replay_days(self) -> int:
+        return int(self.replay_days_input.value)
+
+    async def _refresh_replay_stats(self):
+        """Statistics of the store: sessions by status, size, object count, dates, growth per day."""
+        self.replay_stats_container.clear()
+        root = self._replay_store_root()
+        loop = asyncio.get_event_loop()
+        try:
+            stats = await loop.run_in_executor(None, replay_retention.statistics, root)
+        except replay_retention.RetentionError as e:
+            logger.warning(f'Replay store statistics unavailable: {e}')
+            with self.replay_stats_container:
+                ui.label(f'❌ {e}').classes('text-negative')
+            return
+        except Exception as e:
+            logger.error(f'Replay store statistics failed: {e}', exc_info=True)
+            with self.replay_stats_container:
+                ui.label(f'❌ Replay statistics failed: {e}').classes('text-negative')
+            return
+
+        human = replay_retention.human_bytes
+        with self.replay_stats_container:
+            ui.label(f'Store: {stats["root"]}').classes('text-caption text-grey')
+            with ui.grid(columns=4).classes('w-full gap-4'):
+                for caption, value in (
+                        ('Sessions', str(stats['sessions'])),
+                        ('Object files', str(stats['objects'])),
+                        ('Size on disk', human(stats['total_bytes'])),
+                        ('Oldest / newest session',
+                         f'{(stats["oldest_session"] or "-")[:10]} / {(stats["newest_session"] or "-")[:10]}')):
+                    with ui.card().classes('p-4'):
+                        ui.label(caption).classes('text-caption text-grey')
+                        ui.label(value).classes('text-h6')
+            ui.label('Sessions by status: ' + (', '.join(
+                f'{status}={count}' for status, count in stats['sessions_by_status'].items()) or 'none')
+            ).classes('text-body2 mt-2')
+            if stats['bytes_by_day']:
+                ui.label('Growth per day (object bytes by write date): ' + ', '.join(
+                    f'{day}: {human(size)}' for day, size in stats['bytes_by_day'].items())
+                ).classes('text-caption')
+
+    async def _preview_replay_prune(self):
+        """Dry run: what a prune with the current window would delete (nothing is changed)."""
+        self.replay_preview_container.clear()
+        root = self._replay_store_root()
+        days = self._replay_days()
+        with self.replay_preview_container:
+            ui.label('Analysing the replay store...').classes('text-body2')
+        loop = asyncio.get_event_loop()
+        try:
+            plan = await loop.run_in_executor(None, replay_retention.preview_prune, root, days)
+        except replay_retention.RetentionError as e:
+            logger.warning(f'Replay cleanup preview refused: {e}')
+            self.replay_preview_container.clear()
+            with self.replay_preview_container:
+                ui.label(f'❌ {e}').classes('text-negative')
+            return
+        except Exception as e:
+            logger.error(f'Replay cleanup preview failed: {e}', exc_info=True)
+            self.replay_preview_container.clear()
+            with self.replay_preview_container:
+                ui.label(f'❌ Preview failed: {e}').classes('text-negative')
+            return
+        self.replay_preview_container.clear()
+        self._show_replay_plan(plan)
+
+    def _show_replay_plan(self, plan: Dict[str, Any]):
+        human = replay_retention.human_bytes
+        executed = plan['executed']
+        with self.replay_preview_container:
+            with ui.card().classes('w-full p-4').style('border: 2px solid orange'):
+                if plan['problems']:
+                    ui.label(f"❌ The store is inconsistent ({len(plan['problems'])} problem(s)); "
+                             f"deleting would be refused:").classes('text-negative')
+                    for problem in plan['problems'][:10]:
+                        ui.label(problem).classes('text-caption text-negative')
+                verb = 'Deleted' if executed else 'Will delete'
+                ui.label(f"{verb} {len(plan['sessions_delete'])} session(s) that ended more than "
+                         f"{plan['keep_days']} day(s) ago").classes('text-body1 font-bold text-orange')
+                for session in plan['sessions_delete'][:10]:
+                    ui.label(f"{session['session_id']} ({session['status']}, ended "
+                             f"{(session['ended_at'] or session['started_at'] or '')[:10]})").classes('text-caption')
+                if len(plan['sessions_delete']) > 10:
+                    ui.label(f"... and {len(plan['sessions_delete']) - 10} more").classes('text-caption')
+                ui.label(f"{verb} {plan['objects_delete']} object file(s), {human(plan['bytes_delete'])}"
+                         ).classes('text-body1 font-bold text-orange mt-2')
+                ui.label(
+                    f"Kept: {plan['sessions_kept']} session(s), {len(plan['sessions_open_protected'])} running "
+                    f"(protected), {plan['objects_kept_reachable']} object(s) still used, "
+                    f"{plan['objects_kept_young']} unused but written within the last day"
+                ).classes('text-caption mt-2')
+
+    def _confirm_replay_prune(self):
+        """Confirmation dialog for deleting old replay recordings."""
+        days = self._replay_days()
+        with ui.dialog() as dialog, ui.card():
+            ui.label('⚠️ Confirm Replay Recording Cleanup').classes('text-h6 mb-4')
+            ui.label(f'Recorded sessions that ended more than {days} day(s) ago, and the files only they use, '
+                     f'will be permanently deleted. They can no longer be exported or replayed.'
+                     ).classes('text-body1 mb-2')
+            ui.label('The running session is not touched. This cannot be undone.').classes('text-body2 text-orange mb-4')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._perform_replay_prune(dialog)).props('color=negative')
+        dialog.open()
+
+    async def _perform_replay_prune(self, dialog):
+        """Run the prune in the executor and report the outcome; a refusal or failure is shown, never swallowed."""
+        dialog.close()
+        root = self._replay_store_root()
+        days = self._replay_days()
+        self.replay_preview_container.clear()
+        with self.replay_preview_container:
+            ui.label('Deleting old replay recordings...').classes('text-body2')
+        loop = asyncio.get_event_loop()
+        try:
+            plan = await loop.run_in_executor(None, replay_retention.execute_prune, root, days)
+        except replay_retention.RetentionError as e:
+            logger.error(f'Replay cleanup failed: {e}')
+            self.replay_preview_container.clear()
+            with self.replay_preview_container:
+                ui.label(f'❌ {e}').classes('text-negative')
+            ui.notify(f'Replay cleanup FAILED: {e}', type='negative')
+            return
+        except Exception as e:
+            logger.error(f'Replay cleanup failed: {e}', exc_info=True)
+            self.replay_preview_container.clear()
+            with self.replay_preview_container:
+                ui.label(f'❌ Replay cleanup failed: {e}').classes('text-negative')
+            ui.notify(f'Replay cleanup failed: {e}', type='negative')
+            return
+        self.replay_preview_container.clear()
+        self._show_replay_plan(plan)
+        ui.notify(f"Deleted {len(plan['sessions_delete'])} session(s) and {plan['objects_delete']} object file(s) "
+                  f"({replay_retention.human_bytes(plan['bytes_delete'])} freed).", type='positive')
+        await self._refresh_replay_stats()
 
     def _refresh_activity_log_stats(self):
         """Refresh activity log statistics."""

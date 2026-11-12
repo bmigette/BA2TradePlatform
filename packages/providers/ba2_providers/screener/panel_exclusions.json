@@ -185,6 +185,30 @@
    "reason": "unclean reused ticker (ipo_after_resume in _meta/reused_tickers.json ambiguous list): FMP profile New Era Energy & Digital (ipoDate 2025-08-13) but Alpaca bars from 2022-01-06 with a 2024-09-10..10-10 gap: series likely joins two issuers (gap/reuse audit 2026-10-22)",
    "added": "2026-10-22",
    "reviewed_by": "owner (B. Migette) 2026-10-21 rule: reused or unclean tickers are excluded"
+  },
+  {
+   "symbol": "ETHM",
+   "kind": "delisted",
+   "last_session": "2026-04-30",
+   "reason": "Alpaca daily bars end 2026-04-30 while the vendor listing still shows the symbol (stale-listed); treated as no longer trading after its last bar. Found when the 2026 H1 out-of-sample re-runs refused the panel",
+   "added": "2026-11-08",
+   "reviewed_by": "owner (B. Migette) 2026-11-08"
+  },
+  {
+   "symbol": "MMTXU",
+   "kind": "delisted",
+   "last_session": "2026-04-29",
+   "reason": "Alpaca daily bars end 2026-04-29 while the vendor listing still shows the symbol (stale-listed); treated as no longer trading after its last bar. Found when the 2026 H1 out-of-sample re-runs refused the panel",
+   "added": "2026-11-08",
+   "reviewed_by": "owner (B. Migette) 2026-11-08"
+  },
+  {
+   "symbol": "SATS",
+   "kind": "delisted",
+   "last_session": "2026-06-23",
+   "reason": "Alpaca daily bars end 2026-06-23 while the vendor listing still shows the symbol (stale-listed); treated as no longer trading after its last bar. Found when the 2026 H1 out-of-sample re-runs refused the panel",
+   "added": "2026-11-08",
+   "reviewed_by": "owner (B. Migette) 2026-11-08"
   }
  ]
 }

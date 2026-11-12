@@ -128,10 +128,11 @@ from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.option_book import (
     RAIL_OK, BookTotals, BreakerState, CandidateStructure, RailVerdict, _short_put_assignment,
-    admit, book_totals, rearm, update_breaker,
+    _structure_totals, admit, book_totals, rearm, update_breaker,
 )
+from ba2_common.core.entry_order import transaction_entry_tag
 from ba2_common.core.option_lifecycle import (
-    LifecycleLeg, OptionStructure, structure_metrics,
+    COVERED_CALL_STRATEGY, LifecycleLeg, OptionStructure, structure_metrics,
 )
 from ba2_common.core.option_request import (
     OPTION_RAILS_UNCONFIGURED_REFUSAL, OPTION_RAIL_REFUSAL, validate_refusal_phrase,
@@ -337,7 +338,7 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
     return (None, expert_instance_id)
 
 
-#: ONE lock over ALL THREE stores, held by every writer and by the key scan that clears a
+#: ONE lock over ALL FIVE stores, held by every writer and by the key scan that clears a
 #: thread's own keys. It exists because ``_clear_this_threads_keys`` has to ITERATE the store
 #: to find its keys, and under ``--parallel > 1`` a sibling trial's insert lands inside that
 #: iteration: CPython then raises ``RuntimeError: dictionary changed size during iteration``
@@ -345,7 +346,7 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
 #: ``finally``, so the raise also skipped ``clear_threadlocal_db()`` and left the finishing
 #: trial's DB override installed on that worker thread (review finding, 2026-09-01).
 #:
-#: ONE lock rather than three: the three stores are keyed alike, cleared together, and the
+#: ONE lock rather than five: the five stores are keyed alike, cleared together, and the
 #: contention is nil (a handful of dict operations per bar), so three locks would buy nothing
 #: and add an ordering rule to get wrong. It is an ``RLock`` because the guarded functions
 #: legitimately call one another -- ``reset_state`` -> ``reset_breaker_states``,
@@ -692,6 +693,19 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
 class _PendingCharge:
     transaction_id: Optional[int]
     candidate: CandidateStructure
+    #: The style-member tag of the entry this charge stands for (structure_share condition,
+    #: plan 2026-11-06). None for every untagged entry: nothing reads it then.
+    entry_tag: Optional[int] = None
+    #: The symbol of the transaction ``transaction_id`` named WHEN the charge was recorded, so a
+    #: later row that merely REUSES the id is not mistaken for it (2026-11-07). SQLite (live and
+    #: file-backed backtests) gives a deleted max id to the next insert: an unfilled entry's
+    #: WAITING transaction is deleted, an unrelated stock buy takes its id, and an id-only charge
+    #: then stays "in flight" for that position's whole life. None when it could not be read:
+    #: the charge is then matched on the id alone, as before. Not covered: an id reused by a
+    #: row on the SAME symbol (one_per_underlying blocks that underlying anyway while it is
+    #: open), and a live ticker rename of an in-flight entry's row (the charge is dropped one
+    #: cycle early, until the renamed structure is visible in the book).
+    transaction_symbol: Optional[str] = None
 
 
 #: A hard ceiling on in-flight charges per sleeve. Nothing should ever approach it (the
@@ -702,11 +716,57 @@ _PENDING_LIMIT = 50
 
 _PENDING: Dict[Tuple[Optional[int], int], List[_PendingCharge]] = {}
 
+#: Per-sleeve, per-cycle {entry_tag: committed} for the structure_share condition (plan
+#: 2026-11-06). Same key and same lock as _PENDING; cleared by the same run-boundary resets.
+#: (``_ShareCache`` is defined with the share section below; annotations are lazy.)
+_SHARE_CACHE: Dict[Tuple[Optional[int], int], _ShareCache] = {}
+#: Per-sleeve-key share generation, NEVER cleared (so a stale build can never see its old value
+#: come back: no ABA). Bumped by every TAGGED submission and by every reset of that key. A build
+#: that observed a different value for ITS key when it finished is discarded (a concurrent
+#: record_submitted would otherwise be lost between its pending snapshot and the store, and a
+#: build that straddled a reset would store state the reset meant to forget). Per key, so one
+#: trial's submissions and resets never invalidate another thread's builds. Untagged
+#: submissions never touch it.
+_SHARE_GENS: Dict[Tuple[Optional[int], int], int] = {}
+#: One re-entrant lock per sleeve key (never removed), taken by the raced-build fallback and by
+#: every writer of that key's share state, so the locked build sees every submission while no
+#: OTHER sleeve is ever blocked. Lock order: a key lock first, ``_STATE_LOCK`` (short dict
+#: access only) inside it; never the reverse.
+_SHARE_KEY_LOCKS: Dict[Tuple[Optional[int], int], Any] = {}
+
+
+def _share_key_lock(key: Tuple[Optional[int], int]):
+    with _STATE_LOCK:
+        lock = _SHARE_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = _SHARE_KEY_LOCKS[key] = threading.RLock()
+        return lock
+
+
+def _bump_share_gen(key: Tuple[Optional[int], int]) -> None:
+    with _STATE_LOCK:
+        _SHARE_GENS[key] = _SHARE_GENS.get(key, 0) + 1
+
+
+def _reset_share_keys(keys) -> None:
+    """Forget pending charges and the share cache of ``keys``, one key lock at a time, bumping
+    each key's generation so a build in flight for it is discarded."""
+    for key in keys:
+        with _share_key_lock(key):
+            with _STATE_LOCK:
+                _PENDING.pop(key, None)
+                _SHARE_CACHE.pop(key, None)
+            _bump_share_gen(key)
+
+
+def _all_share_keys() -> List[Tuple[Optional[int], int]]:
+    with _STATE_LOCK:
+        return list(set(_PENDING) | set(_SHARE_CACHE) | set(_SHARE_GENS))
+
 
 def reset_pending_charges() -> None:
     """Forget every sleeve's in-flight charges. Tests, and a fresh backtest."""
-    with _STATE_LOCK:
-        _PENDING.clear()
+    _reset_share_keys(_all_share_keys())
 
 
 def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
@@ -716,18 +776,68 @@ def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
 
 
 def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
-                     candidate: CandidateStructure) -> None:
-    """Remember what was just put on the wire so the NEXT candidate is charged for it."""
+                     candidate: CandidateStructure, entry_tag: Optional[int] = None) -> None:
+    """Remember what was just put on the wire so the NEXT candidate is charged for it.
+
+    `entry_tag` (tagged style entries only) also feeds the per-member share cache
+    (:func:`_note_submission`); an untagged entry never touches it."""
     key = _sleeve_key(expert_instance_id)
-    with _STATE_LOCK:
-        charges = _PENDING.setdefault(key, [])
-        charges.append(_PendingCharge(transaction_id, candidate))
-        if len(charges) > _PENDING_LIMIT:
-            del charges[:-_PENDING_LIMIT]
+    # Read before any lock: it is a ledger read (see _PendingCharge.transaction_symbol).
+    symbol = _transaction_symbol(transaction_id) if transaction_id is not None else None
+    if entry_tag is None:
+        with _STATE_LOCK:
+            _record_pending(key, transaction_id, candidate, entry_tag, symbol)
+        return
+    # Tagged: under the key's lock, so a locked fallback build (member_share) sees this charge.
+    with _share_key_lock(key):
+        with _STATE_LOCK:
+            _record_pending(key, transaction_id, candidate, entry_tag, symbol)
+            _note_submission(key, entry_tag, candidate)
 
 
-def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
-    """The ids of this expert's transactions that still exist and could still open.
+def _transaction_symbol(transaction_id: int) -> Optional[str]:
+    """The symbol of transaction ``transaction_id`` now, or None (logged) when it cannot be read."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction
+
+    try:
+        txn = get_instance(Transaction, transaction_id)
+    except Exception as e:  # noqa: BLE001 -- the charge then falls back to its id alone
+        logger.warning(f"Option RM: could not read transaction {transaction_id} for its pending "
+                       f"charge ({e}); the charge is matched on its id alone")
+        return None
+    if txn is None:
+        logger.warning(f"Option RM: transaction {transaction_id} of a just-submitted entry was "
+                       f"not found; its pending charge is matched on its id alone")
+        return None
+    return txn.symbol
+
+
+def _record_pending(key, transaction_id, candidate, entry_tag, transaction_symbol=None) -> None:
+    charges = _PENDING.setdefault(key, [])
+    charges.append(_PendingCharge(transaction_id, candidate, entry_tag, transaction_symbol))
+    if len(charges) > _PENDING_LIMIT:
+        del charges[:-_PENDING_LIMIT]
+
+
+def _note_submission(key: Tuple[Optional[int], int], entry_tag: int,
+                     candidate: CandidateStructure) -> None:
+    """Called under _STATE_LOCK by :func:`record_submitted` for a TAGGED entry: bump the share generation
+    and add the admitted candidate's max loss to the cached total of its tag, so the next
+    symbol of this cycle sees it. A covered call adds nothing (see _build_share_cache)."""
+    _SHARE_GENS[key] = _SHARE_GENS.get(key, 0) + 1
+    cache = _SHARE_CACHE.get(key)
+    if cache is None or candidate.strategy == COVERED_CALL_STRATEGY:
+        return
+    if candidate.max_loss is None:
+        cache.blind.setdefault(entry_tag, []).append(
+            f"in-flight {candidate.strategy} on {candidate.underlying}: max loss unmeasurable")
+    else:
+        cache.committed[entry_tag] = cache.committed.get(entry_tag, 0.0) + float(candidate.max_loss)
+
+
+def _live_transactions(expert_instance_id: int) -> Optional[Dict[int, Optional[str]]]:
+    """``{id: symbol}`` of this expert's transactions that still exist and could still open.
 
     ``None`` when the ledger could not be read -- and an unreadable ledger must NOT be
     treated as "everything was cancelled", because that would forgive every in-flight
@@ -745,11 +855,17 @@ def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
                      f"{expert_instance_id} ({e}) -- in-flight charges are kept, which is "
                      f"the conservative reading", exc_info=True)
         return None
-    return {t.id for t in rows}
+    return {t.id: t.symbol for t in rows}
 
 
 def _prune_pending(expert_instance_id: int,
                    visible: Sequence[OptionStructure]) -> List[CandidateStructure]:
+    """The candidates of the charges still owed; see :func:`_prune_pending_charges`."""
+    return [c.candidate for c in _prune_pending_charges(expert_instance_id, visible)]
+
+
+def _prune_pending_charges(expert_instance_id: int,
+                           visible: Sequence[OptionStructure]) -> List[_PendingCharge]:
     """Drop charges the book can now see, and charges whose order never became a position.
 
     Two reasons a charge stops being owed, and they are different facts:
@@ -757,14 +873,16 @@ def _prune_pending(expert_instance_id: int,
     * its transaction is OPENED and ``book_totals`` now counts it -- keeping the charge as
       well would double-charge the sleeve and stop it trading;
     * its transaction is gone or resolved (a rejected or cancelled entry) -- it never became
-      exposure, and a charge for it would block the sleeve for the life of the process.
+      exposure, and a charge for it would block the sleeve for the life of the process;
+    * its id now names ANOTHER symbol's transaction (``_PendingCharge.transaction_symbol``):
+      the entry's row was deleted and SQLite reused the id -- the same fact as "gone".
 
     A charge whose transaction id was never captured is KEPT (it really was submitted); the
     FIFO ``_PENDING_LIMIT`` is what stops those accumulating.
 
     THE LEDGER READ HAPPENS OUTSIDE ``_STATE_LOCK``, and the store is then edited by REMOVING
     the charges this pass decided against rather than by overwriting the list wholesale.
-    ``_live_transaction_ids`` issues a SELECT; holding a lock every writer needs across a
+    ``_live_transactions`` issues a SELECT; holding a lock every writer needs across a
     database round trip would serialise the sleeve on I/O for no benefit. The consequence of
     dropping the lock in between is that a sibling worker thread may ``record_submitted`` a
     NEW charge while this read is in flight, and an overwrite would silently discard it -- the
@@ -779,7 +897,7 @@ def _prune_pending(expert_instance_id: int,
     if not charges:
         return []
     seen = {s.transaction_id for s in visible}
-    live = _live_transaction_ids(expert_instance_id)
+    live = _live_transactions(expert_instance_id)
     kept: List[_PendingCharge] = []
     for charge in charges:
         if charge.transaction_id is None:
@@ -787,8 +905,13 @@ def _prune_pending(expert_instance_id: int,
             continue
         if charge.transaction_id in seen:
             continue
-        if live is not None and charge.transaction_id not in live:
-            continue
+        if live is not None:
+            if charge.transaction_id not in live:
+                continue
+            now = live[charge.transaction_id]
+            if (charge.transaction_symbol is not None and now is not None
+                    and now != charge.transaction_symbol):
+                continue
         kept.append(charge)
     dropped = {id(c) for c in charges} - {id(c) for c in kept}
     with _STATE_LOCK:
@@ -798,7 +921,7 @@ def _prune_pending(expert_instance_id: int,
             _PENDING[key] = remaining
         else:
             _PENDING.pop(key, None)
-    return [c.candidate for c in kept]
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +990,8 @@ def reset_state() -> None:
 
     Process-wide, deliberately: this is the test fixture's and the operator's reset, the one
     that must leave nothing behind anywhere. A **running trial must never call it** -- see
-    :func:`reset_thread_state`, which is what a backtest run boundary uses.
+    :func:`reset_thread_state`, which is what a backtest run boundary uses. Also forgets
+    the structure_share cache (``_SHARE_CACHE``).
     """
     reset_breaker_states()
     reset_pending_charges()
@@ -917,13 +1041,16 @@ def reset_thread_state() -> None:
     runs already shared one process-wide key with each other and with live; giving a
     backtest permission to wipe live latches to fix that would be the worse trade.
     """
-    # THREE separate acquisitions, one per store, and deliberately not one around all three.
+    # FIVE separate acquisitions, one per store, and deliberately not one around all five.
     # A sibling can only ever read or write keys under ITS OWN thread id, so it cannot
-    # observe this thread half-cleared; making the boundary atomic across the three stores
+    # observe this thread half-cleared; making the boundary atomic across the five stores
     # would buy nothing and would put the lock in two places, leaving the one that actually
     # guards the iteration (``_clear_this_threads_keys``) removable without a test noticing.
     _clear_this_threads_keys(_BREAKER_STATE)
-    _clear_this_threads_keys(_PENDING)
+    me = threading.get_ident()
+    # pending charges + share cache of this thread's keys, under each key's lock, bumping the
+    # key's generation (a share build that straddles this boundary must not be stored)
+    _reset_share_keys([k for k in _all_share_keys() if k[0] == me])
     _clear_this_threads_keys(_JOURNAL)
 
 
@@ -1113,6 +1240,144 @@ def sleeve_true_equity(account, expert_instance_id: int) -> Optional[float]:
     return _read_equity(lambda: account.true_equity(), expert_instance_id,
                         "the account's true (uncapped) equity",
                         "the drawdown breaker is blind this evaluation")
+
+
+# ---------------------------------------------------------------------------
+# structure share: what each style MEMBER has committed (plan 2026-11-06)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MemberShare:
+    """One member's committed capital against the sleeve's equity. ``share_pct`` is None --
+    never 0 -- whenever any input is unmeasurable; ``unmeasurable`` says which."""
+    entry_tag: int
+    committed: Optional[float]
+    equity: Optional[float]
+    share_pct: Optional[float]
+    unmeasurable: Tuple[str, ...] = ()
+
+
+@dataclass
+class _ShareCache:
+    stamp: Any
+    equity: Optional[float]
+    committed: Dict[int, float]
+    blind: Dict[int, List[str]]
+
+
+def assigned_stock_lots(expert_instance_id: int) -> List[Any]:
+    """This expert's OPENED equity transactions that an option assignment delivered
+    (``meta_data.origin == "csp_assignment"``), oldest first. Dual-path like
+    :func:`open_option_transactions`: the in-mem store in a backtest, SQLite live."""
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import AssetClass, TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT
+
+    rows = transactions_where(expert_id=expert_instance_id, status=TransactionStatus.OPENED)
+    return sorted((t for t in rows
+                   if t.asset_class == AssetClass.EQUITY and isinstance(t.meta_data, dict)
+                   and t.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT),
+                  key=lambda t: t.id)
+
+
+def _build_share_cache(account, expert_instance_id: int, stamp: Any) -> _ShareCache:
+    """Committed capital per entry tag from the book, the assigned stock and the in-flight
+    charges. A covered call contributes 0: its capital is the lot's cost basis."""
+    committed: Dict[int, float] = {}
+    blind: Dict[int, List[str]] = {}
+
+    def add(tag: int, amount: float) -> None:
+        committed[tag] = committed.get(tag, 0.0) + amount
+
+    def lose(tag: int, why: str) -> None:
+        blind.setdefault(tag, []).append(why)
+
+    structures, unbuildable = sleeve_structures(expert_instance_id)
+    for structure in structures:
+        tag = transaction_entry_tag(structure.transaction_id)
+        if tag is None or structure.strategy == COVERED_CALL_STRATEGY:
+            continue
+        amount, _n, _no, _o, _a, why = _structure_totals(structure)
+        if why or amount is None:
+            lose(tag, f"transaction {structure.transaction_id}: {why}")
+        else:
+            add(tag, amount)
+    for transaction_id in unbuildable:
+        tag = transaction_entry_tag(transaction_id)
+        if tag is not None:
+            lose(tag, f"transaction {transaction_id}: OPENED option position with no executed "
+                      f"option order row -- its committed capital is unmeasurable")
+    for lot_txn in assigned_stock_lots(expert_instance_id):
+        tag = transaction_entry_tag(lot_txn.id)
+        if tag is None:
+            continue
+        if lot_txn.open_price is None or lot_txn.quantity is None:
+            lose(tag, f"transaction {lot_txn.id}: assigned stock lot has no cost basis "
+                      f"(open_price={lot_txn.open_price!r}, quantity={lot_txn.quantity!r})")
+        else:
+            add(tag, abs(float(lot_txn.open_price)) * abs(float(lot_txn.quantity)))
+    for charge in _prune_pending_charges(expert_instance_id, structures):
+        if charge.entry_tag is None or charge.candidate.strategy == COVERED_CALL_STRATEGY:
+            continue
+        if charge.candidate.max_loss is None:
+            lose(charge.entry_tag, f"in-flight {charge.candidate.strategy} on "
+                                   f"{charge.candidate.underlying}: max loss unmeasurable")
+        else:
+            add(charge.entry_tag, float(charge.candidate.max_loss))
+    equity = sleeve_equity(account, expert_instance_id)
+    if equity is not None and equity <= 0:
+        equity = None
+    return _ShareCache(stamp, equity, committed, blind)
+
+
+def _share_view(cache: _ShareCache, entry_tag: int) -> MemberShare:
+    why = list(cache.blind.get(entry_tag, ()))
+    if cache.equity is None:
+        why.append("sleeve equity is unavailable or not positive")
+    if why:
+        return MemberShare(entry_tag, None, cache.equity, None, tuple(why))
+    amount = cache.committed.get(entry_tag, 0.0)
+    return MemberShare(entry_tag, amount, cache.equity, amount / cache.equity * 100.0)
+
+
+def member_share(account, expert_instance_id: int, entry_tag: int, as_of: Any) -> MemberShare:
+    """``entry_tag``'s committed capital as a percent of the sleeve's equity at ``as_of``.
+
+    SHARED by live and backtest. A per-cycle cache (keyed by the sleeve key, stamped with the
+    decision time) sits in front of :func:`_build_share_cache`; a stamp mismatch rebuilds from
+    the book, so correctness never depends on the stamp. The stamp is ``(as_of, run_token)``."""
+    if as_of is None:
+        raise ValueError("member_share needs the decision time (the recommendation's "
+                         "created_at); without it the per-cycle cache has no key")
+    key = _sleeve_key(expert_instance_id)
+    # The stamp carries the RUN identity as well as the decision time: a file-backed backtest
+    # (persisted top-N re-runs) files its sleeve state under the live key and replays the same
+    # dates as the previous run, so (key, as_of) alone could hand run 2 run 1's book.
+    from ba2_common.core.db import run_token
+    stamp = (as_of, run_token())
+    for _attempt in range(3):
+        with _STATE_LOCK:
+            cache = _SHARE_CACHE.get(key)
+            if cache is not None and cache.stamp == stamp:
+                return _share_view(cache, entry_tag)
+            generation = _SHARE_GENS.setdefault(key, 0)
+        built = _build_share_cache(account, expert_instance_id, stamp)   # I/O outside the lock
+        with _STATE_LOCK:
+            if _SHARE_GENS.get(key, 0) == generation:
+                _SHARE_CACHE[key] = built
+                return _share_view(built, entry_tag)
+    # Three optimistic builds each lost a race. Never answer from a stale build (it could miss a
+    # submission): build once more under THIS SLEEVE's lock. Every tagged record_submitted and
+    # every reset of this key takes the same re-entrant lock, so none can interleave and the
+    # result holds every recorded charge; other sleeves are never blocked, and the global
+    # _STATE_LOCK is NOT held across the DB reads / broker snapshot of the build.
+    with _share_key_lock(key):
+        with _STATE_LOCK:
+            cache = _SHARE_CACHE.get(key)
+            usable = cache is not None and cache.stamp == stamp
+        if not usable:
+            cache = _build_share_cache(account, expert_instance_id, stamp)
+            with _STATE_LOCK:
+                _SHARE_CACHE[key] = cache
+        return _share_view(cache, entry_tag)
 
 
 def _read_equity(read, expert_instance_id: int, what: str, consequence: str

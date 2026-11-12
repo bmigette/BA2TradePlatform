@@ -2,6 +2,7 @@ import dataclasses
 import math
 import threading
 import time
+import weakref
 from abc import abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
@@ -572,6 +573,10 @@ def _snapshot_is_empty(snap: Any) -> bool:
     return all(v is None or isinstance(v, bool) or (isinstance(v, dict) and not v) for v in values)
 
 
+#: Per-thread ``_gather_*`` namespaces of every expert instance (see MarketExpertInterface.__setattr__).
+_GATHER_TLS = threading.local()
+
+
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
@@ -593,6 +598,53 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     # search space). Read via getattr(expert, "bypasses_classic_rm", False).
     # Base default is False; only weight-target experts (e.g. FactorRanker) set it.
     bypasses_classic_rm: bool = False
+
+    # ---- per-call gather inputs are PER THREAD ------------------------------------------------------------
+    # ``run_analysis`` / ``analyze_as_of`` hand the symbol and per-call settings to ``_gather`` through
+    # ``self._gather_*`` attributes. Live, ONE cached expert instance serves concurrent analyses (WorkerQueue
+    # threads), so plain instance attributes let analysis B overwrite analysis A's symbol between A's assignment
+    # and A's ``_gather``: A then stores B's recommendation under A's symbol (found 2026-11-07 by the replay
+    # test: prod 2026-11-06 CORT got RSI's BUY at RSI's price). Every ``_gather_*`` attribute therefore lives in
+    # a per-thread namespace: each analysis reads exactly what its own thread set, as a backtest (one thread)
+    # always did. Set and read them on the SAME thread (every caller does: no gather fans these reads out).
+    # Only DATA attributes are routed: a name the class defines (``_gather_holdings``, ``_gather_all`` ...) is a
+    # method, and assigning it on an instance (a test double) stays an ordinary instance attribute.
+    @classmethod
+    def _is_gather_state(cls, name: str) -> bool:
+        return name.startswith("_gather_") and not hasattr(cls, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if self._is_gather_state(name):
+            self._gather_thread_namespace()[name] = value
+            return
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails, i.e. never for methods (``_gather``, ``_gather_all`` ...).
+        if type(self)._is_gather_state(name):
+            ns = self._gather_thread_namespace()
+            if name in ns:
+                return ns[name]
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        if self._is_gather_state(name):
+            ns = self._gather_thread_namespace()
+            if name not in ns:
+                raise AttributeError(name)
+            del ns[name]
+            return
+        super().__delattr__(name)
+
+    def _gather_thread_namespace(self) -> Dict[str, Any]:
+        """This thread's ``_gather_*`` values for THIS instance (weakly keyed: a dropped expert frees them)."""
+        per_thread = getattr(_GATHER_TLS, "by_expert", None)
+        if per_thread is None:
+            per_thread = _GATHER_TLS.by_expert = weakref.WeakKeyDictionary()
+        ns = per_thread.get(self)
+        if ns is None:
+            ns = per_thread[self] = {}
+        return ns
 
     """
     Abstract base class for trading account interfaces.
@@ -686,6 +738,33 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "allow_automated_trade_modification": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic modification and closing of existing positions"
+                },
+                # WHO KEEPS THE STOCK A SHORT-OPTION ASSIGNMENT DELIVERS (ba2_common.core.
+                # assignment_hold; the backtest's BacktestAccount makes the identical decision
+                # through the same functions). Per instance, because assignments arrive per
+                # account but belong to the strategy that wrote the option. The declared defaults
+                # are NOT applied when nothing is stored: an instance with neither key stored is
+                # treated as UNDECIDED -- the stock is held and an ERROR names the instance --
+                # because the backtest that scored it may have held or liquidated.
+                "hold_assigned_stock": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Keep (True) or liquidate (False) the stock a short-option "
+                                   "assignment delivers",
+                    "tooltip": "True only for strategies whose own rules manage the delivered "
+                               "shares (the wheel). False: the shares are sold with a market "
+                               "order at the next open, exactly as the backtest did. Not set at "
+                               "all: the stock is HELD and an error is logged. Do not combine "
+                               "with hold_assigned_stock_tags."
+                },
+                "hold_assigned_stock_tags": {
+                    "type": "json", "required": False, "default": None,
+                    "description": "Member entry tags (list of ints) whose assignments keep "
+                                   "their stock; every other member's is liquidated",
+                    "tooltip": "Member-scoped form of hold_assigned_stock for a style instance "
+                               "that composes several members (only the wheel holds). The tag "
+                               "is the entry tag of the assigned option position. An untagged "
+                               "assigned position is held with an error. Leave empty for the "
+                               "run-wide hold_assigned_stock."
                 },
                 # MARKET-CONDITION GATES (plan Task 12, operator decision 2026-09-16). The
                 # profile travels WITH THE EXPERT, like its ruleset does, instead of being a
@@ -868,6 +947,36 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "so a '+10% from entry' target becomes +15% at 1.5. This is the only "
                                "volatility awareness the take-profit has; the stop is already "
                                "ATR-scaled. 1.0 = no change. Requires regime_overlay_enabled."
+                },
+                # Down-trend trigger of the regime overlay (ba2_common.core.regime_overlay): the SAME
+                # three consumers as the regime_* scales, active while SPY is BELOW its 200-day
+                # average (benchmark_regime trend bear_rally/down). Independent of regime_overlay_enabled
+                # and multiplied with the stressed scale when both hold. Default OFF = exact no-op.
+                "downtrend_overlay_enabled": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Scale risk/stop/take-profit while SPY is below its 200-day average",
+                    "tooltip": "Master switch for the down-trend trigger. When off (default) the three "
+                               "downtrend_*_scale settings are ignored entirely. When on they take "
+                               "effect on bars the benchmark trend is bear_rally or down, and "
+                               "multiply with the regime_*_scale values when the market is also stressed."
+                },
+                "downtrend_risk_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Position-SIZE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_risk_scale. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
+                },
+                "downtrend_stop_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Stop-loss DISTANCE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_stop_scale. <1 tightens. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
+                },
+                "downtrend_tp_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Take-profit DISTANCE multiplier while SPY is below its 200-day average",
+                    "tooltip": "Same consumer as regime_tp_scale. 1.0 = no change. "
+                               "Requires downtrend_overlay_enabled."
                 },
                 # Ruleset stop policy (TradeActions.ruleset_stop_policy). Off = the ratchet every
                 # expert has always had: a ruleset stop only tightens. Deliberately NOT a forced
@@ -1459,12 +1568,58 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             "scheduled_at": created_at,
             "started_at": datetime.now(_tz.utc),
         }
-        if settings is not None:
-            meta["settings"] = settings
+        branch_flags: Dict[str, Any] = {}
+        recorded, redacted = self._recorded_settings(settings, branch_flags)
+        if recorded is not None:
+            meta["settings"] = recorded
+        if redacted:
+            branch_flags["redacted_setting_keys"] = redacted
         batch_id = _current_capture_batch()
         if batch_id is not None:
-            meta["branch_flags"] = {"batch_id": batch_id}
+            branch_flags["batch_id"] = batch_id
+        if branch_flags:
+            meta["branch_flags"] = branch_flags
         return meta
+
+    def resolve_all_settings(self) -> Dict[str, Any]:
+        """EVERY setting of this instance, resolved exactly as the live code resolves one.
+
+        The union of the merged definitions (own + builtin risk-manager/platform settings)
+        and every stored key, each through ``get_setting_with_interface_default`` -- the same
+        call ``_resolve_settings`` makes for the expert's own keys, so the two can never
+        disagree. A stored key with no definition has no default to fall back to and is
+        returned as stored.
+        """
+        definitions = type(self).get_merged_settings_definitions()
+        stored = self.settings
+        resolved: Dict[str, Any] = {}
+        for key in sorted(set(definitions) | set(stored)):
+            if key in definitions:
+                resolved[key] = self.get_setting_with_interface_default(key, log_warning=False)
+            else:
+                resolved[key] = stored[key]
+        return resolved
+
+    def _recorded_settings(self, passed, branch_flags):
+        """``(settings_to_record, redacted_names)`` for one analysis (schema 2 content).
+
+        A failure to resolve the full set must not stop the analysis: it is logged as an
+        error and flagged on the record, and the record keeps what the live body passed.
+        """
+        from ba2_common.core.replay.settings_record import full_recorded_settings
+
+        try:
+            return full_recorded_settings(
+                self.resolve_all_settings(), get_instance(ExpertInstance, self.id), passed)
+        except Exception as e:
+            logger.error(f"replay capture: could not resolve the full settings of expert "
+                         f"{getattr(self, 'id', None)}; the record keeps only the settings "
+                         f"the analysis was handed: {e}", exc_info=True)
+            branch_flags["settings_resolution_failed"] = f"{type(e).__name__}: {e}"
+            if passed is None:
+                return None, []
+            from ba2_common.core.replay.settings_record import redact_settings
+            return redact_settings(passed)
 
     @staticmethod
     def _use_case_of(market_analysis: Optional["MarketAnalysis"]) -> str:

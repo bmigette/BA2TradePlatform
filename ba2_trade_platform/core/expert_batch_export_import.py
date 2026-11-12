@@ -37,7 +37,10 @@ from ba2_common.core.rules_export_import import RulesExporter, RulesImporter
 from .db import (InstanceNotFound, add_instance, get_all_instances, get_instance,
                  update_instance)
 from .ExpertPriority import priority_from_settings
-from .models import ExpertInstance, Ruleset
+from sqlmodel import select
+
+from .db import delete_instance, get_db
+from .models import AccountDefinition, ExpertInstance, ExpertSetting, Ruleset
 from .utils import get_expert_instance_from_id
 from ..logger import logger
 
@@ -120,6 +123,8 @@ class PlannedExpert:
     settings_changed: int = 0
     ruleset_names: List[str] = field(default_factory=list)
     problem: Optional[str] = None     # set iff action == 'skip'
+    # (current account id, account id the file moves it to); only on an update that CHANGES it.
+    account_change: Optional[tuple] = None
     entry: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -204,6 +209,13 @@ def plan_batch_import(payload: Dict[str, Any]) -> BatchImportPlan:
                 entry=entry))
             continue
 
+        problem, account_change = _validate_entry(entry, existing)
+        if problem:
+            planned.append(PlannedExpert(alias=alias, expert_type=expert_type, action="skip",
+                                         existing_id=existing.id if existing is not None else None,
+                                         problem=problem, entry=entry))
+            continue
+
         ruleset_names = [entry.get(key) for _, key in _RULESET_SLOTS if entry.get(key)]
         settings_changed = _count_setting_changes(existing, entry.get("expert_settings") or {})
         planned.append(PlannedExpert(
@@ -212,9 +224,57 @@ def plan_batch_import(payload: Dict[str, Any]) -> BatchImportPlan:
             existing_id=existing.id if existing is not None else None,
             settings_changed=settings_changed,
             ruleset_names=ruleset_names,
+            account_change=account_change,
             entry=entry))
 
     return BatchImportPlan(experts=planned)
+
+
+def _validate_entry(entry: Dict[str, Any], existing: Optional[ExpertInstance]):
+    """Refuse an entry that would need a guess. Returns (problem or None, account_change).
+
+    Reads only. No defaults: a create needs an explicit account (that exists in THIS database)
+    and an explicit virtual_equity_pct (0 is a real value: a parked expert). An update keeps
+    whatever the file does not state; an account change is allowed only to an existing account
+    and is returned so the plan can show it. A ruleset name that is present but resolves
+    neither in the file's own rules nor in this database is a refusal, never a silent None.
+    """
+    general = entry.get("general") or {}
+    account_id = general.get("account_id")
+    if account_id is None:
+        if existing is None:
+            return "entry has no account_id; refusing to guess an account", None
+    else:
+        try:
+            account_id = int(account_id)
+        except (TypeError, ValueError):
+            return f"account_id {general.get('account_id')!r} is not an integer", None
+        if not _account_exists(account_id):
+            return f"account {account_id} does not exist in this database", None
+
+    if existing is None and general.get("virtual_equity_pct") is None:
+        return "entry has no virtual_equity_pct; refusing to guess an allocation", None
+    if general.get("virtual_equity_pct") is not None:
+        try:
+            float(general["virtual_equity_pct"])
+        except (TypeError, ValueError):
+            return f"virtual_equity_pct {general['virtual_equity_pct']!r} is not a number", None
+
+    in_file = {r.get("name") for r in ((entry.get("rulesets") or {}).get("rulesets") or [])}
+    for _, name_key in _RULESET_SLOTS:
+        name = entry.get(name_key)
+        if name and name not in in_file and _find_ruleset_by_name(name) is None:
+            return (f"ruleset '{name}' ({name_key}) is neither in the file nor in this database",
+                    None)
+
+    account_change = None
+    if existing is not None and account_id is not None and account_id != existing.account_id:
+        account_change = (existing.account_id, account_id)
+    return None, account_change
+
+
+def _account_exists(account_id: int) -> bool:
+    return any(a.id == account_id for a in get_all_instances(AccountDefinition))
 
 
 def _count_setting_changes(existing: Optional[ExpertInstance], incoming: Dict[str, Any]) -> int:
@@ -256,6 +316,19 @@ def _apply_one(planned: PlannedExpert) -> List[str]:
     general = entry.get("general") or {}
     messages: List[str] = []
 
+    # The plan was checked when it was built, but the database may have moved since: check again
+    # BEFORE writing anything (rulesets included).
+    existing_instance = None
+    if planned.action == "update":
+        try:
+            existing_instance = get_instance(ExpertInstance, planned.existing_id)
+        except InstanceNotFound as e:
+            raise ValueError(f"expert {planned.existing_id} disappeared between "
+                             f"plan and apply") from e
+    problem, _ = _validate_entry(entry, existing_instance)
+    if problem:
+        raise ValueError(problem)
+
     ruleset_ids_by_name = _import_rulesets(entry, messages)
 
     def _slot(name_key: str) -> Optional[int]:
@@ -265,13 +338,10 @@ def _apply_one(planned: PlannedExpert) -> List[str]:
         resolved = ruleset_ids_by_name.get(name)
         if resolved is None:
             # No rule content in the file (old single-expert format): fall back to a name
-            # lookup, and say so if there is nothing to point at.
-            existing = _find_ruleset_by_name(name)
-            if existing is None:
-                messages.append(f"  ruleset '{name}' not in the file and not in this database; "
-                                f"left unset")
-                return None
-            resolved = existing
+            # lookup. _validate_entry already refused a name that resolves nowhere.
+            resolved = _find_ruleset_by_name(name)
+            if resolved is None:
+                raise ValueError(f"ruleset '{name}' is neither in the file nor in this database")
             messages.append(f"  ruleset '{name}' taken from this database (id {resolved}); "
                             f"the file carried no rules for it")
         return resolved
@@ -282,24 +352,35 @@ def _apply_one(planned: PlannedExpert) -> List[str]:
     if planned.action == "create":
         instance = ExpertInstance(
             expert=planned.expert_type,
-            account_id=int(general.get("account_id") or 1),
+            account_id=int(general["account_id"]),
             alias=planned.alias,
             user_description=general.get("user_description") or "",
             # NEVER enabled by an import -- see the module docstring.
             enabled=False,
-            virtual_equity_pct=float(general.get("virtual_equity_pct") or 100.0),
+            virtual_equity_pct=float(general["virtual_equity_pct"]),
             priority=priority_from_settings(general),
             enter_market_ruleset_id=enter_id,
             open_positions_ruleset_id=open_id,
         )
         instance_id = add_instance(instance)
-        messages.append(f"CREATED expert {instance_id} '{planned.alias}' (disabled)")
-    else:
         try:
-            instance = get_instance(ExpertInstance, planned.existing_id)
-        except InstanceNotFound as e:
-            raise ValueError(f"expert {planned.existing_id} disappeared between "
-                             f"plan and apply") from e
+            _apply_settings(instance_id, entry, messages)
+        except Exception:
+            # A half-built expert (links but class-default settings) is worse than none.
+            _discard_created(instance_id)
+            raise
+        messages.insert(0, f"CREATED expert {instance_id} '{planned.alias}' (disabled)")
+        return messages
+
+    # UPDATE. Settings go FIRST and the instance row last, with a snapshot of both: the settings
+    # API commits per call (reset_settings and save_settings each commit), so there is no single
+    # transaction to wrap them in; restoring a snapshot is what makes a failure leave the expert
+    # exactly as it was.
+    instance = existing_instance
+    instance_snapshot = instance.model_dump()
+    settings_snapshot = _snapshot_settings(instance.id)
+    try:
+        _apply_settings(instance.id, entry, messages)
         instance.expert = planned.expert_type
         if general.get("account_id") is not None:
             instance.account_id = int(general["account_id"])
@@ -307,15 +388,65 @@ def _apply_one(planned: PlannedExpert) -> List[str]:
         if general.get("virtual_equity_pct") is not None:
             instance.virtual_equity_pct = float(general["virtual_equity_pct"])
         instance.priority = priority_from_settings(general, current=instance.priority)
-        instance.enter_market_ruleset_id = enter_id
-        instance.open_positions_ruleset_id = open_id
+        # A slot the file does not name is left as it is; a named one was resolved above.
+        if entry.get("enter_market_ruleset_name"):
+            instance.enter_market_ruleset_id = enter_id
+        if entry.get("open_positions_ruleset_name"):
+            instance.open_positions_ruleset_id = open_id
         # instance.enabled is deliberately NOT touched: an import never starts trading.
         update_instance(instance)
-        instance_id = instance.id
-        messages.append(f"UPDATED expert {instance_id} '{planned.alias}'")
-
-    _apply_settings(instance_id, entry, messages)
+    except Exception:
+        _restore_settings(instance_snapshot["id"], settings_snapshot)
+        _restore_instance(instance_snapshot)
+        raise
+    messages.insert(0, f"UPDATED expert {instance.id} '{planned.alias}'")
     return messages
+
+
+def _snapshot_settings(instance_id: int) -> List[Dict[str, Any]]:
+    session = get_db()
+    try:
+        rows = session.exec(
+            select(ExpertSetting).where(ExpertSetting.instance_id == instance_id)).all()
+        return [r.model_dump() for r in rows]
+    finally:
+        session.close()
+
+
+def _restore_settings(instance_id: int, snapshot: List[Dict[str, Any]]) -> None:
+    session = get_db()
+    try:
+        for row in session.exec(
+                select(ExpertSetting).where(ExpertSetting.instance_id == instance_id)).all():
+            session.delete(row)
+        session.flush()
+        for values in snapshot:
+            session.add(ExpertSetting(**values))
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.error(f"Could not restore the settings of expert {instance_id}", exc_info=True)
+        raise
+    finally:
+        session.close()
+    expert = get_expert_instance_from_id(instance_id)
+    if expert is not None:
+        expert._invalidate_settings_cache()
+
+
+def _restore_instance(snapshot: Dict[str, Any]) -> None:
+    instance = get_instance(ExpertInstance, snapshot["id"])
+    for key, value in snapshot.items():
+        setattr(instance, key, value)
+    update_instance(instance)
+
+
+def _discard_created(instance_id: int) -> None:
+    try:
+        _restore_settings(instance_id, [])
+        delete_instance(get_instance(ExpertInstance, instance_id))
+    except Exception:  # noqa: BLE001 -- the original failure is what gets reported
+        logger.error(f"Could not discard the half-created expert {instance_id}", exc_info=True)
 
 
 def _import_rulesets(entry: Dict[str, Any], messages: List[str]) -> Dict[str, int]:

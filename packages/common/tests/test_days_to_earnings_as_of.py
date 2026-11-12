@@ -38,11 +38,11 @@ from ba2_common.core import TradeConditions
 from ba2_common.core.TradeConditions import DaysToEarningsCondition, create_condition
 from ba2_common.core.types import ExpertEventType
 
-SIM_BAR = date(2024, 3, 15)
+SIM_BAR = date(2024, 4, 5)   # 20 days before the next print: inside the 30-day announce horizon
 
 #: A realistic quarterly cadence around SIM_BAR (MSFT's actual print dates).
 QUARTERLY_REPORTS = ["2023-07-25", "2023-10-24", "2024-01-30", "2024-04-25", "2024-07-30"]
-NEXT_QUARTERLY = date(2024, 4, 25)          # 41 days after SIM_BAR
+NEXT_QUARTERLY = date(2024, 4, 25)          # 20 days after SIM_BAR
 
 #: What the annual analyst-estimates endpoint actually returns (fiscal year ends).
 ANNUAL_ESTIMATES = ["2024-06-30", "2025-06-30", "2026-06-30", "2027-06-30"]
@@ -226,30 +226,15 @@ def test_the_documented_straddle_gate_can_actually_fire(monkeypatch):
     assert len(fires) == 6, f"expected the 6 bars within 5 days of the print, got {fires}"
 
 
-def test_the_annual_estimates_are_the_fallback_not_the_source(monkeypatch):
-    """When the calendar has no scheduled future print (a stale/short calendar), fall back to
-    the analyst estimates rather than returning nothing — degraded, not absent."""
-    p = _FakeFundamentals(reports=["2023-10-24", "2024-01-30"])  # nothing after the bar
+def test_there_is_no_estimates_fallback(monkeypatch):
+    """A calendar with no print inside the horizon reads "no scheduled report"; the annual
+    analyst-estimate period (a fiscal-year end) is never consulted or returned."""
+    p = _FakeFundamentals(reports=["2023-10-24", "2024-01-30", "2024-07-30"])  # none within 30d
     monkeypatch.setattr(TradeConditions, "_provider_resolver",
                         lambda category, name, **kw: p, raising=False)
-    got = DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
-        ._next_earnings_date("MSFT", SIM_BAR)
-    assert got == NEXT_ANNUAL
-    assert p.estimate_calls, "the estimates fallback was never consulted"
-
-
-def test_the_estimates_fallback_is_also_asked_as_of_the_bar(monkeypatch):
-    """The fallback used ``as_of_date=datetime.now(timezone.utc)``, which in a backtest asks
-    the provider to drop every estimate before the REAL today."""
-    p = _FakeFundamentals(reports=["2023-10-24"])
-    monkeypatch.setattr(TradeConditions, "_provider_resolver",
-                        lambda category, name, **kw: p, raising=False)
-    DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
-        ._next_earnings_date("MSFT", SIM_BAR)
-    (call,) = p.estimate_calls
-    as_of = call["as_of_date"]
-    as_of_d = as_of.date() if isinstance(as_of, datetime) else as_of
-    assert as_of_d == SIM_BAR, f"estimates asked as of {as_of_d}, not the bar {SIM_BAR}"
+    cond = DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0)
+    assert cond._next_earnings_date("MSFT", SIM_BAR) is None
+    assert not p.estimate_calls
 
 
 def test_the_announcement_date_wins_over_the_fiscal_period_end(monkeypatch):
@@ -297,7 +282,7 @@ def test_an_unparseable_date_is_skipped_not_read_as_today(monkeypatch):
                         lambda category, name, **kw: p, raising=False)
     cond = _cond(_BacktestAccount(), "<=", 5.0)
     assert cond.evaluate() is False, "a garbled date was read as 'today' (0 days away)"
-    assert cond.calculated_value == 41   # the one real row, 2024-04-25
+    assert cond.calculated_value == 20   # the one real row, 2024-04-25
 
 
 def test_only_garbled_dates_is_unevaluable_not_a_number(monkeypatch):
@@ -349,7 +334,7 @@ def test_a_malformed_non_dict_row_does_not_lose_the_good_rows(monkeypatch):
                         lambda category, name, **kw: _JunkRow(), raising=False)
     cond = _cond(_BacktestAccount(), "<=", 45.0)
     assert cond.evaluate() is True
-    assert cond.calculated_value == 41
+    assert cond.calculated_value == 20
 
 
 def test_no_upcoming_earnings_anywhere_is_unevaluable(monkeypatch):
@@ -360,3 +345,28 @@ def test_no_upcoming_earnings_anywhere_is_unevaluable(monkeypatch):
     assert cond.evaluate() is False
     assert cond.get_calculated_value() is None
     assert cond.get_actual_value_display() is None
+
+
+# --------------------------------------------------------------------------------------
+# KNOWABILITY: a report date is public only ~2-6 weeks ahead
+# --------------------------------------------------------------------------------------
+def test_a_report_beyond_the_announce_horizon_is_not_visible(monkeypatch):
+    """The cache holds REALIZED dates months ahead; the condition must not see them.
+    Same reader live and in backtest, so this is the live behaviour too."""
+    from ba2_common.core.knowability import EARNINGS_ANNOUNCE_HORIZON_DAYS
+    far = SIM_BAR + timedelta(days=EARNINGS_ANNOUNCE_HORIZON_DAYS + 1)
+    near = SIM_BAR + timedelta(days=EARNINGS_ANNOUNCE_HORIZON_DAYS)
+    for report, expected in ((far, None), (near, near)):
+        p = _FakeFundamentals(reports=[report.isoformat()])
+        got = DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
+            ._next_scheduled_report(p, "MSFT", SIM_BAR)
+        assert got == expected
+
+
+def test_the_calendar_is_never_read_past_the_announce_horizon(fundamentals):
+    from ba2_common.core.knowability import EARNINGS_ANNOUNCE_HORIZON_DAYS
+    DaysToEarningsCondition(_BacktestAccount(), "MSFT", _rec(), ">=", 0.0) \
+        ._next_earnings_date("MSFT", SIM_BAR)
+    end = fundamentals.past_calls[0]["end_date"]
+    end_d = end.date() if isinstance(end, datetime) else end
+    assert end_d <= SIM_BAR + timedelta(days=EARNINGS_ANNOUNCE_HORIZON_DAYS)

@@ -129,6 +129,71 @@ def add_history_source_flag(ap: Any) -> None:
                          "share a name, a skip-if-completed check or a checkpoint.")
 
 
+def add_estimates_source_flag(ap: Any) -> None:
+    """``--estimates-source`` on a GRID DRIVER's parser: REQUIRED (``estimates_source_of`` refuses when absent), no default (a job must name where its
+    analyst estimates come from; fmp has no revision history, alphavantage is point-in-time)."""
+    from ba2_common.core.estimates_source import ESTIMATES_SOURCES
+    ap.add_argument("--estimates-source", choices=list(ESTIMATES_SOURCES), default=None,
+                    help="Analyst-estimates source of every job: forwarded to `ba2-test optimize` (stamped on the "
+                         "run config and its checkpoint fingerprint), part of the job NAME for alphavantage and "
+                         "of the digest (it is in the argv), so two sources never share a name or a checkpoint.")
+
+
+def estimates_source_of(args: Any, driver: str) -> "str | None":
+    """The driver's stated ``--estimates-source``; absent -> exit with a refusal (no default).
+
+    A ``--dry-run`` only PRINTS the plan and creates nothing: it may omit the flag (returns None, and the job
+    names / argv then carry no estimates token). A real run never gets None."""
+    from ba2_common.core import estimates_source as es
+    if getattr(args, "estimates_source", None) in (None, "") and getattr(args, "dry_run", False):
+        return None
+    try:
+        return es.require_stated_estimates_source(getattr(args, "estimates_source", None), driver)
+    except es.EstimatesSourceMissing as e:
+        raise SystemExit(f"{driver}: REFUSED: --estimates-source {{fmp,alphavantage}} is required ({e})")
+
+
+def estimates_source_tokens(source: "str | None") -> List[str]:
+    """``--estimates-source`` tokens for one job's argv (none for a dry run that did not state it)."""
+    return [] if source is None else ["--estimates-source", source]
+
+
+def with_estimates_source_name(name: str, source: str) -> str:
+    """``name`` with the estimates-source token for a non-fmp source (idempotent); fmp keeps the plain name."""
+    from ba2_common.core.estimates_source import check_estimates_source
+    return name if source is None or check_estimates_source(source) == "fmp" or "-estalphavantage" in name         else name + "-estalphavantage"
+
+
+def add_option_history_source_flag(ap: Any) -> None:
+    """``--option-history-source`` on an OPTION grid driver's parser. Default ``thetadata``: that is what every
+    option driver already did implicitly (``--options-store`` defaulted to thetadata), so the default adds no
+    token anywhere and every existing job keeps its name, digest and checkpoint."""
+    ap.add_argument("--option-history-source", choices=("thetadata", "alphavantage"), default="thetadata",
+                    help="Whose option history every job reads (default thetadata, the legacy store). alphavantage "
+                         "reads AlphaVantageOptionsProvider/ (tools/download_av_option_chains.py): the jobs get "
+                         "`--options-store alphavantage --option-history-source alphavantage` and an -optalphavantage "
+                         "name suffix, so the two vendors never share a name, a digest or a checkpoint.")
+
+
+def option_store_tokens(args: Any) -> List[str]:
+    """The store tokens of one job's argv. Legacy (thetadata, or any explicit ``--options-store``): exactly the
+    old ``--options-store X`` pair (argv byte-identical, so digests are unchanged). alphavantage: the store and the
+    vendor, both explicit. A ``--options-store`` naming another vendor alongside alphavantage is refused."""
+    source = getattr(args, "option_history_source", None) or "thetadata"
+    store = getattr(args, "options_store")
+    if source == "thetadata":
+        return ["--options-store", store]
+    if store not in ("thetadata", source):       # thetadata is merely the parser default
+        raise SystemExit(f"REFUSED: --option-history-source {source} contradicts --options-store {store}")
+    return ["--options-store", source, "--option-history-source", source]
+
+
+def with_option_history_source_name(name: str, args: Any) -> str:
+    """``name`` + ``-optalphavantage`` for the AV store (idempotent); the legacy thetadata keeps the plain name."""
+    source = getattr(args, "option_history_source", None) or "thetadata"
+    return name if source == "thetadata" or name.endswith(f"-opt{source}") else f"{name}-opt{source}"
+
+
 def history_source_tokens(source: str) -> List[str]:
     """``--ohlcv-history-source`` tokens for one job's argv (always stated: a job's source is never implicit)."""
     return ["--ohlcv-history-source", source]
@@ -214,6 +279,17 @@ def job_name_with_digest(name: str, cmd: List[str]) -> str:
             skip = True
             continue
         kept.append(tok)
+    # ``--estimates-source fmp`` is the legacy implicit source (every job before the flag read fmp): it stays out of
+    # the digest so those jobs keep their names, skip-if-completed rows and checkpoints. A non-fmp source is kept.
+    for i in range(len(kept) - 1):
+        if kept[i] == "--estimates-source" and kept[i + 1] == "fmp":
+            del kept[i:i + 2]
+            break
+    # ``--option-history-source thetadata`` is likewise the legacy implicit vendor of every option job.
+    for i in range(len(kept) - 1):
+        if kept[i] == "--option-history-source" and kept[i + 1] == "thetadata":
+            del kept[i:i + 2]
+            break
     digest = hashlib.sha256(json.dumps(kept, sort_keys=False).encode()).hexdigest()[:12]
     return f"{name}-d{digest}"
 

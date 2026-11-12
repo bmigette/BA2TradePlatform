@@ -289,8 +289,8 @@ class _PausingQueue:
     def __init__(self, seam, after):
         self.seam, self.after = seam, after
 
-    def is_task_paused(self, task_id):
-        return len(self.seam.finished) >= self.after
+    def stop_reason(self, task_id):
+        return "paused" if len(self.seam.finished) >= self.after else None
 
     def update_progress(self, *a, **k):
         pass

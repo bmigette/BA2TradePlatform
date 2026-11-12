@@ -18,6 +18,7 @@ at startup, and every shared tap reads ``get_replay_store()``. The default is
 """
 from __future__ import annotations
 
+import collections
 import json
 import queue
 import threading
@@ -40,7 +41,9 @@ from ba2_common.core.replay.context import (
     classify_failure,
 )
 from ba2_common.core.replay.schemas import (
+    READABLE_SCHEMA_VERSIONS,
     SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
     AnalysisRecord,
     CoverageEntry,
     ProviderObservation,
@@ -68,6 +71,7 @@ _ROLE_FIELDS = {
     "settings": "settings_object",
     "bundle": "bundle_object",
     "recommendation": "recommendation_object",
+    "decision": "decision_object",
 }
 
 MANIFEST_NAME = "manifest.json"
@@ -84,6 +88,26 @@ DEFAULT_QUEUE_MAXSIZE = 64
 DEFAULT_DRAIN_TIMEOUT = 30.0
 
 _STOP = object()
+
+#: How long a thread other than the writer waits for the index when it has to write a drop itself
+#: (closed store / dead writer). A trading thread must not wait the index's 30 s busy timeout.
+_DROP_BUSY_TIMEOUT_MS = 250
+
+#: ``branch_flags["record_kind"]`` of a stock decision pass (``decision_record.RECORD_KIND``; spelled out
+#: here because the service must not import the record modules).
+_DECISION_RECORD_KIND = "decision_pass"
+
+
+def _is_decision_pass(record: AnalysisRecord) -> bool:
+    flags = record.branch_flags
+    return "record_kind" in flags and flags["record_kind"] == _DECISION_RECORD_KIND
+
+
+def _capability_of(record: AnalysisRecord) -> str:
+    """The coverage capability a gap of ``record`` belongs to: a pass is ``decision``, an analysis
+    ``recorded_expert``."""
+    return (ReplayStatus.CAPABILITY_DECISION if _is_decision_pass(record)
+            else ReplayStatus.CAPABILITY_RECORDED_EXPERT)
 
 
 @dataclass(frozen=True)
@@ -120,9 +144,10 @@ def load_bundle(directory) -> SessionBundle:
         raise ReplayStoreError(f"{root} is not a replay bundle: no {MANIFEST_NAME}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     version = manifest["schema_version"]
-    if version != SCHEMA_VERSION:
+    if version not in READABLE_SCHEMA_VERSIONS:
         raise ValueError(
-            f"bundle schema_version {version} is not supported (expected {SCHEMA_VERSION})"
+            f"bundle schema_version {version} is not supported "
+            f"(this reader reads {list(READABLE_SCHEMA_VERSIONS)}, writes {SCHEMA_VERSION})"
         )
     codec_version = manifest["codec_version"]
     if codec_version != CODEC_VERSION:
@@ -170,12 +195,22 @@ class ReplayStore:
         *,
         writer: str = "sync",
         queue_maxsize: int = DEFAULT_QUEUE_MAXSIZE,
+        read_only: bool = False,
     ):
         if writer not in ("sync", "thread"):
             raise ValueError(f"writer must be 'sync' or 'thread', got {writer!r}")
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.index = ReplayIndex(self.root / "index.sqlite")
+        if read_only:
+            # Safe next to a live writer: nothing is created, no pragma is written, the
+            # index is opened mode=ro. A missing store is an error, not an empty store.
+            if writer != "sync":
+                raise ValueError("a read-only store has no writer thread")
+            if not (self.root / "index.sqlite").is_file():
+                raise ReplayStoreError(f"{self.root} is not a replay store: no index.sqlite")
+            self.index = ReplayIndex(self.root / "index.sqlite", read_only=True)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.index = ReplayIndex(self.root / "index.sqlite")
         self.objects = ObjectStore(self.root, index=self.index)
         self.health = CaptureHealth()
         self.writer = writer
@@ -183,6 +218,10 @@ class ReplayStore:
         self._session_id: Optional[str] = None
         self._session_hook = None
         self._queue: Optional["queue.Queue"] = None
+        #: Drops (record, detail) still to be written to coverage. Appended by the submitting thread
+        #: (``deque.append`` is atomic and never blocks), written by the writer: the pass thread never
+        #: waits on the index.
+        self._drops: "collections.deque" = collections.deque()
         self._thread: Optional[threading.Thread] = None
         if writer == "thread":
             self._queue = queue.Queue(maxsize=queue_maxsize)
@@ -244,8 +283,14 @@ class ReplayStore:
         status = (
             ReplayStatus.SESSION_FINALIZED if remaining == 0 else ReplayStatus.SESSION_INTERRUPTED
         )
+        # What this process failed to record, written INTO the session so an exported bundle states it
+        # (the counters are cumulative for the process; the rollover finalizes a session per UTC day).
+        snapshot = self.health.snapshot()
+        snapshot["scope"] = "process_cumulative"
+        snapshot["as_of"] = datetime.now(timezone.utc).isoformat()
         self.index.update_session_status(
-            session_id, status, ended_at=datetime.now(timezone.utc)
+            session_id, status, ended_at=datetime.now(timezone.utc),
+            capabilities_update={"capture_health": snapshot},
         )
         if remaining:
             logger.error(
@@ -268,6 +313,7 @@ class ReplayStore:
         """
         if self._queue is None:
             return 0
+        self._flush_drops()
         deadline = time.monotonic() + timeout
         with self._queue.all_tasks_done:
             while self._queue.unfinished_tasks:
@@ -276,6 +322,7 @@ class ReplayStore:
                     break
                 self._queue.all_tasks_done.wait(left)
             remaining = self._queue.unfinished_tasks
+        self._flush_drops()
         if remaining:
             self.health.record(CaptureHealth.QUEUE_SATURATION)
             logger.error(
@@ -306,6 +353,7 @@ class ReplayStore:
                     "queued records are lost"
                 )
             self._thread = None
+        self._flush_drops()
         self.index.close()
 
     # -- recording
@@ -334,7 +382,7 @@ class ReplayStore:
                 f"replay capture: store is closed, dropped analysis {record.analysis_id} "
                 f"({record.expert_class}/{record.symbol}); coverage is incomplete"
             )
-            self._record_drop(record, "replay store already closed")
+            self._note_drop(record, "replay store already closed")
             return
         if self._queue is None:
             self._write_pending(pending)
@@ -348,9 +396,35 @@ class ReplayStore:
                 f"{record.analysis_id} ({record.expert_class}/{record.symbol}); "
                 f"coverage is incomplete"
             )
-            self._record_drop(record, "writer queue saturated")
+            self._note_drop(record, "writer queue saturated")
 
-    def _record_drop(self, record: AnalysisRecord, detail: str) -> None:
+    def _note_drop(self, record: AnalysisRecord, detail: str) -> None:
+        """Hand a drop to the writer; never touches the index from the submitting thread.
+
+        The drop path used to write the coverage row itself (``BEGIN IMMEDIATE`` with a 30 s busy
+        timeout): a full queue means the index is busy, so that blocked the very pass thread the
+        queue exists to protect. The drop is counted and logged by the caller; the coverage row is
+        written by the writer (or by ``drain`` / ``close``). A store without a writer thread writes
+        it at once (the caller IS the writer).
+        """
+        self._drops.append((record, detail))
+        if self._queue is None:
+            self._flush_drops()
+        elif self._thread is None or not self._thread.is_alive():
+            # No live writer to hand it to (closed, or the writer died): write it here, but only
+            # ever waiting a moment for the index; a failure is counted and logged by _record_drop.
+            self._flush_drops(busy_timeout_ms=_DROP_BUSY_TIMEOUT_MS)
+
+    def _flush_drops(self, busy_timeout_ms: Optional[int] = None) -> None:
+        while True:
+            try:
+                record, detail = self._drops.popleft()
+            except IndexError:
+                return
+            self._record_drop(record, detail, busy_timeout_ms=busy_timeout_ms)
+
+    def _record_drop(self, record: AnalysisRecord, detail: str, *,
+                     busy_timeout_ms: Optional[int] = None) -> None:
         """Leave the gap visible in coverage even though the record is gone."""
         try:
             self.index.record_coverage(
@@ -358,11 +432,12 @@ class ReplayStore:
                     CoverageEntry(
                         session_id=record.session_id,
                         analysis_id=record.analysis_id,
-                        capability=ReplayStatus.CAPABILITY_RECORDED_EXPERT,
+                        capability=_capability_of(record),
                         status=ReplayStatus.COVERAGE_MISSING_CAPTURE,
                         detail=detail,
                     )
-                ]
+                ],
+                busy_timeout_ms=busy_timeout_ms,
             )
         except Exception as exc:
             self.health.record(classify_failure(exc))
@@ -379,6 +454,7 @@ class ReplayStore:
                 item = self._queue.get()
                 try:
                     if item is _STOP:
+                        self._flush_drops()
                         return
                     self._write_pending(item)
                 except Exception as exc:
@@ -391,6 +467,7 @@ class ReplayStore:
                     self._record_drop(item.record, f"writer failed: {exc}")
                 finally:
                     self._queue.task_done()
+                self._flush_drops()
         finally:
             # sqlite3 refuses a cross-thread close, so the writer closes its own.
             self.index.close()
@@ -402,9 +479,31 @@ class ReplayStore:
         gaps: List[str] = []
         record = pending.record
 
+        # Observations first: a step whose payload cannot be stored must be named in the pass summary
+        # (``steps_not_recorded``) BEFORE the summary object is published.
+        observations: List[ProviderObservation] = []
+        unstored: List[Tuple[Any, str]] = []
+        for item in pending.observations:
+            try:
+                payload_hash = self._publish(item.payload, refs)
+            except UnsupportedCaptureType as exc:
+                gaps.append(f"observation:{item.observation.observation_id}")
+                unstored.append((item.observation, str(exc)))
+                self.health.record(CaptureHealth.UNSUPPORTED_TYPE)
+                logger.error(
+                    f"replay capture: observation {item.observation.observation_id} "
+                    f"payload is not representable ({exc}); recorded without its payload"
+                )
+                payload_hash = None
+            observations.append(
+                replace(item.observation, payload_object=payload_hash, content_hash=payload_hash)
+            )
+
         for role, value in pending.objects.items():
             if role not in _ROLE_FIELDS:
                 raise ReplayStoreError(f"unknown capture object role {role!r}")
+            if role == "decision" and unstored:
+                value = self._summary_with_step_gaps(value, unstored)
             try:
                 updates[_ROLE_FIELDS[role]] = self._publish(value, refs)
             except UnsupportedCaptureType as exc:
@@ -416,24 +515,12 @@ class ReplayStore:
                 )
                 if role == "bundle":
                     updates["bundle_capture_status"] = ReplayStatus.CAPTURE_UNSUPPORTED
+                if role == "decision":
+                    # Never a ``decision`` outcome without its object: say what is missing.
+                    updates["outcome"] = ReplayStatus.OUTCOME_ERROR
+                    updates["error"] = f"decision summary not recordable: {exc}"
         if "settings_object" in updates:
             updates["settings_hash"] = updates["settings_object"]
-
-        observations: List[ProviderObservation] = []
-        for item in pending.observations:
-            try:
-                payload_hash = self._publish(item.payload, refs)
-            except UnsupportedCaptureType as exc:
-                gaps.append(f"observation:{item.observation.observation_id}")
-                self.health.record(CaptureHealth.UNSUPPORTED_TYPE)
-                logger.error(
-                    f"replay capture: observation {item.observation.observation_id} "
-                    f"payload is not representable ({exc}); recorded without its payload"
-                )
-                payload_hash = None
-            observations.append(
-                replace(item.observation, payload_object=payload_hash, content_hash=payload_hash)
-            )
 
         if gaps:
             updates["capture_gaps"] = tuple(gaps)
@@ -442,7 +529,7 @@ class ReplayStore:
                 CoverageEntry(
                     session_id=record.session_id,
                     analysis_id=record.analysis_id,
-                    capability=ReplayStatus.CAPABILITY_RECORDED_EXPERT,
+                    capability=_capability_of(record),
                     status=ReplayStatus.COVERAGE_MISSING_CAPTURE,
                     detail=f"unsupported capture type for: {', '.join(gaps)}",
                 )
@@ -459,6 +546,25 @@ class ReplayStore:
             verify_objects=self.objects,
         )
 
+    @staticmethod
+    def _summary_with_step_gaps(summary: Any, unstored: Sequence[Tuple[Any, str]]) -> Any:
+        """The decision-pass summary with a ``steps_not_recorded`` entry for every observation whose
+        payload the codec refused (the step is named by kind and symbol, as the recorder names its own
+        failures). A summary that is not a dict is returned unchanged."""
+        if not isinstance(summary, dict) or "steps_not_recorded" not in summary:
+            return summary
+        by_observation = {step["observation_id"]: step for step in summary["steps"]}
+        listed = list(summary["steps_not_recorded"])
+        for observation, reason in unstored:
+            step = by_observation[observation.observation_id]                 if observation.observation_id in by_observation else None
+            listed.append({
+                "kind": observation.method if step is None else step["kind"],
+                "symbol": "" if step is None else step["symbol"],
+                "observation_id": observation.observation_id,
+                "error": f"payload not representable: {reason}",
+            })
+        return {**summary, "steps_not_recorded": listed}
+
     def _publish(self, value: Any, refs: List[ObjectRef]) -> str:
         encoded = encode(value)
         for side in encoded.sides:
@@ -466,6 +572,16 @@ class ReplayStore:
             refs.append(ObjectRef(hash=side_hash, kind=side.kind, size=len(side.data)))
         object_hash = self.objects.put(encoded.kind, encoded.data)
         refs.append(ObjectRef(hash=object_hash, kind=encoded.kind, size=len(encoded.data)))
+        return object_hash
+
+    def publish_session_object(self, value: Any) -> str:
+        """Publish a session-level object (a code patch, a file) and register it in the index.
+
+        Registered so the orphan sweep never reports it and ``export_session`` can ship it.
+        """
+        refs: List[ObjectRef] = []
+        object_hash = self._publish(value, refs)
+        self.index.register_objects(refs)
         return object_hash
 
     # -- reading
@@ -489,7 +605,7 @@ class ReplayStore:
         observations = self.index.session_observations(session_id)
         coverage = self.index.coverage(session_id)
 
-        roots: List[str] = []
+        roots: List[str] = list(session.object_hashes())
         for analysis in analyses:
             roots.extend(analysis.object_hashes())
         for observation in observations:

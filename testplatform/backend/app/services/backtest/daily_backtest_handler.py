@@ -29,6 +29,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from ba2_common.core.deploy_parity import (
     BacktestRunFacts, forced_expert_settings, member_hold_tags_fact)
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
 from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY, resolve_job_history_source
 from ba2_common.core.types import is_option_action
 
@@ -332,8 +334,13 @@ def derive_warmup_days(expert_specs: List[Any]) -> int:
 
 
 class _Paused(Exception):
-    """Raised from the progress callback when the task is paused (surfaces as a failure
-    with a clear message — the queue's pause/resume re-queues the task)."""
+    """Raised from the progress callback when the task is paused OR cancelled (``reason`` says
+    which; the backtest row is closed as failed with a clear message, and the handler returns
+    that reason so the queue keeps the task PAUSED / CANCELLED instead of finalising it)."""
+
+    def __init__(self, msg: str, reason: str = "paused"):
+        super().__init__(msg)
+        self.reason = reason
 
 
 def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -363,8 +370,9 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
         record_option_spread_model(db, bt, config)
 
         def progress(pct: float, msg: str) -> None:
-            if tq.is_task_paused(task_id):
-                raise _Paused(msg)
+            reason = tq.stop_reason(task_id)
+            if reason:
+                raise _Paused(msg, reason)
             tq.update_progress(task_id, pct, msg)
 
         results = run_daily_backtest(config, progress_cb=progress)
@@ -382,8 +390,8 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
     except _Paused as e:
         # Leave the row 'running' status untouched? No — surface paused as a failure so the
         # row is not stuck; the queue handles re-queue on resume independently.
-        _fail(db, bt, f"paused: {e}")
-        return {"status": "failed", "error": "paused"}
+        _fail(db, bt, f"{e.reason}: {e}")
+        return {"status": e.reason}
     except Exception as e:  # noqa: BLE001 — any engine failure must fail the row, not crash the worker
         logger.error(f"Daily backtest {backtest_id} failed: {e}", exc_info=True)
         try:
@@ -581,8 +589,13 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         {OHLCV_HISTORY_SOURCE_KEY: history_source},
         uses_options=uses_options or bool(options_cache_db), where="_build_config")
 
+    # WHERE the run's analyst estimates come from. No default: a run that does not name it refuses
+    # (estimates_source.py); the engine builds its provider bundle from this.
+    estimates_source = _estimates_source_mod.resolve_job_estimates_source(payload)
+
     return {
         OHLCV_HISTORY_SOURCE_KEY: history_source,
+        ESTIMATES_SOURCE_KEY: estimates_source,
         "backtest_id": payload["backtest_id"],
         "name": payload.get("name", f"daily-backtest-{payload['backtest_id']}"),
         "start_date": start_date,
@@ -720,6 +733,30 @@ _REGIME_LOOKBACK_DAYS = 1200
 _SUSPENSION_EVENTS_MEMO: Dict[Any, Any] = {}
 
 
+_DELISTING_TERMINALS_MEMO: Dict[Any, Any] = {}
+
+
+def _delisting_terminals_for(config: Dict[str, Any]) -> Dict[str, Any]:
+    """The cache's terminal values of delistings (``load_delisting_terminals``); ``{}`` for any source but ``alpaca`` or a cache
+    without ``_meta/delisting_terminals.json`` (every delisting then closes at the last close, as before).  Read after
+    ``_suspension_events_for`` has verified the certificate; the loader refuses a file stamped with another suspensions build."""
+    from ba2_common.core.suspension_events import TERMINALS_FILE, load_delisting_terminals
+    from app.services.backtest.history_source import job_history_cache_dir
+
+    if resolve_job_history_source(config) != "alpaca":
+        return {}
+    cache_dir = job_history_cache_dir(config)
+    path = os.path.join(cache_dir, TERMINALS_FILE)
+    if not os.path.isfile(path):
+        return {}
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key not in _DELISTING_TERMINALS_MEMO:
+        _DELISTING_TERMINALS_MEMO.clear()
+        _DELISTING_TERMINALS_MEMO[key] = load_delisting_terminals(cache_dir)
+    return _DELISTING_TERMINALS_MEMO[key]
+
+
 def _suspension_events_for(config: Dict[str, Any]) -> Dict[str, Any]:
     """The run's exchange suspension / delisting events (``ba2_common.core.suspension_events``).
 
@@ -851,9 +888,36 @@ def _config_uses_benchmark_regime(config: Any) -> bool:
     return bool(named_field_leaves_in(config, {TREND_FIELD, VOL_FIELD}))
 
 
+def _config_uses_downtrend_overlay(config: Any) -> bool:
+    """True when ANY expert in the run has ``downtrend_overlay_enabled`` switched on.
+
+    The down-trend trigger of the regime overlay reads the published SPY benchmark regime
+    (``regime_overlay.is_downtrend_now``), which is built only for a run that needs it. Reading the
+    expert settings here (the same dicts the engine builds its experts from) makes the calendar
+    exist whenever the trigger CAN fire, with the spy gate flag off. Settings may arrive as 0/1/"1"
+    from the GA, hence ``coerce_bool``.
+    """
+    from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+
+    if not isinstance(config, dict):
+        return False
+    for spec in config.get("experts") or []:
+        settings = spec.get("settings") if isinstance(spec, dict) else None
+        if not settings or "downtrend_overlay_enabled" not in settings:
+            continue
+        if coerce_bool(settings["downtrend_overlay_enabled"]):
+            return True
+    return False
+
+
+def _run_needs_benchmark_regime(config: Any) -> bool:
+    """The benchmark calendar is required when the run is gated on SPY OR a down-trend overlay is on."""
+    return _config_uses_benchmark_regime(config) or _config_uses_downtrend_overlay(config)
+
+
 def _benchmark_calendar_for_run(raw_ohlcv: Any, config: Dict[str, Any]):
-    """The benchmark calendar when this run is gated, else None WITHOUT touching the cache."""
-    if not _config_uses_benchmark_regime(config):
+    """The benchmark calendar when this run needs it, else None WITHOUT touching the cache."""
+    if not _run_needs_benchmark_regime(config):
         return None
     return _build_benchmark_regime_calendar(
         raw_ohlcv, config["start_date"], config["end_date"], resolve_job_history_source(config))
@@ -1002,6 +1066,8 @@ def run_daily_backtest(
         # The OHLCV history this run reads, resolved ONCE (unstamped = the legacy fmp; an unknown
         # stamp refuses) and written back so every later reader of this config agrees.
         OHLCV_HISTORY_SOURCE_KEY: resolve_job_history_source(config),
+        # Where the run's analyst estimates come from (named by the job, never defaulted).
+        ESTIMATES_SOURCE_KEY: _estimates_source_mod.resolve_job_estimates_source(config),
         # Per-day DYNAMIC screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); the
         # engine reads it (``self._screener_runtime``) to gate ENTRIES to the per-day screened
@@ -1143,6 +1209,7 @@ def run_daily_backtest(
                                   else True),
         )
         account.set_suspension_events(_suspension_events_for(config))
+        account.set_delisting_terminals(_delisting_terminals_for(config))
         resolver.register_account(account_id, account)
 
         experts = _build_experts(config, resolver, account_id)
@@ -1186,7 +1253,7 @@ def run_daily_backtest(
                     raw_ohlcv, config["start_date"], config["end_date"],
                     resolve_job_history_source(config)),
                 benchmark_calendar=_benchmark_calendar_for_run(raw_ohlcv, config),
-                benchmark_regime_required=_config_uses_benchmark_regime(config),
+                benchmark_regime_required=_run_needs_benchmark_regime(config),
                 market_condition_record=market_condition_record,
             )
             # EVENT-data half of the knowability rule: on an intraday clock the readers admit an
@@ -1246,6 +1313,9 @@ def run_daily_backtest(
             # that did; ``fill_rebase_enabled`` is False only under the measurement hook.
             results["fill_rebase_enabled"] = bool(fill_rebase["enabled"])
             results["fill_rebase"] = fill_rebase
+            # Trades closed by their stop/target on the bar the entry FILLED on (review 2026-11-09):
+            # before that fix the fill bar was never tested, so these trades survived into the next bar.
+            results["fill_bar_exits"] = dict(engine.account.fill_bar_exit_counters)
             _su_rec = engine.screener_universe_record()
             if _su_rec is not None:
                 results["screener_universe"] = _su_rec
@@ -1320,7 +1390,8 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     import importlib
 
     out: Dict[str, float] = {}
-    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year",
+                "car_min_trades_each_year"):
         explicit = config.get(key)
         if explicit is not None:
             out[key] = float(explicit)
@@ -1612,13 +1683,57 @@ def _build_experts(
     return out
 
 
+def new_job_expert_settings(class_name: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """The expert settings a NEW job records: ``settings`` plus the CURRENT definition default of
+    every setting whose default changed after results were produced
+    (``ba2_common.core.legacy_setting_defaults``). Without it the job's config would not state the
+    key, and ``_expert_decision_settings`` reads an unstated changed key as the LEGACY value.
+
+    Call it where a job/run config is CREATED (launcher optimize/optimize-batch, the optimize and
+    backtest APIs), never on a stored config. Experts without a changed default come back
+    unchanged (a copy), without being resolved."""
+    import importlib
+    from ba2_common.core.legacy_setting_defaults import materialise_current_defaults
+
+    def _definitions(name: str) -> Dict[str, Any]:
+        module = importlib.import_module(_SUPPORTED_EXPERTS[name])
+        return getattr(module, name).get_settings_definitions()
+
+    return materialise_current_defaults(class_name, settings, _definitions)
+
+
+def new_job_expert_specs(specs: List[Any]) -> List[Any]:
+    """A NEW job's ``experts`` list with :func:`new_job_expert_settings` applied to each spec. A bare
+    class-name spec becomes ``{"class", "settings"}`` only when that expert has a changed default;
+    every other spec is returned as given (an unknown class is left for the handler to refuse)."""
+    out: List[Any] = []
+    for spec in specs:
+        if isinstance(spec, dict) and spec.get("class"):
+            settings = spec.get("settings") or {}
+            stated = new_job_expert_settings(spec["class"], settings)
+            out.append(spec if stated == settings else {**spec, "settings": stated})
+        elif isinstance(spec, str):
+            stated = new_job_expert_settings(spec, {})
+            out.append({"class": spec, "settings": stated} if stated else spec)
+        else:
+            out.append(spec)
+    return out
+
+
 def _expert_decision_settings(expert_cls: Any, overrides: Dict[str, Any]) -> Dict[str, Any]:
     """Resolve the expert's decision settings dict: declared defaults overlaid by overrides.
 
     Pulls each ``_SETTING_KEYS`` entry from the class's ``get_settings_definitions`` default,
     then applies the payload overrides. The defaults belong to the EXPERT (its own contract),
     not the host — fail-early if a key has neither a default nor an override.
+
+    A key whose definition default CHANGED after results were produced
+    (``ba2_common.core.legacy_setting_defaults``) and that the config does not state resolves
+    its LEGACY value: such a config predates the change (new jobs state the current default),
+    so a re-run, TOP-N rebuild or resumed job reproduces what was measured.
     """
+    from ba2_common.core.legacy_setting_defaults import pin_legacy_setting_defaults
+    overrides = pin_legacy_setting_defaults(expert_cls.__name__, overrides)
     defs = expert_cls.get_settings_definitions()
     keys = getattr(expert_cls, "_SETTING_KEYS", tuple(defs.keys()))
     settings: Dict[str, Any] = {}

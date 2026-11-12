@@ -30,9 +30,10 @@
 #
 # STEPS (design 4.2 run order; STEPS="..." runs a subset, in the order given):
 #   fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small
-#   sqm-xl rank-large rank-mid rank-small senate
+#   sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small
 # (fr = FMPRating, ds = DeterministicScorer, ed = FMPEarningsDrift, icb = FMPInsiderClusterBuy,
-#  sqm = DeterministicScorer SQM on the xl screen, rank = FactorRanker, senate = FMPSenateTraderWeight.)
+#  sqm = DeterministicScorer SQM on the xl screen, rank = FactorRanker, senate = FMPSenateTraderWeight,
+#  pb = PullbackReversion, long only, strategy S2: RSI-dip entries in an uptrend, exit_mode genes.)
 # One driver call per step: names carry only the gene tokens that step really searches, and the
 # per-band spread is a per-call flag. Every call adds to ONE summary under $WF_REPORT_DIR.
 #
@@ -80,14 +81,20 @@ SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-${REPO_ROOT}/docs/strategy_researc
 WORKERS="${WORKERS-remote227}"
 PARALLEL="${PARALLEL-0}"
 export BA2_MAX_REMOTE_SLOTS="${BA2_MAX_REMOTE_SLOTS:-28}"
-POPULATION="${POPULATION:-200}"
+# Budget 2026-11-10 (design goal2027-pullback-downmarket "Grid budget"): population 200 -> 300 and later folds
+# 15 -> 20 generations, because the pullback leaves and the down-trend scales add genes.
+POPULATION="${POPULATION:-300}"
 WF_FIRST_GENERATIONS="${WF_FIRST_GENERATIONS:-30}"
-WF_NEXT_GENERATIONS="${WF_NEXT_GENERATIONS:-15}"
+WF_NEXT_GENERATIONS="${WF_NEXT_GENERATIONS:-20}"
 WF_TOP_N="${WF_TOP_N:-3}"
 EARLY_STOP="${EARLY_STOP:-5}"
 EARLY_STOP_MIN_REL="${EARLY_STOP_MIN_REL:-0.01}"
 SUFFIX_BASE="${SUFFIX_BASE:--goal2027}"
-ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate"
+# LATE STEPS (owner: S8/S9 run after EVERY other cell so they can still be vetoed; S9 before S8, S8 last of all). sN-<expert>-<band>
+# runs ONLY strategy SN (the matrix's --late-strategy: the plan's late_strategies section) for FMPRating (fr) and
+# DeterministicScorer (ds). Their split scope and rsi+spy exits are implied by the key, so their names carry no
+# -regsplit/-mx token; G27_REGIME_SPLIT is refused for them (the key already says the scope).
+ALL_STEPS="fr-large ds-large fr-mid ds-mid ed-mid icb-mid ed-small icb-small fr-small ds-small sqm-xl rank-large rank-mid rank-small senate pb-large pb-mid pb-small s9-fr-large s9-ds-large s9-fr-mid s9-ds-mid s9-fr-small s9-ds-small s8-fr-large s8-ds-large s8-fr-mid s8-ds-mid s8-fr-small s8-ds-small"
 STEPS="${STEPS:-$ALL_STEPS}"
 
 # Spread = measured Alpaca SIP median per band; stress = the p90 - median widening (driver's
@@ -99,9 +106,10 @@ expert_of() {
   case "$1" in
     fr) echo FMPRating ;; ds|sqm) echo DeterministicScorer ;; ed) echo FMPEarningsDrift ;;
     icb) echo FMPInsiderClusterBuy ;; rank) echo FactorRanker ;; senate) echo FMPSenateTraderWeight ;;
+    pb) echo PullbackReversion ;;
   esac
 }
-ALL_EXPERTS="FMPRating DeterministicScorer FMPEarningsDrift FMPInsiderClusterBuy FactorRanker FMPSenateTraderWeight"
+ALL_EXPERTS="FMPRating DeterministicScorer FMPEarningsDrift FMPInsiderClusterBuy FactorRanker FMPSenateTraderWeight PullbackReversion"
 skip_all_but() { local out=""; for e in $ALL_EXPERTS; do [ "$e" = "$1" ] || out="${out:+$out,}$e"; done; echo "$out"; }
 
 data_end() { case "${PHASE:-}" in A) echo 2025-12-31 ;; B) echo "" ;; esac; }
@@ -212,6 +220,9 @@ EOF
 preflight() {
   local end="$1"
   case "${PHASE:-}" in A|B) ;; *) echo "FATAL: PHASE must be A (Nov-Dec, data to 2025) or B (January, data to 2026)" >&2; exit 2 ;; esac
+  # Analyst estimates source (2026-11-07): REQUIRED, never defaulted. alphavantage = point-in-time estimates
+  # (needs the AV estimates namespace prewarmed); fmp = no historical estimates (estimate readers refuse in BT).
+  case "${ESTIMATES_SOURCE:-}" in fmp|alphavantage) ;; *) echo "FATAL: ESTIMATES_SOURCE must be fmp or alphavantage" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
   check_checkout || exit 1
   check_home || exit 1
@@ -257,8 +268,12 @@ EOF
 
 # ------------------------------------------------------------------------------------------- one step
 run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
-  local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}"
+  local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}" late=""
   [ "$step" = "senate" ] && { kind=senate; band=senate; }
+  case "$step" in s8-*|s9-*)
+    late="S${step:1:1}"; band="${step#*-}"; kind="${band%%-*}"; band="${band#*-}"
+    [ -z "${G27_REGIME_SPLIT:-}" ] || { echo "FATAL: $step: G27_REGIME_SPLIT is set, but $late implies its own split scope" >&2; return 2; } ;;
+  esac
   local expert; expert="$(expert_of "$kind")"
   local end; end="$(data_end)"
   local sp st; sp="$(spread_for "$band")"; st="$(stress_for "$band")"
@@ -275,6 +290,7 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
       --pass-min-folds 2 --pass-require-fold 2026)
   [ -n "$end" ] && args+=(--wf-data-end "$end")
   [ -n "$WORKERS" ] && args+=(--workers "$WORKERS")
+  args+=(--estimates-source "$ESTIMATES_SOURCE")
   local suffix="$SUFFIX_BASE"
   local mc_o="$MC_OHLCV" mc_t="$MC_TA"
   if [ "$kind" = "senate" ]; then
@@ -282,16 +298,31 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
     args+=(--senate-universe-file "$SENATE_UNIVERSE_FILE")
   fi
   case "$kind" in
-    fr|ds|ed|icb|senate)
+    fr|ds|ed|icb|senate|pb)
       args+=(--strategy-plan "$PLAN_FILE" --decision-times split --search-sizing-mode
              --rm-toggle-policy atr-regime-searched
              --market-condition-profile ohlcv-v1,ta-structure-v1
              --market-condition-manifest "ohlcv-v1=${mc_o},ta-structure-v1=${mc_t}"
-             --search-market-profile --market-exit exit,stop,tp --search-sl-loosen
-             --benchmark-regime-gates --exclude-symbols "@$EXCLUDE_FILE")
-      suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg"
+             --search-market-profile --market-exit "${G27_MARKET_EXIT:-exit,stop,tp}" --search-sl-loosen
+             --benchmark-regime-gates --pullback-gates --exclude-symbols "@$EXCLUDE_FILE")
+      suffix="${suffix}-atr27-rgov-sizegene-mktprof-spyreg-pullback"
+      # --market-exit kinds (exit,stop,tp,rsi,spy; rsi/spy add the RSI-recovery close and the SPY-below-200 stop).
+      # G27_MARKET_EXIT set = that list for every strategy, its own name token. Unset = exit,stop,tp widened PER
+      # STRATEGY by the matrix (--market-exit-per-strategy: S1/S2 +rsi, S6 +rsi,spy; S3/S5/... unchanged); a job whose
+      # kinds differ from exit,stop,tp carries '-mx-<kinds>' in its name, so it never resumes an older job.
+      if [ -n "${G27_MARKET_EXIT:-}" ]; then suffix="${suffix}-mx-${G27_MARKET_EXIT//,/_}"; else args+=(--market-exit-per-strategy); fi
+      # S8/S9 (late steps): only that strategy, from the plan's late_strategies section; its split + rsi/spy are implied.
+      if [ -n "$late" ]; then args+=(--late-strategy "$late"); fi
+      # Optional: ONE ruleset with a SPY-above-200 section and a SPY-below-200 section (launcher --regime-split-entry).
+      # G27_REGIME_SPLIT = context | entry | all. Unset = today's commands, names and labels unchanged.
+      if [ -n "${G27_REGIME_SPLIT:-}" ]; then
+        args+=(--regime-split-entry "$G27_REGIME_SPLIT"); suffix="${suffix}-regsplit-${G27_REGIME_SPLIT}"
+      fi
+      # PullbackReversion (long only) runs S2 on the cap bands; its entry is a daily dip, so the screener
+      # cadence is daily and the entry scan runs every weekday (no weekday genes: _daily_entry in the launcher). The matrix runs it only when asked.
+      if [ "$kind" = "pb" ]; then args+=(--pullback-strategies S2 --cadence-days 1); fi
       if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
-      if [ "$kind" != "senate" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
+      if [ "$kind" != "senate" ] && [ "$kind" != "pb" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
     sqm)
       args+=(--strategies SQM --decision-times split --search-sizing-mode --search-ds-factor-weights
              --search-exploration-ranges --exclude-symbols "@$EXCLUDE_FILE")
@@ -429,7 +460,7 @@ case "$CMD" in
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
       local_env=()
-      for v in PHASE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
+      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
         [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
       done
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1

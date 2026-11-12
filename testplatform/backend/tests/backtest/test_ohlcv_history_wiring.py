@@ -47,6 +47,7 @@ def _block(**extra):
         "account_settings": {"starting_cash": 100_000.0, "commission_per_trade": 0.0,
                              "slippage_bps": 0.0, "fill_model": "next_bar_open"},
         "warmup_days": 30, "seed": 7, "subtype": "daily_expert", "execution_interval": "1d",
+        "estimates_source": "fmp",      # a run names its estimates source (no default)
     }
     block.update(extra)
     return block
@@ -217,9 +218,9 @@ def test_every_job_creating_subcommand_has_the_flag(launcher, capsys, command, _
 def test_single_backtest_cli_stamps_its_config():
     from scripts.run_daily_backtest import _build_real_config, _parse_args
 
-    args = _parse_args(["--start", "2024-03-04", "--end", "2024-03-08"])
+    args = _parse_args(["--start", "2024-03-04", "--end", "2024-03-08", "--estimates-source", "fmp"])
     assert _build_real_config(args)[OHLCV_HISTORY_SOURCE_KEY] == "alpaca"
-    args = _parse_args(["--start", "2024-03-04", "--end", "2024-03-08", "--ohlcv-history-source", "fmp"])
+    args = _parse_args(["--start", "2024-03-04", "--end", "2024-03-08", "--ohlcv-history-source", "fmp", "--estimates-source", "fmp"])
     assert _build_real_config(args)[OHLCV_HISTORY_SOURCE_KEY] == "fmp"
 
 

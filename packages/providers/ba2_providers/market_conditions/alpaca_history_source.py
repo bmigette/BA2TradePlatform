@@ -63,6 +63,17 @@ class AlpacaHistoryWarmupSource:
         except GateCertificateError as e:
             raise WarmupConfigError(str(e)) from e
 
+    def store_asof(self) -> date:
+        """The date the cache's build ran to (``store_asof`` of ``_meta/build_manifest.json``). A series ending well before
+        it stopped trading by the vendor's own record: the warmup builds it as a delisting instead of asking for a fetch
+        this cache never does (``warmup._drop_tails_ended_at_source``). A manifest without it is a configuration error."""
+        from ba2_providers.market_conditions.warmup import WarmupConfigError
+        with open(self.manifest_path, "r", encoding="utf-8") as f:
+            asof = json.load(f).get("store_asof")
+        if not asof:
+            raise WarmupConfigError(f"{self.manifest_path} has no store_asof: rebuild with tools/prepare_history.py")
+        return date.fromisoformat(str(asof)[:10])
+
     def split_calendar(self, symbol: str) -> List[CalendarSplit]:
         events = self._load()
         sym = symbol.upper()

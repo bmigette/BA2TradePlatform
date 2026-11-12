@@ -23,6 +23,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import sys
+
 import pytest
 
 from ba2_experts.FMPSenateTraderCopy import FMPSenateTraderCopy
@@ -2676,3 +2678,70 @@ def test_live_basket_skips_a_member_whose_quote_is_none_loudly(caplog):
     assert set(out) == {"AAPL"}
     assert any("TDY" in r.getMessage() and "without a current price" in r.getMessage()
                for r in caplog.records)
+
+
+# ====================================================================
+# FMPSenateTraderWeight — expected_profit_mode='model' (2026-11-07)
+# ====================================================================
+
+def _model_inputs(growth):
+    rows = [{"reported_eps": growth, "report_date": "2026-05-01", "time": "bmo"}] * 4 + \
+        [{"reported_eps": 1.0, "report_date": "2025-05-01", "time": "bmo"}] * 4
+    return {"earnings": rows, "estimates": []}
+
+
+def test_weight_model_mode_sets_buy_expected_profit_from_the_price_target(monkeypatch):
+    mod = sys.modules["ba2_experts.FMPSenateTraderWeight"]
+    calls = []
+    monkeypatch.setattr(mod, "fetch_estimator_inputs",
+                        lambda providers, sym, as_of, method: calls.append((sym, method)) or _model_inputs(1.3))
+    e, settings = _two_buyer_setup(extra_settings={"expected_profit_mode": "model",
+                                                   "model_target_method": "reported"})
+    rec = _run(e, settings)
+    assert rec.signal == OrderRecommendation.BUY
+    assert calls == [("AAPL", "reported")]
+    assert rec.expected_profit_percent == pytest.approx(30.0)
+    assert "Model price target (reported)" in rec.details
+
+
+def test_weight_model_mode_keeps_static_when_the_model_has_no_answer(monkeypatch):
+    mod = sys.modules["ba2_experts.FMPSenateTraderWeight"]
+    monkeypatch.setattr(mod, "fetch_estimator_inputs", lambda providers, sym, as_of, method: _model_inputs(0.9))
+    e, settings = _two_buyer_setup(extra_settings={"expected_profit_mode": "model"})
+    static = _run(*_two_buyer_setup())
+    rec = _run(e, settings)
+    assert rec.expected_profit_percent == pytest.approx(static.expected_profit_percent)
+
+
+def test_weight_static_mode_never_reads_model_inputs(monkeypatch):
+    mod = sys.modules["ba2_experts.FMPSenateTraderWeight"]
+    monkeypatch.setattr(mod, "fetch_estimator_inputs",
+                        lambda *a, **k: pytest.fail("static mode must not fetch model inputs"))
+    rec = _run(*_two_buyer_setup())
+    assert rec.signal == OrderRecommendation.BUY
+
+
+def test_weight_basket_model_inputs_only_for_symbols_with_a_purchase():
+    from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
+    bundles = {"AAPL": {"all_trades": [{"type": "Purchase"}]},
+               "MSFT": {"all_trades": [{"type": "Sale (Full)"}]},
+               "NVDA": {"all_trades": [{"type": "sale_partial"}, {"type": "buy"}]}}
+    assert FMPSenateTraderWeight._buy_candidates(bundles) == ["AAPL", "NVDA"]
+
+
+def test_weight_basket_drops_a_symbol_without_an_estimate_instead_of_using_static(monkeypatch):
+    """Owner 2026-11-07: no estimate -> that symbol's analysis fails (dropped from the basket), the rest go on."""
+    import logging
+    from ba2_common.core.estimates_pit import EstimatesUnavailable
+    mod = sys.modules["ba2_experts.FMPSenateTraderWeight"]
+
+    def fake(providers, sym, as_of, method):
+        if sym == "NOEST":
+            raise EstimatesUnavailable(f"{sym}: no consensus")
+        return _model_inputs(1.3)
+    monkeypatch.setattr(mod, "fetch_estimator_inputs", fake)
+    e = mod.FMPSenateTraderWeight.__new__(mod.FMPSenateTraderWeight)
+    e.logger = logging.getLogger("t")
+    out = e._model_estimator_inputs(None, ["AAPL", "NOEST"], None,
+                                    {"expected_profit_mode": "model", "model_target_method": "consensus"})
+    assert out["NOEST"] is mod._ESTIMATES_UNAVAILABLE and out["AAPL"] == _model_inputs(1.3)

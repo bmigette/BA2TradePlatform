@@ -131,7 +131,8 @@ def test_no_flags_reproduces_the_pre_lift_builder_byte_for_byte(kind, pristine):
 
 
 def test_the_equity_keys_are_in_the_permitted_market_condition_set():
-    assert mod._EQUITY_MARKET_CONDITION_STRATEGIES == set(EQUITY)
+    # S8/S9 (S6 + implied split / rsi / spy; they need --benchmark-regime-gates, see test_equity_strategy_s8.py)
+    assert mod._EQUITY_MARKET_CONDITION_STRATEGIES == set(EQUITY) | set(mod._IMPLIED_RULE_SHAPE)
     assert mod._EQUITY_MARKET_CONDITION_STRATEGIES <= mod._MARKET_CONDITION_STRATEGIES
     # O_STK still has no entry gate of its own -- unaffected by the equity lift.
     assert "O_STK" not in mod._MARKET_CONDITION_STRATEGIES

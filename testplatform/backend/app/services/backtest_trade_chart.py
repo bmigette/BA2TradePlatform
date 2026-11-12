@@ -113,7 +113,7 @@ class OptionStoreProvenance:
     def is_parquet(self) -> bool:
         """A parquet-backed store: its greeks are not stored, the run inverted them at read
         time. ``parquet`` is the superseded name of ``tastytrade`` (options_store.STORE_ALIASES)."""
-        return (self.store or '').strip().lower() in ('parquet', 'tastytrade', 'thetadata')
+        return (self.store or '').strip().lower() in ('parquet', 'tastytrade', 'thetadata', 'alphavantage')
 
 
 def _store_keys(node: Any, found: Dict[str, str]) -> None:

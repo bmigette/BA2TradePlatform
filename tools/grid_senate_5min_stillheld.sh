@@ -87,7 +87,7 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
   echo "=== Senate $S @ 5min   start $(date)"
   echo "=================================================================="
   "$PY" testplatform/ba2test_launcher.py optimize \
-    --expert FMPSenateTraderWeight \
+    --expert FMPSenateTraderWeight --estimates-source fmp \
     --strategy "$S" \
     --universe "$UNI" \
     --start 2023-01-01 --end 2026-06-30 \

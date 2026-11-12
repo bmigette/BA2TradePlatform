@@ -85,7 +85,9 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, is_analysis_failure_reason, note_job_exit,
-    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce)
+    add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce,
+    add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name,
+    add_option_history_source_flag, option_store_tokens, with_option_history_source_name)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
@@ -593,7 +595,7 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         # a store chosen via env is a decision the master made that the worker cannot see, and
         # the worker would silently re-resolve to the sqlite default. That is how a whole grid
         # once scored against the wrong vendor's history while every log said otherwise.
-        "--options-store", args.options_store,
+        *option_store_tokens(args),
         # EXPLICIT per job for the same reason, and so the spread model is in the job identity
         # (discovery_name digests these args): the launcher's own default is a code constant
         # that a later model version would change silently under an unchanged job name.
@@ -620,6 +622,7 @@ def build_cmd(args, launcher, name, expert, strat, universe, neutral_entry_mode=
         value = getattr(args, field)
         if value is not None:
             cmd += [flag, str(value)]
+    cmd += estimates_source_tokens(estimates_source_of(args, __file__))
     cmd += cap_passthrough(args)
     if args.fitness_trade_scale:
         cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
@@ -688,6 +691,16 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     """
     cmd = build_cmd(args, launcher, "", expert, strat, universe, neutral_entry_mode)
     tokens = cmd[cmd.index("optimize") + 1:]
+    # --estimates-source fmp is the legacy implicit source: kept out of the experiment identity so every
+    # job from before the flag keeps its name (a non-fmp source joins the config, hence the name).
+    for _i in range(len(tokens) - 1):
+        if tokens[_i] == "--estimates-source" and tokens[_i + 1] == "fmp":
+            tokens = tokens[:_i] + tokens[_i + 2:]
+            break
+    for _i in range(len(tokens) - 1):     # likewise the legacy implicit option vendor
+        if tokens[_i] == "--option-history-source" and tokens[_i + 1] == "thetadata":
+            tokens = tokens[:_i] + tokens[_i + 2:]
+            break
     config = {}
     i = 0
     while i < len(tokens):
@@ -721,6 +734,7 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
 def planned_jobs(args, launcher, experts, strategies, universe):
     """Separate neutral arms without changing any other job/checkpoint identity."""
     suffix = _spread_name_tag(args.option_spread_model) + args.name_suffix
+    suffix += with_option_history_source_name('', args)   # '' for thetadata; '-optalphavantage' otherwise
     for name, expert, strategy in _jobs(experts, strategies, suffix):
         modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
         for mode in modes:
@@ -736,6 +750,8 @@ _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exit
 def main(argv=None) -> int:
     ap = build_parser()
     add_refused_decision_times_flag(ap)
+    add_estimates_source_flag(ap)
+    add_option_history_source_flag(ap)
     args = resolve_args(ap, argv)
     refuse_decision_times_and_announce(args)
 

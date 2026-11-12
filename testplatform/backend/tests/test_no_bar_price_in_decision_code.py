@@ -189,7 +189,7 @@ SITES[("packages/experts/ba2_experts/PullbackReversion.py", "last-element", "spy
 # clock the provider clamps it to finished sessions by default. Counted per file so a NEW read is a review event.
 OHLCV_SITES = {   # (file, first line of the call) -> (count, reason): a new read in an old file is a review event
     ("ba2_trade_platform/modules/experts/TradingAgentsUI.py", "price_data = provider.get_ohlcv_data("): (1, "UI chart history (live)"),
-    ("packages/common/ba2_common/core/TradeConditions.py", 'df = _get_provider("ohlcv", "yfinance").get_ohlcv_data('): (4, "recent high/low, relative volume, realised vol: history of FINISHED sessions (clamped)"),
+    ("packages/common/ba2_common/core/TradeConditions.py", 'df = _get_provider("ohlcv", "yfinance").get_ohlcv_data('): (5, "recent high/low, relative volume, realised vol, pullback RSI/SMA200 closes: history of FINISHED sessions (clamped)"),
     ("packages/common/ba2_common/core/backtest_context.py", 'df = prov.get_ohlcv_data(symbol, end_date=as_of, lookback_days=7, interval="1d")'): (1, "the bundle's historical close (see above)"),
     ("packages/common/ba2_common/core/interfaces/MarketDataProviderInterface.py", "df = self.get_ohlcv_data("): (1, "the provider's own implementation"),
     ("packages/experts/ba2_experts/ETFTrend.py", 'histories = {s: provider.get_ohlcv_data(s, end_date=as_of, lookback_days=calendar_days, interval="1d")'): (1, "signal history (completed closes)"),

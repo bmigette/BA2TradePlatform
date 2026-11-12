@@ -151,7 +151,7 @@ def test_scorer_section_is_wired_and_renormalizes_when_absent():
 # ------------------------------------------------- ANALYST: price-target leg
 def _target(days_ago: int, target: float) -> dict:
     d = (NOW - timedelta(days=days_ago)).isoformat().replace("+00:00", "Z")
-    return {"publishedDate": d, "priceTarget": target}
+    return {"publishedDate": d, "priceTarget": target, "adjPriceTarget": target}
 
 
 def test_price_target_drift_needs_real_coverage():

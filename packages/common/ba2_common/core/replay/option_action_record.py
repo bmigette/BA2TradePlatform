@@ -31,7 +31,7 @@ actions never leak into each other.
 
 Payload (``payload``)::
 
-    {"version": 1,
+    {"version": 2,           # 1 = before ``decision_frame_time`` existed (still read)
      "tape_span": {"start": <observation position at entry>,
                    "clock_start": <clock reads recorded at entry>,
                    "clock_end": <clock reads recorded at exit>},
@@ -51,7 +51,12 @@ actions read: id, instance_id, symbol, recommended_action, expected_profit_perce
 data); ``existing_order`` (full ``model_dump``); ``attrs`` (``submit_to_broker``, ``close_percent``,
 ``evaluation_details`` set after construction by the evaluator); ``decision_time`` (ONE
 ``replay_now()`` read taken first; in capture it is therefore the first clock read of the action's
-span, and Task 6 consumes it by calling ``replay_now()`` once before ``execute``).
+span, and Task 6 consumes it by calling ``replay_now()`` once before ``execute``);
+``decision_frame_time`` (version 2): the ``decision_time`` of the live decision frame
+(``market_condition_live.current_decision()``) the action ran under, read off the frame WITHOUT a
+clock read, or ``None`` when no frame was open (then ``live_decision_time()`` read the clock
+itself, and that read is inside the recorded clock span). The frame instant can differ from the
+recorder's own read, and it is the frame that live used for the DTE / session label.
 
 **DB reads of an execute** (what ``db_rows`` must let a scratch DB reproduce), by code path:
 
@@ -77,18 +82,34 @@ must name; ``TradeActionResult`` / order rows the action WRITES are outputs, not
 """
 from __future__ import annotations
 
-import dataclasses
 import inspect
-import threading
-from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
+from ba2_common.core.replay import action_record as core
+from ba2_common.core.replay.action_record import (
+    NOOP_CONTEXT as _NOOP_CONTEXT,
+    Frame as _Frame,
+    _tls,
+    build_outcome,
+    db_row_instances,
+    dump_row as _dump,
+    encodable as _encodable,
+    is_secret as _is_secret,
+    note_record,
+    replay_effects,
+)
 from ba2_common.core.replay.context import current_capture
-from ba2_common.core.replay.observe import SECRET_KEY_TOKENS, record_observation
+from ba2_common.core.replay.observe import record_observation
 
+# The family-independent mechanics (frame, outcome, row dump, redaction, version gate, recorder
+# lifecycle) live in :mod:`~ba2_common.core.replay.action_record`; this module is the OPTION family
+# on top of it. Names re-exported above keep their historical import path.
 __all__ = [
     "OPTION_ACTION_PROVIDER",
     "RECORD_VERSION",
+    "READABLE_VERSIONS",
+    "replay_decision_frame_time",
+    "NO_FRAME_FIELD",
     "action_ctor_kwargs",
     "build_outcome",
     "db_row_instances",
@@ -101,7 +122,9 @@ __all__ = [
 ]
 
 OPTION_ACTION_PROVIDER = "option_action"
-RECORD_VERSION = 1
+RECORD_VERSION = 2
+#: Versions the replay reads. 1 predates ``inputs["decision_frame_time"]``.
+READABLE_VERSIONS = (1, 2)
 
 #: The constructor parameters every TradeAction takes positionally; everything else is config.
 _BASE_PARAMS = frozenset({
@@ -117,39 +140,12 @@ _RECOMMENDATION_FIELDS = (
 )
 
 #: Result-data keys that are bulky and NOT a replay comparison input.
-_RESULT_DATA_SKIP = frozenset({"evaluation_details", "calculation_preview"})
-
-_tls = threading.local()
+_RESULT_DATA_SKIP = core.RESULT_DATA_SKIP
 
 
 # ---------------------------------------------------------------------------
 # public context manager + submit slot
 # ---------------------------------------------------------------------------
-class _Noop:
-    """The handle of a disabled recorder: assignments vanish."""
-
-    __slots__ = ()
-
-    def __setattr__(self, name, value):
-        pass
-
-
-_NOOP = _Noop()
-
-
-class _NoopContext:
-    __slots__ = ()
-
-    def __enter__(self):
-        return _NOOP
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
-_NOOP_CONTEXT = _NoopContext()
-
-
 def record_option_action(action):
     """Context manager around one ``execute``; yields a handle whose ``.result`` the caller sets."""
     context = current_capture()
@@ -158,191 +154,41 @@ def record_option_action(action):
     return _Recorder(action, context)
 
 
-class _Frame:
-    __slots__ = ("action", "submits", "records")
+class _Recorder(core.FrameRecorder):
+    """The live option recorder (only built inside a capture scope, never in replay)."""
 
-    def __init__(self, action):
-        self.action = action
-        self.submits: List[Dict[str, Any]] = []
-        self.records: Dict[str, Any] = {}
+    provider = OPTION_ACTION_PROVIDER
+    version = RECORD_VERSION
+    family = "option action"
 
+    def method_name(self):
+        return type(self.action).__name__
 
-class _Recorder:
-    """The live recorder (only built inside a capture scope, never in replay)."""
-
-    def __init__(self, action, context):
-        self.action = action
-        self.context = context
-        self.result: Any = None
-        self._inner = False
-        self._active = False
-        self._previous = None
-        self._frame: Optional[_Frame] = None
-        self._inputs: Optional[Dict[str, Any]] = None
-        self._db_rows: Optional[List[Dict[str, Any]]] = None
-        self._redacted: List[str] = []
-        self._tape_start: Optional[int] = None
-        self._clock_start: Optional[int] = None
-
-    def __enter__(self):
-        self._tape_start = self.context.observation_position
-        self._clock_start = self.context.clock_read_position    # BEFORE the decision-time read
-        current = getattr(_tls, "frame", None)
-        if current is not None and current.action is self.action:
-            self._inner = True              # covered call -> base execute: one record
-            return _NOOP
-        try:
-            self._inputs = _build_inputs(self.action)
-            self._db_rows, self._redacted = _collect_db_rows(self.action)
-        except Exception as exc:
-            self.context.note_failure("option action inputs not recorded", exc)
-            return _NOOP
-        self._previous = current
-        self._frame = _Frame(self.action)
-        _tls.frame = self._frame
-        self._active = True
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._inner:
-            return False
-        if self._active:
-            _tls.frame = self._previous
-            try:
-                self._record(exc)
-            except Exception as record_exc:      # never change the action's outcome
-                self.context.note_failure("option action outcome not recorded", record_exc)
-        return False
-
-    def _record(self, exc):
+    def identity(self):
         action = self.action
-        outcome = build_outcome(
-            exc, self.result, self._frame,
-            lambda value, label: _encodable(self.context, value, label))
-        inputs = dict(self._inputs)
-        inputs["redacted_setting_keys"] = self._redacted
-        payload = {
-            "version": RECORD_VERSION,
-            # The action's reads are exactly the observations with start <= invocation_seq < this
-            # record's own seq; anything the evaluator read earlier is outside the window.
-            # ``clock_start``/``clock_end``: the half-open range of the record's clock reads taken
-            # inside this action's span (the first is the recorder's own decision-time read).
-            "tape_span": {"start": self._tape_start,
-                          "clock_start": self._clock_start,
-                          "clock_end": self.context.clock_read_position},
-            "inputs": inputs,
-            "db_rows": self._db_rows,
-            "outcome": outcome,
-        }
         recommendation = getattr(action, "expert_recommendation", None)
         order = getattr(action, "existing_order", None)
-        record_observation(
-            provider=OPTION_ACTION_PROVIDER,
-            method=type(action).__name__,
-            identity={
-                "action_class": type(action).__name__,
-                "expert_instance_id": getattr(recommendation, "instance_id", None),
-                "symbol": action.instrument_name,
-                "transaction_id": getattr(order, "transaction_id", None),
-                "recommendation_id": getattr(recommendation, "id", None),
-            },
-            payload=payload,
-        )
+        return {
+            "action_class": type(action).__name__,
+            "expert_instance_id": getattr(recommendation, "instance_id", None),
+            "symbol": action.instrument_name,
+            "transaction_id": getattr(order, "transaction_id", None),
+            "recommendation_id": getattr(recommendation, "id", None),
+        }
 
+    def emit(self, **observation):
+        record_observation(**observation)
 
-def build_outcome(exc, result, frame, encodable) -> Dict[str, Any]:
-    """The ``outcome`` block of an action record, from what one ``execute`` did.
+    def build_inputs(self):
+        return _build_inputs(self.action)
 
-    ONE derivation for two callers: the live recorder (``_Recorder._record``) and the offline
-    replay, which builds the outcome of the re-run the same way so the two are compared like
-    for like. ``encodable(value, label)`` is the recorder's codec guard (the replay passes an
-    identity function: it compares the live objects).
-    """
-    outcome: Dict[str, Any] = {
-        "status": "error" if exc is not None else "returned",
-        "error": repr(exc) if exc is not None else None,
-        "success": None, "message": None, "result_data": None,
-        "entry_record": None, "exit_record": None,
-        "submits": [],
-    }
-    if exc is None and result is not None:
-        outcome["success"], outcome["message"], data = _result_fields(result)
-        if isinstance(data, dict):
-            outcome["entry_record"] = encodable(data.get("entry_record"), "entry_record")
-            outcome["result_data"] = encodable(
-                {k: v for k, v in data.items() if k not in _RESULT_DATA_SKIP}, "result data")
-    if "exit_record" in frame.records:
-        outcome["exit_record"] = encodable(frame.records["exit_record"], "exit_record")
-    if outcome["entry_record"] is None and "entry_record" in frame.records:
-        outcome["entry_record"] = encodable(frame.records["entry_record"], "entry_record")
-    outcome["submits"] = [_encodable_submit(entry, encodable) for entry in frame.submits]
-    return outcome
-
-
-def _encodable_submit(entry: Dict[str, Any], encodable) -> Dict[str, Any]:
-    """``entry`` if the codec can store it, else ``{"method", "unencodable"}``.
-
-    Submits carry live leg objects, so one with an attribute the codec refuses would otherwise
-    fail the freeze of the WHOLE action observation. The marker keeps the method name; the replay
-    reports a recorded marker as ``missing_capture`` (it cannot compare what was not stored).
-    """
-    kept = encodable(entry, "submit")
-    if kept is entry:
-        return entry
-    return {"method": entry["method"], "unencodable": kept["unencodable"]}
-
-
-@contextmanager
-def replay_effects(action):
-    """Offline replay: collect what one re-run ``execute`` submits and stamps.
-
-    The live recorder is a no-op while replaying (it must never write into the tape it reads), but
-    the replay still needs the SAME submit / record notes the recorder collected, in the same
-    shape, so it installs the recorder's own frame without recording anything. Restores the
-    previous frame on exit, exceptions included.
-    """
-    frame = _Frame(action)
-    previous = getattr(_tls, "frame", None)
-    _tls.frame = frame
-    try:
-        yield frame
-    finally:
-        _tls.frame = previous
-
-
-def _result_fields(result):
-    """``(success, message, data)`` of an action result: the real dict, or an attribute object."""
-    if isinstance(result, dict):
-        return result["success"], result["message"], result["data"]
-    return (getattr(result, "success", None), getattr(result, "message", None),
-            getattr(result, "data", None))
+    def collect_db_rows(self):
+        return _collect_db_rows(self.action)
 
 
 def note_submit(method: str, **call) -> None:
     """Called where an option action hands an order to the account. Never raises."""
-    frame = getattr(_tls, "frame", None)
-    if frame is None:
-        return
-    try:
-        legs = call.get("legs")
-        entry = {"method": method}
-        entry.update(call)
-        if legs is not None:
-            entry["legs"] = list(legs)
-            entry["leg_summary"] = [_leg_summary(leg) for leg in legs]
-        frame.submits.append(entry)
-    except Exception as exc:
-        context = current_capture()
-        if context is not None:
-            context.note_failure("option submit not noted", exc)
-
-
-def note_record(name: str, value: Any) -> None:
-    """Called where an action stamps its ``entry_record`` / ``exit_record``. Never raises."""
-    frame = getattr(_tls, "frame", None)
-    if frame is None:
-        return
-    frame.records[name] = value
+    core.note_effect(method, _leg_summary, **call)
 
 
 def _leg_summary(leg) -> Dict[str, Any]:
@@ -351,19 +197,6 @@ def _leg_summary(leg) -> Dict[str, Any]:
         "position_intent": leg.position_intent, "option_type": leg.option_type,
         "strike": leg.strike, "expiry": leg.expiry,
     }
-
-
-def _encodable(context, value, label):
-    """``value`` if the exact codec can store it, else a visible marker (and a counted failure)."""
-    if value is None:
-        return None
-    from ba2_common.core.replay import codec
-    try:
-        codec.encode(value)
-        return value
-    except Exception as exc:
-        context.note_failure(f"option action {label} not encodable", exc)
-        return {"unencodable": repr(value)[:2000]}
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +237,15 @@ _ACCOUNT_DECLARATIONS = ("OPTION_GREEKS_SOURCE",)
 
 
 def _account_declarations(account) -> Dict[str, Any]:
-    out = {}
-    for name in _ACCOUNT_DECLARATIONS:
-        value = getattr(account, name, None)
-        # A declaration is a string tag or absent; a test double's auto-attribute is neither.
-        out[name] = value if isinstance(value, str) else None
-    return out
+    return core.account_declarations(account, _ACCOUNT_DECLARATIONS)
+
+
+def _live_frame_time():
+    """``decision_time`` of the open live decision frame, or ``None`` when there is none."""
+    from ba2_common.core.market_condition_live import current_decision
+
+    frame = current_decision()
+    return None if frame is None else frame.decision_time
 
 
 def _build_inputs(action) -> Dict[str, Any]:
@@ -436,21 +272,14 @@ def _build_inputs(action) -> Dict[str, Any]:
         "existing_order": _dump(order)["row"] if order is not None else None,
         "attrs": attrs,
         "decision_time": replay_now(),
+        # Read off the frame object: NO clock read (the recorded clock span is unchanged).
+        "decision_frame_time": _live_frame_time(),
     }
 
 
 # ---------------------------------------------------------------------------
 # db rows
 # ---------------------------------------------------------------------------
-def _dump(obj) -> Dict[str, Any]:
-    return {"model": type(obj).__name__, "row": obj.model_dump()}
-
-
-def _is_secret(key: Any) -> bool:
-    text = str(key).lower()
-    return any(token in text for token in SECRET_KEY_TOKENS)
-
-
 def _expert_id(action) -> Optional[int]:
     recommendation = action.expert_recommendation
     expert_id = getattr(recommendation, "instance_id", None) if recommendation is not None else None
@@ -463,17 +292,10 @@ def _expert_id(action) -> Optional[int]:
 
 def _collect_db_rows(action):
     """``(rows, redacted setting keys)``: every row an execute reads (module docstring)."""
-    from sqlmodel import Session, select
-
-    from ba2_common.core.db import get_db
-    from ba2_common.core.models import (
-        ExpertInstance, ExpertRecommendation, ExpertSetting, TradingOrder, Transaction,
-    )
-    from ba2_common.core.trade_store import get_or_none, orders_where, transactions_where
-    from ba2_common.core.types import CAPITAL_HOLDING_TRANSACTION_STATUSES
+    from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
+    from ba2_common.core.trade_store import get_or_none, orders_where
 
     rows: Dict[tuple, Dict[str, Any]] = {}
-    redacted: List[str] = []
 
     def add(obj):
         if obj is None:
@@ -505,48 +327,14 @@ def _collect_db_rows(action):
     recommendation_id = getattr(recommendation, "id", None)
     if recommendation_id is not None:
         add(get_or_none(ExpertRecommendation, recommendation_id))
-    if expert_id is not None:
-        add(get_or_none(ExpertInstance, expert_id))
-        with Session(get_db().bind) as session:
-            for setting in session.exec(
-                    select(ExpertSetting).where(ExpertSetting.instance_id == expert_id)).all():
-                if _is_secret(setting.key):
-                    redacted.append(setting.key)
-                else:
-                    add(setting)
-        # THE BOUND. Every transaction read of an execute filters on WAITING / OPENED / CLOSING
-        # (CAPITAL_HOLDING_TRANSACTION_STATUSES): ``_committed_to_underlying`` (symbol, all three),
-        # ``_held_equity_shares`` (symbol, OPENED), ``_own_equity_transactions`` /
-        # ``held_covered_calls`` (symbol, WAITING/OPENED), the duplicate-position gate
-        # (``open_or_waiting_position``), the option risk manager (OPENED / WAITING of the expert)
-        # and the expert's used-balance pass (``capital_transactions``, ANY symbol, all three).
-        # Nothing reads a CLOSED / FAILED row, so history is not recorded: the set is the expert's
-        # capital-holding transactions on any symbol, plus all their orders below. The transaction
-        # an existing order belongs to is added separately above, whatever its status.
-        transactions = list(transactions_where(
-            expert_id=expert_id, statuses=list(CAPITAL_HOLDING_TRANSACTION_STATUSES)))
-        ids = []
-        for transaction in transactions:
-            add(transaction)
-            if transaction.id not in ids:
-                ids.append(transaction.id)
-        if ids:
-            for held in orders_where(transaction_ids=ids):
-                add(held)
-
-    ordered = sorted(rows.items(), key=lambda item: (item[0][0], item[0][1] or 0))
-    return [value for _, value in ordered], sorted(set(redacted))
-
-
-def db_row_instances(payload: Dict[str, Any]) -> list:
-    """The recorded ``db_rows`` as model instances, ready to ``session.add`` into a scratch DB."""
-    from ba2_common.core import models
-
-    instances = []
-    for entry in payload["db_rows"]:
-        model = getattr(models, entry["model"])
-        instances.append(model(**entry["row"]))
-    return instances
+    # THE BOUND (core.collect_expert_rows): the expert instance, its non-secret settings and its
+    # capital-holding transactions on ANY symbol with all their orders. Every transaction read of an
+    # execute filters on WAITING / OPENED / CLOSING (``_committed_to_underlying``,
+    # ``_held_equity_shares``, ``held_covered_calls``, the duplicate-position gate, the option risk
+    # manager and the expert's used-balance pass); nothing reads a CLOSED / FAILED row, so history is
+    # not recorded. The transaction an existing order belongs to is added above, whatever its status.
+    redacted = core.collect_expert_rows(add, expert_id)
+    return core.sorted_rows(rows), sorted(set(redacted))
 
 
 # ---------------------------------------------------------------------------
@@ -583,3 +371,22 @@ def rebuild_option_action(payload: Dict[str, Any], account):
 def replay_decision_time(payload: Dict[str, Any]):
     """The recorded decision clock (the recorder's own first read of the action's span)."""
     return payload["inputs"]["decision_time"]
+
+
+class _NoFrameField:
+    """Sentinel: a version-1 record, written before ``decision_frame_time`` was captured."""
+
+    def __repr__(self):
+        return "NO_FRAME_FIELD"
+
+
+NO_FRAME_FIELD = _NoFrameField()
+
+
+def replay_decision_frame_time(payload: Dict[str, Any]):
+    """The live decision frame's instant (``datetime``), ``None`` (live held no frame: it read
+    the clock itself), or :data:`NO_FRAME_FIELD` (a version-1 record: unknown, must be inferred
+    or refused by the caller, never assumed)."""
+    if payload["version"] < 2:
+        return NO_FRAME_FIELD
+    return payload["inputs"]["decision_frame_time"]

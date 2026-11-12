@@ -33,6 +33,7 @@ from ba2_common.core.market_conditions import (
     STATUS_INVALID_PRICES, STATUS_VALID, STRUCTURE_STATE_CODES, STRUCTURE_STATE_NONE_CODE, WINDOW,
     compute_chart_structure, compute_market_conditions)
 from ba2_common.core.models import ExpertRecommendation
+from ba2_common.core.rsi import wilder_rsi as _wilder_rsi
 from ba2_common.core.types import (
     AnalysisUseCase, MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel,
     TimeHorizon)
@@ -102,33 +103,6 @@ def _closes(bars, name: str) -> np.ndarray:
         i = int(np.flatnonzero(bad)[-1])
         raise ValueError(f"Invalid close in {name} at {bars.index[i]}: {close[i]!r}")
     return close
-
-
-def _wilder_rsi(close: np.ndarray, period: int) -> float:
-    """Wilder RSI of the last bar: the recursion of the probe's ``rsi()``, i.e. pandas
-    ``ewm(alpha=1/n, adjust=False)`` seeded on the first close-to-close change.
-
-    With no down move in the smoothed history the RSI is 100. The probe yields NaN there and
-    never acts on that bar; here a long in ``rsi`` exit mode exits. The short-entry RSI
-    condition also holds, but such a history closes above its SMA200 with a positive slope, so
-    no short trend gate passes. With no move at all the RSI is undefined and raises."""
-    alpha = 1.0 / period
-    keep = 1.0 - alpha
-    values = close.tolist()
-    change = values[1] - values[0]
-    up = change if change > 0 else 0.0
-    down = -change if change < 0 else 0.0
-    prev = values[1]
-    for price in values[2:]:
-        change = price - prev
-        prev = price
-        up = keep * up + alpha * (change if change > 0 else 0.0)
-        down = keep * down + alpha * (-change if change < 0 else 0.0)
-    if down == 0:
-        if up == 0:
-            raise ValueError("RSI undefined: no price change in the history")
-        return 100.0
-    return 100.0 - 100.0 / (1.0 + up / down)
 
 
 def _window(bars: pd.DataFrame, close: np.ndarray):
@@ -274,6 +248,9 @@ BACKTEST_WARMUP_BARS = math.ceil(FETCH_DAYS / 1.45)
 
 SKIP_INSUFFICIENT_HISTORY = "insufficient_history"
 SKIP_STOPPED_TRADING = "symbol_stopped_trading"
+#: ``sma200_and_spy`` only: the symbol has no completed bar on SPY's last session (a halt or a data
+#: gap of at most MAX_STALE_DAYS), so the stock and the market regime cannot be read on one session.
+SKIP_NO_SESSION_BAR = "no_bar_on_decision_session"
 
 
 def _utc_now() -> datetime:
@@ -602,6 +579,17 @@ class PullbackReversion(MarketExpertInterface):
                 f"window ending {session}, under {GAP_WARN_RATIO:.0%} of {SPY_SYMBOL}'s "
                 f"{len(reference)} (gaps or halts); evaluated anyway")
         spy_bars = reference if settings["trend_gate"] == "sma200_and_spy" else None
+        if spy_bars is not None and len(spy_bars) and bars.index[-1] < spy_bars.index[-1]:
+            # pullback_signal refuses misaligned frames (it cannot tell a halt from look-ahead).
+            # Here both frames are clipped to the data session, so this is a symbol that missed
+            # sessions: skipped for this decision, logged once, never a run abort (GSK had no bars
+            # on 2022-07-19..21 and aborted a whole screener run before 2026-11-11).
+            return self._skip(
+                symbol, SKIP_NO_SESSION_BAR,
+                f"{symbol} has no completed bar on {spy_bars.index[-1].date()} (last "
+                f"{bars.index[-1].date()}); trend_gate sma200_and_spy reads the stock and "
+                f"{SPY_SYMBOL} on one session",
+                close, raw_first, last, reference)
         result = pullback_signal(bars, settings, spy_bars)  # validates every setting it reads
         long = settings["direction"] == "long"
         action = result["action"]

@@ -60,6 +60,46 @@ def parse_window(values):
     return values[0], values[1]
 
 
+def parse_overrides(items):
+    """``["k=v", ...]`` -> ``{k: v}``; v is JSON when it parses (numbers, true/false), else the raw string."""
+    out = {}
+    for item in items or []:
+        key, sep, raw = str(item).partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set takes KEY=VALUE, got {item!r}")
+        try:
+            out[key.strip()] = json.loads(raw)
+        except ValueError:
+            out[key.strip()] = raw
+    return out
+
+
+def apply_expert_overrides(config, overrides):
+    """Set ``overrides`` in every expert's settings of a rebuilt run config; returns the previous values."""
+    previous = {}
+    for spec in config.get("experts") or []:
+        settings = spec.setdefault("settings", {})
+        for key, value in overrides.items():
+            previous.setdefault(key, settings.get(key))
+            settings[key] = value
+    return previous
+
+
+def basis_refused_symbols(config):
+    """Symbols of ``config``'s universe the intraday/daily basis preflight would refuse (mismatched or stale)."""
+    import os as _os
+    from app.services.backtest import intraday_basis_preflight as pf
+    from ba2_providers.ohlcv import cross_interval_basis as cib
+    interval = pf.interval_to_check(config)
+    if interval is None:
+        return []
+    lo, hi = cib.judged_window(config["start_date"], config["end_date"], int(config["warmup_days"]))
+    rep = pf.scan(config["enabled_instruments"], interval, lo, hi,
+                  workers=max(1, min(8, (_os.cpu_count() or 2) - 1)), job_kind=pf.job_kind_of(config))
+    return sorted({r.symbol for r in rep.mismatched} | {s for s, _ in rep.stale}
+                  | {r.symbol for r in rep.coverage_refused})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("backtest_id", type=int)
@@ -81,9 +121,34 @@ def main() -> int:
                     help="MEASUREMENT ONLY: let --decision-time 09:30 (the session's first bar) run, "
                          "with the engine's first-bar warning, as a stored row without an override "
                          "does. The GA gene validation still refuses 09:30.")
+    ap.add_argument("--estimates-source", choices=("fmp", "alphavantage"),
+                    help="re-measure on this estimates source; default: the row's own (fmp for a row stored "
+                         "before runs named one)")
+    ap.add_argument("--ohlcv-history-source", choices=("fmp", "alpaca"),
+                    help="re-measure on this OHLCV history; default: the row's own (fmp for a row stored "
+                         "before the Alpaca switch of 2026-10-22)")
+    ap.add_argument("--exclude-symbols", metavar="A,B",
+                    help="remove these symbols from the row's universe for this re-run (recorded in the output), "
+                         "e.g. a symbol the intraday-basis preflight refuses since the row ran")
+    ap.add_argument("--exclude-basis-refused", action="store_true",
+                    help="scan the universe with the intraday/daily basis preflight first and exclude every "
+                         "symbol it would refuse (mismatched or stale), listing them; for re-measuring an old row "
+                         "whose cache has since been found defective. The excluded list is in the output.")
+    ap.add_argument("--source-db", metavar="SQLITE",
+                    help="read the row, its optimization and strategy from THIS test-platform DB (e.g. an "
+                         "unzipped backup) instead of the configured one; opened read-only, nothing is written")
+    ap.add_argument("--screener-panel", metavar="FINGERPRINT|DIR",
+                    help="re-point the row at another screener daily panel (its fingerprint under "
+                         "<cache>/screener/daily_panel, or a directory): a stored row pins the panel it was scored on, "
+                         "which may not serve another window (e.g. an out-of-sample period after a delisting was "
+                         "acknowledged and the panel rebuilt). Printed; still writes no row.")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override an EXPERT setting for this re-run (JSON value, else a string), e.g. "
+                         "--set model_target_method=consensus. Repeatable. Still writes no row.")
     ns = ap.parse_args()
     try:
         ns.window = parse_window(ns.window)
+        ns.set = parse_overrides(ns.set)
     except ValueError as e:
         ap.error(str(e))
 
@@ -92,7 +157,18 @@ def main() -> int:
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
     from app.services.backtest.rerun_handler import rebuild_config_for_backtest
 
-    db = SessionLocal()
+    if ns.source_db:
+        from pathlib import Path as _P
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        src = _P(ns.source_db).resolve()
+        if not src.is_file():
+            ap.error(f"--source-db {src} does not exist")
+        _engine = create_engine(f"sqlite:///file:{src.as_posix()}?mode=ro&uri=true")
+        db = sessionmaker(bind=_engine)()
+        print(f"source DB (read-only): {src}", flush=True)
+    else:
+        db = SessionLocal()
     try:
         bt = db.query(Backtest).filter(Backtest.id == ns.backtest_id).first()
         if bt is None:
@@ -100,8 +176,37 @@ def main() -> int:
             return 1
         stored = {m: getattr(bt, m, None) for m in SUMMARY}
         stored_window = (str(bt.start_date)[:10], str(bt.end_date)[:10])
+        if ns.exclude_basis_refused:
+            # Judged on the FINAL config (the universe can shrink after the rebuild), repeated until clean: a
+            # verdict can depend on the universe's window, so one pass is not enough.
+            excluded = {x.strip().upper() for x in (ns.exclude_symbols or "").split(",") if x.strip()}
+            for _ in range(4):
+                probe = rebuild_config_for_backtest(bt, db, window=ns.window,
+                                                    recompute_universe=ns.recompute_universe,
+                                                    estimates_source=ns.estimates_source,
+                                                    screener_panel=ns.screener_panel,
+                                                    exclude_symbols=sorted(excluded))
+                refused = set(basis_refused_symbols(probe)) - excluded
+                if not refused:
+                    break
+                excluded |= refused
+                print(f"basis preflight: excluding {len(refused)} refused symbols: {', '.join(sorted(refused))}",
+                      flush=True)
+            ns.exclude_symbols = ",".join(sorted(excluded))
         config = rebuild_config_for_backtest(bt, db, window=ns.window,
-                                             recompute_universe=ns.recompute_universe)
+                                             recompute_universe=ns.recompute_universe,
+                                             estimates_source=ns.estimates_source,
+                                                    screener_panel=ns.screener_panel,
+                                             exclude_symbols=[x.strip() for x in (ns.exclude_symbols or "").split(",")
+                                                              if x.strip()])
+        if ns.ohlcv_history_source:
+            from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
+            config[OHLCV_HISTORY_SOURCE_KEY] = ns.ohlcv_history_source
+        if ns.set:
+            if not config.get("experts"):
+                print("--set: the rebuilt config has no experts block")
+                return 1
+            previous = apply_expert_overrides(config, ns.set)
         stored_times = ((config.get("run_schedule_override") or {}).get("times"))
         if ns.decision_time:
             from ba2_common.core.schedule_genes import retime_schedules
@@ -120,6 +225,12 @@ def main() -> int:
     print(f"window {ns.window or stored_window}  (stored row window {stored_window})", flush=True)
     print(f"decision time {ns.decision_time or stored_times}  (stored row's own: {stored_times})",
           flush=True)
+    if ns.screener_panel:
+        print(f"screener panel OVERRIDE: {ns.screener_panel} (the stored row was scored on another panel)", flush=True)
+    print(f"estimates source {config.get('estimates_source')}, OHLCV history "
+          f"{config.get('ohlcv_history_source', 'fmp (legacy)')}", flush=True)
+    if ns.set:
+        print(f"expert setting overrides {ns.set}  (row's own: {previous})", flush=True)
     _note = config.get("screener_universe_legacy_note")
     if _note is not None:
         print(f"static universe: {_note['static_universe_size']} symbols, LEGACY list kept "
@@ -161,6 +272,9 @@ def main() -> int:
     if ns.out:
         Path(ns.out).write_text(json.dumps(
             {"row": ns.backtest_id, "name": name, "window": ns.window or stored_window,
+             "estimates_source": config.get("estimates_source"), "overrides": ns.set,
+             "ohlcv_history_source": config.get("ohlcv_history_source"), "source_db": ns.source_db,
+             "excluded_symbols": ns.exclude_symbols,
              "decision_time": ns.decision_time, "stored_times": stored_times,
              "stored": stored, "stored_window": stored_window, "rerun": got,
              "preload_symbols": results.get("symbol_count"),

@@ -18,7 +18,9 @@ from ba2_common.core.provider_utils import validate_date_range, statement_effect
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
-from ba2_providers.fmp_common import fmp_list_call, fmp_http_get, fmp_history_disk_cached, FMPError
+from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+from ba2_providers.fmp_common import (
+    fmp_list_call, fmp_http_get, fmp_history_disk_cached, FMPError, _is_hermetic_fmp_history)
 
 # Depth of the CACHED statement history, deliberately independent of any caller's
 # ``lookback_periods``.
@@ -728,7 +730,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             return f"# {statement_label} for {symbol}\n\nNo statements found.\n"
     
     @observe_provider("fundamentals_details", "get_past_earnings",
-                      identity=past_earnings_identity)
+                      identity=past_earnings_identity, record_errors=True)
     def get_past_earnings(
         self,
         symbol: str,
@@ -914,7 +916,13 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             Future earnings estimates in requested format
         """
         logger.debug(f"Fetching FMP earnings estimates for {symbol} ({frequency})")
-        
+
+        # FMP keeps ONE snapshot (today's consensus): a hermetic backtest reading it at a past as_of would
+        # see later revisions. Raised BEFORE the try below, whose broad handler would turn it into an
+        # {"error": ...} dict. Live (hermetic flag unset) and as_of today are unchanged.
+        refuse_if_not_point_in_time(as_of_date, hermetic=_is_hermetic_fmp_history(),
+                                    what=f"FMP get_earnings_estimates({symbol})")
+
         try:
             # Use direct API call since fmpsdk doesn't have analyst_estimates method
             # FMP API: https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}
@@ -1051,6 +1059,40 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 return {"error": str(e), "symbol": symbol}
             return f"Error retrieving earnings estimates for {symbol}: {str(e)}"
     
+    def get_quarterly_eps_consensus(self, symbol: str, as_of: Optional[datetime] = None) -> Dict[str, Any]:
+        """Next UNREPORTED quarters' consensus from FMP's earnings calendar (``epsEstimated``). LIVE ONLY.
+
+        The calendar carries one consensus per quarter (today's), no snapshot dates, no history: a hermetic
+        backtest with a historical ``as_of`` raises ``EstimatesNotPointInTime``. Basis: the calendar is
+        fetched now and FMP states its estimates on today's split basis, the same basis as FMP's adjusted
+        earnings and our split-adjusted prices, so no adjustment is applied (and none is needed: the value
+        is as of today by construction). High/low/analyst count are not in the calendar (None).
+        """
+        refuse_if_not_point_in_time(as_of, hermetic=_is_hermetic_fmp_history(),
+                                    what=f"FMP get_quarterly_eps_consensus({symbol})")
+        today = (as_of or datetime.now()).date()
+        raw = fmp_history_disk_cached(
+            "past_earnings_quarterly", symbol,
+            lambda: fmp_list_call(
+                lambda: fmpsdk.historical_earning_calendar(
+                    apikey=self.api_key, symbol=symbol, limit=_PAST_EARNINGS_FETCH_LIMIT),
+                symbol=symbol, endpoint="historical_earning_calendar"))
+        quarters = []
+        for row in raw or []:
+            day = str(row.get("date") or "")[:10]
+            est = row.get("epsEstimated")
+            if not day or est is None or row.get("eps") is not None or day <= today.isoformat():
+                continue                    # reported, already past, or no consensus: not an open quarter
+            quarters.append({
+                "fiscal_period_end": (str(row.get("fiscalDateEnding"))[:10] if row.get("fiscalDateEnding") else None),
+                "report_date": day, "eps_avg": float(est), "eps_high": None, "eps_low": None,
+                "analyst_count": None, "snapshot_date": today.isoformat(), "snapshot_age_days": 0,
+                "label_verified": True, "split_factor": 1.0,
+            })
+        quarters.sort(key=lambda q: q["report_date"])
+        return {"symbol": symbol.upper(), "as_of": None if as_of is None else as_of.isoformat(),
+                "source": "fmp", "quarters": quarters}
+
     def _format_past_earnings_markdown(self, data: Dict[str, Any]) -> str:
         """Format past earnings data as markdown."""
         md = f"# Past Earnings: {data['symbol']} ({data['frequency']})\n\n"

@@ -24,7 +24,8 @@ rdb = _load()
 
 def _args(*extra):
     return rdb._parse_args(
-        ["--expert", "FMPEarningsDrift", "--start", "2024-01-02", "--end", "2024-03-01", *extra]
+        ["--expert", "FMPEarningsDrift", "--start", "2024-01-02", "--end", "2024-03-01",
+         "--estimates-source", "fmp", *extra]
     )
 
 
@@ -54,4 +55,4 @@ def test_helper_daily_and_none_are_no_override():
 
 def test_invalid_schedule_rejected():
     with pytest.raises(SystemExit):
-        rdb._parse_args(["--run-schedule", "fortnightly"])  # argparse choices reject it
+        rdb._parse_args(["--estimates-source", "fmp", "--run-schedule", "fortnightly"])  # argparse choices reject it

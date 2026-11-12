@@ -2923,6 +2923,15 @@ const Backtesting: React.FC = () => {
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
+                  {/* Server renders a self-contained offline HTML (all charts + tables); the
+                      Content-Disposition: attachment header makes the browser save it. */}
+                  <a
+                    href={`${API_BASE}/backtests/${selectedBacktest.id}/export/html`}
+                    download={`backtest-${selectedBacktest.id}.html`}
+                    title="Save this backtest (every chart and table) as one self-contained HTML file"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <Download className="w-3.5 h-3.5" /> Save as HTML
+                  </a>
                   {selectedBacktest.engineType === 'daily_expert' && (
                     <button
                       type="button"

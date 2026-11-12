@@ -40,11 +40,11 @@ UPGRADE = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
 # insufficient-price-targets skip path a few months out.
 _NOW = datetime.now(timezone.utc)
 PRICE_TARGET_HISTORY = [
-    {"publishedDate": (_NOW - timedelta(days=10)).strftime("%Y-%m-%d"), "priceTarget": 110.0},
-    {"publishedDate": (_NOW - timedelta(days=11)).strftime("%Y-%m-%d"), "priceTarget": 124.0},
-    {"publishedDate": (_NOW - timedelta(days=12)).strftime("%Y-%m-%d"), "priceTarget": 128.0},
-    {"publishedDate": (_NOW - timedelta(days=13)).strftime("%Y-%m-%d"), "priceTarget": 128.0},
-    {"publishedDate": (_NOW - timedelta(days=14)).strftime("%Y-%m-%d"), "priceTarget": 160.0},
+    {"publishedDate": (_NOW - timedelta(days=10)).strftime("%Y-%m-%d"), "priceTarget": 110.0, "adjPriceTarget": 110.0},
+    {"publishedDate": (_NOW - timedelta(days=11)).strftime("%Y-%m-%d"), "priceTarget": 124.0, "adjPriceTarget": 124.0},
+    {"publishedDate": (_NOW - timedelta(days=12)).strftime("%Y-%m-%d"), "priceTarget": 128.0, "adjPriceTarget": 128.0},
+    {"publishedDate": (_NOW - timedelta(days=13)).strftime("%Y-%m-%d"), "priceTarget": 128.0, "adjPriceTarget": 128.0},
+    {"publishedDate": (_NOW - timedelta(days=14)).strftime("%Y-%m-%d"), "priceTarget": 160.0, "adjPriceTarget": 160.0},
 ]
 
 
@@ -99,7 +99,12 @@ def test_export_symbol_data_sell_flips_upside_signal(monkeypatch):
     sell_upgrade = [{"strongBuy": 0, "buy": 1, "hold": 1, "sell": 5, "strongSell": 10}]
     sell_consensus = {"targetConsensus": 70.0, "targetHigh": 90.0,
                       "targetLow": 50.0, "targetMedian": 68.0}
-    _patch_live_fetchers(monkeypatch, consensus=sell_consensus, upgrade=sell_upgrade)
+    # the live consensus is rebuilt from the dated split-adjusted rows: 50/68/70/90/70
+    sell_history = [{"publishedDate": (_NOW - timedelta(days=d)).strftime("%Y-%m-%d"),
+                     "priceTarget": p, "adjPriceTarget": p}
+                    for d, p in ((10, 50.0), (11, 70.0), (12, 70.0), (13, 70.0), (14, 90.0))]
+    _patch_live_fetchers(monkeypatch, consensus=sell_consensus, upgrade=sell_upgrade,
+                         price_target_history=sell_history)
     result = FMPRating.export_symbol_data("AAPL", overrides=SETTINGS)
     assert result.error is None, result.error
     assert result.overall_signal == "sell"
@@ -134,7 +139,7 @@ def test_export_symbol_data_skip_insufficient_price_targets_has_no_extra_rows(mo
     are relative to "now" (not hardcoded) so the fixture stays inside the
     live path's real trailing-quarter window regardless of when the test runs."""
     recent = datetime.now(timezone.utc) - timedelta(days=5)
-    thin_targets = [{"publishedDate": recent.strftime("%Y-%m-%d"), "priceTarget": 130.0}]
+    thin_targets = [{"publishedDate": recent.strftime("%Y-%m-%d"), "priceTarget": 130.0, "adjPriceTarget": 130.0}]
     _patch_live_fetchers(monkeypatch, price_target_history=thin_targets)
     result = FMPRating.export_symbol_data("AAPL", overrides=SETTINGS)
     assert result.error is None, result.error

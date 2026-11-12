@@ -35,9 +35,12 @@ from ...core.account_types import (
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance, InstanceNotFound
-from ba2_common.core.assignment_hold import assigned_stock_entry_data
+from ba2_common.core.assignment_hold import assigned_stock_entry_data, decide_live_assigned_stock
+from ba2_common.core.assignment_liquidation import pending_meta, sweep_pending_liquidations
 from ba2_common.core.entry_tag import order_entry_tag
 from sqlmodel import Session, select, or_
+from .alpaca_cover_protection import (
+    CoverProtectionMixin, PROTECTION_SUSPENDED_KEY, is_protection_suspended)
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
 # from the broker's own DIV activity id or from the symbol/date fallback. Keeps the
@@ -301,7 +304,7 @@ def alpaca_api_retry(func):
 
 
 
-class AlpacaAccount(AccountInterface, OptionsAccountInterface):
+class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterface):
     """
     A class that implements the AccountInterface for interacting with Alpaca trading accounts.
     This class provides methods for managing orders, positions, and account information through
@@ -1407,6 +1410,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"{trading_order.broker_order_id} — skipping re-submission"
             )
             return trading_order
+
+        # A protective SELL on a lot whose shares are pledged to an open short call is never
+        # sent: the broker would count them as held for the order and the call would be
+        # uncovered (alpaca_cover_protection). The net under every path that writes a leg.
+        if self._protective_leg_blocked_by_suspension(trading_order):
+            return None
 
         from sqlmodel import Session
         from ...core.db import add_instance
@@ -3153,12 +3162,27 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         PROBE TRAP (docs/WASHTRADE-LOCK.md): a 40410000 also appears when the id belongs
         to a DIFFERENT Alpaca account. Callers must only pass ids of orders whose
         ``account_id`` is this account's, which is what makes ``absent`` meaningful.
+
+        HOW ABSENCE IS READ. From the HTTP status alpaca-py attaches to the error
+        (``APIError.status_code``, taken from the HTTPError it wraps), never from a
+        substring of the body: a 5xx whose text happens to contain "not found" or "404"
+        is a failure to ask, not an answer. Only an APIError carrying NO HTTP response
+        (alpaca-py's REST client always attaches one) falls back to the structured Alpaca
+        error code in the JSON body; a body that is not that JSON is not an answer either.
         """
         try:
             raw = self.client.get_order_by_id(broker_order_id)
         except APIError as e:
-            text = str(e).lower()
-            if "40410000" in text or "not found" in text or "404" in text:
+            http_status = e.status_code
+            if http_status is not None:
+                if http_status == 404:
+                    return None, True
+                raise
+            try:
+                alpaca_code = e.code
+            except (ValueError, KeyError, TypeError):
+                raise e
+            if str(alpaca_code) == "40410000":
                 return None, True
             raise
         return self.alpaca_order_to_tradingorder(raw), False
@@ -3664,13 +3688,29 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         # CRITICAL: Before marking as CANCELED, try to verify order status at broker
                         # Alpaca's get_orders() API has retention limits and may not return old orders
                         # We should only mark as CANCELED if we can explicitly confirm the order is canceled
-                        broker_order = None
-                        verification_failed = False
+                        # NOT get_order(): it collapses every failure into None, so a network error
+                        # or a 429 read as "the broker does not know this order" and a live order
+                        # (a protective stop included) was written off as CANCELED. Only a CONFIRMED
+                        # absence (HTTP 404) may lead there; an unknown outcome changes nothing.
                         try:
-                            broker_order = self.get_order(db_order.broker_order_id)
+                            broker_order, absent = self._get_broker_order_or_absent(db_order.broker_order_id)
+                        except (APIError, OSError) as check_err:
+                            logger.warning(
+                                f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) is missing "
+                                f"from the Alpaca order listing and the by-id lookup FAILED "
+                                f"({type(check_err).__name__}: {check_err}) - its broker status is UNKNOWN, "
+                                f"leaving it unchanged; retrying next refresh"
+                            )
+                            continue
                         except Exception as check_err:
-                            logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
-                            verification_failed = True
+                            logger.error(
+                                f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) is missing "
+                                f"from the Alpaca order listing and the by-id lookup raised an unexpected "
+                                f"{type(check_err).__name__}: {check_err} - its broker status is UNKNOWN, "
+                                f"leaving it unchanged",
+                                exc_info=True
+                            )
+                            continue
 
                         # If we successfully retrieved the order from broker, update to match broker status
                         if broker_order:
@@ -3732,10 +3772,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                         updated_count += 1
                                 continue
 
-                        # If verification failed or order not found at broker:
+                        # The broker CONFIRMED it does not know this order (HTTP 404):
                         # DON'T automatically mark as CANCELED - this could be an old order beyond retention period
                         # Only mark as CANCELED if it's recent (less than 30 days old)
-                        if verification_failed or broker_order is None:
+                        if absent:
                             if db_order.created_at:
                                 created_at = db_order.created_at
                                 if created_at.tzinfo is None:
@@ -4670,9 +4710,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 session.add(transaction_in_session)
                 session.commit()
 
+                # 4b. The shares are pledged to an open short call (alpaca_cover_protection):
+                # the values above ARE stored (the source of truth, re-staged when the call is
+                # gone) but nothing may be put on the shares meanwhile. Not a failure.
+                if is_protection_suspended(transaction_in_session):
+                    logger.warning(
+                        f"Transaction {transaction.id} ({transaction_in_session.symbol}): "
+                        f"TP={transaction_in_session.take_profit} SL={transaction_in_session.stop_loss} "
+                        f"stored{source_label} but NOT staged at the broker -- the shares are "
+                        f"pledged to an open short call (protection suspended until it is gone)")
+                    return True
+
                 # 5. Find the existing exit orders: the position's resting PROTECTION that is
-                # still working (see the C1 note above). Executed rows are excluded too -- a
-                # leg that already fired protects nothing and has nothing left to cancel.
+                # still working (see the C1 note above). A FILLED leg is excluded -- it fired,
+                # protects nothing and has nothing left to cancel. A PARTIALLY_FILLED one is
+                # NOT: it still holds its remainder at the broker, so it must be cancelled
+                # before its replacement goes in (dev 2026-11-05 CELH: skipping it sent a new
+                # OCO the broker rejected for insufficient qty, and the remainder kept no stop).
                 all_orders = [
                     o for o in session.exec(
                         select(TradingOrder).where(
@@ -4681,7 +4735,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             TradingOrder.id != entry_order.id
                         )
                     ).all()
-                    if o.status not in OrderStatus.get_executed_statuses()
+                    if o.status != OrderStatus.FILLED
                     and TransactionHelper.is_resting_protection(o)
                 ]
 
@@ -7595,7 +7649,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stock_entry_data, refusal = self._member_tag_entry_data(opt_txn, "assigned put")
                 if refusal is not None:
                     return refusal
+                # WHO KEEPS THE STOCK: the SHARED decision the backtest account makes
+                # (assignment_hold), from the owning instance's settings and this put's entry tag.
+                # Not held -> the lot is flagged for liquidation IN THE SAME INSERT (a crash can
+                # never leave an unflagged lot), and sweep_pending_liquidations sells it.
+                hold, hold_note = self._assigned_stock_disposition(
+                    opt_txn, expert_id, underlying, symbol, share_qty)
                 now = datetime.now(timezone.utc)
+                txn_meta = {"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
+                            "activity_id": activity_id, "contract": symbol}
                 equity_txn = Transaction(
                     symbol=underlying,
                     quantity=share_qty,
@@ -7605,8 +7667,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     open_date=now,
                     expert_id=expert_id,
                     close_reason=None,
-                    meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
-                               "activity_id": activity_id, "contract": symbol},
+                    meta_data=txn_meta if hold else pending_meta(txn_meta),
                 )
                 equity_txn_id = add_instance(equity_txn)
                 # The assignment's ENTRY order row. Without it the shares exist only as a
@@ -7625,7 +7686,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     closed_note="closed short put txn",
                     open_note="settled the short put LEG; structure still OPEN")
                 return (f"csp_assignment: opened equity long {underlying} "
-                        f"{share_qty}@{strike}; {leg_note}")
+                        f"{share_qty}@{strike}; {leg_note}; {hold_note}")
 
             if right == OptionRight.CALL and is_short:
                 # Short call assigned -> shares called away. The held equity long is
@@ -7652,9 +7713,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         held=held, underlying=underlying, contracts=contracts,
                         strike=strike, contract=symbol, activity_id=activity_id,
                         leg_note=leg_note, remainder_entry_data=remainder_entry_data)
-                logger.warning(
+                logger.error(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
-                    f"equity long found for {underlying} (expert {expert_id}).")
+                    f"equity long found for {underlying} (expert {expert_id}). A NAKED call "
+                    f"delivers SHORT stock at the broker; live does not book it and the "
+                    f"assigned-stock policy cannot liquidate it (the backtest books it and buys "
+                    f"it back at the next open) -- cover the short {underlying} position by hand.")
                 return f"called_away_no_long: {leg_note}, no equity long to close"
 
             # Long option assigned is not a normal flow; record + log.
@@ -7690,6 +7754,64 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
+
+    def _assigned_stock_disposition(self, opt_txn, expert_id, underlying: str, contract: str,
+                                    share_qty: float) -> "tuple[bool, str]":
+        """``(hold, note)`` for the stock a short put's assignment delivers.
+
+        The SAME decision the backtest makes (``assignment_hold``): policy from the owning
+        expert instance's ``hold_assigned_stock`` / ``hold_assigned_stock_tags`` settings, keyed
+        on the assigned position's entry tag. A policy that cannot be read or applied (no stored
+        setting, no owning instance, untagged position under a member-scoped policy, malformed
+        tags) is NEVER guessed: the stock is HELD and the problem is logged as an ERROR plus a
+        FAILURE activity naming the instance -- the shares are at the broker either way, and an
+        unintended sale is the irreversible mistake. Never raises.
+        """
+        from ...core.utils import get_expert_instance_from_id
+        from ba2_common.core.assignment_hold import LiveAssignedStockDecision
+        where = (f"[Account {self.id}] assignment of {contract} (option txn "
+                 f"{getattr(opt_txn, 'id', None)}, expert {expert_id}) delivering "
+                 f"{share_qty:g} x {underlying}")
+        try:
+            settings = None
+            if expert_id is not None:
+                expert = get_expert_instance_from_id(expert_id)
+                settings = expert.settings if expert is not None else None
+            decision = decide_live_assigned_stock(
+                settings, self._position_entry_tag(opt_txn), where=where)
+        except Exception as e:
+            decision = LiveAssignedStockDecision(
+                True, f"{where}: could not evaluate the policy: {e}")
+            logger.error(decision.problem, exc_info=True)
+        if decision.problem is not None:
+            msg = (f"{decision.problem} -- HOLDING the delivered stock (no sale was attempted). "
+                   f"Set hold_assigned_stock / hold_assigned_stock_tags on the instance and "
+                   f"liquidate by hand if it should not be held.")
+            logger.error(msg)
+            try:
+                from ...core.db import log_activity
+                from ...core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(severity=ActivityLogSeverity.FAILURE,
+                             activity_type=ActivityLogType.TRANSACTION_CREATED, description=msg,
+                             data={"contract": contract, "underlying": underlying,
+                                   "shares": share_qty, "assigned_stock_policy": "unresolved"},
+                             source_account_id=self.id, source_expert_id=expert_id)
+            except Exception as e:
+                logger.error(f"[Account {self.id}] could not record the assigned-stock policy "
+                             f"activity: {e}")
+            return True, "assigned stock: HOLD (policy unresolved, see ERROR)"
+        if decision.hold:
+            logger.warning(f"{where}: HOLDING the delivered stock (policy: hold).")
+            return True, "assigned stock: HOLD"
+        logger.warning(f"{where}: policy is to LIQUIDATE -- a market SELL of exactly the "
+                       f"delivered shares is queued for the next refresh sweep.")
+        return False, "assigned stock: LIQUIDATE (queued)"
+
+    def process_pending_assignment_liquidations(self) -> List[dict]:
+        """Sell the assignment-delivered lots flagged for liquidation (live twin of
+        ``BacktestAccount.process_pending_assignment_liquidations``); see
+        ``ba2_common.core.assignment_liquidation``. Called by ``TradeManager`` on every refresh."""
+        return sweep_pending_liquidations(self)
 
     def _settle_option_leg(self, opt_txn, *, contract: str, contracts, close_reason: str,
                            activity_id: str, underlying: str, right, strike, expiry,
@@ -8034,6 +8156,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         from ...core.types import TransactionStatus
 
         meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+        # The lot's covered-call protection marker is the LOT's: the shares it describes were
+        # just called away and the remainder carries no stop/take-profit of its own to re-arm.
+        meta.pop(PROTECTION_SUSPENDED_KEY, None)
         meta["split_from_transaction_id"] = held.id
         meta["split_reason"] = "called_away"
         meta["split_activity_id"] = activity_id

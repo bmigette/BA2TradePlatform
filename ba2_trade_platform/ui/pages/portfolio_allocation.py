@@ -82,6 +82,11 @@ rows ticked in one label's table. Both go through ``_open_symbol_info``, so the
 FMP-key and empty-selection refusals exist once, and the panel is built ON CLICK
 -- never at render -- because it fetches over the network.
 
+The chart icon on each label's header opens the label GROWTH SIMULATOR
+(``label_growth_dialog.py``): what an amount put into the label YTD / 1 / 3 / 5
+years ago, split by its current effective shares, would be worth today. Read-only,
+fetched on click.
+
 This repo uses no ``ui.refreshable`` / ``ui.stepper`` / ``ui.aggrid``: refresh is
 ``container.clear()`` followed by rebuilding inside ``with container:``. Blocking
 broker work goes through ``asyncio.to_thread``.
@@ -112,6 +117,7 @@ from sqlmodel import select
 from ...config import get_app_setting
 from ...core import allocator_csv
 from ...core import allocator_exclusion as exclusion_store
+from ...core import allocator_freeze as freeze_store
 from ...core import allocator_protection_service as protect_svc
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
@@ -192,6 +198,7 @@ from ..utils import allocator_protection_view as protect_view
 from ..utils.allocator_protection_view import label_badge_segments, label_extras_text
 from ..utils.portfolio_allocation_view import effective_symbol_weights
 from .allocator_protection_dialog import open_protection_dialog
+from .label_growth_dialog import open_label_growth
 from .portfolio_allocation_wizard import (
     notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
@@ -446,7 +453,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             scope, float(amount), current, margin,
             available_buying_power=base.available_buying_power,
             allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
-            valuation_mode=valuation_mode)
+            valuation_mode=valuation_mode,
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
     else:
         # ``unsellable_symbols`` is deliberately NOT populated from untracked broker
         # holdings: those are sold directly as closing orders (ACTION_SELL_UNTRACKED),
@@ -456,7 +464,10 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
             default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode,
-            unallocated_pct=unallocated_pct)
+            unallocated_pct=unallocated_pct,
+            # THE FREEZE: read from the DB at solve time (like the exclusions), so a freeze set after
+            # the dialog opened still applies to the Refresh re-solve.
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
     # ``margin`` is REQUIRED and is the SAME dict the plan above was solved with:
     # the precheck may re-solve, and a re-solve without it rebuilds a bare
     # MarginInfo per fractional row and rounds on the default 4dp grid, losing
@@ -646,6 +657,10 @@ MARKER_LABEL_PNL_DIV = 'pf-label-pnl-div'
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
 MARKER_LABEL_ICON = 'pf-label-icon'
+#: The chart icon among the header's controls (pencil, chart, info): opens the label growth simulator.
+MARKER_LABEL_GROWTH_SIM = 'pf-label-growth-sim'
+LABEL_GROWTH_SIM_TOOLTIP = ('Growth simulator: what an amount (default $10,000) put into this label YTD, 1, 3 or '
+                            '5 years ago, split by its current shares, would be worth today')
 #: The orange count beside that icon: symbols in the label whose share is 0% or
 #: unset. Marked because its text is a bare integer that repeats all over the row.
 MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
@@ -819,7 +834,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
                     symbol_facts: Optional[Dict[str, Any]] = None,
                     symbol_stats: Optional[Dict[str, Any]] = None,
                     protection: Optional[Dict[str, Any]] = None,
-                    exclusions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    exclusions: Optional[Dict[str, Any]] = None,
+                    frozen: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -842,6 +858,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'protection': protection or {'supported': False, 'items': {}, 'quantities': {}},
         # {SYMBOL: AllocatorExclusion}: the operator's manual disables.
         'exclusions': {(k or '').strip().upper(): v for k, v in (exclusions or {}).items()},
+        # {SYMBOL: AllocatorFrozen}: the operator's freezes (no orders, value fixed outside the maths).
+        'frozen': {(k or '').strip().upper(): v for k, v in (frozen or {}).items()},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -901,7 +919,8 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
                          target_value=row.get('target_value'),
                          current_value=row.get('current_value'),
                          quantity=row.get('quantity'),
-                         price=row.get('price'))
+                         price=row.get('price'),
+                         cost_valued=row['cost_valued'])
     row['share_delta'] = format_delta(delta.share, suffix='pp')
     row['share_delta_color'] = delta_color(delta.share)
     row['value_delta'] = format_delta(delta.value)
@@ -913,7 +932,10 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     # The shares that target buys. ``None`` stays None all the way to the cell --
     # an unpriced row prints nothing rather than a 0 that claims a target of none.
     target_qty = symbol_target_quantity(target_value=row.get('target_value'),
-                                        price=row.get('price'))
+                                        price=row.get('price'),
+                                        current_value=row.get('current_value'),
+                                        quantity=row.get('quantity'),
+                                        cost_valued=row['cost_valued'])
     row['target_quantity'] = None if target_qty is None else round(target_qty, 4)
 
 
@@ -2353,6 +2375,37 @@ def _open_symbol_info(symbols) -> None:
                      display_names=_display_names_for(symbols))
 
 
+def label_growth_split(live: Dict[str, Any], label: str):
+    """``(shares, excluded, unset)`` of one label AS THE TABLE SHOWS IT NOW: ``shares`` is the effective share of the
+    label per symbol (``effective_symbol_weights`` over the live, possibly just-edited weights -- defaults and even
+    splits included, excluded symbols out and their share spread over the rest), ``excluded`` / ``unset`` the label's
+    symbols that are not in it. Reads ``live`` only."""
+    view = live['view_by_label'][label]
+    weights = live['weights'][label] if label in live['weights'] else {}
+    shares = effective_symbol_weights(weights, live['exclusions'])
+    symbols = [(r.symbol or '').strip().upper() for r in view.rows]
+    stored = {(k or '').strip().upper() for k in weights}
+    excluded = [s for s in symbols if s in live['exclusions']]
+    unset = [s for s in symbols if s not in stored and s not in live['exclusions']]
+    return shares, excluded, unset
+
+
+def _open_label_growth(account_id: int, live: Dict[str, Any], label: str) -> None:
+    """The chart icon on a label's header: open the growth simulator on the label's CURRENT effective split.
+
+    Read-only. Not a coroutine, like ``_open_symbol_info``: the dialog starts its own fetch task on the running loop,
+    and the fetch itself runs in ``asyncio.to_thread``. The distributions come from FMP, so with no key it says
+    which setting is missing instead of opening an empty dialog."""
+    api_key = get_app_setting('FMP_API_KEY')
+    if not api_key:
+        ui.notify('FMP API key not configured. Please set FMP_API_KEY in '
+                  'Settings > App Settings.', type='warning')
+        return
+    shares, excluded, unset = label_growth_split(live, label)
+    open_label_growth(account_id, label, shares, api_key=api_key, as_of=date.today(),
+                      excluded=excluded, unset=unset)
+
+
 def _display_names_for(symbols) -> Dict[str, str]:
     """``{SYMBOL: company name}`` for the info panel, fetching what is not on file.
 
@@ -2514,6 +2567,15 @@ SYMBOL_CHIPS_TEMPLATE = r'''
                        @click="() => $parent.$emit('excludeToggle', props.row.symbol)">
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.excl_tip }}</q-tooltip>
                 </q-btn>
+                <q-btn dense flat round size="sm" :icon="props.row.frz_icon" class="pf-frz-icon"
+                       :aria-label="props.row.frozen ? 'Unfreeze' : 'Freeze'"
+                       :style="{ color: props.row.frz_hex }"
+                       @click="() => $parent.$emit('freezeToggle', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">{{ props.row.frz_tip }}</q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frozen_badge" class="text-caption text-weight-bold pf-frozen-badge"
+                      style="color:#38bdf8;background:rgba(56,189,248,0.15);border-radius:4px;padding:0 4px;
+                             line-height:1.25;white-space:nowrap">{{ props.row.frozen_badge }}</span>
             </div>
 '''
 
@@ -2528,6 +2590,7 @@ PROTECT_CHECK_CONFIRM = (
     'It never re-places an order you cancelled on the broker\'s site. Continue?')
 MARKER_PROTECT_CHECK = 'pf-protect-check'
 MARKER_EXCLUDE_TOGGLE = 'pf-exclude-toggle'
+MARKER_FREEZE_TOGGLE = 'pf-freeze-toggle'
 MARKER_LABEL_EXTRAS = 'pf-label-extras'
 MARKER_LABEL_SEGMENTS = 'pf-label-segments'
 MARKER_SEGMENT_PREFIX = 'pf-label-seg-'
@@ -2713,7 +2776,7 @@ def symbol_card_template(card_columns=SYMBOL_CARD) -> str:
     return (
         '<div class="col-12" style="width:100%">'
         '<div class="pf-sym-card" :class="{\'pf-sym-card--sel\': props.selected, '
-        '\'pf-sym-card--excl\': props.row.excluded}">'
+        '\'pf-sym-card--excl\': props.row.excluded, \'pf-sym-card--frozen\': props.row.frozen}">'
         '<div class="pf-sym-head">'
         '<q-checkbox v-model="props.selected" />'
         '<span v-if="props.row.flag" :title="\'Also in: \' + props.row.labels" '
@@ -2745,7 +2808,8 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
         height: 1px; background: rgba(255,255,255,0.22); margin: 2px 0 4px; }
     .pf-bar-row.pf-bar-row > * { width: auto !important; min-width: 0 !important;
         max-width: 100% !important; }
-    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-info {
+    .pf-bar-row > .pf-b-icon, .pf-bar-row > .pf-b-edit, .pf-bar-row > .pf-b-sim,
+    .pf-bar-row > .pf-b-info {
         padding: 8px; box-sizing: content-box; font-size: 24px; }
     /* ONE CARD, not a box in a box: the expansion's header row and its container each
        painted their own translucent panel and padding inside the card above. */
@@ -2754,7 +2818,7 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
     .q-expansion-item:has(.pf-bar-row) .q-item { background: transparent !important;
         padding: 8px 6px 8px 10px !important; }
     /* LINE 1: the FULL label name, bold, wrapping allowed (never an ellipsis).
-       LINE 2: colour tag, badges, symbol count, edit, info -- 40px tap targets. */
+       LINE 2: colour tag, badges, symbol count, edit, simulator, info -- 40px tap targets. */
     .pf-bar-row.pf-bar-row > .pf-b-name { order: 1; flex: 1 1 100% !important;
         font-size: 1.1rem; font-weight: 700 !important; line-height: 1.25;
         white-space: normal !important; overflow: visible !important;
@@ -2764,6 +2828,7 @@ LABEL_BAR_PHONE_CSS = phone_media(r"""
     .pf-bar-row > .pf-b-warn { order: 2; }
     .pf-bar-row > .pf-b-count { order: 3; }
     .pf-bar-row > .pf-b-edit { order: 4; margin-left: auto; }
+    .pf-bar-row > .pf-b-sim { order: 4; }
     .pf-bar-row > .pf-b-info { order: 5; }
     .pf-bar-row.pf-bar-row > .pf-b-value { order: 10; flex: 1 1 auto !important;
         text-align: left; font-size: 1rem; font-weight: 600; }
@@ -2837,6 +2902,9 @@ PROTECT_CSS = r"""
     .pf-row-excluded td { opacity: 0.55; }
     .pf-row-excluded td:has(.pf-icons) { opacity: 1; }
     .pf-sym-card--excl .pf-tiles, .pf-sym-card--excl .pf-field { opacity: 0.55; }
+    /* A FROZEN ROW keeps its colours (it is still part of the maths) and gets a blue left edge. */
+    .pf-row-frozen td:first-child { box-shadow: inset 3px 0 0 #38bdf8; }
+    .pf-sym-card--frozen { box-shadow: inset 3px 0 0 #38bdf8; }
 """
 
 PROTECT_PHONE_CSS = phone_media("""
@@ -3005,6 +3073,61 @@ async def apply_exclusion_change(account_id: int, symbol: str, currently_exclude
               type='positive')
     await refresh()
     return True
+
+
+async def apply_freeze_change(account_id: int, symbol: str, currently_frozen: bool,
+                              note: Optional[str], refresh) -> bool:
+    """Write the freeze / unfreeze decision, tell the operator, redraw. Returns whether it was
+    written (a failure is shown and logged, never swallowed)."""
+    symbol = symbol.strip().upper()
+    try:
+        if currently_frozen:
+            await asyncio.to_thread(freeze_store.unfreeze_symbol, account_id, symbol)
+        else:
+            await asyncio.to_thread(freeze_store.freeze_symbol, account_id, symbol, note=note)
+    except Exception as e:  # noqa: BLE001 -- shown, not swallowed
+        logger.error(f'Toggling freeze of {symbol} failed: {e}', exc_info=True)
+        ui.notify(f'Could not change {symbol}: {e}', type='negative')
+        return False
+    ui.notify(f"{symbol} {'unfrozen' if currently_frozen else 'frozen'}", type='positive')
+    await refresh()
+    return True
+
+
+def _open_freeze_dialog(account_id: int, symbol: str, frozen: Dict[str, Any], refresh) -> None:
+    """Freeze / unfreeze ONE symbol. Always confirmed: it changes what the next rebalance trades.
+
+    Freezing does not touch protective TP/SL orders; unfreezing is explicit."""
+    symbol = symbol.strip().upper()
+    currently = symbol in frozen
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-[520px]'):
+        if currently:
+            ui.label(f'Unfreeze {symbol}?').classes('text-h6')
+            ui.label('Rebalancing may buy or sell it again and its share counts in the label maths '
+                     'as normal at the next rebalance.').classes('text-xs text-secondary-custom')
+            note = None
+        else:
+            ui.label(f'Freeze {symbol}?').classes('text-h6')
+            ui.label('A rebalance will place NO order for it (no buy, sell or resize) and protective '
+                     'TP/SL orders stay exactly as they are. Its CURRENT value is fixed and taken out of '
+                     'the money the other symbols share, in proportion to their shares. Its stored '
+                     'share is kept, so unfreezing restores the original targets.'
+                     ).classes('text-xs text-secondary-custom')
+            note = ui.input('Note (optional)', placeholder='e.g. waiting for earnings') \
+                .props('dense outlined').classes('w-full')
+
+        async def _go() -> None:
+            done = await apply_freeze_change(
+                account_id, symbol, currently,
+                (note.value or None) if note is not None else None, refresh)
+            if done:
+                dialog.close()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-2 pf-actions'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Unfreeze' if currently else 'Freeze', on_click=_go) \
+                .props('color=primary').mark(MARKER_FREEZE_TOGGLE)
+    dialog.open()
 
 
 def _open_exclusion_dialog(account_id: int, symbol: str, exclusions: Dict[str, Any], refresh) -> None:
@@ -3198,6 +3321,9 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         **_protection_fields(live['protection'], r.symbol, r.quantity),
         # The operator's manual disable: badge, toggle, tooltip. An excluded row is greyed.
         **protect_view.exclusion_fields(live['exclusions'].get(r.symbol)),
+        # The operator's freeze: snowflake button + 'frozen' badge. A frozen row's TARGET is its current
+        # value and its 'eff.' share its current share of the label (see ``build_label_views(frozen=)``).
+        **protect_view.freeze_fields(live['frozen'].get(r.symbol)),
         # The share an ENABLED row is really solved with when its label has an excluded symbol.
         'eff_weight_pct': r.effective_weight_pct,
         'eff_weight': protect_view.effective_weight_text(r.weight_pct, r.effective_weight_pct),
@@ -3251,6 +3377,9 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         'weight_key': 0,
         'quantity': round(r.quantity, 4),
         'cost_basis': round(r.cost_basis, 2),
+        # ``cost`` valuation mode: ``current_value`` above is the cost basis, and the
+        # share columns must convert the way the engine does (``symbol_target_quantity``).
+        'cost_valued': view.valuation_mode == VALUATION_MODE_COST,
         'price': None if r.price is None else round(r.price, 4),
         'market_value': None if r.market_value is None else round(r.market_value, 2),
         'comment': r.comment or '',
@@ -3324,7 +3453,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
              lambda e: _open_exclusion_dialog(account_id, str(emitted_value(e)),
                                               live['exclusions'], refresh))
     # An excluded row is greyed (Quasar's ``table-row-class-fn``); its toggle stays readable.
-    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : \'\'"')
+    table.props(':table-row-class-fn="(row) => row.excluded ? \'pf-row-excluded\' : '
+                '(row.frozen ? \'pf-row-frozen\' : \'\')"')
+    table.on('freezeToggle',
+             lambda e: _open_freeze_dialog(account_id, str(emitted_value(e)),
+                                           live['frozen'], refresh))
     if live['protection']['supported']:
         table.on('protectClick',
                  lambda e: open_protection_dialog(account_id, str(emitted_value(e)), refresh))
@@ -3761,6 +3894,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 .on('click.stop',
                     lambda _e=None, lbl=view.label: _focus_label_target(live, lbl)) \
                 .tooltip('Edit this label’s portfolio target')
+            # The growth simulator. ``click.stop`` like the pencil: it must not fold the label.
+            ui.icon('show_chart').classes('cursor-pointer text-secondary-custom pf-b-sim') \
+                .mark(MARKER_LABEL_GROWTH_SIM) \
+                .on('click.stop',
+                    lambda _e=None, lbl=view.label: _open_label_growth(account_id, live, lbl)) \
+                .tooltip(LABEL_GROWTH_SIM_TOOLTIP)
             # The ⓘ that took the long clause off the header line. Its tooltip is
             # created ONCE and re-texted on every redraw: calling ``.tooltip()``
             # again would add a second tooltip element, and by the tenth keystroke
@@ -3857,7 +3996,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                            symbol_facts=payload.get('symbol_facts') or {},
                            symbol_stats=payload.get('symbol_stats') or {},
                            protection=payload.get('protection'),
-                           exclusions=payload.get('exclusions'))
+                           exclusions=payload.get('exclusions'),
+                           frozen=payload.get('frozen'))
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)

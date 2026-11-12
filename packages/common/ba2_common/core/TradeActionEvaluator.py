@@ -404,6 +404,19 @@ class TradeActionEvaluator:
     
     def evaluate(self, instrument_name: str, expert_recommendation: ExpertRecommendation,
                  ruleset_id: int, existing_order: Optional[TradingOrder] = None) -> List[Dict[str, Any]]:
+        """Evaluate the ruleset (see ``_evaluate``); one ``rules`` decision-step record inside a
+        capture scope, a plain call (one ``current_capture()`` check) everywhere else."""
+        from ba2_common.core.replay.decision_record import record_rules
+
+        with record_rules(self, instrument_name, expert_recommendation, ruleset_id,
+                          existing_order) as step:
+            summaries = self._evaluate(instrument_name, expert_recommendation, ruleset_id,
+                                       existing_order)
+            step.result = summaries
+            return summaries
+
+    def _evaluate(self, instrument_name: str, expert_recommendation: ExpertRecommendation,
+                  ruleset_id: int, existing_order: Optional[TradingOrder] = None) -> List[Dict[str, Any]]:
         """
         Evaluate trading conditions from a ruleset and create TradeAction objects for applicable actions.
         
@@ -1115,6 +1128,13 @@ class TradeActionEvaluator:
                     rule_evaluation["all_conditions_met"] = False
                     continue
                 
+                # A condition that must know WHICH member its own rule opens (structure_share)
+                # defines ``bind_event_action``; no other condition does, so for every other
+                # trigger this is one attribute lookup and nothing happens (GA-neutral).
+                bind = getattr(condition, "bind_event_action", None)
+                if bind is not None:
+                    bind(event_action)
+
                 # Get condition description
                 condition_evaluation["condition_description"] = condition.get_description()
                 

@@ -79,7 +79,7 @@ from ba2_common.core.option_trade_record import (
 )
 from ba2_common.core.market_calendar import backtest_decision_label, decision_data_session
 from ba2_common.core.utils import as_utc_key
-from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate
+from ba2_common.core.suspension_events import is_suspended, symbols_to_liquidate, terminal_exit
 from ba2_common.core.failure_modes import must_measure
 from ba2_common.core.option_bs import bs_price
 from ba2_common.core.option_payoff import PayoffLeg, position_value_bounds
@@ -103,7 +103,8 @@ logger = logging.getLogger(__name__)
 
 # ``TradingOrder.data`` key marking a book-keeping fill that moved no cash commission (option
 # expiry/assignment closes, the assignment-created stock lot, forced stock liquidations).
-# ``get_round_trip_trades`` skips these when charging commission per fill.
+# ``get_round_trip_trades`` skips these when charging commission per fill. The post-assignment
+# next-bar liquidation is NOT one of them: it pays an equity market fill's costs.
 SYNTHETIC_FILL_KEY = "synthetic_fill"
 
 #: The fill-time re-base counters (``BacktestAccount.fill_rebase_counters``), published in
@@ -171,6 +172,16 @@ def _owner_rank(order) -> int:
     if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
         return _OWNER_FILLED_OPEN
     return _OWNER_PENDING_OPEN
+
+
+def _expiry_intrinsic(strike: float, is_call: bool, spot: float) -> float:
+    """Per-share INTRINSIC value an option settles at on its expiry date, from the
+    underlying settlement price ``spot``: ``max(0, spot - strike)`` for a call,
+    ``max(0, strike - spot)`` for a put. The ONE formula both expiry paths use -- the
+    single-leg settlement (``settle_single_leg_expiry``) and the defined-risk combo unit
+    settlement (``settle_defined_risk_combo_expiry``) -- so the two cannot diverge."""
+    strike, spot = float(strike), float(spot)
+    return max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
 
 
 def _expiry_trigger(side: OrderDirection, itm: bool) -> OptionCloseReason:
@@ -680,6 +691,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._positions: Dict[str, _Position] = {}
         # Exchange suspension / delisting events (set_suspension_events); {} = feature off (FMP source).
         self._suspension_events: Dict[str, Any] = {}
+        # Terminal values of delistings (set_delisting_terminals); {} = every delisting at the last close.
+        self._delisting_terminals: Dict[str, Any] = {}
+        #: delisting exits by terminal kind this run (kind -> count); 'unknown' / 'stock_merger' = priced at the last close.
+        self.delisting_exit_counts: Dict[str, int] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
         self._equity_snapshots: List[Dict[str, Any]] = []
         # Parallel ascending list of snapshot dates (snapshots are appended in clock order) so
@@ -2715,6 +2730,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         FMP source, or an Alpaca cache without the file) leaves every path exactly as it was."""
         self._suspension_events = dict(events)
 
+    def set_delisting_terminals(self, terminals: Any) -> None:
+        """Install ``ba2_common.core.suspension_events.load_delisting_terminals`` (what a holder received at a delisting)."""
+        self._delisting_terminals = dict(terminals)
+
     def liquidate_suspended_positions(self, as_of: datetime) -> bool:
         """Close every held STOCK position whose symbol is suspended from its exchange on ``as_of``'s session, and cancel
         every working order of such a symbol; True when the book changed.
@@ -2747,6 +2766,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                  f"the suspension table does not match the cache it is run on (rebuild the cache)")
             gone = any(last < session and resume is None for last, resume in events[sym])   # the event in effect never resumes
             comment = "delisting_liquidation" if gone else "suspension_liquidation"
+            if gone:
+                # What the holder RECEIVED, not the last print: 0 for a worthless removal / bankruptcy ticker (SIVB 106 -> 0),
+                # the per-share cash of a cash merger; unknown or stock-for-stock -> the last close, counted and logged.
+                tprice, tkind = terminal_exit(sym, last_session, self._delisting_terminals)
+                self.delisting_exit_counts[tkind] = self.delisting_exit_counts.get(tkind, 0) + 1
+                if tprice is not None:
+                    px, comment = tprice, {"worthless": "delisting_worthless", "bankruptcy_otc": "delisting_worthless",
+                                           "cash_merger": "delisting_cash_merger"}[tkind]
+                else:
+                    logger.warning("[backtest] %s: delisting after %s has no terminal value (%s): closed at the last close %.4f",
+                                   sym, last_session, tkind, float(px))
             qty = pos.qty
             self._liquidate_stock_position(pos, price=float(px), comment=comment)
             logger.warning(
@@ -2764,10 +2794,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _record_stock_liquidation_close(
         self, symbol: str, qty: float, was_long: bool, px: float,
-        comment: str = "margin_call_liquidation",
+        comment: str = "margin_call_liquidation", *, commission_paid: bool = False,
     ) -> None:
         """Persist a synthetic FILLED closing order for a forced STOCK liquidation
         (margin call, or the post-assignment next-bar liquidation — ``comment`` names which).
+
+        ``commission_paid``: the caller charged ``commission_per_trade`` on this fill (the
+        assignment liquidation does, like any equity market fill). The order then does NOT
+        carry ``SYNTHETIC_FILL_KEY`` -- that flag means "moved no commission", and
+        ``get_round_trip_trades`` must charge the row exactly what the cash ledger paid.
 
         BOOK-KEEPING only (the caller already moved cash + ledger). Linked to the symbol's
         OPENED equity transaction when one resolves — the entry order's side must match the
@@ -2806,7 +2841,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             broker_order_id=self._next_broker_id(),
             comment=comment,
             created_at=as_of,
-            data={SYNTHETIC_FILL_KEY: True},
+            data=(None if commission_paid else {SYNTHETIC_FILL_KEY: True}),
         )
         new_id = add_instance(order)
         if new_id is not None:
@@ -3254,9 +3289,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
              limit; STOP -> only if the bar crosses the stop (then fills at stop ±slippage).
           3. CANCEL the OCO sibling when one OCO/TP/SL leg fills (first-leg-wins close).
 
-        Activation runs first so a leg whose parent filled on THIS same bar (a same-bar
-        MARKET entry) can be evaluated against the next bar on the following call — never
-        on the entry bar (no look-ahead within a bar).
+        TP/SL brackets of an OPEN transaction are tested in ``_apply_bracket_exits`` below. An
+        entry that fills in THIS call is still WAITING here; the remainder of its fill bar
+        (fill at the open -> the bar's high/low/close) is tested after the roll, in
+        ``refresh_transactions`` (``_apply_fill_bar_brackets``), and later bars by the next calls.
 
         Step 0 is the OPTION DAY-ORDER sweep (``_expire_stale_option_limits``), which runs
         BEFORE the fill loop so an aged-out limit cannot trade on the bar it dies.
@@ -4649,8 +4685,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if parent.id is not None:
             self._fill_dates[parent.id] = as_of
 
-    def _apply_bracket_exits(self, as_of) -> bool:
+    def _apply_bracket_exits(self, as_of, only_txn_ids: Optional[set] = None) -> bool:
         """Lean TP/SL bracket exits — the replacement for WAITING_TRIGGER/OCO leg orders.
+
+        ``only_txn_ids`` restricts the pass to those transactions (the FILL-BAR pass,
+        ``_apply_fill_bar_brackets``); None = every OPEN transaction (the per-bar pass).
 
         For each OPEN transaction of THIS account carrying a ``take_profit`` and/or ``stop_loss``,
         if the current bar crosses the level, synthesize the closing order at that level (STOP wins
@@ -4669,6 +4708,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         opened = [
             (t.id, t.take_profit, t.stop_loss)
             for t in transactions_where(status=TransactionStatus.OPENED)
+            if only_txn_ids is None or t.id in only_txn_ids
         ]
 
         filled_any = False
@@ -4752,8 +4792,65 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 self._apply_fill(persisted, fill_px, as_of)
                 self.invalidate_order_cache()  # a close order was persisted -> reload next bar
                 filled_any = True
+                if only_txn_ids is not None and persisted.status == OrderStatus.FILLED:
+                    c = self.fill_bar_exit_counters
+                    c["exits_on_fill_bar"] += 1
+                    c["stop_loss" if leg == "SL" else "take_profit"] += 1
                 break  # SL-first: at most one bracket close per txn per bar
         return filled_any
+
+    # ---------------------------------------------------------------------------------------------
+    # The ENTRY'S OWN FILL BAR (review 2026-11-09)
+    #
+    # A MARKET entry decided on clock D fills at the OPEN of next_bar(D). Its transaction is still
+    # WAITING when the per-bar bracket pass above runs (that pass reads OPENED transactions only),
+    # the WAITING -> OPENED roll comes after refresh_orders, and the NEXT pass tests the bar after
+    # that. So the remainder of the fill bar (open -> high/low/close) was never tested against the
+    # entry's stop / target, while live the protective legs rest at the broker from the fill and
+    # trigger on that same bar. On the daily clock that is the whole first session; on the 5-minute
+    # clock one 5-minute bar. The backtest was optimistic exactly where a fresh entry is stopped out
+    # on day one.
+    #
+    # The fix runs the SAME bracket function (same _evaluate_fill gap/slippage rules, same SL-first
+    # rule on a bar that spans both levels) once more, after the roll, for the transactions whose
+    # entry filled on that pass, against the bar the entry filled on (``next_bar(fill as_of)``,
+    # recorded at the fill so a roll at a later clock can never test a later bar). Nothing past the
+    # fill bar is read. ``same_bar_close`` fills AT the bar's close, so it has no remainder to test.
+    # ---------------------------------------------------------------------------------------------
+    @property
+    def fill_bar_exit_counters(self) -> Dict[str, int]:
+        """How many trades the fill-bar pass closed (``results["fill_bar_exits"]``)."""
+        return self.__dict__.setdefault(
+            "_fill_bar_exit_counters", {"exits_on_fill_bar": 0, "stop_loss": 0, "take_profit": 0})
+
+    def _note_entry_fill_bar(self, order, as_of) -> None:
+        """Remember that ``order`` OPENED its transaction on the bar after ``as_of`` (equity entry,
+        next-bar-open fill), so ``refresh_transactions`` tests that bar's remainder after the roll.
+        A scale-in on an already OPENED transaction is not noted: the per-bar pass tested it."""
+        if self._cfg["fill_model"] == "same_bar_close":
+            return
+        txn = get_instance(Transaction, order.transaction_id)
+        if txn is None or txn.status != TransactionStatus.WAITING:
+            return
+        if not txn.take_profit and not txn.stop_loss:
+            return
+        self.__dict__.setdefault("_entry_fill_bar_pending", {})[order.transaction_id] = as_of
+
+    def _apply_fill_bar_brackets(self) -> bool:
+        """Test each transaction noted by ``_note_entry_fill_bar`` against the remainder of its
+        entry's fill bar, through ``_apply_bracket_exits`` (one code path). Returns whether any
+        closed. Run after the WAITING -> OPENED roll; consumes the pending set."""
+        pending = self.__dict__.pop("_entry_fill_bar_pending", None)
+        if not pending:
+            return False
+        by_clock: Dict[Any, set] = {}
+        for txn_id, fill_as_of in pending.items():
+            by_clock.setdefault(fill_as_of, set()).add(txn_id)
+        closed_any = False
+        for fill_as_of in sorted(by_clock):
+            if self._apply_bracket_exits(fill_as_of, only_txn_ids=by_clock[fill_as_of]):
+                closed_any = True
+        return closed_any
 
     def refresh_transactions(self) -> bool:
         """Roll order state into transactions, then fix ``open_date``/``close_date`` to sim time.
@@ -4772,8 +4869,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             entry order's simulated fill bar (``_fill_dates[entry.id]``);
           * ``close_date`` of every transaction CLOSED on THIS bar to the current sim clock
             (the closing leg fills on the current bar; ``refresh_orders`` ran just before).
+
+        Between the roll and the re-stamp, a transaction OPENED by this roll is tested against the
+        remainder of its entry's fill bar (``_apply_fill_bar_brackets``); when that closes one, the
+        roll runs once more so the transaction is CLOSED on this same bar, as live would be.
         """
         ok = super().refresh_transactions()
+        if self._apply_fill_bar_brackets():
+            ok = super().refresh_transactions() and ok
         sim_now = self._price.now()
 
         # ---- open_date: re-stamp to the entry's SIM fill bar (overwrite wall-clock). ----
@@ -5090,6 +5193,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # transaction``, ``_record_stock_liquidation_close``) are book-keeping rows written
             # AFTER cash moved without a commission; they carry ``SYNTHETIC_FILL_KEY`` in
             # ``order.data``. Charging them overcharged the rows against the cash ledger.
+            # (The post-assignment ``assignment_liquidation`` pays a commission in cash and
+            # is written WITHOUT the flag, so its row is charged here like any fill.)
             comm = commission * sum(
                 1 for o in (*entries, *exits)
                 if not (isinstance(o.data, dict) and o.data.get(SYNTHETIC_FILL_KEY)))
@@ -5229,7 +5334,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         EQUITY ROWS ONLY. Option rows read their recorded ``exit_record`` trigger instead: a
         close_option ticket is a limit order with no stop, so this guess labelled every option
         close -- stop-loss and DTE exits included -- ``take_profit``."""
-        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation"):
+        if exit_order.comment in ("suspension_liquidation", "delisting_liquidation", "delisting_worthless",
+                                  "delisting_cash_merger"):
             return exit_order.comment                   # the exchange-suspension close names itself
         tp = exit_order.limit_price
         sl = exit_order.stop_price
@@ -6916,10 +7022,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         to 67-85% of final equity was the OS1 blow-up. Concretely:
 
           * OTM -> worthless (transaction closed at premium 0) — unchanged.
-          * LONG ITM (call or put): NEVER exercised. SELL-TO-CLOSE at the expiry bar's
-            premium close (intrinsic when the sparse cache has no bar — near expiry the
-            premium converges to intrinsic). NO share position is created; cash is credited
-            premium x multiplier x contracts exactly once.
+          * LONG ITM (call or put): NEVER exercised. Settled for cash at INTRINSIC from the
+            underlying settlement price ``spot`` (``_expiry_intrinsic``, the formula the
+            combo path uses) -- never the expiry bar's premium close, which can carry time
+            value that does not exist at expiry. NO share position is created; cash is
+            credited intrinsic x multiplier x contracts exactly once, and only when the
+            settlement found the leg's transaction.
           * SHORT ITM (call or put): ALWAYS physical assignment at the strike, covered or
             naked — the share leg is the real-world outcome and keeps the assignment loss
             in the book. But the assigned stock is unmanaged here, so EVERY assignment
@@ -6930,22 +7038,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             ``hold_assigned_stock`` (the WHEEL) opts out of that last step only — the
             assignment itself is identical, the shares are simply kept.
 
-        Assignment cash always moves at the STRIKE; the sell-to-close credit is the only
-        premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
+        Assignment cash always moves at the STRIKE; the long's cash settlement at intrinsic
+        is the only premium leg. Deterministic at-expiry settlement — no slippage/commission,
         matching ``settle_option_expiry``. Defined-risk combos must NOT be routed here (they
         unit-settle via ``settle_defined_risk_combo_expiry``).
         """
         strike = float(position.strike)
         is_call = position.option_type == OptionRight.CALL
-        itm = (spot > strike) if is_call else (spot < strike)
-        if not itm:
+        intrinsic = _expiry_intrinsic(strike, is_call, spot)
+        if intrinsic <= 0.0:   # OTM (or exactly at the money)
             return self.settle_option_expiry(position, close_premium=0.0,
                                              trigger=OptionCloseReason.EXPIRED_OTM)
 
         contracts = float(position.quantity)
         multiplier = float(position.multiplier or 100)
         shares = int(position.quantity) * int(multiplier)
-        intrinsic = (spot - strike) if is_call else (strike - spot)
 
         if position.side == OrderDirection.SELL:
             # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
@@ -6992,33 +7099,35 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 )
             return ok
 
-        # LONG ITM -> SELL-TO-CLOSE, never exercise: the strategy's exits only manage
-        # options, so exercised stock would ride unmanaged to the end of the run. Price at
-        # the expiry bar's premium close; intrinsic when the cache has no bar (near expiry
-        # the premium converges to intrinsic). Cash is credited at the premium; NO share
-        # position is created.
-        # A bar in another share basis than the lot's is a different contract reusing the
-        # OCC string after a split (Task 1a): the lot settles at its own-basis intrinsic.
-        bar = self._option_bar(position.contract_symbol) if self._options else None
-        if bar and bar.get("close") is not None:
-            # The expiry bar's print can be junk (the arb guard's own documented class: a
-            # $0.01 call against $50+ of intrinsic) and this credit is REALISED cash, not
-            # a mark — clamp it into the same no-arb bounds the guard enforces on fills
-            # (floor at intrinsic, cap at spot for a call / strike for a put). Spot is a
-            # parameter here, so the bounds always resolve. (Review 2026-08-30 F1.)
-            premium = self._clamp_premium_to_no_arb(float(bar["close"]), strike, is_call, spot)
-        else:
-            premium = float(intrinsic)
+        # LONG ITM -> SETTLED FOR CASH AT INTRINSIC, never exercised: the strategy's exits
+        # only manage options, so exercised stock would ride unmanaged to the end of the
+        # run. NO share position is created.
+        #
+        # INTRINSIC, not the expiry bar's premium close (review 2026-11-09). On the expiry
+        # date the contract has no time value left; the day's last print of a thin contract
+        # can still carry some, and booking it (it used to be ``max(close, intrinsic)``)
+        # paid long single legs a premium nobody receives at expiry -- while a defined-risk
+        # combo settled at pure intrinsic and a short leg was assigned at the strike. The
+        # intrinsic comes from the SAME underlying settlement price and the SAME formula
+        # (``_expiry_intrinsic``) the combo path uses. ``spot`` is in the lot's own share
+        # basis (Task 1a), so a split never mixes contracts here. A bar-priced close remains
+        # only for a NON-expiry forced liquidation (``_liquidate_option_lot``).
+        premium = float(intrinsic)
+        # The EVENT is the live OPEXC (an ITM long resolved at expiry); only the settlement
+        # differs (intrinsic cash, no shares) -- see OptionCloseReason.EXERCISED.
+        ok = self.settle_option_expiry(position, close_premium=premium,
+                                       trigger=OptionCloseReason.EXERCISED)
+        if not ok:
+            # No transaction to settle against: nothing was booked, so no cash moves either
+            # (crediting first used to pay the premium for a leg that stayed held).
+            return False
         self._cash += premium * multiplier * contracts
         logger.warning(
-            "[backtest] long %s %s ITM at expiry — sold to close at %.4f (backtests never "
-            "exercise; intrinsic %.4f).",
-            "call" if is_call else "put", position.contract_symbol, premium, intrinsic,
+            "[backtest] long %s %s ITM at expiry — settled for cash at intrinsic %.4f "
+            "(backtests never exercise).",
+            "call" if is_call else "put", position.contract_symbol, premium,
         )
-        # The EVENT is the live OPEXC (an ITM long resolved at expiry); only the settlement
-        # differs (premium, no shares) -- see OptionCloseReason.EXERCISED.
-        return self.settle_option_expiry(position, close_premium=premium,
-                                         trigger=OptionCloseReason.EXERCISED)
+        return True
 
     def process_pending_assignment_liquidations(self) -> bool:
         """Broker-style liquidation of stock orphaned by a short-option assignment.
@@ -7029,8 +7138,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         NEXT bar's OPEN — never more than was assigned, never more than is still held in
         that direction (a pre-existing position the strategy opened itself is untouched,
         and an assignment that merely offset an opposite position leaves nothing to do).
-        Each liquidation persists a synthetic FILLED closing order (comment
-        ``assignment_liquidation``) so the equity move is a visible trade. A symbol with
+        Each liquidation is priced and charged like an ordinary equity MARKET fill of its
+        side -- the open through ``_slip`` (slippage + half the spread, adverse) plus
+        ``commission_per_trade`` -- and persists a FILLED closing order (comment
+        ``assignment_liquidation``, at the slipped price, NOT flagged ``SYNTHETIC_FILL_KEY``
+        because it paid a commission) so the equity move is a visible trade. A symbol with
         no bar this tick stays pending for the next bar. One dict check when nothing is
         pending; equity-only runs never schedule anything — and neither do runs that set
         ``hold_assigned_stock`` (the wheel), for which this method is a permanent no-op
@@ -7083,15 +7195,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     continue  # stays queued: retry once the short call releases its cover
                 to_close = float(sellable)
             signed = -to_close if assigned > 0 else to_close  # sell long / buy back short
-            self._cash -= signed * px
-            self._update_position(symbol, signed, px)
+            # The liquidation is an ordinary equity MARKET fill of its side and pays what one
+            # pays (review 2026-11-09): ``_slip`` (slippage + half the spread, adverse -- a
+            # sale fills below the open, a buy-back above it) and ``commission_per_trade``,
+            # exactly as ``_apply_fill`` charges. It used to trade at the raw open for free.
+            # With all three costs at zero this is the old arithmetic, value for value.
+            fill_px = self._slip(px, side_is_buy=(assigned < 0))
+            commission = float(self._cfg["commission_per_trade"])
+            self._cash -= signed * fill_px
+            self._cash -= commission
+            self._update_position(symbol, signed, fill_px)
             self._record_stock_liquidation_close(
-                symbol, to_close, was_long=(assigned > 0), px=px, comment="assignment_liquidation"
+                symbol, to_close, was_long=(assigned > 0), px=fill_px,
+                comment="assignment_liquidation", commission_paid=True,
             )
             logger.warning(
-                "[backtest] assignment_liquidation: %s %g x %s @ %.4f (next-bar open) — "
-                "assigned stock is unmanaged in a backtest; cash now $%.2f.",
-                "sold" if assigned > 0 else "bought back", to_close, symbol, px, self._cash,
+                "[backtest] assignment_liquidation: %s %g x %s @ %.4f (next-bar open %.4f "
+                "after slippage/spread; commission $%.2f) — assigned stock is unmanaged in a "
+                "backtest; cash now $%.2f.",
+                "sold" if assigned > 0 else "bought back", to_close, symbol, fill_px, px,
+                commission, self._cash,
             )
             if locked_out > 0:
                 # Only the PLEDGED remainder stays queued. Popping it here (what the
@@ -7154,8 +7277,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         net_payoff = 0.0
         strikes: List[float] = []
         for pos in positions:
-            is_call = pos.option_type == OptionRight.CALL
-            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            intrinsic = _expiry_intrinsic(pos.strike, pos.option_type == OptionRight.CALL, spot)
             sign = 1.0 if pos.side == OrderDirection.BUY else -1.0
             mult = float(pos.multiplier or 100)
             net_payoff += sign * intrinsic * mult * float(pos.quantity)
@@ -7192,8 +7314,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # expired_otm) -- the SAME rule the live reconciler applies, independent of leg order.
         leg_triggers = []
         for pos in positions:
-            is_call = pos.option_type == OptionRight.CALL
-            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            intrinsic = _expiry_intrinsic(pos.strike, pos.option_type == OptionRight.CALL, spot)
             trigger = _expiry_trigger(pos.side, intrinsic > 0.0)
             leg_triggers.append(trigger)
             self._record_option_expiry_close(txn, pos, float(intrinsic), trigger=trigger)
@@ -7829,6 +7950,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # An ENTRY's protective levels were built before the fill; live re-bases them to the real
         # fill the moment the entry is FILLED (TradeManager). Same function here (see below).
         if order.depends_on_order is None and order.transaction_id is not None:
+            self._note_entry_fill_bar(order, as_of)
             self._rebase_levels_at_entry_fill(order, fill_px)
 
     #: MEASUREMENT HOOK ONLY (tools/measure_variant.py ``+norebase``; tests). Never set it in a

@@ -533,6 +533,17 @@ class TradeRiskManagement:
 
     def size_candidate_orders(self, expert_instance_id: int, candidates,
                               option_decisions: Optional[List[Dict[str, Any]]] = None):
+        """Size the candidates (see ``_size_candidate_orders``); one ``size`` decision-step record
+        inside a capture scope, a plain call everywhere else."""
+        from ba2_common.core.replay.decision_record import record_size
+
+        with record_size(self, expert_instance_id, candidates, option_decisions) as step:
+            funded = self._size_candidate_orders(expert_instance_id, candidates, option_decisions)
+            step.result = funded
+            return funded
+
+    def _size_candidate_orders(self, expert_instance_id: int, candidates,
+                               option_decisions: Optional[List[Dict[str, Any]]] = None):
         """Size a list of IN-MEMORY candidate (TradingOrder, ExpertRecommendation) pairs and return
         the funded subset — the temp-order-list order flow.
 
@@ -1170,8 +1181,12 @@ class TradeRiskManagement:
         dash on every row of every run production has ever recorded.
         """
         try:
+            from ba2_common.core.replay.decision_record import note_sizing_run, sizing_frame_open
             from ba2_common.core.trade_store import inmem_trades_active
-            if inmem_trades_active():
+            in_backtest = inmem_trades_active()
+            # A backtest builds this explanation only for an open decision ``size`` step (never
+            # today: capture is a live feature), so a backtest is exactly as before.
+            if in_backtest and not sizing_frame_open():
                 return
 
             from ba2_common.core.risk_manager_run import MODE_CLASSIC, record_run
@@ -1188,6 +1203,12 @@ class TradeRiskManagement:
             # The pass's option entries (sized by their own actions), after the ranked
             # equity rows: they carry no rank, so the funding order above is untouched.
             decisions = list(decisions) + list(extra_decisions or [])
+
+            # The RM's own explanation, handed to the open decision ``size`` step BEFORE the row is
+            # written: the same decisions/context live capture and a backtest both get.
+            note_sizing_run(decisions, context)
+            if in_backtest:
+                return
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,

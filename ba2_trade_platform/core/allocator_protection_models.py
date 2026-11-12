@@ -11,7 +11,7 @@ shared ``SQLModel.metadata`` is the job of whoever imports this module first:
 ``main.initialize_system`` does it BEFORE ``init_db()`` (so ``create_all`` builds the tables on
 any database), ``alembic/env.py`` does it for autogenerate, and the stores import it.
 
-FOUR tables: ``allocator_protection`` (+ ``allocator_protection_order`` per broker order),
+FIVE tables (the fifth, ``allocator_frozen``, is the operator's per-symbol freeze): ``allocator_protection`` (+ ``allocator_protection_order`` per broker order),
 ``allocator_exclusion`` (the ONE way a symbol is kept out of allocation: the operator's manual
 "disable") and ``allocator_weight_change`` (the audit trail of the automatic weight reductions a
 protective fill makes).
@@ -185,6 +185,30 @@ class AllocatorExclusion(SQLModel, table=True):
     excluded_reason: str = Field(default=EXCLUDED_DISABLED, description="Plain str; today only 'disabled' (manual)")
     since: DateTime = Field(default_factory=_utcnow)
     note: str | None = Field(default=None, description="Optional operator note, e.g. 'bought manually'")
+
+
+class AllocatorFrozen(SQLModel, table=True):
+    """A symbol the OPERATOR FROZE for allocation, for one account.
+
+    The row's EXISTENCE is the flag (delete it to unfreeze); absent == not frozen, so there is no
+    default to migrate. A frozen symbol is NOT excluded: it stays in its labels and in the base. The
+    rebalance places NO order for it (no buy, sell or resize) and leaves its protective TP/SL orders
+    alone; its CURRENT value is taken as fixed and removed from the money the other members share
+    (``portfolio_allocation.compute_allocation(frozen_symbols=)``). Its stored weight is untouched,
+    so unfreezing restores the original targets at the next rebalance.
+
+    Per ACCOUNT and symbol, like ``AllocatorExclusion`` (a symbol in two labels is frozen in both).
+    """
+    __tablename__ = "allocator_frozen"
+    __table_args__ = (
+        UniqueConstraint('account_id', 'symbol', name='uix_alloc_frozen_account_symbol'),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    symbol: str = Field(index=True, description="Upper-cased symbol")
+    since: DateTime = Field(default_factory=_utcnow)
+    note: str | None = Field(default=None, description="Optional operator note")
 
 
 class AllocatorWeightChange(SQLModel, table=True):

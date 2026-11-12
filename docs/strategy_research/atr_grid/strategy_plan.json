@@ -553,6 +553,16 @@
    "S6"
   ]
  },
+ "late_strategies": {
+  "S8": [
+   "DeterministicScorer",
+   "FMPRating"
+  ],
+  "S9": [
+   "DeterministicScorer",
+   "FMPRating"
+  ]
+ },
  "rule": "keep a strategy for an expert when one of its goal2020 TOP-N backtests is in that expert's pooled top 5 (all bands, both sizing modes) by any of: fitness, car",
  "source": {
   "db": "C:\\Users\\basti\\Documents\\ba2\\test\\dl_forecasting.db",

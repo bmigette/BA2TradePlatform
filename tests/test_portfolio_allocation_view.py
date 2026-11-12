@@ -5304,3 +5304,51 @@ class TestTheSubmitResultCells:
     def test_a_run_that_sent_nothing_says_so(self):
         view = self.view
         assert 'nothing was sent' in view.submit_summary_line([], run_id=9)
+
+
+# --- cost valuation mode: the share columns convert the way the engine does -------------------
+from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_target_quantity  # noqa: E402
+
+def test_cost_mode_trim_converts_at_the_average_cost_not_the_price():
+    """The reported row: 7.4202 shares that cost 529.21 (71.32 each), now 53.50, target
+    425.04. By cost it is 104.17 OVER, so the shares must say trim -- at the average cost a
+    sold share removes -- not "buy 0.52" from dividing the whole target by today's price."""
+    d = symbol_delta(weight_pct=40.0, pct_of_label=49.8, target_value=425.04,
+                     current_value=529.21, quantity=7.4202, price=53.5, cost_valued=True)
+    avg = 529.21 / 7.4202
+    assert d.value == pytest.approx(-104.17)
+    assert d.quantity == pytest.approx(-104.17 / avg)
+    assert d.quantity < 0
+    assert symbol_target_quantity(target_value=425.04, price=53.5, current_value=529.21,
+                                  quantity=7.4202, cost_valued=True) == pytest.approx(7.4202 - 104.17 / avg)
+
+
+def test_cost_mode_buy_converts_at_the_market_price():
+    d = symbol_delta(weight_pct=20.0, pct_of_label=3.64, target_value=212.52,
+                     current_value=38.68, quantity=0.2638, price=138.1, cost_valued=True)
+    assert d.quantity == pytest.approx((212.52 - 38.68) / 138.1)
+
+
+def test_cost_mode_money_and_shares_never_disagree_in_sign():
+    for target in (100.0, 425.04, 529.21, 600.0, 900.0):
+        d = symbol_delta(weight_pct=1.0, pct_of_label=1.0, target_value=target,
+                         current_value=529.21, quantity=7.4202, price=53.5, cost_valued=True)
+        assert (d.value > 0) == (d.quantity > 0) and (d.value < 0) == (d.quantity < 0)
+
+
+def test_cost_mode_without_a_usable_average_cost_trims_nothing():
+    assert symbol_target_quantity(target_value=0.0 + 10.0, price=50.0, current_value=100.0,
+                                  quantity=0.0, cost_valued=True) == pytest.approx(0.0)
+
+
+def test_cost_mode_with_an_unknown_holding_is_unknown_not_zero():
+    assert symbol_target_quantity(target_value=100.0, price=50.0, current_value=None,
+                                  quantity=2.0, cost_valued=True) is None
+
+
+def test_market_mode_is_unchanged_by_the_cost_mode_branch():
+    assert symbol_target_quantity(target_value=184.83, price=105.86, current_value=529.30,
+                                  quantity=5) == pytest.approx(184.83 / 105.86)
+    d = symbol_delta(weight_pct=38.34, pct_of_label=38.34, target_value=184.83,
+                     current_value=529.30, quantity=5, price=105.86)
+    assert d.quantity == pytest.approx(184.83 / 105.86 - 5)

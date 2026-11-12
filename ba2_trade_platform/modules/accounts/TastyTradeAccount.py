@@ -763,6 +763,10 @@ class TastyTradeAccount(AccountInterface):
                 f"fetch unfiltered (that would return every order ever placed)")
         return matches
 
+    #: Raw statuses ``_map_order_status`` already warned about (once per process per value:
+    #: ``refresh_orders`` maps the WHOLE history every cycle and names the affected order itself).
+    _UNMAPPED_STATUSES_SEEN: set = set()
+
     @classmethod
     def _map_order_status(cls, tt_status) -> OrderStatus:
         """TastyTrade order status -> platform OrderStatus. UNKNOWN for anything unmapped."""
@@ -771,7 +775,9 @@ class TastyTradeAccount(AccountInterface):
         try:
             return cls._TT_STATUS_MAP[TTOrderStatus(tt_status)]
         except (ValueError, KeyError):
-            logger.warning(f"Unmapped TastyTrade order status {tt_status!r}; recording UNKNOWN")
+            if repr(tt_status) not in cls._UNMAPPED_STATUSES_SEEN:
+                cls._UNMAPPED_STATUSES_SEEN.add(repr(tt_status))
+                logger.warning(f"Unmapped TastyTrade order status {tt_status!r}; reported as UNKNOWN")
             return OrderStatus.UNKNOWN
 
     @staticmethod
@@ -2212,7 +2218,11 @@ class TastyTradeAccount(AccountInterface):
 
         Matching is on ``external_identifier`` first (we set it to our own row id at
         submission -- TastyTrade's equivalent of Alpaca's ``client_order_id``), then on
-        ``broker_order_id``. Unlike AlpacaAccount.refresh_orders this does NOT cancel
+        ``broker_order_id``. SQLite recycles row ids and the whole history is walked, so an
+        external_identifier match is applied only when the row stores THAT broker id; a row
+        with no broker id yet adopts only an order received no earlier than the row (see
+        ``_may_adopt_broker_order``), one per row (``_choose_adoption_candidate``). An unmapped
+        broker status is never written over the row's status. Unlike AlpacaAccount.refresh_orders this does NOT cancel
         rows that are missing from the response: TastyTrade's order history is
         paginated and date-windowed, so absence is not evidence of cancellation.
 
@@ -2237,6 +2247,12 @@ class TastyTradeAccount(AccountInterface):
 
         updated_count = 0
         mapped_count = 0
+        # Pass 1: resolve each broker order to (at most) one row. A row matched by its
+        # external_identifier is applied only when it stores THIS broker id; a row without a
+        # broker id collects adoption candidates, decided in pass 2 independently of the
+        # history's iteration order.
+        matched = []        # (db_order, raw, broker_order_id, broker_state)
+        candidates = {}     # row id -> [(raw, broker_order_id, broker_state)]
         for raw in raw_orders:
             raw_id = getattr(raw, "id", None)
             if raw_id in (None, -1):
@@ -2255,9 +2271,19 @@ class TastyTradeAccount(AccountInterface):
                 except (InstanceNotFound, TypeError, ValueError):
                     candidate = None
                 if candidate is not None and candidate.account_id == self.id:
-                    db_order = candidate
-                    if not db_order.broker_order_id:
-                        mapped_count += 1
+                    if candidate.broker_order_id:
+                        if candidate.broker_order_id == broker_order_id:
+                            db_order = candidate
+                        else:
+                            # tradingorder ids are recycled by SQLite: this is another
+                            # (earlier) order that carried the same row id.
+                            self._log_unapplied_broker_order(
+                                raw, candidate,
+                                f"the row tracks broker order {candidate.broker_order_id}")
+                    elif self._may_adopt_broker_order(raw, candidate):
+                        candidates.setdefault(candidate.id, []).append(
+                            (raw, broker_order_id, broker_state))
+                        continue
 
             if db_order is None:
                 with get_db() as session:
@@ -2270,6 +2296,18 @@ class TastyTradeAccount(AccountInterface):
                     found_id = found.id if found else None
                 db_order = get_instance(TradingOrder, found_id) if found_id else None
             if db_order is None:
+                continue
+            matched.append((db_order, raw, broker_order_id, broker_state))
+
+        # Pass 2: one broker order per row without a broker id, chosen deterministically.
+        for row_id, row_candidates in candidates.items():
+            chosen = self._choose_adoption_candidate(row_id, row_candidates)
+            matched.append((get_instance(TradingOrder, row_id), *chosen))
+
+        for db_order, raw, broker_order_id, broker_state in matched:
+            if broker_state.status == OrderStatus.UNKNOWN:
+                # Never write UNKNOWN over a status we know; the order is left as it is.
+                self._warn_unmapped_status_once(raw, db_order, broker_order_id)
                 continue
 
             has_changes = False
@@ -2300,6 +2338,7 @@ class TastyTradeAccount(AccountInterface):
 
             if not db_order.broker_order_id:
                 db_order.broker_order_id = broker_order_id
+                mapped_count += 1
                 has_changes = True
 
             if has_changes:
@@ -2310,6 +2349,85 @@ class TastyTradeAccount(AccountInterface):
             f"[Account {self.id}] Refreshed TastyTrade orders: {updated_count} updated, "
             f"{mapped_count} mapped via external_identifier")
         return True
+
+    #: How much EARLIER than its row a broker order may have been received and still be
+    #: adopted by a row without a broker id: local-vs-broker clock skew only. The row is
+    #: written before ``place_order`` is called, so a genuine order is never older than it.
+    _ADOPTION_CLOCK_TOLERANCE = timedelta(seconds=60)
+
+    #: ``(account id, broker order id, raw status)`` already warned about by refresh_orders.
+    _UNMAPPED_STATUS_WARNED: set = set()
+
+    @staticmethod
+    def _as_utc(stamp):
+        """A datetime as aware UTC; SQLite hands back naive datetimes that ARE UTC."""
+        from datetime import timezone
+        if stamp.tzinfo is None:
+            return stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc)
+
+    def _log_unapplied_broker_order(self, raw, row, reason: str) -> None:
+        """A broker order carrying a row's identifier that is NOT applied to the row. DEBUG
+        for history; WARNING while it is still working, since nobody tracks that order."""
+        status = getattr(raw, "status", None)
+        message = (f"[Account {self.id}] TastyTrade order {getattr(raw, 'id', None)} "
+                   f"(status {getattr(status, 'value', status)}) carries external_identifier "
+                   f"{getattr(raw, 'external_identifier', None)!r} but is not applied to row "
+                   f"{row.id}: {reason}")
+        if status in self._TT_OPEN_STATUSES:
+            logger.warning(f"{message}; this WORKING order is not tracked by any row")
+        else:
+            logger.debug(message)
+
+    def _may_adopt_broker_order(self, raw, row) -> bool:
+        """Whether a row WITHOUT a broker id may adopt this broker order: only one received
+        no earlier than the row's creation (minus clock-skew tolerance). An order from before
+        the row existed belongs to an earlier row with the same recycled id."""
+        received = getattr(raw, "received_at", None)
+        if received is None:
+            self._log_unapplied_broker_order(raw, row, "the broker order has no receipt time")
+            return False
+        if row.created_at is None:
+            self._log_unapplied_broker_order(raw, row, "the row has no creation time")
+            return False
+        if self._as_utc(received) < self._as_utc(row.created_at) - self._ADOPTION_CLOCK_TOLERANCE:
+            self._log_unapplied_broker_order(
+                raw, row, f"it was received at {received}, before the row was created "
+                          f"({row.created_at}); a recycled row id?")
+            return False
+        return True
+
+    def _choose_adoption_candidate(self, row_id: int, row_candidates):
+        """The ONE broker order a row without a broker id adopts, independent of the order
+        the history was walked in: a working order first, then one with fills, then the most
+        recently received, then the highest broker id."""
+        def rank(item):
+            raw, broker_order_id, broker_state = item
+            return (getattr(raw, "status", None) in self._TT_OPEN_STATUSES,
+                    broker_state.filled_qty is not None and float(broker_state.filled_qty) > 0,
+                    self._as_utc(raw.received_at),
+                    int(broker_order_id))
+
+        chosen = max(row_candidates, key=rank)
+        if len(row_candidates) > 1:
+            listed = ", ".join(
+                f"{bid} ({getattr(getattr(r, 'status', None), 'value', getattr(r, 'status', None))})"
+                for r, bid, _s in sorted(row_candidates, key=rank, reverse=True))
+            logger.warning(
+                f"[Account {self.id}] Row {row_id} has no broker id and {len(row_candidates)} "
+                f"TastyTrade orders carry its identifier: {listed}; adopting {chosen[1]}")
+        return chosen
+
+    def _warn_unmapped_status_once(self, raw, row, broker_order_id: str) -> None:
+        """Name an unmapped broker status ONCE per order (refresh walks the whole history)."""
+        raw_status = getattr(raw, "status", None)
+        key = (self.id, broker_order_id, repr(raw_status))
+        if key in self._UNMAPPED_STATUS_WARNED:
+            return
+        self._UNMAPPED_STATUS_WARNED.add(key)
+        logger.warning(
+            f"[Account {self.id}] TastyTrade order {broker_order_id} reports unmapped status "
+            f"{raw_status!r}; row {row.id} left unchanged at {row.status}")
 
     @staticmethod
     def _net_dividend(gross_total: float, tax_total: float) -> float:

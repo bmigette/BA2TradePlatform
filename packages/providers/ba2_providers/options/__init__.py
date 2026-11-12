@@ -23,11 +23,12 @@ from ba2_common.core.interfaces.OptionsDataProviderInterface import (
 )
 
 from .alpaca import AlpacaOptionsProvider
+from .alphavantage import AlphaVantageOptionsProvider
 from .parquet_store import OptionHistoryParquetStore, PartitionState
 from .tastytrade import TastyTradeOptionsProvider
 from .thetadata import ThetaDataOptionsProvider
 
-__all__ = ["AlpacaOptionsProvider", "OptionHistoryParquetStore", "PartitionState",
+__all__ = ["AlpacaOptionsProvider", "AlphaVantageOptionsProvider", "OptionHistoryParquetStore", "PartitionState",
            "TastyTradeOptionsProvider", "ThetaDataOptionsProvider",
            "OPTIONS_HISTORY_PROVIDERS", "options_history_floor"]
 
@@ -39,6 +40,7 @@ OPTIONS_HISTORY_PROVIDERS: Dict[str, Type[OptionsDataProviderInterface]] = {
     AlpacaOptionsProvider.name: AlpacaOptionsProvider,
     TastyTradeOptionsProvider.name: TastyTradeOptionsProvider,
     ThetaDataOptionsProvider.name: ThetaDataOptionsProvider,
+    AlphaVantageOptionsProvider.name: AlphaVantageOptionsProvider,
 }
 
 

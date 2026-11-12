@@ -16,6 +16,8 @@ from app.schemas.trade_chart import TradeChartContext
 from app.services.backtest_trade_chart import (
     TradeChartRowNotFound, build_trade_chart_context,
 )
+from ba2_common.core import estimates_source as _estimates_source_mod
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY
 from ba2_common.core.ohlcv_history import OHLCV_HISTORY_SOURCE_KEY
 from app.services.sync_client import push_backtest
 
@@ -85,6 +87,7 @@ class BacktestCreate(BaseModel):
     # OHLCV history a daily_expert run reads: "fmp" | "alpaca". None = the new-job default (alpaca for
     # equity, fmp for option runs); an unknown name or an option run on alpaca is refused (400).
     ohlcv_history_source: Optional[str] = None
+    estimates_source: Optional[str] = None      # REQUIRED at creation (no default): fmp | alphavantage
     # ML-engine fields (required only when engine == "ml"; validated in the route).
     model_id: Optional[str] = None  # String model ID like "mdl-abc123"
     prediction_dataset_id: Optional[int] = None
@@ -159,6 +162,7 @@ class DailyBacktestCreate(BaseModel):
     are NOT used by the daily engine (the universe is ``enabled_instruments``)."""
     name: str
     ohlcv_history_source: Optional[str] = None  # None = new-job default (see BacktestCreate)
+    estimates_source: Optional[str] = None      # REQUIRED at creation (no default): fmp | alphavantage
     enabled_instruments: List[str]
     experts: List[dict]  # [{"class": "FMPEarningsDrift", "settings": {...}}] or ["FMPEarningsDrift"]
     start_date: str
@@ -427,7 +431,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     Fail-early validation (``backend/CLAUDE.md``): the expert class must be supported, and a
     ``static`` universe must be non-empty.
     """
-    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS, new_job_expert_settings
 
     expert = backtest.expert or {}
     expert_class = expert.get("class")
@@ -438,7 +442,10 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
             status_code=400,
             detail=f"unsupported expert '{expert_class}'; supported: {sorted(_SUPPORTED_EXPERTS)}",
         )
-    expert_settings = expert.get("settings") or {}
+    # A NEW run states the current default of every setting whose default changed after results
+    # were produced (stored on the row as expertSettings, so a re-run/deploy reads it back); an
+    # unstated one would be read as a pre-change run (ba2_common.core.legacy_setting_defaults).
+    expert_settings = new_job_expert_settings(expert_class, expert.get("settings") or {})
 
     universe = backtest.universe or {}
     mode = universe.get("mode")
@@ -549,6 +556,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
          "entry_rules": backtest.entry_rules or backtest.entry_actions},
         "POST /backtests (daily_expert)")
     strategy_params[OHLCV_HISTORY_SOURCE_KEY] = history_source
+    strategy_params[ESTIMATES_SOURCE_KEY] = _new_job_estimates_source(backtest.estimates_source, "POST /backtests (daily_expert)")
 
     db_backtest = Backtest(
         name=backtest.name,
@@ -701,6 +709,14 @@ def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
     return {"status": "queued", "task_id": task_id, "backtest_id": backtest_id}
 
 
+def _new_job_estimates_source(stated: Optional[str], where: str) -> str:
+    """The analyst-estimates source a NEW API-created run is stamped with. Required: no default (HTTP 400)."""
+    try:
+        return _estimates_source_mod.resolve_job_estimates_source({ESTIMATES_SOURCE_KEY: stated})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"{where}: {e}")
+
+
 def _new_job_history_source(stated: Optional[str], probe: dict, where: str) -> str:
     """The OHLCV history a NEW API-created run is stamped with (``new_job_history_source``): an explicit value
     wins, else alpaca for an equity run and fmp for an option run. Unknown / option-on-alpaca -> HTTP 400."""
@@ -727,6 +743,8 @@ def create_daily_backtest(
     new row id.
     The ``daily_backtest`` handler runs the engine and persists the results onto the row.
     """
+    from app.services.backtest.daily_backtest_handler import new_job_expert_specs
+
     # Validate fail-early (no defaults).
     if not request.enabled_instruments:
         raise HTTPException(status_code=400, detail="enabled_instruments must be non-empty")
@@ -747,9 +765,10 @@ def create_daily_backtest(
         raise HTTPException(status_code=400, detail=str(e))
 
     history_source = _new_job_history_source(request.ohlcv_history_source, {}, "POST /backtests/daily")
+    estimates_source = _new_job_estimates_source(request.estimates_source, "POST /backtests/daily")
     db_backtest = Backtest(
         name=request.name,
-        strategy_params={OHLCV_HISTORY_SOURCE_KEY: history_source},
+        strategy_params={OHLCV_HISTORY_SOURCE_KEY: history_source, ESTIMATES_SOURCE_KEY: estimates_source},
         model_id=None,  # daily expert runs are not model-driven (Task-7 migration makes this nullable)
         start_date=start_date,
         end_date=end_date,
@@ -776,7 +795,8 @@ def create_daily_backtest(
             'backtest_id': db_backtest.id,
             'name': request.name,
             'enabled_instruments': request.enabled_instruments,
-            'experts': request.experts,
+            # a NEW run states every changed default (ba2_common.core.legacy_setting_defaults)
+            'experts': new_job_expert_specs(request.experts),
             'start_date': request.start_date,
             'end_date': request.end_date,
             'initial_capital': request.initial_capital,
@@ -788,6 +808,7 @@ def create_daily_backtest(
             # None on the daily-cadence path -> engine analyses every bar (unchanged).
             'run_schedule_override': run_schedule_override,
             OHLCV_HISTORY_SOURCE_KEY: history_source,
+            ESTIMATES_SOURCE_KEY: estimates_source,
         },
         description=f'Daily expert backtest over {len(request.enabled_instruments)} instruments',
     )
@@ -1373,6 +1394,32 @@ def export_backtest_json(
     if not backtest:
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
     return _derive_export_payload(backtest, kind, db)
+
+
+@router.get("/{backtest_id}/export/html")
+def export_backtest_html(
+    backtest_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download the backtest detail page as ONE self-contained HTML file (all charts + tables).
+
+    Read-only; rendered by ``app.services.backtest.html_export`` from the same ``to_dict()`` /
+    ``yearly_breakdown`` the detail page uses. A queued/running row has no results yet -> 409.
+    """
+    from fastapi.responses import Response
+    from app.services.backtest.html_export import render_backtest_html
+
+    backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not backtest:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+    if backtest.status in ("pending", "queued", "running"):
+        raise HTTPException(status_code=409, detail=f"Backtest {backtest_id} is {backtest.status}; no results to export yet")
+    strategy = db.query(Strategy).filter(Strategy.id == backtest.strategy_id).first() if backtest.strategy_id else None
+    content = render_backtest_html(backtest, strategy)
+    return Response(
+        content=content, media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=backtest-{backtest_id}.html"},
+    )
 
 
 @router.post("/{backtest_id}/export")

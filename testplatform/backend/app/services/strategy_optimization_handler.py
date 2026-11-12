@@ -34,6 +34,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.knowability import DEFAULT_DECISION_TIME, entry_times_for  # noqa: F401
+from ba2_common.core.estimates_source import ESTIMATES_SOURCE_KEY, check_estimates_source
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
+from app.services.backtest.options_store import (
+    LEGACY_OPTION_HISTORY_SOURCE, check_option_history_source, non_legacy_option_history_source)
 from ba2_common.core.ohlcv_history import resolve_job_history_source
 
 
@@ -58,7 +62,7 @@ from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
 from app.services.chain_seed import (  # noqa: E402
     CHAIN_SEED_KEY, SEEDED_FROM_KEY, ChainSeedError,
     build_chain_seed_population, final_population_record, stored_record)
-from app.services.task_queue import get_task_queue
+from app.services.task_queue import STOP_CANCELLED, get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params, market_profile_members
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
@@ -1398,7 +1402,10 @@ def _analysis_failures_field(results: Dict[str, Any]) -> Dict[str, Any]:
     job-level summary can aggregate them. Same shape idea as ``dt_missing``."""
     af = (results or {}).get("analysis_failures")
     if af and af.get("passes"):
-        return {"af": {"passes": int(af["passes"]), "failed": int(af["failed"])}}
+        out = {"passes": int(af["passes"]), "failed": int(af["failed"])}
+        if af.get("estimates_unavailable"):
+            out["eu"] = int(af["estimates_unavailable"])    # failed for want of an estimate, not in "failed"
+        return {"af": out}
     return {}
 
 
@@ -1445,8 +1452,12 @@ def summarise_analysis_failures(opt_name: str, all_results: list) -> Optional[Di
     worst_af, worst_key = max(rows, key=lambda x: x[0]["failed"] / max(x[0]["passes"], 1))
     agg = {"trials": len(rows), "passes": passes, "failed": failed,
            "worst_share": round(worst_af["failed"] / max(worst_af["passes"], 1), 4), "worst_trial": worst_key}
+    eu = sum(a.get("eu", 0) for a, _ in rows)
+    if eu:
+        agg["estimates_unavailable"] = eu
     line = (f"[{opt_name}] analysis passes over {len(rows)} trial(s): {passes} total, {failed} failed "
-            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})")
+            f"({(failed / passes if passes else 0):.2%}); worst trial {agg['worst_share']:.2%} (key {worst_key})"
+            + (f"; {eu} more failed for want of an estimate ({eu / passes:.2%})" if eu and passes else ""))
     (logger.warning if failed else logger.info)(line)
     return agg
 
@@ -1590,6 +1601,9 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     # goal2027 2.2: whatever belongs to an unselected market profile (identity without market:profile).
     from app.services.strategy_param_space import neutralise_market_profile_genes
     decoded_flat = neutralise_market_profile_genes(decoded_flat, market_members)
+    # --market-exit rsi|spy: the genes of a rule toggled off (identity without such a rule).
+    from app.services.strategy_param_space import neutralise_independent_exit_genes
+    decoded_flat = neutralise_independent_exit_genes(decoded_flat)
     if not anchors:
         return decoded_flat
     from app.services.strategy_param_space import mode_token
@@ -1598,9 +1612,18 @@ def canonical_trial_params(anchors: Dict[str, Any], decoded_flat: Dict[str, Any]
     out: Optional[Dict[str, Any]] = None
     for cid, (choices, anchor) in anchors.items():
         mode_key, value_key = f"cond:{cid}:mode", f"cond:{cid}:value"
-        if mode_key not in decoded_flat or value_key not in decoded_flat or anchor is None:
+        field_key = f"cond:{cid}:field"
+        if mode_key not in decoded_flat:
             continue
         if mode_token(decoded_flat[mode_key], choices, cid) != MODE_OFF:
+            continue
+        # An off leaf is removed: its field gene (the pullback RSI period) is inert too. Dropped from
+        # the memo key (never from the config the trial runs), so every period shares one key.
+        if field_key in decoded_flat:
+            if out is None:
+                out = dict(decoded_flat)
+            del out[field_key]
+        if value_key not in decoded_flat or anchor is None:
             continue
         if decoded_flat[value_key] == anchor:
             continue
@@ -1738,6 +1761,24 @@ def _final_status(all_results: list) -> str:
     if _count_measured(all_results) > 0:
         return "completed"
     return "no_measurements" if all_results else "failed"
+
+
+class TaskStopRequested(InterruptedError):
+    """The task row was paused or cancelled while this handler ran (``reason`` says which)."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"task {reason}")
+        self.reason = reason
+
+
+def _raise_if_stop_requested(tq: Any, task_id: str) -> None:
+    """The ONE stop check of a run: raises TaskStopRequested on pause OR cancel.
+
+    ``tq.is_task_paused`` alone sees PAUSED only, so a cancelled run used to go on to the end and
+    then be recorded as completed."""
+    reason = tq.stop_reason(task_id)
+    if reason:
+        raise TaskStopRequested(reason)
 
 
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
@@ -1914,8 +1955,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 logger.debug(f"live opt persist skipped: {e}")
 
         def fitness_function(decoded_flat: Dict[str, Any]) -> float:
-            if tq.is_task_paused(task_id):
-                raise InterruptedError("paused/cancelled")
+            _raise_if_stop_requested(tq, task_id)
             decoded = decode_params(strategy, decoded_flat)
             key = trial_key(
                 {
@@ -2020,8 +2060,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             row.all_results = all_results
             db.commit()
             push_optimization(row, db)
-            if tq.is_task_paused(task_id):
-                raise InterruptedError("paused/cancelled")
+            _raise_if_stop_requested(tq, task_id)
 
         # Checkpoints are keyed on the JOB (its name), not this row's id, so a relaunch of an
         # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
@@ -2030,7 +2069,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             param_space, ga, checkpoint_expert_settings_identity(backtest_cfg),
             backtest_cfg.get("rm_toggles_unpinned"), backtest_cfg.get("screener_universe_rule"),
             _screener_identity(backtest_cfg.get("screener_opt")),
-            resolve_job_history_source(backtest_cfg))
+            resolve_job_history_source(backtest_cfg), _estimates_source_mod.resolve_job_estimates_source(backtest_cfg),
+            non_legacy_option_history_source(backtest_cfg))
         # The OBJECTIVE this run is scored under, as the trials will actually see it (the trial
         # config carries the same key, and strategy_fitness._maybe_robust reads it). Written into
         # every checkpoint and compared on resume -- see _assert_checkpoint_robustness_matches.
@@ -2108,8 +2148,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 checkpoint the population MID-generation instead of only at the boundary.
                 """
                 nonlocal _pool          # rebound by the batch-end recycle at the bottom
-                if tq.is_task_paused(task_id):
-                    raise InterruptedError("paused/cancelled")
+                _raise_if_stop_requested(tq, task_id)
                 fits: list = [None] * len(param_dicts)
                 tally = _TrialErrorTally()
                 jobs = []  # (idx, decoded_flat, key, config)
@@ -2316,8 +2355,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     # DistributedEvaluator (its broker is cleared of this optimization's pending
                     # trials). Trials already running finish and are discarded, as a GA pause
                     # discards its interrupted generation.
-                    if brute_force and done < total_in_batch and tq.is_task_paused(task_id):
-                        raise InterruptedError("paused/cancelled")
+                    if brute_force and done < total_in_batch:
+                        _raise_if_stop_requested(tq, task_id)
                 # RECYCLE, DISTRIBUTED PATH. With --workers the trials run through
                 # DistributedEvaluator, whose consumer threads submit to the pool continuously --
                 # _local_execute_jobs (and its per-chunk rebuild) is never called, so without this
@@ -2762,6 +2801,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             "best_params": result["best_params"],
         }
 
+    except TaskStopRequested as stop:
+        if stop.reason == STOP_CANCELLED:
+            # Cancelled: the run is abandoned (no checkpoint is written for it, no result kept)
+            # and the row must not keep reading "running". The task row is already CANCELLED.
+            try:
+                row = db.query(StrategyOptimization).filter(
+                    StrategyOptimization.id == opt_id).first()
+                if row is not None:
+                    row.status = "cancelled"
+                    row.completed_at = datetime.now()
+                    db.commit()
+                    push_optimization(row, db)
+            except Exception as e:  # noqa: BLE001 -- the cancel itself already happened
+                db.rollback()
+                logger.warning(f"strategy_optimization {opt_id}: could not mark the row cancelled: {e}")
+            logger.warning(f"strategy_optimization {opt_id}: CANCELLED")
+            return {"status": "cancelled", "optimization_id": opt_id}
+        return {"status": "paused"}
     except InterruptedError:
         return {"status": "paused"}
     except Exception as e:  # noqa: BLE001 — any crash must fail the row, not the worker
@@ -3106,6 +3163,7 @@ def _build_daily_trial_config(
     # split-basis converter reads FMP's calendar).
     from app.services.backtest.history_source import refuse_option_job_on_unsupported_source
     history_source = resolve_job_history_source(backtest_cfg)
+    estimates_source = _estimates_source_mod.resolve_job_estimates_source(backtest_cfg)   # no default: the job names it
     refuse_option_job_on_unsupported_source(
         {OHLCV_HISTORY_SOURCE_KEY: history_source},
         uses_options=bool(options_cache_db) or strategy_uses_options(
@@ -3320,6 +3378,7 @@ def _build_daily_trial_config(
         # Which OHLCV history the trial reads (see above). In the whitelist: a key missing here is
         # silently dropped and the trial would read the legacy history whatever the job says.
         OHLCV_HISTORY_SOURCE_KEY: history_source,
+        ESTIMATES_SOURCE_KEY: estimates_source,      # whitelist: a dropped key would refuse in the engine
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
         "start_date": backtest_cfg["start_date"],
         "end_date": backtest_cfg["end_date"],
@@ -3374,6 +3433,8 @@ def _build_daily_trial_config(
         # ``_car_trade_thresholds_for_experts`` on its expert/default resolution exactly.
         "car_hard_min_trades_per_year": backtest_cfg.get("car_hard_min_trades_per_year"),
         "car_min_trades_per_year": backtest_cfg.get("car_min_trades_per_year"),
+        # Per-calendar-year trade floor override (strategy_fitness._year_gate); same whitelist reason.
+        "car_min_trades_each_year": backtest_cfg.get("car_min_trades_each_year"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already
@@ -3684,7 +3745,10 @@ def _report_trial_result(on_result, idx: int, fitness: float) -> None:
 #: to the default scores exactly like an absent key, so it is not folded -- an explicit "same"
 #: from a UI-built config must not orphan a checkpoint written without the key.
 #: ``rank_universe`` (MLForecast, strategy MLR): the ranked symbol set; the same genes score differently on another one.
-CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": ""}
+#: ``yc_scale`` (DeterministicScorer, 2026-11-09): mapped to 0.005, NOT the definition's new 0.5 -- the value an
+#: UNSTATED key resolves to in the backtest engine (``ba2_common.core.legacy_setting_defaults``). Every job before the
+#: change ran 0.005 and keeps its fingerprint; a new job states 0.5 and can never resume a 0.005 checkpoint.
+CHECKPOINT_IDENTITY_EXPERT_SETTINGS = {"macro_short_side": "same", "rank_universe": "", "yc_scale": 0.005}
 
 
 def checkpoint_expert_settings_identity(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -3716,7 +3780,9 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
                            rm_toggles_unpinned: Optional[List[str]] = None,
                            screener_universe_rule: Optional[str] = None,
                            screener_criteria: Optional[str] = None,
-                           ohlcv_history_source: Optional[str] = None) -> str:
+                           ohlcv_history_source: Optional[str] = None,
+                           estimates_source: Optional[str] = None,
+                           option_history_source: Optional[str] = None) -> str:
     """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
 
     A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
@@ -3785,6 +3851,17 @@ def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any],
         payload["screener_criteria"] = screener_criteria
     if ohlcv_history_source is not None and ohlcv_history_source != LEGACY_HISTORY_SOURCE:
         payload["ohlcv_history_source"] = check_history_source(ohlcv_history_source)
+    if estimates_source is not None and check_estimates_source(estimates_source) != "fmp":
+        # Where the analyst estimates come from is part of what a genome was scored on (fmp refuses
+        # historical estimate reads, alphavantage serves point-in-time ones): a checkpoint never crosses.
+        # Joined ONLY when it is not the legacy fmp, like ohlcv_history_source: every job from before the
+        # setting existed read fmp, and keeps its fingerprint (resumes are not broken by the new flag).
+        payload["estimates_source"] = check_estimates_source(estimates_source)
+    if option_history_source is not None and check_option_history_source(option_history_source) != LEGACY_OPTION_HISTORY_SOURCE:
+        # Which vendor's option history a genome was scored on is part of its identity. Joined ONLY when
+        # it is not the legacy thetadata (and never for a run without a parquet option vendor, where the
+        # caller passes None), so every job from before the switch keeps its fingerprint.
+        payload["option_history_source"] = option_history_source
     lattice_anchor = _resolve_lattice_anchor(ga)
     if lattice_anchor != "zero":
         payload["lattice_anchor"] = lattice_anchor

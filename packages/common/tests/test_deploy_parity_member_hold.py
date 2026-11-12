@@ -1,16 +1,17 @@
-"""Stage-2 E2 review I1: the member-scoped hold is a deploy-parity fact, and it cannot deploy.
+"""The assigned-stock policy is a deploy-parity fact that live CARRIES (live-assigned-stock-liquidation).
 
-``hold_assigned_stock_tags`` decides, per style member, whether an assignment's stock is held or
-liquidated. Live has no such decision at all (it never sells assigned stock), so a run that used
-it must not export as ``hold_assigned_stock: False`` -- that would describe a different run. The
-table records it, and ``refuse_undeployable`` refuses the export by name.
+``hold_assigned_stock`` / ``hold_assigned_stock_tags`` decide whether an assignment's stock is held
+or liquidated. Live now makes the same decision per instance (``assignment_hold.
+decide_live_assigned_stock``), so both rows have a real ``live_setting``: the export carries them in
+``expert_params`` (never into the backtest's own expert -- ``applied_in_backtest=False`` keeps the
+BT byte-identical) and the importer writes them.
 """
-import pytest
-
 from ba2_common.core.deploy_parity import (
-    BACKTEST_FORCED_SETTINGS, BacktestRunFacts, UndeployableRunRefused, backtest_only_settings,
-    refuse_undeployable,
+    BACKTEST_FORCED_SETTINGS, BacktestRunFacts, backtest_only_settings, deploy_expert_settings,
+    forced_expert_settings, legacy_hold_settings, refuse_undeployable, reportable_backtest_only,
 )
+
+_ROWS = {r.key: r for r in BACKTEST_FORCED_SETTINGS}
 
 
 def _facts(**over):
@@ -19,42 +20,59 @@ def _facts(**over):
     return BacktestRunFacts(**base)
 
 
-def test_the_table_records_the_member_scoped_hold_as_a_backtest_only_fact():
-    (row,) = [r for r in BACKTEST_FORCED_SETTINGS if r.key == "hold_assigned_stock_tags"]
-    assert row.live_setting is None and row.why_no_live_analogue
-    assert backtest_only_settings(_facts(hold_assigned_stock_tags=(7, 3)))[
-        "hold_assigned_stock_tags"] == [3, 7]
+def test_both_policy_rows_have_a_live_setting_of_the_same_name():
+    for key in ("hold_assigned_stock", "hold_assigned_stock_tags"):
+        assert _ROWS[key].live_setting == key
+        assert _ROWS[key].applied_in_backtest is False
 
 
-def test_a_run_without_it_records_None_and_deploys():
-    facts = _facts()
-    assert backtest_only_settings(facts)["hold_assigned_stock_tags"] is None
-    refuse_undeployable(facts)          # does not raise
+def test_the_backtests_own_expert_settings_are_unchanged():
+    """The handler reads forced_expert_settings: it must NOT gain the policy keys (the BT engine
+    takes the policy from its account config, and its expert settings stay byte-identical)."""
+    forced = forced_expert_settings(_facts(hold_assigned_stock=True, hold_assigned_stock_tags=(7,)))
+    assert "hold_assigned_stock" not in forced and "hold_assigned_stock_tags" not in forced
 
 
-def test_a_member_scoped_run_is_refused_for_deploy_by_name():
-    with pytest.raises(UndeployableRunRefused, match="hold_assigned_stock_tags"):
-        refuse_undeployable(_facts(hold_assigned_stock_tags=(7,)))
+def test_the_export_carries_the_policy_run_level():
+    out = deploy_expert_settings(_facts(hold_assigned_stock=True))
+    assert out["hold_assigned_stock"] is True
+    assert "hold_assigned_stock_tags" not in out          # None is not written
 
 
+def test_the_export_carries_the_policy_member_scoped_sorted():
+    out = deploy_expert_settings(_facts(hold_assigned_stock_tags=(7, 3)))
+    assert out["hold_assigned_stock_tags"] == [3, 7]
+    assert out["hold_assigned_stock"] is False
 
-def test_only_the_rows_whose_None_means_nothing_are_marked_silent_when_none():
+
+def test_a_member_scoped_run_is_no_longer_refused():
+    refuse_undeployable(_facts(hold_assigned_stock_tags=(7,)))      # does not raise
+
+
+def test_the_policy_is_not_a_backtest_only_record_any_more():
+    assert set(backtest_only_settings(_facts())) == {"entry_action"}
+
+
+def test_only_entry_action_is_silent_when_none():
     silent = {r.key for r in BACKTEST_FORCED_SETTINGS if r.silent_when_none}
-    assert silent == {"hold_assigned_stock_tags", "entry_action"}
-    # the flag is a statement about a backtest-only record; a live-carried row never has it
+    assert silent == {"entry_action"}
     assert all(r.live_setting is None for r in BACKTEST_FORCED_SETTINGS if r.silent_when_none)
 
 
-def test_the_deploy_report_skips_a_None_row_only_where_the_table_says_None_means_nothing():
-    """Every deployable payload carries ``hold_assigned_stock_tags: None`` (a member-scoped run is
-    refused above) and an equity run ``entry_action: None``; printing them on every deploy is
-    noise. The decision is the ROW's, not a blanket "skip None": a None on any other row, or on
-    a key the table does not know, is still reported."""
-    from ba2_common.core.deploy_parity import reportable_backtest_only
-    assert reportable_backtest_only(backtest_only_settings(_facts(hold_assigned_stock=True))) == {
-        "hold_assigned_stock": True}
-    assert reportable_backtest_only({"hold_assigned_stock": None, "unknown_row": None,
-                                     "hold_assigned_stock_tags": None, "entry_action": None}) == {
-        "hold_assigned_stock": None, "unknown_row": None}
-    assert reportable_backtest_only({"hold_assigned_stock": False, "entry_action": "open_call"})         == {"hold_assigned_stock": False, "entry_action": "open_call"}
+def test_the_deploy_report_does_not_call_a_carried_key_not_applied():
+    assert reportable_backtest_only({"hold_assigned_stock": True, "entry_action": "open_call",
+                                     "hold_assigned_stock_tags": [3]}) == {
+        "entry_action": "open_call"}
+    assert reportable_backtest_only({"entry_action": None, "unknown_row": None}) == {
+        "unknown_row": None}
     assert reportable_backtest_only(None) == {} and reportable_backtest_only({}) == {}
+
+
+def test_a_legacy_payload_policy_is_recovered_from_backtest_only():
+    assert legacy_hold_settings({"hold_assigned_stock": True,
+                                 "hold_assigned_stock_tags": None,
+                                 "entry_action": "x"}) == {"hold_assigned_stock": True}
+    assert legacy_hold_settings({"hold_assigned_stock": False}) == {"hold_assigned_stock": False}
+    assert legacy_hold_settings({"hold_assigned_stock_tags": [3, 7]}) == {
+        "hold_assigned_stock_tags": [3, 7]}
+    assert legacy_hold_settings(None) == {} and legacy_hold_settings({}) == {}

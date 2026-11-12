@@ -292,7 +292,7 @@ def test_yield_curve_and_sahm_inputs_are_actually_wired():
         },
         "index_closes": pd.Series(range(1, 301), dtype=float),
     }
-    regime = e._build_regime(bundle, {})
+    regime = e._build_regime(bundle, {"yc_scale": 0.5})
     used = set(regime["components"])
     for key in ("yield_curve", "sahm", "credit"):
         assert key in used, f"{key} never contributes (dead macro input)"
@@ -526,8 +526,27 @@ def test_gather_fetches_estimator_inputs_only_when_use_model_target_is_on():
     # use_model_target ON: now the exploding fake IS reached -- prove it's actually wired,
     # not merely untested, by asserting the AssertionError surfaces.
     e._gather_use_model_target = True
+    e._gather_model_target_method = "reported"
     with pytest.raises(AssertionError, match="get_past_earnings called"):
         e._gather(providers, as_of=NOW)
+
+    # An estimate-based method in a backtest: the provider refuses (hermetic FMP), and the expert propagates it.
+    from ba2_experts.analyst_target_model import EstimatesNotPointInTime
+    from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+
+    class _Refusing(ExplodingDetails):
+        def get_past_earnings(self, *a, **k):
+            return {"earnings": []}
+
+        def get_earnings_estimates(self, symbol, frequency, as_of_date, **k):
+            refuse_if_not_point_in_time(as_of_date, hermetic=True, what="fake FMP")
+
+    refusing = _Refusing()
+    providers2 = LiveProviderBundle(lambda cat, name, **kw: {"fundamentals_details": refusing, "ohlcv": FakeOHLCV(),
+                                                             "indicators": FakeMacro()}.get(cat))
+    e._gather_model_target_method = "forward"
+    with pytest.raises(EstimatesNotPointInTime):
+        e._gather(providers2, as_of=NOW)
 
 
 # --------------------------------------------------------------------------- #

@@ -12,7 +12,7 @@ never report 100% by dropping unavailable rows." (spec section 8)
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -31,6 +31,15 @@ __all__ = [
     "CAPABILITY_TITLES",
     "CAPABILITY_OPTION_SELECTION",
     "OPTION_STAGE_ROWS",
+    "DECISION_STAGE_ROWS",
+    "STAGE_SELECTION",
+    "STAGE_RULES_AND_SIZING",
+    "STAGE_EXECUTION",
+    "STAGE_DECISION_RULES",
+    "STAGE_DECISION_SIZING",
+    "STAGE_DECISION_TPSL",
+    "STAGE_DECISION_ORDER",
+    "STAGE_DECISION_SUBMIT",
     "STATUS_ORDER",
 ]
 
@@ -40,6 +49,7 @@ __all__ = [
 STATUS_ORDER: Tuple[str, ...] = (
     ReplayStatus.COVERAGE_MATCH,
     ReplayStatus.COVERAGE_DIFFERENCE,
+    ReplayStatus.COVERAGE_CODE_DRIFT,
     ReplayStatus.COVERAGE_MISSING_CAPTURE,
     ReplayStatus.COVERAGE_MISSING_HISTORY,
     ReplayStatus.COVERAGE_REVISION_UNKNOWN,
@@ -122,10 +132,14 @@ CAPABILITY_CAVEATS: Dict[str, str] = {
 #: recorded provider returns, and a historical row when it was rebuilt from a pinned
 #: cache root -- the first proves the mapping, the second measures reconstruction
 #: drift. Only the capability that actually ran fills the row in ITS report.
+STAGE_SELECTION = "Selection"
+STAGE_RULES_AND_SIZING = "Rules and sizing"
+STAGE_EXECUTION = "Execution"
+
 STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
-    ("Selection",
+    (STAGE_SELECTION,
      "Candidate coverage, filters, ranked order, selected/held symbols",
-     ()),
+     (ReplayStatus.CAPABILITY_DECISION,)),
     ("Expert inputs",
      "Normalized _gather bundle rebuilt from the recorded provider returns "
      "(gather tape) or from a pinned historical cache root (historical)",
@@ -133,13 +147,49 @@ STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("Recommendation",
      "Skip reason, signal, confidence, expected profit, current price, target",
      (ReplayStatus.CAPABILITY_RECORDED_EXPERT, ReplayStatus.CAPABILITY_HISTORICAL)),
-    ("Rules and sizing",
+    (STAGE_RULES_AND_SIZING,
      "Branch, eligibility, operands/budget, intended side/quantity, TP/SL",
-     ()),
-    ("Execution",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_EXECUTION,
      "Submit attempts/rejections, partial/full fills, final active protection",
-     ()),
+     (ReplayStatus.CAPABILITY_DECISION,)),
 )
+
+#: The stock decision-pass replay's finer stage rows (shown only on a ``decision`` report; the three
+#: coarse rows above are their roll-up). Comparison is EXACT at every stage; a numeric difference carries
+#: its delta. A row that is about another kind of step (a ``rules`` row has no order build) is
+#: ``not_run`` there, so every row is represented at every stage.
+STAGE_DECISION_RULES = "Decision rules"
+STAGE_DECISION_SIZING = "Decision sizing"
+STAGE_DECISION_TPSL = "Decision TP/SL"
+STAGE_DECISION_ORDER = "Decision order build"
+STAGE_DECISION_SUBMIT = "Decision submit / refusal"
+
+DECISION_STAGE_ROWS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    (STAGE_DECISION_RULES,
+     "Action summaries, every condition evaluation (type, result, the values it read), rule verdicts, "
+     "gate verdicts (open position, equity, route)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_SIZING,
+     "Candidate orders, funded set (symbol, quantity, stop), the RM's decisions (outcome, reason, "
+     "operands, binding constraint) and context figures",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_TPSL,
+     "Take-profit / stop-loss prices handed to the account (submit_order, adjust_tp/sl)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_ORDER,
+     "The main order and transaction the execute built (fields, not ids or timestamps)",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+    (STAGE_DECISION_SUBMIT,
+     "Ordered account effect calls with arguments, action results, the refusal or error",
+     (ReplayStatus.CAPABILITY_DECISION,)),
+)
+
+DECISION_NOT_RUN = (
+    "Smart risk manager passes (LLM reasoning); option entries/exits (replayed by `option-selection`); "
+    "broker fills, rejections and adapter-built protective legs (observations, not decisions); rules "
+    "that read market-data providers (OHLCV / indicators / fundamentals) report `missing_capture` "
+    "until those reads are served from the tape")
 
 
 #: The option selection stage rows (shown only on an ``option_selection`` report). Comparison is
@@ -341,6 +391,9 @@ class ReplayReport:
     #: whether anything tried to leave the machine -- and a reader that has only the
     #: report must be able to see them. Refused if it would overwrite a standard key.
     extra: Dict[str, Any] = field(default_factory=dict)
+    #: ``CodeComparison.to_mapping()`` of recorded vs running code, set by
+    #: :meth:`apply_code_comparison`. ``None`` = the comparison was not made.
+    code_provenance: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------- accessors
     @property
@@ -355,6 +408,28 @@ class ReplayReport:
                 raise ValueError(f"unknown replay status {result.status!r}")
             out[result.status] += 1
         return out
+
+    def apply_code_comparison(self, comparison: Any) -> None:
+        """Record recorded-vs-running code, and relabel results when the code DIFFERS.
+
+        When the running code is provably not the recorded code, a ``difference`` cannot be
+        told from drift, so it is reported as ``code_drift`` -- a distinct status, never merged
+        into ``difference`` (a real parity break on identical code).
+        """
+        self.code_provenance = comparison.to_mapping()
+        if not comparison.drift:
+            return
+        drift = ReplayStatus.COVERAGE_CODE_DRIFT
+        note = "code drift: " + "; ".join(comparison.reasons)
+        self.results = [
+            replace(r, status=drift, detail=(f"{r.detail} [{note}]" if r.detail else note))
+            if r.status == ReplayStatus.COVERAGE_DIFFERENCE else r
+            for r in self.results
+        ]
+        for per_stage in self.stage_results.values():
+            for key, status in per_stage.items():
+                if status == ReplayStatus.COVERAGE_DIFFERENCE:
+                    per_stage[key] = drift
 
     def by_status(self, status: str) -> List[AnalysisResult]:
         return [r for r in self.results if r.status == status]
@@ -375,6 +450,8 @@ class ReplayReport:
         ]
         if self.capability == CAPABILITY_OPTION_SELECTION:
             not_run.append(HISTORICAL_PROVIDER_TITLE)
+        if self.capability == ReplayStatus.CAPABILITY_DECISION:
+            not_run.append(DECISION_NOT_RUN)
         title = (OPTION_CAPABILITY_TITLE if self.capability == CAPABILITY_OPTION_SELECTION
                  else CAPABILITY_TITLES[self.capability])
         caveat = (OPTION_CAVEAT if self.capability == CAPABILITY_OPTION_SELECTION
@@ -398,6 +475,8 @@ class ReplayReport:
         out: List[Tuple[str, str, str, Tuple[str, ...]]] = []
         rows = STAGE_ROWS + (OPTION_STAGE_ROWS
                              if self.capability == CAPABILITY_OPTION_SELECTION else ())
+        if self.capability == ReplayStatus.CAPABILITY_DECISION:
+            rows = rows + DECISION_STAGE_ROWS
         for stage, fields_text, capabilities in rows:
             if self.capability not in capabilities:
                 out.append((stage, fields_text, ReplayStatus.COVERAGE_NOT_RUN, capabilities))
@@ -438,6 +517,14 @@ class ReplayReport:
             f"Generated: {self.generated_at.isoformat()}",
             "",
         ]
+        if self.code_provenance is not None:
+            lines += [f"**Code:** {self.code_provenance['line']}", ""]
+            if self.code_provenance["drift"]:
+                lines += ["**CODE DRIFT:** " + "; ".join(self.code_provenance["reasons"])
+                          + ". Results that differ are labelled `code_drift`, not "
+                          "`difference`: they cannot be told from a parity break "
+                          "until replayed on the recorded code "
+                          "(`ba2-test replay checkout`).", ""]
         lines += self.header_lines()
         lines += ["", "## Totals", "", "| Status | Analyses |", "|---|---:|"]
         for status in STATUS_ORDER:
@@ -458,7 +545,8 @@ class ReplayReport:
                 f"{result.use_case} | {result.recorded_outcome} | {result.status} | "
                 f"{_cell(result.detail)} |")
 
-        differences = self.by_status(ReplayStatus.COVERAGE_DIFFERENCE)
+        differences = (self.by_status(ReplayStatus.COVERAGE_DIFFERENCE)
+                       + self.by_status(ReplayStatus.COVERAGE_CODE_DRIFT))
         if differences:
             lines += ["", "## Field differences", ""]
             for result in differences:
@@ -499,6 +587,8 @@ class ReplayReport:
             ],
             "results": [r.to_mapping() for r in self.results],
         }
+        if self.code_provenance is not None:
+            payload["code"] = self.code_provenance
         overlap = sorted(set(self.extra) & set(payload))
         if overlap:
             raise ValueError(

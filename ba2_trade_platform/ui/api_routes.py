@@ -242,7 +242,7 @@ def process_recommendations(body: ProcessRecommendationsRequest):
                             detail=f"No expert instance with id {body.expert_instance_id}")
     try:
         created = get_trade_manager().process_expert_recommendations_after_analysis(
-            body.expert_instance_id, lookback_days=body.lookback_days) or []
+            body.expert_instance_id, lookback_days=body.lookback_days, trigger="manual") or []
     except Exception as e:  # noqa: BLE001 -- surface the pass's own error, do not swallow it
         logger.error(f"process_recommendations: pass failed for expert "
                      f"{body.expert_instance_id}: {e}", exc_info=True)

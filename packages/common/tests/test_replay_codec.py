@@ -614,3 +614,40 @@ def test_freeze_handles_shared_and_cyclic_references():
     assert snapshot["self"] is snapshot
     shared["n"] = 2
     assert snapshot["shared_a"]["n"] == 1
+
+
+# --------------------------------------------------------------------------- shared values
+
+
+def test_a_shared_value_is_its_own_object_referenced_by_hash_and_decodes_transparently():
+    from ba2_common.core.replay.codec import SharedValue, frame_refs
+
+    row = {"id": 7, "symbol": "AAPL", "when": datetime(2026, 11, 8, 15, 0, tzinfo=timezone.utc)}
+    enc = encode({"rows": [SharedValue(row), SharedValue(dict(row))], "n": 2})
+    assert len(enc.sides) == 1                                   # identical rows: ONE object
+    (side,) = enc.sides
+    assert side.kind == "json" and content_hash(side.kind, side.data) in enc.frame_map()
+    assert frame_refs(enc.kind, enc.data) == (content_hash(side.kind, side.data),)
+    out = decode(enc.kind, enc.data, enc.meta, frames=enc.frame_map())
+    assert out == {"rows": [row, row], "n": 2}
+
+
+def test_a_shared_value_keeps_the_frames_inside_it_and_an_unresolvable_reference_is_an_error():
+    from ba2_common.core.replay.codec import SharedValue
+
+    frame = pd.DataFrame({"a": [1.0, 2.0]})
+    enc = encode({"x": SharedValue({"frame": frame})})
+    out = decode(enc.kind, enc.data, enc.meta, frames=enc.frame_map())
+    pd.testing.assert_frame_equal(out["x"]["frame"], frame)
+    with pytest.raises(KeyError):
+        decode(enc.kind, enc.data, enc.meta, frames={})
+
+
+def test_a_changed_shared_row_is_a_different_object_and_the_payload_is_small():
+    from ba2_common.core.replay.codec import SharedValue
+
+    big = {"data": "x" * 5000}
+    first = encode({"r": SharedValue(big)})
+    second = encode({"r": SharedValue({"data": "x" * 5000, "status": "b"})})
+    assert len(first.data) < 200 and len(first.sides[0].data) > 5000
+    assert content_hash("json", first.sides[0].data) != content_hash("json", second.sides[0].data)

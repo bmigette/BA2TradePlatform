@@ -317,3 +317,73 @@ def test_certificate_check_is_memoized_per_process(_cert_cache, monkeypatch):
     history_source.verify_alpaca_cache_certified(str(_cert_cache))
     monkeypatch.setattr(ver, "read_gate_certificate", lambda meta: pytest.fail("re-verified an unchanged cache"))
     history_source.verify_alpaca_cache_certified(str(_cert_cache))
+
+
+# --- terminal value of a delisting: what the holder received, not the last print ---------------------------------------
+
+def _delist(terminals, rows=ROWS[:3]):
+    acct, ctx, ps = _acct(GONE, rows=rows)
+    acct.set_delisting_terminals(terminals)
+    return acct, ctx, ps
+
+
+def test_worthless_delisting_liquidates_at_zero_not_the_last_close():
+    acct, ctx, ps = _delist({"AAPL": (date(2024, 1, 4), "worthless", 0.0)})
+    try:
+        _hold(acct, ps)
+        cash = acct.get_balance()
+        ps.set_clock(AFTER)
+        assert acct.liquidate_suspended_positions(AFTER) is True
+        acct.refresh_transactions()
+        assert acct.get_positions() == [] and acct.get_balance() == pytest.approx(cash)      # nothing came back
+        (trade,) = acct.get_round_trip_trades()
+        assert trade["exit_reason"] == "delisting_worthless" and trade["exit_price"] == 0.0
+        assert trade["pnl"] == pytest.approx(-10 * 100.0)                                    # the whole stake
+        assert acct.delisting_exit_counts == {"worthless": 1}
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_cash_merger_delisting_liquidates_at_the_deal_price():
+    acct, ctx, ps = _delist({"AAPL": (date(2024, 1, 4), "cash_merger", 152.5)})
+    try:
+        _hold(acct, ps)
+        cash = acct.get_balance()
+        ps.set_clock(AFTER)
+        acct.liquidate_suspended_positions(AFTER)
+        acct.refresh_transactions()
+        assert acct.get_balance() == pytest.approx(cash + 10 * 152.5)
+        (trade,) = acct.get_round_trip_trades()
+        assert trade["exit_reason"] == "delisting_cash_merger" and trade["exit_price"] == pytest.approx(152.5)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_unknown_or_other_session_terminal_falls_back_to_the_last_close_and_is_counted():
+    for terminals in ({}, {"AAPL": (date(2024, 1, 4), "stock_merger", None)},
+                      {"AAPL": (date(2023, 6, 1), "worthless", 0.0)}):          # a terminal of ANOTHER delisting is not this one's
+        acct, ctx, ps = _delist(terminals)
+        try:
+            _hold(acct, ps)
+            ps.set_clock(AFTER)
+            acct.liquidate_suspended_positions(AFTER)
+            acct.refresh_transactions()
+            (trade,) = acct.get_round_trip_trades()
+            assert trade["exit_reason"] == "delisting_liquidation" and trade["exit_price"] == pytest.approx(150.0)
+            assert sum(acct.delisting_exit_counts.values()) == 1 and "worthless" not in acct.delisting_exit_counts
+        finally:
+            ctx.__exit__(None, None, None)
+
+
+def test_a_temporary_suspension_never_uses_a_terminal_value():
+    acct, ctx, ps = _acct(EVENTS)
+    try:
+        acct.set_delisting_terminals({"AAPL": (date(2024, 1, 4), "worthless", 0.0)})
+        _hold(acct, ps)
+        ps.set_clock(AFTER)
+        acct.liquidate_suspended_positions(AFTER)
+        acct.refresh_transactions()
+        (trade,) = acct.get_round_trip_trades()
+        assert trade["exit_reason"] == "suspension_liquidation" and trade["exit_price"] == pytest.approx(150.0)
+    finally:
+        ctx.__exit__(None, None, None)

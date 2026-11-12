@@ -73,7 +73,7 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 from matrix_flags import (  # noqa: E402
     finish_matrix, note_job_exit,
-    add_history_source_flag, cap_passthrough, decision_times_plan, decision_times_split, decision_times_tokens,
+    add_estimates_source_flag, add_history_source_flag, estimates_source_of, cap_passthrough, estimates_source_tokens, with_estimates_source_name, decision_times_plan, decision_times_split, decision_times_tokens,
     history_source_tokens,
     job_name_with_digest, screener_dry_run_universe_note, with_decision_times_name, with_history_source_name,
     with_universe_rule_name)
@@ -98,6 +98,11 @@ _PLACEHOLDER_UNIVERSE = ("AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD
 # settle lower than the truth. That biases one gene, not the run.
 _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "DeterministicScorer"]
 _RANKER = "FactorRanker"
+# goal2027 design 2026-11-10 part 4: PullbackReversion (long only) runs on the cap bands like a classic expert, but
+# only when --pullback-strategies names its strategies (opt-in per invocation: the shared strategy plan is also read
+# by other grids, so it is not extended, and every existing command runs exactly the jobs it ran before). It needs
+# no per-band data exclusion.
+_PULLBACK_EXPERT = "PullbackReversion"
 # goal2027 runs Senate INSIDE the grid (owner 2026-11-02: no separate Senate grid). Its cells live on
 # the pseudo-band ``senate``: a STATIC disclosure-derived universe (--senate-universe-file), not a
 # cap-band screen -- congressional trades are too sparse per symbol to split by cap. Only Senate runs
@@ -173,16 +178,71 @@ _STRATEGY_BUDGET_OVERRIDE = {
 }
 
 
-def market_condition_passthrough(args) -> list:
+#: Strategies whose rule shape is IMPLIED by the key (the launcher's ``_IMPLIED_RULE_SHAPE``, pinned by test): S8 = S6 + SPY
+#: regime split ``all`` + rsi/spy exits, S9 = the same with split scope ``entry``. They are never given
+#: ``--regime-split-entry`` here (the launcher refuses a contradicting scope and the key already says it).
+IMPLIED_SHAPE_STRATEGIES = frozenset({"S8", "S9"})
+
+#: ``--late-strategy`` choices, in GRID ORDER: S9 cells run after every other cell, S8 cells run last of all, so the owner can
+#: still veto them. They run from the plan's ``late_strategies`` section ({strategy: [experts]}), never from ``experts``.
+LATE_STRATEGY_ORDER = ("S9", "S8")
+
+#: ``--market-exit-per-strategy``: the market-exit kinds ADDED to ``--market-exit`` for these strategies (S1/S2 gain the
+#: RSI-recovery close, S6 also the SPY-below-200 stop). Any other strategy keeps ``--market-exit`` as given, and S8/S9
+#: imply rsi+spy in the launcher, so they are absent here.
+MARKET_EXIT_EXTRA_BY_STRATEGY = {"S1": ("rsi",), "S2": ("rsi",), "S6": ("rsi", "spy")}
+
+
+def market_exit_for(args, strat) -> "str | None":
+    """The ``--market-exit`` value a job of strategy ``strat`` carries: ``args.market_exit``, widened by
+    ``MARKET_EXIT_EXTRA_BY_STRATEGY`` under ``--market-exit-per-strategy`` (canonical kind order)."""
+    base = getattr(args, "market_exit", None)
+    if not base or not getattr(args, "market_exit_per_strategy", False) or strat not in MARKET_EXIT_EXTRA_BY_STRATEGY:
+        return base
+    from ba2_common.core.market_condition_templates import ALL_MARKET_EXIT_KINDS
+
+    wanted = {t.strip() for t in base.split(",") if t.strip()} | set(MARKET_EXIT_EXTRA_BY_STRATEGY[strat])
+    return ",".join(k for k in ALL_MARKET_EXIT_KINDS if k in wanted)
+
+
+def market_exit_name_token(args, strat) -> str:
+    """``-mx-<kinds>`` (the grid's existing token) when this job's kinds differ from ``--market-exit`` as given, else ''."""
+    kinds = market_exit_for(args, strat)
+    return f"-mx-{kinds.replace(',', '_')}" if kinds != getattr(args, "market_exit", None) else ""
+
+
+def load_late_strategy_experts(path, strategy) -> list:
+    """The experts the plan's ``late_strategies`` section runs ``strategy`` for. Refused, not guessed: no such section,
+    an unknown strategy, an expert the driver does not know."""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if "late_strategies" not in doc:
+        raise SystemExit(f"--late-strategy {strategy}: {path} has no 'late_strategies' section")
+    late = doc["late_strategies"]
+    bad = sorted(set(late) - IMPLIED_SHAPE_STRATEGIES)
+    if bad:
+        raise SystemExit(f"--strategy-plan {path}: late_strategies has unsupported strategies {bad}")
+    if strategy not in late:
+        raise SystemExit(f"--late-strategy {strategy}: {path} lists no experts for it under late_strategies")
+    experts = list(late[strategy])
+    unknown = sorted(set(experts) - set(_CLASSIC))
+    if not experts or unknown or len(set(experts)) != len(experts):
+        raise SystemExit(f"--strategy-plan {path}: late_strategies {strategy} has an empty, repeated or unknown "
+                         f"expert list {experts} (classic experts: {_CLASSIC})")
+    return experts
+
+
+def market_condition_passthrough(args, strat=None) -> list:
     """Extra `optimize` CLI tokens for the goal2027atr market-condition flags ([] when none of
-    the five is given, so an ordinary invocation of this driver is untouched)."""
+    the five is given, so an ordinary invocation of this driver is untouched). ``strat`` selects the
+    per-strategy ``--market-exit`` kinds (``--market-exit-per-strategy``)."""
     out: list = []
     if getattr(args, "market_condition_profile", None):
         out += ["--market-condition-profile", args.market_condition_profile]
     if getattr(args, "market_condition_manifest", None):
         out += ["--market-condition-manifest", args.market_condition_manifest]
     if getattr(args, "market_exit", None):
-        out += ["--market-exit", args.market_exit]
+        out += ["--market-exit", market_exit_for(args, strat)]
     if getattr(args, "market_condition_mode", None) and args.market_condition_mode != "searched":
         out += ["--market-condition-mode", args.market_condition_mode]
     if getattr(args, "search_sl_loosen", False):
@@ -227,7 +287,7 @@ EXPLORATION_RANGE_PAIRS = {
 
 
 #: The strategies whose entry rules carry the SPY regime gates (the launcher's ``_EQUITY_MARKET_CONDITION_STRATEGIES``).
-SPY_GATE_STRATEGIES = frozenset({"S1", "S2", "S3", "S4", "S5", "S6", "S7"})
+SPY_GATE_STRATEGIES = frozenset({"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"})
 
 
 def benchmark_regime_tokens(args, strat) -> list:
@@ -236,6 +296,25 @@ def benchmark_regime_tokens(args, strat) -> list:
     launcher, so neither is given the flag (the caller prints a NOTE)."""
     if getattr(args, "benchmark_regime_gates", False) and strat in SPY_GATE_STRATEGIES:
         return ["--benchmark-regime-gates"]
+    return []
+
+
+def pullback_gate_tokens(args, strat) -> list:
+    """`--pullback-gates` for an S1-S7 job when the matrix searches the per-symbol pullback entry gates (goal2027 design
+    2026-11-10 part 3), else []. A bypass job (``strat is None``) has no entry rules and SQM takes no such genes: both
+    are refused by the launcher, so neither is given the flag (the caller prints a NOTE)."""
+    if getattr(args, "pullback_gates", False) and strat in SPY_GATE_STRATEGIES:
+        return ["--pullback-gates"]
+    return []
+
+
+def regime_split_tokens(args, strat) -> list:
+    """`--regime-split-entry SCOPE` for an S1-S7 job when the matrix splits the entry rules by the SPY 200-day regime
+    (goal2027 design 2026-11-10 down-market follow-up), else []. Same scope as the SPY gates it pins; a bypass job
+    (``strat is None``) and SQM are given nothing (the caller prints a NOTE)."""
+    scope = getattr(args, "regime_split_entry", None)
+    if scope and strat in SPY_GATE_STRATEGIES and strat not in IMPLIED_SHAPE_STRATEGIES:   # S8/S9 imply their own scope
+        return ["--regime-split-entry", scope]
     return []
 
 
@@ -371,7 +450,7 @@ def _completed_names() -> set:
 
 
 def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix="",
-          strategy_plan=None):
+          strategy_plan=None, pullback_strategies=()):
     """Yield (name, expert, strategy_or_None, band) in priority order.
 
     ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
@@ -434,6 +513,9 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
                 if EXPERT_ONLY_STRATEGIES.get(s, expert) != expert:
                     continue  # e.g. SQM is DeterministicScorer's recipe only
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
+        if pullback_strategies and _eligible(band, _PULLBACK_EXPERT):
+            for s in pullback_strategies:
+                yield (f"scr-{band}-{_PULLBACK_EXPERT}-{s}{name_suffix}", _PULLBACK_EXPERT, s, band)
         if _RANKER not in skip_experts:
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
 
@@ -495,7 +577,7 @@ def _parse_stress_spread(spec: str) -> dict:
             raise SystemExit(f"--stress-spread-bps: {band}={val!r} is not a number")
     return {b: v for b, v in out.items() if v > 0}
 
-_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "SQM"}
+_KNOWN_STRATEGIES = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "SQM"}   # S8/S9 run only via --late-strategy
 
 
 def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
@@ -636,8 +718,18 @@ def main() -> int:
                     help="Forward --market-condition-manifest to every job. Folds into the "
                          "job's name digest.")
     ap.add_argument("--market-exit", default=None, metavar="KIND[,KIND...]",
-                    help="Forward --market-exit to every job (equity S1-S7 only; requires "
-                         "--market-condition-profile). Folds into the job's name digest.")
+                    help="Forward --market-exit to every job (equity S1-S7 only; kinds exit,stop,tp,rsi,spy: "
+                         "exit/stop/tp require --market-condition-profile, spy requires --benchmark-regime-gates, "
+                         "rsi needs neither). Folds into the job's name digest.")
+    ap.add_argument("--market-exit-per-strategy", action="store_true", default=False,
+                    help="Widen --market-exit per strategy (MARKET_EXIT_EXTRA_BY_STRATEGY): S1/S2 add rsi, S6 adds rsi,spy; "
+                         "every other strategy keeps --market-exit as given. A job whose kinds differ carries the "
+                         "'-mx-<kinds>' name token. REQUIRES --market-exit and --benchmark-regime-gates.")
+    ap.add_argument("--late-strategy", default=None, choices=LATE_STRATEGY_ORDER,
+                    help="Run ONLY this implied-shape strategy (S9 = S6 + split scope entry, S8 = split scope all; both "
+                         "with rsi+spy exits) for the experts the --strategy-plan's 'late_strategies' section lists, instead "
+                         "of the plan's regular strategies. Grid order: every other cell first, then S9, then S8. REQUIRES "
+                         "--strategy-plan and --benchmark-regime-gates.")
     ap.add_argument("--market-condition-mode", default=None, choices=("searched", "all-off"),
                     help="Forward --market-condition-mode to every job ('searched' is the "
                          "launcher default and is NOT forwarded, so it never folds into the "
@@ -677,6 +769,7 @@ def main() -> int:
                          "says so).")
     ap.add_argument("--interval", default="5min")
     add_history_source_flag(ap)
+    add_estimates_source_flag(ap)
     ap.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
                          "level (widens LIMIT/TP trigger thresholds + degrades MARKET/STOP fill "
@@ -727,6 +820,19 @@ def main() -> int:
                     help="Search the SPY regime ENTRY gates (spy-trend, spy-vol mode genes with an off value; goal2027 "
                          "2.3) on every S1-S7 job. REQUIRES --name-suffix to contain 'spyreg'. Not forwarded to the "
                          "FactorRanker job (bypass) or SQM (no SPY genes).")
+    ap.add_argument("--pullback-strategies", default="",
+                    help="Comma list of S1-S7 strategies to run PullbackReversion (long only; goal2027 design "
+                         "2026-11-10 part 4) with on every cap band, e.g. 'S2'. Default empty = the expert is not run. "
+                         "'--skip-experts PullbackReversion' drops it again.")
+    ap.add_argument("--pullback-gates", action="store_true", default=False,
+                    help="Search the per-symbol PULLBACK entry gates (RSI 2-5, below the 20-day high, price vs SMA200; "
+                         "each with an off value; goal2027 design 2026-11-10 part 3) on every S1-S7 job. REQUIRES "
+                         "--name-suffix to contain 'pullback'. Not forwarded to the FactorRanker job (bypass) or SQM.")
+    ap.add_argument("--regime-split-entry", default=None, choices=("context", "entry", "all"), metavar="SCOPE",
+                    help="Split every S1-S7 entry rule into a SPY-above-200 rule and a SPY-below-200 rule with their "
+                         "own '-dn' genes (launcher --regime-split-entry; SCOPE context|entry|all). REQUIRES "
+                         "--benchmark-regime-gates and --name-suffix to contain 'regsplit'. Not forwarded to the "
+                         "FactorRanker job (bypass) or SQM. Absent = today's commands.")
     ap.add_argument("--search-exploration-ranges", action="store_true", default=False,
                     help="Widen the time-exit lattices and add the FMPEarningsDrift S5 time exit so every "
                          "exploration phase-1 timeout and its control is searchable (goal2027 item 2.9). REQUIRES "
@@ -793,6 +899,12 @@ def main() -> int:
                          "the small band (BID, GRSD, HCAC, OGG, SHOT, TRIB, VII) and the large band "
                          "(FITB-PA) of the 2026-10-07 store until their bars are fetched.")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--print-commands", action="store_true",
+                    help="With --dry-run: also print each job's full launcher command.")
+    ap.add_argument("--launcher-arg", action="append", default=[], metavar="--FLAG=VALUE",
+                    help="Append this token verbatim to EVERY launched optimize command (repeatable), e.g. "
+                         "--launcher-arg=--seed-genomes=seeds.json --launcher-arg=--initial-capital=1000. It is part "
+                         "of the driver argv, so it changes the job-name digest like any other flag.")
     # ----------------------------------------------------------------------------------------
     # goal2027 walk-forward (docs/plans/2026-10-25-goal2027-walk-forward-plan.md). Every flag below
     # except --walk-forward itself is REFUSED without --walk-forward, and the pass thresholds, the
@@ -898,6 +1010,39 @@ def main() -> int:
         ap.error(f"--benchmark-regime-gates requires --name-suffix to contain 'spyreg' (got {args.name_suffix!r}): its "
                  f"gene space differs from an ungated run's, so it must not share a job name. "
                  f"Example: --name-suffix goal2027-spyreg")
+    _pb_strats = [t.strip() for t in args.pullback_strategies.split(",") if t.strip()]
+    _bad_pb = sorted(set(_pb_strats) - ((SPY_GATE_STRATEGIES - IMPLIED_SHAPE_STRATEGIES) | {"SQM"}))
+    if _bad_pb or "SQM" in _pb_strats or len(set(_pb_strats)) != len(_pb_strats):
+        ap.error(f"--pullback-strategies {args.pullback_strategies!r}: unknown, repeated or unsupported strategies "
+                 f"(allowed: {sorted(SPY_GATE_STRATEGIES)})")
+    if args.pullback_gates and "pullback" not in args.name_suffix.replace("_", "").lower():
+        ap.error(f"--pullback-gates requires --name-suffix to contain 'pullback' (got {args.name_suffix!r}): its "
+                 f"gene space differs from an ungated run's, so it must not share a job name. "
+                 f"Example: --name-suffix goal2027-pullback")
+    if args.market_exit:
+        from ba2_common.core.market_condition_templates import ALL_MARKET_EXIT_KINDS, MARKET_EXIT_KINDS
+        _mx = [t.strip() for t in args.market_exit.split(",") if t.strip()]
+        if not _mx or set(_mx) - set(ALL_MARKET_EXIT_KINDS) or len(set(_mx)) != len(_mx):
+            ap.error(f"--market-exit {args.market_exit!r}: takes distinct kinds from {','.join(ALL_MARKET_EXIT_KINDS)}")
+        if "spy" in _mx and not args.benchmark_regime_gates:
+            ap.error("--market-exit spy requires --benchmark-regime-gates (the rule reads the SPY regime that flag publishes)")
+        if set(_mx) & set(MARKET_EXIT_KINDS) and not args.market_condition_profile:
+            ap.error("--market-exit exit/stop/tp require --market-condition-profile (the rules read market conditions)")
+    if args.market_exit_per_strategy and not (args.market_exit and args.benchmark_regime_gates):
+        ap.error("--market-exit-per-strategy requires --market-exit and --benchmark-regime-gates (S6 gains the spy stop)")
+    if args.late_strategy:
+        if not (args.strategy_plan and args.benchmark_regime_gates):
+            ap.error(f"--late-strategy {args.late_strategy} requires --strategy-plan and --benchmark-regime-gates "
+                     f"(the key's split and spy stop read the SPY regime)")
+        if args.pullback_strategies.strip():
+            ap.error("--late-strategy runs the plan's late strategies only; drop --pullback-strategies")
+    if args.regime_split_entry:
+        if not args.benchmark_regime_gates:
+            ap.error("--regime-split-entry requires --benchmark-regime-gates (it pins the SPY trend leaf that flag adds)")
+        if "regsplit" not in args.name_suffix.replace("_", "").lower():
+            ap.error(f"--regime-split-entry requires --name-suffix to contain 'regsplit' (got {args.name_suffix!r}): "
+                     f"its gene space differs from an unsplit run's, so it must not share a job name. "
+                     f"Example: --name-suffix goal2027-regsplit-context")
     if args.search_market_profile:
         _need = ("ohlcv-v1", "ta-structure-v1")
         _profiles = [t.strip() for t in (args.market_condition_profile or "").split(",") if t.strip()]
@@ -971,12 +1116,21 @@ def main() -> int:
 
     skip_experts = frozenset(e.strip() for e in args.skip_experts.split(",") if e.strip())
     strategy_plan = None
-    if args.strategy_plan:
+    if args.late_strategy:
+        # ONLY the late strategy's experts, ONLY that strategy: every other expert (and the bypass / Senate / pullback
+        # jobs) is skipped, and the regular plan is not consulted.
+        _late_experts = load_late_strategy_experts(args.strategy_plan, args.late_strategy)
+        skip_experts = skip_experts | (set(_CLASSIC) | {_RANKER, _SENATE, _PULLBACK_EXPERT}) - set(_late_experts)
+        strategy_plan = {e: [args.late_strategy] for e in _late_experts}
+        print(f"late strategy {args.late_strategy} (plan {args.strategy_plan}): "
+              + "; ".join(f"{e} {args.late_strategy}" for e in _late_experts))
+    elif args.strategy_plan:
         strategy_plan = load_strategy_plan(args.strategy_plan, skip_experts)
         print(f"strategy plan {args.strategy_plan}: "
               + "; ".join(f"{e} {','.join(s)}" for e, s in sorted(strategy_plan.items())))
+    pullback_strategies = tuple(t.strip() for t in args.pullback_strategies.split(",") if t.strip())
     jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix,
-                      strategy_plan))
+                      strategy_plan, pullback_strategies))
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies="
           f"{'per --strategy-plan' if strategy_plan else strategies}); "
@@ -990,6 +1144,9 @@ def main() -> int:
     if args.walk_forward:
         WF, WFC = _wf_import()
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
+        # --market-exit-per-strategy: a job whose kinds differ from --market-exit carries them in its name, so it never
+        # resumes a job built with other kinds.
+        name = name + market_exit_name_token(args, strat)
         # The decision-time gene reaches every classic job. The FactorRanker (bypass) job has no
         # schedule genes: it keeps its plain name and the fixed default time, announced here.
         job_dt_times = None if strat is None else args.decision_times_resolved
@@ -1005,6 +1162,7 @@ def main() -> int:
             name = with_universe_rule_name(name, simulated=strat is not None)   # FactorRanker (bypass): no gate
         # The OHLCV history is part of the job's identity too (an alpaca job never resumes an fmp one).
         name = with_history_source_name(name, args.ohlcv_history_source)
+        name = with_estimates_source_name(name, estimates_source_of(args, __file__))
         # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
         # visible in the log instead of being inferred later from a suspiciously late first trade.
         job_start = _start_for(expert, args.start)
@@ -1049,6 +1207,7 @@ def main() -> int:
                # window and bucket empty calendar years into the consistency fitness.
                "--start", job_start, "--end", job_end, "--fitness", args.fitness,
                "--interval", args.interval, *history_source_tokens(args.ohlcv_history_source),
+               *estimates_source_tokens(estimates_source_of(args, __file__)),
                "--population", str(population),
                "--generations", str(generations),
                # (screener jobs only; the token ORDER is unchanged so existing name digests hold)
@@ -1089,6 +1248,7 @@ def main() -> int:
             cmd += ["--no-robust-fitness"]
         if args.spread_bps and args.spread_bps > 0:
             cmd += ["--spread-bps", str(args.spread_bps)]
+        cmd += list(args.launcher_arg)
         # Auto-labels for easy filtering (GET /api/backtests?label=...): one tag for the grid/
         # batch id (--name-suffix, e.g. "goal5"), one for the strategy (or expert, for the
         # bypass FactorRanker job which has no strategy). Every top-N Backtest this job persists
@@ -1106,7 +1266,7 @@ def main() -> int:
         # ordinary invocation's cmd (and therefore its name/digest below) is byte-identical to
         # before this block existed. Appended LAST so it never displaces an existing token's
         # position for a job with no new flags.
-        mc_tokens = market_condition_passthrough(args)
+        mc_tokens = market_condition_passthrough(args, strat)
         cmd += mc_tokens
         # --exclude-symbols: appended after the market-condition tokens (same "never displaces an
         # existing token's position" reasoning). It ALSO triggers the digest on its own (see
@@ -1158,6 +1318,18 @@ def main() -> int:
         if args.benchmark_regime_gates and not spy_tokens:
             print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no SPY regime gate, flag not applied",
                   flush=True)
+        # --pullback-gates (goal2027 part 3): appended after the SPY gates; digest on its own. Same scope as the SPY gates.
+        pb_tokens = pullback_gate_tokens(args, strat)
+        cmd += pb_tokens
+        if args.pullback_gates and not pb_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no pullback gate, flag not applied",
+                  flush=True)
+        # --regime-split-entry: appended after the pullback gates; digest on its own. Same scope as the SPY gates.
+        rs_tokens = regime_split_tokens(args, strat)
+        cmd += rs_tokens
+        if args.regime_split_entry and not rs_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {strat or 'bypass'} takes no regime split, flag not applied",
+                  flush=True)
         job_name = name
         # The walk-forward budgets and fold spec are part of the cell identity: a changed budget,
         # window, top-N or pass rule must never resume an older cell's -wf/-refit names. Under
@@ -1170,7 +1342,7 @@ def main() -> int:
             str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
             job_name = _job_name(name, ident + wf_tokens)
@@ -1204,6 +1376,9 @@ def main() -> int:
                 _uni_note = screener_dry_run_universe_note(args.store, band, job_start, args.end, args.interval)
             print(f"  {'DONE' if job_name in done else 'TODO'}  {job_name}  "
                   f"({expert} {strat or '(bypass)'} / {band})  [{_uni_note}]")
+            if args.print_commands:
+                import shlex
+                print("    " + shlex.join(cmd))
             continue
         if job_name in _completed_names():   # re-read each loop (resumable)
             _fixed_note = ("; NOTE --decision-times fixed keeps the legacy job name, so this is the "

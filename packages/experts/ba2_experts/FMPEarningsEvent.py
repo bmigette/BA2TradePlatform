@@ -195,6 +195,7 @@ from ba2_common.core.earnings_stamp import (
     EVENT_DATE_KEY,
 )
 from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.knowability import earnings_visible_horizon_days
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ba2_common.core.types import (
     MarketAnalysisStatus, OptionRight, OrderRecommendation, Recommendation, RiskLevel,
@@ -381,6 +382,9 @@ def _split_events(rows: List[Dict[str, Any]], as_of_day: str,
     event is the EARLIEST row in [as_of_day, as_of_day + look_days] -- the event day
     itself counts as 0 days away, matching DaysToEarningsCondition's inclusive bound.
     """
+    # KNOWABILITY: a report date is public only ~2-6 weeks ahead (knowability.py), so the
+    # window is capped at EARNINGS_ANNOUNCE_HORIZON_DAYS whatever the setting says.
+    look_days = earnings_visible_horizon_days(look_days)
     horizon = (_parse_day(as_of_day) + timedelta(days=look_days)).strftime("%Y-%m-%d")
     past: List[Dict[str, Any]] = []
     upcoming: List[Dict[str, Any]] = []
@@ -648,7 +652,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
         # so asking to the HORIZON is what makes the already-scheduled upcoming print
         # visible at all (the same trick DaysToEarningsCondition uses). The past/future
         # split is done in _process via _split_events -- see the module docstring.
-        horizon = now + timedelta(days=look_days)
+        horizon = now + timedelta(days=earnings_visible_horizon_days(look_days))
         earnings = past_earnings_get(
             providers.fundamentals_details(), symbol, as_of=horizon,
             frequency="quarterly", lookback_periods=_CALENDAR_PERIODS, format_type="dict")

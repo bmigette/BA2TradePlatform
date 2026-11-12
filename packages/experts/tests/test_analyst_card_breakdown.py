@@ -28,7 +28,7 @@ _CONSENSUS = {"targetConsensus": 130.0, "targetHigh": 160.0,
 _UPGRADE = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
 _NOW = datetime.now(timezone.utc)
 _TARGET_HISTORY = [
-    {"publishedDate": (_NOW - timedelta(days=d)).strftime("%Y-%m-%d"), "priceTarget": p}
+    {"publishedDate": (_NOW - timedelta(days=d)).strftime("%Y-%m-%d"), "priceTarget": p, "adjPriceTarget": p}
     for d, p in ((10, 110.0), (11, 124.0), (12, 128.0), (13, 128.0), (14, 160.0))
 ]
 
@@ -81,7 +81,7 @@ def test_the_price_target_set_is_a_table_with_the_percent_from_current(fmp_expor
     assert table["Current price"] == "$100.00"
 
 
-def test_a_missing_price_target_is_reported_as_n_a_not_as_zero(monkeypatch):
+def test_live_consensus_high_comes_from_the_adjusted_rows_not_the_vendor_snapshot(monkeypatch):
     monkeypatch.setattr(FMPRating, "_fetch_price_target_consensus",
                         lambda self, symbol: {"targetConsensus": 130.0,
                                               "targetLow": 110.0})
@@ -93,8 +93,7 @@ def test_a_missing_price_target_is_reported_as_n_a_not_as_zero(monkeypatch):
     result = FMPRating.export_symbol_data("AAPL", overrides=_FMP_SETTINGS)
     assert result.error is None, result.error
     table = _tbl(_row(result, "Consensus price target"))
-    assert table["High"] == "n/a"
-    assert "$0.00" not in table["High"]
+    assert table["High"].startswith("$160.00")
 
 
 def test_the_long_derivation_is_still_carried_as_multi_line_steps(fmp_export):

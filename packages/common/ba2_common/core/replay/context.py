@@ -23,6 +23,7 @@ import contextvars
 import functools
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -101,11 +102,55 @@ class CaptureHealth:
     DISK_ERROR = "disk_error"
     UNSUPPORTED_TYPE = "unsupported_type"
     OTHER = "other"
-    KINDS = (QUEUE_SATURATION, DISK_ERROR, UNSUPPORTED_TYPE, OTHER)
+    #: A stock decision pass whose scope could not be opened (no session, expert/account lookup
+    #: failed, the scope itself failed): the pass RAN, nothing of it was recorded.
+    PASS_NOT_RECORDED = "pass_not_recorded"
+    #: A pass that ended before it was a decision (lock miss, pending analysis jobs): nothing is
+    #: written on purpose, but it is counted -- per reason in :meth:`discards` -- so a regression
+    #: that discards real passes shows up as a rate.
+    PASS_DISCARDED = "pass_discarded"
+    #: A decision STEP (rules / size / execute / pass_state) whose record could not be built or
+    #: written; the pass itself carries ``capture_failures`` and the step is named in its summary.
+    STEP_NOT_RECORDED = "step_not_recorded"
+    KINDS = (QUEUE_SATURATION, DISK_ERROR, UNSUPPORTED_TYPE, OTHER,
+             PASS_NOT_RECORDED, PASS_DISCARDED, STEP_NOT_RECORDED)
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counts: Dict[str, int] = {kind: 0 for kind in self.KINDS}
+        self._discards: Dict[str, int] = {}
+        self._discards_by_expert: Dict[str, int] = {}
+
+    def record_discard(self, reason: str, expert_class: Optional[str] = None) -> None:
+        """Count a discarded pass under ``reason`` (also bumps :data:`PASS_DISCARDED`).
+
+        ``expert_class`` (the owning expert of the pass) additionally feeds the per-expert tally.
+        """
+        with self._lock:
+            self._counts[self.PASS_DISCARDED] += 1
+            self._discards[reason] = self._discards.get(reason, 0) + 1
+            if expert_class:
+                self._discards_by_expert[expert_class] = self._discards_by_expert.get(expert_class, 0) + 1
+
+    def discards_by_expert(self) -> Dict[str, int]:
+        """Discarded passes by the owning expert class (passes with no named expert are not here)."""
+        with self._lock:
+            return dict(self._discards_by_expert)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Everything the health surfaces show, taken under one lock: counters, discards, failure total."""
+        with self._lock:
+            return {
+                "counters": dict(self._counts),
+                "discards": dict(self._discards),
+                "discards_by_expert": dict(self._discards_by_expert),
+                "total_failures": sum(c for k, c in self._counts.items() if k != self.PASS_DISCARDED),
+            }
+
+    def discards(self) -> Dict[str, int]:
+        """Discarded passes by reason."""
+        with self._lock:
+            return dict(self._discards)
 
     def record(self, kind: str) -> None:
         if kind not in self._counts:
@@ -134,9 +179,22 @@ class CaptureHealth:
         return self.count(self.OTHER)
 
     @property
+    def pass_not_recorded(self) -> int:
+        return self.count(self.PASS_NOT_RECORDED)
+
+    @property
+    def pass_discarded(self) -> int:
+        return self.count(self.PASS_DISCARDED)
+
+    @property
+    def step_not_recorded(self) -> int:
+        return self.count(self.STEP_NOT_RECORDED)
+
+    @property
     def total(self) -> int:
+        """Failures counted (a DISCARDED pass is an accounted-for outcome, not a failure)."""
         with self._lock:
-            return sum(self._counts.values())
+            return sum(count for kind, count in self._counts.items() if kind != self.PASS_DISCARDED)
 
     def as_dict(self) -> Dict[str, int]:
         with self._lock:
@@ -224,6 +282,12 @@ class CaptureContext:
         self._skip_reason: Optional[str] = None
         self._error: Optional[str] = None
         self._error_logged = False
+        self._discard_reason: Optional[str] = None
+        #: Stock decision pass only: per-symbol verdicts the step recorders and the gate notes
+        #: accumulate; frozen into the ``decision`` object when the pass ends.
+        self.decision_ledger: Dict[str, Any] = {}
+        #: Called with the seconds the scope-close submit took (the decision recorder counts them in its budget).
+        self.submit_hook = None
         self._lock = threading.Lock()
 
         if "settings" in self.meta:
@@ -340,6 +404,37 @@ class CaptureContext:
                 self._note_failure("skip recommendation snapshot failed", exc)
         self._outcome = ReplayStatus.OUTCOME_SKIP
         self._skip_reason = str(skip_reason)
+
+    def set_decision(self, summary: Any) -> None:
+        """Record that a stock DECISION PASS ran to its end, with its frozen summary.
+
+        The summary (pass kind, recommendations considered, per-symbol verdicts, funded set, created
+        order ids, errors) is stored as the ``decision`` object. A summary the codec refuses is a
+        counted failure and the outcome becomes an ERROR naming it -- never a ``decision`` without
+        its object.
+        """
+        try:
+            self._objects["decision"] = freeze(summary)
+            self._outcome = ReplayStatus.OUTCOME_DECISION
+        except Exception as exc:
+            self._note_failure("decision summary snapshot failed", exc)
+            self._outcome = ReplayStatus.OUTCOME_ERROR
+            self._error = f"decision summary not recordable: {_format_error(exc)}"
+
+    def discard(self, reason: str) -> None:
+        """The pass ended before it was a decision: write nothing, COUNT it under ``reason``.
+
+        Applies only while no outcome has been set (a pass that already decided is not discarded).
+        The count happens when the scope closes (:meth:`submit_to`).
+        """
+        if reason is None or not str(reason).strip():
+            raise MissingSkipReason(self.analysis_id)
+        if self._outcome is None:
+            self._discard_reason = str(reason)
+
+    @property
+    def discard_reason(self) -> Optional[str]:
+        return self._discard_reason
 
     @property
     def observation_position(self) -> int:
@@ -509,6 +604,24 @@ class CaptureContext:
         except Exception as exc:
             self._note_failure(f"branch flag {name} not recorded", exc)
 
+    def recorded_timezone(self):
+        """The RECORDING host's timezone (a ``tzinfo``) from the pass metadata, or ``None``.
+
+        ``branch_flags["host_timezone"] = {"name": <IANA or None>, "utc_offset_seconds": int}`` is
+        written when the pass opens. A replay evaluates "today" in THIS zone, never the replaying
+        host's. ``None`` when the record carries none (pre-schema-3): the caller decides, loudly.
+        """
+        flags = self.meta["branch_flags"] if "branch_flags" in self.meta else {}
+        if "host_timezone" not in flags:
+            return None
+        recorded = flags["host_timezone"]
+        name = recorded["name"]
+        if name:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        from datetime import timedelta
+        return timezone(timedelta(seconds=recorded["utc_offset_seconds"]))
+
     # -- finishing
 
     def build_record(self) -> AnalysisRecord:
@@ -556,10 +669,20 @@ class CaptureContext:
 
     def submit_to(self, store) -> None:
         """Hand the finished record to the store. Failures stay inside recording."""
+        if self._discard_reason is not None and self._outcome is None:
+            store.health.record_discard(self._discard_reason, self.meta["expert_class"])
+            return
+        started = time.perf_counter()
         try:
             store.submit(self.build_record(), objects=self.objects, observations=self.observations)
         except Exception as exc:
             self._note_failure("analysis record not submitted", exc)
+        finally:
+            if self.submit_hook is not None:
+                try:
+                    self.submit_hook(time.perf_counter() - started)
+                except Exception as exc:  # noqa: BLE001 -- accounting never reaches the writer
+                    logger.error(f"replay capture: submit accounting failed: {exc}", exc_info=True)
 
     # -- failure boundary
 
@@ -569,7 +692,7 @@ class CaptureContext:
         with self._lock:
             return dict(self._failures)
 
-    def note_failure(self, message: str, exc: BaseException) -> None:
+    def note_failure(self, message: str, exc: BaseException, kind: Optional[str] = None) -> None:
         """Count a recording failure raised OUTSIDE this class (a provider tap).
 
         The taps in :mod:`ba2_common.core.replay.observe` do work of their own --
@@ -578,10 +701,10 @@ class CaptureContext:
         degrades coverage, it is counted and logged once, and it never reaches
         the expert.
         """
-        self._note_failure(message, exc)
+        self._note_failure(message, exc, kind)
 
-    def _note_failure(self, message: str, exc: BaseException) -> None:
-        kind = classify_failure(exc)
+    def _note_failure(self, message: str, exc: BaseException, kind: Optional[str] = None) -> None:
+        kind = classify_failure(exc) if kind is None else kind
         self.health.record(kind)
         with self._lock:
             if kind not in self._failures:

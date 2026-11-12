@@ -194,6 +194,10 @@ def test_input_mode_drops_the_unmeasured_macro_section():
     assert res["n_sections"] == 2
 
 
+# _build_regime reads the RESOLVED settings (live and backtest both resolve every key)
+_YC_SCALE = DeterministicScorer.get_settings_definitions()["yc_scale"]["default"]
+
+
 # ---------------------------------------------------------------------------
 # the expert's own section builder (_build_regime uses no instance state, so it
 # is callable unbound -- the cold bundle must reach final_score as None, not be
@@ -202,7 +206,8 @@ def test_input_mode_drops_the_unmeasured_macro_section():
 
 def test_the_expert_reports_a_cold_bundle_as_unknown():
     regime = DeterministicScorer._build_regime(
-        None, {"macro_inputs": {}, "index_closes": None}, {"macro_mode": "multiply"})
+        None, {"macro_inputs": {}, "index_closes": None},
+        {"macro_mode": "multiply", "yc_scale": _YC_SCALE})
     assert regime["score"] is None
     assert regime["n_inputs"] == 0
 
@@ -213,7 +218,7 @@ def test_the_expert_still_measures_a_regime_when_the_inputs_arrive():
     closes = pd.Series([float(100 + i) for i in range(260)])
     regime = DeterministicScorer._build_regime(
         None, {"macro_inputs": {"vix": 15.0}, "index_closes": closes},
-        {"macro_mode": "multiply"})
+        {"macro_mode": "multiply", "yc_scale": _YC_SCALE})
     assert regime["score"] is not None
     assert regime["n_inputs"] == 2
     assert regime["score"] == pytest.approx(1.0)

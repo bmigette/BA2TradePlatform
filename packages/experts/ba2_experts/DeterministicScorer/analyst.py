@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ba2_common.core.knowability import intraday_decision_clock, published_known
+from ba2_experts.price_target_basis import log_skipped_unadjusted, split_adjusted_target
 
 DEF_WINDOW_DAYS = 90
 DEF_HALFLIFE_DAYS = 30
@@ -131,10 +132,15 @@ def price_target_drift(rows: Optional[List[Dict[str, Any]]], as_of: datetime,
     floor = as_of - timedelta(days=int(window_days))
 
     dated: List[tuple] = []
+    skipped = 0
     for r in rows:
         raw = r.get("publishedDate") or r.get("date")
-        target = r.get("priceTarget")
-        if raw is None or target is None:
+        # SPLIT BASIS: adjPriceTarget (today's basis), never the as-published priceTarget.
+        target = split_adjusted_target(r)
+        if raw is None:
+            continue
+        if target is None:
+            skipped += 1
             continue
         try:
             d = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
@@ -154,6 +160,7 @@ def price_target_drift(rows: Optional[List[Dict[str, Any]]], as_of: datetime,
         if t > 0 and math.isfinite(t):
             dated.append((d, t))
 
+    log_skipped_unadjusted("DeterministicScorer.price_target_drift", skipped)
     if len(dated) < max(1, int(min_targets)):
         return None
     dated.sort(key=lambda x: x[0])

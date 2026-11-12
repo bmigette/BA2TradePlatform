@@ -212,7 +212,8 @@ def test_the_icons_live_in_the_symbol_cell_group_with_the_info_icon():
     chips = page.SYMBOL_CHIPS_TEMPLATE
     assert "$emit('protectClick', props.row.symbol)" in chips and "$emit('excludeToggle', props.row.symbol)" in chips
     assert chips.index('icon="info"') < chips.index('icon="shield"') < chips.index(':icon="props.row.excl_icon"')
-    assert chips.count('size="sm"') == 3 and 'pf-icons' in chips                       # all three the same size
+    assert chips.count('size="sm"') == 4 and 'pf-icons' in chips                       # all four (info, shield, eye, freeze) the same size
+    assert chips.index(':icon="props.row.excl_icon"') < chips.index(':icon="props.row.frz_icon"')
     template = page.symbol_card_template()
     assert 'props.row.prot_on' in template and template.index('props.row.prot_on') < template.index('class="pf-tiles"')
 

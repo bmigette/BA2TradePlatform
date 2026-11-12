@@ -55,6 +55,7 @@ from ba2_common.core.schedule_genes import schedule_refusal_message, schedule_we
 from ba2_common.core.utils import as_utc_key
 from ba2_common.core.suspension_events import is_suspended
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
+from ba2_common.core import estimates_source as _estimates_source_mod  # called through the module (tests patch it)
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.trade_cycle import (
@@ -74,6 +75,7 @@ from ba2_common.core.OptionRiskManagement import (
     option_risk_manager_enabled, update_sleeve_breaker,
 )
 from ba2_common.core.benchmark_regime import reset_benchmark_regime, set_benchmark_regime
+from ba2_common.core.TradeConditions import reset_finished_measure_memo
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
 
@@ -155,6 +157,11 @@ MAX_FAILED_ANALYSIS_SHARE = 0.05
 MIN_ANALYSIS_PASSES_FOR_REFUSAL = 20
 
 
+def _is_estimates_unavailable(exc: Optional[BaseException]) -> bool:
+    """``ba2_common.core.estimates_pit.EstimatesUnavailable`` (by MRO name: no import in the hot path)."""
+    return exc is not None and any(k.__name__ == "EstimatesUnavailable" for k in type(exc).__mro__)
+
+
 class AnalysisFailureRefusal(RuntimeError):
     """The run's analysis passes failed too often for its result to mean anything.
 
@@ -210,8 +217,8 @@ class _BacktestProviderBundle(LiveProviderBundle):
     close of the latest bar that has ENDED at the decision instant. On a daily clock it is the inherited read, unchanged.
     """
 
-    def __init__(self, get_provider: Callable[..., Any], price_source: Any):
-        super().__init__(get_provider)
+    def __init__(self, get_provider: Callable[..., Any], price_source: Any, estimates_source: str):
+        super().__init__(get_provider, estimates_source=estimates_source)
         self._price_source = price_source
 
     def price_at_date(self, symbol: str, as_of: Optional[datetime]) -> Optional[float]:
@@ -403,7 +410,7 @@ def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
 
     NOTE: the engine settles through ``BacktestAccount.settle_single_leg_expiry``, which
     applies the no-orphaned-stock backtest policy on top of this theoretical outcome (a
-    long ITM is NEVER exercised — always sold to close at the expiry premium/intrinsic;
+    long ITM is NEVER exercised — always settled for cash at intrinsic;
     shorts always physically assign, with the assigned stock liquidated at the next bar's
     open). This helper remains the pure ITM/side contract."""
     from ba2_common.core.types import OptionRight, OrderDirection
@@ -685,7 +692,8 @@ class DailyBacktestEngine:
         if self._benchmark_regime_required and self._benchmark_calendar is None:
             wanted = [eid for _expert, eid, _s, _r in self.experts]
             raise RuntimeError(
-                f"the run is gated on the SPY benchmark regime (spy-trend / spy-vol) for expert "
+                f"the run needs the SPY benchmark regime (spy-trend / spy-vol gates, or "
+                f"downtrend_overlay_enabled) for expert "
                 f"instance(s) {wanted} but no benchmark regime calendar could be built: no SPY daily "
                 f"history could be read from the {resolve_job_history_source(self.config)} cache; the "
                 f"gates would read unknown everywhere and the GA would search dead genes. "
@@ -758,6 +766,7 @@ class DailyBacktestEngine:
         # never reached its own reset.
         reset_stressed()
         reset_benchmark_regime()
+        reset_finished_measure_memo()
 
         self._assert_daily_reads_are_clamped()
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
@@ -1069,6 +1078,7 @@ class DailyBacktestEngine:
         # bar before its own first set_stressed.
         reset_stressed()
         reset_benchmark_regime()
+        reset_finished_measure_memo()
         # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
         # the transactions, the final equity from the ledger).
         if (hasattr(self.account, "check_option_ledger")
@@ -1215,8 +1225,17 @@ class DailyBacktestEngine:
         rec = self.__dict__.setdefault("analysis_failures", {}).setdefault(expert_id, {"passes": 0, "failed": 0, "first_error": None})
         rec["passes"] += 1
 
-    def _analysis_failed(self, expert_id: int, what: str) -> None:
+    def _analysis_failed(self, expert_id: int, what: str, exc: Optional[BaseException] = None) -> None:
         rec = self.analysis_failures[expert_id]
+        if _is_estimates_unavailable(exc):
+            # The symbol's analysis failed because the estimates source has no estimate for it (owner,
+            # 2026-11-07: fail the analysis, keep the symbol in the universe). A coverage fact of the source
+            # (~26% of the broad universe on Alpha Vantage), not a broken expert: counted and reported apart,
+            # outside the failed share that refuses the run.
+            rec["estimates_unavailable"] = rec.get("estimates_unavailable", 0) + 1
+            if rec.get("first_estimates_unavailable") is None:
+                rec["first_estimates_unavailable"] = what[:500]
+            return
         rec["failed"] += 1
         if rec["first_error"] is None:
             rec["first_error"] = what[:500]
@@ -1225,9 +1244,13 @@ class DailyBacktestEngine:
         """The ``analysis_failures`` blob: totals plus the per-expert counts and first error."""
         passes = sum(r["passes"] for r in self.analysis_failures.values())
         failed = sum(r["failed"] for r in self.analysis_failures.values())
+        unavailable = sum(r.get("estimates_unavailable", 0) for r in self.analysis_failures.values())
         first = next((r["first_error"] for r in self.analysis_failures.values() if r["first_error"]), None)
-        return {"passes": passes, "failed": failed, "first_error": first,
-                "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+        out = {"passes": passes, "failed": failed, "first_error": first,
+               "by_expert": {str(k): dict(v) for k, v in self.analysis_failures.items()}}
+        if unavailable:
+            out["estimates_unavailable"] = unavailable
+        return out
 
     def entry_gate_record(self) -> Optional[Dict[str, Any]]:
         """``{rule: {"n", "met", "b": {leaf: first-false count}, "order": [leaf...]}}`` of the ENTRY
@@ -1239,6 +1262,13 @@ class DailyBacktestEngine:
         ``MAX_FAILED_ANALYSIS_SHARE`` (judged from ``MIN_ANALYSIS_PASSES_FOR_REFUSAL`` passes on).
         An expert that analyses fine and emits no BUY has ZERO failed passes: not a failure."""
         rec = self.analysis_failures_record()
+        if rec.get("estimates_unavailable"):
+            first_eu = next((r.get("first_estimates_unavailable") for r in self.analysis_failures.values()
+                             if r.get("first_estimates_unavailable")), None)
+            logger.warning(
+                f"[daily_engine] ESTIMATES UNAVAILABLE: {rec['estimates_unavailable']} of {rec['passes']} "
+                f"analysis passes failed for want of an estimate (not counted toward the failed-share "
+                f"refusal); first: {first_eu}")
         if not rec["failed"]:
             return
         logger.warning(
@@ -1471,7 +1501,7 @@ class DailyBacktestEngine:
                     raise
                 _reraise_option_basis_refusal(e)
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"{symbol} @ {as_of:%Y-%m-%d}: {e}", e)
                 continue
 
             if self._stage_recommendation_candidate(
@@ -1719,7 +1749,7 @@ class DailyBacktestEngine:
                 raise
             _reraise_option_basis_refusal(e)
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
-            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"basket @ {as_of:%Y-%m-%d}: {e}", e)
             return False
 
         # TYPE GUARD: a basket expert's analyze_as_of MUST return List[Recommendation] (one per
@@ -1861,7 +1891,7 @@ class DailyBacktestEngine:
                     raise
                 _reraise_option_basis_refusal(e)
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                self._analysis_failed(expert_id, f"open-pos {symbol} @ {as_of:%Y-%m-%d}: {e}", e)
                 continue
             if rec_is_unpriced(rec):
                 # A HELD symbol with no decidable price at this tick: nothing can be decided for it, so
@@ -2064,7 +2094,7 @@ class DailyBacktestEngine:
                 raise
             _reraise_option_basis_refusal(e)
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
-            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}")
+            self._analysis_failed(expert_id, f"bypass @ {as_of:%Y-%m-%d}: {e}", e)
             return
 
         if getattr(rec, "skip", False):
@@ -2136,8 +2166,8 @@ class DailyBacktestEngine:
 
         # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
         #     backtest policy — see BacktestAccount.settle_single_leg_expiry): OTM ->
-        #     worthless; ITM long -> NEVER exercised, sold to close at the expiry
-        #     premium (intrinsic fallback) — no shares; ITM short -> ALWAYS physically
+        #     worthless; ITM long -> NEVER exercised, settled for cash at intrinsic
+        #     from the expiry close — no shares; ITM short -> ALWAYS physically
         #     assigned (shares at the strike), with the assigned stock liquidated at
         #     the next bar's open (4a-pre above).
         #     Defined-risk combos unit-settle as a group instead. Runs after the
@@ -2208,8 +2238,8 @@ class DailyBacktestEngine:
         no-orphaned-stock backtest policy):
 
           * worthless -> close the option transaction at premium 0 (realise the entry P&L).
-          * ITM long -> NEVER exercised: sold to close at the expiry bar's premium close
-            (intrinsic fallback) — no share position, cash credited at the premium.
+          * ITM long -> NEVER exercised: settled for cash at INTRINSIC from the same expiry
+            close the combos use — no share position, cash credited at intrinsic.
           * ITM short -> ALWAYS physically assigned (shares at the STRIKE); the assigned
             stock is unmanaged in a backtest, so it is liquidated in full at the next
             bar's open (``process_pending_assignment_liquidations``) — unless the run sets
@@ -2488,6 +2518,7 @@ class DailyBacktestEngine:
             bundle = _BacktestProviderBundle(
                 lambda category, name, **kw: _get_provider(category, name, **kw),
                 self.price,
+                _estimates_source_mod.resolve_job_estimates_source(self.config),   # the run's explicit estimates source; no default
             )
             self._bundle_cache = bundle
         return bundle

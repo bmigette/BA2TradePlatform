@@ -139,7 +139,7 @@ _OPTIONS = (
     'has_option_position', 'has_covered_call', 'has_protective_put', 'has_assigned_shares',
     'days_to_expiry', 'short_leg_days_to_expiry', 'covered_call_days_to_expiry',
     'loss_pct_of_max_loss', 'profit_multiple_of_premium', 'credit_decayed_pct',
-    'long_leg_delta', 'iv_rank', 'iv_to_realized_vol',
+    'long_leg_delta', 'iv_rank', 'iv_to_realized_vol', 'structure_share',
 )
 
 #: Everything that describes the TAPE rather than the position or the expert's call -- the four
@@ -147,7 +147,8 @@ _OPTIONS = (
 #: point of this pass: the fifteen fields were unreachable from the editor at all.
 _MARKET = (
     'relative_volume', 'percent_below_recent_high', 'percent_above_recent_low',
-    'iv_to_realized_vol',
+    'iv_to_realized_vol', 'pullback_rsi_2', 'pullback_rsi_3', 'pullback_rsi_4', 'pullback_rsi_5',
+    'price_vs_sma200_percent',
 ) + tuple(sorted(market_condition_fields()))
 
 _TIMING = (

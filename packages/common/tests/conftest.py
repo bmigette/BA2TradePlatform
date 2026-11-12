@@ -77,3 +77,12 @@ def _test_fakes_declare_a_greeks_source(monkeypatch):
     """
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
     monkeypatch.setattr(OptionsAccountInterface, "OPTION_GREEKS_SOURCE", "test_fake")
+
+
+@pytest.fixture(autouse=True)
+def _reset_finished_measure_memo():
+    """The finished-history measure memo is process-global: no test inherits another test's values."""
+    from ba2_common.core.TradeConditions import reset_finished_measure_memo
+    reset_finished_measure_memo()
+    yield
+    reset_finished_measure_memo()

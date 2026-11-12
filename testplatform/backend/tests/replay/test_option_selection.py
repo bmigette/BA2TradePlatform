@@ -413,3 +413,93 @@ def test_the_tape_account_class_is_built_once_per_recorded_class_and_declaration
     assert len(TapeOptionsAccount.__subclasses__()) == count
     assert option_selection._account_class("Acct", {"OPTION_GREEKS_SOURCE": None}) is not first
     assert option_selection._account_class("Other", {"OPTION_GREEKS_SOURCE": "broker"}) is not first
+
+
+# ---------------------------------------------------------------------------
+# the live decision frame (audit gap #1): live took ONE clock read for the whole pass
+# ---------------------------------------------------------------------------
+from datetime import timedelta  # noqa: E402
+
+from ba2_common.core.market_condition_live import replay_decision_frame  # noqa: E402
+from ba2_common.core.replay.clock import replay_now  # noqa: E402
+from tests.replay.option_support import NOW  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def framed_session(tmp_path_factory) -> Path:
+    """An entry recorded the way the live pass runs it: begin_decision's single clock read, then
+    ``execute`` under that frame (so ``live_decision_time()`` takes no read of its own). The
+    frame instant (the first read) is NOT the recorder's own decision_time read."""
+    root = tmp_path_factory.mktemp("option-selection-framed")
+
+    def scenario():
+        account = RecordingOptionsAccount()
+        begin = replay_now()                                # begin_decision's read
+        with replay_decision_frame(begin):
+            return entry_action(account).execute()
+
+    recorded = record_session(root / "store", root / "export", scenario)
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]
+    return recorded["bundle_dir"]
+
+
+def _payload_of(bundle):
+    (obs,) = [o for o in bundle.observations if o.provider == "option_action"]
+    return bundle.decode(obs.payload_object)
+
+
+def test_a_framed_entry_records_the_frame_and_replays_to_a_match(framed_session):
+    bundle = load_bundle(framed_session)
+    payload = _payload_of(bundle)
+    (analysis,) = bundle.analyses
+    assert payload["version"] == oar.RECORD_VERSION
+    assert payload["inputs"]["decision_frame_time"].isoformat() == analysis.clock_reads[0]
+    assert payload["inputs"]["decision_time"].isoformat() == analysis.clock_reads[1]
+    assert payload["tape_span"]["clock_end"] - payload["tape_span"]["clock_start"] == 1
+
+    report = option_selection.run(framed_session)
+    assert _only(report).status == MATCH, _only(report).detail
+    assert "inferred" not in _only(report).detail
+
+
+def test_without_the_frame_the_replay_reproduces_the_clock_miss(framed_session):
+    """The pre-fix replay installed no frame: the action's own read found none left."""
+    def drop_frame(value):
+        value["inputs"]["decision_frame_time"] = None
+
+    report = option_selection.run_bundle(_EditedBundle(load_bundle(framed_session), drop_frame))
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "clock_read" in row.detail
+
+
+def test_a_version_1_record_infers_the_frame_from_the_begin_decision_read_and_says_so(framed_session):
+    def legacy(value):
+        value["version"] = 1
+        del value["inputs"]["decision_frame_time"]
+
+    report = option_selection.run_bundle(_EditedBundle(load_bundle(framed_session), legacy))
+    row = _only(report)
+    assert row.status == MATCH, row.detail
+    assert "decision frame inferred (legacy record)" in row.detail
+
+
+def test_a_version_1_record_with_an_ambiguous_pass_is_missing_capture_not_a_guess(tmp_path):
+    def scenario():
+        account = RecordingOptionsAccount()
+        replay_now()                                        # an extra read before the action
+        begin = replay_now()
+        with replay_decision_frame(begin):
+            return entry_action(account).execute()
+
+    recorded = record_session(tmp_path / "store", tmp_path / "export", scenario)
+    assert recorded["outcome"]["success"], recorded["outcome"]["message"]
+
+    def legacy(value):
+        value["version"] = 1
+        del value["inputs"]["decision_frame_time"]
+
+    report = option_selection.run_bundle(_EditedBundle(load_bundle(recorded["bundle_dir"]), legacy))
+    row = _only(report)
+    assert row.status == ReplayStatus.COVERAGE_MISSING_CAPTURE
+    assert "recorded before decision-frame capture" in row.detail

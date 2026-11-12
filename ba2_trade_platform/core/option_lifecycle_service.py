@@ -148,7 +148,7 @@ rather than hidden. ``rearm_breaker`` is the operator override.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -1022,8 +1022,18 @@ def _close(account, txn, structure: OptionStructure, decision: LifecycleDecision
                         f"nothing left to close")
             return
 
+        if len(legs) == 1:
+            # ONE leg has no child rows: the parent row's quantity is what the broker is
+            # sent (AlpacaAccount._build_option_order_request ignores ratio_qty), so the
+            # contracts go on the order and the leg carries ratio 1 (the single-leg
+            # convention of every opener and of CloseOptionAction).
+            order_quantity = legs[0].ratio_qty
+            submit_legs = [replace(legs[0], ratio_qty=1)]
+        else:
+            order_quantity = 1
+            submit_legs = list(legs)
         order = account.submit_option_order(
-            legs=list(legs), quantity=1, order_type="market",
+            legs=submit_legs, quantity=order_quantity, order_type="market",
             option_strategy="close", transaction_id=txn.id)
         if order is None:
             result.failed.append(txn.id)
@@ -1058,10 +1068,13 @@ def _closing_legs(structure: OptionStructure) -> Optional[Tuple[OptionLeg, ...]]
     """Offsetting legs for everything still held, or ``None`` if we must not submit.
 
     Each held contract is reversed at its netted size: a net-long leg is SOLD to close, a
-    net-short leg is BOUGHT to close. ``quantity=1`` on the order with ``ratio_qty`` per leg
-    is how ``submit_option_order`` sizes children (``quantity * ratio_qty``), so an
-    unbalanced structure — one wing partially bought back — closes at its real remaining
-    sizes rather than at the parent's original ratio.
+    net-short leg is BOUGHT to close. For two or more legs ``quantity=1`` on the order with
+    ``ratio_qty`` per leg is how ``submit_option_order`` sizes children
+    (``quantity * ratio_qty``), so an unbalanced structure — one wing partially bought back
+    — closes at its real remaining sizes rather than at the parent's original ratio. For a
+    SINGLE leg there are no child rows and the broker is sent the parent's quantity, so
+    ``_close`` moves the contracts onto the order (``quantity=N``, leg ``ratio_qty=1``);
+    this function still returns the netted size in ``ratio_qty`` either way.
 
     A net size that is not a whole number of contracts refuses the WHOLE close and returns
     ``None``. Truncating it (``int(abs(n))``) would silently submit a partial flatten and

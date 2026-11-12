@@ -57,6 +57,57 @@ def benchmark_regime_leaves(prefix: str) -> list:
             for spec in BENCHMARK_FIELDS.values()]
 
 
+def pinned_benchmark_leaf(leaf_id: str, field: str, token: str) -> dict:
+    """A SPY benchmark leaf PINNED to one regime value (``field == code(token)``): no mode gene, so it can
+    never be ``off``, and already in the resolved shape the GA decode writes (``mode`` = the token), so it
+    passes ``market_condition_rules._unresolved_reason``. ``--regime-split-entry`` pins ``spy_trend_regime``
+    to ``above_200`` / ``below_200``; an unknown regime matches neither (the leaf's own behaviour)."""
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS, field_codes
+
+    if field not in BENCHMARK_FIELDS:
+        raise ValueError(f"pinned_benchmark_leaf: {field!r} is not a benchmark field "
+                         f"(have {sorted(BENCHMARK_FIELDS)!r})")
+    if token not in field_codes(field):
+        raise ValueError(f"pinned_benchmark_leaf: {token!r} is not a value of {field!r} "
+                         f"(have {sorted(field_codes(field))!r})")
+    return _fixed_categorical_leaf(leaf_id, field, token)
+
+
+#: The RSI periods the pullback gate may read; each is a registered condition field
+#: ``pullback_rsi_<period>`` (a rule leaf carries no second parameter, so the period is part of the
+#: field name). ONE leaf searches over them through its ``cond:<id>:field`` choice gene.
+PULLBACK_RSI_PERIODS = (2, 3, 4, 5)
+PULLBACK_RSI_FIELDS = tuple(f"pullback_rsi_{p}" for p in PULLBACK_RSI_PERIODS)
+
+#: goal2027 design 2026-11-10 part 3: per-symbol PULLBACK entry gates. (leaf suffix, field, authored
+#: op, authored value, min, max, step). The authored op/value is only the seed; the mode gene
+#: (off/below/above) picks ``<`` / ``>`` and the value gene the threshold. The RSI leaf's ``field`` is
+#: the authored seed too: its ``field`` gene picks the period (see :data:`PULLBACK_RSI_FIELDS`).
+PULLBACK_GATE_SPECS = (
+    ("pb-rsi", PULLBACK_RSI_FIELDS[0], "<", 25.0, 5.0, 50.0, 5.0),
+    ("pb-below-high", "percent_below_recent_high", ">", 6.0, 2.0, 20.0, 2.0),
+    ("pb-vs-sma200", "price_vs_sma200_percent", ">", 0.0, -10.0, 10.0, 2.5),
+)
+
+
+def pullback_gate_leaves(prefix: str) -> list:
+    """The pullback ENTRY gates for rule prefix ``prefix``: ``<prefix>-pb-rsi`` (period searched by
+    its ``field`` gene), ``<prefix>-pb-below-high``, ``<prefix>-pb-vs-sma200``. Each is a numeric leaf
+    with a mode gene (``off`` removes it, so today's behaviour stays inside the search space) and a
+    threshold gene."""
+    from ba2_common.core.rule_models import NUMERIC_MODE_CHOICES
+
+    leaves = []
+    for suffix, field, op, value, lo, hi, step in PULLBACK_GATE_SPECS:
+        leaf = {"id": f"{prefix}-{suffix}", "field": field, "field_type": "numeric", "mode_optimize": True,
+                "op": op, "value": value, "optimize": True, "value_min": lo, "value_max": hi,
+                "value_step": step, "mode_choices": list(NUMERIC_MODE_CHOICES)}
+        if field in PULLBACK_RSI_FIELDS:
+            leaf.update(field_optimize=True, field_choices=list(PULLBACK_RSI_FIELDS))
+        leaves.append(leaf)
+    return leaves
+
+
 #: The kinds :func:`market_exit_rules` can build, in emission order.
 MARKET_EXIT_KINDS = ("exit", "stop", "tp")
 _DIRECTIONS = ("long", "short")
@@ -230,4 +281,92 @@ def market_exit_rules(prefix: str, profiles, direction: str, kinds=MARKET_EXIT_K
     where = f"market_exit_rules({prefix!r}, {direction!r})"
     _assert_no_off_leaf(rules, where)
     assert_market_rule_actions(rules, where)
+    return rules
+
+
+# ---------------------------------------------------------------------------------------------
+# Exit rules that read registries INDEPENDENT of the market-condition profile
+# ---------------------------------------------------------------------------------------------
+#: ``--market-exit`` kinds that need no ``--market-condition-profile``: ``rsi`` reads the per-symbol pullback
+#: RSI fields, ``spy`` the SPY benchmark regime. Neither is a market-condition field, so neither carries
+#: ``market_master_gene`` / ``market_profile_gene`` and neither is switched by ``market:enabled`` /
+#: ``market:profile``.
+INDEPENDENT_EXIT_KINDS = ("rsi", "spy")
+#: Every kind ``--market-exit`` accepts, in emission order (the profile kinds first, as before).
+ALL_MARKET_EXIT_KINDS = MARKET_EXIT_KINDS + INDEPENDENT_EXIT_KINDS
+
+#: Rule id = ``<prefix><suffix>``; its leaves are ``<rule id>-rsi`` / ``-trend`` / ``-tag``. The suffixes are
+#: how the trial memo key (``strategy_param_space.neutralise_independent_exit_genes``) finds these rules.
+RSI_EXIT_RULE_SUFFIX = "-pb-exit-rsi"
+SPY_STOP_RULE_SUFFIX = "-spy-stop"
+INDEPENDENT_EXIT_RULE_SUFFIXES = (RSI_EXIT_RULE_SUFFIX, SPY_STOP_RULE_SUFFIX)
+
+#: The RSI recovery threshold band: a long exits when the short RSI is ABOVE it, a short when BELOW.
+_RSI_EXIT_PCT = {"long": {"value": 70.0, "min": 50.0, "max": 90.0, "step": 5.0},
+                 "short": {"value": 30.0, "min": 10.0, "max": 50.0, "step": 5.0}}
+
+#: The entry tags ``--regime-split-entry`` stamps (with the ``spy`` exit kind) on the SPY-up / SPY-down sections.
+SPY_UP_ENTRY_TAG = 1
+SPY_DOWN_ENTRY_TAG = 2
+
+
+def independent_exit_rules(prefix: str, direction: str, kinds, spy_up_tag=None) -> list:
+    """The ``rsi`` / ``spy`` exit rules for ``kinds`` (a subset of :data:`INDEPENDENT_EXIT_KINDS`), each OFF by
+    default behind a rule-level toggle gene, like :func:`market_exit_rules` (same fixed-leaf discipline: no
+    leaf may carry a mode gene, an ``off`` mode would empty the AND and fire for every position).
+
+    * ``<prefix>-pb-exit-rsi``: ONE leaf on a pullback RSI field, the period searched by the SAME
+      ``field_optimize`` / ``field_choices`` gene the entry leaf uses (:data:`PULLBACK_RSI_FIELDS`); the comparison
+      is fixed (long: above, short: below) and the threshold searched (long 50..90 step 5, default 70; short
+      10..50, default 30). Action ``close``, stops processing.
+    * ``<prefix>-spy-stop``: a pinned SPY-trend leaf (long: ``below_200``, short: ``above_200``; no gene, unknown
+      matches neither) -> ``adjust_stop_loss`` from ``order_open_price``, percent searched in the band the
+      ``-mkt-stop`` rule uses (-2..0). Continues processing.
+
+    ``spy_up_tag``: when given, the ``spy`` rule is ANDed with an ``entry_tag == <tag>`` leaf, so it only touches
+    positions opened by the tagged entry section (see ``--regime-split-entry``). Added AFTER the no-off-leaf check:
+    the tag leaf is a pure scope, it carries no gene and cannot be switched off.
+
+    Single-direction only, exactly as :func:`market_exit_rules` (SCOPE paragraph there)."""
+    from ba2_common.core.market_condition_rules import assert_market_rule_actions
+    from ba2_common.core.market_conditions import BENCHMARK_FIELDS
+
+    if direction not in _DIRECTIONS:
+        raise ValueError(f"independent_exit_rules: direction must be one of {_DIRECTIONS!r}, got {direction!r}")
+    kinds = tuple(kinds)
+    if any(k not in INDEPENDENT_EXIT_KINDS for k in kinds) or len(set(kinds)) != len(kinds):
+        raise ValueError(f"independent_exit_rules: kinds must be distinct values of "
+                         f"{INDEPENDENT_EXIT_KINDS!r}, got {kinds!r}")
+    long = direction == "long"
+    rules = []
+    if "rsi" in kinds:
+        band = _RSI_EXIT_PCT[direction]
+        rid = f"{prefix}{RSI_EXIT_RULE_SUFFIX}"
+        op = ">" if long else "<"
+        leaf = {"id": f"{rid}-rsi", "field": PULLBACK_RSI_FIELDS[0], "field_type": "numeric",
+                "op": op, "comparison": op, "mode": "above" if long else "below", "value": band["value"],
+                "optimize": True, "value_min": band["min"], "value_max": band["max"],
+                "value_step": band["step"],
+                "field_optimize": True, "field_choices": list(PULLBACK_RSI_FIELDS)}
+        rules.append(_exit_rule(rid, [leaf], [{"action_type": "close"}], False))
+    if "spy" in kinds:
+        from ba2_common.core.benchmark_regime import TREND_FIELD
+        if TREND_FIELD not in BENCHMARK_FIELDS:
+            raise ValueError(f"independent_exit_rules: {TREND_FIELD!r} is not a benchmark field")
+        rid = f"{prefix}{SPY_STOP_RULE_SUFFIX}"
+        leaf = pinned_benchmark_leaf(f"{rid}-trend", TREND_FIELD, "below_200" if long else "above_200")
+        action = {"action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+                  "action_value": _STOP_PCT["value"], "action_value_optimize": True,
+                  "action_value_min": _STOP_PCT["min"], "action_value_max": _STOP_PCT["max"],
+                  "action_value_step": _STOP_PCT["step"]}
+        rules.append(_exit_rule(rid, [leaf], [action], True))
+    where = f"independent_exit_rules({prefix!r}, {direction!r})"
+    _assert_no_off_leaf(rules, where)
+    assert_market_rule_actions(rules, where)
+    if spy_up_tag is not None:
+        for rule in rules:
+            if rule["id"].endswith(SPY_STOP_RULE_SUFFIX):
+                rule["conditions"]["conditions"].append(
+                    {"id": f"{rule['id']}-tag", "field": "entry_tag", "field_type": "numeric",
+                     "op": "==", "comparison": "==", "value": float(spy_up_tag)})
     return rules

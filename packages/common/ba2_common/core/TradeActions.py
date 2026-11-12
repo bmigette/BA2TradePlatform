@@ -208,10 +208,21 @@ class TradeAction(ABC):
         every transaction read a covered call's short contract as a short share, and a pure
         option position as a share position.
 
+        Same tri-state contract as ``get_current_position``: a FAILED read is not a flat
+        position. It used to return None here too, and IncreaseInstrumentShareAction read that
+        None as 0.0 -- so a store hiccup while 100 shares were held bought the full target
+        AGAIN on top of them.
+
         Returns:
             Signed quantity (positive for long, negative for short), 0 if no
-            open transactions, or None if expert_id is unavailable (or the read failed).
+            open transactions, or None ONLY when the action has no owning expert.
+
+        Raises:
+            PositionFetchFailed: the transaction-store read failed (an absorbed error); a
+                non-benign error still propagates as itself, as before.
         """
+        from ba2_common.core.portfolio_allocation import PositionFetchFailed
+
         try:
             # transactions_where (inside _own_equity_transactions) is the dual-path equivalent of
             # the raw select() this once used (review 2026-07-18, M2): a raw select(Transaction)
@@ -222,8 +233,10 @@ class TradeAction(ABC):
             return self._signed_quantity(transactions)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
-            logger.error(f"Error getting expert position for {self.instrument_name}: {e}", exc_info=True)
-            return None
+            logger.error(f"Expert position read FAILED for {self.instrument_name}: {e} -- the "
+                         f"expert's position is unverified", exc_info=True)
+            raise PositionFetchFailed(
+                f"expert position read failed for {self.instrument_name}: {e}") from e
 
     # --- Netting: an opposite order only reduces or closes this expert's own position ----------
 
@@ -235,7 +248,7 @@ class TradeAction(ABC):
         option Transaction's ``symbol`` is the UNDERLYING and its quantity is a contract count,
         so counting it as shares would make a covered call read as a short. A read failure
         propagates -- the netting callers decide an order's direction on this and must not guess
-        (``get_expert_position`` catches it and returns None).
+        (``get_expert_position`` turns an absorbed one into ``PositionFetchFailed``).
 
         The expert is found the same way ``resolve_expert`` finds it (``_owning_expert_id``)."""
         expert_id = self._owning_expert_id()
@@ -2232,8 +2245,22 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get max allowed per instrument
-            max_percent_per_instrument = expert.settings.get('max_virtual_equity_per_instrument_percent', 10.0)
+            # Max allowed per instrument, resolved the way TradeRiskManagement sizes with it:
+            # the stored value, else the expert's DECLARED interface default. No hidden 10.0
+            # here (CLAUDE.md): None means neither exists, and that is a refusal.
+            max_percent_per_instrument = expert.get_setting_with_interface_default(
+                'max_virtual_equity_per_instrument_percent', log_warning=False)
+            if max_percent_per_instrument is None:
+                message = (f"Expert {expert_instance_id} has no "
+                           f"max_virtual_equity_per_instrument_percent setting and no declared "
+                           f"default; refusing to size an increase of {self.instrument_name}")
+                logger.error(message)
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=message,
+                    data={}
+                )
             if self.target_percent > max_percent_per_instrument:
                 logger.warning(f"Target percent {self.target_percent}% exceeds max allowed {max_percent_per_instrument}%. Using max.")
                 self.target_percent = max_percent_per_instrument
@@ -2241,9 +2268,25 @@ class IncreaseInstrumentShareAction(TradeAction):
             # Calculate target position value
             target_value = virtual_equity * (self.target_percent / 100.0)
 
-            # Get expert's own position (not broker total which includes other experts)
-            current_position_qty = self.get_expert_position()
+            # Get expert's own position (not broker total which includes other experts).
+            # A FAILED read refuses: read as 0.0 it re-bought the full target on top of
+            # the shares already held.
+            from ba2_common.core.portfolio_allocation import PositionFetchFailed
+            try:
+                current_position_qty = self.get_expert_position()
+            except PositionFetchFailed as e:
+                message = (f"Expert position for {self.instrument_name} could not be read; "
+                           f"refusing to size an increase ({e})")
+                logger.error(message)
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=message,
+                    data={}
+                )
             if current_position_qty is None:
+                # None now means only "no owning expert", which the instance-id check above
+                # already excludes; kept as before (flat) rather than changing that path.
                 current_position_qty = 0.0
 
             current_price = self.get_current_price()
@@ -2446,8 +2489,21 @@ class DecreaseInstrumentShareAction(TradeAction):
             # Calculate target position value
             target_value = virtual_equity * (self.target_percent / 100.0)
 
-            # Get expert's own position (not broker total which includes other experts)
-            current_position_qty = self.get_expert_position()
+            # Get expert's own position (not broker total which includes other experts).
+            # A FAILED read refuses as such, not as "No position to decrease".
+            from ba2_common.core.portfolio_allocation import PositionFetchFailed
+            try:
+                current_position_qty = self.get_expert_position()
+            except PositionFetchFailed as e:
+                message = (f"Expert position for {self.instrument_name} could not be read; "
+                           f"refusing to size a decrease ({e})")
+                logger.error(message)
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=message,
+                    data={}
+                )
             if current_position_qty is None or current_position_qty == 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
@@ -3724,6 +3780,11 @@ class _OptionEntryAction(TradeAction):
                 f"(modelled concession {quote_concession(legs, halves, fraction):.4f}/share)")
         return quoted
 
+    def _record_submitted_kwargs(self) -> Dict[str, Any]:
+        """Extra `record_submitted` keywords: the member tag only when this entry has one, so
+        an untagged entry calls it exactly as before the structure_share feature."""
+        return {} if self.entry_tag is None else {"entry_tag": self.entry_tag}
+
     def _option_risk_manager(self):
         """(expert, expert_instance_id) when this expert runs the option risk manager.
 
@@ -4012,7 +4073,7 @@ class _OptionEntryAction(TradeAction):
             # structure did not exist -- the concentrated book F5 says the rails exist to
             # stop. The charge is dropped again the moment the transaction becomes visible.
             record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
-                             rm_candidate)
+                             rm_candidate, **self._record_submitted_kwargs())
         # Persist the entry facts on the order row. FIVE of them, from four lineages:
         #   - option_reserve       -- the short-premium reserve, so available BP reflects it;
         #   - max_loss_per_contract -- the measured max loss, so the loss_pct_of_max_loss exit

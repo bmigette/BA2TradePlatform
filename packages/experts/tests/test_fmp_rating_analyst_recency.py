@@ -121,7 +121,7 @@ def _detail_expert(grades, targets):
 
 def test_format_analyst_details_md_builds_both_tables():
     targets = [{"publishedDate": "2026-06-01", "analystCompany": "Evercore",
-                "priceTarget": 120.0, "priceWhenPosted": 100.0}]
+                "priceTarget": 120.0, "adjPriceTarget": 120.0, "priceWhenPosted": 100.0}]
     md = _detail_expert(GRADES, targets)._format_analyst_details_md("ASC")
     assert "Recent Analyst Ratings" in md and "Recent Price Targets" in md
     assert "Alpha" in md and "Evercore" in md and "$120.00" in md

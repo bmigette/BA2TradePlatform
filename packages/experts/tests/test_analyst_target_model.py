@@ -204,7 +204,7 @@ def test_fetch_estimator_inputs_degrades_to_empty_on_a_benign_fetch_failure(monk
     import ba2_common.core.failure_modes as fm
     monkeypatch.setenv("BA2_ERROR_MODE", "legacy")  # a ValueError here is not a real defect type
     fm._mode.cache_clear() if hasattr(fm._mode, "cache_clear") else None
-    bundle = _FakeBundle(_FakeDetailsProvider(raise_on="past"))
+    bundle = _FakeBundle(_FakeDetailsProvider(raise_on="past", estimates=_estimates(5.0, 6.0)))
     out = fetch_estimator_inputs(bundle, "AAPL", as_of=None)
     assert out["earnings"] == []
 
@@ -217,3 +217,243 @@ def test_pipeline_fetch_then_estimate():
     out = estimate_price_target(inputs, current_price=100.0, method="trailing")
     assert out is not None
     assert out["anchor_pe"] == pytest.approx(25.0)
+
+
+# --------------------------------------------------------------------------- #
+# point-in-time methods (2026-11-07): reported quarterly EPS only
+# --------------------------------------------------------------------------- #
+from datetime import datetime, timezone  # noqa: E402
+
+from ba2_experts.analyst_target_model import (  # noqa: E402
+    EstimatesNotPointInTime, MAX_REPORTED_GROWTH, POINT_IN_TIME_METHODS,
+)
+
+
+def test_reported_grows_ttm_by_its_one_year_growth():
+    # newest first: TTM = 4 x 1.25 = 5.0, prior TTM = 4 x 1.0 = 4.0 -> growth 1.25
+    inputs = {"earnings": _earnings(*[1.25] * 4, *[1.0] * 4), "estimates": []}
+    out = estimate_price_target(inputs, current_price=100.0, method="reported")
+    assert out["anchor_pe"] == pytest.approx(20.0)          # 100 / 5.0
+    assert out["following_eps"] == pytest.approx(6.25)      # 5.0 x 1.25
+    assert out["target_price"] == pytest.approx(125.0)      # price x growth
+    assert out["expected_profit_percent"] == pytest.approx(25.0)
+
+
+def test_reported_2y_annualises_two_year_growth():
+    # TTM 5.76 vs TTM two years earlier 4.0 -> ratio 1.44 -> 1.2 a year
+    inputs = {"earnings": _earnings(*[1.44] * 4, *[1.2] * 4, *[1.0] * 4), "estimates": []}
+    out = estimate_price_target(inputs, current_price=100.0, method="reported_2y")
+    assert out["target_price"] == pytest.approx(120.0)
+
+
+@pytest.mark.parametrize("method", POINT_IN_TIME_METHODS)
+def test_reported_needs_the_full_quarter_history(method):
+    n = 8 if method == "reported" else 12
+    inputs = {"earnings": _earnings(*[1.0] * (n - 1)), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method=method) is None
+
+
+def test_reported_missing_print_is_none():
+    inputs = {"earnings": _earnings(1.2, 0, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_shrinking_eps_has_no_bullish_target():
+    inputs = {"earnings": _earnings(*[0.9] * 4, *[1.0] * 4), "estimates": []}
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_degenerate_base_is_rejected():
+    # prior TTM 0.04 -> growth 100x: a near-zero base, not a growth rate
+    inputs = {"earnings": _earnings(*[1.0] * 4, *[0.01] * 4), "estimates": []}
+    assert 4.0 / 0.04 > MAX_REPORTED_GROWTH
+    assert estimate_price_target(inputs, 100.0, method="reported") is None
+
+
+def test_reported_respects_the_profit_cap():
+    inputs = {"earnings": _earnings(*[2.0] * 4, *[1.0] * 4), "estimates": []}  # +100%
+    out = estimate_price_target(inputs, 100.0, method="reported", max_expected_profit_percent=40.0)
+    assert out["target_price"] == pytest.approx(140.0)
+
+
+class _SnapshotOnlyDetails(_FakeDetailsProvider):
+    """What the FMP provider does in a hermetic backtest: refuse a historical estimates read."""
+
+    def get_earnings_estimates(self, **kw):
+        from ba2_common.core.estimates_pit import refuse_if_not_point_in_time
+        refuse_if_not_point_in_time(kw["as_of_date"], hermetic=True, what="fake FMP")
+        return super().get_earnings_estimates(**kw)
+
+
+@pytest.mark.parametrize("method", ["forward", "trailing"])
+def test_provider_refusal_propagates_instead_of_degrading_to_empty(method):
+    """The refusal lives in the provider now; the model must not absorb it into 'no estimates'."""
+    bundle = _FakeBundle(_SnapshotOnlyDetails(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=datetime(2022, 3, 1, tzinfo=timezone.utc),
+                               method=method)
+
+
+def test_quarterly_source_cannot_feed_the_annual_methods():
+    from ba2_experts.analyst_target_model import EstimatesGranularityError
+
+    class _AV(_FakeDetailsProvider):
+        def get_earnings_estimates(self, **kw):
+            return {"frequency": "quarterly", "source": "alphavantage", "estimates": _estimates(5.0, 6.0)}
+
+    with pytest.raises(EstimatesGranularityError):
+        fetch_estimator_inputs(_FakeBundle(_AV(earnings=_earnings(1.0))), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="forward")
+
+
+class _RecordingDetails(_FakeDetailsProvider):
+    def __init__(self, earnings):
+        super().__init__(earnings=earnings)
+        self.calls = []
+
+    def get_past_earnings(self, **kw):
+        self.calls.append(("past", kw["lookback_periods"]))
+        return super().get_past_earnings(**kw)
+
+    def get_earnings_estimates(self, **kw):
+        self.calls.append(("estimates", None))
+        return super().get_earnings_estimates(**kw)
+
+
+def test_reported_fetch_reads_earnings_only_and_drops_a_same_day_amc_print():
+    as_of = datetime(2022, 3, 1, 15, 0, tzinfo=timezone.utc)
+    rows = ([{"reported_eps": 9.0, "report_date": "2022-03-01", "time": "amc"}]
+            + [{"reported_eps": 1.0, "report_date": f"2021-{m:02d}-01", "time": "bmo"} for m in range(12, 0, -1)])
+    det = _RecordingDetails(rows)
+    out = fetch_estimator_inputs(_FakeBundle(det), "AAPL", as_of=as_of, method="reported")
+    assert det.calls == [("past", 9)]                  # 8 quarters + 1 spare, no estimates read
+    assert out["estimates"] == []
+    assert len(out["earnings"]) == 8 and out["earnings"][0]["report_date"] == "2021-12-01"
+
+
+def test_reported_fetch_keeps_a_same_day_bmo_print():
+    as_of = datetime(2022, 3, 1, 15, 0, tzinfo=timezone.utc)
+    rows = [{"reported_eps": 2.0, "report_date": "2022-03-01", "time": "bmo"}] + \
+        [{"reported_eps": 1.0, "report_date": f"2021-{m:02d}-01", "time": "bmo"} for m in range(12, 0, -1)]
+    out = fetch_estimator_inputs(_FakeBundle(_RecordingDetails(rows)), "AAPL", as_of=as_of, method="reported")
+    assert out["earnings"][0]["report_date"] == "2022-03-01"
+
+
+def test_live_estimate_methods_still_fetch():
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    out = fetch_estimator_inputs(bundle, "AAPL", as_of=None, method="forward")
+    assert out["estimates"] == _estimates(5.0, 6.0)
+
+
+def test_historical_replay_permission_reads_the_snapshot_and_is_scoped():
+    from ba2_experts.analyst_target_model import estimate_snapshot_allowed
+    bundle = _FakeBundle(_SnapshotOnlyDetails(earnings=_earnings(1.0), estimates=_estimates(5.0, 6.0)))
+    as_of = datetime(2022, 3, 1, tzinfo=timezone.utc)
+    with estimate_snapshot_allowed():
+        assert fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")["estimates"]
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=as_of, method="forward")
+
+
+# --------------------------------------------------------------------------- #
+# "consensus" (2026-11-07): next quarter's consensus as of the decision / same quarter a year earlier
+# --------------------------------------------------------------------------- #
+def _consensus_inputs(next_q, year_ago=1.0, recent=1.2):
+    return {"earnings": _earnings(recent, recent, recent, year_ago), "estimates": [],
+            "consensus": [{"eps_avg": next_q, "snapshot_date": "2023-03-01"}]}
+
+
+def test_consensus_grows_price_by_next_quarter_vs_same_quarter_last_year():
+    out = estimate_price_target(_consensus_inputs(1.3), 100.0, method="consensus")
+    assert out["target_price"] == pytest.approx(130.0)
+    assert out["consensus_snapshot_date"] == "2023-03-01"
+
+
+def test_consensus_without_a_snapshot_is_none():
+    inputs = {"earnings": _earnings(1.2, 1.2, 1.2, 1.0), "estimates": [], "consensus": []}
+    assert estimate_price_target(inputs, 100.0, method="consensus") is None
+
+
+def test_consensus_shrinking_quarter_has_no_bullish_target():
+    assert estimate_price_target(_consensus_inputs(0.9), 100.0, method="consensus") is None
+
+
+def test_consensus_fetch_reads_the_estimates_source_as_of_the_decision():
+    calls = {}
+
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            calls["as_of"] = as_of
+            return {"quarters": [{"eps_avg": 1.3, "snapshot_date": "2022-02-01"}]}
+
+    as_of = datetime(2022, 3, 1, 15, tzinfo=timezone.utc)
+    out = fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.2, 1.2, 1.2, 1.0))), "AAPL",
+                                 as_of=as_of, method="consensus")
+    assert calls["as_of"] == as_of and out["consensus"][0]["eps_avg"] == 1.3
+
+
+def test_consensus_refusal_from_a_non_point_in_time_source_propagates():
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            raise EstimatesNotPointInTime("fmp has no history")
+
+    with pytest.raises(EstimatesNotPointInTime):
+        fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.0))), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+# --------------------------------------------------------------------------- #
+# no estimate = failed analysis (owner, 2026-11-07): raise, never fall back
+# --------------------------------------------------------------------------- #
+from ba2_experts.analyst_target_model import EstimatesNotPrewarmed, EstimatesUnavailable  # noqa: E402
+
+
+def _consensus_det(answer):
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            return answer
+    return _FakeBundle(Det(earnings=_earnings(1.2, 1.2, 1.2, 1.0)))
+
+
+@pytest.mark.parametrize("why", ["no_data", "none_as_of", None])
+def test_consensus_without_any_estimate_fails_the_analysis(why):
+    answer = {"quarters": [], "source": "alphavantage", **({"unavailable": why} if why else {})}
+    with pytest.raises(EstimatesUnavailable, match="AAPL"):
+        fetch_estimator_inputs(_consensus_det(answer), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+def test_consensus_never_downloaded_is_a_prewarm_gap_not_a_coverage_fact():
+    answer = {"quarters": [], "source": "alphavantage", "unavailable": "not_prewarmed"}
+    with pytest.raises(EstimatesNotPrewarmed):
+        fetch_estimator_inputs(_consensus_det(answer), "AAPL",
+                               as_of=datetime(2022, 3, 1, tzinfo=timezone.utc), method="consensus")
+
+
+def test_consensus_unreadable_source_fails_the_analysis():
+    class Det(_FakeDetailsProvider):
+        def get_quarterly_eps_consensus(self, symbol, as_of=None):
+            raise ConnectionError("network down")       # benign (OSError): still no estimate -> fails
+
+    with pytest.raises(EstimatesUnavailable):
+        fetch_estimator_inputs(_FakeBundle(Det(earnings=_earnings(1.0))), "AAPL", as_of=None, method="consensus")
+
+
+@pytest.mark.parametrize("method", ["forward", "trailing"])
+def test_annual_estimate_methods_without_estimates_fail_the_analysis(method):
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=[]))
+    with pytest.raises(EstimatesUnavailable):
+        fetch_estimator_inputs(bundle, "AAPL", as_of=None, method=method)
+
+
+@pytest.mark.parametrize("method", POINT_IN_TIME_METHODS)
+def test_reported_methods_never_need_an_estimate(method):
+    bundle = _FakeBundle(_FakeDetailsProvider(earnings=_earnings(1.0), estimates=[]))
+    assert fetch_estimator_inputs(bundle, "AAPL", as_of=None, method=method)["estimates"] == []
+
+
+def test_estimates_unavailable_is_never_absorbed(monkeypatch):
+    from ba2_common.core.failure_modes import absorb_if_benign
+    monkeypatch.setenv("BA2_ERROR_MODE", "legacy")
+    with pytest.raises(EstimatesUnavailable):
+        absorb_if_benign(EstimatesUnavailable("x"), EstimatesUnavailable)

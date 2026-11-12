@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from ba2_common.core.interfaces.MarketDataProviderInterface import ohlcv_identity
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import quote_identity
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay import (
     AnalysisRecord,
     ProviderObservation,
@@ -79,6 +80,7 @@ from app.services.replay.expert_replay import (
     replay_context,
 )
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = ["ReplayTape", "TapeProviderBundle", "run"]
@@ -623,6 +625,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         expert._gather_max_days_since_report = int(
             _setting(settings, "max_days_since_report", analysis))
         expert._gather_expected_profit_mode = _setting(settings, "expected_profit_mode", analysis)
+        if expert._gather_expected_profit_mode == "model":
+            expert._gather_model_target_method = _setting(settings, "model_target_method", analysis)
         # The RECORD says which branch ran, not the tape. When the calendar branch
         # ran, the tape presents an FMP-typed provider (the branch is chosen by
         # isinstance) and serves the bulk calendar; if that response is missing the
@@ -635,6 +639,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
     if expert_class == "FMPInsiderClusterBuy":
         expert._gather_lookback_days = int(_setting(settings, "lookback_days", analysis))
         expert._gather_expected_profit_mode = _setting(settings, "expected_profit_mode", analysis)
+        if expert._gather_expected_profit_mode == "model":
+            expert._gather_model_target_method = _setting(settings, "model_target_method", analysis)
         return TapeProviderBundle(tape)
 
     if expert_class == "DeterministicScorer":
@@ -658,6 +664,8 @@ def _prepare(expert_class: str, expert, tape: ReplayTape, settings: Dict[str, An
         expert._gather_w_earnings = float(_setting(settings, "w_earnings", analysis) or 0.0)
         expert._gather_index_symbol = str(_setting(settings, "index_symbol", analysis))
         expert._gather_use_model_target = bool(_setting(settings, "use_model_target", analysis))
+        if expert._gather_use_model_target:
+            expert._gather_model_target_method = str(_setting(settings, "model_target_method", analysis))
 
         def _refuse_api_key():
             raise refuse("fmp_api_key", analysis_id=analysis.analysis_id,
@@ -792,8 +800,7 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     )
     with replay_isolation():
         for analysis in bundle.analyses:
+            if is_decision_pass(analysis):      # not an expert analysis: no gather to replay
+                continue
             report.results.append(replay_gather(bundle, analysis))
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)

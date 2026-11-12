@@ -404,9 +404,14 @@ class AccountInterface(ReadOnlyAccountInterface):
                 trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
                 try:
                     parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
+                    # SAME SIDE = never the entry. Besides the partial close above, this is a
+                    # REPLACEMENT staged on the cancel of the protection it supersedes (dev
+                    # 2026-11-10 NVDA txn 95: the position fell 3 -> 2, the 2-share replacement
+                    # inherited the cancelled 3-share stop's size and the broker refused it for
+                    # insufficient qty, leaving the position with no stop). Its builder sized it
+                    # on the position; it keeps that size.
                     is_partial_close_parent = (
                         parent_order is not None
-                        and parent_order.order_type == OrderType.MARKET
                         and parent_order.side == trading_order.side
                     )
                     if parent_order and parent_order.quantity and not is_partial_close_parent:
@@ -421,7 +426,8 @@ class AccountInterface(ReadOnlyAccountInterface):
                     elif is_partial_close_parent:
                         logger.debug(
                             f"TP/SL order {trading_order.id or 'new'} parent {parent_order.id} is a same-side "
-                            f"MARKET close - keeping independent quantity {trading_order.quantity}"
+                            f"{parent_order.order_type} (close or superseded protection) - keeping "
+                            f"independent quantity {trading_order.quantity}"
                         )
                     else:
                         logger.warning(

@@ -365,7 +365,9 @@ def test_future_rows_cannot_move_a_past_value():
 # --------------------------------------------------------------------------
 def _settings(params: dict) -> dict:
     s = dict(params)
-    s.update({"adx_gate": 25.0, "adx_rsi_boost": 2.0, "atr_period": params["adx_period"]})
+    s.update({"adx_gate": 25.0, "adx_rsi_boost": 2.0, "atr_period": params["adx_period"],
+              # _process hands the dict to the macro section, which reads the resolved value
+              "yc_scale": 0.5})
     return s
 
 

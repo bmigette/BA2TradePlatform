@@ -98,12 +98,27 @@ def _recommendation_rows(market_analysis_id):
         ).all()
 
 
+def _ensure_instance_row(expert):
+    """The bare fixture experts have no ExpertInstance row; the recorder reads the real one."""
+    from ba2_common.core.models import ExpertInstance
+
+    from ba2_common.core.db import InstanceNotFound
+
+    try:
+        get_instance(ExpertInstance, expert.id)
+    except InstanceNotFound:
+        add_instance(ExpertInstance(id=expert.id, account_id=1, expert=type(expert).__name__,
+                                    enabled=True, virtual_equity_pct=37.5,
+                                    enter_market_ruleset_id=5, open_positions_ruleset_id=6))
+
+
 def _run(case, capture_root=None):
     """Drive one expert's live run_analysis; return (recommendation, calls, state)."""
     expert, settings, patches, counters, reset = case()
     produced = []
     _spy_process(expert, produced)
     reset()
+    _ensure_instance_row(expert)
     market_analysis = _market_analysis(expert._gather_symbol, expert.id)
 
     with ExitStack() as stack:
@@ -224,9 +239,9 @@ def _fmp_rating_case():
                  "targetLow": 110.0, "targetMedian": 128.0}
     upgrade = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
     price_targets = [
-        {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-        {"publishedDate": "2026-06-09", "priceTarget": 124.0},
-        {"publishedDate": "2026-06-08", "priceTarget": 128.0},
+        {"publishedDate": "2026-06-10", "priceTarget": 110.0, "adjPriceTarget": 110.0},
+        {"publishedDate": "2026-06-09", "priceTarget": 124.0, "adjPriceTarget": 124.0},
+        {"publishedDate": "2026-06-08", "priceTarget": 128.0, "adjPriceTarget": 128.0},
     ]
     counters = {"consensus": 0, "upgrades": 0, "price_targets": 0, "grades": 0}
 
@@ -480,8 +495,8 @@ def _ds_fred_meta():
 _DS_GRADES = [{"date": "2026-06-01", "analystRatingsStrongBuy": 6,
                "analystRatingsbuy": 4, "analystRatingsHold": 2,
                "analystRatingsSell": 1, "analystRatingsStrongSell": 0}]
-_DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0},
-               {"publishedDate": "2026-06-04", "priceTarget": 116.0}]
+_DS_TARGETS = [{"publishedDate": "2026-06-10", "priceTarget": 120.0, "adjPriceTarget": 120.0},
+               {"publishedDate": "2026-06-04", "priceTarget": 116.0, "adjPriceTarget": 116.0}]
 
 
 def _deterministic_scorer_case(bars=400, quote=True):
@@ -1329,3 +1344,92 @@ def test_every_recorded_expert_routes_its_live_path_through_the_capture_scope():
             f"{expert_class.__name__}.run_analysis records the skip itself; "
             f"_gather_and_process owns the outcome so the experts cannot disagree "
             f"about whether a skip also leaves a recommendation on the row")
+
+
+# --------------------------------------------------------------------------- #
+# 3. The recorded settings are the FULL resolved settings (schema 2, audit gap 5)
+# --------------------------------------------------------------------------- #
+def _recorded_settings_of(on, tmp_path_root):
+    record = on["records"][0]
+    return record, _decode_object(tmp_path_root, record.settings_object)
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_recorded_settings_are_the_full_resolved_instance_settings(name, tmp_path):
+    from ba2_common.core.replay.settings_record import INSTANCE_KEY_PREFIX, redact_settings
+
+    root = tmp_path / name
+    on = _run(CASES[name], capture_root=root)
+    record, recorded = _recorded_settings_of(on, root)
+    expert = on["expert"]
+
+    # The decision-time risk-manager keys the warm plan needs are IN the recording.
+    for key in ("use_atr_stop", "sizing_mode", "atr_period"):
+        assert key in recorded, f"{name}: recorded settings lack {key!r}"
+    # Every resolved setting, by the expert's own resolver (one implementation, not a copy).
+    expected, _dropped = redact_settings(expert.resolve_all_settings())
+    for key, value in expected.items():
+        if key not in on["settings"]:  # the live body's own dict wins on overlap (asserted below)
+            assert recorded[key] == value, (name, key)
+    # ... and every setting the live body handed _process.
+    for key, value in on["settings"].items():
+        assert recorded[key] == value, (name, key)
+    # The instance columns that drive decisions.
+    assert recorded[f"{INSTANCE_KEY_PREFIX}virtual_equity_pct"] == 37.5
+    assert recorded[f"{INSTANCE_KEY_PREFIX}enabled"] is True
+    assert recorded[f"{INSTANCE_KEY_PREFIX}account_id"] == 1
+    assert recorded[f"{INSTANCE_KEY_PREFIX}enter_market_ruleset_id"] == 5
+    assert recorded[f"{INSTANCE_KEY_PREFIX}open_positions_ruleset_id"] == 6
+    assert record.schema_version == 2
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_a_warm_plan_resolves_the_expert_from_its_recorded_settings(name, tmp_path):
+    """The audit's symptom: 'setting use_atr_stop is required' for EVERY expert."""
+    from ba2_common.core.replay import Window, required_replay_inputs
+    import ba2_experts.replay_dependencies  # noqa: F401 - registers the adapters
+
+    root = tmp_path / name
+    on = _run(CASES[name], capture_root=root)
+    _record, recorded = _recorded_settings_of(on, root)
+
+    requirements = required_replay_inputs(
+        name, recorded, None, ["AAPL"], Window(start=NOW.replace(year=2025), end=NOW))
+    assert requirements, f"{name}: nothing was planned"
+
+
+def test_credentials_are_dropped_from_the_recorded_settings(tmp_path, monkeypatch):
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+    original = MarketExpertInterface.resolve_all_settings
+
+    def with_secrets(self):
+        resolved = original(self)
+        resolved["vendor_api_key"] = "SECRET-VALUE-1"
+        resolved["bearer_token"] = "SECRET-VALUE-2"
+        return resolved
+
+    monkeypatch.setattr(MarketExpertInterface, "resolve_all_settings", with_secrets)
+    root = tmp_path / "FMPRating"
+    on = _run(CASES["FMPRating"], capture_root=root)
+    record, recorded = _recorded_settings_of(on, root)
+
+    assert "vendor_api_key" not in recorded and "bearer_token" not in recorded
+    assert "SECRET-VALUE" not in repr(recorded)
+    assert record.branch_flags["redacted_setting_keys"] == ["bearer_token", "vendor_api_key"]
+    assert "use_atr_stop" in recorded
+
+
+def test_a_failed_full_resolution_is_flagged_and_keeps_the_passed_settings(tmp_path, monkeypatch):
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+    def boom(self):
+        raise RuntimeError("definitions unavailable")
+
+    monkeypatch.setattr(MarketExpertInterface, "resolve_all_settings", boom)
+    root = tmp_path / "FMPRating"
+    on = _run(CASES["FMPRating"], capture_root=root)  # the analysis itself still runs
+    record, recorded = _recorded_settings_of(on, root)
+
+    assert "RuntimeError: definitions unavailable" in record.branch_flags["settings_resolution_failed"]
+    assert set(recorded) == set(on["settings"])

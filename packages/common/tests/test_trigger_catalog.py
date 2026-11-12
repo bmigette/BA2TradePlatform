@@ -112,13 +112,16 @@ def test_the_counts_the_design_agreed():
 
     80 -> 81 / position 18 -> 19 (2026-09-25): ``entry_tag``, the style-group member tag (plan
     2026-09-25 option-stage2-build, Task 2), filed under position -- it is a fact about who
-    opened the evaluated position."""
+    opened the evaluated position.
+
+    83 -> 84 / options 13 -> 14 (2026-11-06): ``structure_share``, a style member's share of the
+    sleeve (plan 2026-11-06 structure-share-condition)."""
     assert category_counts() == {
-        "all": 83,
+        "all": 84,
         "position": 19,
         "signal": 26,
         "targets": 10,
-        "options": 13,
+        "options": 14,
         "market": 21,
         "timing": 12,
     }

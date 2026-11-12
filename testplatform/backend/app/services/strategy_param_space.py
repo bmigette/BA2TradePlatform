@@ -27,6 +27,9 @@ Namespacing:
                                    leaf off|below|above (with its :value threshold gene),
                                    categorical leaf off + the field's registry values in
                                    ascending code order (no :value gene). off removes the leaf.
+  cond:<id>:field                  that leaf's FIELD (choice over its field_choices; the pullback RSI
+                                   period). Decode writes it into the leaf and drops field_*; inert
+                                   (and dropped from the memo key) when the leaf's mode is off.
   entry:<rid>:enabled              entry rule ON/OFF toggle (rule.toggle_optimize)
   entry:<rid>:a<i>:action_value    entry rule action i's value
   entry:<rid>:a<i>:enabled         entry rule action i's ON/OFF toggle
@@ -296,6 +299,26 @@ def neutralise_market_profile_genes(flat_params: Dict[str, Any], members: Option
     return flat_params if out == flat_params else out
 
 
+def neutralise_independent_exit_genes(flat_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalise a decoded genome for the TRIAL MEMO KEY: a ``--market-exit rsi|spy`` rule whose toggle
+    decoded to 0 is absent from the run, so its threshold / RSI-period / stop-percent genes describe nothing and
+    are REMOVED from the key (never from the config the trial runs): two genomes differing only there share one
+    key. The rules are found by id suffix (``market_condition_templates.INDEPENDENT_EXIT_RULE_SUFFIXES``): rule
+    genes are ``exit:<rid>:enabled`` / ``exit:<rid>:a*``, leaf genes ``cond:<rid>-*``.
+
+    Returns ``flat_params`` ITSELF when there is no such rule (every older job) or nothing changes."""
+    from ba2_common.core.market_condition_templates import INDEPENDENT_EXIT_RULE_SUFFIXES
+
+    off = [k[len("exit:"):-len(":enabled")] for k, v in flat_params.items()
+           if k.startswith("exit:") and k.endswith(":enabled") and v == 0
+           and k[len("exit:"):-len(":enabled")].endswith(INDEPENDENT_EXIT_RULE_SUFFIXES)]
+    if not off:
+        return flat_params
+    dead = tuple(f"exit:{rid}:a" for rid in off) + tuple(f"cond:{rid}-" for rid in off)
+    out = {k: v for k, v in flat_params.items() if not k.startswith(dead)}
+    return flat_params if len(out) == len(flat_params) else out
+
+
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
 # drop the whole rule.)
@@ -427,6 +450,8 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
         out[f"cond:{cid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
     if cond.get("mode_optimize"):
         _collect_mode_gene(cond, cid, out)
+    if cond.get("field_optimize") or cond.get("fieldOptimize"):
+        _collect_field_gene(cond, cid, out)
 
 
 def _expected_mode_choices(leaf: Dict[str, Any], cid: str, kind: Optional[str]) -> list:
@@ -466,6 +491,35 @@ def _collect_mode_gene(cond: Dict[str, Any], cid: str, out: Dict[str, Any]) -> N
             f"got {declared!r}")
     out[f"cond:{cid}:mode"] = {
         "type": "choice", "choices": expected, "min": 0, "max": len(expected) - 1, "step": 1,
+    }
+
+
+def _collect_field_gene(cond: Dict[str, Any], cid: str, out: Dict[str, Any]) -> None:
+    """``cond:<id>:field`` choice gene for a ``field_optimize`` leaf (the pullback RSI period).
+
+    The choices are the leaf's own ``field_choices`` (condition field names); the authored ``field``
+    must be one of them and each must be a registered condition field, so a typo fails at collection,
+    once per job, not as a per-trial crash. Needs ``mode_optimize``: ``off`` removes the leaf, which is
+    what makes the field gene inert (and lets the memo key drop it)."""
+    if "conditions" in cond:
+        raise ValueError(f"condition {cid!r}: field_optimize is only valid on a leaf, not a group")
+    if not cond.get("mode_optimize") and cond.get("mode") in (None, MODE_OFF):
+        raise ValueError(f"condition {cid!r}: field_optimize is only supported beside mode_optimize "
+                         f"(or on a fixed leaf with a resolved non-off mode)")
+    choices = list(cond.get("field_choices") or cond.get("fieldChoices") or [])
+    if not choices:
+        raise ValueError(f"condition {cid!r}: field_optimize requires field_choices")
+    if len(set(choices)) != len(choices):
+        raise ValueError(f"condition {cid!r}: field_choices has duplicates: {choices!r}")
+    if cond.get("field") not in choices:
+        raise ValueError(f"condition {cid!r}: field {cond.get('field')!r} is not one of field_choices {choices!r}")
+    from ba2_common.core.rule_builders import FIELD_EVENT
+
+    unknown = [c for c in choices if c not in FIELD_EVENT]
+    if unknown:
+        raise ValueError(f"condition {cid!r}: field_choices {unknown!r} are not registered condition fields")
+    out[f"cond:{cid}:field"] = {
+        "type": "choice", "choices": choices, "min": 0, "max": len(choices) - 1, "step": 1,
     }
 
 
@@ -672,12 +726,23 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
         out[key] = spec
 
 
+#: Rule-level marker (``--regime-split-entry``): the rule's rule/action genes are keyed by THIS id instead of
+#: its own ``id``, so two rules (the SPY-up and SPY-down copies of one entry rule) can share one gene set.
+#: Rule-level on purpose: ``normalize_trade_rules`` keeps unknown RULE keys (not leaf keys); stripped on decode.
+GENE_RULE_ID_MARKER = "gene_rule_id"
+
+
+def _gene_rule_id(rule: Dict[str, Any]):
+    """The id a rule's own ``entry:``/``exit:`` genes are keyed by: its ``gene_rule_id`` marker, else its ``id``."""
+    return rule.get(GENE_RULE_ID_MARKER) or rule.get("geneRuleId") or rule.get("id")
+
+
 def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
     """cond:* + rule/action genes across ONE TradeRule list (ns = 'entry' or 'exit')."""
     for rule in (rules or []):
         if not isinstance(rule, dict):
             continue
-        rid = rule.get("id")
+        rid = _gene_rule_id(rule)
         if rid and rule.get("toggle_optimize"):
             out[f"{ns}:{rid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
         if rid:
@@ -996,6 +1061,8 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
                 kept.append(child)
             node["conditions"] = kept
         cid = node.get("id")
+        if node.get("field_choices") or node.get("fieldChoices") or node.get("field_optimize"):
+            _apply_field(node, cid, by_id.get(cid, {}))
         if cid and cid in by_id:
             sub = by_id[cid]
             if "value" in sub:
@@ -1050,6 +1117,43 @@ def mode_token(raw: Any, choices: Any, cid: str) -> str:
     if token not in choices:
         raise ValueError(f"condition {cid!r}: mode {token!r} is not one of {choices!r}")
     return token
+
+
+def field_token(raw: Any, choices: Any, cid: str) -> str:
+    """The field name a decoded ``cond:<id>:field`` gene means, for one leaf's ``field_choices``
+    (the choice gene's token, or a raw index from a hand-built flat dict). Anything else raises
+    naming the leaf: an unreadable field gene is a broken genome, never "keep the authored field"."""
+    if not choices:
+        raise ValueError(
+            f"condition {cid!r}: a cond:{cid}:field gene was decoded but the template leaf "
+            f"declares no field_choices")
+    choices = list(choices)
+    if isinstance(raw, str):
+        token = raw
+    elif (isinstance(raw, (int, float)) and not isinstance(raw, bool)
+          and float(raw).is_integer() and 0 <= int(raw) < len(choices)):
+        token = choices[int(raw)]
+    else:
+        raise ValueError(
+            f"condition {cid!r}: field gene {raw!r} is neither a choice token nor an index into {choices!r}")
+    if token not in choices:
+        raise ValueError(f"condition {cid!r}: field {token!r} is not one of {choices!r}")
+    return token
+
+
+def _apply_field(node: Dict[str, Any], cid: str, sub: Dict[str, Any]) -> None:
+    """Resolve a ``field_optimize`` leaf into an ordinary concrete leaf (deep-copied node).
+
+    Writes the decoded field (or keeps the authored one when the genome carries no field gene, like a
+    value gene that is absent) and removes ``field_optimize``/``field_choices``: a decoded leaf is a
+    RULE, and a leaf still carrying them is refused downstream (``assert_market_conditions_resolved``)."""
+    choices = node.get("field_choices") or node.get("fieldChoices")
+    if "field" in sub:
+        node["field"] = field_token(sub["field"], choices, cid)
+    elif choices and node.get("field") not in choices:
+        raise ValueError(f"condition {cid!r}: field {node.get('field')!r} is not one of {list(choices)!r}")
+    for key in ("field_optimize", "fieldOptimize", "field_choices", "fieldChoices"):
+        node.pop(key, None)
 
 
 def _resolve_modes(tree: Any, by_id: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
@@ -1228,7 +1332,7 @@ def _decode_rule_list(rules, ns: str,
         if not isinstance(rule, dict):
             out.append(rule)
             continue
-        rid = rule.get("id")
+        rid = _gene_rule_id(rule)
         genes = rule_genes.get(rid or "", {})
         gene_enabled = genes.get("enabled")
         if rule.get("enabled") is False:
@@ -1282,6 +1386,8 @@ def _decode_rule_list(rules, ns: str,
         rule.pop("marketMasterGene", None)
         rule.pop("market_profile_gene", None)
         rule.pop("marketProfileGene", None)
+        rule.pop(GENE_RULE_ID_MARKER, None)
+        rule.pop("geneRuleId", None)
         out.append(rule)
     return out
 
@@ -1627,7 +1733,7 @@ def authored_genome(strategy, space: Dict[str, Any], *, lattice_anchor: str = "z
     for ns, attr in (("entry", "entry_rules"), ("exit", "exit_rules")):
         rules = [r for r in (getattr(strategy, attr, None) or []) if isinstance(r, dict)]
         for rule in rules:
-            rid = rule.get("id")
+            rid = _gene_rule_id(rule)
             tree = rule.get("conditions")
             authored_abs: Dict[str, Any] = {}
             _collect_authored_values(tree, authored_abs)
@@ -1682,6 +1788,11 @@ def _author_tree(node, authored_abs, space, anchor, put, where) -> None:
             put(key, 1, loc)
         elif field == "mode":
             put(key, _authored_mode(node, cid, list(cfg["choices"])), loc)
+        elif field == "field":
+            if node.get("field") not in cfg["choices"]:
+                raise ValueError(f"authored genome: {key!r}: template field {node.get('field')!r} "
+                                 f"not in {list(cfg['choices'])!r} ({loc})")
+            put(key, node["field"], loc)
         else:
             raise ValueError(f"authored genome: cannot answer {key!r} ({loc})")
 

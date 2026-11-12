@@ -27,7 +27,8 @@ from ._common import jsonable, naive_utc, page, parse_enum, require_row, row_dic
 from ._locks import (EXIT_USE_CASES, acquire_transaction_lock, expert_write_lock,
                      transaction_write_lock)
 from .accounts import broker_write, map_broker_error
-from .errors import BrokerRefused, BrokerUnreachable, Conflict, Invalid, NotFound, Unmeasurable
+from .errors import (BrokerRefused, BrokerUnreachable, Conflict, Invalid, NotFound, ServiceError,
+                     Unmeasurable)
 
 
 def _write_scope(expert_id: Optional[int], dry_run: bool):
@@ -197,6 +198,36 @@ def validate_tp_sl(account, txn: Transaction, tp_price: Optional[float], sl_pric
         txn.side, tp_price or None, sl_price or None, reference_price=ref_price)
     if not ok:
         raise Invalid(reason, {"id": txn.id})
+
+
+@dataclass
+class BatchTpPlan:
+    """Outcome for one transaction of the batch "Adjust TP %": ``price`` to set, or ``reason`` it is skipped."""
+    price: Optional[float]
+    reason: Optional[str]
+
+
+def plan_batch_tp(account, txn: Transaction, tp_percent: float) -> BatchTpPlan:
+    """Side-aware TP target for the batch action: long = open * (1 + pct/100), short = open * (1 - pct/100),
+    validated against the account's CURRENT price by ``validate_tp_sl`` (the single-row check). A missing open or
+    current price, or a target that is on the wrong side / would fill at once, SKIPS the row with a reason; there
+    is no fallback to the open price. Option rows are treated like the single-row path (no special case)."""
+    open_price = txn.open_price
+    if open_price is None or isinstance(open_price, bool) or not math.isfinite(open_price) or open_price <= 0:
+        return BatchTpPlan(None, f"invalid open price ({open_price})")
+    factor = 1 + tp_percent / 100 if txn.side == OrderDirection.BUY else 1 - tp_percent / 100
+    target = open_price * factor
+    if target <= 0:
+        return BatchTpPlan(None, f"TP {tp_percent:g}% gives a non-positive target")
+    try:
+        validate_tp_sl(account, txn, target, None)
+    except ServiceError as e:
+        return BatchTpPlan(None, e.message)
+    except OSError as e:
+        return BatchTpPlan(None, f"The current price of {txn.symbol} could not be read: {type(e).__name__}")
+    except ValueError as e:
+        return BatchTpPlan(None, f"The current price of {txn.symbol} is unavailable: {type(e).__name__}")
+    return BatchTpPlan(target, None)
 
 
 def plan_tp_sl(txn: Transaction, tp_value: Optional[float], sl_value: Optional[float]) -> Optional[TpSlStep]:

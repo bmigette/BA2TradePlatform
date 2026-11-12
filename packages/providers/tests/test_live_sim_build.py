@@ -153,6 +153,25 @@ def test_acknowledged_delisting_keeps_history_and_is_never_selectable_after(cach
     assert np.isfinite(pan0.arrays["lc"][pan0.pos(SESSIONS[22].isoformat()), pan0.sym_index["C"]])
 
 
+def test_a_delisted_symbol_is_never_selectable_after_its_last_bar_without_any_review_entry(cache):
+    """D: bars stop at SESSIONS[20], not in the vendor listing. It keeps its history, is a candidate on every day it has a
+    finished bar, and drops out of the screen from the next morning (no 35-day lingering previous close)."""
+    man = lb.build_daily_panel(str(cache), ["A", "B", "C", "D"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,
+                               acknowledged_stale=["C"], history_source="fmp")
+    last = SESSIONS[20].isoformat()
+    assert man["delisted_symbols"] == ["D"] and man["delisted_masked_after_last_session"] == {"D": last}
+    pan = ls.load_panel(man["path"])
+    i, c_i = pan.sym_index["D"], pan.sym_index["C"]
+
+    def candidate(day, idx):
+        c = pan.columns(pan.pos(day))
+        return bool(np.isfinite(c["last_close"][idx] * c["shares"][idx]))
+    assert candidate(last, i) and candidate(SESSIONS[5].isoformat(), i)
+    assert not candidate(SESSIONS[21].isoformat(), i) and not candidate(SESSIONS[22].isoformat(), i)
+    assert np.isfinite(pan.arrays["c"][pan.pos(last), i])                              # the history is kept
+    assert candidate(SESSIONS[22].isoformat(), c_i)       # a stale name the vendor STILL lists is not masked (it is a defect)
+
+
 def test_acknowledged_delisting_with_the_wrong_last_session_or_pending_review_refuses(cache, tmp_path):
     with pytest.raises(ls.SimulationRefusal, match="does not describe this data"):
         lb.build_daily_panel(str(cache), ["A", "C"], "2023-10-02", "2024-03-28", workers=2, log=lambda m: None,

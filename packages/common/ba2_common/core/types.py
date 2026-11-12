@@ -500,6 +500,14 @@ class ExpertEventType(str, Enum):
     # Option-related numeric events
     N_PERCENT_BELOW_RECENT_HIGH = "percent_below_recent_high"  # Percent the current price is below the recent high
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
+    # Pullback entry gates (goal2027 design 2026-11-10, part 3). Wilder RSI of finished daily closes,
+    # one member per period because a rule leaf carries no second parameter; and the distance of the
+    # account price from the SMA200 of finished daily closes, in percent.
+    N_PULLBACK_RSI_2 = "pullback_rsi_2"
+    N_PULLBACK_RSI_3 = "pullback_rsi_3"
+    N_PULLBACK_RSI_4 = "pullback_rsi_4"
+    N_PULLBACK_RSI_5 = "pullback_rsi_5"
+    N_PRICE_VS_SMA200_PERCENT = "price_vs_sma200_percent"
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
     # The UNDERLYING's current-bar volume as a multiple of its own trailing average
     # (1.0 == normal). The underlying, deliberately, not a contract: most individual contracts
@@ -542,6 +550,11 @@ class ExpertEventType(str, Enum):
     # only. UNEVALUABLE (fires in NEITHER direction) when the entry order carries no tag, which
     # is every position not opened by a style-group entry.
     N_ENTRY_TAG = "entry_tag"
+    # A style MEMBER's committed capital as a percent of the sleeve's equity (plan
+    # 2026-11-06 structure-share-condition). An ENTRY gate: ANDed last into each member's
+    # entry rule by a style that opts in (``structure_share``); False lets the next member's
+    # rule be tried. UNEVALUABLE (False, ERROR logged) when the share cannot be measured.
+    N_STRUCTURE_SHARE = "structure_share"
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
     # "21 days after opening" and "21 days before expiry" are different quantities. This is what
@@ -820,6 +833,11 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET.value,
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
+        ExpertEventType.N_PULLBACK_RSI_2.value,
+        ExpertEventType.N_PULLBACK_RSI_3.value,
+        ExpertEventType.N_PULLBACK_RSI_4.value,
+        ExpertEventType.N_PULLBACK_RSI_5.value,
+        ExpertEventType.N_PRICE_VS_SMA200_PERCENT.value,
         ExpertEventType.N_IV_RANK.value,
         ExpertEventType.N_RELATIVE_VOLUME.value,
         ExpertEventType.N_IV_TO_REALIZED_VOL.value,
@@ -827,6 +845,7 @@ def get_numeric_event_values():
         ExpertEventType.N_REC_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_AFTER_EVENT.value,
         ExpertEventType.N_ENTRY_TAG.value,
+        ExpertEventType.N_STRUCTURE_SHARE.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
         ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value,

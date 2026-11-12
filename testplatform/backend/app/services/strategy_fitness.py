@@ -93,6 +93,14 @@ _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above
 # its ratios, so it is excluded rather than ranked.
 _CAR_HARD_MIN_TRADES_PER_YEAR = 12.0
 
+# PER-CALENDAR-YEAR trade floor (design 2026-11-10-goal2027-pullback-downmarket, section 1). The two
+# per-year-AVERAGE thresholds above let a genome that trades 40 times in one year and not at all in
+# the next score as "20 a year". year_gate = clamp(min over calendar-year buckets of
+# structures_opened_in_bucket / (floor x fraction_of_a_year_the_bucket_covers), 0, 1), a SOFT factor on
+# a positive base only. Per-run override: ``car_min_trades_each_year`` in results (same resolution as
+# ``car_min_trades_per_year``).
+_CAR_MIN_TRADES_EACH_YEAR = 12.0
+
 # Ceiling on the drawdown reward. dd_guard is 20/dd, i.e. base x dd_guard IS 20 x Calmar, so an
 # unbounded guard lets a tiny-drawdown config buy its way past a materially better one: measured
 # at dd 3.86% it collected 5.18x. Capping at 2.0 keeps the full Calmar gradient down to a 10%
@@ -351,6 +359,29 @@ _CONVEX_WIPED_OUT_DD_PCT = 100.0  # >= this is terminal: WIPED_OUT_SENTINEL, che
 _CONVEX_MIN_TICKETS_PER_YEAR = 30.0   # STRUCTURES per year (see _trades_per_year), not legs
 _CONVEX_MIN_UNDERLYINGS = 20          # distinct underlyings traded over the whole window
 _CONVEX_ALIASES = ("option_convex",)
+
+# --- option_long metric constants (CONFIG, not genes) ------------------------------------------
+# The LONG-HORIZON option-book fitness (owner-approved 2026-11-07), for stage-2 ``O_STYLE``
+# "long" styles (O_CBS call backspread, O_LEAP deep-ITM LEAPS, O_PMCC, O_CONVEX). The CAR family
+# scores year-by-year consistency and would teach the GA to gut long-dated convex payoffs;
+# ``option_convex`` is too lax for LEAPS/CBS (free to 50% drawdown, no negative-year charge) and
+# is tied to ``--strategy O_CONVEX``. Scores are NOT comparable with any CAR-family or convex
+# score. Like the convex thresholds these are CONFIG, never searchable genes.
+_LONG_DD_FREE_PCT = 25.0   # |drawdown| (%) charged not at all
+_LONG_DD_DEAD_PCT = 60.0   # factor reaches 0.0 here; linear between, 0.0 beyond
+_LONG_NEG_YEAR_FLOOR = 0.5  # a negative calendar year costs at most half: max(0.5, 1 + r/100)
+_LONG_MIN_STRUCTURES_PER_YEAR = 5.0   # option STRUCTURES per year (not legs); owner 2026-11-07:
+#   12 refused every LEAPS seed at $20k (~10/yr: one-year holds), so 5
+_LONG_MIN_UNDERLYINGS = 8             # distinct underlyings over the whole window (owner 2026-11-07)
+_LONG_ALIASES = ("option_long",)
+# Same metric with a WIDER drawdown tolerance (owner 2026-11-08, $10k LC/BULLCS/CONVEX/LEAP job):
+# free to 40%, zero at 50%. Its OWN canonical key, not an alias -- an alias promises identical
+# scores, and these differ for every run with 25% < |dd| < 60%. Never compare the two.
+_LONG_DD4050_KEY = "option_long_dd40_50"
+#: metric -> (dd free %, dd dead %). Every option_long variant scores through ``_option_long``.
+_LONG_DD_BANDS = {"option_long": (_LONG_DD_FREE_PCT, _LONG_DD_DEAD_PCT),
+                  _LONG_DD4050_KEY: (40.0, 50.0)}
+_LONG_METRICS = frozenset(_LONG_DD_BANDS)
 # One name on purpose. ``option_car``'s aliases exist because the CAR family predates the
 # fitness catalog; a new metric with three spellings is three strings a routing rail has to
 # know about. TASK 13 SEAM: the O_CONVEX strategy key and the mutual refusal (an O_CONVEX job
@@ -456,6 +487,7 @@ _OCAR_KEY = _OCAR_ALIASES[0]  # "option_consistent_annual_return"
 _OCR_KEY = _OCR_ALIASES[0]  # "option_car_over_risk"
 _OCT_KEY = _OCT_ALIASES[0]  # "option_car_target"
 _CONVEX_KEY = _CONVEX_ALIASES[0]  # "option_convex"
+_LONG_KEY = _LONG_ALIASES[0]  # "option_long"
 
 _SPECIAL_META = {
     _MAX_DRAWDOWN_KEY: {
@@ -543,6 +575,31 @@ _SPECIAL_META = {
         "supports_win_rate_factor": False,
         "uses_adjusted_under_caps": False,
     },
+    _LONG_KEY: {
+        "label": "Long-Horizon Option Book (Option)",
+        "description": "For LONG-dated option books (LEAPS, call backspreads, PMCC, convex): "
+                       "end-of-window total return x a drawdown factor (free to 25%, linear "
+                       "to 0 at 60%) x a negative-calendar-year factor (each losing year "
+                       "costs max(0.5, 1 + r)), behind a breadth floor of >=12 structures/yr "
+                       "AND >=10 underlyings; robustness factors apply under "
+                       "--robust-fitness. Scores are NOT comparable with any CAR-family or "
+                       "option_convex score.",
+        # Breadth floor replaces the trade scale; the win-rate factor would score hit rate,
+        # which a long convex-leaning book must not be ranked on; no adjusted-return switch
+        # (it would clip the winners the book exists to catch), exactly as option_convex.
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": False,
+        "uses_adjusted_under_caps": False,
+    },
+    _LONG_DD4050_KEY: {
+        "label": "Long-Horizon Option Book, DD 40/50 (Option)",
+        "description": "option_long with a wider drawdown band: drawdown free to 40%, linear "
+                       "to 0 at 50%. Same return, negative-year, breadth and robustness terms. "
+                       "Scores are NOT comparable with option_long or any other metric.",
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": False,
+        "uses_adjusted_under_caps": False,
+    },
 }
 
 
@@ -584,9 +641,11 @@ def _build_metrics_catalog() -> list:
         _OCT_KEY: sorted(a for a in _OCT_ALIASES if a != _OCT_KEY),
         _OCT_SOFT30_KEY: [],
         _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
+        _LONG_KEY: [],
+        _LONG_DD4050_KEY: [],
     }
     for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _OCR_KEY, _OCT_KEY,
-                    _OCT_SOFT30_KEY, _CONVEX_KEY):
+                    _OCT_SOFT30_KEY, _CONVEX_KEY, _LONG_KEY, _LONG_DD4050_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -617,7 +676,7 @@ def assert_catalog_complete() -> None:
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
                 | set(_OCAR_ALIASES) | set(_OCR_ALIASES) | set(_OCT_ALIASES)
-                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES))
+                | {_OCT_SOFT30_KEY} | set(_CONVEX_ALIASES) | set(_LONG_METRICS))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -626,7 +685,7 @@ def assert_catalog_complete() -> None:
 def scores_option_structures(fitness_metric: str) -> bool:
     """Whether ``compute_fitness`` scores this metric on the OPTION-STRUCTURE partition
     (``_option_structure_groups``) rather than on raw rows -- i.e. whether it is one of the
-    three option CAR-family branches that pass ``option_structures=True``.
+    three option CAR-family branches (and ``option_long``) that pass ``option_structures=True``.
 
     For callers OUTSIDE the fitness (the deploy-time concentration check) that must group trades
     exactly as the GA did. ``compute_fitness`` itself does not read this: each branch passes the
@@ -635,7 +694,7 @@ def scores_option_structures(fitness_metric: str) -> bool:
     """
     metric = str(fitness_metric).lower()
     return (metric in _OCAR_ALIASES or metric in _OCR_ALIASES or metric in _OCT_ALIASES
-            or metric == _OCT_SOFT30_KEY)
+            or metric == _OCT_SOFT30_KEY or metric in _LONG_METRICS)
 
 
 def compute_fitness(fitness_metric: str, results: dict,
@@ -745,6 +804,16 @@ def compute_fitness(fitness_metric: str, results: dict,
             results["fitness_raw"] = _fit
             results["fitness_robust"] = None
         return _fit
+
+    if metric in _LONG_METRICS:
+        # OPTION-ONLY, never a default. Reached only by an explicit ``option_long``. Wrappers:
+        # spread stress and robustness (concentration x MC x spread, per-STRUCTURE P&L) apply
+        # exactly as for the option CAR family; the win-rate factor is omitted (hit rate is
+        # not a ranking quantity for a long convex-leaning book) -- see _option_long.
+        _fit = _option_long(results, *_LONG_DD_BANDS[metric])
+        return _maybe_robust(
+            _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
+            fitness_metric, results, stress_spread_bps, robust, option_structures=True)
 
     key = _FITNESS_KEYS.get(metric)
     if key is None:
@@ -1377,6 +1446,15 @@ def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
     # stresses again -- unbounded recursion. Passing 0.0 explicitly is not enough, because the
     # config-echo fallback in _min_with_stressed consults the dict when the argument is 0.
     out["stress_spread_bps"] = 0.0
+    # MUST clear the robustness request too, for the same config-echo reason: _min_with_stressed
+    # re-scores this copy with robust=None, so _maybe_robust would read robust_fitness=True back
+    # off it and multiply the STRESSED score by concentration x Monte Carlo, and the outer
+    # _maybe_robust then multiplies the min by them again (both applied twice whenever the
+    # adjusted stressed score undercut the base -- nearly always once conc x mc < 1, even for a
+    # metric this function does not restate; fixed 2026-11-09). The factors belong once, outside:
+    # min(base, stressed) x conc x mc x spread. robustness_metrics' spread screen reads only
+    # annualized_return off this copy, so it is unaffected.
+    out["robust_fitness"] = False
     car = metrics.get("annualized_return")
     out["annualized_return"] = car
     # Overwrite BOTH: _consistent_annual_return prefers the adjusted figure whenever a profit
@@ -1432,6 +1510,12 @@ def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
         pts.append({"date": ts, "equity": equity})
     if pts:
         out["equity_curve"] = pts
+    # The per-year trade floor counts WHICH trades were opened in each calendar year, and a wider
+    # spread changes none of them. Pin the buckets of the REAL curve: the synthesized curve above
+    # starts at the first exit and ends at the last, so a silent year vanishes from it and two
+    # exits minutes apart make a zero-length bucket (ZeroDivisionError in _year_gate, 56 trials of
+    # the goal2027 run on 2026-11-11).
+    out[_PINNED_YEAR_BUCKETS] = _year_trade_buckets(results)
     return out
 
 
@@ -1439,6 +1523,9 @@ def _consistent_annual_return(results: dict) -> float:
     """Fitness aligned with the trading goal: ~30%/yr EVERY year, ~30 trades/yr, dd <= 20% ok.
 
     fitness = base x dd_guard x consistency x trade_gate, where:
+
+    * year_gate -- ``_year_gate``: weakest calendar-year bucket's structures opened / floor (12, pro-rated
+      for a partial bucket), clamped to [0, 1]; a silent year is 0. 1.0 when no trade list / curve.
 
     * base — ``adjusted_annualized_return`` when a profit cap is active (same adjusted-metric
       switch as the other return metrics: a lucky mega-winner must not win the search), else
@@ -1498,6 +1585,9 @@ def _consistent_annual_return(results: dict) -> float:
         return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
     trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
 
+    # Per-calendar-year floor: recorded for every run that reaches here, APPLIED to a positive base only.
+    year_gate = _year_gate(results)
+
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign
 
@@ -1555,7 +1645,7 @@ def _consistent_annual_return(results: dict) -> float:
             "has an uneven year)."
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
-    return base * dd_guard * consistency * trade_gate
+    return base * dd_guard * consistency * trade_gate * (1.0 if year_gate is None else year_gate)
 
 
 def _option_dd_penalty(dd: float) -> float:
@@ -2290,6 +2380,119 @@ def _option_convex(results: dict) -> float:
     return ret * dd_factor
 
 
+def _long_neg_year_factor(year_returns: list) -> float:
+    """Product over losing calendar years of ``max(_LONG_NEG_YEAR_FLOOR, 1 + r/100)``.
+
+    ``year_returns`` are percentages from ``_calendar_year_returns``. Positive and zero years
+    contribute 1.0. An empty list (curve missing/too short to form a year) is NO information and
+    gives 1.0 -- the same stance ``_consistency_factor`` takes for fewer than two years; no
+    value is invented.
+    """
+    factor = 1.0
+    for r in year_returns:
+        if r < 0:
+            factor *= max(_LONG_NEG_YEAR_FLOOR, 1.0 + float(r) / 100.0)
+    return factor
+
+
+def _long_dd_factor(dd: float, free_pct: float = _LONG_DD_FREE_PCT,
+                    dead_pct: float = _LONG_DD_DEAD_PCT) -> float:
+    """1.0 at |dd| <= free_pct (25%), linear to 0.0 at dead_pct (60%), 0.0 beyond."""
+    d = abs(float(dd))
+    if d <= free_pct:
+        return 1.0
+    if d >= dead_pct:
+        return 0.0
+    return 1.0 - (d - free_pct) / (dead_pct - free_pct)
+
+
+def _option_long(results: dict, dd_free_pct: float = _LONG_DD_FREE_PCT,
+                 dd_dead_pct: float = _LONG_DD_DEAD_PCT) -> float:
+    """LONG-HORIZON option-book metric (owner-approved 2026-11-07).
+
+    ``total_return x dd_factor x neg_year_factor``, behind a breadth floor. THE ORDER IS THE
+    CONTRACT (same discipline as ``_option_convex``):
+
+      1. WIPEOUT: measured max drawdown >= 100% -> WIPED_OUT_SENTINEL, literally first. A
+         missing / non-numeric / non-finite drawdown raises (never a defaulted zero).
+      2. No/unreadable ``total_return`` -> ZERO_TRADE_SENTINEL (as ``_option_convex``); zero
+         trades are caught earlier by ``compute_fitness`` (ZERO_TRADE_SENTINEL).
+      3. RETURN TERM: ``results["total_return"]`` (end of window, %), and drawdown from
+         ``results["max_drawdown"]`` -- exactly the series ``_option_convex`` reads under an
+         equity cap (the uncapped-P&L scoring curve and the capped drawdown curve; see its
+         docstring). Never the profit-capped/adjusted figure.
+      4. DD FACTOR: 1.0 at |dd| <= dd_free_pct, linear to 0.0 at dd_dead_pct, 0.0 beyond
+         (25/60 for option_long, 40/50 for option_long_dd40_50; ``_LONG_DD_BANDS``).
+      5. NEGATIVE-YEAR FACTOR: calendar-year returns of ``results["equity_curve"]`` (the scoring
+         curve) via ``_calendar_year_returns`` (same partial-year merging as the CAR family);
+         each year with r < 0 contributes ``max(0.5, 1 + r/100)``; the factor is the product.
+         If no yearly series can be formed the factor is 1.0 (no invented value; same stance as
+         ``_consistency_factor`` for < 2 years).
+      6. BREADTH FLOOR: >= 5 option STRUCTURES per year (``_trades_per_year(...,
+         option_structures=True)``) AND >= 8 distinct underlyings, else LOW_TRADE_SENTINEL.
+      7. A return <= 0 is returned RAW (a <1 factor on a negative would raise it toward 0), so a
+         losing book stays negative and ranks below any positive one. Otherwise
+         ``ret x dd_factor x neg_year_factor``.
+      8. ROBUSTNESS (concentration x MC x spread, on STRUCTURE P&L) is applied by
+         ``compute_fitness`` when robust fitness is on, as for the option CAR metrics.
+      9. TELEMETRY on ``results["option_long_telemetry"]``, never scored.
+
+    Scores are NOT comparable with CAR-family or ``option_convex`` scores.
+    """
+    # --- 1. WIPEOUT, literally first ---------------------------------------------------------
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_long requires results['max_drawdown'] and it is absent or None. An "
+            "unmeasurable drawdown is not a zero drawdown.")
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"option_long: max_drawdown is not numeric: {dd_raw!r}") from e
+    if not math.isfinite(dd):
+        raise ValueError(f"option_long: max_drawdown is not finite ({dd_raw!r}).")
+    if dd >= 100.0:
+        return WIPED_OUT_SENTINEL
+
+    # --- 2/3. RETURN TERM --------------------------------------------------------------------
+    ret = results.get("total_return")
+    if ret is None or (isinstance(ret, float) and (math.isnan(ret) or math.isinf(ret))):
+        return ZERO_TRADE_SENTINEL
+    ret = float(ret)
+
+    # --- 4. DD FACTOR / 5. NEGATIVE-YEAR FACTOR ----------------------------------------------
+    dd_factor = _long_dd_factor(dd, dd_free_pct, dd_dead_pct)
+    year_returns = _calendar_year_returns(results.get("equity_curve"))
+    neg_year_factor = _long_neg_year_factor(year_returns)
+
+    # --- 6. BREADTH FLOOR --------------------------------------------------------------------
+    if "trades" not in results:
+        raise ValueError(
+            "option_long requires results['trades'] to measure the breadth floor (>= "
+            f"{_LONG_MIN_UNDERLYINGS} distinct underlyings), and the key is absent. If you are "
+            "re-scoring a stored Backtest, restore the trade list from its column first.")
+    trades = results["trades"] or []
+    tpy = _trades_per_year(results, option_structures=True)
+    if tpy is None:
+        return LOW_TRADE_SENTINEL
+    tpy = float(tpy)
+    underlyings = _distinct_underlyings(trades)
+    if tpy < _LONG_MIN_STRUCTURES_PER_YEAR or underlyings < _LONG_MIN_UNDERLYINGS:
+        return LOW_TRADE_SENTINEL
+
+    # --- 9. TELEMETRY: recorded, NEVER scored ------------------------------------------------
+    tele = _convex_telemetry(trades, tpy, underlyings)
+    tele.update({"structures_per_year": tpy, "total_return": ret, "max_drawdown_abs": dd,
+                 "dd_factor": dd_factor, "neg_year_factor": neg_year_factor,
+                 "year_returns": list(year_returns)})
+    results["option_long_telemetry"] = tele
+
+    # --- 7. a negative return passes through raw ---------------------------------------------
+    if ret <= 0:
+        return ret
+    return ret * dd_factor * neg_year_factor
+
+
 def _consistency_factor(year_returns: list) -> float:
     """clamp(worst_year / mean_year, 0.25, 1.0); 1.0 when mean <= 0 or < 2 measurable years."""
     if len(year_returns) < 2:
@@ -2301,12 +2504,14 @@ def _consistency_factor(year_returns: list) -> float:
     return min(max(worst / mean, _CAR_CONSISTENCY_FLOOR), 1.0)
 
 
-def _calendar_year_returns(equity_curve) -> list:
-    """Per-calendar-year returns (%) from an equity curve of ``{date, equity}`` points.
+def _calendar_year_segments(equity_curve) -> list:
+    """The calendar-year buckets of an equity curve: ``[start_dt, end_dt, start_eq, end_eq]`` each.
 
     Year boundaries are calendar (Dec 31 close -> Dec 31 close, measured at the LAST equity
-    point of each year). A partial year at the start/end of the run counts as its own year only
-    if it spans >= ~6 months; shorter stubs are merged into their neighbor year.
+    point of each year). A partial year at the start/end of the run counts as its own bucket
+    only if it spans >= ~6 months; shorter stubs are merged into their neighbor bucket. ``[]``
+    when the curve has fewer than two usable points. ONE bucketing, shared by
+    ``_calendar_year_returns`` (consistency) and ``_year_trade_buckets`` (per-year trade floor).
     """
     pts = []
     for p in equity_curve or []:
@@ -2344,7 +2549,96 @@ def _calendar_year_returns(equity_curve) -> list:
     if len(segs) >= 2 and (segs[-1][1] - segs[-1][0]).total_seconds() < min_secs:
         segs[-2][1], segs[-2][3] = segs[-1][1], segs[-1][3]
         segs.pop()
-    return [(e_eq / s_eq - 1.0) * 100.0 for _s_dt, _e_dt, s_eq, e_eq in segs]
+    return segs
+
+
+def _calendar_year_returns(equity_curve) -> list:
+    """Per-calendar-year returns (%) from an equity curve of ``{date, equity}`` points.
+
+    Buckets come from ``_calendar_year_segments`` (partial years under ~6 months merge into
+    their neighbor).
+    """
+    return [(e_eq / s_eq - 1.0) * 100.0
+            for _s_dt, _e_dt, s_eq, e_eq in _calendar_year_segments(equity_curve)]
+
+
+#: ``stressed_results`` stores the unstressed run's year buckets under this key (None = unmeasurable).
+_PINNED_YEAR_BUCKETS = "_year_buckets_of_unstressed_run"
+
+
+def _year_trade_buckets(results: dict):
+    """Per calendar-year bucket: ``[{"label", "years", "structures"}, ...]`` or None.
+
+    Buckets are the equity curve's (``_calendar_year_segments``), so a year with no trades is a
+    bucket holding ZERO -- it cannot vanish for lack of trades. ``years`` is the fraction of a year
+    the bucket covers (~1.0 for a whole year, snapped within 0.04; a merged stub makes it > 1).
+    Structures are counted by ENTRY date with the ``_structure_count`` partition (legs of one
+    structure are one bet). Returns the stored ``results["trades_by_year"]`` when the trade list is
+    absent (a re-scored DB row), and None when neither is available (nothing to measure).
+    """
+    if _PINNED_YEAR_BUCKETS in results:
+        return results[_PINNED_YEAR_BUCKETS]  # a stressed copy: the buckets of the run it restates
+    trades = results.get("trades")
+    segs = _calendar_year_segments(results.get("equity_curve"))
+    if trades is None:
+        stored = results.get("trades_by_year")
+        return stored if isinstance(stored, list) and stored else None
+    if not segs:
+        return None
+    if trades and not any(isinstance(t, dict) and (t.get("entry_time") or t.get("date")) for t in trades):
+        # Rows with no entry date at all are not a trade LOG (the engine's rows always carry
+        # entry_time); there is nothing to bucket, so the year gate is unmeasurable. A list where only
+        # SOME rows lack a date is corrupt and raises below.
+        return None
+    # calendar-year range of each bucket: from the year after the previous bucket's last year
+    ranges = []
+    prev_end = None
+    for s_dt, e_dt, _s, _e in segs:
+        ys = s_dt.year if prev_end is None else prev_end + 1
+        ranges.append((ys, e_dt.year))
+        prev_end = e_dt.year
+    members = [[] for _ in segs]
+    for t in trades:
+        if not isinstance(t, dict):
+            raise ValueError(f"year gate: trade row is not a dict: {t!r}")
+        raw = t.get("entry_time", t.get("date"))
+        d = _parse_dt(raw)
+        if d is None:
+            raise ValueError(f"year gate: trade has no parseable entry_time ({raw!r})")
+        idx = len(segs) - 1
+        for i, (_ys, ye) in enumerate(ranges):
+            if d.year <= ye:
+                idx = i
+                break
+        members[idx].append(t)
+    out = []
+    for (s_dt, e_dt, _s, _e), (ys, ye), mem in zip(segs, ranges, members):
+        frac = (e_dt - s_dt).total_seconds() / (365.25 * 86400.0)
+        n = round(frac)
+        if n >= 1 and abs(frac - n) <= 0.04:
+            frac = float(n)
+        out.append({"label": str(ys) if ys == ye else f"{ys}-{ye}",
+                    "years": round(frac, 4),
+                    "structures": int(_structure_count(mem) or 0)})
+    return out
+
+
+def _year_gate(results: dict) -> Optional[float]:
+    """clamp(min over buckets of structures / (floor x bucket years), 0, 1); None = unmeasurable.
+
+    Records ``fitness_year_gate`` and ``trades_by_year`` in ``results`` (as the other fitness
+    components are recorded) so a persisted row can be decomposed.
+    """
+    buckets = _year_trade_buckets(results)
+    if not buckets:
+        results["fitness_year_gate"] = None
+        results["trades_by_year"] = None
+        return None
+    floor = float(results.get("car_min_trades_each_year") or _CAR_MIN_TRADES_EACH_YEAR)
+    gate = min(min(max(b["structures"] / (floor * b["years"]), 0.0), 1.0) for b in buckets)
+    results["fitness_year_gate"] = gate
+    results["trades_by_year"] = buckets
+    return gate
 
 
 def _years_spanned_by_curve(equity_curve) -> float:

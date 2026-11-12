@@ -9,11 +9,13 @@ testplatform/backend/tests/test_export_payload_golden.py.
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ba2_common.core.deploy_parity import (
-    BacktestRunFacts, backtest_only_settings, forced_expert_settings, member_hold_tags_fact,
+    BacktestRunFacts, backtest_only_settings, deploy_expert_settings,
+    member_hold_tags_fact,
     refuse_undeployable,
 )
 from ba2_common.core.factor_ranker_topn import repair_fr_top_n_below_pool
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
+from ba2_common.core.legacy_setting_defaults import pin_legacy_setting_defaults
 from ba2_common.core.market_condition_rules import (
     assert_market_conditions_resolved, assert_market_rule_actions,
 )
@@ -336,7 +338,13 @@ def derive_export_payload(
         # refused by name (``UndeployableRunRefused``, the caller's 409), never exported with a
         # field that describes a different run.
         refuse_undeployable(facts)
-        expert_params = {**expert_params, **forced_expert_settings(facts)}
+        # A setting whose definition default CHANGED after this run was produced, and that the run
+        # does not state, ran with the LEGACY value -- the backtest engine resolves it the same way
+        # (daily_backtest_handler._expert_decision_settings). Written explicitly, or the deploy would
+        # leave the live instance on the NEW default (e.g. DeterministicScorer yc_scale 0.5 instead
+        # of the 0.005 the run measured). A run that states the key exports it unchanged.
+        expert_params = pin_legacy_setting_defaults(backtest.expert_name, expert_params)
+        expert_params = {**expert_params, **deploy_expert_settings(facts)}
         payload = {
             "backtest_id": backtest.id,
             "name": backtest.name,
@@ -415,18 +423,19 @@ def derive_export_payload(
             entry_rules = converted["entry_rules"]
             exit_rules = converted["exit_rules"]
 
-        # The exit list as STORED is checked too: normalizing coerces an unknown group operator
-        # (a NOT) to AND, which would hide exactly the nesting the action check refuses.
+        # The exit list as STORED is checked too (it used to be the only place a NOT was seen:
+        # normalizing coerced it to AND; since 2026-11-09 normalizing refuses it as well).
         raw_exit_rules = exit_rules if isinstance(exit_rules, list) else []
-        entry_rules = normalize_trade_rules(entry_rules or [])
-        exit_rules = normalize_trade_rules(exit_rules or [])
         # MARKET-CONDITION GATES (design 2026-09-15 section 5). An export is what a deploy reads,
         # so it is the first place an undeployable ruleset can be caught: an UNRESOLVED mode gene
         # (entry OR exit) is the optimizer's search template, not a rule (live would have no
         # operator to apply), and a market gate on an open-positions rule may only close, reduce
         # or adjust TP/SL, from a top-level AND (plan 2026-09-24 Task B2). All are 400s, not
-        # 500s: the payload is wrong, the server is fine.
+        # 500s: the payload is wrong, the server is fine -- the normalization's own refusal of a
+        # NOT / unknown group operator included.
         try:
+            entry_rules = normalize_trade_rules(entry_rules or [])
+            exit_rules = normalize_trade_rules(exit_rules or [])
             assert_market_conditions_resolved(entry_rules, f"backtest {backtest.id} entry_rules")
             assert_market_conditions_resolved(exit_rules, f"backtest {backtest.id} exit_rules")
             assert_market_rule_actions(raw_exit_rules, f"backtest {backtest.id} exit_rules")

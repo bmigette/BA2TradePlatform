@@ -36,7 +36,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,10 @@ EXPERT_NAMES = tuple(FETCHER_METHODS)
 #: Experts whose warming needs the congressional-disclosure feeds (the per-symbol fetcher plus
 #: the one-shot unscoped "latest disclosures" warm, ``do_senate_latest``).
 SENATE_EXPERTS = ("FMPSenateTraderWeight", "FMPSenateTraderCopy")
+
+#: Basket mode reads disclosures up to ``max_disclose_date_days`` (GA gene max 270) before the decision date,
+#: so a run starting S needs the feed rows disclosed from S - this many days (270 + margin).
+SENATE_DISCLOSE_LOOKBACK_DAYS = 300
 
 #: How far back ``do_insider`` warms insider transactions. Union semantics: the widest
 #: window any GA trial's ``lookback_days`` gene can ask for, so no trial hits a gap. (A
@@ -305,12 +309,20 @@ class PrewarmFetchers:
                  fmp_key: Optional[str],
                  end_date: datetime,
                  finnhub_key: Optional[str],
-                 log: Optional[Callable[[str], None]] = None) -> None:
+                 estimates_source: str,
+                 log: Optional[Callable[[str], None]] = None,
+                 start_date: Optional[datetime] = None) -> None:
+        from ba2_common.core.estimates_source import check_estimates_source
+        # The run's estimates source (no default): alphavantage additionally warms the point-in-time
+        # consensus namespace for every symbol an estimate-reading expert warms.
+        self.estimates_source = check_estimates_source(estimates_source)
         if not fmp_key:
             raise PrewarmConfigError(
                 "FMP_API_KEY not configured (set it in .env or the app-settings DB).")
         self.fmp_key = fmp_key
         self.end_date = end_date
+        # Lower edge of the run (None = unknown): bounds which feed-referenced tickers the senate warm needs.
+        self.start_date = start_date
         self.finnhub_key = finnhub_key
         self._log_fn = log if log is not None else logger.info
 
@@ -332,6 +344,11 @@ class PrewarmFetchers:
         self.senate_seen_traders: set = set()
         self._senate_warmed_skill_syms: set = set()
         self._senate_lock = threading.Lock()
+        # Per-item failures of the one-shot senate warm (a trader, a buy-symbol price). Collected, never
+        # swallowed: run_prewarm reports them with the per-symbol failures.
+        self.senate_failures: List[str] = []
+        self.senate_extra_symbols: List[str] = []
+        self.senate_house_floor: str = ""
 
     # ------------------------------------------------------------------ table
     @property
@@ -404,7 +421,23 @@ class PrewarmFetchers:
 
         for namespace in ESTIMATOR_NAMESPACES:
             self._warm(namespace, sym)
+        self._warm_av_consensus(sym)
 
+    def _routed_details(self):
+        """``fundamentals_details()`` of a bundle on this run's estimates source (built once)."""
+        if getattr(self, "_details_router", None) is None:
+            from ba2_common.core.backtest_context import LiveProviderBundle
+            from ba2_providers import get_provider
+            self._details_router = LiveProviderBundle(
+                get_provider, estimates_source=self.estimates_source).fundamentals_details()
+        return self._details_router
+
+    def _warm_av_consensus(self, sym: str) -> None:
+        """Warm the Alpha Vantage point-in-time EPS consensus (+ split calendar) of *sym* when this run's
+        estimates source is ``alphavantage``; nothing for ``fmp``."""
+        if self.estimates_source == "alphavantage":
+            from ba2_experts.warm_fetchers import AV_CONSENSUS_NAMESPACE
+            self._warm(AV_CONSENSUS_NAMESPACE, sym)
     # --------------------------------------------------------------- fetchers
     def do_fmprating(self, sym: str) -> None:
         """Consensus reconstruction inputs + the dated individual grades (rating-recency)."""
@@ -459,9 +492,12 @@ class PrewarmFetchers:
         --timeframes 1d`` over [start-warmup, end] as well.
         """
         from ba2_experts.FactorRanker import data as _fr_data
-        _fr_data.fetch_value_inputs([sym], as_of=self.end_date)    # statements + OHLCV as_of price
-        _fr_data.fetch_quality_inputs([sym], as_of=self.end_date)  # statements (disk hits)
-        _fr_data.fetch_pead_inputs([sym], as_of=self.end_date)     # past_earnings + estimates
+        # The routed details of THIS run's estimates source (the same object a backtest bundle hands the expert).
+        details = self._routed_details()
+        _fr_data.fetch_value_inputs([sym], as_of=self.end_date, details=details)    # statements + OHLCV as_of price
+        _fr_data.fetch_quality_inputs([sym], as_of=self.end_date, details=details)  # statements (disk hits)
+        _fr_data.fetch_pead_inputs([sym], as_of=self.end_date, details=details)     # past_earnings + estimates
+        self._warm_av_consensus(sym)                               # pead dispersion from AV when so stated
         _fr_data.fetch_close_prices([sym], as_of=self.end_date)    # momentum: 1d OHLCV parquet
 
     def do_finnhub(self, sym: str) -> None:
@@ -514,7 +550,13 @@ class PrewarmFetchers:
         # whose symbols a today-anchored cap would miss, hard-failing the hermetic run. Symbols
         # FMP has no data for persist as the [] sentinel, which the scorer skips cleanly.
         for name in new_traders:
-            history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
+            try:
+                history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
+            except Exception as e:  # noqa: BLE001 - one trader must not abort the warm; reported
+                self._senate_failed(f"congress_trader_history/{name}", e)
+                with self._senate_lock:
+                    self.senate_seen_traders.discard(name)  # not warmed: stays out of the roster
+                continue
             # Scalper skip: a trader excluded by even the grid's gentlest filter setting
             # (SENATE_SCALPER_BOUNDS) contributes to NO GA trial's signal, so their (potentially
             # thousands of) buy-symbols are dead weight - skip their price-history warm.
@@ -534,16 +576,30 @@ class PrewarmFetchers:
                         self._senate_warmed_skill_syms.add(ssym)
                         new_skill_syms.append(ssym)
             for ssym in new_skill_syms:
-                s._get_price_at_date(ssym, self.end_date)  # warms historical_price_full (once)
+                try:
+                    s._get_price_at_date(ssym, self.end_date)  # warms historical_price_full (once)
+                except Exception as e:  # noqa: BLE001
+                    self._senate_failed(f"historical_price_full/{ssym}", e)
+
+    def _senate_failed(self, what: str, err: Exception) -> None:
+        from ba2_providers.fmp_common import redact
+        detail = f"FMPSenateTraderWeight/{what}: {type(err).__name__}: {redact(err)}"
+        with self._senate_lock:
+            self.senate_failures.append(detail)
+        self.log(f"!! prewarm {detail}")
 
     def do_senate(self, sym: str) -> None:
         """FMPSenateTraderWeight: warm the SAME fmp_history namespaces ``_gather`` reads --
         per-symbol senate/house trades (congress_{chamber}_trades) + the symbol's full daily
         price history (historical_price_full), plus each DISCLOSED trader's full history
-        (congress_trader_history, keyed by trader name, discovered from the trades)."""
+        (congress_trader_history, keyed by trader name, discovered from the trades), and the
+        price-target model's quarterly earnings (past_earnings_quarterly)."""
         s = self._ensure_senate_expert()
         trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
         s._get_price_at_date(sym, self.end_date)  # warms historical_price_full (once)
+        # expected_profit_mode='model' (a GA gene) reads the reported quarterly earnings of the
+        # price-target model; its point-in-time methods never read the estimates namespace.
+        self._warm("past_earnings_quarterly", sym)
         self.warm_new_traders(s, trades)
 
     def do_senate_latest(self) -> None:
@@ -566,6 +622,78 @@ class PrewarmFetchers:
         self.log(f"   senate: {len(senate_latest)} senate + {len(house_latest)} house rows "
                  f"fetched (full pagination)")
         self.warm_new_traders(s, senate_latest + house_latest)
+        # The house feed's oldest disclosure: the backtest backfills everything older from the roster's
+        # trader histories (``FMPSenateTraderWeight._pre_cap_backfill``), so those tickers need warming too.
+        self.senate_house_floor = min((str(t.get("disclosureDate") or "")[:10] for t in house_latest
+                                       if t.get("disclosureDate")), default="")
+        self.senate_extra_symbols = self.feed_referenced_symbols(s, senate_latest + house_latest)
+        self.log(f"   senate: {len(self.senate_extra_symbols)} feed-referenced tradable tickers "
+                 f"(disclosed in the run window) get the full per-symbol warm")
+
+    def feed_referenced_symbols(self, s, trades) -> List[str]:
+        """Every ticker a backtest over this run can be asked to price or analyse: the tradable,
+        normalised tickers of feed rows disclosed inside [start - SENATE_DISCLOSE_LOOKBACK_DAYS, end].
+
+        Basket mode (``_gather_all``) discovers its symbols from the feed, not from the universe, so it prices
+        every one of them (``historical_price_full``), and open-position management reads the per-symbol
+        ``congress_*_trades`` of each held one. The universe-only warm left all of those to be hermetic misses.
+        Uses the expert's OWN normalisation + tradability filter so the set is exactly what it will touch."""
+        from ba2_common.core.utils import is_tradable_stock_ticker
+        lo = None
+        if self.start_date is not None:
+            lo = (self.start_date - timedelta(days=SENATE_DISCLOSE_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        hi = self.end_date.strftime("%Y-%m-%d")
+        out = set()
+        for t in trades:
+            ds = str(t.get("disclosureDate") or "")[:10]
+            if not ds or ds > hi or (lo is not None and ds < lo):
+                continue
+            sym = s._normalize_ticker(str(t.get("symbol", "")))
+            if sym and is_tradable_stock_ticker(sym):
+                out.add(sym)
+        return sorted(out)
+
+    def pre_cap_referenced_symbols(self) -> List[str]:
+        """The tickers of the rows ``FMPSenateTraderWeight._pre_cap_backfill`` adds: every roster trader's
+        history rows disclosed BEFORE the house feed's oldest disclosure, filtered to the run window exactly as
+        ``feed_referenced_symbols`` filters the feed. Without these, a 2020-2023 run prices backfilled house
+        disclosures whose ``historical_price_full`` was never warmed (147 hermetic misses on 2020-2025).
+        Reads the same roster the backtest reads (in-memory seen traders UNION the persisted file)."""
+        s = self.senate_expert
+        floor = self.senate_house_floor
+        if s is None or not floor:
+            return []
+        from ba2_experts.FMPSenateTraderWeight import CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY
+        from ba2_providers.fmp_common import fmp_history_disk_read
+        with self._senate_lock:
+            names = set(self.senate_seen_traders)
+        names |= set(fmp_history_disk_read(CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY) or [])
+        rows = []
+        for name in sorted(names):
+            try:
+                history = s._fetch_trader_history(name) or []
+            except Exception as e:  # noqa: BLE001 - one trader must not abort the warm; reported
+                self._senate_failed(f"congress_trader_history/{name}", e)
+                continue
+            for t in history:
+                ds = str(t.get("disclosureDate") or "")[:10]
+                if ds and ds < floor:
+                    rows.append(t)
+        return self.feed_referenced_symbols(s, rows)
+
+    def finalize_senate_roster(self) -> int:
+        """Persist ``congress_trader_roster/ALL``: every trader whose history this prewarm (or an earlier one)
+        warmed. The backtest reads it to backfill disclosures older than FMP's house-latest page cap
+        (``FMPSenateTraderWeight._pre_cap_backfill``). Monotone: unions with the file already on disk."""
+        from ba2_experts.FMPSenateTraderWeight import CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY
+        from ba2_providers.fmp_common import fmp_history_disk_read, fmp_history_disk_write
+        with self._senate_lock:
+            names = set(self.senate_seen_traders)
+        names |= set(fmp_history_disk_read(CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY) or [])
+        roster = sorted(names)
+        fmp_history_disk_write(CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY, roster)
+        self.log(f"   senate: trader roster persisted ({len(roster)} traders)")
+        return len(roster)
 
 
 def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str], workers: int,
@@ -608,11 +736,21 @@ def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str
         if any(e in experts for e in SENATE_EXPERTS):
             fetchers.do_senate_latest()
             senate_latest = True
+            # Feed-referenced tickers outside the universe get the same per-symbol warm (trades,
+            # price history, earnings): basket mode prices them and open-position management reads them.
+            if "FMPSenateTraderWeight" in experts and "FMPSenateTraderWeight" not in skipped:
+                have = set(symbols)
+                for sym in fetchers.senate_extra_symbols:
+                    if sym not in have:
+                        work.append(("FMPSenateTraderWeight", sym, table["FMPSenateTraderWeight"]))
 
-        if work:
+        def _run(batch):
+            nonlocal errors
+            if not batch:
+                return
             with ThreadPoolExecutor(max_workers=max(1, workers),
                                     initializer=set_ttl_frozen, initargs=(True,)) as ex:
-                futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
+                futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in batch}
                 for fut in as_completed(futures):
                     expert, sym = futures[fut]
                     try:
@@ -628,6 +766,29 @@ def run_prewarm(fetchers: PrewarmFetchers, experts: List[str], symbols: List[str
                         detail = f"{type(e).__name__}: {redact(str(e))}"
                         failures.append(f"{expert}/{sym}: {detail}")
                         fetchers.log(f"!! prewarm {expert}/{sym} failed: {detail}")
+
+        _run(work)
+
+        # Pre-cap backfill tickers (2020-2023 house disclosures the backtest rebuilds from trader histories).
+        # Each round can surface new traders (from the per-symbol congress trades just warmed), whose
+        # histories add rows, so repeat until nothing new appears (bounded).
+        if senate_latest and "FMPSenateTraderWeight" in experts and "FMPSenateTraderWeight" not in skipped:
+            warmed = {sym for (e, sym, _) in work if e == "FMPSenateTraderWeight"}
+            for rnd in range(1, 4):
+                extra = [sym for sym in fetchers.pre_cap_referenced_symbols() if sym not in warmed]
+                fetchers.log(f"   senate: pre-cap backfill round {rnd}: {len(extra)} new tradable tickers")
+                if not extra:
+                    break
+                warmed.update(extra)
+                batch = [("FMPSenateTraderWeight", sym, table["FMPSenateTraderWeight"]) for sym in extra]
+                work.extend(batch)
+                _run(batch)
+
+    if senate_latest:
+        fetchers.finalize_senate_roster()
+        for f in fetchers.senate_failures:
+            errors += 1
+            failures.append(f)
 
     notes = []
     if not work:

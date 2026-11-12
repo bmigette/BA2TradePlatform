@@ -1,4 +1,6 @@
 """Tests for ba2_common.core.rules_convert — live ruleset export-file <-> backtester shapes."""
+import pytest
+
 from ba2_common.core.rules_convert import (
     live_export_to_strategy,
     strategy_to_live_export,
@@ -232,13 +234,15 @@ def test_strategy_to_live_export_attaches_entry_actions_to_every_enter_rule():
     assert again["buy_entry_conditions"]["operator"] == "OR"
 
 
-def test_unknown_event_type_does_not_raise():
+def test_unknown_event_type_is_refused_not_skipped():
+    """Live FAILS a rule carrying an unknown trigger (it never fires). Skipping the trigger here,
+    as this used to, imported a backtest rule that fired on ``bullish`` alone (2026-11-09)."""
+    from ba2_common.core.rules_convert import UnknownTriggerEventTypeError
+
     payload = {"export_type": "rule", "rule": {
         "name": "BUY", "subtype": "enter_market",
         "triggers": {"t0": {"event_type": "totally_made_up"}, "t1": {"event_type": "bullish"}},
         "actions": {"a0": {"action_type": "buy"}},
     }}
-    out = live_export_to_strategy(payload)
-    # The unknown trigger is skipped; the known one survives.
-    fields = [leaf["field"] for leaf in out["buy_entry_conditions"]["conditions"]]
-    assert fields == ["bullish"]
+    with pytest.raises(UnknownTriggerEventTypeError, match="totally_made_up"):
+        live_export_to_strategy(payload)

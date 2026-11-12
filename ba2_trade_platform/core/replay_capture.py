@@ -27,6 +27,8 @@ from typing import Any, Dict, Optional
 
 from ba2_common.core.interfaces.ExtendableSettingsInterface import coerce_bool
 from ba2_common.core.interfaces.MarketExpertInterface import set_capture_batch_provider
+from ba2_common.core.replay.clock import host_timezone
+from ba2_common.core.replay.decision_record import DECISION_FAMILIES
 from ba2_common.core.replay import (
     ReplayStore,
     SessionRecord,
@@ -40,6 +42,16 @@ from .models import AppSetting
 
 #: The app setting that turns capture on. Created as "false" on first read.
 CAPTURE_SETTING_KEY = "replay_capture_enabled"
+
+#: Optional ROLLOUT allow-list of the stock decision-pass recording: a comma-separated list of expert
+#: class names (``FMPRating,DeterministicScorer``). Absent, blank or ``*`` = every expert (the default
+#: whenever capture is on). The row is NOT created automatically; add it on the Settings page / DB to
+#: start with selected experts. A pass of an expert that is not listed is not recorded and is counted
+#: as a discard with reason ``expert_not_allowed`` (per expert in the capture-health surface). It
+#: changes what is recorded, never what is traded. An excluded expert loses MORE than its rules/size/execute
+#: steps: the market-condition windows and the option-action capture are read inside the same pass scope,
+#: so they are not recorded for it either (its backtest replay then has no tape for them).
+DECISION_PASS_EXPERTS_KEY = "replay_decision_pass_experts"
 
 #: Store layout version. A future incompatible layout gets its own directory
 #: rather than mixing two shapes in one root.
@@ -69,6 +81,12 @@ RECORDED_EXPERTS = (
 _LOCK = threading.RLock()
 _SESSION_DATE: Optional[str] = None
 _SESSION_TEMPLATE: Dict[str, Any] = {}
+
+#: How often the background roller checks the UTC date. Decision passes do NOT roll the session themselves
+#: (the rollover drains the writer and writes the index: a pass thread must never wait on it).
+SESSION_ROLL_INTERVAL_SECONDS = 30.0
+_roller_thread: Optional[threading.Thread] = None
+_roller_stop = threading.Event()
 _BATCH = threading.local()
 
 
@@ -128,6 +146,28 @@ def capture_enabled() -> bool:
     return coerce_bool(row.value_str)
 
 
+def decision_pass_expert_allowlist() -> Optional[frozenset]:
+    """The expert classes whose decision passes are recorded, or ``None`` for every expert.
+
+    Read per pass (one indexed row); an unreadable setting raises -- the caller counts the pass as not
+    recorded and logs it, it does not guess.
+    """
+    from sqlmodel import select
+
+    from .db import get_db
+
+    with get_db() as session:
+        row = session.exec(
+            select(AppSetting).where(AppSetting.key == DECISION_PASS_EXPERTS_KEY)
+        ).first()
+    if row is None or row.value_str is None:
+        return None
+    names = [name.strip() for name in row.value_str.split(",") if name.strip()]
+    if not names or "*" in names:
+        return None
+    return frozenset(names)
+
+
 def store_root() -> str:
     """Where this instance's captures live: ``<CACHE_FOLDER>/replay/<layout>``."""
     import ba2_trade_platform.config as config
@@ -160,8 +200,10 @@ def initialize_replay_capture() -> Optional[ReplayStore]:
             store.mark_interrupted_sessions()
             global _SESSION_TEMPLATE
             _SESSION_TEMPLATE = _describe_instance()
+            _SESSION_TEMPLATE.update(_collect_session_provenance(store))
             store.set_session_hook(_roll_session_if_needed)
             set_replay_store(store)
+            _start_session_roller()
             set_capture_batch_provider(get_current_batch)
             _begin_session(store)
             logger.info(f"Replay capture is ON; recording expert inputs to {root}")
@@ -191,6 +233,7 @@ def shutdown_replay_capture(timeout: float = 30.0) -> None:
                 return
             global _SESSION_DATE
             session_id = store.session_id
+            _stop_session_roller()
             set_replay_store(None)
             set_capture_batch_provider(None)
             if session_id is not None:
@@ -210,6 +253,19 @@ def get_capture_health() -> Dict[str, int]:
     return store.health.as_dict()
 
 
+def get_capture_status() -> Dict[str, Any]:
+    """The live capture state for the ops endpoint: on/off, the open session and the health counters.
+
+    ``enabled`` False means no store is installed (capture off); the counters are then empty and say so
+    rather than reading as a clean bill of health.
+    """
+    store = get_replay_store()
+    if store is None:
+        return {"enabled": False, "session_id": None, "counters": {}, "discards": {},
+                "discards_by_expert": {}, "total_failures": 0}
+    return {"enabled": True, "session_id": store.session_id, **store.health.snapshot()}
+
+
 # --------------------------------------------------------------------------- #
 # Sessions
 # --------------------------------------------------------------------------- #
@@ -225,6 +281,30 @@ def _begin_session(store: ReplayStore) -> str:
     store.begin_session(session)
     _SESSION_DATE = today
     return session.session_id
+
+
+def _start_session_roller() -> None:
+    global _roller_thread
+    _roller_stop.clear()
+
+    def loop() -> None:
+        while not _roller_stop.wait(SESSION_ROLL_INTERVAL_SECONDS):
+            try:
+                _roll_session_if_needed()
+            except Exception as exc:  # noqa: BLE001 -- keep rolling; the failure is loud
+                logger.error(f"replay capture: background session roll failed: {exc}", exc_info=True)
+
+    _roller_thread = threading.Thread(target=loop, name="ba2-replay-session-roller", daemon=True)
+    _roller_thread.start()
+
+
+def _stop_session_roller() -> None:
+    global _roller_thread
+    thread = _roller_thread
+    _roller_thread = None
+    _roller_stop.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=ROLLOVER_DRAIN_TIMEOUT + 3.0)
 
 
 def _roll_session_if_needed() -> None:
@@ -278,8 +358,36 @@ def _describe_instance() -> Dict[str, Any]:
         "source_revision": revision,
         "dirty": dirty,
         "config_hashes": {},
-        "capabilities": {"recorded_experts": list(RECORDED_EXPERTS)},
+        "capabilities": {
+            "recorded_experts": list(RECORDED_EXPERTS),
+            # What a session states it can replay besides expert analyses (design 2.2).
+            "decision_families": list(DECISION_FAMILIES),
+            # The recording host's timezone: "today" in a replayed decision is the day in THIS zone.
+            "host_timezone": host_timezone(),
+        },
     }
+
+
+def _collect_session_provenance(store: ReplayStore) -> Dict[str, Any]:
+    """The exact code this process runs (patch of a dirty tree, untracked files, versions).
+
+    Once per process start -- the code in memory is the code at start -- never in the decision
+    path, and never raises: a failure is returned as ``provenance_error`` so the session says
+    so, and live trading is unaffected.
+    """
+    from ba2_common.core.replay.provenance import collect_provenance
+
+    try:
+        provenance, error = collect_provenance(_repo_root(), store.publish_session_object)
+    except Exception as e:  # collect_provenance does not raise; this is the belt for its braces
+        provenance, error = {}, f"collect_provenance: {e}"
+    if error:
+        logger.error(f"replay capture: code provenance incomplete: {error}")
+    return {"provenance": provenance, "provenance_error": error}
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _instance_id() -> str:
@@ -317,7 +425,7 @@ def _source_revision():
     not an error -- but the revision then stays UNKNOWN (``None``) instead of
     being filled with something that looks like an answer.
     """
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    repo = _repo_root()
     try:
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,

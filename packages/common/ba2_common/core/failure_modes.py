@@ -110,9 +110,11 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 # ReplayMiss (``ba2_common.core.replay.context``, 2026-11-05): a replay needed a recorded value the
 # bundle does not hold. Absorbed, the replayed code would run on a fallback and report a match it
 # did not earn. A miss is a coverage fact and must reach the replay harness, in every mode.
+# EstimatesUnavailable (``ba2_common.core.estimates_pit``, 2026-11-07): an estimate-based decision with no
+# estimate for the symbol. Absorbed, the expert would fall back to a non-estimate answer for that symbol.
 _NEVER_ABSORB_NAMES = frozenset({"SplitBasisRefused", "OptionSpotBasisMismatch",
                                  "MacroAvailabilityUnknown", "OHLCVTopUpRefused",
-                                 "StaleAnchorPrice", "ReplayMiss"})
+                                 "StaleAnchorPrice", "ReplayMiss", "EstimatesUnavailable"})
 
 
 def is_never_absorbed(exc: BaseException) -> bool:

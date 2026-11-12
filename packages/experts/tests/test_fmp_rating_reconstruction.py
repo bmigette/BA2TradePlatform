@@ -60,16 +60,16 @@ GRADES_HISTORY = [
 # v4/price-target individual analyst notes.
 PRICE_TARGET_HISTORY = [
     # EARLY window (publishedDate in ~2026-01..03): below current (100) -> bearish.
-    {"publishedDate": "2026-01-10", "priceTarget": 80.0},
-    {"publishedDate": "2026-02-15", "priceTarget": 90.0},
-    {"publishedDate": "2026-03-05", "priceTarget": 85.0},
+    {"publishedDate": "2026-01-10", "priceTarget": 80.0, "adjPriceTarget": 80.0},
+    {"publishedDate": "2026-02-15", "priceTarget": 90.0, "adjPriceTarget": 90.0},
+    {"publishedDate": "2026-03-05", "priceTarget": 85.0, "adjPriceTarget": 85.0},
     # LATE window (publishedDate in ~2026-04..06): above current (100) -> bullish.
-    {"publishedDate": "2026-05-01", "priceTarget": 130.0},
-    {"publishedDate": "2026-05-15", "priceTarget": 150.0},
-    {"publishedDate": "2026-06-05", "priceTarget": 140.0},
+    {"publishedDate": "2026-05-01", "priceTarget": 130.0, "adjPriceTarget": 130.0},
+    {"publishedDate": "2026-05-15", "priceTarget": 150.0, "adjPriceTarget": 150.0},
+    {"publishedDate": "2026-06-05", "priceTarget": 140.0, "adjPriceTarget": 140.0},
     # FUTURE (after every as_of): MUST be ignored (no-lookahead). If leaked it would
     # blow up the average.
-    {"publishedDate": "2026-12-20", "priceTarget": 9999.0},
+    {"publishedDate": "2026-12-20", "priceTarget": 9999.0, "adjPriceTarget": 9999.0},
 ]
 
 
@@ -147,9 +147,9 @@ def test_consensus_target_as_of_ignores_future_and_pre_window_rows():
     # the LATE window. Dropping them yields the IDENTICAL result.
     c = FMPRating._consensus_target_as_of(PRICE_TARGET_HISTORY, AS_OF_LATE, 90)
     in_window_only = [
-        {"publishedDate": "2026-05-01", "priceTarget": 130.0},
-        {"publishedDate": "2026-05-15", "priceTarget": 150.0},
-        {"publishedDate": "2026-06-05", "priceTarget": 140.0},
+        {"publishedDate": "2026-05-01", "priceTarget": 130.0, "adjPriceTarget": 130.0},
+        {"publishedDate": "2026-05-15", "priceTarget": 150.0, "adjPriceTarget": 150.0},
+        {"publishedDate": "2026-06-05", "priceTarget": 140.0, "adjPriceTarget": 140.0},
     ]
     assert FMPRating._consensus_target_as_of(in_window_only, AS_OF_LATE, 90) == c
     assert c["targetHigh"] == 150.0  # would be 9999 if the future row leaked

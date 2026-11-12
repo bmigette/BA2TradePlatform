@@ -4780,7 +4780,8 @@ class TransactionsTab:
             ui.notify('No transactions selected', type='warning')
             return
         
-        count = len(self.selected_transactions)
+        selected_ids = list(self.selected_transactions.keys())  # captured at open: the count shown is the set applied
+        count = len(selected_ids)
         
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-sm'):
             ui.label('Batch Adjust Take Profit').classes('text-h6 mb-4')
@@ -4796,19 +4797,19 @@ class TransactionsTab:
                 format='%.1f'
             ).classes('w-full mb-4')
             
-            ui.label('Example: 5.0% means TP = Open Price × 1.05').classes('text-caption text-grey-7')
+            ui.label('Example: 5.0% means TP = Open Price × 1.05 (long) or × 0.95 (short)').classes('text-caption text-grey-7')
             
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Apply', on_click=lambda: self._execute_batch_adjust_tp(tp_percent_input.value, dialog)).props('color=info')
+                ui.button('Apply', on_click=lambda: self._execute_batch_adjust_tp(tp_percent_input.value, dialog, selected_ids)).props('color=info')
         
         dialog.open()
     
-    def _execute_batch_adjust_tp(self, tp_percent: float, dialog):
+    def _execute_batch_adjust_tp(self, tp_percent: float, dialog, selected_ids):
         """Execute batch TP adjustment (async, non-blocking)."""
         dialog.close()
         
-        transaction_ids = list(self.selected_transactions.keys())
+        transaction_ids = list(selected_ids)
         if not transaction_ids:
             ui.notify('No transactions selected', type='warning')
             return
@@ -4825,9 +4826,11 @@ class TransactionsTab:
                 from ...core.types import OrderType, OrderDirection
                 from ...core.utils import get_account_instance_from_id
                 from sqlmodel import Session, select
-                
+                from nicegui import run
+                from ...services.trades import plan_batch_tp
+
                 success_count = 0
-                failed = []
+                failed = []  # (transaction id, reason)
                 existing_tp_modified = []
                 new_tp_created = []
                 
@@ -4837,12 +4840,12 @@ class TransactionsTab:
                         txn = get_instance(Transaction, txn_id)
                         if not txn:
                             logger.error(f"[Batch TP] Transaction {txn_id} not found")
-                            failed.append(txn_id)
+                            failed.append((txn_id, "transaction not found"))
                             continue
                         
                         if not txn.open_price or txn.open_price <= 0:
                             logger.error(f"[Batch TP] Transaction {txn_id} has invalid open_price: {txn.open_price}")
-                            failed.append(txn_id)
+                            failed.append((txn_id, "invalid open price"))
                             continue
                         
                         logger.info(f"[Batch TP] Transaction {txn_id}: symbol={txn.symbol}, open_price={txn.open_price}")
@@ -4854,10 +4857,6 @@ class TransactionsTab:
                         except Exception as e:
                             logger.error(f"[Batch TP] Could not get current open qty for transaction {txn_id}: {e}", exc_info=True)
                             current_open_qty = 0
-                        
-                        # Calculate new TP price
-                        new_tp_price = txn.open_price * (1 + tp_percent / 100)
-                        logger.info(f"[Batch TP] Transaction {txn_id}: calculated new_tp_price={new_tp_price:.2f}")
                         
                         # Get account for order operations
                         # Transaction has expert_id, get account from expert instance
@@ -4877,29 +4876,36 @@ class TransactionsTab:
                         
                         if not account:
                             logger.error(f"[Batch TP] Cannot adjust TP for transaction {txn_id}: no account found")
-                            failed.append(txn_id)
+                            failed.append((txn_id, "no account found"))
                             continue
                         
                         logger.info(f"[Batch TP] Transaction {txn_id}: found account")
                         
+                        # Side-aware target, validated against the CURRENT price; a refused row is skipped with its reason
+                        plan = await run.io_bound(plan_batch_tp, account, txn, tp_percent)
+                        if plan.price is None:
+                            logger.warning(f"[Batch TP] Transaction {txn_id}: skipped: {plan.reason}")
+                            failed.append((txn_id, plan.reason))
+                            continue
+                        new_tp_price = plan.price
                         # Use adjust_tp() to handle TP adjustment properly (creates OCO/OTO orders)
                         logger.info(f"[Batch TP] Transaction {txn_id}: calling adjust_tp with price ${new_tp_price:.2f}")
                         try:
-                            success = account.adjust_tp(txn, new_tp_price, source="manual")
+                            success = await run.io_bound(account.adjust_tp, txn, new_tp_price, source="manual")
                             if success:
                                 success_count += 1
                                 existing_tp_modified.append(txn_id)
                                 logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully adjusted TP to ${new_tp_price:.2f}")
                             else:
-                                failed.append(txn_id)
+                                failed.append((txn_id, "adjust_tp returned False"))
                                 logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to adjust TP (adjust_tp returned False)")
                         except Exception as e:
                             logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error adjusting TP: {e}", exc_info=True)
-                            failed.append(txn_id)
+                            failed.append((txn_id, f"error adjusting TP: {e}"))
                     
                     except Exception as e:
                         logger.error(f"Error processing transaction {txn_id}: {e}", exc_info=True)
-                        failed.append(txn_id)
+                        failed.append((txn_id, f"error: {e}"))
                 
                 # Schedule UI update with detailed results
                 def show_result():
@@ -4912,10 +4918,11 @@ class TransactionsTab:
                     message = ' • '.join(msg_parts)
                     
                     if failed:
-                        message += f' • {len(failed)} failed'
-                        ui.notify(message, type='warning')
+                        message += f' • {len(failed)} skipped/failed'
+                        message += ''.join(f'\n#{fid}: {freason}' for fid, freason in failed)
+                        ui.notify(message, type='warning', multi_line=True, timeout=15000, close_button=True)
                     else:
-                        ui.notify(message + f' (+{tp_percent:.1f}%)', type='positive')
+                        ui.notify(message + f' ({tp_percent:.1f}% in the profit direction)', type='positive')
                     
                     self.selected_transactions.clear()
                     self._update_batch_buttons()

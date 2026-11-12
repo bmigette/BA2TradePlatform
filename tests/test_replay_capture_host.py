@@ -109,6 +109,37 @@ def test_the_session_describes_the_running_build(cache_root):
     assert session.source_revision is None or len(session.source_revision) == 40
 
 
+def test_the_session_records_the_exact_code_it_runs(cache_root):
+    """Provenance is on the session; a dirty tree's patch hash matches the tree's own diff."""
+    from ba2_common.core.replay import provenance
+
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+    session = store.index.get_session(store.session_id)
+
+    assert session.provenance_error is None, session.provenance_error
+    assert session.provenance["versions"]["app_version"] == session.app_version
+    snap = provenance.snapshot_code(replay_capture._repo_root())
+    assert session.provenance["patch_sha256"] == snap.patch_sha256
+    if snap.patch:
+        assert store.decode_object(session.provenance["patch_object"])["sha256"] == snap.patch_sha256
+
+
+def test_a_provenance_failure_is_recorded_loudly_and_capture_stays_on(cache_root, monkeypatch):
+    from ba2_common.core.replay import provenance
+
+    def boom(*_a, **_k):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(provenance, "collect_provenance", boom)
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+
+    assert store is not None
+    session = store.index.get_session(store.session_id)
+    assert "git exploded" in session.provenance_error
+
+
 def test_two_instances_get_different_ids(cache_root, monkeypatch):
     import ba2_trade_platform.config as config
 
@@ -401,3 +432,20 @@ def test_shutdown_finalizes_the_session_and_uninstalls_the_store(cache_root):
         assert reopened.index.get_session(session_id).status == "finalized"
     finally:
         reopened.close()
+
+
+def test_a_background_roller_rolls_the_session_at_the_date_change(cache_root, monkeypatch):
+    """Decision passes no longer roll the session on their own thread: a daemon roller does."""
+    import time
+
+    monkeypatch.setattr(replay_capture, "SESSION_ROLL_INTERVAL_SECONDS", 0.05)
+    _enable()
+    store = replay_capture.initialize_replay_capture()
+    first = store.session_id
+    replay_capture._SESSION_DATE = "2020-01-01"
+    deadline = time.monotonic() + 5.0
+    while store.session_id == first and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert store.session_id != first
+    replay_capture.shutdown_replay_capture(timeout=5.0)
+    assert replay_capture._roller_thread is None

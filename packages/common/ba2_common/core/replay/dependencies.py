@@ -106,6 +106,11 @@ class MissingDependencySetting(KeyError):
         )
 
 
+#: The decision-time settings :func:`rule_requirements` reads beyond the expert's own keys. A
+#: recording that holds none of them predates full-settings recording (schema 2).
+RULE_REQUIRED_SETTINGS = ("use_atr_stop", "sizing_mode", "atr_period")
+
+
 def require_setting(settings: Mapping[str, Any], key: str, *, needed_by: str) -> Any:
     """Read ``key`` from ``settings`` or raise :class:`MissingDependencySetting`.
 

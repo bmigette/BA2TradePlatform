@@ -70,6 +70,7 @@ from ba2_common.core.replay.option_taps import OPTION_PROVIDER, OPTION_TAPPED_ME
 from app.services.replay.expert_replay import compare_values
 from app.services.replay.gather_tape import ReplayTape
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import (
     CAPABILITY_OPTION_SELECTION,
     STAGE_OPTION_PRICING,
@@ -519,6 +520,68 @@ def action_window(observations: Sequence[ProviderObservation], start: int, end: 
             and o.tap_depth == 0]
 
 
+_INFERRED_NOTE = "decision frame inferred (legacy record)"
+
+
+@contextmanager
+def _frame_scope(frame_time: Optional[datetime]):
+    """Run the action under the live decision frame it was recorded under (``None``: it held none
+    and read the clock itself, which the recorded span supplies)."""
+    if frame_time is None:
+        yield
+        return
+    from ba2_common.core.market_condition_live import replay_decision_frame
+    with replay_decision_frame(frame_time):
+        yield
+
+
+def _infer_legacy_frame(bundle, analysis: AnalysisRecord, observations: Sequence[ProviderObservation],
+                        span: Dict[str, Any]) -> Tuple[Optional[datetime], str]:
+    """The decision frame instant of a version-1 action record (which did not store it).
+
+    Returns ``(frame_time, "")`` or ``(None, reason)``; ``(None, "")`` means "no frame was open".
+    The rule, proven on the real 8082 bundle (see the task report) and applied only when every
+    condition holds:
+
+    * the action's own span has exactly 2 or more reads  -> live made a second read itself, so no
+      frame was open (``None``, behaviour unchanged);
+    * the span has exactly ONE read (the recorder's own) -> the action's ``live_decision_time()``
+      took no clock read, so a frame was open. Its instant is the pass's ``begin_decision`` read
+      iff the analysis' reads are exactly: that one read, then one recorded span per action, with
+      nothing else (``len(reads) == 1 + sum(span lengths)`` and the first action starts at read
+      1). Anything else is ambiguous and refused.
+    """
+    length = span["clock_end"] - span["clock_start"]
+    if length >= 2:
+        return None, ""
+    if length != 1:
+        return None, f"the action's clock span [{span['clock_start']}, {span['clock_end']}) is empty"
+    spans = []
+    for obs in observations:
+        if obs.provider != oar.OPTION_ACTION_PROVIDER:
+            continue
+        other = bundle.decode(obs.payload_object)["tape_span"]
+        spans.append((other["clock_start"], other["clock_end"]))
+    reads = list(analysis.clock_reads)
+    spans.sort()
+    if not spans or spans[0][0] != 1:
+        return None, ("the frame instant cannot be inferred: the pass's first action does not "
+                      "start at clock read 1 (more than one read precedes the actions)")
+    cursor = 1
+    for start, end in spans:
+        if start != cursor:
+            return None, ("the frame instant cannot be inferred: the pass's clock reads are not "
+                          "one begin-decision read followed by contiguous action spans")
+        cursor = end
+    if cursor != len(reads):
+        return None, ("the frame instant cannot be inferred: the pass has clock reads outside "
+                      "the action spans besides the first")
+    frame_time = datetime.fromisoformat(reads[0])
+    if frame_time > datetime.fromisoformat(reads[span["clock_start"]]):
+        return None, "the inferred frame instant is later than the action's own decision read"
+    return frame_time, ""
+
+
 def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
                   observation: ProviderObservation, observations: Sequence[ProviderObservation],
                   clock_start: int) -> Tuple[_Outcome, int]:
@@ -528,7 +591,7 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     except Exception as exc:  # noqa: BLE001 -- a payload the codec refuses is a coverage gap
         return _missing(f"the recorded action could not be decoded: {type(exc).__name__}: {exc}"), \
             clock_start
-    if payload["version"] != oar.RECORD_VERSION:
+    if payload["version"] not in oar.READABLE_VERSIONS:
         return _missing(f"unknown option action record version {payload['version']!r}"), \
             clock_start
 
@@ -557,6 +620,14 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
                         f"{span['clock_end']}) of the record's {len(analysis.clock_reads)} reads"),             clock_start
     next_start = span["clock_end"]
 
+    frame_time = oar.replay_decision_frame_time(payload)
+    inferred_frame = False
+    if frame_time is oar.NO_FRAME_FIELD:
+        frame_time, why = _infer_legacy_frame(bundle, analysis, observations, span)
+        if why:
+            return _missing(f"recorded before decision-frame capture: {why}"), next_start
+        inferred_frame = frame_time is not None
+
     try:
         tape = SpanTape(bundle, analysis, window)
         account = _tape_account(tape, payload["inputs"], analysis.analysis_id)
@@ -575,7 +646,7 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
     try:
         with _scratch_trading_db(instances), _resolver(_ScratchResolver(account, analysis.analysis_id)):
             action = oar.rebuild_option_action(payload, account)
-            with use_capture_context(context):
+            with use_capture_context(context), _frame_scope(frame_time):
                 # The recorder's own clock read is the first of the action's span.
                 consumed = replay_now()
                 if consumed != decision_time:
@@ -602,16 +673,17 @@ def replay_action(bundle: SessionBundle, analysis: AnalysisRecord,
         # The action swallowed a miss into some other outcome; the miss is the finding.
         return _missing(_miss_text(tape.misses[0])), next_start
 
+    note = (f"; {_INFERRED_NOTE} at {frame_time.isoformat()}" if inferred_frame else "")
     statuses, diffs = compare_outcomes(payload["outcome"], produced)
     if produced["status"] == "error" and payload["outcome"]["status"] != "error":
         # A re-run that raises where live returned: named by its error, not by a stage count.
-        return _Outcome(_DIFFERENCE, f"error: {produced['error']}", statuses, diffs), next_start
+        return _Outcome(_DIFFERENCE, f"error: {produced['error']}{note}", statuses, diffs), next_start
     if not diffs:
         return _Outcome(_MATCH, "re-ran to the recorded contracts, limit, quantity, record "
-                                "and outcome", statuses), next_start
+                                f"and outcome{note}", statuses), next_start
     differing = [stage for stage in STAGES if statuses[stage] == _DIFFERENCE]
     keys = ", ".join(sorted({label for label, _r, _p in diffs}))
-    return _Outcome(_DIFFERENCE, f"{len(diffs)} difference(s) in {', '.join(differing)}: {keys}",
+    return _Outcome(_DIFFERENCE, f"{len(diffs)} difference(s) in {', '.join(differing)}: {keys}{note}",
                     statuses, diffs), next_start
 
 
@@ -663,7 +735,4 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     bundle = load_bundle(bundle_dir)
     with replay_isolation():
         report = run_bundle(bundle, str(Path(bundle_dir)))
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)

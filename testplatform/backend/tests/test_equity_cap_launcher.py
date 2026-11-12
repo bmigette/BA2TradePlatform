@@ -201,7 +201,7 @@ def test_the_cap_is_not_a_gene_in_the_batch_driver_either(monkeypatch):
     assert not any("equity_cap" in k for k in cfg["expert_params"])
 
 
-def test_no_strategy_the_launcher_builds_exposes_an_equity_cap_gene():
+def test_no_strategy_the_launcher_builds_exposes_an_equity_cap_gene(monkeypatch):
     """The other half of "not a gene": the GA also collects genes off the Strategy row, so the
     cap must be absent from THAT space too, for every strategy variant the CLI can build."""
     from app.services.strategy_param_space import collect_param_space
@@ -218,6 +218,8 @@ def test_no_strategy_the_launcher_builds_exposes_an_equity_cap_gene():
     # needs a --style-config spec); the audit builds every candidate style.
     for kind in sorted(set(L._STRATEGY_BUILDERS) - set(L._PHASE_GATED_OPTION_STRATEGIES)
                        - set(L._SPEC_DRIVEN_STRATEGIES)):
+        # S8/S9 REFUSE to build without --benchmark-regime-gates (their split + spy stop read the SPY regime)
+        monkeypatch.setattr(L, "_BENCHMARK_REGIME_GATES", kind in L._IMPLIED_RULE_SHAPE)
         strategy = L._build_strategy(kind, f"gene-space-{kind}", "FMPRating")
         space = collect_param_space(strategy)
         assert not any("equity_cap" in k for k in space), \

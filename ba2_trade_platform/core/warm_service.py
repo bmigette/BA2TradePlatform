@@ -398,6 +398,19 @@ def plan_and_enqueue_batch(batch_id: str) -> int:
         return 0
 
 
+
+def _readable_analyses(store, session_id: str):
+    """The session's analyses this build can read. A row written by a NEWER schema is skipped per row
+    and reported at ERROR (never a silent drop, and never a failed listing for the other rows)."""
+    skipped: list = []
+    records = store.index.analyses(session_id, skipped=skipped)
+    if skipped:
+        logger.error(
+            f"warm: {len(skipped)} analysis row(s) of session {session_id} were written by a newer "
+            f"schema than this build reads and are skipped: {[s['analysis_id'] for s in skipped]}")
+    return records
+
+
 def _recorded_batch_groups(batch_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """``(expert_class, settings_hash) -> {settings, rules, symbols}`` for one batch.
 
@@ -412,7 +425,7 @@ def _recorded_batch_groups(batch_id: str) -> Dict[Tuple[str, str], Dict[str, Any
     if session_id is None:
         return {}
     groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for record in store.index.analyses(session_id):
+    for record in _readable_analyses(store, session_id):
         if (record.branch_flags or {}).get("batch_id") != batch_id:
             continue
         if record.settings_object is None:
@@ -650,7 +663,7 @@ def _session_requirements(now: datetime):
     if store is None or store.session_id is None:
         return []
     batches = set()
-    for record in store.index.analyses(store.session_id):
+    for record in _readable_analyses(store, store.session_id):
         batch_id = (record.branch_flags or {}).get("batch_id")
         if batch_id:
             batches.add(batch_id)

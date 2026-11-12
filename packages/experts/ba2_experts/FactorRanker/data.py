@@ -31,8 +31,24 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+from ba2_common.core.estimates_pit import EstimatesNotPointInTime
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import FMPError
+
+
+def _routed_details(details=None):
+    """The ``fundamentals_details()`` the fetchers read: the caller's (the expert passes its bundle's, so a
+    backtest's estimates source applies), else the LIVE bundle's -- FMP statements, estimates from the
+    ``data_provider_estimates`` setting. Replaces the direct ``FMPCompanyDetailsProvider()`` constructions."""
+    if details is not None:
+        return details
+    from ba2_common.core.estimates_router import EstimatesRoutedDetails
+    from ba2_common.core.estimates_source import live_estimates_source
+    from ba2_providers import get_provider
+    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
+    base = FMPCompanyDetailsProvider()
+    source = live_estimates_source()
+    return EstimatesRoutedDetails(base, base if source == "fmp" else get_provider("estimates", source), source)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +231,8 @@ def fetch_close_prices(symbols, lookback_days: int = 400,
 
 def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
                        ohlcv_provider=None,
-                       price_as_of: Optional[Dict[str, float]] = None) -> Dict[str, dict]:
+                       price_as_of: Optional[Dict[str, float]] = None,
+                       details=None) -> Dict[str, dict]:
     """{symbol: {eps_ttm, price, fcf_ttm, enterprise_value}} from latest annual fundamentals.
 
     NO-LOOKAHEAD: ``price`` and ``market_cap`` are computed from AS_OF-correct sources,
@@ -240,10 +257,9 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
     price reuses the memoized series and stays results-identical. ``None`` (live) falls
     back to the live registry's OHLCV provider (``_history_provider``).
     """
-    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
     explicit_as_of = as_of
     as_of = as_of or datetime.now(timezone.utc)
-    details = FMPCompanyDetailsProvider()
+    details = _routed_details(details)
     # LAZY: only construct a real FMPOHLCVProvider if some symbol actually falls through to
     # the OHLCV-fetch price path below (price_as_of misses it, or the caller passed none at
     # all). When price_as_of fully covers the batch (the metric-store fast path this was
@@ -341,11 +357,10 @@ def _as_of_close(ohlcv, symbol: str, as_of: datetime) -> Optional[float]:
     return float(closes.iloc[-1])
 
 
-def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, dict]:
+def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None, details=None) -> Dict[str, dict]:
     """{symbol: {roe, gross_profit, total_assets, accruals_ratio}} from latest annual fundamentals."""
-    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
     as_of = as_of or datetime.now(timezone.utc)
-    details = FMPCompanyDetailsProvider()
+    details = _routed_details(details)
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
@@ -400,11 +415,10 @@ def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str,
     return out
 
 
-def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, dict]:
+def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None, details=None) -> Dict[str, dict]:
     """{symbol: {actual, estimate, estimate_std, days_since}} from latest earnings + estimates."""
-    from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
     as_of = as_of or datetime.now(timezone.utc)
-    details = FMPCompanyDetailsProvider()
+    details = _routed_details(details)
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
@@ -421,8 +435,8 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
                     details.get_earnings_estimates(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"),
                     "estimates", "earnings estimates",
                 )
-            except FMPError:
-                raise  # same quota/rate-limit reasoning as the outer catch below
+            except (FMPError, EstimatesNotPointInTime):
+                raise  # same quota/rate-limit reasoning as the outer catch below; a lookahead read is loud
             except Exception as est_err:
                 logger.warning(
                     f"FactorRanker: {sym} earnings estimates unavailable "
@@ -438,7 +452,7 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
                 ),
                 "days_since": days_since(report_date, as_of),
             }
-        except FMPError:
+        except (FMPError, EstimatesNotPointInTime):
             raise  # quota/rate-limit hits every symbol -- one loud failure, not a silent batch drop
         except Exception as e:
             logger.warning(

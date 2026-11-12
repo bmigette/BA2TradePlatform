@@ -22,6 +22,8 @@ import re
 import time
 import requests
 
+from ba2_experts.expert_mixins import _http_status
+
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ba2_common.core.db import get_db, update_instance, add_instance
@@ -35,6 +37,12 @@ from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
 from ba2_experts.scoring_table import ScoringTable, use_scoring_table
+from ba2_common.core.estimates_pit import EstimatesNotPrewarmed, EstimatesUnavailable
+from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
+
+#: fmp_history entry the PREWARM writes: every congress trader (name) it met, sorted. See ``_pre_cap_backfill``.
+CONGRESS_ROSTER_NAMESPACE = "congress_trader_roster"
+CONGRESS_ROSTER_KEY = "ALL"
 
 _USE_SCORING_TABLE = use_scoring_table()
 # NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
@@ -127,6 +135,13 @@ _WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 _PRICE_MAP_MEM: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
 
+#: LIVE-only counterpart of ``_PRICE_MAP_MEM`` (which is backtest-only): ``{sym: (fetched_at, map)}``
+#: with a short TTL so a long-lived live process neither serves a stale map nor refetches the full
+#: history once per disclosure. Never holds an empty map.
+_LIVE_PRICE_MAP_MEM: Dict[str, Any] = {}
+_LIVE_PRICE_MAP_TTL_S = 600.0
+_LIVE_PRICE_MAP_MAX = 256
+
 #: How many HELD-BACK symbols a live basket analysis keeps in its state row.
 #:
 #: A cycle scans the whole disclosure feed -- measured on prod 2026-09-15 at up to ~250 symbols,
@@ -136,9 +151,16 @@ _PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
 BASKET_HELD_BACK_MAX = 50
 
 
+#: Symbols already reported as lacking the price-target model's cached earnings (log once each).
+_MODEL_INPUT_MISSES: set = set()
+#: ``_model_estimator_inputs`` marker: the symbol's estimate-based model has no estimate -> dropped from the basket.
+_ESTIMATES_UNAVAILABLE = object()
+
+
 def clear_price_map_memo() -> None:
     """Drop the projection memo (tests / between unrelated universes)."""
     _PRICE_MAP_MEM.clear()
+    _LIVE_PRICE_MAP_MEM.clear()
 
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
@@ -396,6 +418,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "description": "Confidence to profit factor",
                 "tooltip": "Factor to convert confidence to expected profit. Default 0.15 means 100% confidence = 15% expected profit. Formula: expected_profit = confidence * factor."
             },
+            "expected_profit_mode": {
+                "type": "str", "required": False, "default": "static",
+                "choices": ["static", "model"],
+                "description": "Expected profit of a BUY",
+                "tooltip": "'static': confidence x confidence_to_profit_factor. 'model': the "
+                           "fundamentals price target of ba2_experts.analyst_target_model (see "
+                           "model_target_method), falling back to the static figure when the "
+                           "model has no answer for the symbol. SELL signals always use static."
+            },
+            "model_target_method": {
+                "type": "str", "required": False, "default": "reported",
+                "choices": ["forward", "trailing", "reported", "reported_2y", "consensus"],
+                "description": "Price-target method (model mode)",
+                "tooltip": "'reported' / 'reported_2y': TTM reported EPS grown by its 1-year / "
+                           "annualised 2-year growth (knowable in a backtest). 'forward' / "
+                           "'trailing' read FMP estimates and run live only."
+            },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Model expected-profit ceiling (%)",
+                "tooltip": "Model mode only: the price target is capped at price x (1 + this/100)."
+            },
             "min_traders": {
                 "type": "int",
                 "required": True,
@@ -551,6 +595,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades", "skill_lookback_months",
         "skill_signal_weight", "skill_confidence_weight",
         "min_trader_avg_hold_days", "min_trader_hold_roundtrips",
+        "expected_profit_mode", "model_target_method", "max_expected_profit_percent",
     )
 
     @classmethod
@@ -837,7 +882,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = self._decision_price(providers, symbol, as_of)
+        estimator_inputs = self._model_estimator_inputs(providers, [symbol], as_of, gather_settings)
         return {
+            "estimator_inputs": estimator_inputs.get(symbol),
             "all_trades": all_trades,
             # still-held ONLY -- see the note where this is built; the windowed set hides
             # closing sales whose DISCLOSURE fell outside max_disclose_date_days.
@@ -849,6 +896,33 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "trader_hold_info_by_name": trader_hold_info_by_name,
             "symbol": symbol,
         }
+
+    def _pre_cap_backfill(self, house: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Disclosures OLDER than the house ``-latest`` feed reaches, from the roster's trader histories.
+
+        FMP's ``house-latest`` is capped at 100 pages x 250 rows (disclosures back to ~2023-05 as of
+        2026-11): a 2020-2023 backtest would otherwise see NO house disclosure before the cap, silently.
+        ``-trades-by-name`` has no such cap, so the prewarm records every trader it met in
+        ``congress_trader_roster/ALL`` (feed + per-symbol ``-trades`` rows, which also surface members who left
+        Congress before the cap) and warms each one's full history. Rows dated before the feed's oldest house
+        disclosure are returned here; the caller's fingerprint dedup absorbs any senate overlap.
+        Live (not frozen): the roster fetch is ``[]`` -> no backfill (live only needs the recent feed).
+        A hermetic run with no prewarmed roster registers ONE named miss (never silent)."""
+        from ba2_providers.fmp_common import fmp_history_disk_cached
+        roster = fmp_history_disk_cached(CONGRESS_ROSTER_NAMESPACE, CONGRESS_ROSTER_KEY, lambda: []) or []
+        if not roster or not house:
+            return []
+        floor = min((str(t.get("disclosureDate") or "")[:10] for t in house if t.get("disclosureDate")),
+                    default="")
+        if not floor:
+            return []
+        extra: List[Dict[str, Any]] = []
+        for name in roster:
+            for t in (self._fetch_trader_history(name) or []):
+                ds = str(t.get("disclosureDate") or "")[:10]
+                if ds and ds < floor:
+                    extra.append(t)
+        return extra
 
     def _all_trades_index_cached(self, is_live: bool = False) -> Dict[str, Any]:
         """Unscoped counterpart of ``_symbol_trades_index_cached``: a per-instance memo of the
@@ -886,6 +960,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         senate = self._fetch_senate_trades(symbol=None, full_history=True) or []
         house = self._fetch_house_trades(symbol=None, full_history=True) or []
+        senate = senate + self._pre_cap_backfill(house)
         # Same dedup fingerprint as _symbol_trades_index_cached, generalized across symbols
         # (amended/duplicate filings must count once, same as the per-symbol path).
         seen: set = set()
@@ -1138,7 +1213,57 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 f"Senate basket prices resolved: {len(bundle_by_symbol)}/{len(symbols)} symbols")
             if unavailable:
                 self.logger.warning(f"Senate basket skipping symbols without a current price: {unavailable}")
+        estimator_inputs = self._model_estimator_inputs(
+            providers, self._buy_candidates(bundle_by_symbol), as_of, gather_settings)
+        for symbol, inputs in estimator_inputs.items():
+            if inputs is _ESTIMATES_UNAVAILABLE:
+                # The basket analogue of a failed per-symbol analysis: the symbol is dropped from THIS
+                # analysis (never decided on the static expected profit instead). Warned in
+                # _model_estimator_inputs.
+                del bundle_by_symbol[symbol]
+                continue
+            bundle_by_symbol[symbol]["estimator_inputs"] = inputs
         return bundle_by_symbol
+
+    def _model_estimator_inputs(self, providers: ProviderBundle, symbols: List[str],
+                                as_of: Optional[datetime],
+                                settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The price-target model's inputs per symbol, fetched only in expected_profit_mode=model."""
+        if self._setting_or_default(settings, "expected_profit_mode") != "model":
+            return {}
+        method = str(self._setting_or_default(settings, "model_target_method"))
+        from ba2_providers.fmp_common import FMPHistoryCacheMiss
+        out: Dict[str, Any] = {}
+        for sym in symbols:
+            try:
+                out[sym] = fetch_estimator_inputs(providers, sym, as_of, method=method)
+            except (EstimatesUnavailable, EstimatesNotPrewarmed) as e:
+                # An estimate-based method with no estimate for this symbol: its analysis FAILS (owner,
+                # 2026-11-07), i.e. the symbol leaves this basket analysis; the rest of the basket goes on.
+                self.logger.warning(f"{sym}: dropped from the Senate basket analysis, the price-target "
+                                    f"model ({method}) has no estimate: {e}")
+                out[sym] = _ESTIMATES_UNAVAILABLE
+            except FMPHistoryCacheMiss as e:
+                # A disclosed symbol outside the prewarmed set (basket mode discovers symbols
+                # from the feed, like the price misses _gather_all already skips): no model
+                # inputs, so the static expected profit stays. Logged once per symbol.
+                if sym not in _MODEL_INPUT_MISSES:
+                    _MODEL_INPUT_MISSES.add(sym)
+                    self.logger.warning(f"{sym}: no cached quarterly earnings for the price-target "
+                                        f"model ({e}); static expected profit used")
+                out[sym] = None
+        return out
+
+    @staticmethod
+    def _buy_candidates(bundle_by_symbol: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Symbols with at least one purchase in their window: the only ones that can come out
+        BUY, so the only ones whose model inputs are worth reading (most basket symbols carry
+        sales only). Same buy test as _calculate_recommendation's _is_buy_t."""
+        def _is_buy_type(t: Dict[str, Any]) -> bool:
+            ttype = str(t.get("type", "")).lower()
+            return "purchase" in ttype or "buy" in ttype
+        return [sym for sym, bundle in bundle_by_symbol.items()
+                if any(_is_buy_type(t) for t in bundle["all_trades"])]
 
     @staticmethod
     def _price_cache_miss_exceptions() -> Tuple[type, ...]:
@@ -1268,6 +1393,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_trader_hold_roundtrips=int(self._setting_or_default(settings, "min_trader_hold_roundtrips")),
             is_live=(as_of is None),
         )
+        self._apply_model_expected_profit(rec, data_bundle, settings, current_price)
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
             current_price=current_price, details=rec["details"],
@@ -1275,6 +1401,25 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             raw_outputs={"name": "Senate Trade Analysis", "type": "senate_trade_analysis",
                          "text": rec["details"], "recommendation": rec,
                          "filtered_trades": filtered})
+
+    def _apply_model_expected_profit(self, rec: Dict[str, Any], data_bundle: Dict[str, Any],
+                                     settings: Dict[str, Any], current_price: float) -> None:
+        """expected_profit_mode=model: a BUY's expected profit becomes the fundamentals price
+        target's upside when the model has one for the symbol; otherwise the static figure stays."""
+        if rec["signal"] != OrderRecommendation.BUY \
+                or self._setting_or_default(settings, "expected_profit_mode") != "model":
+            return
+        model_out = estimate_price_target(
+            data_bundle.get("estimator_inputs") or {}, current_price=current_price,
+            method=str(self._setting_or_default(settings, "model_target_method")),
+            max_expected_profit_percent=float(self._setting_or_default(settings, "max_expected_profit_percent")))
+        if model_out is None:
+            rec["details"] += "\nModel price target: not computable, static expected profit kept.\n"
+            return
+        rec["expected_profit_percent"] = model_out["expected_profit_percent"]
+        rec["details"] += (f"\nModel price target ({model_out['method']}): ${model_out['target_price']:.2f} "
+                           f"(+{model_out['expected_profit_percent']:.1f}%, anchor P/E "
+                           f"{model_out['anchor_pe']:.1f})\n")
 
     def _process_all(self, bundle_by_symbol: Dict[str, Dict[str, Any]], settings: Dict[str, Any],
                      as_of: Optional[datetime] = None) -> List[Recommendation]:
@@ -1436,10 +1581,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 all_trades.extend(senate_data)
                 self.logger.debug(f"Found {len(senate_data)} senate trades by {trader_name}")
 
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) not in (400, 404):  # 400/404 = FMP knows no such name: definitively no rows
+                self._fetch_failed(f"senate trader history for {trader_name}", e)
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch senate trader history for {trader_name}: {e}")
+            self._fetch_failed(f"senate trader history for {trader_name}", e)
         except Exception as e:
-            self.logger.error(f"Unexpected error fetching senate trader history for {trader_name}: {e}")
+            self._fetch_failed(f"senate trader history for {trader_name} (unexpected)", e)
 
         # Fetch house trades by name
         try:
@@ -1460,10 +1608,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 all_trades.extend(house_data)
                 self.logger.debug(f"Found {len(house_data)} house trades by {trader_name}")
 
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) not in (400, 404):
+                self._fetch_failed(f"house trader history for {trader_name}", e)
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch house trader history for {trader_name}: {e}")
+            self._fetch_failed(f"house trader history for {trader_name}", e)
         except Exception as e:
-            self.logger.error(f"Unexpected error fetching house trader history for {trader_name}: {e}")
+            self._fetch_failed(f"house trader history for {trader_name} (unexpected)", e)
 
         self.logger.debug(f"Found total of {len(all_trades)} trades by {trader_name} (senate + house)")
         return all_trades if all_trades else None
@@ -1482,24 +1633,67 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             data = response.json()
             hist = data.get("historical", []) if isinstance(data, dict) else []
             return hist if isinstance(hist, list) else []
+        except requests.exceptions.HTTPError as e:
+            if _http_status(e) in (400, 404):
+                return []  # DEFINITIVE "FMP has no history for this ticker" -> prewarm's empty sentinel
+            self._fetch_failed(f"price history for {symbol}", e)
+            return []
         except (requests.exceptions.RequestException, FMPError) as e:
-            self.logger.error(f"Failed to fetch price history for {symbol}: {e}")
+            self._fetch_failed(f"price history for {symbol}", e)
             return []
         except Exception as e:
-            self.logger.error(f"Error fetching price history for {symbol}: {e}")
+            self._fetch_failed(f"price history for {symbol} (unexpected)", e)
             return []
+
+    def _fetch_failed(self, what: str, err: Exception) -> None:
+        """A fetch of ``what`` failed after the shared getter's retries.
+
+        FROZEN (prewarm / backtest) runs RAISE: this is called from inside a ``fmp_history_disk_cached``
+        fetch, and swallowing here made the caller's cache write persist a PARTIAL answer (one chamber's
+        trader history) or, under the prewarm sentinel, a false ``[]`` "known empty" for a ticker FMP
+        does have data for. The live path keeps its log-and-degrade behaviour.
+        The message is redacted: requests' errors quote the URL, ``apikey=`` included."""
+        from ba2_providers.fmp_common import _is_ttl_frozen, redact
+        msg = f"Failed to fetch {what}: {redact(err)}"
+        self.logger.error(msg)
+        if _is_ttl_frozen():
+            raise ValueError(msg) from None
+
+    def _live_price_map(self, sym: str) -> Dict[str, Any]:
+        """LIVE ``{date: open}`` map for ``sym``, memoised for ``_LIVE_PRICE_MAP_TTL_S`` only.
+
+        ``_gather`` resolves one price per trade, so a symbol with N disclosures would pull its
+        full (~3 MB) history N times per analysis with no memo; the TTL collapses that to one
+        fetch per symbol per window while a long-lived live process still sees new sessions.
+        An EMPTY result (a failed fetch returns ``[]``) is never stored, so the next call retries.
+        """
+        now = time.time()
+        hit = _LIVE_PRICE_MAP_MEM.get(sym)
+        if hit is not None and (now - hit[0]) < _LIVE_PRICE_MAP_TTL_S:
+            return hit[1]
+        hist = self._fetch_price_history_uncached(sym) or []
+        smap = {row.get("date"): row.get("open") for row in hist if row.get("date")}
+        if not smap:
+            _LIVE_PRICE_MAP_MEM.pop(sym, None)
+            return smap
+        _LIVE_PRICE_MAP_MEM[sym] = (now, smap)
+        while len(_LIVE_PRICE_MAP_MEM) > _LIVE_PRICE_MAP_MAX:
+            _LIVE_PRICE_MAP_MEM.pop(next(iter(_LIVE_PRICE_MAP_MEM)))
+        return smap
 
     def _get_price_at_date(self, symbol: str, date: datetime) -> Optional[float]:
         """Opening price for ``symbol`` on ``date`` (or None if not a trading day / unavailable).
 
-        The per-symbol FULL daily history is fetched ONCE and disk-cached (backtest-only, via
-        ``fmp_history_disk_cached``) so spawned grid workers read it from disk instead of
-        re-hitting FMP for every (symbol, exec-date) on every analysis bar — the dominant cold
-        cost of a Senate backtest. The per-date open is byte-identical to the old single-day
-        ``from=to=date`` query; the live path (freeze flag off) passes through to a fresh fetch
-        exactly as before.
+        BACKTEST (TTL freeze flag on): the per-symbol FULL daily history is fetched ONCE and
+        disk-cached (via ``fmp_history_disk_cached``) so spawned grid workers read it from disk
+        instead of re-hitting FMP for every (symbol, exec-date) on every analysis bar — the
+        dominant cold cost of a Senate backtest. The per-date open is byte-identical to the old
+        single-day ``from=to=date`` query. WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY
+        THAT — see ``_PRICE_MAP_MEM``.
 
-        WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY THAT — see ``_PRICE_MAP_MEM``.
+        LIVE (freeze flag off): never reads or writes ``_PRICE_MAP_MEM`` (it would serve the
+        first-built map for the life of the process); uses ``_live_price_map``, a short-TTL memo
+        that never stores an empty map.
         """
         if not self._api_key:
             return None
@@ -1508,6 +1702,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         sym = self._normalize_ticker(symbol)
         if not sym:
             return None
+
+        from ba2_providers.fmp_common import _is_ttl_frozen
+        if not _is_ttl_frozen():
+            return self._live_price_map(sym).get(date.strftime("%Y-%m-%d"))
 
         smap = _PRICE_MAP_MEM.get(sym)
         if smap is None:

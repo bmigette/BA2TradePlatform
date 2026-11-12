@@ -13,18 +13,58 @@ from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
+from ba2_common.core.replay.clock import replay_now
+from ba2_common.core.trade_cycle import (
+    entry_submit_stop, row_or_none, select_enter_candidates, stage_funded_entry,
+    submit_funded_entry)
+from ba2_common.core.replay.decision_record import (
+    note_funded, note_gate, note_pass_error, note_selection, pass_discard, pass_fail, pass_skip,
+    record_execute, record_pass_state)
 from ba2_common.core.washtrade import (
     went_out_as_contended_complex, was_rejected_as_washtrade, stamp_rejection)
 # ONE constant, TWO readers: the OCO stop leg places its limit this far through the stop,
 # and _force_close_breached_stops below decides a stop was jumped by the same number. See
 # the constant's own comment in AlpacaAccount for why they can never be allowed to drift.
 from ..modules.accounts.AlpacaAccount import OCO_STOP_LIMIT_CUSHION
+from ..modules.accounts.alpaca_cover_protection import is_protection_suspended
 
 
 # Serializes account refreshes across all entry points (scheduled job, immediate job,
-# manual triggers). Dependent-order submission funnels through refresh_accounts; running
-# two refreshes concurrently could submit the same dependent order twice.
+# manual triggers). It does NOT serialize WAITING_TRIGGER submission on its own: every
+# expert's entry pass also calls _check_all_waiting_trigger_orders, outside this lock --
+# that is what the per-order claim below is for.
 _REFRESH_LOCK = threading.Lock()
+
+# Per-ORDER claim on the submission of a WAITING_TRIGGER dependent order. The scheduled
+# refresh and any number of entry passes run _check_all_waiting_trigger_orders concurrently,
+# each submitting from its own Phase-1 snapshot; without this, two of them could send the
+# same protective leg twice (a duplicate stop at the broker, or a 40310000 rejection written
+# back as ERROR over the leg the first one placed). A claim is held from the fresh re-read of
+# the row until its outcome is in the DB, so a later claimant re-reads that outcome and skips.
+#
+# Why not a DB claim (UPDATE ... WHERE status=WAITING_TRIGGER): the only "being submitted"
+# status is PENDING, and a PENDING row with depends_on_order is exactly what
+# AlpacaAccount._check_and_submit_dependent_orders submits -- the claim itself would invite
+# a second submit. Why not one lock around the method: the entry pass would have to skip
+# (its just-filled position unprotected until the next refresh) or wait behind slow broker
+# calls. The guard below is held only for a set operation, never across I/O.
+# In-process only: one live process owns a DB.
+_DEPENDENT_SUBMIT_CLAIMS: set = set()
+_DEPENDENT_SUBMIT_CLAIMS_GUARD = threading.Lock()
+
+
+def _claim_dependent_submit(order_id: int) -> bool:
+    """Claim the right to submit WAITING_TRIGGER order ``order_id``; False if another thread holds it."""
+    with _DEPENDENT_SUBMIT_CLAIMS_GUARD:
+        if order_id in _DEPENDENT_SUBMIT_CLAIMS:
+            return False
+        _DEPENDENT_SUBMIT_CLAIMS.add(order_id)
+        return True
+
+
+def _release_dependent_submit(order_id: int) -> None:
+    with _DEPENDENT_SUBMIT_CLAIMS_GUARD:
+        _DEPENDENT_SUBMIT_CLAIMS.discard(order_id)
 
 # Market-regime benchmark + its once-per-day classification cache (see
 # TradeManager._publish_market_regime). SPY: the classifier in ba2_common.core.market_regime was
@@ -71,6 +111,12 @@ _WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
 # AlpacaAccount's refresh already applies before concluding anything about a freshly
 # submitted order. See _check_stranded_waiting_transactions.
 _STRANDED_ENTRY_GRACE_MINUTES = 5.0
+
+# How long a CLOSING transaction must have had NOTHING working (its last order at least this
+# old) before _retry_stuck_closes asks close_transaction again. Long enough that a close just
+# submitted or just rejected is not hammered every refresh; short enough that a stranded
+# position is retried the same session. See _retry_stuck_closes.
+_STUCK_CLOSE_RETRY_MINUTES = 30.0
 
 
 def classify_waiting_trigger(parent_status, trigger_status, parent_filled_qty=None):
@@ -204,6 +250,42 @@ def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> b
     if available_qty is None or required_qty is None:
         return False
     return available_qty < required_qty
+
+
+# The comment ``AccountInterface.submit_close_order_for_transaction`` writes on every FULL
+# close it creates (its only writer). A trim ("Partial close order ...") is not a full close.
+_FULL_CLOSE_COMMENT_PREFIX = "Closing position for transaction"
+
+
+def is_staged_full_close(order) -> bool:
+    """A full-position MARKET close of a transaction, staged by ``close_transaction``."""
+    return bool(order.order_type == OrderType.MARKET and order.transaction_id
+                and (order.comment or "").startswith(_FULL_CLOSE_COMMENT_PREFIX))
+
+
+def _measured_qty(value):
+    """A broker-reported quantity as a finite float, or None when it is not one.
+    (Alpaca hands ``filled_qty`` over as a string.)"""
+    if value is None:
+        return None
+    try:
+        qty = float(value)
+    except (TypeError, ValueError):
+        return None
+    return qty if math.isfinite(qty) else None
+
+
+def _as_order_status(value):
+    """``value`` as an OrderStatus, or None when it is not a recognisable one."""
+    if isinstance(value, OrderStatus):
+        return value
+    raw = str(getattr(value, "value", value))
+    for candidate in (raw, raw.lower()):
+        try:
+            return OrderStatus(candidate)
+        except ValueError:
+            continue
+    return None
 
 
 # The re-base rules live in ba2_common (shared with the backtest). rebase_price_to_fill is
@@ -343,7 +425,20 @@ class TradeManager:
             for ruleset_id in (expert.enter_market_ruleset_id, expert.open_positions_ruleset_id):
                 if ruleset_id is not None and benchmark_leaves_in_ruleset(ruleset_id):
                     return True
+            if self._expert_has_downtrend_overlay(expert):
+                return True
         return False
+
+    def _expert_has_downtrend_overlay(self, expert) -> bool:
+        """True when this enabled expert instance has ``downtrend_overlay_enabled`` on: the down-trend
+        trigger of the regime overlay reads the published SPY regime even with no spy_* ruleset leaf
+        (the backtest builds the same calendar via ``_run_needs_benchmark_regime``)."""
+        from ba2_common.core.regime_overlay import downtrend_enabled
+
+        from .utils import get_expert_instance_from_id
+
+        instance = get_expert_instance_from_id(expert.id)
+        return downtrend_enabled(instance)
 
     def _fetch_benchmark_daily(self, now):
         """``(dates, closes)`` of SPY DAILY bars up to ``now`` from the history provider.
@@ -609,6 +704,26 @@ class TradeManager:
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)
 
+                    # A covered call SUSPENDS the resting stop on the shares it pledges
+                    # (AlpacaAccount, see alpaca_cover_protection). The option events just
+                    # reconciled above are what end a call (expiry / buy-back / assignment),
+                    # so this is where the stored stop / take-profit is put back under shares
+                    # that are still held. Before the breached-stop sweep below, which skips
+                    # a lot that is still suspended. Isolated: a failure here must not cost
+                    # the rest of the refresh (the next refresh retries).
+                    if hasattr(account, 'reconcile_suspended_protection'):
+                        try:
+                            rearmed = account.reconcile_suspended_protection()
+                            if rearmed:
+                                self.logger.info(
+                                    f"Re-armed protection on {rearmed} lot(s) whose covered "
+                                    f"call ended for {account_def.name}")
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error re-arming suspended protection for {account_def.name}: "
+                                f"{e}", exc_info=True,
+                            )
+
                     # SAFETY NET: a stop-LIMIT exit leg that a gap jumped can never fill,
                     # leaving an open position with no stop under it. Force-close those at
                     # market. Runs LAST, on the freshly-refreshed order/position/transaction
@@ -619,6 +734,26 @@ class TradeManager:
                     except Exception as e:
                         self.logger.error(
                             f"Error force-closing breached stops for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
+                    # A protective OCO whose TP leg PARTLY filled: the broker cancels the
+                    # stop leg, leaving the remainder with a take-profit and no stop.
+                    try:
+                        self._reprotect_partially_filled_exits(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error re-protecting partly filled exits for {account_def.name}: {e}",
+                            exc_info=True,
+                        )
+
+                    # A CLOSING transaction whose close died at the broker with nothing
+                    # left working: no other pass revisits CLOSING, so retry it here.
+                    try:
+                        self._retry_stuck_closes(account)
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error retrying stuck closes for {account_def.name}: {e}",
                             exc_info=True,
                         )
 
@@ -739,6 +874,16 @@ class TradeManager:
                     continue
                 if txn.stop_loss is None or not txn.symbol:
                     continue
+                # Shares pledged to an open short call are never sold (the backtest's
+                # ``_pledged_share_lock``): the protection was SUSPENDED when the call was
+                # written and is re-armed when it is gone. A market sell here would strip the
+                # call of its cover (and ``close_transaction`` refuses it anyway, every pass).
+                if is_protection_suspended(txn):
+                    self.logger.info(
+                        f"[Account {account.id}] breached-stop check: {txn.symbol} transaction "
+                        f"{txn.id} skipped -- its shares are pledged to an open short call, so "
+                        f"its stop {txn.stop_loss} is not enforced until the call is gone")
+                    continue
                 # Plain tuples, so nothing below depends on a live ORM session.
                 watched.append((txn.id, txn.symbol, txn.side, float(txn.stop_loss)))
 
@@ -830,6 +975,11 @@ class TradeManager:
                     f"stop exit did not fill — force-closing at market."
                 )
 
+                # close_transaction cancels the resting exit legs and STAGES the market close
+                # on their cancel; it is not sent from here. The trigger sweep sends it only
+                # once the broker confirms the legs final, sized to what they left unsold
+                # (_size_staged_full_close) -- a leg that fills while being cancelled must not
+                # be sold a second time (NVDA transaction 468, 2026-11-09).
                 result = account.close_transaction(txn_id)
                 if not isinstance(result, dict):
                     raise ValueError(
@@ -874,6 +1024,169 @@ class TradeManager:
                 )
                 continue
 
+    def _equity_transactions_of(self, account, status):
+        """``account``'s equity transactions in ``status``, as detached rows.
+
+        Transactions link to an account only through their orders (same join as
+        ``_force_close_breached_stops``). Options are skipped: their ``symbol`` is the
+        UNDERLYING and they have their own close path."""
+        from sqlmodel import Session, select
+        from .db import get_db
+        from .types import AssetClass
+
+        with Session(get_db().bind) as session:
+            txns = session.exec(
+                select(Transaction).join(TradingOrder).where(
+                    TradingOrder.account_id == account.id,
+                    Transaction.status == status,
+                ).distinct()
+            ).all()
+            out = [t for t in txns
+                   if t.asset_class != AssetClass.OPTION and t.multiplier in (None, 1)
+                   and t.symbol]
+            for t in out:
+                session.expunge(t)
+        return out
+
+    def _reprotect_partially_filled_exits(self, account):
+        """Re-protect a position whose protective OCO partly filled and lost its stop leg.
+
+        WHY. When the take-profit side of an Alpaca OCO fills only PART of the position, the
+        broker cancels the stop leg and keeps the take-profit working for the remainder (dev
+        8080 CELH, transaction 72: 29 of 52 sold 2026-09-28, the other 23 then rode with no
+        stop for six weeks). Nothing noticed: the order refresh records the leg as CANCELED
+        and the parent as PARTIALLY_FILLED, both "normal" states.
+
+        THE RULE. For each OPENED equity transaction with a ``stop_loss``: an OCO on it that
+        is PARTIALLY_FILLED, whose stop leg(s) (``parent_order_id`` = the OCO) are all
+        terminal and unfilled -- or that has no leg row at all -- and that no staged
+        replacement (WAITING_TRIGGER, ``depends_on_order`` = the OCO) is already waiting on,
+        is replaced through ``account.adjust_tp_sl`` at the transaction's own TP/SL. That
+        path cancels the working OCO and stages the new exit for the remainder on the
+        cancel (sized by ``TransactionHelper.post_fill_position_quantity``). A refusal is
+        logged as an ERROR and in the activity log; it is retried next refresh.
+
+        Live-only (TradeManager is never called by the backtest, which fills exits whole).
+        """
+        from ba2_common.core.trade_store import orders_where
+        from .types import TransactionStatus, ActivityLogSeverity, ActivityLogType
+        from .db import log_activity
+
+        terminal = OrderStatus.get_terminal_statuses()
+        for txn in self._equity_transactions_of(account, TransactionStatus.OPENED):
+            if txn.stop_loss is None:
+                continue
+            if is_protection_suspended(txn):
+                self.logger.info(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id}: not re-protected "
+                    f"-- its shares are pledged to an open short call (protection suspended)")
+                continue
+            try:
+                orders = orders_where(transaction_id=txn.id)
+                stranded = []
+                for oco in orders:
+                    if (oco.order_type != OrderType.OCO
+                            or oco.status != OrderStatus.PARTIALLY_FILLED):
+                        continue
+                    legs = [o for o in orders if o.parent_order_id == oco.id]
+                    stop_alive = any(o.status not in terminal or o.status == OrderStatus.FILLED
+                                     for o in legs)
+                    staged = any(o.depends_on_order == oco.id
+                                 and o.status == OrderStatus.WAITING_TRIGGER for o in orders)
+                    if not stop_alive and not staged:
+                        stranded.append(oco)
+                if not stranded:
+                    continue
+
+                ids = [o.id for o in stranded]
+                self.logger.warning(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id}: protective "
+                    f"OCO {ids} partly filled and its stop leg is gone -- the remainder has no "
+                    f"stop. Replacing the exit at TP={txn.take_profit} SL={txn.stop_loss}.")
+                ok = account.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss,
+                                          source="partial_fill_reprotect")
+                if not ok:
+                    msg = (f"Re-protecting {txn.symbol} transaction {txn.id} after partly "
+                           f"filled OCO {ids} FAILED: the remainder still has no stop. "
+                           f"Retried next refresh.")
+                    self.logger.error(f"[Account {account.id}] {msg}")
+                    log_activity(ActivityLogSeverity.FAILURE, ActivityLogType.TP_SL_ADJUSTED,
+                                 msg, data={"transaction_id": txn.id, "symbol": txn.symbol,
+                                            "oco_order_ids": ids},
+                                 source_account_id=account.id)
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {account.id}] partly-filled-exit check failed for transaction "
+                    f"{txn.id} ({txn.symbol}): {e}", exc_info=True)
+                continue
+
+    def _retry_stuck_closes(self, account, *, now=None):
+        """Retry the close of a CLOSING transaction that has nothing left working.
+
+        WHY. ``close_transaction`` flips a transaction to CLOSING before it submits the close.
+        If the broker then rejects or cancels that close, the transaction stays CLOSING and no
+        pass ever looks at it again: every exit pass, the breached-stop safety net included,
+        scans OPENED only; the external-close reconciler closes it only once the broker holds
+        no shares of the symbol at all. Dev 8080 PRG, transaction 258: the stop-breach forced
+        close of 2026-10-28 was refused (insufficient qty) and the last share sat unprotected
+        for 11 days, while the safety net's own log said "it will be retried next refresh".
+
+        THE RULE. While the market is open, for each CLOSING equity transaction of
+        ``account`` with NO order still working (no active or unsent status) and whose newest
+        order is at least ``_STUCK_CLOSE_RETRY_MINUTES`` old, call
+        ``account.close_transaction`` again. It is the one close path: it re-checks the broker
+        position, retires a dead close order and sizes the new one on the open quantity. A
+        failed retry is an ERROR and an activity-log FAILURE, and is retried after the same
+        wait.
+        """
+        from datetime import timedelta
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.utils import as_utc_key, log_close_order_activity
+        from .types import TransactionStatus
+
+        # Same gate as the breached-stop sweep: a market close sent after hours would queue
+        # for the open on a decision nobody re-checked.
+        if not account.is_market_open():
+            return
+
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=_STUCK_CLOSE_RETRY_MINUTES)
+        working = OrderStatus.get_active_statuses() | OrderStatus.get_unsent_statuses()
+        for txn in self._equity_transactions_of(account, TransactionStatus.CLOSING):
+            try:
+                orders = orders_where(transaction_id=txn.id)
+                if not orders or any(o.status in working for o in orders):
+                    continue
+                newest = max(as_utc_key(o.created_at, default=now) for o in orders)
+                if newest > cutoff:
+                    continue
+
+                self.logger.warning(
+                    f"[Account {account.id}] {txn.symbol} transaction {txn.id} is CLOSING with "
+                    f"no order working since {newest:%Y-%m-%d %H:%M} UTC -- its close died at "
+                    f"the broker. Retrying the close.")
+                result = account.close_transaction(txn.id)
+                if not isinstance(result, dict):
+                    raise ValueError(f"close_transaction({txn.id}) returned "
+                                     f"{type(result).__name__}, not a result dict")
+                success = bool(result['success'])
+                if not success:
+                    self.logger.error(
+                        f"[Account {account.id}] retrying the close of {txn.symbol} "
+                        f"transaction {txn.id} FAILED: {result['message']}. Retried again "
+                        f"in {_STUCK_CLOSE_RETRY_MINUTES:g} min.")
+                log_close_order_activity(
+                    transaction=txn, account_id=account.id, success=success,
+                    error_message=None if success else result['message'],
+                    close_order_id=result['close_order_id'],
+                    canceled_count=result['canceled_count'],
+                    deleted_count=result['deleted_count'], is_retry=True)
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {account.id}] stuck-close retry failed for transaction "
+                    f"{txn.id} ({txn.symbol}): {e}", exc_info=True)
+                continue
+
     def _reconcile_account_option_activities(self, account):
         """Reconcile broker option lifecycle events (assignment / exercise / expiry)
         against the local Transaction ledger for one account.
@@ -898,20 +1211,31 @@ class TradeManager:
             # makes the overlapping windows across refreshes harmless.
             after = datetime.now(timezone.utc) - timedelta(days=7)
             activities = account.get_option_activities(after=after)
-            if not activities:
-                return
-            results = account.reconcile_option_assignments(activities)
-            applied = [r for r in (results or [])
-                       if not str(r.get("result", "")).startswith(("already_processed", "skipped"))]
-            self.logger.info(
-                f"[Account {account.id}] Option reconciliation: {len(activities)} activity(ies), "
-                f"{len(applied)} newly applied"
-            )
+            if activities:
+                results = account.reconcile_option_assignments(activities)
+                applied = [r for r in (results or [])
+                           if not str(r.get("result", "")).startswith(
+                               ("already_processed", "skipped"))]
+                self.logger.info(
+                    f"[Account {account.id}] Option reconciliation: {len(activities)} "
+                    f"activity(ies), {len(applied)} newly applied"
+                )
         except Exception as e:
             self.logger.error(
                 f"[Account {getattr(account, 'id', '?')}] Option reconciliation failed: {e}",
                 exc_info=True
             )
+        # The live twin of the backtest's next-bar assignment liquidation: sell the stock lots
+        # the reconciler flagged "not held" (assignment_hold). Runs on EVERY refresh, not only
+        # when new activities arrived, because a refused/failed sale stays pending and is retried
+        # here. Its own try: an activity-feed failure must not stop a sale already owed.
+        if hasattr(account, "process_pending_assignment_liquidations"):
+            try:
+                account.process_pending_assignment_liquidations()
+            except Exception as e:
+                self.logger.error(
+                    f"[Account {getattr(account, 'id', '?')}] assignment liquidation sweep "
+                    f"failed: {e}", exc_info=True)
 
     # ======================================================================
     # Daily ATM-IV recorder — the series behind IVRankCondition
@@ -1229,7 +1553,7 @@ class TradeManager:
                 sl_price = None
                 if (order.order_type == OrderType.MARKET and not is_closing
                         and not order.depends_on_order):
-                    sl_price = self._entry_submit_stop(order, order.stop_price or None)
+                    sl_price = entry_submit_stop(order, order.stop_price or None)
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
@@ -1318,21 +1642,6 @@ class TradeManager:
             f"the entry signal is stale and this blocker may never clear",
         )
 
-    @staticmethod
-    def _row_or_none(model_class, row_id):
-        """``get_instance`` that answers None instead of raising InstanceNotFound.
-
-        "The row is gone" is a legitimate answer for a compensation routine — it means there is
-        nothing left to compensate — and must not abort the caller.
-        """
-        from .db import InstanceNotFound
-        if not row_id:
-            return None
-        try:
-            return get_instance(model_class, row_id)
-        except InstanceNotFound:
-            return None
-
     def _fail_unsent_entry(self, order, reason: str) -> bool:
         """Cancel an entry that never reached the broker, and release everything behind it.
 
@@ -1364,7 +1673,7 @@ class TradeManager:
             self.logger.error(f"Cannot compensate an unsaved entry order ({reason})")
             return False
 
-        on_disk = self._row_or_none(TradingOrder, order_id)
+        on_disk = row_or_none(TradingOrder, order_id)
         if on_disk is None:
             self.logger.warning(
                 f"Order {order_id} no longer exists — nothing to compensate ({reason})")
@@ -1427,7 +1736,7 @@ class TradeManager:
             dependent_ids = [d.id for d in dependents]
         cancelled = 0
         for dep_id in dependent_ids:
-            dep = self._row_or_none(TradingOrder, dep_id)
+            dep = row_or_none(TradingOrder, dep_id)
             if dep and dep.status == OrderStatus.WAITING_TRIGGER:
                 dep.status = OrderStatus.CANCELED
                 update_instance(dep)
@@ -1453,7 +1762,7 @@ class TradeManager:
 
         if not transaction_id:
             return False
-        txn = self._row_or_none(Transaction, transaction_id)
+        txn = row_or_none(Transaction, transaction_id)
         if not txn or txn.status != TransactionStatus.WAITING:
             return False
         txn.status = TransactionStatus.FAILED
@@ -1496,7 +1805,7 @@ class TradeManager:
             child_ids = [c.id for c in children if c.id not in entry_ids]
 
         for child_id in child_ids:
-            child = self._row_or_none(TradingOrder, child_id)
+            child = row_or_none(TradingOrder, child_id)
             if child is None or child.status in terminal or child.status == OrderStatus.FILLED:
                 continue
             broker_id = getattr(child, 'broker_order_id', None)
@@ -1565,7 +1874,7 @@ class TradeManager:
             self.logger.error(f"Cannot give up on an unsaved entry order ({reason})")
             return False
 
-        on_disk = self._row_or_none(TradingOrder, entry_id)
+        on_disk = row_or_none(TradingOrder, entry_id)
         if on_disk is None:
             self.logger.warning(
                 f"Order {entry_id} no longer exists — nothing to give up on ({reason})")
@@ -1619,7 +1928,7 @@ class TradeManager:
         self._cancel_waiting_trigger_dependents(entry_id)
         failed = self._fail_waiting_transaction(txn.id, reason)
         if not failed:
-            current = self._row_or_none(Transaction, txn.id)
+            current = row_or_none(Transaction, txn.id)
             self.logger.info(
                 f"Transaction {txn.id} was no longer WAITING when the give-up path reached "
                 f"it (now {current.status if current else 'gone'})")
@@ -1662,7 +1971,7 @@ class TradeManager:
 
         for txn_id in waiting_ids:
             try:
-                txn = self._row_or_none(Transaction, txn_id)
+                txn = row_or_none(Transaction, txn_id)
                 if txn is None or txn.status != TransactionStatus.WAITING:
                     continue  # changed since we listed it
 
@@ -1719,12 +2028,12 @@ class TradeManager:
 
                 # verdict == "dead"
                 entry_id, account_id, _ = entry_rows[-1]
-                entry = self._row_or_none(TradingOrder, entry_id)
+                entry = row_or_none(TradingOrder, entry_id)
                 if entry is None:
                     continue
                 account = account_cache.get(account_id)
                 if account is None:
-                    account_def = self._row_or_none(AccountDefinition, account_id)
+                    account_def = row_or_none(AccountDefinition, account_id)
                     account_class = (
                         get_account_class(account_def.provider) if account_def else None)
                     if account_class is None:
@@ -1763,126 +2072,16 @@ class TradeManager:
             ages.append((datetime.now(timezone.utc) - created_at).total_seconds() / 60.0)
         return min(ages) if ages else None
 
-    def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
-        """Write the risk manager's decision onto the entry row BEFORE the broker is called.
-
-        WHY IT MUST BE BEFORE. At this point the RM-sized quantity and the safeguard stop exist
-        only in memory, on a TRANSIENT candidate object that is about to be thrown away — see
-        ``_submit_funded_entry_with_retry``'s own docstring: "re-deriving them later from a
-        stranded row is not possible". Everything that can go wrong from here (a lock, a broker
-        rejection, a crash, a restart) leaves a row on disk, and that row is either sized and
-        re-drivable or it is a dead qty-0 stub nothing can reconstruct. Order 460 on PROD
-        2026-08-10 was the latter and sat untouched for 8 hours.
-
-        Persisting first also makes the broker submit the ONLY thing left that can fail, which
-        is what lets the compensation in ``_fail_unsent_entry`` be a simple, provable statement
-        about a row rather than a guess about how far the submit got.
-
-        ``stop_price`` mirrors what the DB sizing path already does. There the candidate IS the
-        persisted row, so ``_ensure_safeguard_stop``'s write lands in the database for free; the
-        temp-order-list path sizes a transient candidate and only ever passed the stop as a
-        ``submit_order`` argument, leaving the row's ``stop_price`` null. That null is what
-        ``_check_all_washtrade_locked_orders`` re-reads to rebuild the protective leg when it
-        re-submits a cleared lock — with no stop on the row it re-sends the entry naked.
-
-        An explicit stop the ruleset already put on the order always wins, exactly as in
-        ``_ensure_safeguard_stop``: the RM's is a SAFEGUARD, not an override.
-
-        Safe to call here only because the order is DETACHED (see the enter loop's read-only
-        session invariant). On an attached row this update_instance is the self-deadlock.
-        """
-        order.quantity = quantity
-        if stop_price and not order.stop_price:
-            order.stop_price = stop_price
-        update_instance(order)
-
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
     _ENTRY_SUBMIT_BACKOFF_S = 2.0
 
-    @staticmethod
-    def _entry_submit_stop(order, safeguard_sl):
-        """Use the backtest's stop policy without changing the RM sizing input.
-
-        The evaluator has already attached the ruleset stop to the transaction.
-        Sending just the safeguard here would overwrite a tighter ruleset leg in
-        AccountInterface's initial_setup block. Read the current transaction on
-        each attempt so a delayed retry also preserves subsequent tightening.
-        """
-        from ba2_common.core.position_sizing import reconcile_protective_stop
-
-        transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-        return reconcile_protective_stop(
-            ruleset_sl=transaction.stop_loss if transaction else None,
-            safeguard_sl=safeguard_sl,
-            is_long=order.side == OrderDirection.BUY,
-        )
-
     def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
-        """Submit a funded entry, retrying when the DB (not the broker) is what failed.
-
-        WHY. A sqlite write lock must never cost a trade. Measured on PROD 2026-08-10: CVS was
-        screened, passed its ruleset and was FUNDED by the RM (1 share @ $95.69), then
-        submit_order's Transaction insert hit "database is locked". db.retry_on_lock burns 4
-        attempts against a 30s busy_timeout -- ~2 minutes -- then re-raises; the caller logged it
-        and moved on. The trade was simply lost, leaving a stranded qty-0 PENDING row with no
-        transaction and no broker id. Nothing sweeps those: the only code that touches PENDING
-        entries DELETES them, and order 460 sat untouched for 8 hours. Dev is worse -- 161 lock
-        events in a day and 5 entries lost the same way.
-
-        The lock is transient and the retry is trivially correct HERE, because at this point the
-        RM-sized quantity and safeguard stop are still in memory (fo.quantity / fo.stop_price);
-        re-deriving them later from a stranded row is not possible, which is why this belongs in
-        the funded loop and not in a sweeper.
-
-        ONLY lock failures are retried. A broker rejection, a validation error or a wash-trade
-        lock is a real answer and must not be re-attempted -- re-sending on those risks a
-        duplicate order, which is far worse than a missed one.
-        """
-        import time as _time
-
-        last_err = None
-        for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
-            try:
-                submit_sl = self._entry_submit_stop(order, sl_price)
-                from ba2_common.core.trade_cycle import stamp_safeguard_anchor
-                _txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-                stamp_safeguard_anchor(
-                    order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
-                    lambda: account.get_instrument_current_price(order.symbol))
-                submitted = account.submit_order(order, sl_price=submit_sl)
-            except Exception as e:  # noqa: BLE001 — classified immediately below
-                if "database is locked" not in str(e).lower():
-                    raise  # a real answer from the broker/validator: never re-send
-                last_err = e
-                if attempt < self._ENTRY_SUBMIT_RETRIES:
-                    delay = self._ENTRY_SUBMIT_BACKOFF_S * attempt
-                    self.logger.warning(
-                        f"Entry submit for order {order.id} ({order.symbol}) lost to a DB lock "
-                        f"(attempt {attempt}/{self._ENTRY_SUBMIT_RETRIES}); retrying in {delay:.0f}s")
-                    _time.sleep(delay)
-            else:
-                # The stop this entry was SIZED on, recorded once as the transaction's max-loss
-                # stop. ``sl_price`` is the RM safeguard the candidate was sized off, BEFORE
-                # _entry_submit_stop reconciled it with the ruleset stop; the helper falls back
-                # to the ruleset stop only when there is no safeguard. OUTSIDE the try on
-                # purpose: nothing it does may be mistaken for a DB-locked submit and re-send
-                # the order. It never raises (see the helper).
-                if submitted:
-                    from ba2_common.core.trade_cycle import record_max_loss_stop
-                    record_max_loss_stop(order, sl_price)
-                    # the transaction may only exist since the submit; the fill-time re-base reads
-                    # the stamp from it either way (idempotent when already stamped before)
-                    stamp_safeguard_anchor(
-                        order, (_txn.stop_loss if _txn else None), sl_price, submit_sl,
-                        lambda: account.get_instrument_current_price(order.symbol))
-                return submitted
-        self.logger.error(
-            f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
-            f"{self._ENTRY_SUBMIT_RETRIES} DB-lock retries: {last_err}. The RM funded this trade "
-            f"and it never reached the broker; order {order.id} is left PENDING with no broker id.",
-            exc_info=True)
-        return None
+        """Submit a funded entry, retrying when the DB (not the broker) is what failed
+        (``trade_cycle.submit_funded_entry``: shared with the offline decision replay, whose
+        docstring carries the history -- CVS 2026-08-10, order 460)."""
+        return submit_funded_entry(account, order, sl_price, retries=self._ENTRY_SUBMIT_RETRIES,
+                                   backoff_s=self._ENTRY_SUBMIT_BACKOFF_S, log=self.logger)
 
     def _rechain_behind_entry_legs(self, account, dependent_order, parent_order_id) -> bool:
         """Chain an exit that fires on its ENTRY's fill behind the cancellation of that entry's
@@ -1931,6 +2130,103 @@ class TradeManager:
                 f"Exit {dependent_order.id} ({dependent_order.symbol}) chained on the cancel of "
                 f"entry {parent_order_id}'s leg(s) {[leg.id for leg in legs]}, which hold the shares")
         return True
+
+    def _size_staged_full_close(self, account, close_order):
+        """How many shares a staged full close may sell NOW, measured at the broker.
+
+        WHY. ``close_transaction`` cancels a transaction's resting exit legs and stages the
+        close (WAITING_TRIGGER on the last cancelled leg's CANCELED) at the quantity the DB
+        held at that moment. A leg can fill -- partly or wholly -- between that moment and the
+        cancel landing, and the close was then submitted unchanged. Dev 8080 NVDA transaction
+        468, 2026-11-09: long 4; the stop leg sold 1 at 14:30:59, the breached-stop safety net
+        cancelled it at 14:31:27 and staged a close for 4; when the leg synced CANCELED (filled
+        1) this sweep sent the 4: 5 sold for a 4-share position, the 5th taken from another
+        NVDA transaction on the account. A leg that FILLED instead of cancelling also reaches
+        "submit" (``classify_waiting_trigger``), which would have sold the whole size again.
+        ``TransactionHelper.reconcile_canceled_partial_fill`` resizes staged dependents only
+        on an OPENED transaction; ``close_transaction`` has already made this one CLOSING.
+
+        THE RULE. Every EXIT-side order of the transaction that was just cancelled (the
+        trigger order and its OCO family) or that the DB still believes is working is re-read
+        AT THE BROKER, and must be final there (terminal or FILLED) with a measurable filled
+        quantity. What may be sold is the transaction's filled entry quantity minus every
+        exit fill (broker figures for the re-read orders, the DB's settled figures for the
+        rest), and never more than the staged quantity.
+
+        Returns ``(verdict, quantity, detail)``:
+            ("submit", qty, detail) -- send the close for ``qty`` (<= the staged quantity);
+            ("flat", 0.0, detail)   -- nothing is left to sell: do NOT send it;
+            ("defer", None, reason) -- the broker state is unknown: do NOT send it this pass.
+
+        THE TRADE-OFF in "defer": the stop has already been breached, so waiting one more
+        refresh can cost slippage on a still-open position. Sending a market order whose size
+        rests on an unconfirmed cancel can sell shares this transaction does not own -- they
+        come out of another position, silently, and leave the ledger wrong. One more pass is
+        recoverable; an oversell is not, so unknown never sends.
+        """
+        from ba2_common.core.trade_store import orders_where
+
+        txn = get_instance(Transaction, close_order.transaction_id)
+        if txn.side == OrderDirection.BUY:
+            exit_side = OrderDirection.SELL
+        elif txn.side == OrderDirection.SELL:
+            exit_side = OrderDirection.BUY
+        else:
+            return "defer", None, f"transaction {txn.id} has an unrecognised side {txn.side!r}"
+        orders = [o for o in orders_where(transaction_id=txn.id) if o.id != close_order.id]
+
+        terminal = OrderStatus.get_terminal_statuses()
+        executed = OrderStatus.get_executed_statuses()
+        final = terminal | {OrderStatus.FILLED}
+
+        # The order the close waits on, and its OCO family (parent row and child legs):
+        # close_transaction cancelled them together, and any of them may have traded.
+        trigger = next((o for o in orders if o.id == close_order.depends_on_order), None)
+        family = set()
+        if trigger is not None:
+            roots = {trigger.id} | ({trigger.parent_order_id} if trigger.parent_order_id else set())
+            family = roots | {o.id for o in orders if o.parent_order_id in roots}
+
+        held = 0.0
+        read_at_broker = []
+        for o in orders:
+            status, filled = o.status, _measured_qty(o.filled_qty)
+            if (o.broker_order_id and o.side == exit_side
+                    and (o.id in family or o.status not in final)):
+                broker_order = account.get_order(o.broker_order_id)
+                if broker_order is None:
+                    return "defer", None, (
+                        f"exit order {o.id} (broker {o.broker_order_id}) could not be read at "
+                        f"the broker, so whether it sold shares is unknown")
+                status = _as_order_status(getattr(broker_order, "status", None))
+                if status not in final:
+                    return "defer", None, (
+                        f"exit order {o.id} (broker {o.broker_order_id}) is "
+                        f"{getattr(status, 'value', status)!s} at the broker -- its cancel is not "
+                        f"confirmed and it can still sell")
+                filled = _measured_qty(getattr(broker_order, "filled_qty", None))
+                if filled is None:
+                    return "defer", None, (
+                        f"the broker reports no usable filled quantity for exit order {o.id} "
+                        f"(broker {o.broker_order_id}): {getattr(broker_order, 'filled_qty', None)!r}")
+                read_at_broker.append(f"{o.id}={status.value}/{filled:g}")
+            if status not in executed and status not in terminal:
+                continue   # still working / never sent: nothing traded that is final
+            if filled is None:
+                if status in executed:
+                    return "defer", None, (
+                        f"order {o.id} is {status.value} but its filled quantity is unrecorded")
+                continue
+            if o.side == txn.side:
+                held += filled
+            elif o.side == exit_side:
+                held -= filled
+
+        detail = (f"entry fills minus exit fills = {held:g}; broker re-read: "
+                  f"{', '.join(read_at_broker) or 'none'}")
+        if held <= 1e-9:
+            return "flat", 0.0, detail
+        return "submit", min(float(close_order.quantity), held), detail
 
     def _check_all_waiting_trigger_orders(self):
         """
@@ -2281,7 +2577,29 @@ class TradeManager:
             # PHASE 2: Process all order submissions OUTSIDE of session context
             submitted_count = 0
             for dependent_order, parent_order_id in orders_to_submit:
+                # ONE submitter per order (see _DEPENDENT_SUBMIT_CLAIMS). The claim is
+                # released in the `finally` below, after every outcome write of this order.
+                if not _claim_dependent_submit(dependent_order.id):
+                    self.logger.debug(
+                        f"Dependent order {dependent_order.id} is being submitted by another "
+                        f"thread; skipping it in this pass")
+                    continue
                 try:
+                    # Phase 1 read this row before the claim: another pass may have submitted,
+                    # failed, deferred-and-rechained or cancelled it since. Act only if it is
+                    # still the row Phase 1 decided on; otherwise the next pass re-evaluates it.
+                    current = row_or_none(TradingOrder, dependent_order.id)
+                    if (current is None or current.status != OrderStatus.WAITING_TRIGGER
+                            or current.broker_order_id
+                            or current.depends_on_order != dependent_order.depends_on_order
+                            or current.depends_order_status_trigger
+                            != dependent_order.depends_order_status_trigger):
+                        self.logger.debug(
+                            f"Dependent order {dependent_order.id} changed since this pass read "
+                            f"it (now {getattr(current, 'status', 'deleted')}, broker id "
+                            f"{getattr(current, 'broker_order_id', None)}); not submitting it here")
+                        continue
+
                     account_def = get_instance(AccountDefinition, dependent_order.account_id)
                     if not account_def:
                         self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
@@ -2306,6 +2624,44 @@ class TradeManager:
 
                     if self._rechain_behind_entry_legs(account, dependent_order, parent_order_id):
                         continue
+
+                    # A staged FULL close is sized NOW, from the broker's final word on the
+                    # legs it waited on -- never from the quantity it was staged at (see
+                    # _size_staged_full_close: NVDA transaction 468 sold 5 for 4).
+                    if is_staged_full_close(dependent_order):
+                        verdict, close_qty, detail = self._size_staged_full_close(
+                            account, dependent_order)
+                        if verdict == "defer":
+                            self.logger.error(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) NOT "
+                                f"submitted this pass: {detail}. A market close sized on an "
+                                f"unconfirmed cancel can sell shares this transaction does not "
+                                f"own; it stays WAITING_TRIGGER and is retried next pass.")
+                            continue
+                        if verdict == "flat":
+                            fresh = get_instance(TradingOrder, dependent_order.id)
+                            fresh.status = OrderStatus.CLOSED
+                            note = "not sent: transaction already flat at the broker"
+                            fresh.comment = (f"{fresh.comment} | {note}" if fresh.comment
+                                             else note)[:500]
+                            update_instance(fresh)
+                            self.logger.warning(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) NOT "
+                                f"sent: the position is already flat -- its exit legs sold it "
+                                f"before their cancel landed ({detail}). The fills close the "
+                                f"transaction on the next transaction refresh.")
+                            continue
+                        if close_qty < float(dependent_order.quantity) - 1e-9:
+                            self.logger.warning(
+                                f"Staged close order {dependent_order.id} for transaction "
+                                f"{dependent_order.transaction_id} ({dependent_order.symbol}) "
+                                f"resized {dependent_order.quantity:g} -> {close_qty:g}: its exit "
+                                f"legs sold part of the position before their cancel landed "
+                                f"({detail}).")
+                            dependent_order.quantity = close_qty
+                            update_instance(dependent_order)
 
                     # Gate cancel-and-replace orders (e.g. a trailing-stop OCO swap): only
                     # submit once the broker has ACTUALLY released the prior order's qty.
@@ -2398,7 +2754,9 @@ class TradeManager:
                         update_instance(fresh)
                     except Exception as update_error:
                         self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
-            
+                finally:
+                    _release_dependent_submit(dependent_order.id)
+
             if submitted_count > 0:
                 self.logger.info(f"Processed {submitted_count} waiting trigger orders")
                 
@@ -2638,140 +2996,205 @@ class TradeManager:
             
         return None
         
-    def _decision_capture_scope(self, expert_instance_id: int, use_case=None):
-        """A replay-capture scope for ONE decision pass of an expert (no-op when capture is off).
+    def _decision_capture_scope(self, expert_instance_id: int, use_case=None, trigger: str = "scheduler"):
+        """A replay-capture scope for ONE decision pass of ANY expert (no-op when capture is off).
 
         ``use_case`` is the pass: ``AnalysisUseCase.ENTER_MARKET`` (default, the entry pass) or
-        ``AnalysisUseCase.OPEN_POSITIONS`` (the exit pass). The body is the same for both.
+        ``AnalysisUseCase.OPEN_POSITIONS`` (the exit pass). ``trigger`` is ``"scheduler"`` or
+        ``"manual"`` (the UI / API calls). Used as ``with self._decision_capture_scope(...) as ctx``;
+        ``ctx`` is the pass' ``CaptureContext`` or ``None`` when nothing is being recorded.
 
-        WHY THE DECISION PASS NEEDS ITS OWN SCOPE. Capture is opened per ANALYSIS, by
-        ``MarketExpertInterface._analysis_capture``. The market-condition gates are not read
-        during an analysis: they are read HERE, when the entry ruleset is evaluated, after every
-        analysis of the pass has finished and its scope has closed. Without a scope of its own
-        the pass records nothing, ``LiveMarketConditionResolver.begin_decision`` sees no capture
-        context, and a replay of a gated bundle raises ``ReplayMiss`` in ``begin_decision``
-        because the windows it needs were never written down. A gated live decision that cannot
-        be replayed is a decision nobody can audit.
+        WHY EVERY EXPERT. The pass is where the rules are evaluated, the candidates sized and the
+        orders created: the stock decision that nobody could audit or replay before. It is also where
+        the market-condition windows and the option action taps are read (capture is opened per
+        ANALYSIS by ``MarketExpertInterface._analysis_capture``; these reads happen here, after every
+        analysis scope has closed). The scope therefore opens for every expert whenever a store
+        exists; it records what the pass reads and does (``decision_record``), it does not change it.
 
-        The same scope also carries the OPTION ACTION taps (chain/quote/IV/sizing reads and the
-        per-action record of ``OptionsAccountInterface`` entries and closes): those run inside
-        the rule evaluation of this pass, so an option expert's pass needs a scope even when it
-        has no market-condition profile.
+        The pass carries the REAL expert class of the instance (not ``TradeManager`` as an expert)
+        and ``branch_flags = {record_kind: decision_pass, pass, trigger, host_timezone}``.
 
-        Returns a context manager. Every failure to describe the pass degrades to "not
-        recorded", never to "the pass does not run": recording is evidence, not a dependency.
+        RECORDING IS NEVER A DEPENDENCY OF TRADING, AND NEVER SILENT. Every failure to open the scope
+        (no session, the expert row cannot be read, the scope itself fails) is counted in
+        ``CaptureHealth.PASS_NOT_RECORDED``, logged once at ERROR, and -- when a session is open --
+        written as a minimal ``error`` pass record naming the cause. The pass then runs unrecorded.
         """
-        import uuid
-        from contextlib import nullcontext
-        from datetime import timezone as _tz
+        from contextlib import contextmanager
 
-        from ba2_common.core.market_condition_live import resolver_for_expert_instance
-        from ba2_common.core.replay import capture_scope, get_replay_store
+        @contextmanager
+        def _scope():
+            from ba2_common.core.replay import capture_scope, get_replay_store
+            from ba2_common.core.replay.context import CaptureHealth
 
-        from .types import AnalysisUseCase
+            from .types import AnalysisUseCase
 
-        if use_case is None:
-            use_case = AnalysisUseCase.ENTER_MARKET
-        pass_name = "enter-market" if use_case == AnalysisUseCase.ENTER_MARKET else "open-positions"
-        id_prefix = "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
+            uc = AnalysisUseCase.ENTER_MARKET if use_case is None else use_case
+            pass_name = "enter-market" if uc == AnalysisUseCase.ENTER_MARKET else "open-positions"
+            store = get_replay_store()
+            if store is None:
+                from ba2_common.core.replay import decision_sizing
 
-        # The scope opens ONLY when THIS EXPERT has a market-condition resolver, or one of its
-        # rulesets holds an option action (see _expert_has_option_rules; the account class is NOT
-        # the test: AlpacaAccount is always an OptionsAccountInterface, stock experts included). Otherwise there is nothing to record, and opening it
-        # anyway would submit a synthetic "TradeManager" AnalysisRecord per decision pass into
-        # every capture session -- which replay inventory counts as an analysis and expert_replay
-        # then reports as COVERAGE_UNSUPPORTED. That silently moves the replay-coverage
-        # percentage of deployments that use neither feature (every stock deployment).
-        #
-        # PER EXPERT since Task 12 (the profile is that expert's setting): a process-wide
-        # "is a resolver installed" test would now be true for every deployment, because the
-        # dispatching resolver is always installed.
-        try:
-            has_resolver = resolver_for_expert_instance(expert_instance_id) is not None
-        except Exception as e:  # noqa: BLE001 -- DELIBERATELY broad on the EXIT pass only, see below
-            if use_case == AnalysisUseCase.ENTER_MARKET:
-                raise          # entries: refusing is the safe reading, as before this helper
-            # EXITS ARE NEVER BLOCKED BY THE MARKET-CONDITION MACHINERY: a resolver build that
-            # fails here fails identically in _open_exit_pass_market_condition_scope, which
-            # reports it (ERROR + FAILURE activity row) and runs the pass without the scope.
-            # This lookup only decides whether to RECORD, so it must not stop a stop-loss.
-            logger.error(f"replay capture: could not look up the market-condition resolver of "
-                         f"expert {expert_instance_id}; the {pass_name} pass is not recorded: {e}",
-                         exc_info=True)
-            return nullcontext()
-        store = get_replay_store()
-        if store is None:
-            return nullcontext()
-        if not has_resolver:
+                if not decision_sizing.dry_run_enabled():
+                    yield None
+                    return
+                # BA2_REPLAY_DECISION_DRYRUN=1 and no store: record into a throwaway context and only
+                # COUNT the bytes (design Task 1). The recorders are the read-only ones, nothing is written.
+                try:
+                    dry_meta = self._decision_pass_meta(
+                        decision_sizing.DryRunStore(), expert_instance_id, uc, pass_name, trigger)
+                except Exception as e:  # noqa: BLE001 -- the dry run must not stop a decision
+                    logger.error(f"decision dry run: pass meta not built: {e}", exc_info=True)
+                    yield None
+                    return
+                with decision_sizing.dry_run_scope(dry_meta) as dry_context:
+                    yield dry_context
+                return
             try:
-                is_options = self._expert_has_option_rules(expert_instance_id)
-            except Exception as e:  # noqa: BLE001 -- see the docstring: recording is not a dependency
-                logger.error(
-                    f"replay capture: could not resolve the account of expert {expert_instance_id}; "
-                    f"the {pass_name} pass is not recorded: {e}", exc_info=True)
-                return nullcontext()
-            if not is_options:
-                return nullcontext()
-        try:
-            session_id = store.current_session_id()
-            if session_id is None:
-                logger.error(
-                    "replay capture is enabled but no session is open; the %s decision "
-                    "pass for expert %s is not recorded and a gated decision in it cannot be "
-                    "replayed", pass_name, expert_instance_id)
-                return nullcontext()
-            meta = {
-                # The pass is not a MarketAnalysis, so it carries an id of its own shape rather
-                # than borrowing one analysis's id and colliding with that analysis's bundle.
-                "analysis_id": f"{id_prefix}-{expert_instance_id}-{uuid.uuid4().hex}",
-                "attempt_id": uuid.uuid4().hex,
-                "session_id": session_id,
-                "expert_class": "TradeManager",
-                "expert_instance_id": expert_instance_id,
-                # One pass decides for every symbol the expert recommended; the per-symbol
-                # identity is on each recorded observation, not on the bundle.
-                "symbol": "",
-                "use_case": str(use_case.value),
-                "scheduled_at": None,
-                "started_at": datetime.now(_tz.utc),
-            }
-        except Exception as e:  # noqa: BLE001 -- a recording problem never stops a decision
-            logger.error(f"replay capture: could not describe the decision pass: {e}", exc_info=True)
-            return nullcontext()
-        return capture_scope(store, meta)
+                meta = self._decision_pass_meta(store, expert_instance_id, uc, pass_name, trigger)
+                from . import replay_capture
+
+                allowed = replay_capture.decision_pass_expert_allowlist()
+                not_allowed = allowed is not None and meta["expert_class"] not in allowed
+                if not_allowed:
+                    # ROLLOUT allow-list (replay_capture.DECISION_PASS_EXPERTS_KEY): not an error, a
+                    # decision not to record; counted per reason and expert so it stays visible.
+                    store.health.record_discard("expert_not_allowed", meta["expert_class"])
+            except Exception as e:  # noqa: BLE001 -- a recording problem never stops a decision
+                self._decision_pass_not_recorded(store, expert_instance_id, uc, pass_name, trigger, e)
+                yield None
+                return
+            if not_allowed:
+                yield None          # outside the try: the pass body's own exceptions land here
+                return
+            with capture_scope(store, meta) as context:
+                if context is None:
+                    # capture_scope logged the cause; this makes it a pass-level fact.
+                    store.health.record(CaptureHealth.PASS_NOT_RECORDED)
+                    yield None
+                    return
+                yield context
+
+        return _scope()
 
     @staticmethod
-    def _expert_has_option_rules(expert_instance_id: int) -> bool:
-        """True when a ruleset of this expert holds an option entry/exit action.
+    def _decision_id_prefix(use_case) -> str:
+        """The analysis-id prefix of a pass: ``decision`` (entry) or ``exit-decision`` (exit)."""
+        from ba2_common.core.types import AnalysisUseCase
 
-        THE GATE FOR THE OPTION CAPTURE SCOPE. It is the rulesets, not the account class: every
-        ``AlpacaAccount`` is an ``OptionsAccountInterface`` whether or not the expert on it ever
-        trades an option, so an isinstance test gave every Alpaca STOCK expert a scope on both
-        passes (moving stock replay coverage and recording stock-pass broker reads). Option
-        actions run only from a rule, so "an action of an option type sits in the expert's
-        enter-market or open-positions ruleset" is exactly "this pass can produce an option
-        action record". Rule membership is read through the ruleset -> rule LINK (the engine's
-        read; ``EventAction.subtype`` is not consulted), and the type from ``actions[*]``
-        (``action_type`` or ``type``, as the evaluator reads it) against
-        ``get_option_action_values()``.
+        return "decision" if use_case == AnalysisUseCase.ENTER_MARKET else "exit-decision"
+
+    def _decision_pass_meta(self, store, expert_instance_id: int, use_case, pass_name: str,
+                            trigger: str) -> Dict[str, Any]:
+        """The analysis meta of a decision pass (design section 2.2)."""
+        import uuid
+
+        from ba2_common.core.replay.clock import host_timezone
+        from ba2_common.core.replay.decision_record import RECORD_KIND
+        from ba2_common.core.types import AnalysisUseCase
+
+        # NOT current_session_id(): that runs the host's rollover check (a 2 s drain plus index writes) on THIS
+        # thread, and a pass - an exit pass especially - must never wait on it. The background session roller
+        # (replay_capture) rolls at the UTC date change; until it has, the pass records into the still-open
+        # previous session, which is a valid session.
+        session_id = store.session_id
+        if session_id is None:
+            raise RuntimeError("replay capture is enabled but no session is open")
+        instance = get_instance(ExpertInstance, expert_instance_id)
+        started_at = datetime.now(timezone.utc)
+        id_prefix = self._decision_id_prefix(use_case)
+        return {
+            # The pass is not a MarketAnalysis, so it carries an id of its own shape rather than
+            # borrowing one analysis's id and colliding with that analysis's bundle.
+            "analysis_id": f"{id_prefix}-{expert_instance_id}-{uuid.uuid4().hex}",
+            "attempt_id": uuid.uuid4().hex,
+            "session_id": session_id,
+            "expert_class": instance.expert,
+            "expert_instance_id": expert_instance_id,
+            # One pass decides for every symbol the expert recommended; the per-symbol identity is
+            # on each recorded step, not on the pass.
+            "symbol": "",
+            "use_case": str(use_case.value),
+            "scheduled_at": None,
+            "started_at": started_at,
+            "branch_flags": {
+                "record_kind": RECORD_KIND,
+                "pass": pass_name,
+                "trigger": trigger,
+                "host_timezone": host_timezone(started_at),
+            },
+        }
+
+    def _decision_pass_not_recorded(self, store, expert_instance_id: int, use_case, pass_name: str,
+                                    trigger: str, cause: BaseException) -> None:
+        """Count, log and (with a session) persist the fact that a pass is not being recorded."""
+        from ba2_common.core.replay.context import CaptureHealth
+        from ba2_common.core.replay.decision_record import RECORD_KIND
+
+        store.health.record(CaptureHealth.PASS_NOT_RECORDED)
+        logger.error(
+            f"replay capture: the {pass_name} decision pass of expert {expert_instance_id} is not "
+            f"recorded ({type(cause).__name__}: {cause}); the pass runs normally", exc_info=cause)
+        try:
+            import uuid
+
+            from ba2_common.core.replay.schemas import AnalysisRecord, ReplayStatus
+
+            session_id = store.session_id
+            if session_id is None:
+                return                      # the counter is the only evidence there is
+            try:
+                expert_class = get_instance(ExpertInstance, expert_instance_id).expert
+            except Exception:  # noqa: BLE001 -- the very failure being reported may be this lookup
+                expert_class = "unknown"
+            now = datetime.now(timezone.utc)
+            store.submit(AnalysisRecord(
+                analysis_id=f"{self._decision_id_prefix(use_case)}-{expert_instance_id}-{uuid.uuid4().hex}",
+                attempt_id=uuid.uuid4().hex, session_id=session_id,
+                expert_class=expert_class, expert_instance_id=expert_instance_id, symbol="",
+                use_case=str(use_case.value), started_at=now, finished_at=now,
+                outcome=ReplayStatus.OUTCOME_ERROR,
+                error=f"pass not recorded: {type(cause).__name__}: {cause}",
+                branch_flags={"record_kind": RECORD_KIND, "pass": pass_name, "trigger": trigger},
+                capture_failures={CaptureHealth.PASS_NOT_RECORDED: 1}))
+        except Exception as e:  # noqa: BLE001 -- counted above; this is only the persisted evidence
+            logger.error(f"replay capture: could not persist the pass-not-recorded evidence: {e}",
+                         exc_info=True)
+
+    @staticmethod
+    def _created_order_ids(created) -> list:
+        """The entry pass' created orders as ids."""
+        return [o.id for o in created]
+
+    @staticmethod
+    def _created_result_order_ids(created) -> list:
+        """The exit pass' action results as the ids of the orders they created."""
+        ids = [(r.get("data") or {}).get("order_id") for r in created
+               if isinstance(r, dict) and r.get("success")]
+        return [i for i in ids if i]
+
+    def _finish_decision_pass(self, context, created, order_ids=None) -> None:
+        """End a pass that ran to its end: freeze its summary as the ``decision`` outcome.
+
+        ``created`` is what the pass returns and ``order_ids`` extracts the ids from it: that
+        bookkeeping runs INSIDE the guard, because the orders were already sent by now and a failure
+        reading them must cost the record, never the caller's return value.
+        A pass that already ended as a skip / error / discard keeps that outcome. Never raises.
         """
-        from ba2_common.core.db import ruleset_event_actions
-        from ba2_common.core.types import get_option_action_values
+        if context is None:
+            return
+        try:
+            from ba2_common.core.replay.decision_record import pass_summary
 
-        from .models import ExpertInstance
+            if not context.has_outcome and context.discard_reason is None:
+                created_order_ids = (self._created_order_ids if order_ids is None else order_ids)(created)
+                context.set_decision(pass_summary(context, created=created_order_ids))
+            if not context.has_outcome and context.discard_reason is None:
+                raise RuntimeError("the decision pass ended without a recorded outcome")
+        except Exception as e:  # noqa: BLE001 -- recording never reaches the decision
+            from ba2_common.core.replay.context import CaptureHealth
 
-        expert_instance = get_instance(ExpertInstance, expert_instance_id)
-        option_values = set(get_option_action_values())
-        for ruleset_id in (expert_instance.enter_market_ruleset_id,
-                           expert_instance.open_positions_ruleset_id):
-            if ruleset_id is None:
-                continue
-            for rule in ruleset_event_actions(ruleset_id):
-                for action in (rule.actions or {}).values():
-                    value = action.get("action_type") or action.get("type")
-                    if getattr(value, "value", value) in option_values:
-                        return True
-        return False
+            context.note_failure("decision pass summary not recorded", e,
+                                 CaptureHealth.PASS_NOT_RECORDED)
 
     def _option_entry_decisions(self, expert, expert_instance_id: int, symbol: str,
                                 results) -> list:
@@ -2803,7 +3226,8 @@ class TradeManager:
                                 f"(expert {expert_instance_id}): {e}")
             return []
 
-    def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
+    def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1,
+                                                      trigger: str = "scheduler") -> List[TradingOrder]:
         """Process enter_market recommendations inside ONE market-condition decision scope.
 
         The scope reads the evaluation clock once, on this (coordinating) thread, and only when
@@ -2818,9 +3242,11 @@ class TradeManager:
         """
         from ba2_common.core.market_condition_live import market_condition_decision_scope
 
-        with self._decision_capture_scope(expert_instance_id):
+        with self._decision_capture_scope(expert_instance_id, trigger=trigger) as pass_context:
             with market_condition_decision_scope(expert_instance_id=expert_instance_id):
-                return self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
+                created = self._process_expert_recommendations_after_analysis(expert_instance_id, lookback_days)
+            self._finish_decision_pass(pass_context, created)
+            return created
 
     #: The per-expert processing locks, in the fixed order ``hold_expert_locks`` takes them.
     _PROCESSING_USE_CASES = ("enter_market", "open_positions")
@@ -2895,6 +3321,7 @@ class TradeManager:
         
         if not lock_acquired:
             self.logger.info(f"Could not acquire lock for expert {expert_instance_id} (enter_market) - another thread is already processing. Skipping.")
+            pass_discard("lock_busy")
             return []
         
         # We have the lock - make sure we release it when done
@@ -2912,7 +3339,12 @@ class TradeManager:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
             # The SPY regime the spy-trend / spy-vol entry gates read, from FINISHED sessions, BEFORE any
             # rule is evaluated (the pass can run outside a refresh).
-            self._publish_benchmark_regime()
+            # THE pass's decision instant: the ONE wall-clock read of this pass, taken through the
+            # evaluation-clock seam (the wall clock when no capture is open) BEFORE anything else could
+            # read it, so a replay finds it first. The regime publish and the recommendation cutoff
+            # below both use it.
+            decision_now = replay_now()
+            self._publish_benchmark_regime(now=decision_now)
             
             from sqlmodel import select
             from .db import get_db
@@ -2927,12 +3359,14 @@ class TradeManager:
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
                 self.logger.error(f"Expert instance {expert_instance_id} not found")
+                pass_fail(f"expert instance {expert_instance_id} not found")
                 return created_orders
 
             # Get the expert instance model (for ruleset IDs)
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
                 self.logger.error(f"Expert instance model {expert_instance_id} not found")
+                pass_fail(f"expert instance model {expert_instance_id} not found")
                 return created_orders
 
             # Check if "Allow automated trade opening" is enabled
@@ -2941,33 +3375,38 @@ class TradeManager:
             )
             if not allow_automated_trade_opening:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping recommendation processing")
+                pass_skip("automated trade opening disabled")
                 return created_orders
 
             # Check if there's an enter_market ruleset configured
             if not expert_instance.enter_market_ruleset_id:
                 self.logger.debug(f"No enter_market ruleset configured for expert {expert_instance_id}, skipping automated order creation")
+                pass_skip("no enter_market ruleset configured")
                 return created_orders
 
             # Check if there are still pending analysis jobs for this expert
             if self._has_pending_analysis_jobs(expert_instance_id):
                 self.logger.debug(f"Still has pending analysis jobs for expert {expert_instance_id}, skipping automated order creation")
+                pass_discard("pending_analysis_jobs")
                 return created_orders
 
             # Get the account instance for this expert
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
                 self.logger.error(f"Account definition {expert_instance.account_id} not found")
+                pass_fail(f"account definition {expert_instance.account_id} not found")
                 return created_orders
 
             account_class = get_account_class(account_def.provider)
             if not account_class:
                 self.logger.error(f"Account provider {account_def.provider} not found")
+                pass_fail(f"account provider {account_def.provider} not found")
                 return created_orders
 
             account = account_class(account_def.id)
 
             # Get recent recommendations based on lookback_days parameter
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            cutoff_time = decision_now - timedelta(days=lookback_days)
             from ba2_common.core.hold_entry import evaluate_hold_entries
             allow_hold = evaluate_hold_entries(expert.settings)
 
@@ -3002,23 +3441,19 @@ class TradeManager:
 
                 if not all_recommendations:
                     self.logger.info(f"No actionable recommendations found for expert {expert_instance_id}")
+                    pass_skip("no actionable recommendations")
                     return created_orders
                 
-                # Filter to get only the latest recommendation per instrument
-                # This prevents processing multiple recommendations for the same symbol
-                latest_per_instrument = {}
-                for rec in all_recommendations:
-                    # Keep only the first (most recent) recommendation for each symbol
-                    if rec.symbol not in latest_per_instrument:
-                        latest_per_instrument[rec.symbol] = rec
-                
-                # Convert to list and sort by profit potential
-                recommendations = sorted(
-                    latest_per_instrument.values(),
-                    key=lambda r: r.expected_profit_percent,
-                    reverse=True
-                )
-                
+                # Latest recommendation per instrument (prevents processing several for one symbol),
+                # best profit potential first: the SHARED selection the decision replay recomputes.
+                recommendations = select_enter_candidates(all_recommendations)
+
+                note_selection(recommendations)
+                record_pass_state(
+                    expert=expert, expert_instance=expert_instance, pass_name="enter-market",
+                    lookback_days=lookback_days, cutoff_time=cutoff_time, decision_time=decision_now,
+                    account=account, ruleset_id=expert_instance.enter_market_ruleset_id,
+                    fetched_recommendations=all_recommendations, selected_recommendations=recommendations)
                 self.logger.info(f"Found {len(recommendations)} unique instruments with recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
                 self.logger.info(f"Evaluating recommendations through enter_market ruleset: {expert_instance.enter_market_ruleset_id}")
                 
@@ -3098,6 +3533,9 @@ class TradeManager:
                         existing_txn = open_or_waiting_position(
                             expert_instance_id, recommendation.symbol, session=session)
                         
+                        note_gate(recommendation.symbol, "open_or_waiting_position", existing_txn is None,
+                                  None if existing_txn is None else
+                                  f"transaction {existing_txn.id} {existing_txn.status}")
                         if existing_txn:
                             self.logger.warning(
                                 f"SAFETY CHECK: Skipping recommendation {recommendation.id} for {recommendation.symbol} - "
@@ -3109,6 +3547,8 @@ class TradeManager:
                         # Uses minimum_equity_threshold_percent from account settings (default 5%)
                         # Skip execution if insufficient funds to avoid creating pending orders that can't be filled
                         has_sufficient_equity, equity_reason = expert.has_sufficient_equity_for_trading()
+                        note_gate(recommendation.symbol, "sufficient_equity", bool(has_sufficient_equity),
+                                  equity_reason)
                         if not has_sufficient_equity:
                             self.logger.warning(
                                 f"EQUITY CHECK: Skipping recommendation {recommendation.id} for {recommendation.symbol} - "
@@ -3124,6 +3564,7 @@ class TradeManager:
                         try:
                             route = entry_route(s['action_type'] for s in action_summaries)
                         except MixedEntryActionsRefused as mixed:
+                            note_gate(recommendation.symbol, "entry_route", False, str(mixed))
                             # Neither path can size both halves: the equity RM would stamp a
                             # share count + stock stop onto the option order, and the option
                             # path would submit the equity action unsized. Refuse loudly.
@@ -3131,6 +3572,7 @@ class TradeManager:
                                 f"Refusing recommendation {recommendation.id} for {recommendation.symbol}: "
                                 f"{mixed}")
                             continue
+                        note_gate(recommendation.symbol, "entry_route", True, str(route))
                         if route == ENTRY_ROUTE_OPTION:
                             # Option actions size and submit themselves through their shared
                             # risk/capacity guards, exactly like the backtest option path,
@@ -3162,6 +3604,7 @@ class TradeManager:
 
                     except Exception as e:
                         self.logger.error(f"Error processing recommendation {recommendation.id}: {e}", exc_info=True)
+                        note_pass_error(f"recommendation {recommendation.id}", e)
                         continue
 
                 # TEMP-ORDER-LIST RM SIZING: size ALL the bar's candidates in one in-memory pass; only
@@ -3192,119 +3635,66 @@ class TradeManager:
                             fo = funded_by_symbol.get(candidate.symbol)
                             if fo is None or not (fo.quantity and fo.quantity > 0):
                                 continue  # unfunded — never persisted (no churn / delete)
+                            note_funded(candidate.symbol, fo.quantity, fo.stop_price)
                             # BEFORE the try, and per iteration: the except handler below
                             # compensates `order`, and a name left bound by the PREVIOUS
                             # iteration would make it compensate the wrong symbol's entry.
                             order = None
                             try:
-                                # Persist the real order + transaction + TP/SL bracket (execute is
-                                # byte-identical to the old flow; now called ONLY for funded symbols).
-                                execution_results = evaluator.execute()
-                                for result in execution_results:
-                                    if result.get('success') and isinstance(result.get('data'), dict):
-                                        oid = result['data'].get('order_id')
-                                        if oid:
-                                            # DETACHED on purpose — see the block comment above
-                                            # this loop's `with get_db() as session:`. Fetching
-                                            # through the long-lived `session` attaches the row,
-                                            # the RM stamp two lines below makes that session
-                                            # DIRTY, and the next query on it autoflushes and
-                                            # takes sqlite's one write lock — which submit_order
-                                            # then blocks on from its own second connection.
-                                            # get_instance(session=None) opens and closes its own
-                                            # session and hands back a fully loaded, detached row.
-                                            o = self._row_or_none(TradingOrder, oid)
-                                            if o and o.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
-                                                order = o
-                                if order is None:
-                                    self.logger.warning(f"No main order created for funded {candidate.symbol}")
-                                    continue
-                                # RM-sized quantity + safeguard stop from the candidate pass,
-                                # WRITTEN TO DISK before the broker is asked for anything.
-                                self._persist_funded_entry(order, fo.quantity, fo.stop_price or None)
+                                with record_execute(evaluator, candidate.symbol, recommendation, True) as step:
+                                    def _executed(results, main_order, step=step):
+                                        nonlocal order
+                                        step.result = results
+                                        step.order = main_order
+                                        # Bind the order the moment it is KNOWN, before anything is
+                                        # persisted: execute() has already created the WAITING
+                                        # Transaction + PENDING order, so a raise in the persist /
+                                        # leg stamp must still reach the except handler's
+                                        # _fail_unsent_entry for THIS order (pre-refactor the loop
+                                        # bound it before persisting).
+                                        order = main_order
 
-                                # ...and stamp the SAME quantity onto the protective legs execute()
-                                # just created. They were built by the account from the entry's
-                                # quantity while it was still the TRANSIENT 0 that
-                                # build_entry_candidate() sets, because the bracket is created inside
-                                # execute() and the RM size is stamped only here, one line above.
-                                #
-                                # A leg is therefore born correct only when the stamp happens to land
-                                # first, which is a race, not a rule. Measured 2026-08-08: 23 of 96
-                                # entry-staged legs across dev+prod carried quantity 0 (every one of
-                                # them `trigger=FILLED`, i.e. staged against an unfilled entry), and
-                                # the three live ones — WKC / GNTX / CSTL — were refused by the
-                                # quantity<=0 guard and cancelled, leaving those positions with a
-                                # stop and NO take-profit.
-                                #
-                                # Doing it here closes the race at the source: same value, same
-                                # moment. Scoped to legs of THIS entry, created seconds ago by
-                                # THIS execute(), so they are all full-position legs — the
-                                # partial-close case (a leg sized for the REMAINING shares behind a
-                                # close order) hangs off a different parent and cannot be reached.
-                                #
-                                # NOT shared with the backtest deliberately: BacktestAccount builds
-                                # its legs lazily at fill time from the FILLED entry quantity
-                                # (`held = abs(net)`), so it cannot inherit a transient 0 and has no
-                                # equivalent defect. Live must stage the leg before the fill because
-                                # the broker needs it resting; that constraint is live-only.
-                                #
-                                # PERSISTED HERE, per leg, through its own short-lived session —
-                                # NOT left as a pending mutation on the enter loop's session. That
-                                # is what the previous version did behind `no_autoflush`, and it
-                                # only moved the problem: the legs stayed dirty and attached, so
-                                # the NEXT candidate's first query flushed them instead and took
-                                # the write lock right before ITS submit. `no_autoflush` closes one
-                                # column; owning nothing on that session closes them all.
-                                try:
-                                    from sqlmodel import select as _leg_select
-                                    from .db import get_db as _get_db
-                                    with _get_db() as leg_session:
-                                        leg_ids = [l.id for l in leg_session.exec(
-                                            _leg_select(TradingOrder).where(
-                                                TradingOrder.depends_on_order == order.id)).all()]
-                                    for leg_id in leg_ids:
-                                        leg = self._row_or_none(TradingOrder, leg_id)
-                                        if leg is not None and leg.quantity != order.quantity:
-                                            self.logger.info(
-                                                f"Stamped protective leg {leg.id} ({leg.order_type}) "
-                                                f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
-                                            leg.quantity = order.quantity
-                                            update_instance(leg)
-                                except Exception as leg_err:  # noqa: BLE001 — never block the entry
-                                    self.logger.error(
-                                        f"Failed to stamp protective-leg quantity for order {order.id}: "
-                                        f"{leg_err}", exc_info=True)
+                                    # Execute (the real order + transaction + TP/SL bracket, ONLY for
+                                    # funded symbols), fetch the main order DETACHED, write the RM-sized
+                                    # quantity + safeguard stop onto it BEFORE the broker is asked for
+                                    # anything and stamp the protective legs: ONE shared function
+                                    # (trade_cycle.stage_funded_entry), the same the offline decision
+                                    # replay calls. Its docstrings carry the history of each step.
+                                    stage_funded_entry(
+                                        evaluator, candidate.symbol, fo.quantity, fo.stop_price or None,
+                                        on_executed=_executed)
+                                    if order is None:
+                                        continue
 
-                                # The submit wrapper reconciles this RM safeguard with the
-                                # transaction's ruleset stop using the same helper as backtests.
-                                self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                submitted_order = self._submit_funded_entry_with_retry(
-                                    account, order, sl_price=fo.stop_price or None)
-                                if submitted_order:
-                                    submitted_count += 1
-                                    # No expunge: `order` was never attached to this session in
-                                    # the first place (see the detached fetch above), so there is
-                                    # nothing to detach — and expunging only ever covered the
-                                    # entry, never the legs, which is how the flush found another
-                                    # way through on the next iteration.
-                                    created_orders.append(order)
-                                    self.logger.info(f"Successfully submitted order {order.id} to broker")
-                                else:
-                                    # COMPENSATE. Logging and moving on used to leave the entry
-                                    # PENDING, its protective legs WAITING_TRIGGER and — the part
-                                    # that actually costs trades — the Transaction submit_order
-                                    # had already created sitting in WAITING. The SAFETY CHECK
-                                    # above refuses any symbol+expert with a WAITING transaction
-                                    # and nothing sweeps one, so a single failed submit retired
-                                    # the symbol permanently. _fail_unsent_entry refuses unless
-                                    # the order provably never reached the broker.
-                                    self.logger.warning(f"Failed to submit order {order.id} to broker")
-                                    self._fail_unsent_entry(
-                                        order,
-                                        f"the funded entry submit for {order.symbol} returned "
-                                        f"nothing (DB-lock retries exhausted, or the broker "
-                                        f"layer declined to send it)")
+                                    # The submit wrapper reconciles this RM safeguard with the
+                                    # transaction's ruleset stop using the same helper as backtests.
+                                    self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
+                                    submitted_order = self._submit_funded_entry_with_retry(
+                                        account, order, sl_price=fo.stop_price or None)
+                                    if submitted_order:
+                                        submitted_count += 1
+                                        # No expunge: `order` was never attached to this session in
+                                        # the first place (see the detached fetch above), so there is
+                                        # nothing to detach — and expunging only ever covered the
+                                        # entry, never the legs, which is how the flush found another
+                                        # way through on the next iteration.
+                                        created_orders.append(order)
+                                        self.logger.info(f"Successfully submitted order {order.id} to broker")
+                                    else:
+                                        # COMPENSATE. Logging and moving on used to leave the entry
+                                        # PENDING, its protective legs WAITING_TRIGGER and — the part
+                                        # that actually costs trades — the Transaction submit_order
+                                        # had already created sitting in WAITING. The SAFETY CHECK
+                                        # above refuses any symbol+expert with a WAITING transaction
+                                        # and nothing sweeps one, so a single failed submit retired
+                                        # the symbol permanently. _fail_unsent_entry refuses unless
+                                        # the order provably never reached the broker.
+                                        self.logger.warning(f"Failed to submit order {order.id} to broker")
+                                        self._fail_unsent_entry(
+                                            order,
+                                            f"the funded entry submit for {order.symbol} returned "
+                                            f"nothing (DB-lock retries exhausted, or the broker "
+                                            f"layer declined to send it)")
                             except Exception as submit_error:
                                 self.logger.error(f"Error executing/submitting funded {candidate.symbol}: {submit_error}", exc_info=True)
                                 # Same leak, other exit: submit_order RAISED (a validation error,
@@ -3334,9 +3724,11 @@ class TradeManager:
                         self._check_all_waiting_trigger_orders()
                     except Exception as e:
                         self.logger.error(f"Error during risk management for expert {expert_instance_id}: {e}", exc_info=True)
+                        note_pass_error("risk management", e)
                 
         except Exception as e:
             self.logger.error(f"Error processing expert recommendations after analysis for expert {expert_instance_id}: {e}", exc_info=True)
+            note_pass_error("pass", e)
         finally:
             # Always release the lock when we're done
             processing_lock.release()
@@ -3712,7 +4104,24 @@ class TradeManager:
         except Exception as log_error:
             self.logger.warning(f"Failed to log market-condition scope failure activity: {log_error}")
 
-    def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
+    def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1,
+                                               trigger: str = "scheduler") -> List[TradingOrder]:
+        """Process OPEN_POSITIONS recommendations inside ONE decision capture scope.
+
+        The scope opens FIRST (before the lock, the early returns and the market-condition scope):
+        every exit of the pass is then either a recorded decision or a counted discard. It is a
+        no-op without a capture store, and a failure to open it never stops an exit (it is counted
+        and the pass runs unrecorded). See ``_process_open_positions_recommendations``.
+        """
+        from .types import AnalysisUseCase
+
+        with self._decision_capture_scope(expert_instance_id, AnalysisUseCase.OPEN_POSITIONS,
+                                          trigger=trigger) as pass_context:
+            created = self._process_open_positions_recommendations(expert_instance_id, lookback_days)
+            self._finish_decision_pass(pass_context, created, self._created_result_order_ids)
+            return created
+
+    def _process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations for OPEN_POSITIONS analysis.
         
@@ -3746,6 +4155,7 @@ class TradeManager:
         
         if not lock_acquired:
             self.logger.info(f"Could not acquire lock for expert {expert_instance_id} (open_positions) - another thread is already processing. Skipping.")
+            pass_discard("lock_busy")
             return []
         
         created_orders = []
@@ -3767,12 +4177,14 @@ class TradeManager:
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
                 self.logger.error(f"Expert instance {expert_instance_id} not found")
+                pass_fail(f"expert instance {expert_instance_id} not found")
                 return created_orders
 
             # Get the expert instance model (for ruleset IDs)
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
                 self.logger.error(f"Expert instance model {expert_instance_id} not found")
+                pass_fail(f"expert instance model {expert_instance_id} not found")
                 return created_orders
 
             # Check if "Allow automated trade modification" is enabled
@@ -3781,28 +4193,32 @@ class TradeManager:
             )
             if not allow_automated_trade_modification:
                 self.logger.debug(f"Automated trade modification disabled for expert {expert_instance_id}, skipping recommendation processing")
+                pass_skip("automated trade modification disabled")
                 return created_orders
 
             # Check if there's an open_positions ruleset configured
             if not expert_instance.open_positions_ruleset_id:
                 self.logger.debug(f"No open_positions ruleset configured for expert {expert_instance_id}, skipping automated trade modification")
+                pass_skip("no open_positions ruleset configured")
                 return created_orders
 
             # Get the account instance for this expert
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
                 self.logger.error(f"Account definition {expert_instance.account_id} not found")
+                pass_fail(f"account definition {expert_instance.account_id} not found")
                 return created_orders
 
             account_class = get_account_class(account_def.provider)
             if not account_class:
                 self.logger.error(f"Account provider {account_def.provider} not found")
+                pass_fail(f"account provider {account_def.provider} not found")
                 return created_orders
 
             account = account_class(account_def.id)
 
             # Get recent recommendations based on lookback_days parameter
-            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            # (the recommendation cutoff is taken inside the capture scope below, through the clock seam)
 
             # ONE market-condition decision pass for this expert's exit rules, mirroring the
             # entry pass (process_expert_recommendations_after_analysis). Without it a market
@@ -3815,7 +4231,11 @@ class TradeManager:
             # begin_decision reads current_capture()); it is a no-op unless capture is on and the
             # expert is gated or on an options account. A failure to OPEN the market-condition
             # scope never stops the exits: see _open_exit_pass_market_condition_scope.
-            with self._decision_capture_scope(expert_instance_id, AnalysisUseCase.OPEN_POSITIONS),                     self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
+            with self._open_exit_pass_market_condition_scope(expert_instance_id, account_def.id), get_db() as session:
+                # Recent recommendations by lookback_days. Read INSIDE the capture scope (opened by the
+                # public wrapper), so the pass's decision instant is a recorded clock read and replays as such.
+                decision_now = replay_now()
+                cutoff_time = decision_now - timedelta(days=lookback_days)
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
@@ -3826,6 +4246,7 @@ class TradeManager:
 
                 if not all_recommendations:
                     self.logger.info(f"No recommendations found for expert {expert_instance_id}")
+                    pass_skip("no recommendations")
                     return created_orders
 
                 # Prefer recommendations from OPEN_POSITIONS-subtype analyses: without this, a
@@ -3866,6 +4287,12 @@ class TradeManager:
                 # Convert to list
                 recommendations = list(latest_per_instrument.values())
                 
+                note_selection(recommendations)
+                record_pass_state(
+                    expert=expert, expert_instance=expert_instance, pass_name="open-positions",
+                    lookback_days=lookback_days, cutoff_time=cutoff_time, decision_time=decision_now,
+                    account=account, ruleset_id=expert_instance.open_positions_ruleset_id,
+                    fetched_recommendations=all_recommendations, selected_recommendations=recommendations)
                 self.logger.info(f"Found {len(recommendations)} unique instruments with open_positions recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
                 self.logger.info(f"Evaluating recommendations through open_positions ruleset: {expert_instance.open_positions_ruleset_id}")
                 
@@ -3990,7 +4417,11 @@ class TradeManager:
 
                             # Execute the actions with submit_to_broker flag set based on permission setting
                             try:
-                                execution_results = evaluator.execute(submit_to_broker=allow_automated_trade_modification)
+                                with record_execute(evaluator, recommendation.symbol, recommendation,
+                                                    allow_automated_trade_modification) as step:
+                                    execution_results = evaluator.execute(
+                                        submit_to_broker=allow_automated_trade_modification)
+                                    step.result = execution_results
                                 if execution_results:
                                     created_count = sum(1 for r in execution_results if r.get('success'))
                                     pending_count = sum(1 for r in execution_results if not allow_automated_trade_modification and r.get('success'))
@@ -4003,6 +4434,7 @@ class TradeManager:
                                     self.logger.debug(f"No orders created from actions for {recommendation.symbol}")
                             except Exception as e:
                                 self.logger.error(f"Error executing actions for recommendation {recommendation.id}: {e}", exc_info=True)
+                                note_pass_error(f"execute {recommendation.symbol}", e)
 
                             # Store evaluation details so the rule analysis icon appears in the UI
                             if evaluation_details:
@@ -4021,6 +4453,7 @@ class TradeManager:
                         
                     except Exception as e:
                         self.logger.error(f"Error evaluating open_positions recommendation {recommendation.id}: {e}", exc_info=True)
+                        note_pass_error(f"recommendation {recommendation.id}", e)
                 
                 return created_orders
                 

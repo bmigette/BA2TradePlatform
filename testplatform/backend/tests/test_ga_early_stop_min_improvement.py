@@ -539,10 +539,10 @@ class _PausingQueue:
     def __init__(self, real, seen, pause_at):
         self._real, self._seen, self._pause_at = real, seen, pause_at
 
-    def is_task_paused(self, task_id):
+    def stop_reason(self, task_id):
         opt = self._seen.get("optimizer")
-        return bool(opt is not None and self._pause_at is not None
-                    and len(opt.history) >= self._pause_at)
+        return "paused" if (opt is not None and self._pause_at is not None
+                            and len(opt.history) >= self._pause_at) else None
 
     def __getattr__(self, name):
         return getattr(self._real, name)

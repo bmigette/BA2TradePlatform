@@ -73,6 +73,9 @@ PERMITTED = ["O_LC", "O_LP", "O_VERT", "O_BULLCS", "O_BULLPS", "O_BEARCS", "O_BF
 #: 2026-09-24 Task 8 -- the launcher authors the 1-contract sizing floor as a FIXED param on
 #: every non-convex pure-option entry). A deliberate authoring change to the ACTION, not
 #: market-condition profile drift; the condition tree is untouched.
+#:
+#: AMENDED 2026-11-09 (owner): the floor is OFF again (key removed) and the 5% sizing band's
+#: ceiling went 10 -> 15. Deliberate action-authoring changes; the condition tree is untouched.
 PROFILE_NONE_O_LC = json.loads(r"""
 {
     "id": "o_lc-entry",
@@ -164,7 +167,6 @@ PROFILE_NONE_O_LC = json.loads(r"""
             "option_dte_min": 25,
             "option_dte_max": 45,
             "option_sizing": 5.0,
-            "option_min_one_contract": true,
             "option_strike_param_optimize": true,
             "option_strike_param_min": 0.0,
             "option_strike_param_max": 8.0,
@@ -186,7 +188,7 @@ PROFILE_NONE_O_LC = json.loads(r"""
             "option_strike_delta_step": 0.05,
             "option_sizing_optimize": true,
             "option_sizing_min": 1.0,
-            "option_sizing_max": 10.0,
+            "option_sizing_max": 15.0,
             "option_sizing_step": 1.0,
             "option_entry_cross": 0.75,
             "option_entry_cross_optimize": true,

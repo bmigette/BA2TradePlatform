@@ -205,18 +205,20 @@ class TestApply:
         assert enter.name == "carried enter_market"
         assert created.open_positions_ruleset_id != created.enter_market_ruleset_id
 
-    def test_a_missing_ruleset_with_no_rules_in_the_file_is_reported_not_invented(self, seeded):
-        """An old single-expert export names a ruleset it does not carry."""
+    def test_a_name_only_ruleset_resolves_from_this_database(self, seeded):
+        """An old single-expert export names a ruleset it does not carry; if this database has
+        it, the link is made (an unresolvable name is refused: TestCreateRefusals)."""
         payload = {"experts": [{
             "expert_type": "FMPRating",
-            "general": {"alias": "batch-nameonly", "account_id": seeded["account"].id},
+            "general": {"alias": "batch-nameonly", "account_id": seeded["account"].id,
+                        "virtual_equity_pct": 5.0},
             "expert_settings": {},
-            "enter_market_ruleset_name": "a ruleset this database never had",
+            "enter_market_ruleset_name": "batch enter_market",
         }]}
         messages = apply_batch_import(plan_batch_import(payload))
         created = [i for i in get_all(ExpertInstance) if i.alias == "batch-nameonly"][0]
-        assert created.enter_market_ruleset_id is None
-        assert any("left unset" in m for m in messages)
+        assert created.enter_market_ruleset_id == seeded["enter"].id
+        assert any("taken from this database" in m for m in messages)
 
     def test_one_bad_entry_does_not_lose_the_others(self, seeded):
         payload = build_batch_export([seeded["instance"].id])
@@ -349,3 +351,145 @@ class TestSettingsSurviveTheRoundTripUnchanged:
         once = self._settings(inst.id)
         apply_batch_import(plan_batch_import(build_batch_export([inst.id])))
         assert self._settings(inst.id) == once
+
+
+def _entry(seeded, alias, **general):
+    g = {"alias": alias, "account_id": seeded["account"].id, "virtual_equity_pct": 10.0}
+    g.update(general)
+    return {"expert_type": "FMPRating", "general": g, "expert_settings": {}}
+
+
+def _by_alias(alias):
+    found = [i for i in get_all(ExpertInstance) if i.alias == alias]
+    return found[0] if found else None
+
+
+class TestCreateRefusals:
+    def test_an_explicit_zero_percent_stays_zero(self, seeded):
+        plan = plan_batch_import({"experts": [_entry(seeded, "z", virtual_equity_pct=0)]})
+        assert plan.creates
+        apply_batch_import(plan)
+        assert _by_alias("z").virtual_equity_pct == 0.0
+
+    @pytest.mark.parametrize("missing", ["absent", "none"])
+    def test_a_missing_percent_is_refused(self, seeded, missing):
+        e = _entry(seeded, "nopct")
+        if missing == "absent":
+            del e["general"]["virtual_equity_pct"]
+        else:
+            e["general"]["virtual_equity_pct"] = None
+        plan = plan_batch_import({"experts": [e]})
+        assert plan.skips and "virtual_equity_pct" in plan.skips[0].problem
+        apply_batch_import(plan)
+        assert _by_alias("nopct") is None
+
+    @pytest.mark.parametrize("acct", ["absent", "none", "unknown"])
+    def test_a_missing_or_unknown_account_is_refused(self, seeded, acct):
+        e = _entry(seeded, "noacct")
+        if acct == "absent":
+            del e["general"]["account_id"]
+        elif acct == "none":
+            e["general"]["account_id"] = None
+        else:
+            e["general"]["account_id"] = 999999
+        plan = plan_batch_import({"experts": [e]})
+        assert plan.skips and "account" in plan.skips[0].problem
+        apply_batch_import(plan)
+        assert _by_alias("noacct") is None
+
+    def test_an_unresolved_ruleset_name_is_refused(self, seeded):
+        e = _entry(seeded, "badrs")
+        e["enter_market_ruleset_name"] = "a ruleset this database never had"
+        plan = plan_batch_import({"experts": [e]})
+        assert plan.skips and "ruleset" in plan.skips[0].problem
+        apply_batch_import(plan)
+        assert _by_alias("badrs") is None
+
+
+class TestUpdateKeepsLiveLinks:
+    def test_a_different_account_shows_in_the_plan_and_is_applied(self, seeded):
+        other = create_account_definition()
+        payload = build_batch_export([seeded["instance"].id])
+        payload["experts"][0]["general"]["account_id"] = other.id
+        plan = plan_batch_import(payload)
+        assert plan.updates[0].account_change == (seeded["account"].id, other.id)
+        apply_batch_import(plan)
+        assert get_instance(ExpertInstance, seeded["instance"].id).account_id == other.id
+
+    def test_the_same_account_is_no_change(self, seeded):
+        plan = plan_batch_import(build_batch_export([seeded["instance"].id]))
+        assert plan.updates[0].account_change is None
+
+    def test_an_unknown_account_on_update_is_refused_and_nothing_moves(self, seeded):
+        payload = build_batch_export([seeded["instance"].id])
+        payload["experts"][0]["general"]["account_id"] = 999999
+        plan = plan_batch_import(payload)
+        assert plan.skips and "account" in plan.skips[0].problem
+        apply_batch_import(plan)
+        assert get_instance(ExpertInstance, seeded["instance"].id).account_id == seeded["account"].id
+
+    def test_no_ruleset_names_keeps_the_existing_links(self, seeded):
+        payload = build_batch_export([seeded["instance"].id])
+        e = payload["experts"][0]
+        e["enter_market_ruleset_name"] = None
+        del e["open_positions_ruleset_name"]
+        e["rulesets"] = None
+        apply_batch_import(plan_batch_import(payload))
+        inst = get_instance(ExpertInstance, seeded["instance"].id)
+        assert inst.enter_market_ruleset_id == seeded["enter"].id
+        assert inst.open_positions_ruleset_id == seeded["hold"].id
+
+    def test_an_unresolved_ruleset_name_on_update_is_refused_and_links_stay(self, seeded):
+        payload = build_batch_export([seeded["instance"].id])
+        e = payload["experts"][0]
+        e["rulesets"] = None
+        e["enter_market_ruleset_name"] = "no such ruleset anywhere"
+        e["general"]["user_description"] = "must not land"
+        plan = plan_batch_import(payload)
+        assert plan.skips and "ruleset" in plan.skips[0].problem
+        apply_batch_import(plan)
+        inst = get_instance(ExpertInstance, seeded["instance"].id)
+        assert inst.enter_market_ruleset_id == seeded["enter"].id
+        assert inst.user_description == "the original"
+
+
+class TestFailedSaveLeavesTheExpertAsItWas:
+    def test_update_restores_instance_and_settings(self, seeded, monkeypatch):
+        inst = seeded["instance"]
+        expert = get_expert_instance_from_id(inst.id)
+        before_settings = TestSettingsSurviveTheRoundTripUnchanged._settings(inst.id)
+        other = create_account_definition()
+
+        payload = build_batch_export([inst.id])
+        e = payload["experts"][0]
+        e["expert_settings"]["some_setting"] = "new"
+        e["general"].update(account_id=other.id, virtual_equity_pct=3.0,
+                            user_description="new desc", priority=2)
+        plan = plan_batch_import(payload)
+
+        def boom(self, settings):
+            raise RuntimeError("disk on fire")
+        monkeypatch.setattr(type(expert), "save_settings", boom)
+        messages = apply_batch_import(plan)
+        monkeypatch.undo()
+
+        assert any(m.startswith("FAILED") for m in messages)
+        after = get_instance(ExpertInstance, inst.id)
+        assert (after.account_id, after.virtual_equity_pct, after.user_description,
+                after.priority) == (seeded["account"].id, 42.0, "the original", 7)
+        assert after.enter_market_ruleset_id == seeded["enter"].id
+        assert TestSettingsSurviveTheRoundTripUnchanged._settings(inst.id) == before_settings
+
+    def test_a_failed_create_leaves_no_expert(self, seeded, monkeypatch):
+        expert_cls = type(get_expert_instance_from_id(seeded["instance"].id))
+        e = _entry(seeded, "doomed")
+        e["expert_settings"] = {"some_setting": "x"}
+        plan = plan_batch_import({"experts": [e]})
+
+        def boom(self, settings):
+            raise RuntimeError("disk on fire")
+        monkeypatch.setattr(expert_cls, "save_settings", boom)
+        messages = apply_batch_import(plan)
+        monkeypatch.undo()
+        assert any(m.startswith("FAILED") for m in messages)
+        assert _by_alias("doomed") is None

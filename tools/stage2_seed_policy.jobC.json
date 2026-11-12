@@ -2,6 +2,8 @@
  "fill": {
   "cond:*-spy-trend:mode": "off",
   "cond:*-spy-vol:mode": "off",
+  "cond:*-market-*:mode": "off",
+  "cond:*-market-*:value": "$authored",
   "model:circuit_breaker_pct": 50,
   "model:max_deployment_pct": 80,
   "model:max_notional_leverage": 10

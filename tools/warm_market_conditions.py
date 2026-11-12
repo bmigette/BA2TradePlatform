@@ -225,7 +225,9 @@ def cmd_build(args) -> int:
               f"--gap-fill instead of overriding it at `build` time)", file=sys.stderr)
         return EXIT_CONFIG
     source = None
-    if args.fetch_missing:
+    # A built-only source (alpaca) goes to the build even cache-only: its store_asof() is what tells a delisting
+    # (a series ending before the store's own as-of) from missing coverage (warmup._drop_tails_ended_at_source).
+    if args.fetch_missing or args.ohlcv_history_source != "fmp":
         try:
             source = make_source(plan.cache_root, args.ohlcv_history_source)
         except W.WarmupConfigError as e:

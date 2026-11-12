@@ -69,7 +69,8 @@ from ba2_common.core.market_condition_rules import (  # noqa: E402
     assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
-    SCREENER_UNIVERSE_SETTING, explicit_default_settings, live_settings_from_universe,
+    SCREENER_UNIVERSE_SETTING, explicit_default_settings, legacy_hold_settings,
+    live_settings_from_universe,
     reportable_backtest_only, unmapped_screener_keys,
 )
 from ba2_common.core.models import ExpertInstance  # noqa: E402
@@ -311,7 +312,10 @@ def main() -> int:
         #     sits under OR/NOT, is refused (``assert_market_rule_actions``);
         #   * an unresolved optimizer template on EITHER side is refused.
         # ``trade_rules_to_live_export`` below runs the last two again, but only AFTER a new
-        # instance has been created -- a refusal there would leave that instance behind.
+        # instance has been created -- a refusal there would leave that instance behind. So it
+        # also runs here as a DRY RUN (pure, writes nothing): a NOT group, a condition tree too
+        # wide to expand into AND-rules, or a rule that would convert always-true is refused
+        # before anything is written.
         try:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
@@ -319,6 +323,7 @@ def main() -> int:
             assert_market_rule_actions(exit_rules, f"{label}: exit rules")
             assert_market_conditions_resolved(entry_rules, f"{label}: entry rules")
             assert_market_conditions_resolved(exit_rules, f"{label}: exit rules")
+            trade_rules_to_live_export(entry_rules, exit_rules, name=label)
         except ValueError as e:
             print(f"FATAL: {label}: {e}")
             return 1
@@ -561,6 +566,33 @@ def main() -> int:
         else:
             print("  WARNING: payload carries no run_schedule_override -- the instance will "
                   "have NO schedule and will never fire. Set one before enabling it.")
+        # ASSIGNED-STOCK POLICY (hold_assigned_stock / hold_assigned_stock_tags): live decides
+        # per instance exactly as the backtest did. A payload exported before live carried them
+        # holds the facts under backtest_only; apply those so the instance is not left UNDECIDED
+        # (undecided = stock held + an ERROR at every assignment).
+        for k, v in legacy_hold_settings(entry["settings"].get("backtest_only")).items():
+            if expert_params.get(k) is None:
+                expert_params[k] = v
+                print(f"  assigned-stock policy: {k}={v!r} taken from the legacy backtest_only block")
+        _hold_keys = ("hold_assigned_stock", "hold_assigned_stock_tags")
+        _stored = expert.settings
+        for k in _hold_keys:
+            if k not in expert_params:
+                print(f"  WARNING: the payload states no {k}; stored value is "
+                      f"{_stored[k] if k in _stored else None!r}"
+                      + ("  -- an instance with NEITHER key stored is UNDECIDED (stock held, "
+                         "ERROR logged at every assignment)" if all(
+                             (_stored[x] if x in _stored else None) is None
+                             and x not in expert_params for x in _hold_keys) else ""))
+        if (expert_params.get("hold_assigned_stock_tags") is None
+                and (_stored["hold_assigned_stock_tags"] if "hold_assigned_stock_tags" in _stored
+                     else None) is not None):
+            print("  WARNING: the instance still stores hold_assigned_stock_tags from an earlier "
+                  "deploy and this payload has none -- clear it by hand or the policy resolver "
+                  "refuses the combination with hold_assigned_stock=True (stock held, ERROR)")
+        print(f"  assigned-stock policy: hold_assigned_stock="
+              f"{expert_params.get('hold_assigned_stock')!r} "
+              f"hold_assigned_stock_tags={expert_params.get('hold_assigned_stock_tags')!r}")
         expert.save_settings({k: (v, None) for k, v in expert_params.items()})
         print(f"expertsetting: saved {len(expert_params)} keys for instance {inst_id}"
               + ("  (incl. allow_automated_trade_opening)" if created else ""))

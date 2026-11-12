@@ -241,14 +241,18 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
             },
             "model_target_method": {
                 "type": "str", "required": False, "default": "forward",
-                "choices": ["forward", "trailing"],
+                "choices": ["forward", "trailing", "reported", "reported_2y", "consensus"],
                 "description": "Only used when expected_profit_mode='model'. 'forward' anchors "
                                "the P/E multiple on the nearest-FY consensus EPS estimate "
                                "(unbiased on average, validated in "
                                "test_files/probe_analyst_price_target_model.py); 'trailing' "
                                "anchors on trailing TTM reported EPS (lower worst-case, "
-                               "persistent low bias). See ba2_experts.analyst_target_model's "
-                               "module docstring for the full validation writeup.",
+                               "persistent low bias). Both read FMP estimates, which are one "
+                               "snapshot of today's revisions, so a backtest refuses them. "
+                               "'reported' / 'reported_2y' use only reported quarterly EPS "
+                               "(TTM grown by its 1-year / annualised 2-year growth) and are "
+                               "the methods the GA searches. See ba2_experts."
+                               "analyst_target_model's module docstring.",
             },
             "dynamic_scale": {
                 "type": "float", "required": False, "default": 0.0,
@@ -294,7 +298,8 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         skip_detail_fetch = False
         # LIVE-ONLY calendar shortcut (see module docstring). Backtest (as_of set) never enters
         # this branch, so grid/backtest results are byte-identical to before this change.
-        calendar_branch = as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider)
+        calendar_branch = as_of is None and isinstance(getattr(details_provider, "base_provider", details_provider),
+                                                      FMPCompanyDetailsProvider)
         # Which branch ran is a RECORDED FACT, not something a replay may infer
         # from which observations happen to be on the tape: inferring it would let
         # a missing calendar response silently reroute the replay down the
@@ -360,7 +365,8 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         # contract. Resolved before _gather by run_analysis/analyze_as_of, mirroring
         # _gather_max_days_since_report.
         if getattr(self, "_gather_expected_profit_mode", "static") == "model":
-            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of)
+            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of,
+                                                         method=getattr(self, "_gather_model_target_method", "forward"))
         return bundle
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
@@ -446,6 +452,7 @@ Confidence: {confidence:.1f}%
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_max_days_since_report = int(context.settings["max_days_since_report"])
         self._gather_expected_profit_mode = context.settings.get("expected_profit_mode", "static")
+        self._gather_model_target_method = context.settings.get("model_target_method", "forward")
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
@@ -553,6 +560,7 @@ Confidence: {confidence:.1f}%
             self._gather_symbol = symbol
             self._gather_max_days_since_report = settings["max_days_since_report"]
             self._gather_expected_profit_mode = settings.get("expected_profit_mode", "static")
+            self._gather_model_target_method = settings.get("model_target_method", "forward")
             providers = self._live_providers()
             # Recorded live analysis (spec step 2): a no-op when capture is off,
             # in which case this is exactly the gather/guard/process sequence it

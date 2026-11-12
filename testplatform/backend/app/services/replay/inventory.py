@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ba2_common.core.replay import ReplayStatus, load_bundle
+from ba2_common.core.replay.decision_record import is_decision_pass
 
 from app.services.replay.report import CAPABILITY_TITLES, STATUS_ORDER
 
 __all__ = ["run", "to_markdown", "INVENTORY_NAME"]
 
 INVENTORY_NAME = "inventory.json"
+
+#: ``analyses_by_record_kind`` keys: an expert analysis vs a stock decision pass.
+RECORD_KIND_EXPERT = "expert_analysis"
+RECORD_KIND_DECISION_PASS = "decision_pass"
 
 #: Every capability the report knows about, so one with no rows still appears as
 #: ``not_run`` instead of dropping out of the table.
@@ -35,12 +40,18 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
     """Count everything in ``bundle_dir``; write ``inventory.json`` when asked."""
     bundle = load_bundle(bundle_dir)
     analyses = bundle.analyses
+    # A stock decision pass is NOT an expert analysis (it carries the owning expert's class only as
+    # its owner): it is counted by record kind, never under ``analyses_by_expert``.
+    decision_passes = [a for a in analyses if is_decision_pass(a)]
+    expert_analyses = [a for a in analyses if not is_decision_pass(a)]
 
-    by_expert = Counter(a.expert_class for a in analyses)
+    by_record_kind = Counter(RECORD_KIND_DECISION_PASS if is_decision_pass(a) else RECORD_KIND_EXPERT
+                             for a in analyses)
+    by_expert = Counter(a.expert_class for a in expert_analyses)
     by_use_case = Counter(a.use_case for a in analyses)
     by_outcome = Counter(a.outcome for a in analyses)
     by_capture_status = Counter(a.bundle_capture_status for a in analyses)
-    by_expert_outcome = Counter((a.expert_class, a.outcome) for a in analyses)
+    by_expert_outcome = Counter((a.expert_class, a.outcome) for a in expert_analyses)
     skip_reasons = Counter(a.skip_reason for a in analyses
                            if a.outcome == ReplayStatus.OUTCOME_SKIP)
 
@@ -63,8 +74,12 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
         # An analysis with no coverage row for a capability has not been run for
         # it. Saying so explicitly is what stops a partial run reading as a full
         # one when the totals are divided.
+        # The decision capability answers for decision passes only, the expert capabilities for expert
+        # analyses only.
+        applicable = (decision_passes if capability == ReplayStatus.CAPABILITY_DECISION
+                      else expert_analyses)
         rows[ReplayStatus.COVERAGE_NOT_RUN] += sum(
-            1 for a in analyses if a.analysis_id not in seen)
+            1 for a in applicable if a.analysis_id not in seen)
         coverage[capability] = rows
 
     capture_gaps = Counter(gap for a in analyses for gap in a.capture_gaps)
@@ -95,6 +110,7 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             "observations": len(bundle.observations),
             "coverage_rows": len(bundle.coverage),
         },
+        "analyses_by_record_kind": dict(sorted(by_record_kind.items())),
         "analyses_by_expert": dict(sorted(by_expert.items())),
         "analyses_by_use_case": dict(sorted(by_use_case.items())),
         "analyses_by_outcome": dict(sorted(by_outcome.items())),
@@ -118,6 +134,8 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
         "coverage_by_capability": coverage,
         # Separate from the stock capabilities above, which keep their exact set.
         "option_actions": option_actions,
+        "decision_passes": _decision_passes(bundle, decision_passes),
+        "decision_coverage": _decision_coverage(bundle, decision_passes),
     }
     if out_dir is not None:
         out = Path(out_dir)
@@ -127,6 +145,75 @@ def run(bundle_dir, out_dir=None) -> Dict[str, Any]:
             encoding="utf-8")
         (out / "inventory.md").write_text(to_markdown(inventory), encoding="utf-8")
     return inventory
+
+
+def _decision_passes(bundle, passes) -> Dict[str, Any]:
+    """Recorded stock decision passes, counted by pass kind, outcome and recorded step kind.
+
+    Replayed by the ``decision`` capability (``replay decision``); its coverage rows are in
+    ``coverage_by_capability``.
+    """
+    by_pass: Counter = Counter()
+    by_outcome: Counter = Counter()
+    steps: Counter = Counter()
+    for analysis in passes:
+        by_pass[analysis.branch_flags["pass"] if "pass" in analysis.branch_flags else "unknown"] += 1
+        by_outcome[analysis.outcome] += 1
+        for observation in bundle.observations_for(analysis.analysis_id):
+            if observation.provider == "decision_step":
+                steps[observation.method] += 1
+    return {
+        "total": len(passes),
+        "by_pass": dict(sorted(by_pass.items())),
+        "by_outcome": dict(sorted(by_outcome.items())),
+        "steps_by_kind": dict(sorted(steps.items())),
+        "replayed_by": ReplayStatus.CAPABILITY_DECISION,
+        "replay_command": "ba2-test replay decision --bundle <dir>",
+    }
+
+
+def _decision_coverage(bundle, passes) -> Dict[str, Any]:
+    """Per expert: passes recorded / discarded / not recorded / failed, and the recorder's own health.
+
+    * recorded -- the pass ended as a decision or as a recorded decision not to act.
+    * not_recorded -- the pass RAN but its scope could not open (an error row carrying the
+      ``pass_not_recorded`` failure); the live recorder counted it too.
+    * failed -- the pass ended in any other error.
+    * discarded -- from ``capabilities.capture_health`` (written at finalize): passes that ended before
+      they were a decision (lock miss, pending analysis jobs). ``None`` when the session carries no
+      health record (an older session), which is "unknown", never zero.
+    """
+    health = bundle.session.capabilities["capture_health"] if "capture_health" in bundle.session.capabilities else None
+    discards_by_expert = dict(health["discards_by_expert"]) if health is not None else None
+    experts: Dict[str, Dict[str, Any]] = {}
+
+    def row(expert):
+        return experts.setdefault(expert, {"recorded": 0, "discarded": None if health is None else 0,
+                                           "not_recorded": 0, "failed": 0})
+
+    for analysis in passes:
+        entry = row(analysis.expert_class)
+        if analysis.outcome in (ReplayStatus.OUTCOME_DECISION, ReplayStatus.OUTCOME_SKIP):
+            entry["recorded"] += 1
+        elif "pass_not_recorded" in analysis.capture_failures:
+            entry["not_recorded"] += 1
+        else:
+            entry["failed"] += 1
+    for expert, count in (discards_by_expert or {}).items():
+        row(expert)["discarded"] = count
+
+    totals = {key: sum(e[key] for e in experts.values() if e[key] is not None)
+              for key in ("recorded", "discarded", "not_recorded", "failed")}
+    counters = dict(health["counters"]) if health is not None else {}
+    failures = {k: v for k, v in counters.items() if k != "pass_discarded" and v}
+    return {
+        "by_expert": dict(sorted(experts.items())),
+        "totals": totals,
+        "health_recorded": health is not None,
+        "discards_by_reason": dict(sorted(health["discards"].items())) if health is not None else {},
+        "capture_failures": sum(failures.values()),
+        "capture_failure_kinds": dict(sorted(failures.items())),
+    }
 
 
 def _option_actions(bundle) -> Dict[str, Any]:
@@ -190,7 +277,12 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
         f"{inventory['totals']['observations']} provider observations, "
         f"{inventory['totals']['coverage_rows']} coverage rows.",
     ]
-    lines += _table("Analyses by expert", "Expert", inventory["analyses_by_expert"])
+    banner = _banner(inventory["decision_coverage"])
+    if banner:
+        lines = [banner, ""] + lines
+    lines += _decision_coverage_markdown(inventory["decision_coverage"])
+    lines += _table("Analyses by record kind", "Record kind", inventory["analyses_by_record_kind"])
+    lines += _table("Analyses by expert (expert analyses only)", "Expert", inventory["analyses_by_expert"])
     lines += _table("Analyses by use case", "Use case", inventory["analyses_by_use_case"])
     lines += _table("Analyses by outcome", "Outcome", inventory["analyses_by_outcome"])
     lines += _table("Analyses by expert and outcome", "Expert / outcome",
@@ -221,6 +313,13 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
     for capability, rows in inventory["coverage_by_capability"].items():
         counts = " | ".join(str(rows[status]) for status in STATUS_ORDER)
         lines.append(f"| {capability} | {counts} |")
+    decisions = inventory["decision_passes"]
+    lines += ["", "## Decision passes", "",
+              f"{decisions['total']} recorded stock decision pass(es), replayed by the "
+              f"`{decisions['replayed_by']}` capability (`{decisions['replay_command']}`)."]
+    lines += _table("Decision passes by kind", "Pass", decisions["by_pass"])
+    lines += _table("Decision passes by outcome", "Outcome", decisions["by_outcome"])
+    lines += _table("Recorded decision steps", "Step", decisions["steps_by_kind"])
     options = inventory["option_actions"]
     lines += ["", "## Option actions", "",
               f"{options['total']} recorded option entry / close action(s), replayed by the "
@@ -231,6 +330,31 @@ def to_markdown(inventory: Dict[str, Any]) -> str:
               "|---" * len(STATUS_ORDER) + "|",
               "| " + " | ".join(str(options["coverage"][s]) for s in STATUS_ORDER) + " |"]
     return "\n".join(lines) + "\n"
+
+
+def _banner(coverage: Dict[str, Any]) -> str:
+    if not coverage["capture_failures"]:
+        return ""
+    kinds = ", ".join(f"{k}={v}" for k, v in coverage["capture_failure_kinds"].items())
+    return (f"**CAPTURE FAILURES: {coverage['capture_failures']} recording failure(s) in this session "
+            f"({kinds}). Coverage below is incomplete.**")
+
+
+def _decision_coverage_markdown(coverage: Dict[str, Any]) -> List[str]:
+    lines = ["", "## Decision coverage", ""]
+    if not coverage["health_recorded"]:
+        lines += ["_no capture_health in this session: discarded passes and recorder failures are "
+                  "unknown (shown as `-`), not zero._", ""]
+    lines += ["| Expert | Recorded | Discarded | Not recorded | Failed |", "|---|---:|---:|---:|---:|"]
+    for expert, e in coverage["by_expert"].items():
+        discarded = "-" if e["discarded"] is None else e["discarded"]
+        lines.append(f"| {expert} | {e['recorded']} | {discarded} | {e['not_recorded']} | {e['failed']} |")
+    t = coverage["totals"]
+    lines.append(f"| **all** | {t['recorded']} | {t['discarded']} | {t['not_recorded']} | {t['failed']} |")
+    if coverage["discards_by_reason"]:
+        lines += ["", "Discards by reason: " + ", ".join(
+            f"{k}={v}" for k, v in coverage["discards_by_reason"].items())]
+    return lines
 
 
 def _table(title: str, key_header: str, rows: Dict[str, int]) -> List[str]:

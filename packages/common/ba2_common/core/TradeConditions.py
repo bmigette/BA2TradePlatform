@@ -9,15 +9,20 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict, Callable, Type
 from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
+import numpy as np
 import threading
+from collections import OrderedDict
 
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import TradingOrder, ExpertRecommendation
 from ba2_common.core.types import OrderRecommendation, ExpertEventType, RiskLevel, TimeHorizon
 from ba2_common.core.db import get_db
+from ba2_common.core.rsi import wilder_rsi
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
+from ba2_common.core.replay import replay_now
+from ba2_common.core.replay.context import current_capture
 from ba2_common.core import benchmark_regime as _br
 # The established vocabulary for "the broker's position fetch FAILED" — reused rather
 # than re-invented so the engine, the live service, the UI and the conditions all raise
@@ -26,6 +31,7 @@ from ba2_common.core.portfolio_allocation import PositionFetchFailed
 # The earnings-event STAMP CONTRACT (design 2026-08-31 leaps-grid S9): the key paths the
 # ranking expert writes and the two O_ERN timing conditions below read back. Shared with
 # TradeActions, which stamps the event date onto the entry order at submit.
+from ba2_common.core.knowability import EARNINGS_ANNOUNCE_HORIZON_DAYS
 from ba2_common.core.earnings_stamp import (
     order_event_date,
     stamped_days_to_earnings,
@@ -151,6 +157,52 @@ def resolve_market_condition_context(account, instrument_name: str,
             f"market-condition context resolver returned {type(ctx).__name__}, "
             f"expected MarketConditionContext or None")
     return ctx
+
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-process memo of measurements that depend ONLY on finished daily history
+# ---------------------------------------------------------------------------------------------
+#: ``(id(provider), symbol, measurement, lookback_days, session)`` -> the computed number, or ``None``
+#: (the UNKNOWN outcome). ``session`` is the clamped fetch end ``_as_of_fetch_end()`` returns (the
+#: simulated bar's day in a backtest), so a later session can never serve an earlier decision or
+#: vice versa. LIVE, where that is None by design, is never memoised (see ``_finished_measure``). Only the history part is memoised: the CURRENT price is read fresh on every
+#: evaluation, never cached. Bounded LRU; the backtest engine clears it between runs (next to
+#: ``reset_benchmark_regime``). The code path is identical live and in a backtest.
+_FINISHED_MEASURE_MEMO: "OrderedDict" = OrderedDict()
+_FINISHED_MEASURE_MEMO_MAX = 8192
+_FINISHED_MEASURE_MEMO_LOCK = threading.Lock()
+FINISHED_MEASURE_STATS = {"evaluations": 0, "computations": 0}
+#: Test/diagnostic switch: False bypasses the memo entirely (the uncached path).
+FINISHED_MEASURE_MEMO_ENABLED = True
+
+
+def reset_finished_measure_memo() -> None:
+    """Clear the memo and counters. Call between runs so one trial cannot inherit another's values."""
+    with _FINISHED_MEASURE_MEMO_LOCK:
+        _FINISHED_MEASURE_MEMO.clear()
+        FINISHED_MEASURE_STATS["evaluations"] = 0
+        FINISHED_MEASURE_STATS["computations"] = 0
+
+
+def _wall_today() -> date:
+    """The live "today" of a condition, read through the evaluation-clock seam.
+
+    No capture context (production, an unrecorded pass): exactly ``date.today()``. Under capture
+    the instant is a ``replay_now()`` read (recorded in order; the recorded read in replay) and the
+    date is its LOCAL calendar day -- the same day ``date.today()`` names, so recording changes no
+    decision. UNDER REPLAY the day is the calendar day of the recorded instant in the RECORDING
+    host's timezone (``branch_flags["host_timezone"]`` of the pass), not the replaying host's: the
+    same recording must name the same day on any machine. A replay record without a timezone is a
+    loud ``ReplayMiss``.
+    """
+    context = current_capture()
+    if context is None:
+        return date.today()
+    if context.is_replay:
+        from ba2_common.core.replay.clock import wall_today_in_recorded_timezone
+        return wall_today_in_recorded_timezone(replay_now())
+    return replay_now().astimezone().date()
 
 
 def _is_missing(value) -> bool:
@@ -412,6 +464,40 @@ class TradeCondition(ABC):
             return None, True
         return datetime.combine(as_of, _time.max, tzinfo=timezone.utc), True
 
+    def _finished_measure(self, measure: str, lookback_days: int, compute):
+        """``(value, ok)``: ``compute(df)`` over the clamped daily OHLCV frame, memoised per
+        (provider, symbol, measure, lookback, session).
+
+        ``compute`` returns a float, or ``None`` for UNKNOWN (it logs why). ``ok`` is False only when
+        the simulated clock is unreadable (nothing is fetched). A raised exception is NOT memoised.
+        The price part of a condition never goes through here."""
+        end_date, clock_ok = self._as_of_fetch_end()
+        if not clock_ok:
+            return None, False
+        provider = _get_provider("ohlcv", "yfinance")
+        # LIVE (end_date None) IS NEVER MEMOISED: the live frame is whatever the provider returns
+        # now, so a transient empty answer would stay UNKNOWN for the whole day and a frame that
+        # moves intraday would be frozen at its first read. Only a CLAMPED session is a pure
+        # function of (symbol, session), which is the backtest/GA case the memo exists for.
+        memoise = FINISHED_MEASURE_MEMO_ENABLED and end_date is not None
+        key = (id(provider), self.instrument_name, measure, lookback_days, end_date)
+        FINISHED_MEASURE_STATS["evaluations"] += 1
+        if memoise:
+            with _FINISHED_MEASURE_MEMO_LOCK:
+                if key in _FINISHED_MEASURE_MEMO:
+                    _FINISHED_MEASURE_MEMO.move_to_end(key)
+                    return _FINISHED_MEASURE_MEMO[key], True
+        FINISHED_MEASURE_STATS["computations"] += 1
+        df = provider.get_ohlcv_data(self.instrument_name, interval="1d", end_date=end_date,
+                                     lookback_days=lookback_days)
+        value = compute(df)
+        if memoise:
+            with _FINISHED_MEASURE_MEMO_LOCK:
+                _FINISHED_MEASURE_MEMO[key] = value
+                while len(_FINISHED_MEASURE_MEMO) > _FINISHED_MEASURE_MEMO_MAX:
+                    _FINISHED_MEASURE_MEMO.popitem(last=False)
+        return value, True
+
     def _evaluation_date(self) -> Optional[date]:
         """The condition's "today" as a concrete ``date``, or ``None`` when unmeasurable.
 
@@ -427,7 +513,9 @@ class TradeCondition(ABC):
         as_of = self._simulated_as_of_date()
         if as_of is AS_OF_UNAVAILABLE:
             return None
-        return date.today() if as_of is None else as_of
+        if as_of is not None:
+            return as_of
+        return _wall_today()
 
 
     def has_expert_position(self) -> bool:
@@ -2252,7 +2340,7 @@ class DaysOpenedCondition(CompareCondition):
 
             # Sim-aware "now": the recommendation's as-of bar in a backtest, wall-clock
             # in live. Falls back to wall-clock only if no recommendation timestamp.
-            now = getattr(self.expert_recommendation, "created_at", None) or datetime.now(timezone.utc)
+            now = getattr(self.expert_recommendation, "created_at", None) or replay_now()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
 
@@ -2312,7 +2400,7 @@ class DaysSinceLastCloseCondition(CompareCondition):
             from ba2_common.core.trade_repository import get_trade_repository
 
             expert_id = getattr(self.expert_recommendation, "instance_id", None)
-            now = getattr(self.expert_recommendation, "created_at", None) or datetime.now(timezone.utc)
+            now = getattr(self.expert_recommendation, "created_at", None) or replay_now()
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
 
@@ -2516,25 +2604,21 @@ class PercentBelowRecentHighCondition(CompareCondition):
             # MemoizedOHLCVProvider — which discards lookback_days — returns the ENTIRE
             # [start - warmup, run end] window, so tail(RECENT_WINDOW) below was the high of
             # the last 20 days of the whole RUN: a number out of the simulated future that
-            # fabricates dips that never happened. None in live (unchanged call).
-            end_date, clock_ok = self._as_of_fetch_end()
-            if not clock_ok:
-                self.calculated_value = None
-                return False
+            # fabricates dips that never happened. ``_finished_measure`` clamps the fetch
+            # (``_as_of_fetch_end``) and memoises the high per symbol per session.
+            def _high(df):
+                if df is None or df.empty:
+                    logger.warning(f"No OHLCV data for {self.instrument_name}")
+                    return None
+                high = float(df.tail(self.RECENT_WINDOW)["High"].max())
+                if high <= 0:
+                    logger.warning(f"Invalid recent high for {self.instrument_name}: {high}")
+                    return None
+                return high
 
-            # Resolve the OHLCV provider via the host-injected resolver
-            # (ba2_common never imports ba2_providers).
-            df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d", end_date=end_date,
-                lookback_days=self.RECENT_WINDOW * 2 + 10)
-            if df is None or df.empty:
-                logger.warning(f"No OHLCV data for {self.instrument_name}")
-                self.calculated_value = None
-                return False
-
-            recent_high = float(df.tail(self.RECENT_WINDOW)["High"].max())
-            if recent_high <= 0:
-                logger.warning(f"Invalid recent high for {self.instrument_name}: {recent_high}")
+            recent_high, clock_ok = self._finished_measure(
+                f"high{self.RECENT_WINDOW}", self.RECENT_WINDOW * 2 + 10, _high)
+            if not clock_ok or recent_high is None:
                 self.calculated_value = None
                 return False
 
@@ -2556,6 +2640,142 @@ class PercentBelowRecentHighCondition(CompareCondition):
     def get_description(self) -> str:
         return (f"Check if {self.instrument_name} is {self.operator_str} {self.value}% "
                 f"below its recent {self.RECENT_WINDOW}-day high")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class _PullbackHistoryCondition(CompareCondition):
+    """Base of the pullback entry gates (goal2027 design 2026-11-10, part 3): reads the FINISHED
+    daily closes through the clamped OHLCV provider (``_as_of_fetch_end``, as
+    ``PercentBelowRecentHighCondition``) and "now" from the ACCOUNT price, never from a bar.
+
+    Missing or too-short history, a corrupt close or an unreadable clock leave
+    ``calculated_value`` None and the condition False for every operator (UNKNOWN, never a
+    default value).
+    """
+
+    #: Closes the measurement needs, and the calendar-day fetch that covers them with margin.
+    MIN_CLOSES = 0
+    LOOKBACK_DAYS = 0
+
+    def _finished_close_measure(self, measure: str, compute_from_closes):
+        """``(value, ok)`` of ``compute_from_closes(closes)`` over the finished daily closes,
+        memoised per symbol per session (``_finished_measure``). ``value`` None = UNKNOWN."""
+        def _compute(df):
+            if df is None or df.empty or "Close" not in df:
+                logger.warning(f"No OHLCV data for {self.instrument_name}")
+                return None
+            closes = df["Close"].to_numpy(dtype=float)
+            if len(closes) < self.MIN_CLOSES:
+                logger.warning(f"Only {len(closes)} finished daily closes for {self.instrument_name}; "
+                               f"{type(self).__name__} needs {self.MIN_CLOSES}")
+                return None
+            if not np.isfinite(closes).all() or (closes <= 0).any():
+                logger.warning(f"Invalid close in the history of {self.instrument_name}")
+                return None
+            return compute_from_closes(closes)
+
+        return self._finished_measure(measure, self.LOOKBACK_DAYS, _compute)
+
+
+class PullbackRsiCondition(_PullbackHistoryCondition):
+    """Wilder RSI(``PERIOD``) of the finished daily closes (shared ``ba2_common.core.rsi``).
+
+    One subclass per period (2-5): a rule leaf carries no second parameter, so the period is
+    part of the field name (``pullback_rsi_<n>``). An RSI that is undefined (no price change in
+    the whole history) is UNKNOWN.
+    """
+
+    PERIOD = 0
+    RSI_WINDOW = 100      # bound the recursion: a backtest's memoized provider ignores lookback_days
+    MIN_CLOSES = 60       # decay of the recursion's seed: 0.8**60 is negligible even at period 5
+    LOOKBACK_DAYS = 150
+
+    def evaluate(self) -> bool:
+        try:
+            def _rsi(closes):
+                try:
+                    return float(wilder_rsi(closes[-self.RSI_WINDOW:], self.PERIOD))
+                except ValueError as e:
+                    logger.warning(f"RSI({self.PERIOD}) undefined for {self.instrument_name}: {e}")
+                    return None
+
+            value, ok = self._finished_close_measure(f"rsi{self.PERIOD}w{self.RSI_WINDOW}", _rsi)
+            if not ok or value is None:
+                self.calculated_value = None
+                return False
+            self.calculated_value = value
+            logger.info(f"RSI({self.PERIOD}) for {self.instrument_name}: {self.calculated_value:.2f}")
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating pullback RSI condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the RSI({self.PERIOD}) of {self.instrument_name} is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.1f}"
+
+
+class PullbackRsi2Condition(PullbackRsiCondition):
+    PERIOD = 2
+
+
+class PullbackRsi3Condition(PullbackRsiCondition):
+    PERIOD = 3
+
+
+class PullbackRsi4Condition(PullbackRsiCondition):
+    PERIOD = 4
+
+
+class PullbackRsi5Condition(PullbackRsiCondition):
+    PERIOD = 5
+
+
+class PriceVsSma200Condition(_PullbackHistoryCondition):
+    """(current price - SMA200) / SMA200 * 100: the SMA200 is the mean of the last 200 FINISHED
+    daily closes, the price is the ACCOUNT's current price (the same call live and in a
+    backtest). Fewer than 200 closes is UNKNOWN."""
+
+    SMA_WINDOW = 200
+    MIN_CLOSES = 200
+    LOOKBACK_DAYS = 400
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+            sma, ok = self._finished_close_measure(
+                f"sma{self.SMA_WINDOW}", lambda closes: float(closes[-self.SMA_WINDOW:].mean()))
+            if not ok or sma is None:
+                self.calculated_value = None
+                return False
+            self.calculated_value = (current_price - sma) / sma * 100
+            logger.info(f"Price vs SMA200 for {self.instrument_name}: price=${current_price:.2f}, "
+                        f"sma200=${sma:.2f}, diff={self.calculated_value:+.2f}%")
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating price vs SMA200 condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} is {self.operator_str} {self.value}% "
+                f"from its 200-day average")
 
     def get_actual_value_display(self) -> Optional[str]:
         if self.calculated_value is None:
@@ -3089,8 +3309,8 @@ class DaysToEarningsCondition(CompareCondition):
     per-symbol CONSTANT (MSFT 310d, AAPL 34d, NVDA 154d on every bar), which is why the
     documented ``iv_rank<=30 and days_to_earnings<=5 -> open_straddle`` rule could never fire.
 
-    The annual estimates remain as a FALLBACK for a symbol whose calendar carries no
-    scheduled future print — degraded, not absent.
+    There is NO estimates fallback: a symbol whose calendar shows no report within the
+    knowability horizon (30 days) has "no scheduled report".
 
     Unknown is never a value: with no usable evaluation date or no upcoming earnings from
     either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
@@ -3103,10 +3323,12 @@ class DaysToEarningsCondition(CompareCondition):
     stays the answer for UNCHAINED uses: any expert, no stamp required.
     """
 
-    #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
-    #: one quarter (so a delayed print is still found) and bounded, so a stale calendar
-    #: cannot hand back a date from the far future as if it were the next one.
-    EARNINGS_HORIZON_DAYS = 200
+    #: How far past the evaluation bar a scheduled report date is VISIBLE: the knowability
+    #: horizon (``knowability.EARNINGS_ANNOUNCE_HORIZON_DAYS``, 30 days). The cached calendar
+    #: holds the realized date of every future print, but companies announce a date only
+    #: ~2-6 weeks ahead, so reading further would give a backtest dates live cannot know.
+    #: Beyond it the condition sees "no scheduled report". Same reader live and in backtest.
+    EARNINGS_HORIZON_DAYS = EARNINGS_ANNOUNCE_HORIZON_DAYS
     #: Calendar rows to pull. The provider returns rows <= end_date newest-first, so this
     #: only needs to span [bar, bar + horizon] plus a little history.
     EARNINGS_CALENDAR_PERIODS = 8
@@ -3145,28 +3367,9 @@ class DaysToEarningsCondition(CompareCondition):
             # The gate is about the EVENT, so the announcement wins when both are present.
             d = self._parse_day(row.get("report_date")) or \
                 self._parse_day(row.get("fiscal_date_ending"))
-            if d is not None and d >= as_of:
+            if d is not None and as_of <= d <= as_of + timedelta(days=self.EARNINGS_HORIZON_DAYS):
                 upcoming.append(d)
         return min(upcoming) if upcoming else None
-
-    def _next_estimate_period(self, provider, symbol: str, as_of: date):
-        """Earliest forward analyst-estimate period end on or after ``as_of``. FALLBACK ONLY:
-        FMP serves these ANNUAL regardless of the frequency argument, so the answer is a
-        fiscal year end rather than an earnings date."""
-        result = provider.get_earnings_estimates(
-            symbol, frequency="quarterly",
-            as_of_date=datetime.combine(as_of, _time.min, tzinfo=timezone.utc),
-            lookback_periods=4, format_type="dict",
-        )
-        estimates = (result or {}).get("estimates") or []
-        future = []
-        for est in estimates:
-            if not isinstance(est, dict):
-                continue
-            d = self._parse_day(est.get("fiscal_date_ending"))
-            if d is not None and d >= as_of:
-                future.append(d)
-        return min(future) if future else None
 
     def _next_earnings_date(self, symbol: str, as_of: date):
         """Best-effort next earnings date for ``symbol`` as of ``as_of``, or None.
@@ -3184,17 +3387,10 @@ class DaysToEarningsCondition(CompareCondition):
                 return None
             provider = _get_provider("fundamentals_details", "fmp")
 
-            scheduled = self._next_scheduled_report(provider, symbol, as_of)
-            if scheduled is not None:
-                return scheduled
-
-            estimated = self._next_estimate_period(provider, symbol, as_of)
-            if estimated is not None:
-                logger.info(
-                    f"No scheduled earnings report for {symbol} within "
-                    f"{self.EARNINGS_HORIZON_DAYS} days of {as_of.isoformat()}; falling back "
-                    f"to the (annual) analyst-estimate period {estimated.isoformat()}")
-            return estimated
+            # No fallback: a report beyond the knowability horizon (or none in the calendar) is
+            # "no scheduled report". The annual analyst-estimate period is a fiscal-year end,
+            # not a report date, and is not readable at a historical as_of.
+            return self._next_scheduled_report(provider, symbol, as_of)
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)
@@ -3475,6 +3671,108 @@ class EntryTagCondition(CompareCondition):
         if self.calculated_value is None:
             return None
         return f"member tag {int(self.calculated_value)}"
+
+
+class StructureShareCondition(CompareCondition):
+    """Gate a style member's ENTRY on its own share of the sleeve (plan 2026-11-06).
+
+    ``share = committed(member) / sleeve_equity * 100``; the rule passes while ``share <op>
+    value`` (the style builder authors ``<``). ANDed LAST into each member's entry rule, so it
+    only runs on candidates that passed every other gate, and a False lets the NEXT member's
+    rule be tried for the symbol (a rail refusal would not).
+
+    WHICH member: the entry tag of the rule's OWN entry action, injected by
+    ``TradeActionEvaluator._evaluate_conditions`` through :meth:`bind_event_action` (the only
+    condition with that hook; every other condition is untouched). The candidate's own size is
+    not known yet (strike/qty/max_loss are computed in ``_submit_option_order``): a member may
+    overshoot X by one entry, bounded by its sizing gene.
+
+    The arithmetic, the cache and the "unmeasurable" rule live in
+    ``OptionRiskManagement.member_share`` -- ONE function for live and backtest. UNKNOWN NEVER
+    PASSES: no member tag, no decision time, an expert that does not run the option risk manager
+    (its ``record_submitted`` charges would never reach the cache), or any unmeasurable input
+    -> False and an ERROR log naming why (and the transaction). A corrupted stored tag
+    propagates (``ValueError``, not benign under BA2_ERROR_MODE=enforce).
+
+    THE CYCLE CLOCK (cache stamp). The per-cycle share cache needs ONE stamp per decision
+    cycle. No cycle-level clock is shared by live and backtest without invasive changes: in a
+    backtest every recommendation of a bar carries the bar time (``created_at=as_of``), but live
+    each symbol has its own MarketAnalysis and recommendation, created seconds apart inside
+    one TradeManager pass. So the stamp is the recommendation's ``created_at`` FLOORED TO THE
+    MINUTE in BOTH runtimes (backtest bar times are minute-aligned already, so a backtest is
+    unchanged; a live pass finishes within a minute, so its candidates share one build). A
+    mismatch only ever REBUILDS from the book and pending charges, so a pass that straddles a
+    minute boundary costs one extra build, never a wrong answer; within a minute the cache is
+    kept current by ``record_submitted``.
+    """
+
+    def __init__(self, account: AccountInterface, instrument_name: str,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
+                 existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, operator_str,
+                         float(value), existing_order)
+        self.rule_entry_tag: Optional[int] = None
+
+    def bind_event_action(self, event_action) -> None:
+        """Called by the evaluator with the EventAction this condition belongs to."""
+        from ba2_common.core.entry_tag import entry_tag_of_actions
+
+        # A rule whose entry actions disagree on the tag raises ValueError here ON PURPOSE: it is
+        # a builder bug, enforce mode wants it loud, and it aborts that rule's evaluation.
+        self.rule_entry_tag = entry_tag_of_actions(getattr(event_action, "actions", None))
+
+    def evaluate(self) -> bool:
+        self.calculated_value = None
+        try:
+            tag = self.rule_entry_tag
+            if tag is None:
+                logger.error(f"structure_share on {self.instrument_name}: the rule has no entry "
+                             f"action carrying an entry_tag, so no member's share can be "
+                             f"measured -- the condition is FALSE")
+                return False
+            rec = self.expert_recommendation
+            instance_id = getattr(rec, "instance_id", None)
+            created_at = getattr(rec, "created_at", None)
+            if instance_id is None or created_at is None:
+                logger.error(f"structure_share on {self.instrument_name}: the recommendation "
+                             f"carries no instance_id/created_at (instance_id={instance_id!r}, "
+                             f"created_at={created_at!r}) -- the condition is FALSE")
+                return False
+            as_of = created_at.replace(second=0, microsecond=0)     # the cycle clock, see class doc
+            from ba2_common.core import OptionRiskManagement as orm
+            from ba2_common.core.instance_resolver import get_instance_resolver
+
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+            if expert is None or not orm.option_risk_manager_enabled(
+                    getattr(expert, "settings", None), expert_instance_id=instance_id):
+                logger.error(f"structure_share on {self.instrument_name}: expert {instance_id} "
+                             f"does not run risk_manager_mode='classic_options', so in-flight "
+                             f"entries are never recorded and a share cannot be kept -- the "
+                             f"condition is FALSE")
+                return False
+            reading = orm.member_share(self.account, instance_id, tag, as_of)
+            if reading.share_pct is None:
+                logger.error(f"structure_share on {self.instrument_name}: member {tag}'s share "
+                             f"is UNMEASURABLE ({'; '.join(reading.unmeasurable)}) -- the "
+                             f"condition is FALSE, never read as zero")
+                return False
+            self.calculated_value = reading.share_pct
+            return self.operator_func(reading.share_pct, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating structure_share condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the member's committed capital as a share of the sleeve for "
+                f"{self.instrument_name}'s entry (structure_share) is {self.operator_str} "
+                f"{self.value:g}%")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"member {self.rule_entry_tag}: {self.calculated_value:.1f}% of sleeve"
 
 
 class DaysToExpiryCondition(CompareCondition):
@@ -4656,6 +4954,11 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
     ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
     ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
+    ExpertEventType.N_PULLBACK_RSI_2: PullbackRsi2Condition,
+    ExpertEventType.N_PULLBACK_RSI_3: PullbackRsi3Condition,
+    ExpertEventType.N_PULLBACK_RSI_4: PullbackRsi4Condition,
+    ExpertEventType.N_PULLBACK_RSI_5: PullbackRsi5Condition,
+    ExpertEventType.N_PRICE_VS_SMA200_PERCENT: PriceVsSma200Condition,
     ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
     ExpertEventType.N_IV_RANK: IVRankCondition,
     ExpertEventType.N_RELATIVE_VOLUME: RelativeVolumeCondition,
@@ -4664,6 +4967,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_ENTRY_TAG: EntryTagCondition,
+    ExpertEventType.N_STRUCTURE_SHARE: StructureShareCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
     ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY: CoveredCallDaysToExpiryCondition,

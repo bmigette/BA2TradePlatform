@@ -759,7 +759,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             factors[name] = self._compute_factor(
                 name, fetch_name, calc, universe, as_of=as_of,
                 pead_drift_window_days=pead_window, ohlcv_provider=ohlcv_provider,
-                price_as_of=(price_as_of if name == "value" else None))
+                price_as_of=(price_as_of if name == "value" else None),
+                providers=providers)
 
         holdings = self._gather_holdings() if universe else []
         return {
@@ -862,7 +863,7 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
 
     def _compute_factor(self, name, fetch_name, calc, universe, as_of=None,
                         pead_drift_window_days=None, ohlcv_provider=None,
-                        price_as_of=None) -> Dict[str, float]:
+                        price_as_of=None, providers=None) -> Dict[str, float]:
         """Fetch a factor's inputs in bulk and run its calculator.
 
         The fetcher is looked up on the ``data`` module at call time so it stays
@@ -890,6 +891,10 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         # an OHLCV fetch so FactorRanker holds no per-symbol price series in memory.
         if price_as_of is not None and _accepts_kwarg(fetcher, "price_as_of"):
             fetch_kwargs["price_as_of"] = price_as_of
+        # The bundle's routed fundamentals_details() (FMP statements, estimates from the run's/live source).
+        # Resolved only for a fetcher that takes it (a patched/mock fetcher without the kwarg is unchanged).
+        if providers is not None and _accepts_kwarg(fetcher, "details"):
+            fetch_kwargs["details"] = providers.fundamentals_details()
         inputs = fetcher(universe, **fetch_kwargs)
         if name == "pead":
             if pead_drift_window_days is None:

@@ -116,9 +116,15 @@ class TransactionHelper:
           (side opposite to the transaction side)
         - not already reconciled (idempotent via ``order.data['partial_fill_reconciled']``)
 
-        Effect: transaction.quantity -= filled_qty (audit note in meta_data); active
-        dependent TP/SL orders are resynced via adjust-like logic; a fully-consumed
-        transaction is marked CLOSED at the order's average fill price.
+        Effect (audit note in meta_data either way):
+        - partial (filled < quantity): transaction.quantity -= filled_qty; inactive
+          dependent TP/SL orders are resized to the remainder. The trim's own P&L is
+          not booked (known limitation).
+        - fully consumed: closed via ``close_transaction_with_logging`` at the order's
+          average fill price (``open_price``), quantity kept at the consumed size so the
+          realised P&L is measured; unsent dependents are retired (CLOSED). With no
+          average fill price it is NOT closed: an ERROR is logged and False returned
+          without the idempotency flag, so a later refresh can complete it.
 
         Returns True when a reconciliation was applied.
         """
@@ -145,8 +151,26 @@ class TransactionHelper:
 
                 old_qty = float(txn.quantity or 0)
                 new_qty = max(0.0, old_qty - filled)
-                fill_price = db_order.open_price or db_order.stop_price or db_order.limit_price
+                consumes_position = new_qty <= 0
                 symbol, txn_id = db_order.symbol, txn.id
+
+                if consumes_position:
+                    # The close price of a CLOSED transaction is what its realised P&L is
+                    # booked at, so only the order's real average fill price may become it.
+                    # A stop/limit price never traded. Leave everything untouched (no
+                    # idempotency flag) so a later refresh carrying the fill price completes it.
+                    if db_order.open_price is None:
+                        logger.error(
+                            f"reconcile_canceled_partial_fill: order {order_id} ({symbol}) filled "
+                            f"{filled} before cancel, consuming transaction {txn_id} "
+                            f"(qty {old_qty}), but carries no average fill price; NOT closing "
+                            f"the transaction at an invented price. It stays OPENED until a "
+                            f"refresh supplies the fill price.")
+                        return False
+                    fill_price = db_order.open_price
+                else:
+                    # Audit note only: a partial reduction books no close price.
+                    fill_price = db_order.open_price or db_order.stop_price or db_order.limit_price
 
                 meta = dict(txn.meta_data or {})
                 notes = list(meta.get("partial_fill_reconciliations") or [])
@@ -161,13 +185,24 @@ class TransactionHelper:
                 })
                 meta["partial_fill_reconciliations"] = notes
                 txn.meta_data = meta
-                txn.quantity = new_qty
 
-                if new_qty <= 0:
-                    txn.status = TransactionStatus.CLOSED
+                if consumes_position:
+                    # quantity is KEPT at the size this fill consumed, as every other
+                    # close keeps it (refresh_transactions never writes a flat 0 back):
+                    # calculate_transaction_pnl multiplies by it, so zeroing it booked the
+                    # close at P&L 0.0. Closed through the shared helper for the standard
+                    # status/close_date/activity-log bookkeeping (it does not commit).
                     txn.close_price = fill_price
-                    txn.close_date = datetime.now(timezone.utc)
-                    txn.close_reason = "partial fill on canceled order consumed position"
+                    from ba2_common.core.utils import close_transaction_with_logging
+                    close_transaction_with_logging(
+                        transaction=txn,
+                        account_id=db_order.account_id,
+                        close_reason="partial fill on canceled order consumed position",
+                        session=session,
+                        additional_data={"order_id": order_id, "filled_qty": filled},
+                    )
+                else:
+                    txn.quantity = new_qty
                 session.add(txn)
 
                 # Resync still-inactive dependent TP/SL orders (PENDING/WAITING_TRIGGER,
@@ -178,6 +213,18 @@ class TransactionHelper:
                 )).all()
                 for dep in dependents:
                     if dep.depends_on_order is None:
+                        continue
+                    if consumes_position:
+                        # Nothing is left to protect or sell: retire every never-sent
+                        # dependent (fixed_quantity ones too) the way
+                        # AccountInterface.close_transaction retires unsent orders.
+                        if dep.status in OrderStatus.get_unsent_statuses():
+                            logger.info(
+                                f"reconcile_canceled_partial_fill: closing unsent dependent "
+                                f"order {dep.id} ({dep.status.value}); transaction {txn_id} "
+                                f"position consumed")
+                            dep.status = OrderStatus.CLOSED
+                            session.add(dep)
                         continue
                     if (dep.data or {}).get("fixed_quantity"):
                         continue
@@ -200,7 +247,7 @@ class TransactionHelper:
             logger.warning(
                 f"Reconciled canceled partial fill: order {order_id} ({symbol}) filled "
                 f"{filled} before cancel; transaction {txn_id} qty {old_qty} -> {new_qty}"
-                + (" (transaction CLOSED)" if new_qty <= 0 else ""))
+                + (f" (transaction CLOSED at {fill_price})" if consumes_position else ""))
             return True
 
         except Exception as e:
@@ -397,7 +444,7 @@ class TransactionHelper:
         of the entry-side orders ever sent (``_recalculate_transaction_quantity``), so a trim
         never lowers it, and an add raises it before the add has filled. This is:
 
-            net filled quantity (every executed order, BUY +, SELL -)
+            net filled quantity (every executed order, and the partial fill of a CANCELED/EXPIRED one; BUY +, SELL -)
           + the unfilled remainder of every working order that is NOT resting protection
             (an add, a trim, a close someone submitted), signed the same way
 
@@ -411,6 +458,7 @@ class TransactionHelper:
         ``orders``: the transaction's orders (any status).
         """
         executed = OrderStatus.get_executed_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
         working = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
                    | {OrderStatus.PARTIALLY_FILLED})
         net = 0.0
@@ -421,6 +469,12 @@ class TransactionHelper:
                     raise ValueError(
                         f"transaction {transaction.id}: order {order.id} is {order.status} with "
                         f"no filled_qty -- the position size is unmeasurable")
+                net += sign * float(order.filled_qty)
+            elif order.status in terminal and order.filled_qty:
+                # CANCELED/EXPIRED after a PARTIAL fill: those shares traded (dev 2026-11-10
+                # NVDA txn 95, PRG 2026-10-28). Skipping them sized the replacement stop on the
+                # pre-fill position and the broker refused it. Same rule as
+                # Transaction.get_current_open_qty.
                 net += sign * float(order.filled_qty)
             if order.status in working and not TransactionHelper.is_resting_protection(order):
                 if order.quantity is None or (order.status == OrderStatus.PARTIALLY_FILLED

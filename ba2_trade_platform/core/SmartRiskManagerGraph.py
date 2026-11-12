@@ -39,7 +39,9 @@ from .models import SmartRiskManagerJob, MarketAnalysis, Transaction
 from .types import MarketAnalysisStatus
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
-from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
+from .SmartRiskManagerToolkit import (
+    PRICE_UNAVAILABLE, SmartRiskManagerToolkit, position_price_unavailable,
+)
 from .utils import get_expert_instance_from_id
 
 
@@ -392,6 +394,25 @@ def _build_locked_symbols_section(
         return ""
 
 
+def _normalise_transaction_id(value: Any) -> Optional[int]:
+    """A recommended action's transaction_id as an int, or None when it is not a whole number.
+
+    The model may emit 12, "12" or 12.0 for the same transaction; grouping on the raw value
+    made those separate keys (two broker calls, no combining). A value that is not a whole
+    number (12.5, "abc", True) is NOT coerced: None leaves the action ungrouped, and it then
+    fails by name when executed.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _build_positions_summary(open_positions: List[Dict[str, Any]]) -> str:
     """
     Build a clear, prominent summary of open positions with valid transaction IDs.
@@ -420,13 +441,17 @@ def _build_positions_summary(open_positions: List[Dict[str, Any]]) -> str:
 
         # Build price info string
         price_info = ""
-        if current_price:
+        if position_price_unavailable(pos):
+            price_info += f" @ {PRICE_UNAVAILABLE}"
+        else:
             price_info += f" @ ${current_price:.2f}"
         if entry_price:
             price_info += f" | Entry: ${entry_price:.2f}"
         if pnl_pct is not None:
             sign = "+" if pnl_pct >= 0 else ""
             price_info += f" | P&L: {sign}{pnl_pct:.1f}%"
+        else:
+            price_info += f" | P&L: UNKNOWN (do NOT assume 0%)"
 
         # Build SL/TP info
         sl_order = pos.get('sl_order')
@@ -848,8 +873,12 @@ FILLED Positions (Live Trades - {num_open_positions} total):
         valid_transaction_ids = []
         for pos in state["open_positions"]:
             valid_transaction_ids.append(str(pos['transaction_id']))
-            portfolio_summary += f"\n- Transaction #{pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ${pos['current_price']:.2f}"
-            portfolio_summary += f" | P&L: {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:.2f})"
+            if position_price_unavailable(pos):
+                portfolio_summary += f"\n- Transaction #{pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ⚠️ {PRICE_UNAVAILABLE}"
+                portfolio_summary += f" | P&L: UNKNOWN (live price unavailable - do NOT assume 0%)"
+            else:
+                portfolio_summary += f"\n- Transaction #{pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ${pos['current_price']:.2f}"
+                portfolio_summary += f" | P&L: {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:.2f})"
             
             # Show SL/TP status explicitly
             sl_order = pos.get("sl_order")
@@ -864,7 +893,10 @@ FILLED Positions (Live Trades - {num_open_positions} total):
                 portfolio_summary += f" | TP: ${tp_order['price']:.2f}"
             else:
                 portfolio_summary += f" | NO TAKE PROFIT"
-        
+
+        if portfolio_status.get('totals_partial'):
+            portfolio_summary += f"\n⚠️ Portfolio totals are {portfolio_status['totals_note']}"
+
         # Add pending positions if any
         pending_positions = portfolio_status.get('pending_positions', [])
         if pending_positions:
@@ -1377,23 +1409,58 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Initialize actions log and detailed reports
         actions_log = state["actions_log"].copy()
         detailed_action_reports = []
-        
+        superseded_notes = []  # same-type duplicates replaced by a later action (not executed)
+
         # OPTIMIZATION: Group TP/SL actions by transaction_id to combine them into single adjust_tp_sl calls
         tp_sl_grouped_actions = {}  # transaction_id -> {"tp_action": action, "sl_action": action}
         other_actions = []
-        
+
         for action in recommended_actions:
             action_type = action.get("action_type")
             if action_type in ["update_stop_loss", "update_take_profit"]:
-                transaction_id = action.get("parameters", {}).get("transaction_id")
+                raw_transaction_id = action.get("parameters", {}).get("transaction_id")
+                # Normalise so "12" and 12 are ONE key (and one broker call), not two.
+                transaction_id = _normalise_transaction_id(raw_transaction_id)
                 if transaction_id:
+                    action = {**action, "parameters": {**action["parameters"],
+                                                       "transaction_id": transaction_id}}
                     if transaction_id not in tp_sl_grouped_actions:
                         tp_sl_grouped_actions[transaction_id] = {"tp_action": None, "sl_action": None}
-                    
-                    if action_type == "update_take_profit":
-                        tp_sl_grouped_actions[transaction_id]["tp_action"] = action
-                    else:  # update_stop_loss
-                        tp_sl_grouped_actions[transaction_id]["sl_action"] = action
+
+                    slot = "tp_action" if action_type == "update_take_profit" else "sl_action"
+                    superseded = tp_sl_grouped_actions[transaction_id][slot]
+                    if superseded is not None:
+                        # The LATER action of the same type wins (unchanged); the earlier one is
+                        # not executed -- say so loudly and record it, never drop it silently.
+                        logger.warning(
+                            f"Superseded {action_type} for transaction #{transaction_id}: "
+                            f"{superseded.get('parameters')} is replaced by the later "
+                            f"{action.get('parameters')} and will NOT be executed")
+                        superseded_params = superseded.get("parameters", {})
+                        actions_log.append({
+                            "iteration": state["iteration_count"],
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "action_type": action_type,
+                            "arguments": superseded_params,
+                            "reason": superseded.get("reason", "Recommended by research node"),
+                            "confidence": superseded.get("confidence", 0),
+                            "source": "research_node_recommendation",
+                            "superseded": True,
+                            "success": False,
+                            "result": {
+                                "success": False,
+                                "superseded": True,
+                                "message": (f"Not executed: superseded by a later {action_type} for "
+                                            f"transaction #{transaction_id} ({action.get('parameters')})"),
+                            },
+                            "summary": (f"Superseded (not executed): {action_type} for transaction "
+                                        f"#{transaction_id} {superseded_params} was replaced by a later "
+                                        f"{action_type} {action.get('parameters')}"),
+                        })
+                        superseded_notes.append(
+                            f"- {action_type}: superseded (not executed) for transaction "
+                            f"#{transaction_id}: {superseded_params} replaced by {action.get('parameters')}")
+                    tp_sl_grouped_actions[transaction_id][slot] = action
                 else:
                     # No transaction_id, treat as regular action
                     other_actions.append(action)
@@ -1498,31 +1565,14 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     new_tp_price = parameters["new_tp_price"]
                     new_sl_price = parameters["new_sl_price"]
 
-                    # Get transaction for adjust_tp_sl call
+                    # Validate transaction exists (same pre-check as the single actions)
                     with get_db() as session:
                         transaction = session.get(Transaction, transaction_id)
                         if transaction:
-                            result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price, source="smart_risk_manager")
-
-                            if result:
-                                # Create success result dict matching other action formats
-                                result = {
-                                    "success": True,
-                                    "message": f"Updated both TP to ${new_tp_price:.2f} and SL to ${new_sl_price:.2f}",
-                                    "transaction_id": transaction_id,
-                                    "old_tp_price": transaction.take_profit,
-                                    "new_tp_price": new_tp_price,
-                                    "old_sl_price": transaction.stop_loss,
-                                    "new_sl_price": new_sl_price
-                                }
-                                logger.info(f"Successfully updated both TP and SL for transaction {transaction_id}")
-                            else:
-                                result = {
-                                    "success": False,
-                                    "message": f"Failed to update TP/SL for transaction {transaction_id} - likely entry order not yet filled",
-                                    "transaction_id": transaction_id
-                                }
-                                logger.warning(f"Failed to update TP/SL for transaction {transaction_id}")
+                            # The toolkit runs the SAME checks as update_stop_loss /
+                            # update_take_profit (ownership, status, live price, side of each
+                            # price) and only then makes the single combined broker call.
+                            result = toolkit.update_tp_sl(transaction_id, new_tp_price, new_sl_price, reason)
                         else:
                             result = {
                                 "success": False,
@@ -1663,7 +1713,10 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                 summary_lines.append(f"- {tool_label}: success={res.get('success', 'unknown')}, {res.get('message', 'no message')}")
             else:
                 summary_lines.append(f"- {tool_label}: error={r.get('error', 'unknown error')}")
-        
+        if superseded_notes:
+            summary_lines.append(f"Superseded {len(superseded_notes)} duplicate recommendation(s) (NOT executed):")
+            summary_lines.extend(superseded_notes)
+
         actions_summary = "\n".join(summary_lines)
         
         # Refresh portfolio status after actions
@@ -1947,15 +2000,19 @@ class SmartRiskManagerGraph:
                 Dictionary with:
                     - account_virtual_equity: Total portfolio value
                     - account_available_balance: Cash available for new positions
-                    - filled_positions: List of open positions
+                    - filled_positions: List of open positions (a position whose live price
+                      is unavailable has current_price/P&L/value None, price_available False
+                      and a price_status saying PRICE UNAVAILABLE -- its P&L is unknown, not 0)
                     - pending_positions: List of pending positions
+                    - price_unavailable_positions: positions listed without a live price
             """
             portfolio = self.toolkit.get_portfolio_status()
             return {
                 "account_virtual_equity": portfolio["account_virtual_equity"],
                 "account_available_balance": portfolio["account_available_balance"],
                 "filled_positions": portfolio["open_positions"],
-                "pending_positions": portfolio.get("pending_positions", [])
+                "pending_positions": portfolio.get("pending_positions", []),
+                "price_unavailable_positions": portfolio["price_unavailable_positions"]
             }
         
         @tool

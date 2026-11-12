@@ -260,3 +260,50 @@ def test_persist_applies_the_rebase_after_the_window(L, monkeypatch):
                              data_rebase=_spec_dict(static_universe=["AAPL", "NEW"]))
     assert rebased == [("2026-01-01", "2026-12-31")]
     assert seen and seen[0]["enabled_instruments"] == ["AAPL", "NEW"]
+
+
+# ---- a screener job's static universe follows the TEST window (2026-11-10: every goal2027 phase-A cell failed its
+# out-of-sample re-run on "candidates but have no bars in this run's price source": names listed after the train window)
+
+def _screener_block(**kw):
+    from ba2_providers.screener import universe_superset as us
+    b = {"start_date": "2024-01-01", "end_date": "2024-12-31", "enabled_instruments": ["AAPL", "OLD"],
+         "excluded_instruments": [], "screener_opt": {"store": "s"}, "screener_universe_rule": us.RULE_ID}
+    b.update(kw)
+    return b
+
+
+def test_test_window_universe_is_recomputed_for_a_superset_screener_block(L, monkeypatch, capsys):
+    from app.services.backtest import rerun_handler as rh
+    calls = []
+
+    def fake(block, ranges, *, row_id=None):
+        calls.append((block["start_date"], block["end_date"], ranges))
+        return {**block, "enabled_instruments": ["AAPL", "NEW"], "excluded_instruments": ["GONE"],
+                "_universe_recompute_note": {"static_universe_size": 2, "previous_size": 2, "computed_size": 3,
+                                             "excluded_for_missing_cache": ["GONE"], "criteria_version": None}}
+    monkeypatch.setattr(rh, "recompute_static_universe", fake)
+    out = L._test_window_static_universe(_screener_block(), {"screener:x": 1}, 7, "WF1-OOS-R")
+    assert calls == [("2024-01-01", "2024-12-31", {"screener:x": 1})]
+    assert out["enabled_instruments"] == ["AAPL", "NEW"]
+    said = capsys.readouterr().out
+    assert "recomputed for the test window 2024-01-01..2024-12-31" in said
+    assert "EXCLUDED" in said and "GONE" in said               # an uncached name is dropped LOUDLY, by name
+
+
+def test_test_window_universe_leaves_static_and_legacy_blocks_alone(L, monkeypatch):
+    from app.services.backtest import rerun_handler as rh
+    monkeypatch.setattr(rh, "recompute_static_universe",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not recompute")))
+    static = {"start_date": "2024-01-01", "end_date": "2024-12-31", "enabled_instruments": ["AAPL"]}
+    assert L._test_window_static_universe(static, {}, 1, "WF1-OOS-R") is static
+    legacy = _screener_block(screener_universe_rule=None)
+    assert L._test_window_static_universe(legacy, {}, 1, "WF1-OOS-R") is legacy
+
+
+def test_persist_recomputes_the_universe_only_under_a_window_override(L, monkeypatch):
+    import inspect
+    src = inspect.getsource(L._persist_top_backtests)
+    assert "if window is not None:\n            bt_block = _test_window_static_universe(" in src
+    # after the rebase: the rebase's exclusions must be in the block the superset is computed from
+    assert src.index("_rebase_run_data(bt_block, data_rebase)") < src.index("_test_window_static_universe(")

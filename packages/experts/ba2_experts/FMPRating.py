@@ -18,6 +18,7 @@ from ba2_common.core.replay import observe_provider, record_branch_flag, replay_
 from ba2_common.core.provider_utils import parse_provider_date
 from ba2_common.core.knowability import intraday_decision_clock, published_known
 from ba2_common.logger import get_expert_logger
+from ba2_experts.price_target_basis import log_skipped_unadjusted, split_adjusted_target
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_providers.fmp_common import fmp_http_get, FMPError, TTLCache, fmp_history_disk_cached
@@ -339,7 +340,7 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
             # (``publishedDate`` carries a UTC timestamp) is not yet public.
             if intraday_decision_clock() and not published_known(r.get("publishedDate"), ref_date):
                 continue
-            if r.get("priceTarget") is not None:
+            if split_adjusted_target(r) is not None:
                 n += 1
         return n
 
@@ -414,12 +415,15 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
             # price-target history over the trailing quarter. Copy the cached consensus
             # dict before annotating so the shared TTLCache entry is never mutated.
             if consensus_data is not None:
-                consensus_data = dict(consensus_data)
                 pt_history = self._fetch_price_target_history(symbol)
                 # replay_now(as_of): the wall clock live (as_of is None on this
                 # branch), the recorded read when replaying. Same instant, same
                 # semantics -- the evaluation clock is now observable (spec s4).
-                consensus_data["targetCount"] = self._count_targets_in_window(
+                # SPLIT BASIS (live): FMP's consensus endpoint is a vendor snapshot that can mix
+                # pre- and post-split targets after a recent split, so the targets are rebuilt
+                # from the dated rows by the SAME function the backtest uses (split-adjusted
+                # per row, trailing quarter). The endpoint remains the coverage gate.
+                consensus_data = self._consensus_target_as_of(
                     pt_history, replay_now(as_of), _QUARTER_DAYS)
             current_price = self._get_current_price(symbol)
         else:
@@ -692,9 +696,14 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         Returns ``None`` when no row qualifies (no coverage as-of that date)."""
         if not grades_history:
             return None
+        # INTRADAY clock: same knowability rule as the price-target and per-grade paths -- a
+        # bare-date row is public from the NEXT session (cache rows are monthly snapshots dated
+        # the 1st), so on the decision day itself the previous snapshot is still the latest.
+        _intraday = intraday_decision_clock()
         eligible = [
             r for r in grades_history
             if (d := _memo_provider_date(r, "date")) is not None and d <= as_of
+            and (not _intraday or published_known(r.get("date"), as_of))
         ]
         if not eligible:
             return None
@@ -728,19 +737,21 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         from datetime import timedelta
         floor = as_of - timedelta(days=int(window_days))
         targets = []
+        skipped = 0
         for r in price_target_history:
             d = _memo_provider_date(r, "publishedDate")
             if d is None or d > as_of or d < floor:
                 continue
             if intraday_decision_clock() and not published_known(r.get("publishedDate"), as_of):
                 continue
-            pt = r.get("priceTarget")
+            # SPLIT BASIS: adjPriceTarget is on today's basis like every price we compare to;
+            # priceTarget is the as-published (unsplit) figure. See price_target_basis.
+            pt = split_adjusted_target(r)
             if pt is None:
+                skipped += 1
                 continue
-            try:
-                targets.append(float(pt))
-            except (TypeError, ValueError):
-                continue
+            targets.append(pt)
+        log_skipped_unadjusted("FMPRating._consensus_target_as_of", skipped)
         if not targets:
             return None
         targets_sorted = sorted(targets)
@@ -1142,7 +1153,7 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             for r in recent:
                 company = r.get("analystCompany") or r.get("analystName") or "?"
                 parts.append(f"| {_ds(r, 'publishedDate')} | {company} | "
-                             f"{_money(r.get('priceTarget'))} | {_money(r.get('priceWhenPosted'))} |")
+                             f"{_money(r.get('adjPriceTarget'))} | {_money(r.get('priceWhenPosted'))} |")
             parts.append("")
         return "\n".join(parts)
 

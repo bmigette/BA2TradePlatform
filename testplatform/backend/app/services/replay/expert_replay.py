@@ -34,6 +34,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay import (
     AnalysisRecord,
     CaptureContext,
@@ -48,6 +49,7 @@ from ba2_common.core.types import Recommendation
 from ba2_common.logger import logger
 
 from app.services.replay.isolation import refuse, replay_isolation
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import AnalysisResult, ReplayReport, merge_coverage
 
 __all__ = [
@@ -507,12 +509,11 @@ def run(bundle_dir, out_dir=None) -> ReplayReport:
     )
     with replay_isolation():
         for analysis in bundle.analyses:
+            if is_decision_pass(analysis):      # replayed by the decision capability, not as an expert
+                continue
             report.results.append(replay_analysis(bundle, analysis))
     # Running a capability IS the coverage fact, so it is written back into the
     # bundle: otherwise `replay inventory` still reports `not_run` for a
     # capability that has just been run, and the two commands disagree about the
     # same session.
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)

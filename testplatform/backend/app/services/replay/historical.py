@@ -106,6 +106,7 @@ from ba2_common.core.replay import (
     load_bundle,
 )
 from ba2_common.core.replay.codec import decode
+from ba2_common.core.replay.decision_record import is_decision_pass
 from ba2_common.core.replay.dependencies import (
     KIND_HISTORY,
     KIND_INDICATOR,
@@ -123,6 +124,7 @@ from app.services.replay.expert_replay import (
     compare_recommendations,
     compare_values,
 )
+from app.services.replay.provenance import finish_report
 from app.services.replay.report import (
     AnalysisResult,
     FieldDiff,
@@ -171,6 +173,8 @@ DS_ANALYST_KEY_FLAG = "ds_analyst_key_present"
 _HOST_BRANCH_FLAGS = frozenset({
     "use_case", "market_analysis_id", "batch_id",
     "historical", "as_of", "live_attempt_id",
+    # How the RECORDING resolved/redacted the settings; says nothing about the calculation.
+    "settings_resolution_failed", "redacted_setting_keys",
 })
 
 #: Branch flags whose value is DECIDED BY ``as_of is None``, i.e. by which of the
@@ -333,6 +337,7 @@ def _preflight(bundle: SessionBundle, analysis: AnalysisRecord, pinned: PinnedRo
                plans):
     """Either the row this analysis already earns, or the job that will produce it."""
     from ba2_common.core.replay.dependencies import adapter_for
+    from ba2_common.core.replay.settings_record import explain_missing_setting
 
     if analysis.expert_class not in SUPPORTED_EXPERTS or \
             adapter_for(analysis.expert_class) is None:
@@ -367,7 +372,8 @@ def _preflight(bundle: SessionBundle, analysis: AnalysisRecord, pinned: PinnedRo
     except MissingDependencySetting as exc:
         return AnalysisResult.for_analysis(
             analysis, ReplayStatus.COVERAGE_MISSING_CAPTURE,
-            f"the recorded settings cannot declare this expert's dependencies: {exc}")
+            "the recorded settings cannot declare this expert's dependencies: "
+            + explain_missing_setting(exc, settings, schema_version=analysis.schema_version))
 
     blocking, notes = _coverage_verdict(plan)
     if blocking:
@@ -563,6 +569,8 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
     jobs: List[_Job] = []
     plans = _PlanCache(pinned)
     for analysis in bundle.analyses:
+        if is_decision_pass(analysis):          # not an expert analysis (replayed as a decision)
+            continue
         outcome = _preflight(bundle, analysis, pinned, plans)
         if isinstance(outcome, _Job):
             jobs.append(outcome)
@@ -584,7 +592,7 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
                 bundle, job, produced.get(attempt_id),
                 child["analyses"].get(attempt_id), decoder, child["timed_out"])
 
-    results = [decided[a.attempt_id] for a in bundle.analyses]
+    results = [decided[a.attempt_id] for a in bundle.analyses if not is_decision_pass(a)]
     report = ReplayReport(
         session_id=bundle.session.session_id,
         bundle_dir=str(Path(bundle_dir)),
@@ -602,10 +610,7 @@ def _run_isolated(bundle_dir, cache_root, out_dir, timeout: Optional[float]) -> 
             "isolation": child["isolation"],
         }},
     )
-    merge_coverage(bundle_dir, report)
-    if out_dir is not None:
-        report.write(out_dir)
-    return report
+    return finish_report(report, bundle, bundle_dir, out_dir)
 
 
 def _stage_results(results: Sequence[AnalysisResult]) -> Dict[str, Dict[str, str]]:
@@ -1222,11 +1227,15 @@ def _run_one_analysis(bundle: SessionBundle, entry: Dict[str, Any], store,
             if context is None:
                 return {"ran": False, "detail": "the capture scope did not open"}
             _install_bundle_recorder(expert, context)
-            recommendation = expert.analyze_as_of(as_of, BacktestContext(
-                providers=LiveProviderBundle(get_provider),
-                settings=settings,
-                as_of=as_of,
-                extra={"symbol": entry["symbol"]}))
+            # A recorded live analysis may have used an estimate-based price-target method; the
+            # reconstruction reads the warmed snapshot and this report labels it revision_unknown.
+            from ba2_common.core.estimates_pit import estimate_snapshot_allowed
+            with estimate_snapshot_allowed():
+                recommendation = expert.analyze_as_of(as_of, BacktestContext(
+                    providers=LiveProviderBundle(get_provider),
+                    settings=settings,
+                    as_of=as_of,
+                    extra={"symbol": entry["symbol"]}))
             type(expert)._record_outcome(context, recommendation)
         outcome = {"ran": True}
     except (KeyboardInterrupt, SystemExit):

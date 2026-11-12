@@ -200,6 +200,7 @@ These are **estimates** derived from the figures above, not tested configuration
 |---|---|---|
 | ThetaData option store, local workstation | ~15.6 GB | local measurement (operator, 2026-09) |
 | ThetaData option store, remote227 (819 of the 820 large-cap names) | ~18 GB | stage-2 plan §2 |
+| Alpha Vantage option store (856 names, 2020-2026-11) | 45-80 GB, central 63 GB (**estimate**, section 4.6) | measured 55.5 B/row on AAPL/HOG |
 | FMP OHLCV cache | ~16 GB | local measurement |
 | `fmp_history` | ~8 GB | local measurement |
 | `market_conditions` | ~2 GB | local measurement |
@@ -322,6 +323,58 @@ Runs of record:
 | 2026-10-13..16 | download (`alpaca_store`) | 7,048 symbols, 0 failed, 232 refused chunks, 7.6 GB |
 | 2026-10-20 | download (`alpaca_store_daily2016`) | 11,621 symbols: 7,984 written, 3,767 empty (funds/OTC without Alpaca bars), 0 failed, 12,075 requests, 425 MB, 1 h 31 min |
 | 2026-10-20 | split-table (raw jump only) | 7,854 symbols, 1,620 events accepted, 2,311 review rows; superseded by the FMP-step run |
+
+#### 4.0.1 The DATED, survivorship-free stock universe (owner decision 2026-11-07)
+
+A symbol is eligible from its listing until its delisting. `tools/screener_store_universe.txt` (4,733 names) is today's
+listing plus 144 delisted names that happened to be in a scratch file; it misses SIVB, FRC, TWTR, ATVI, XLNX, CTXS, SPLK,
+PXD, HES, ANSS, CERN and ~1,600 more delistings of 2019-03..2026-11. **The January data rebuild MUST use the dated
+universe**, not the committed survivor file:
+
+```
+python tools/build_screener_universe.py --keys-db ~/Documents/ba2/trade/db.sqlite --account-id 1            # dry run: report only
+python tools/build_screener_universe.py --keys-db ... --account-id 1 --end <rebuild end> --write           # writes the files below
+```
+
+Output: `tools/screener_store_universe_dated.txt` (base order, additions appended sorted),
+`tools/screener_store_universe_dated.dates.tsv` (symbol, first month, **last bar = the delisting date**, source, name) and
+`<work-dir>/report.json` (counts by reason; every rejection with its detail). The work dir (`--work-dir`, default
+`~/Documents/ba2/common/cache/_universe_build`) caches every API response, so a re-run costs nothing. Cost of a cold run
+(measured 2026-11-07): ~300 Alpaca requests (assets x2, one corporate-actions call per month, batched monthly bars, batched
+last-month daily bars) and ~200 FMP profile calls. Credentials: an account's `api_key`/`api_secret` (a PAPER account is fine,
+asset list and SIP history are public) from `--keys-db`, the FMP key from its `appsetting.FMP_API_KEY`; nothing is printed.
+
+Sources and rules (full list in the tool's docstring): Alpaca inactive assets, the ACQUIREE of every cash/stock/stock-and-cash
+merger and every worthless removal in the span (Alpaca drops many dead tickers from its asset list; TWTR, ATVI, SPLK, PXD, HES
+exist only there), FMP delisted-companies page 0 (our plan returns only the newest 100), plus
+`tools/screener_universe_extra_delisted.txt` (reviewed bankruptcies with no merger record: SIVB, FRC, ...). Kept: NYSE / NASDAQ /
+AMEX common shares and ADSs. Rejected, counted by reason: ETFs and funds (FMP flag), warrants / units / rights / preferreds /
+notes (name and five-letter-series rules), OTC and ARCA/BATS rows, class-share symbols with `.`/`-`, CUSIP-like ids,
+**renames** (old side of a name change whose new symbol is listed: the rename machinery of `rename_successors.csv` carries the
+history; a successor on OTC such as RAD -> RADCQ after a bankruptcy is a delisting), **reused tickers** (two inactive assets with
+one ticker, an FMP ipoDate after the last bar, a month without any bar between first and last, FMP "actively trading" while
+Alpaca bars ended): those go to the report for a human, never guessed. Each kept name has Alpaca daily bars in the span and
+its delisting date is its last daily bar. SPAC common shares are kept (the base file holds 272 SPAC names); `--exclude-spacs`
+drops them.
+
+Rebuild order with the dated file (replaces `tools/screener_store_universe.txt` in rows 3 and 3b of 4.1 and in the Alpaca download
+and `prepare_history.py` steps): (1) download (`alpaca_history_download.py` / `prepare_history.py --steps download`,
+`--symbols-file tools/screener_store_universe_dated.txt`); (2) `split-table,build,verify` (the build writes
+`_meta/suspensions.json`: every added name must appear there as `delisted` with the same last session);
+(3) **regenerate the allow-stale list** from that `suspensions.json` (delisted events whose last bar is > 10 days before `--end`;
+the old 144-name file is far too short, expect ~1,700 names) and pass it as `--allow-stale-symbols`; (4) metric store and daily
+panel (`build-screener-metrics ... --daily-panel`): delisted names drop out of the metric store 7 calendar days after their last bar
+(`staleness_max_days`) and out of the panel from the morning after their last session (BUILD_REV 4, see below);
+(5) consistency check, no network: `python tools/build_screener_universe.py --out tools/screener_store_universe_dated.txt --check-cache
+<cache>/AlpacaHistoryOHLCVProvider/_meta/suspensions.json` (exit 1 on any added name without a matching `delisted` event).
+The snapshot of 2026-11-07 is committed for review; regenerate it in January with the rebuild's `--end`.
+
+How the backtest treats a name that delists mid-run (tests: `testplatform/backend/tests/backtest/test_suspension_liquidation.py`,
+`packages/providers/tests/test_live_sim_build.py`): the daily engine closes a held position at the last exchange close on the first
+session after the last bar (`delisting_liquidation`, a synthetic FILLED order, logged WARNING), cancels its working orders, never
+fills after the last bar and blocks re-entry; the screener panel masks the symbol from the morning after its last session (before
+BUILD_REV 4 an unreviewed delisting lingered up to 35 days as a candidate the engine then refused). **Exit price of a delisting (2026-11-07):** a worthless removal, a bankruptcy ticker (RAD -> RADCQ) or an extras-file name tagged `worthless` (SIVB, FRC, ...) liquidates at **0** (`delisting_worthless`); a cash merger at the corporate action's per-share cash (`delisting_cash_merger`); stock-for-stock mergers and unknown reasons at the last close (`delisting_liquidation`, WARNING logged, counted in `BacktestAccount.delisting_exit_counts`). The table is `<cache>/AlpacaHistoryOHLCVProvider/_meta/delisting_terminals.json`, installed after the cache rebuild with `build_screener_universe.py --out ... --install-terminals <cache>/_meta/suspensions.json` (stamped with the suspensions build; a terminal recorded for another last session is ignored). Without the file every delisting closes at the last close, as before. It is NOT covered by the gate certificate: every worker's cache must carry the same file (`cache push` after installing), or master and worker price delistings differently. A delisting within the last 5 sessions before the store's end is not yet a
+`delisted` event (build slack).
 
 ### 4.1 Equity (goal2020 and single equity backtests)
 
@@ -503,6 +556,64 @@ Measured on 2026-09-25/26 (local box, from the data runbook and the repair log):
 | Dividend calendars | 796 requests, 12.6 MB |
 | Both manifests, cold, cache-only, concurrency 1 | 45-70 min |
 
+### 4.6 Alpha Vantage option history (second store, beside ThetaData; owner decision 2026-11-07)
+
+`CACHE_FOLDER/AlphaVantageOptionsProvider/` is a SECOND parquet store with the ThetaData layout
+(`<SYM>/exp=<DATE>/<SYM>_<DATE>_1d.parquet` + `_manifest.json`), read by the same `ParquetOptionsProvider`.
+The ThetaData store is never touched; a job picks one with `--option-history-source {thetadata,alphavantage}`.
+Code: `packages/providers/ba2_providers/options/alphavantage.py` (mapping, store), downloader
+`tools/download_av_option_chains.py`. Needs the premium `alpha_vantage_api_key` AppSetting (75 calls/minute for the
+KEY, shared with `tools/backfill_av_estimates.py`).
+
+**Download.** One AV call (`HISTORICAL_OPTIONS&symbol=X&date=D`) is one end-of-day chain, so the unit is (symbol, NYSE
+session). Resumable and crash-safe: a fetched day is staged in `<SYM>/_days/` and then recorded in
+`<SYM>/_ledger.jsonl` (an empty chain is recorded too and never re-requested); staged days are compacted into the
+`exp=` partitions every 200 days, at the end of each symbol and on Ctrl-C. A failed day is not recorded: it is in the
+`--report` JSON with its reason and is retried by the next run. The API key is never printed (error text is redacted).
+
+```bash
+# the owner universe: 820 large caps + the top-100 list = 856 names, 2020-01-01 .. latest completed session
+python tools/download_av_option_chains.py --symbols-file tools/options_universe_large_cap.txt     --symbols-file tools/options_universe_top100.txt --start 2020-01-01     --db ~/Documents/ba2/test/dl_forecasting.db --calls-per-minute 70 --report av_options_report.json
+# --dry-run prints the calls still owed; --limit N is a smoke run; --root/--budget-file relocate the store/limiter
+```
+
+Rate budget: `--calls-per-minute` is this process's own cap; `--key-limit` (75) is the ceiling over every process sharing
+`--budget-file` (default `<cache>/_av_rate_budget.json`), so several downloaders coexist. `backfill_av_estimates.py` does
+NOT use the file (it sleeps ~45 calls/min on its own): while it runs pass `--calls-per-minute 25`, then restart with 70
+(resume loses nothing).
+
+**Time.** 856 names x 1,722 sessions (2020-01-02..2026-11-06) = 1,474,032 calls: 13.7 days at 75/min, 14.6 at 70/min,
+17.1 at 60/min (**estimate**; names listed after 2020 spend one call per empty session; the transfer is ~0.7 MB per call).
+
+**Disk (measured 2026-11-07 on AAPL and HOG, 3 sessions each).** AAPL 2022-03: 1,716-1,764 contracts per chain; HOG 591. Parquet
+zstd, one file: 55.5 bytes per contract-row with the greeks/size/mark columns (20.2 B AAPL / 14.5 B HOG for the 15 ThetaData-shaped
+columns alone; the five greeks are ~31 B of the 55). Tiny 3-day partitions measure ~125-155 B/row (file overhead), so the figure
+for a full store is the dense one. **Estimate**: 856 names x 1,722 sessions x 600-1,000 contracts = 0.9-1.5 G rows = **45-80 GB (central 63 GB)**,
+against ~18 GB for the ThetaData store; staged days add <1 GB transiently per symbol.
+
+**Mapping decisions** (module docstring has the evidence):
+
+| AV field | Store column | Rule |
+|---|---|---|
+| `last` | `close` | ONLY on a day the contract traded (`volume > 0` and `last > 0`), else null: AV carries a stale `last` on no-trade rows (1,841 of 9,496 NVDA 2024-05-31 contracts had volume 0 and last > 0). Same rule as ThetaData (`close > 0` iff `volume > 0`). The backtest marks a no-trade row from its quote. |
+| (none) | `open`, `high`, `low` | AV has no OHLC. Set = `close` on a traded day, else null. A `next_bar_open` fill reads `open` and refuses to fill on null, so null everywhere would make the store untradeable; the fill reference is the fill day's LAST print instead of its first (on the fill day, not look-ahead for decisions; coarser than a true open). Manifests say `ohlc: close-only`. |
+| `bid`, `ask` | `bid`, `ask` | ThetaData's `_quote` rule: ask <= 0 means no quote; bid 0 with an ask is a real "nobody bids". |
+| `volume`, `open_interest`, `implied_volatility` | `volume`, `open_interest`, `iv` | Int64 / Int64 / decimal; IV 0 or > 100 is null (ThetaData's `_clean_iv`). A row with neither a trade nor a quote is dropped. |
+| `mark`, `bid_size`, `ask_size`, `delta`, `gamma`, `theta`, `vega`, `rho` | same names | Extra columns, kept for the record. The reader ignores them: it inverts its own greeks from `close`, as for every parquet store. |
+| `strike`, `contractID` | `strike`, `occ_symbol` | **As-traded** strikes, like ThetaData: NVDA 2024-05-31 (10:1 split 2024-06-10) lists 1,005..1,165 around a ~$1,100 spot. The Part E split-basis machinery therefore applies unchanged. |
+
+**Switching a job.** `--option-history-source alphavantage` on `optimize`, `optimize-batch`, `prewarm` (read-only coverage report of the AV store) and
+`scripts/run_daily_backtest.py`; it selects `options_store=alphavantage` and is recorded on the run config as `option_history_source`
+(stating it with a contradicting `--options-store` is refused). The drivers `run_options_matrix.py`, `run_options2_matrix.py`,
+`run_convex_matrix.py` take `--option-history-source` too (default `thetadata`, which is what they always did through `--options-store thetadata`):
+`alphavantage` adds `--options-store alphavantage --option-history-source alphavantage` to every job, an `-optalphavantage` name suffix, and
+joins the digest, the discovery name and the checkpoint fingerprint. `thetadata` adds nothing anywhere, so every existing job keeps its name, completion
+row and checkpoint. History floor of the store: 2020-01-01. Warm the derived arrays for it with
+`python tools/build_shared_arrays.py --options-store alphavantage --universe-file ...` like step 6 of 4.2.
+
+Caveats: AV is queried by the CURRENT ticker only; renamed names (META before 2022-06, ...) may return nothing for the old period and are recorded
+empty. Compare a job on the two vendors only after checking close/quote agreement on a sample (not done yet).
+
 ### 4.5 Alternative: import a warmed cache
 
 ```bash
@@ -585,7 +696,7 @@ What the discovery profile runs:
 | Job-name suffix | `STAGE1_SUFFIX=-st1fix` (the current run) | env |
 | Robust fitness (concentration × Monte Carlo × spread) | on by default; `STAGE1_ROBUST=0` opts out and needs its own suffix | env |
 | Fill-volume sizing | `--option-size-within-fill-volume` (always passed by the script) | flag |
-| 1-contract floor | `option_min_one_contract=True` on every entry except `O_CONVEX*` | code default, `ba2test_launcher.py:3422` |
+| 1-contract floor | `option_min_one_contract=True` on every entry except `O_CONVEX*` for runs launched before TEST 2026.11.0187; OFF for every entry from TEST 0187 (2026-11-09), when the 5% sizing band went 1-10 -> 1-15 | code default, `ba2test_launcher.py` `_option_entry_action_for` |
 | Entry cross 0.75-1.0 (step 0.05) | `_OPTION_ENTRY_CROSS_BAND` gene | code default, `ba2test_launcher.py:3682` |
 | DS `macro_short_side="mirror"` on option jobs | spec `option_fixed_settings` (part of the job digest) | code, `ba2test_launcher.py:1363` |
 | Market-condition gates | `MARKET_CONDITION_PROFILE=ohlcv-v1,ta-structure-v1`, `MARKET_CONDITION_MANIFEST=ohlcv-v1=<d>,ta-structure-v1=<d>` | env |
@@ -720,6 +831,12 @@ recovers. So:
 | Option fitness family | `option_consistent_annual_return`, `option_car_over_risk`, `option_car_target`, `option_car_target_soft30` and `option_convex` are mutually incomparable |
 | FMPRating window | Starts 2022; never mix it with full-window rows in per-year comparisons |
 | OHLCV history source fmp -> alpaca, **2026-10-20** (§4.0) | Equity jobs stamp `ohlcv_history_source`; a row without the stamp ran on the FMP cache. Different price history, so never compare across it |
+| Robust x stress double count fixed, **2026-11-09** (TEST 0188) | With BOTH `robust_fitness` and `stress_spread_bps` on, the stressed re-score applied concentration × Monte Carlo itself and the outer adjustment applied them again. Fitness is now min(raw, stressed) × concentration × Monte Carlo × spread. Runs with both flags on are not comparable across it; runs with only one flag on are unchanged |
+| DeterministicScorer `yc_scale` 0.005 -> 0.5, **2026-11-09** | Every DS backtest, GA run and live instance before it used `yc_scale` 0.005, which saturates the yield-curve tanh (a near-binary input). Macro-on DS results (`macro_mode` multiply/gate/input) before and after are not comparable; `macro_mode=off` is unaffected. A job created after it states `yc_scale` in its expert settings; a stored config without the key re-runs and deploys at 0.005 (`ba2_common.core.legacy_setting_defaults`) |
+| O_ERN `opt_dte` band 0..21 -> 0..1, **2026-11-09** (TEST 0189) | O_ERN inherited the default DTE exit (default 21, authored ON) while entering at 7..~22 DTE, so the straddle was closed on the first manage pass and never held through the print; the exit is now an expiry-week safety close only (default 0, band 0..1, guarded at import against the 5-day pre-print lead). Every earlier O_ERN result measured a no-hold strategy and is void; the event exit (`days_after_event` 0-2) is the real exit. |
+| Long ITM single-leg option expiry at intrinsic, **2026-11-09** (`TEST 0189`) | A long ITM call or put without a combo settled at the expiry bar's premium close (floored at intrinsic, capped at spot/strike), so a print with time value left in it paid more than the option was worth at expiry. It now settles at intrinsic from the expiry close, the same formula the defined-risk combos use. Option runs that hold a long leg outside a defined-risk combo to expiry (long call/put, LEAPS, the long legs of straddles, strangles, jade lizards and ratio spreads) are not comparable across it; defined-risk combos, short legs and equity-only runs are unchanged |
+| Assignment liquidation pays fill costs, **2026-11-09** (`TEST 0189`) | The next-bar sale of stock from an assigned short put (or buy-back of short stock from an assigned naked call) filled at the raw open with no slippage, no spread and no commission, and its trade row skipped the commission. It now pays what an equity market fill of that side pays: `slippage_bps` plus half of `spread_bps`, adverse, and `commission_per_trade`, in cash and in the row. Option runs with short-option assignments that are not held (`hold_assigned_stock` off) are not comparable across it when any of those costs is non-zero; held assignments, zero-cost configs and equity-only runs are unchanged |
+| Entry fill bar tested against the stop/target, **2026-11-09** (`TEST 0190`) | An equity entry filled at the next bar's open, but its transaction was still WAITING when that bar's TP/SL check ran, and the next check read the bar after. So the bar the entry filled on was never tested: on the daily clock the whole first session, on the 5-minute clock one 5-minute bar. Live, the stop rests from the fill. The fill bar is now tested through the same bracket function (gap rule, stop wins when the bar spans both levels); results carry `fill_bar_exits`. Equity results before it are not comparable, daily clock most of all (measured on 20 symbols over 2024 with a -5%/+8% bracket: 53 of 427 entries left on their fill bar, return 40.7% -> 32.9%). On the 5-minute clock the same run changed by 0 trades. Option fills do not take this path and are unchanged; a stock entry in an option run that carries a stop/target (e.g. the `O_STK` arm) is covered |
 
 ### 6.4 Determinism caveats
 

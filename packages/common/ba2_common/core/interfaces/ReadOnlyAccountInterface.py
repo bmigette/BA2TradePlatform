@@ -18,8 +18,15 @@ from ba2_common.core.models import AccountSetting
 from ba2_common.core.types import AssetClass, OrderStatus
 from ba2_common.core.interfaces.ExtendableSettingsInterface import (
     ExtendableSettingsInterface, coerce_bool)
+from ba2_common.core.replay.account_taps import tap_account_methods
 from ba2_common.core.replay.observe import observe_provider
 from ba2_common.core.replay.schemas import ReplayStatus
+
+
+#: (account id, transaction id, filled buy, filled sell) of every OVERSOLD transaction
+#: ``refresh_transactions`` has already reported in this process. The refresh runs every few
+#: minutes; the same ERROR every pass buries it. A change in the fills reports it again.
+_OVERSOLD_REPORTED: set = set()
 
 
 #: A margin_factor below 1.0 would let an account deploy LESS than its balance,
@@ -218,6 +225,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     For trading-capable accounts, subclass AccountInterface instead (which inherits this).
     """
     SETTING_MODEL = AccountSetting
+
+    def __init_subclass__(cls, **kwargs):
+        # Replay capture: every concrete account OVERRIDES the sizing reads and the effect calls, so
+        # the taps are applied per subclass (see ba2_common.core.replay.account_taps for the rules).
+        super().__init_subclass__(**kwargs)
+        tap_account_methods(cls)
 
     #: True when ``get_account_snapshot()`` is built from the very broker read ``get_account_info()``
     #: makes (the base derives one from the other; AlpacaAccount's snapshot calls ``get_account_info``;
@@ -2403,15 +2416,41 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         calculated_quantity = 0.0
 
                     # Update transaction quantity if different
-                    if calculated_quantity != 0 and transaction.quantity != calculated_quantity:
-                        if calculated_quantity < 0:
+                    if calculated_quantity < 0:
+                        # OVERSOLD (or, for a short, over-covered): this transaction's exits
+                        # traded MORE than its entry. That is not a position this row holds; the
+                        # excess came out of ANOTHER position on the account (dev 8080 NVDA
+                        # transaction 468, 2026-11-09: bought 4, sold 5). This used to log
+                        # "Using abs() as safety measure" on EVERY refresh and write
+                        # quantity = abs(-1) = 1, inventing a 1-share position on the
+                        # transaction's own side that anything sizing off ``quantity`` would act
+                        # on. The quantity is now left as it was, and the oversell is reported
+                        # loudly ONCE per process (per fills) with what an operator must do.
+                        report_key = (self.id, transaction.id, total_filled_buy, total_filled_sell)
+                        if report_key not in _OVERSOLD_REPORTED:
+                            _OVERSOLD_REPORTED.add(report_key)
+                            side_value = getattr(transaction.side, "value", transaction.side)
+                            entry_word, exit_word = (("bought", "sold")
+                                                     if transaction.side == OrderDirection.BUY
+                                                     else ("sold", "bought"))
+                            entered = (total_filled_buy if transaction.side == OrderDirection.BUY
+                                       else total_filled_sell)
+                            exited = (total_filled_sell if transaction.side == OrderDirection.BUY
+                                      else total_filled_buy)
                             logger.error(
-                                f"NEGATIVE calculated_quantity in sync_transaction_orders: {calculated_quantity} "
-                                f"for transaction {transaction.id} ({transaction.symbol}, side={transaction.side}), "
-                                f"total_filled_buy={total_filled_buy}, total_filled_sell={total_filled_sell}. "
-                                f"Using abs() as safety measure."
-                            )
-                            calculated_quantity = abs(calculated_quantity)
+                                f"OVERSOLD transaction {transaction.id} ({transaction.symbol} "
+                                f"{side_value}, account {self.id}, status "
+                                f"{getattr(transaction.status, 'value', transaction.status)}): "
+                                f"{entry_word} {entered:g} but {exit_word} {exited:g} -- "
+                                f"{-calculated_quantity:g} share(s) beyond its own position, taken "
+                                f"from another {transaction.symbol} position on this account. The "
+                                f"broker book is now {-calculated_quantity:g} short of the "
+                                f"platform's other open {transaction.symbol} transactions. "
+                                f"Quantity left at {transaction.quantity} (not rewritten). ACTION: "
+                                f"reconcile {transaction.symbol} by hand (re-buy the excess or "
+                                f"reduce the other transactions), then close this transaction. "
+                                f"Reported once per process.")
+                    elif calculated_quantity != 0 and transaction.quantity != calculated_quantity:
                         transaction.quantity = calculated_quantity
                         has_changes = True
                         logger.debug(f"Transaction {transaction.id} quantity updated to {calculated_quantity}")
@@ -3063,3 +3102,8 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - equity_value (float): Equity/positions portion
         """
         pass
+
+
+# The concrete sizing helpers defined ON this interface are tapped here; __init_subclass__ only
+# runs for subclasses (AccountInterface and every broker).
+tap_account_methods(ReadOnlyAccountInterface)

@@ -80,6 +80,12 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "instrument_account_share": ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE,
     "percent_below_recent_high": ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH,
     "percent_above_recent_low": ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW,
+    # Pullback entry gates (goal2027 part 3). Listed here or the leaf is silently dropped.
+    "pullback_rsi_2": ExpertEventType.N_PULLBACK_RSI_2,
+    "pullback_rsi_3": ExpertEventType.N_PULLBACK_RSI_3,
+    "pullback_rsi_4": ExpertEventType.N_PULLBACK_RSI_4,
+    "pullback_rsi_5": ExpertEventType.N_PULLBACK_RSI_5,
+    "price_vs_sma200_percent": ExpertEventType.N_PRICE_VS_SMA200_PERCENT,
     "iv_rank": ExpertEventType.N_IV_RANK,
     # Volume / volatility entry gates. Both are UNEVALUABLE (never a plausible-looking
     # default) when the underlying measurement is missing -- see their condition classes.
@@ -97,6 +103,8 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # a composed option expert opened the position, read back off its entry order row. ANDed
     # into each member's exits; UNEVALUABLE (never fires) on an untagged position.
     "entry_tag": ExpertEventType.N_ENTRY_TAG,
+    # A style member's share of the sleeve (plan 2026-11-06); ANDed last into its entry rule.
+    "structure_share": ExpertEventType.N_STRUCTURE_SHARE,
     # THE DIRECTION CALL AS A NUMBER (SELL -2 .. BUY +2, HOLD 0). MANDATORY here and not
     # merely tidy: the option grid's entry gate is this leaf, and an unmapped field is
     # DROPPED by triggers_from_condition_tree with nothing but a WARNING -- every option
@@ -265,7 +273,9 @@ def rule_carries_action(actions: Any, action_type: str) -> bool:
 
 
 def tree_leaves(node: Any) -> Iterable[dict]:
-    """Yield leaf condition dicts (those with a 'field') from an AND/OR condition tree."""
+    """Yield leaf condition dicts (those with a 'field') from an AND/OR condition tree, in tree
+    order. The order is the POSITION every trigger key ``cond_<i>`` refers to. It says nothing
+    about the groups: use :func:`condition_tree_branches` for the tree's boolean structure."""
     if not isinstance(node, dict):
         return
     kids = node.get("conditions")
@@ -274,6 +284,110 @@ def tree_leaves(node: Any) -> Iterable[dict]:
             yield from tree_leaves(child)
     elif node.get("field"):
         yield node
+
+
+# ---------------------------------------------------------------------------------------------
+# Boolean structure: a condition TREE -> AND-only branches (disjunctive normal form)
+# ---------------------------------------------------------------------------------------------
+# A live ``EventAction`` has no groups: ``TradeActionEvaluator`` ANDs its triggers. So a tree with
+# a real OR is written as SEVERAL live rules, one per AND-branch of its disjunctive normal form,
+# carrying the same actions at consecutive ``order_index`` (rules_convert / the backtest seeder).
+# Before this, every leaf was flattened into ONE AND and an exit ``OR[profit > 10, days > 5]`` ran
+# as ``profit > 10 AND days > 5`` in the backtest and live alike.
+
+#: The most AND-branches one rule may expand to. A wider tree is refused rather than silently
+#: becoming dozens of live rules nobody reviewed (2 ** 3 = 8: three independent two-way ORs).
+MAX_DNF_BRANCHES = 8
+
+_AND, _OR = "AND", "OR"
+
+
+class ConditionTreeExportError(ValueError):
+    """A condition tree that cannot be written as AND-only rules without changing what it means."""
+
+
+class UnsupportedConditionGroupError(ConditionTreeExportError):
+    """A group whose boolean is not AND or OR (NOT, XOR, ...), or whose ``operator`` and ``type``
+    disagree. A live rule cannot negate a trigger, and coercing the group to AND (what
+    ``rule_models.ConditionGroup`` used to do) inverts it."""
+
+
+class ConditionTreeTooWideError(ConditionTreeExportError):
+    """A tree whose disjunctive normal form has more than :data:`MAX_DNF_BRANCHES` branches."""
+
+
+def condition_group_operator(node: dict, where: str = "condition tree") -> str:
+    """The boolean of ONE group (``operator`` or ``type``, absent = AND), upper-cased.
+
+    REFUSED (:class:`UnsupportedConditionGroupError`): anything but AND/OR, and a group whose
+    ``operator`` and ``type`` both name a boolean and disagree (the canonical form writes both,
+    the same; a payload carrying two different ones says two things)."""
+    spelled = [str(node[k]).strip().upper() for k in ("operator", "type")
+               if node.get(k) not in (None, "")]
+    if len(set(spelled)) > 1:
+        raise UnsupportedConditionGroupError(
+            f"{where}: group {node.get('id') or '<no id>'!r} has operator {node.get('operator')!r} "
+            f"and type {node.get('type')!r}, which disagree. Write one boolean.")
+    op = spelled[0] if spelled else _AND
+    if op not in (_AND, _OR):
+        raise UnsupportedConditionGroupError(
+            f"{where}: group {node.get('id') or '<no id>'!r} is a {op!r} group. A live rule ANDs "
+            f"its triggers and cannot negate one, so only AND and OR groups convert (a NOT group "
+            f"would be read as AND, firing exactly when it should not). Rewrite the condition "
+            f"without it, e.g. with the opposite flag or the opposite comparison.")
+    return op
+
+
+def condition_tree_branches(tree: Any, where: str = "condition tree") -> List[List[int]]:
+    """The tree's disjunctive normal form, as leaf POSITIONS (indices into ``tree_leaves(tree)``).
+
+    Each inner list is one AND-branch, positions ascending; the tree is true exactly when one of
+    the branches is (all its leaves true). ``[]`` for a tree with no leaf at all.
+
+    Groups are read the way :func:`tree_leaves` walks them (a dict with non-empty
+    ``conditions``). A group with no leaf under it is NEUTRAL -- it contributes no condition to an
+    AND and no branch to an OR -- exactly as the flattening walk treats it, so a tree in which no
+    OR has two non-empty children has ONE branch holding every leaf in order: the flattened
+    conjunction, byte for byte.
+
+    REFUSED: a non-AND/OR group (:class:`UnsupportedConditionGroupError`) and more than
+    :data:`MAX_DNF_BRANCHES` branches (:class:`ConditionTreeTooWideError`).
+    """
+    counter = [0]
+
+    def too_wide(n: int) -> None:
+        if n > MAX_DNF_BRANCHES:
+            raise ConditionTreeTooWideError(
+                f"{where}: the condition tree expands to {n} AND-branches (more than "
+                f"{MAX_DNF_BRANCHES}); each branch becomes its own live rule. Simplify the tree "
+                f"or split it into separate rules by hand.")
+
+    def walk(node: Any) -> Optional[List[Tuple[int, ...]]]:
+        if not isinstance(node, dict):
+            return None
+        kids = node.get("conditions")
+        if kids:
+            op = condition_group_operator(node, where)
+            parts = [p for p in (walk(child) for child in kids) if p is not None]
+            if not parts:
+                return None
+            if op == _OR:
+                out = [b for p in parts for b in p]
+                too_wide(len(out))
+                return out
+            acc: List[Tuple[int, ...]] = [()]
+            for p in parts:
+                too_wide(len(acc) * len(p))
+                acc = [a + b for a in acc for b in p]
+            return acc
+        if node.get("field"):
+            i = counter[0]
+            counter[0] += 1
+            return [(i,)]
+        return None
+
+    branches = walk(tree)
+    return [sorted(b) for b in branches] if branches else []
 
 
 def assert_market_fields_mappable(tree: Any, where: str) -> None:
@@ -371,43 +485,34 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     or value the engine would refuse) raises ``ValueError`` here instead -- on EVERY conversion
     path, since they all come through this function. A tree without a tag leaf (every rule that
     existed before the tag) converts exactly as before.
+
+    A tree with a REAL OR (an OR group with two or more non-empty children) has no single-AND
+    form, so it is REFUSED here (:class:`ConditionTreeExportError`) instead of being flattened
+    into an AND of every leaf; convert it with :func:`trigger_sets_from_condition_tree` /
+    :func:`rule_trigger_sets_from_tree`, one rule per branch. A NOT group is refused too
+    (:func:`condition_group_operator`).
     """
+    branches = condition_tree_branches(tree)
+    if len(branches) > 1:
+        raise ConditionTreeExportError(
+            f"the condition tree has {len(branches)} OR-branches, and one EventAction ANDs its "
+            f"triggers: flattening it would require every branch at once. Convert it with "
+            f"trigger_sets_from_condition_tree (one rule per branch).")
     return _triggers_and_leaf_ids(tree)[0]
 
 
 def trigger_leaf_ids(tree: Any) -> Dict[str, str]:
     """``{trigger key: leaf id}`` for exactly the triggers :func:`triggers_from_condition_tree`
-    returns for ``tree`` (same walk, same dropped leaves; read-only, used by backtest gate counters)."""
+    returns for ``tree`` (same walk, same dropped leaves; read-only, used by backtest gate counters).
+    Keys are positions in the WHOLE tree, so the map also labels every per-branch trigger dict of
+    :func:`trigger_sets_from_condition_tree`."""
     return _triggers_and_leaf_ids(tree, warn=False)[1]
 
 
-def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
-    """:func:`triggers_from_condition_tree` for ONE enabled TradeRule, refusing the two drops
-    that turn a rule fail-OPEN. Used where a TradeRule list becomes EventActions: the backtest
-    seeder (``default_rulesets.seed_ruleset_from_rules``) and the live export
-    (``rules_convert.trade_rules_to_live_export``), so both refuse the same rules.
-
-    * The tree has at least one leaf but ZERO triggers came out. Empty triggers are ALWAYS TRUE:
-      an exit rule would close every position on every pass. No author means that. A style
-      member's ``entry_tag`` leaf does not count on either side: it scopes, it does not gate, so
-      a tagged rule whose AUTHORED leaves all dropped is refused like its single-structure twin.
-    * A MARKET-CONDITION leaf was dropped (fewer market triggers than market leaves). The rule
-      would run without its gate: a different strategy under the same name.
-
-    A partial drop of ordinary (non-market) leaves is NOT refused. That is the long-standing
-    behaviour of :func:`triggers_from_condition_tree` (logged at WARNING), and existing rulesets
-    rely on it. A tree with no leaf at all (``None``, or an empty group) is not refused either:
-    that rule was authored with no condition, or a decode removed every leaf, and this function
-    cannot tell which.
-    """
-    from ba2_common.core.market_condition_rules import market_condition_fields
-
-    try:
-        triggers = triggers_from_condition_tree(tree) if tree else {}
-    except ValueError as e:
-        # Name the RULE as well as the leaf (the shared converter only knows the leaf).
-        raise ValueError(f"{where}: {e}") from e
-    leaves = list(tree_leaves(tree))
+def _refuse_fail_open(where: str, leaves: List[dict], triggers: Dict[str, dict],
+                      check_market: bool = True) -> None:
+    """The two drops that turn ONE AND-rule fail-OPEN (see :func:`rule_trigger_sets_from_tree`):
+    authored leaves but no authored trigger (ALWAYS TRUE), and a market leaf with no trigger."""
     # The style-group MEMBER TAG leaf (``entry_tag``, ANDed into every member exit) is not an
     # authored condition: it always converts, so counting it here would turn "every authored
     # leaf dropped" into ``{entry_tag == N}`` -- ALWAYS TRUE for that member's positions, while
@@ -426,8 +531,12 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
             + (" of its member (the entry_tag leaf alone scopes, it does not gate)"
                if len(authored_leaves) < len(leaves) else "")
             + ". Fix or remove the leaves.")
-    # (A member-tag leaf that cannot be honoured never reaches this point: the shared
-    # ``triggers_from_condition_tree`` above refuses it on every path.)
+    if not check_market:
+        return
+    # (A member-tag leaf that cannot be honoured never reaches this point: the shared trigger
+    # walk refuses it on every path.)
+    from ba2_common.core.market_condition_rules import market_condition_fields
+
     fields = market_condition_fields()
     market_leaves = [leaf for leaf in leaves if leaf.get("field") in fields]
     market_triggers = [t for t in triggers.values() if t.get("event_type") in fields]
@@ -437,7 +546,82 @@ def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
             f"{len(market_leaves)} market-condition leaf/leaves "
             f"{[leaf.get('id') or leaf.get('field') for leaf in market_leaves]!r} produced no "
             f"trigger. The rule would run without its market gate.")
-    return triggers
+
+
+def _branch_trigger_sets(tree: Any, where: str, strict: bool) -> List[Dict[str, dict]]:
+    """The ONE expansion behind :func:`trigger_sets_from_condition_tree` (``strict`` False) and
+    :func:`rule_trigger_sets_from_tree` (``strict`` True)."""
+    if not tree:
+        return [{}]
+    branches = condition_tree_branches(tree, where)   # NOT / too wide refused before any warning
+    try:
+        triggers = _triggers_and_leaf_ids(tree)[0]
+    except ValueError as e:
+        # Name the RULE as well as the leaf (the shared walk only knows the leaf).
+        raise ValueError(f"{where}: {e}") from e
+    leaves = list(tree_leaves(tree))
+    if len(branches) <= 1:
+        # A plain conjunction: exactly the flattened dict, refused exactly as before.
+        if strict:
+            _refuse_fail_open(where, leaves, triggers)
+        return [triggers]
+    sets: List[Dict[str, dict]] = []
+    for n, branch in enumerate(branches, start=1):
+        # Keys stay the leaf's position in the WHOLE tree (``trigger_leaf_ids`` labels them).
+        branch_triggers = {f"cond_{i}": triggers[f"cond_{i}"] for i in branch
+                           if f"cond_{i}" in triggers}
+        # A branch whose leaves ALL dropped would be an always-true live rule -- something the
+        # flattened form could never produce -- so it is refused on the lenient path too.
+        _refuse_fail_open(f"{where} (OR-branch {n} of {len(branches)})",
+                          [leaves[i] for i in branch], branch_triggers, check_market=strict)
+        sets.append(branch_triggers)
+    return sets
+
+
+def trigger_sets_from_condition_tree(tree: Any, where: str = "condition tree") -> List[Dict[str, dict]]:
+    """One ANDed EventAction 'triggers' dict per AND-branch of ``tree`` (its disjunctive normal
+    form, :func:`condition_tree_branches`), in branch order. Each becomes its own live rule with
+    the same actions; together they fire exactly when the tree is true.
+
+    A tree with no real OR returns ONE dict, identical to :func:`triggers_from_condition_tree`
+    (same keys, same leniency about a dropped ordinary leaf). With several branches a branch whose
+    every leaf dropped is REFUSED -- it would be always true. NOT groups and trees wider than
+    :data:`MAX_DNF_BRANCHES` are refused. The LEGACY converters use this (the legacy exporter and
+    the backtest's legacy seeders); TradeRule lists use :func:`rule_trigger_sets_from_tree`."""
+    return _branch_trigger_sets(tree, where, strict=False)
+
+
+def rule_trigger_sets_from_tree(tree: Any, where: str) -> List[Dict[str, dict]]:
+    """:func:`trigger_sets_from_condition_tree` for ONE enabled TradeRule, refusing (per branch)
+    the two drops that turn a rule fail-OPEN. Used where a TradeRule list becomes EventActions:
+    the backtest seeder (``default_rulesets.seed_ruleset_from_rules``) and the live export
+    (``rules_convert.trade_rules_to_live_export``), so both expand and refuse the same rules.
+
+    * A branch has at least one leaf but ZERO triggers came out. Empty triggers are ALWAYS TRUE:
+      an exit rule would close every position on every pass. No author means that. A style
+      member's ``entry_tag`` leaf does not count on either side: it scopes, it does not gate, so
+      a tagged rule whose AUTHORED leaves all dropped is refused like its single-structure twin.
+    * A MARKET-CONDITION leaf was dropped (fewer market triggers than market leaves). The rule
+      would run without its gate: a different strategy under the same name.
+
+    A partial drop of ordinary (non-market) leaves is NOT refused. That is the long-standing
+    behaviour of :func:`triggers_from_condition_tree` (logged at WARNING), and existing rulesets
+    rely on it. A tree with no leaf at all (``None``, or an empty group) is not refused either:
+    that rule was authored with no condition, or a decode removed every leaf, and this function
+    cannot tell which.
+    """
+    return _branch_trigger_sets(tree, where, strict=True)
+
+
+def rule_triggers_from_tree(tree: Any, where: str) -> Dict[str, dict]:
+    """:func:`rule_trigger_sets_from_tree` for a rule that must stay ONE EventAction: refuses
+    (:class:`ConditionTreeExportError`) a tree with more than one OR-branch."""
+    sets = rule_trigger_sets_from_tree(tree, where)
+    if len(sets) > 1:
+        raise ConditionTreeExportError(
+            f"{where}: the condition tree has {len(sets)} OR-branches and cannot be one "
+            f"EventAction; convert it with rule_trigger_sets_from_tree (one rule per branch).")
+    return sets[0]
 
 
 # Strategy rule option_* field -> the action-config key the ``TradeActionEvaluator`` reads

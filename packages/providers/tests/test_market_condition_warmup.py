@@ -1016,3 +1016,47 @@ def test_repair_reports_the_kept_tails(root):
     p = W.plan(PROFILE, ("SPL",), START, END, cache_root=root, source=src)
     rep = W.repair(p, source=src)
     assert rep["kept_tails"] == src.kept_tails
+
+
+class _BuiltOnlySource(FakeSource):
+    """A cache-only source (the Alpaca history cache): it never fetches, and its build records the date it ran to."""
+
+    def __init__(self, root, asof):
+        super().__init__(root)
+        self.asof = asof
+
+    def store_asof(self):
+        return self.asof
+
+    def fetch_daily(self, symbol, start, end):
+        raise AssertionError(f"a built-only source must never be fetched ({symbol})")
+
+
+def test_a_series_that_ends_before_the_built_only_source_s_asof_is_a_delisting_and_builds_to_its_last_bar(root):
+    """2026-11-09 goal2027 phase A: DFS / K / WBA / X ... stopped trading inside 2020-2025, and the Alpaca store (asof
+    2026-10-12) has no later bar to fetch. Such a tail is the vendor's own record of the end: the build publishes the
+    symbol up to its last bar (coverage says where it ends, the reader treats the trailing run as a delisting)."""
+    df = TRUTH["BBB"]
+    _write(root, "BBB", df.iloc[:-10])
+    last_bar = df["Date"].iloc[-11].date()
+    src = _BuiltOnlySource(root, asof=date(2026, 10, 12))
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src)
+    assert rep.ok and rep.exit_code == 0 and rep.manifest_digest, rep
+    assert rep.counters["symbols_ended_at_source"] == 1
+    m = MarketConditionStore(root).read_manifest(rep.manifest_digest)
+    tail = [e for e in m["coverage"]["BBB"]["exceptions"] if e["kind"] == "raw_unavailable"]
+    assert len(tail) == 1 and tail[0]["first_session"] > last_bar.isoformat()
+    assert tail[0]["last_session"] == END.isoformat()
+    assert m["coverage"]["AAA"]["rows"] == p.row_sessions
+
+
+def test_a_series_that_ends_at_the_built_only_source_s_own_asof_still_blocks(root):
+    """A store built only up to the window end cannot tell a delisting from its own end: still an inventory item."""
+    df = TRUTH["BBB"]
+    _write(root, "BBB", df.iloc[:-10])
+    src = _BuiltOnlySource(root, asof=END)
+    p = W.plan(PROFILE, UNIVERSE, START, END, cache_root=root, source=src)
+    rep = W.build(W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json())), fetch_missing=False, source=src)
+    assert not rep.ok and rep.manifest_digest is None
+    assert {(i["symbol"], i["kind"]) for i in rep.inventory} == {("BBB", "stale_tail")}

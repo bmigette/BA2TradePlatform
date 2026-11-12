@@ -969,7 +969,7 @@ class BuildReport:
 _COUNTER_KEYS = ("provider_calls", "provider_bytes", "rows_total", "rows_computed", "rows_reused",
                  "objects_written", "objects_reused", "raw_objects_written", "raw_objects_reused",
                  "symbols_built", "symbols_excluded", "snapshot_retries", "full_refetches", "range_fetches",
-                 "gap_fill_missing_sessions", "gap_fill_invalid_sessions")
+                 "gap_fill_missing_sessions", "gap_fill_invalid_sessions", "symbols_ended_at_source")
 
 
 class _Counters:
@@ -1344,6 +1344,32 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     return _SymbolResult(sym, objects, used_raw, _coverage_from(statuses, fields, extra))
 
 
+def _drop_tails_ended_at_source(plan_: MarketConditionWarmPlan, blocking: List[Dict[str, Any]],
+                                source: Optional[WarmupSource], fetch_missing: bool, counters: "_Counters",
+                                log: Callable[[str], None]) -> List[Dict[str, Any]]:
+    """A ``stale_tail`` on a BUILT-ONLY source is a delisting, not a gap to fetch, when that source's own build ran past
+    the window: the Alpaca history cache (``store_asof()``) is never fetched by a warmup, so a series that stops before
+    the store's as-of date stopped trading by the vendor's own record (DFS, K, WBA, X ... in 2020-2025). It is built up
+    to its last bar (``_build_symbol`` records the ``raw_unavailable`` tail in coverage; the readers treat a trailing run
+    as a delisting) and LOGGED by name. A store whose as-of is not after the window end cannot tell its own end from a
+    delisting, so the tail stays an inventory item there. A fetchable source (FMP) keeps its fetch path."""
+    asof_fn = getattr(source, "store_asof", None)
+    if fetch_missing or asof_fn is None:
+        return blocking
+    asof = asof_fn()
+    if asof is None or asof <= date.fromisoformat(plan_.last_row_session):
+        return blocking
+    kept = []
+    for item in blocking:
+        if item["kind"] == RAW_STALE_TAIL:
+            counters.add("symbols_ended_at_source")
+            log(f"build {item['symbol']}: series ends {item['cache_last']}, before the source's as-of {asof}: "
+                f"treated as a delisting, built to its last bar")
+        else:
+            kept.append(item)
+    return kept
+
+
 def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: int = 4,
           log: Callable[[str], None] = _log_noop, source: Optional[WarmupSource] = None,
           allow_exclusions: bool = False) -> BuildReport:
@@ -1381,6 +1407,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
             f"authorised (pass allow_exclusions): {unwaived}")
         return report
     blocking = [i for i in blocking if i.get("fetchable", True)]
+    blocking = _drop_tails_ended_at_source(plan_, blocking, source, fetch_missing, counters, log)
     if blocking and not fetch_missing:
         report.inventory = blocking
         report.counters = dict(counters.values)
