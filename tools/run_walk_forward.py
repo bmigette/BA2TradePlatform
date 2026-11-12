@@ -313,6 +313,8 @@ def _parse(argv: Sequence[str]):
                     help="strict: a fold passes only if its OOS return is ABOVE the threshold "
                          "(default: at or above)")
     ap.add_argument("--pass-max-dd-mult", type=float, required=True)
+    ap.add_argument("--pass-max-oos-dd", type=float, default=None,
+                    help="percent, optional: OOS |maxDD| must also be <= this absolute cap")
     ap.add_argument("--pass-min-folds", type=int, required=True)
     ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
                     help="A test year whose fold winner MUST pass (repeatable), on top of "
@@ -373,7 +375,8 @@ def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
     try:
         plan = WF.make_plan(
             a.prefix, _folds_from_args(a), opt_args, _launcher_path(a), a.top_n,
-            WF.Thresholds(a.pass_min_oos_return, a.pass_max_dd_mult, a.pass_min_folds),
+            WF.Thresholds(a.pass_min_oos_return, a.pass_max_dd_mult, a.pass_min_folds,
+                          a.pass_max_oos_dd),
             test_parallel=a.test_parallel, skip_train=a.skip_train, only_fold=a.only_fold,
             embargo_days=a.embargo_days, selection=selection, seed_chain=a.chain_seed,
             require_test_years=a.pass_require_fold, exclusive_return=a.pass_min_oos_return_exclusive)

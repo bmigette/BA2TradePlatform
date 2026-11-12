@@ -194,7 +194,8 @@ def _fold_key(plan: WF.Plan, f: WF.Fold, identities: Optional[List[Any]] = None)
             "top_n": plan.top_n, "selection": plan.selection,
             "exclusive_return": plan.exclusive_return,
             "thresholds": {"min_oos_return": th.min_oos_return, "max_dd_mult": th.max_dd_mult,
-                           "min_folds": th.min_folds}}
+                           "min_folds": th.min_folds,
+                           **({"max_oos_dd": th.max_oos_dd} if th.max_oos_dd is not None else {})}}
 
 
 def _save_fold(report_dir: str, plan: WF.Plan, f: WF.Fold, genomes: List[WF.GenomeFold],
@@ -216,11 +217,26 @@ def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold,
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        if doc["key"] != _fold_key(plan, f, identities):
-            logger.warning("[%s] stored report %s rejected: key mismatch (window, top-n, selection, "
-                           "thresholds or the train job(s) changed); re-evaluating fold %d",
-                           plan.prefix, path, f.index)
-            return None
+        want = _fold_key(plan, f, identities)
+        if doc["key"] != want:
+            # ONLY the pass thresholds differ: the stored IS/OOS metrics are those of the same train
+            # jobs, window, top-n and selection, and the verdict is a pure function of them. Re-judge
+            # under the new rule and store the result; the backtests are not run again.
+            same_but_rule = ({k: v for k, v in doc["key"].items() if k != "thresholds"}
+                             == {k: v for k, v in want.items() if k != "thresholds"})
+            if not same_but_rule:
+                logger.warning("[%s] stored report %s rejected: key mismatch (window, top-n, "
+                               "selection or the train job(s) changed); re-evaluating fold %d",
+                               plan.prefix, path, f.index)
+                return None
+            genomes = [WF.rejudge(WF.GenomeFold(**g), plan.thresholds, plan.exclusive_return)
+                       for g in doc["genomes"]]
+            logger.warning("[%s] stored report %s was judged under other pass thresholds (%s); its "
+                           "metrics are kept and fold %d is re-judged under %s",
+                           plan.prefix, path, doc["key"].get("thresholds"), f.index,
+                           want["thresholds"])
+            _save_fold(report_dir, plan, f, genomes, identities)
+            return genomes
         return [WF.GenomeFold(**g) for g in doc["genomes"]]
     except OSError as e:
         logger.warning("[%s] stored report %s rejected: unreadable (%s); re-evaluating fold %d",

@@ -23,7 +23,7 @@ import json
 import math
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -245,14 +245,23 @@ def train_command(launcher: Any, user_args: Sequence[str], prefix: str, fold: Fo
 
 @dataclass(frozen=True)
 class Thresholds:
-    """All three REQUIRED (no defaults): a verdict is only as honest as its thresholds."""
+    """The first three are REQUIRED (no defaults): a verdict is only as honest as its thresholds.
+
+    ``max_oos_dd`` is an optional ABSOLUTE cap on top of the relative one (owner 2026-11-12: the
+    multiple alone fails a strategy whose training drawdown was shallow on a test drawdown that is
+    modest in absolute terms, so the multiple was loosened and a ceiling added). A fold passes the
+    drawdown rule when its OOS |max DD| is within BOTH limits, i.e. within the smaller one."""
     min_oos_return: float      # percent, per fold
     max_dd_mult: float         # OOS |max DD| <= mult * IS |max DD|
     min_folds: int             # folds whose rank-1 winner must pass
+    max_oos_dd: Optional[float] = None    # percent: OOS |max DD| <= this, whatever the IS one was
 
     def validate(self, n_folds: int) -> None:
         if self.max_dd_mult <= 0:
             raise WalkForwardError(f"--pass-max-dd-mult must be > 0, got {self.max_dd_mult}")
+        if self.max_oos_dd is not None and not 0 < self.max_oos_dd <= 100:
+            raise WalkForwardError(
+                f"--pass-max-oos-dd must be a percent in (0, 100], got {self.max_oos_dd}")
         if not 1 <= self.min_folds <= n_folds:
             raise WalkForwardError(
                 f"--pass-min-folds {self.min_folds} must be between 1 and the number of folds "
@@ -312,6 +321,31 @@ def efficiency(oos_car: float, is_car: float) -> Optional[float]:
     return oos_car / is_car if is_car > 0 else None
 
 
+def fail_reasons(o_trades: int, o_ret: float, o_dd: float, is_dd: float, th: Thresholds,
+                 exclusive_return: bool = False) -> List[str]:
+    """Why a genome fails its fold under ``th`` (empty = PASS). A pure function of the stored
+    metrics, so a changed rule re-judges a finished fold without re-running its backtests."""
+    reasons: List[str] = []
+    if o_trades == 0:
+        reasons.append("zero OOS trades")
+    if (o_ret <= th.min_oos_return) if exclusive_return else (o_ret < th.min_oos_return):
+        reasons.append(f"OOS return {o_ret:.2f}% "
+                       f"{'<=' if exclusive_return else '<'} {th.min_oos_return:g}%")
+    if abs(o_dd) > th.max_dd_mult * abs(is_dd):
+        reasons.append(f"OOS |maxDD| {abs(o_dd):.2f}% > {th.max_dd_mult:g} x IS |maxDD| "
+                       f"{abs(is_dd):.2f}%")
+    if th.max_oos_dd is not None and abs(o_dd) > th.max_oos_dd:
+        reasons.append(f"OOS |maxDD| {abs(o_dd):.2f}% > the {th.max_oos_dd:g}% cap")
+    return reasons
+
+
+def rejudge(g: "GenomeFold", th: Thresholds, exclusive_return: bool = False) -> "GenomeFold":
+    """``g`` with its verdict recomputed under ``th``; every metric is kept as stored."""
+    reasons = fail_reasons(g.oos_trades, g.oos_return, g.oos_max_dd, g.is_max_dd, th,
+                           exclusive_return)
+    return replace(g, passed=not reasons, fail_reasons=reasons)
+
+
 def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds,
                     exclusive_return: bool = False) -> GenomeFold:
     where = f"fold {fold.index} rank {pick.rank}"
@@ -326,15 +360,7 @@ def evaluate_genome(fold: Fold, pick: IsPick, oos: OosMetrics, th: Thresholds,
     o_car = annualise(o_ret, fold.test_years)
     if o_car is None:
         raise MissingMetric(f"missing metric: {where} OOS CAR")
-    reasons: List[str] = []
-    if o_trades == 0:
-        reasons.append("zero OOS trades")
-    if (o_ret <= th.min_oos_return) if exclusive_return else (o_ret < th.min_oos_return):
-        reasons.append(f"OOS return {o_ret:.2f}% "
-                       f"{'<=' if exclusive_return else '<'} {th.min_oos_return:g}%")
-    if abs(o_dd) > th.max_dd_mult * abs(is_dd):
-        reasons.append(f"OOS |maxDD| {abs(o_dd):.2f}% > {th.max_dd_mult:g} x IS |maxDD| "
-                       f"{abs(is_dd):.2f}%")
+    reasons = fail_reasons(o_trades, o_ret, o_dd, is_dd, th, exclusive_return)
     return GenomeFold(
         fold=fold.index, rank=pick.rank, is_fitness=_need(pick.fitness, f"{where} IS fitness"),
         is_return=is_ret, is_car=is_car, is_max_dd=is_dd, is_trades=int(pick.trades),
@@ -525,7 +551,9 @@ def render_dry_run(plan: Plan) -> str:
     lines = [f"walk-forward plan '{plan.prefix}': {len(plan.folds)} fold(s), top-n {plan.top_n}, "
              f"embargo {plan.embargo_days}d, test-parallel {plan.test_parallel}",
              f"thresholds: OOS return >= {th.min_oos_return:g}% per fold, OOS |maxDD| <= "
-             f"{th.max_dd_mult:g} x IS |maxDD|, >= {th.min_folds} fold winner(s) must pass"
+             f"{th.max_dd_mult:g} x IS |maxDD|"
+             + (f" and <= {th.max_oos_dd:g}%" if th.max_oos_dd is not None else "")
+             + f", >= {th.min_folds} fold winner(s) must pass"
              + (f", and the {', '.join(map(str, plan.require_test_years))} fold(s) MUST pass"
                 if plan.require_test_years else "")]
     for f in plan.selected_folds():
@@ -639,7 +667,9 @@ def _eff(v: Optional[float]) -> str:
 def result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
     return {
         "prefix": res.prefix,
-        "thresholds": asdict(res.thresholds),
+        # the optional cap appears only when set, so a report made without it reads as before
+        "thresholds": {k: v for k, v in asdict(res.thresholds).items()
+                       if not (k == "max_oos_dd" and v is None)},
         "top_n": res.top_n,
         "selection": res.selection,
         "complete": res.complete,
@@ -669,6 +699,8 @@ def render_markdown(res: WalkForwardResult) -> str:
            f"- `--pass-min-oos-return{'-exclusive' if res.exclusive_return else ''}` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
            f"fold's test window, NOT annualised; window lengths are in each fold heading)",
            f"- `--pass-max-dd-mult` {th.max_dd_mult:g} (OOS |max DD| <= mult x IS |max DD|)",
+           *([f"- `--pass-max-oos-dd` {th.max_oos_dd:g}% (OOS |max DD| <= this, whatever the IS one was)"]
+             if th.max_oos_dd is not None else []),
            f"- `--pass-min-folds` {th.min_folds} (fold winners that must pass)",
            "- a genome with zero OOS trades FAILS",
            *([f"- `--pass-require-fold` {', '.join(map(str, res.require_test_years))} (these test "

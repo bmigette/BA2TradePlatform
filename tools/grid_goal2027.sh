@@ -70,6 +70,12 @@ FORBIDDEN_HOMES="${FORBIDDEN_HOMES:-/home/debian/ba2-grid/home}"
 MEMORY_MAX="${MEMORY_MAX:-80G}"     # remote227 transient unit's cgroup cap (box: 251 GB, 24 worker slots)
 UNIT="${UNIT:-ba2-goal2027}"
 DRIVER=tools/run_screener_capband_matrix.py
+# DRAWDOWN PASS RULE (owner 2026-11-12, changed mid-grid): a fold winner passes when its test-year
+# |max DD| is within 2.5 x its training |max DD| AND within 35%. The grid started on 1.5 x alone, which
+# failed a +39% test year on a -15.9% drawdown because training had been -9.5%. The cells keep the
+# names they had under 1.5 (--wf-name-pass-max-dd-mult): completed jobs resume, stored folds are re-judged.
+PASS_DD_MULT="${PASS_DD_MULT:-2.5}"
+PASS_MAX_OOS_DD="${PASS_MAX_OOS_DD:-35}"
 WF_REPORT_DIR="${WF_REPORT_DIR:-${REPO_ROOT}/reports/goal2027_wf}"
 TRAIN_START="${TRAIN_START:-2020-01-01}"
 FITNESS="${FITNESS:-consistent_annual_return}"
@@ -286,7 +292,9 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
       --walk-forward --wf-defer-last-test --wf-train-start "$TRAIN_START" --wf-test-years 2024,2025,2026
       --wf-first-generations "$WF_FIRST_GENERATIONS" --wf-next-generations "$WF_NEXT_GENERATIONS"
       --wf-top-n "$WF_TOP_N" --wf-report-dir "$WF_REPORT_DIR" --wf-test-parallel 1
-      --pass-min-oos-return 0 --pass-min-oos-return-exclusive --pass-max-dd-mult 1.5
+      --pass-min-oos-return 0 --pass-min-oos-return-exclusive
+      --pass-max-dd-mult "$PASS_DD_MULT" --pass-max-oos-dd "$PASS_MAX_OOS_DD"
+      --wf-name-pass-max-dd-mult 1.5
       --pass-min-folds 2 --pass-require-fold 2026)
   [ -n "$end" ] && args+=(--wf-data-end "$end")
   [ -n "$WORKERS" ] && args+=(--workers "$WORKERS")

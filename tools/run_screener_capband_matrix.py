@@ -952,6 +952,15 @@ def main() -> int:
                          "--pass-min-oos-return (default: at or above).")
     ap.add_argument("--pass-max-dd-mult", type=float, default=None,
                     help="OOS |maxDD| must be <= this x IS |maxDD| (REQUIRED).")
+    ap.add_argument("--pass-max-oos-dd", type=float, default=None,
+                    help="Percent, optional: OOS |maxDD| must ALSO be <= this absolute cap. Not part of "
+                         "the cell names: stored fold reports are re-judged under it.")
+    ap.add_argument("--wf-name-pass-max-dd-mult", type=float, default=None,
+                    help="Name the cells as if --pass-max-dd-mult were this value. For a pass rule "
+                         "changed MID-GRID: the train jobs do not depend on the rule, so the cells "
+                         "keep the names (and completed jobs) they had under the old multiple, and "
+                         "their stored fold reports are re-judged under the new one. Default: the "
+                         "multiple itself.")
     ap.add_argument("--pass-min-folds", type=int, default=None,
                     help="Fold winners that must pass for the cell to pass (REQUIRED).")
     ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
@@ -970,6 +979,8 @@ def main() -> int:
         _stray += ["--wf-run-all-folds"] if args.wf_run_all_folds else []
         _stray += ["--pass-min-oos-return-exclusive"] if args.pass_min_oos_return_exclusive else []
         _stray += ["--pass-require-fold"] if args.pass_require_fold else []
+        _stray += ["--pass-max-oos-dd"] if args.pass_max_oos_dd is not None else []
+        _stray += ["--wf-name-pass-max-dd-mult"] if args.wf_name_pass_max_dd_mult is not None else []
         if _stray:
             ap.error(f"{', '.join(_stray)} need --walk-forward")
     else:
@@ -1339,7 +1350,10 @@ def main() -> int:
             "--wf-spec", args.wf_train_start, args.wf_test_years,
             "defer" if args.wf_defer_last_test else str(args.wf_data_end),
             str(args.wf_first_generations), str(args.wf_next_generations), str(args.wf_top_n),
-            str(args.pass_min_oos_return), str(args.pass_max_dd_mult), str(args.pass_min_folds),
+            str(args.pass_min_oos_return),
+            str(args.pass_max_dd_mult if args.wf_name_pass_max_dd_mult is None
+                else args.wf_name_pass_max_dd_mult),
+            str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
         if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
@@ -1354,7 +1368,7 @@ def main() -> int:
                 data_end=args.wf_data_end_d, first_generations=args.wf_first_generations,
                 next_generations=args.wf_next_generations, top_n=args.wf_top_n,
                 thresholds=WF.Thresholds(args.pass_min_oos_return, args.pass_max_dd_mult,
-                                         args.pass_min_folds),
+                                         args.pass_min_folds, args.pass_max_oos_dd),
                 require_test_years=tuple(args.pass_require_fold),
                 exclusive_return=args.pass_min_oos_return_exclusive,
                 defer_last_test=args.wf_defer_last_test, run_all_folds=args.wf_run_all_folds,

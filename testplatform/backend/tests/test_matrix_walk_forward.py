@@ -514,3 +514,43 @@ def test_by_default_a_cell_that_cannot_pass_stops_early(env, monkeypatch):
     monkeypatch.setattr(sys, "argv", _argv(env, experts=("DeterministicScorer",)))
     assert M.main() == 0
     assert [n[-4:] for n in env.fake.order] == ["-wf1", "-wf2"]
+
+
+# ------------------------------------------------------------------ pass rule changed mid-grid (2026-11-12)
+
+
+def _name_with(env, monkeypatch, mult, *extra):
+    env.fake.order.clear()
+    env.fake.completed.clear()
+    argv = _argv(env, *extra, experts=("DeterministicScorer",))
+    argv[argv.index("--pass-max-dd-mult") + 1] = mult
+    monkeypatch.setattr(sys, "argv", argv)
+    assert M.main() == 0
+    return env.fake.order[0][:-4]
+
+
+def test_a_changed_multiple_renames_the_cell_unless_the_name_is_pinned(env, monkeypatch):
+    old = _name_with(env, monkeypatch, "1.5")
+    assert _name_with(env, monkeypatch, "2.5") != old                       # a new rule is a new cell...
+    assert _name_with(env, monkeypatch, "2.5", "--wf-name-pass-max-dd-mult", "1.5") == old   # ...unless pinned
+
+
+def test_the_absolute_cap_is_not_part_of_the_cell_name_and_reaches_the_plan(env, monkeypatch):
+    old = _name_with(env, monkeypatch, "1.5")
+    seen = []
+    from app.services import walk_forward as WF
+    from app.services import wf_chain as WFC
+    real = WFC.run_cells
+    monkeypatch.setattr(WFC, "run_cells", lambda specs, *a, **k: (seen.extend(specs), real(specs, *a, **k))[1])
+    assert _name_with(env, monkeypatch, "1.5", "--pass-max-oos-dd", "35") == old
+    assert seen[-1].thresholds == WF.Thresholds(0.0, 1.5, 2, 35.0)
+
+
+@pytest.mark.parametrize("flag", [("--pass-max-oos-dd", "35"), ("--wf-name-pass-max-dd-mult", "1.5")])
+def test_the_new_flags_need_walk_forward(env, monkeypatch, flag, capsys):
+    argv = [a for a in _argv(env, experts=("DeterministicScorer",))]
+    i = argv.index("--walk-forward")
+    monkeypatch.setattr(sys, "argv", argv[:i] + list(flag))
+    with pytest.raises(SystemExit):
+        M.main()
+    assert "need --walk-forward" in capsys.readouterr().err

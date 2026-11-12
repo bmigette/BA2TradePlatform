@@ -153,14 +153,50 @@ def test_completed_train_without_stored_report_is_re_evaluated_not_retrained(tmp
     assert res.verdict == "PASS" and res.refit_job == "cell-refit"
 
 
-def test_stale_fold_report_with_other_thresholds_is_not_trusted(tmp_path):
+def test_fold_report_stored_under_other_thresholds_is_rejudged_not_rerun(tmp_path):
+    """2026-11-12: the pass rule changed mid-grid. The stored METRICS are those of the same train jobs,
+    window, top-n and selection, so they are kept and only the verdict is recomputed -- under the NEW
+    rule, never the stored one. (This used to re-run the out-of-sample backtests.)"""
     C.run_cell(_spec(), ChainRunner([GOOD, GOOD, GOOD]), str(tmp_path), log=lambda *_: None)
     r = ChainRunner([BAD, BAD, BAD], completed={"cell-wf1", "cell-wf2", "cell-wf3", "cell-refit"})
     res = C.run_cell(_spec(thresholds=WF.Thresholds(10.0, 1.5, 2)), r, str(tmp_path),
                      log=lambda *_: None)
-    # re-evaluated, cache ignored (fold 3 is never reached: 0 of 2 passed, the cell is eliminated)
-    assert [e[0] for e in r.events] == ["oos", "oos"]
+    # GOOD's stored +5% no longer reaches the 10% the new rule asks: fold 3 is never reached, and
+    # nothing is run again (the runner would have answered BAD, -5%)
+    assert r.events == []
     assert res.verdict == "FAIL"
+    doc = json.loads((tmp_path / "cell" / "fold1.json").read_text(encoding="utf-8"))
+    assert doc["key"]["thresholds"]["min_oos_return"] == 10.0          # stored again under the new rule
+    assert [g["oos_return"] for g in doc["genomes"]] == [5.0, 5.0]
+    assert all(not g["passed"] and "OOS return 5.00% < 10%" in g["fail_reasons"] for g in doc["genomes"])
+
+
+def test_a_looser_drawdown_rule_revives_a_cell_the_old_rule_eliminated(tmp_path):
+    deep = _oos(39.0, -31.0)                                # IS maxDD is -20: 1.5x = 30 fails, 2.5x = 50 passes
+    first = C.run_cell(_spec(), ChainRunner([deep, deep, deep]), str(tmp_path), log=lambda *_: None)
+    assert first.verdict == "FAIL" and first.report["eliminated"]["before_fold"] == 3
+    r = ChainRunner([deep, deep, deep], completed={"cell-wf1", "cell-wf2"})
+    res = C.run_cell(_spec(thresholds=WF.Thresholds(0.0, 2.5, 2, 35.0)), r, str(tmp_path),
+                     log=lambda *_: None)
+    assert r.events == [("train", "cell-wf3"), ("oos", "cell-wf3"), ("train", "cell-refit")]   # folds 1-2 not re-run
+    assert res.verdict == "PASS"
+
+
+def test_the_absolute_cap_fails_a_drawdown_the_multiple_allows(tmp_path):
+    deep = _oos(39.0, -36.0)                                # within 2.5 x 20 = 50, beyond the 35% cap
+    res = C.run_cell(_spec(thresholds=WF.Thresholds(0.0, 2.5, 2, 35.0)),
+                     ChainRunner([deep, deep, deep]), str(tmp_path), log=lambda *_: None)
+    assert res.verdict == "FAIL"
+    doc = json.loads((tmp_path / "cell" / "fold1.json").read_text(encoding="utf-8"))
+    assert doc["key"]["thresholds"]["max_oos_dd"] == 35.0
+    assert doc["genomes"][0]["fail_reasons"] == ["OOS |maxDD| 36.00% > the 35% cap"]
+
+
+def test_a_changed_window_still_rejects_the_stored_report(tmp_path):
+    C.run_cell(_spec(), ChainRunner([GOOD, GOOD, GOOD]), str(tmp_path), log=lambda *_: None)
+    r = ChainRunner([BAD, BAD, BAD], completed={"cell-wf1", "cell-wf2", "cell-wf3", "cell-refit"})
+    C.run_cell(_spec(top_n=1, thresholds=WF.Thresholds(0.0, 2.5, 2)), r, str(tmp_path), log=lambda *_: None)
+    assert [e[0] for e in r.events][:1] == ["oos"]          # top-n differs too: re-evaluated, not re-judged
 
 
 def test_a_train_that_never_completes_stops_the_chain(tmp_path):

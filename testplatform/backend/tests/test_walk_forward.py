@@ -495,3 +495,42 @@ def test_rerun_on_2026_goes_through_persist_with_window_and_never_calls_the_rail
         assert "ga_fitness_divergence" not in (bt.results or {})   # other window: gate skipped
     finally:
         db.close()
+
+
+# ------------------------------------------------------------------ absolute drawdown cap (2026-11-12)
+
+
+def test_drawdown_rule_is_the_tighter_of_the_multiple_and_the_cap():
+    th = WF.Thresholds(0.0, 2.5, 1, 35.0)
+    ok = lambda o_dd, is_dd: WF.fail_reasons(10, 5.0, o_dd, is_dd, th)          # noqa: E731
+    assert ok(-15.86, -9.46) == []                         # the DeterministicScorer fold the 1.5x rule failed
+    assert ok(-24.0, -9.46) == ["OOS |maxDD| 24.00% > 2.5 x IS |maxDD| 9.46%"]
+    assert ok(-36.0, -20.0) == ["OOS |maxDD| 36.00% > the 35% cap"]
+    assert ok(-35.0, -20.0) == []                          # at the cap passes
+    assert len(ok(-60.0, -20.0)) == 2                      # both limits broken: both said
+    assert WF.fail_reasons(10, 5.0, -36.0, -20.0, WF.Thresholds(0.0, 2.5, 1)) == []    # no cap given: none applied
+
+
+def test_rejudge_keeps_every_metric_and_recomputes_only_the_verdict():
+    g = WF.evaluate_genome(_plan().folds[0], _pick(1, dd=-10.0), _oos(39.0, -16.0), WF.Thresholds(0.0, 1.5, 1))
+    assert not g.passed
+    again = WF.rejudge(g, WF.Thresholds(0.0, 2.5, 1, 35.0))
+    assert again.passed and again.fail_reasons == []
+    assert {k: v for k, v in vars(again).items() if k not in ("passed", "fail_reasons")} == \
+           {k: v for k, v in vars(g).items() if k not in ("passed", "fail_reasons")}
+
+
+@pytest.mark.parametrize("bad", [0.0, -5.0, 100.5])
+def test_cap_outside_a_percent_is_refused(bad):
+    with pytest.raises(WF.WalkForwardError, match="--pass-max-oos-dd"):
+        WF.Thresholds(0.0, 2.5, 1, bad).validate(3)
+
+
+def test_report_and_dry_run_state_the_cap_only_when_set(tmp_path):
+    capped = _result([_oos(5.0, -25.0), _oos(3.0, -30.0)], planned=2, th=WF.Thresholds(0.0, 2.5, 2, 35.0))
+    jp, mp = WF.write_report(capped, str(tmp_path / "c"))
+    assert "`--pass-max-oos-dd` 35%" in Path(mp).read_text(encoding="utf-8")
+    assert json.loads(Path(jp).read_text(encoding="utf-8"))["thresholds"]["max_oos_dd"] == 35.0
+    plain = _result([_oos(5.0, -25.0), _oos(3.0, -30.0)], planned=2)
+    _jp, mp2 = WF.write_report(plain, str(tmp_path / "p"))
+    assert "--pass-max-oos-dd" not in Path(mp2).read_text(encoding="utf-8")
