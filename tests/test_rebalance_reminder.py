@@ -98,3 +98,14 @@ def test_store_and_rule_together(account_id):
     r = rebalance_reminder(store.last_rebalance_run_at(account_id), store.get_reminder_months(account_id),
                            date(2026, 11, 13))
     assert r.due and r.last_run_date == date(2026, 8, 3) and r.days_elapsed == 102
+
+
+def test_dates_are_compared_in_utc():
+    """Review 2026-11-13: created_at is UTC; an aware time is converted, a naive one IS UTC, and the text says UTC."""
+    from datetime import timedelta, timezone
+    new_york = timezone(timedelta(hours=-5))
+    r = rebalance_reminder(datetime(2026, 8, 12, 21, 30, tzinfo=new_york), 3, date(2026, 11, 13))
+    assert r.last_run_date == date(2026, 8, 13) and r.due and r.days_elapsed == 92      # 02:30 UTC on 13 Aug
+    naive = rebalance_reminder(datetime(2026, 8, 12, 21, 30), 3, date(2026, 11, 12))
+    assert naive.last_run_date == date(2026, 8, 12) and naive.due
+    assert '2026-08-12 (UTC)' in naive.text

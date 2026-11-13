@@ -290,3 +290,93 @@ def test_chart_and_table_carry_every_variant():
     rows = sim.table_rows(res)
     assert [r['variant'] for r in rows] == [sim.VARIANT_NAMES[k] for k in (sim.HOLD, 1, 3, 6, 12)]
     assert rows[0]['d_total'] == '—' and rows[1]['d_total'] == '+12.50 pp'
+
+
+# ---------------------------------------------------------------------------
+# review 2026-11-13
+# ---------------------------------------------------------------------------
+
+def test_two_payouts_on_one_ex_date_with_one_unknown_refuse_instead_of_crashing():
+    """``sorted`` on (date, amount) compared None with a float and raised TypeError."""
+    levels, unknown = sim.total_return_levels([('2024-01-02', 10.0), ('2024-01-03', 10.0)],
+                                              (('2024-01-03', 1.0), ('2024-01-03', None)))
+    assert unknown == ['2024-01-03'] and list(levels) == pytest.approx([10.0, 11.0])
+    closes = {'A': _flat(), 'B': _flat()}
+    payouts = {'A': DistributionHistory(events=(('2024-06-03', 1.0), ('2024-06-03', None))),
+               'B': DistributionHistory(events=())}
+    res = _run({'A': 50, 'B': 50}, closes, payouts)
+    assert res.variants == []
+    assert 'has no split-adjusted amount' in res.refusal and 'A (2024-06-03)' in res.refusal
+
+
+def test_unusable_closes_are_counted_and_named_not_dropped_silently():
+    closes = {'A': dict(_flat(), **{'2024-03-01': float('nan'), '2024-03-04': 0.0, '2024-03-05': -1.0}),
+              'B': dict(_flat(), **{'2024-07-01': None})}
+    res = _run({'A': 50, 'B': 50}, closes)
+    assert res.refusal is None
+    assert res.window.dropped_bars == {'A': 3, 'B': 1}
+    assert any(n.startswith('A: 3 bar(s) with no usable close') for n in res.notes)
+    assert any(n.startswith('B: 1 bar(s) with no usable close') for n in res.notes)
+
+
+def test_a_frequency_that_never_rebalances_is_said_in_the_table_and_the_notes():
+    # The 1-year window: Every 12 months at offset 0 (the chart) would rebalance at the 12th month-end, which is the
+    # window's last row -- so its charted line is hold's, while other start months do rebalance.
+    res = _run({'A': 50, 'B': 50}, TWO)
+    yearly = _variant(res, 12)
+    assert yearly.charted_offset_without_rebalance and 0 < yearly.offsets_without_rebalance < yearly.offsets
+    assert any(n.startswith('Every 12 months: the charted start (offset 0) has no rebalance') for n in res.notes)
+    row = next(r for r in sim.table_rows(res) if r['variant'] == 'Every 12 months')
+    assert f"(none at {yearly.offsets_without_rebalance} of 12 starts)" in row['rebalances']
+    # A frame inside one month has no month-end at all: every frequency IS hold, and says so.
+    prices = pd.DataFrame({'X': [1.0, 2.0, 1.5], 'Y': [1.0, 1.0, 1.0]},
+                          index=pd.to_datetime(['2024-03-04', '2024-03-05', '2024-03-06']))
+    rows, _curves = sim.simulate_frame(prices, {'X': 1, 'Y': 1}, sim.RebalanceParams(cost_bps=0.0))
+    result = sim.RebalanceTestResult(params=sim.RebalanceParams(), window=None, variants=rows)
+    for r in sim.table_rows(result)[1:]:
+        assert r['rebalances'] == 'none in this window (= hold)'
+    assert all(n.endswith('so every figure equals hold.') for n in sim._rebalance_count_notes(rows))
+
+
+def test_tilt_at_the_second_rebalance_uses_the_return_since_the_previous_one():
+    """k_winners = 1, monthly. A: 100 -> 200 (31 Jan) -> 300 (15 Feb) -> 600 (15 Mar), B flat.
+    31 Jan: r_A = +1 -> factor 2 -> 2/3 of 1.5 in A: A 1.0, B 0.5. 15 Feb: A 1.5, total 2.0.
+    29 Feb: r_A since 31 Jan = +0.5 (NOT +2 since the start) -> factor 1.5 -> A 0.6 of 2.0 = 1.2, B 0.8.
+    15 Mar: A doubles -> 2.4 + 0.8 = 3.2. (Measured since the start, factor 3 -> 0.75: 3.0 + 0.5 = 3.5.)"""
+    days = DAYS[DAYS >= '2024-01-02']
+
+    def a(d):
+        iso = d.date().isoformat()
+        return 100.0 if iso < '2024-01-31' else 200.0 if iso < '2024-02-15' else 300.0 if iso < '2024-03-15' \
+            else 600.0
+    res = _run({'A': 50, 'B': 50}, {'A': _series(days, a), 'B': _flat(days=days)}, k_winners=1.0)
+    assert _variant(res, 1).total_return_pct == pytest.approx(220.0)
+
+
+def test_no_look_ahead_a_prefix_run_matches_the_full_run_on_the_shared_rows():
+    """Every decision uses rows up to its own: running on a prefix gives the same equity on every shared row except the
+    prefix's last (which is never a month-end there, as its month is not over)."""
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range('2022-01-03', '2024-06-28')
+    prices = pd.DataFrame(np.exp(np.cumsum(rng.normal(0, 0.02, size=(len(idx), 3)), axis=0)) * 100,
+                          index=idx, columns=['X', 'Y', 'Z'])
+    target = np.array([0.5, 0.3, 0.2])
+    for months, offset in ((1, 0), (3, 1), (6, 5), (12, 4)):
+        kw = dict(cost_bps=15.0, k_winners=0.7, k_losers=-0.4)
+        full, _t, _n = sim.simulate_variant(prices, target, months, offset, **kw)
+        for cut in (100, 333, 517):
+            part, _t2, _n2 = sim.simulate_variant(prices.iloc[:cut], target, months, offset, **kw)
+            assert part[:cut - 1] == pytest.approx(full[:cut - 1], rel=1e-12), (months, offset, cut)
+
+
+def test_a_distribution_on_the_first_window_day_is_excluded():
+    """The first row is the base: a payout that lands on it is in the base price, not in any return of the window."""
+    closes = {'A': _flat(), 'B': _flat()}
+    res = _run({'A': 50, 'B': 50}, closes, {'A': DistributionHistory(events=(('2024-01-01', 5.0),)),
+                                           'B': DistributionHistory(events=())})
+    assert res.window.start == '2024-01-01'
+    assert _variant(res, sim.HOLD).total_return_pct == pytest.approx(0.0)
+    # ...and an UNKNOWN amount on that day does not refuse either: it is outside the window's returns
+    res = _run({'A': 50, 'B': 50}, closes, {'A': DistributionHistory(events=(('2024-01-01', None),)),
+                                           'B': DistributionHistory(events=())})
+    assert res.refusal is None

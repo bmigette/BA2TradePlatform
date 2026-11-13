@@ -2469,8 +2469,10 @@ def _load_rebalance_reminder(account_id: int):
 
 def _render_rebalance_reminder(reminder: RebalanceReminder, *, on_review, on_interval) -> None:
     """The reminder. DUE (or no run on record): a warning banner with the dates and a Review and Submit button that
-    calls ``on_review`` -- the toolbar's own handler, so the same dry run and the same Submit. Not due: one muted line.
-    Either way the interval box, which writes only the reminder's own setting."""
+    calls ``on_review`` -- the page passes the toolbar's own handler, deferred into the never-cleared dialog host, so
+    the same dry run and the same Submit. Not due: one muted line. Either way the interval box, which writes only the
+    reminder's own setting, and only on blur or Enter: saving per keystroke would store the "1" of a "12" being typed,
+    and the redraw that follows a save would rebuild the box under the cursor."""
     due = reminder.due
     with ui.element('div').classes(f"alert-banner {'warning' if due else 'info'} w-full p-2") \
             .mark(MARKER_REBAL_REMINDER):
@@ -2480,11 +2482,19 @@ def _render_rebalance_reminder(reminder: RebalanceReminder, *, on_review, on_int
                 ui.button(REVIEW_BUTTON_LABEL, icon='fact_check', on_click=on_review) \
                     .props('color=primary dense').mark(MARKER_REBAL_REMINDER_REVIEW) \
                     .tooltip(REBAL_REMINDER_REVIEW_TOOLTIP)
-            ui.number(label='Remind every (months)', value=reminder.interval_months, min=1,
-                      max=MAX_REMINDER_MONTHS, step=1, format='%.0f',
-                      on_change=lambda e: on_interval(e.value)) \
-                .props('dense outlined hide-bottom-space debounce=600').classes('w-44') \
+            box = ui.number(label='Remind every (months)', value=reminder.interval_months, min=1,
+                            max=MAX_REMINDER_MONTHS, step=1, format='%.0f') \
+                .props('dense outlined hide-bottom-space').classes('w-44') \
                 .mark(MARKER_REBAL_REMINDER_INTERVAL)
+
+            def _commit(_e=None, box=box):
+                # Unchanged (a plain focus-and-leave) writes nothing.
+                if box.value is not None and float(box.value) == float(reminder.interval_months):
+                    return None
+                return on_interval(box.value)
+
+            box.on('blur', _commit)
+            box.on('keydown.enter', _commit)
 
 
 def _display_names_for(symbols) -> Dict[str, str]:
@@ -4792,11 +4802,17 @@ async def content() -> None:
                 painter.deactivate()
 
         async def _draw_reminder() -> None:
-            """The "rebalance due" reminder. Its button IS ``_review`` -- the toolbar's Review and Submit, latch,
-            what-if interlock and all -- so it opens the same dry run and nothing goes out before Submit."""
+            """The "rebalance due" reminder. Its button runs ``_review`` -- the toolbar's Review and Submit, latch,
+            what-if interlock and all -- so it opens the same dry run and nothing goes out before Submit.
+
+            THROUGH ``_defer``, never directly: a click handler builds its elements in the clicked button's slot,
+            and this button lives in ``reminder_host``, which every refresh CLEARS -- including the refresh that ends
+            a Submit. Called directly, the order preview would be a child of the reminder and be deleted under the
+            user. ``_defer`` starts it from a timer in ``dialog_host``, which is never cleared (the same hop the
+            income panel's Invest uses). Dates: UTC on both sides (``rebalance_reminder`` docstring)."""
             try:
                 last_at, months = await asyncio.to_thread(_load_rebalance_reminder, account_id)
-                reminder = rebalance_reminder(last_at, months, date.today())
+                reminder = rebalance_reminder(last_at, months, datetime.now(timezone.utc).date())
             except Exception as e:
                 logger.error(f"Rebalance reminder for account {account_id} could not be loaded: {e}",
                              exc_info=True)
@@ -4807,7 +4823,8 @@ async def content() -> None:
                 return
             reminder_host.clear()          # right before drawing: overlapping refreshes draw one reminder
             with reminder_host:
-                _render_rebalance_reminder(reminder, on_review=_review, on_interval=_set_reminder_interval)
+                _render_rebalance_reminder(reminder, on_review=lambda: _defer(_review),
+                                           on_interval=_set_reminder_interval)
 
         async def _set_reminder_interval(value) -> None:
             try:

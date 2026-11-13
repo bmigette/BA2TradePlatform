@@ -107,6 +107,8 @@ class WindowInfo:
     late: List[Tuple[str, str]] = field(default_factory=list)
     no_history: List[str] = field(default_factory=list)
     zero_weight: List[str] = field(default_factory=list)
+    #: ``{symbol: bars dropped for a close that is not finite or not positive}`` (members with a weight only).
+    dropped_bars: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -121,6 +123,10 @@ class VariantResult:
     max_drawdown_pct: float     # mean over offsets; <= 0
     turnover_pct_per_year: float
     rebalances: float           # mean count over offsets
+    #: Start offsets at which this variant never rebalanced in the window (it then IS hold there), and whether
+    #: offset 0 -- the one the chart draws -- is one of them.
+    offsets_without_rebalance: int = 0
+    charted_offset_without_rebalance: bool = False
     #: Versus hold (None for hold itself). Drawdown: positive = shallower than hold.
     d_total_pct: Optional[float] = None
     d_annualised_pct: Optional[float] = None
@@ -206,15 +212,20 @@ def tilt_weights(target: np.ndarray, period_return: np.ndarray, k_winners: float
 # total-return levels
 # ---------------------------------------------------------------------------
 
-def _usable_bars(closes: Optional[Mapping[str, Any]], as_of_iso: str) -> List[Tuple[str, float]]:
-    bars = []
+def _usable_bars(closes: Optional[Mapping[str, Any]], as_of_iso: str) -> Tuple[List[Tuple[str, float]], int]:
+    """``([(date, close)] ascending, bars dropped for a close that is not finite or not positive)``; bars after
+    ``as_of`` are left out (not counted as dropped). The caller REPORTS the drops."""
+    bars, dropped = [], 0
     for day, close in (closes or {}).items():
         day = str(day)[:10]
-        if day > as_of_iso or not _finite(close) or float(close) <= 0:
+        if day > as_of_iso:
+            continue
+        if not _finite(close) or float(close) <= 0:
+            dropped += 1
             continue
         bars.append((day, float(close)))
     bars.sort()
-    return bars
+    return bars, dropped
 
 
 def total_return_levels(bars: Sequence[Tuple[str, float]],
@@ -227,7 +238,8 @@ def total_return_levels(bars: Sequence[Tuple[str, float]],
     closes = np.array([c for _, c in bars], dtype=float)
     paid = np.zeros(len(bars))
     unknown: List[str] = []
-    for ex, amount in sorted((str(ex)[:10], a) for ex, a in events):
+    # Sorted on the DATE ONLY: two rows can share an ex-date, and an amount of None does not compare with a float.
+    for ex, amount in sorted(((str(ex)[:10], a) for ex, a in events), key=lambda pair: pair[0]):
         i = int(np.searchsorted(dates, ex, side='left'))
         if i == 0 or i >= len(dates):        # before the first bar / not yet in a close
             continue
@@ -326,7 +338,9 @@ def simulate_frame(prices: pd.DataFrame, weights: Mapping[str, float],
             annualised_min_pct=min(r[1] for r in runs), annualised_max_pct=max(r[1] for r in runs),
             max_drawdown_pct=float(np.mean([r[2] for r in runs])),
             turnover_pct_per_year=float(np.mean([r[3] for r in runs])),
-            rebalances=float(np.mean([r[4] for r in runs]))))
+            rebalances=float(np.mean([r[4] for r in runs])),
+            offsets_without_rebalance=sum(1 for r in runs if r[4] == 0),
+            charted_offset_without_rebalance=months is not None and runs[0][4] == 0))
     hold = rows[0]
     for r in rows[1:]:
         r.d_total_pct = r.total_return_pct - hold.total_return_pct
@@ -370,7 +384,9 @@ def run_rebalance_test(weights: Mapping[str, float], closes: Mapping[str, Mappin
     zero = sorted(s for s, w in clean.items() if w <= 0)
     positive = {s: w for s, w in clean.items() if w > 0}
     total_weight = sum(positive.values())
-    bars_by = {s: _usable_bars(upper_closes.get(s), as_of_iso) for s in positive}
+    usable = {s: _usable_bars(upper_closes.get(s), as_of_iso) for s in positive}
+    bars_by = {s: bars for s, (bars, _dropped) in usable.items()}
+    dropped_bars = {s: n for s, (_bars, n) in sorted(usable.items()) if n}
     no_history = sorted(s for s, b in bars_by.items() if not b)
     first = {s: b[0][0] for s, b in bars_by.items() if b}
 
@@ -381,7 +397,7 @@ def run_rebalance_test(weights: Mapping[str, float], closes: Mapping[str, Mappin
                           weights={s: positive[s] / covered for s in members} if covered > 0 else {},
                           candidates=len(positive),
                           coverage_pct=(covered / total_weight * 100.0) if total_weight > 0 else 0.0,
-                          late=list(late), no_history=no_history, zero_weight=zero)
+                          late=list(late), no_history=no_history, zero_weight=zero, dropped_bars=dropped_bars)
 
     def refuse(message: str, info: WindowInfo) -> RebalanceTestResult:
         return RebalanceTestResult(params=params, window=info, refusal=message, notes=_membership_notes(info))
@@ -433,7 +449,7 @@ def run_rebalance_test(weights: Mapping[str, float], closes: Mapping[str, Mappin
                       "understated: " + '; '.join(unknown) + '.', info)
 
     rows, curves = simulate_frame(frame, info.weights, params)
-    notes = _window_notes(info, bars_by, first_row, last_row)
+    notes = _window_notes(info, bars_by, first_row, last_row) + _rebalance_count_notes(rows)
     return RebalanceTestResult(params=params, window=info, variants=rows,
                                curve_dates=[d.date().isoformat() for d in frame.index], curves=curves, notes=notes)
 
@@ -448,6 +464,24 @@ def _membership_notes(info: WindowInfo) -> List[str]:
         notes.append(f"No price history, left out: {', '.join(info.no_history)}.")
     if info.zero_weight:
         notes.append(f"Weight 0, left out: {', '.join(info.zero_weight)}.")
+    for s, n in info.dropped_bars.items():
+        notes.append(f"{s}: {n} bar(s) with no usable close (not a number, zero or negative) were ignored.")
+    return notes
+
+
+def _rebalance_count_notes(rows: Sequence[VariantResult]) -> List[str]:
+    """Say when a frequency never rebalanced, so a figure equal to hold is explained rather than puzzling."""
+    notes: List[str] = []
+    for v in rows:
+        if v.key == HOLD:
+            continue
+        if v.offsets_without_rebalance == v.offsets:
+            notes.append(f"{v.name}: no rebalance date fell inside this window at any start month, so every figure "
+                         f"equals hold.")
+        elif v.charted_offset_without_rebalance:
+            notes.append(f"{v.name}: the charted start (offset 0) has no rebalance date inside this window, so its "
+                         f"line is hold's; {v.offsets_without_rebalance} of {v.offsets} start months never "
+                         f"rebalance (they are in the table's mean).")
     return notes
 
 
@@ -498,12 +532,23 @@ def table_rows(result: RebalanceTestResult) -> List[Dict[str, Any]]:
                       else f"{v.annualised_min_pct:+.2f}% .. {v.annualised_max_pct:+.2f}% ({v.offsets} starts)"),
             'drawdown': fmt_pct(v.max_drawdown_pct),
             'turnover': f"{v.turnover_pct_per_year:.0f}%",
-            'rebalances': f"{v.rebalances:.1f}".rstrip('0').rstrip('.'),
+            'rebalances': _rebalances_text(v),
             'd_total': fmt_pp(v.d_total_pct),
             'd_annualised': fmt_pp(v.d_annualised_pct),
             'd_drawdown': fmt_pp(v.d_drawdown_pct),
         })
     return out
+
+
+def _rebalances_text(v: VariantResult) -> str:
+    if v.key == HOLD:
+        return '0'
+    if v.offsets_without_rebalance == v.offsets:
+        return 'none in this window (= hold)'
+    mean = f"{v.rebalances:.1f}".rstrip('0').rstrip('.')
+    if v.offsets_without_rebalance:
+        return f"{mean} (none at {v.offsets_without_rebalance} of {v.offsets} starts)"
+    return mean
 
 
 def chart_options(result: RebalanceTestResult) -> Dict[str, Any]:
