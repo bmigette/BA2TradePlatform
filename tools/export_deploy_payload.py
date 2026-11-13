@@ -21,7 +21,9 @@ import sys
 
 REPO = os.environ.get("BA2_REPO", r"C:\Users\basti\Documents\dev\BA2TradePlatform")
 BACKEND = os.path.join(REPO, "testplatform", "backend")
-for p in (BACKEND, os.path.join(REPO, "testplatform")):
+# This script's own directory, ABSOLUTE, before the chdir below: deploy_option_lifecycle lives here.
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+for p in (BACKEND, os.path.join(REPO, "testplatform"), _TOOLS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 os.chdir(BACKEND)
@@ -36,6 +38,31 @@ from app.models.database import SessionLocal  # noqa: E402
 from app.models.backtest import Backtest  # noqa: E402
 from app.api.backtests import _derive_export_payload  # noqa: E402
 from ba2_common.export.backtest_export import build_deploy_entry  # noqa: E402
+from deploy_option_lifecycle import deploy_lifecycle_thresholds  # noqa: E402
+
+
+def _write_lifecycle_thresholds(settings: dict, ruleset: dict, *, where: str) -> dict:
+    """Write the option LIFECYCLE thresholds a ``classic_options`` payload needs, and say so.
+
+    The live option pass refuses to manage a classic_options sleeve that does not declare them, and a
+    backtest config never carries them (a backtest runs none of those exits), so the export writes
+    them in the form that reproduces the backtest: every premium exit off, the roll window taken from
+    the backtest's own roll rule (``deploy_option_lifecycle``). A value the config DID carry was never
+    read by the run, so it is replaced, and the replacement is printed.
+    """
+    expert_params = settings["settings"]["expert_params"]
+    thresholds = deploy_lifecycle_thresholds(expert_params, ruleset["entry_rules"],
+                                             ruleset["exit_rules"], where=where)
+    for key, value in thresholds.items():
+        if key in expert_params and expert_params[key] != value:
+            print(f"  {key}: the backtest config carried {expert_params[key]!r}, which no backtest "
+                  f"reads; deployed as {value!r}")
+    expert_params.update(thresholds)
+    if thresholds:
+        print(f"  classic_options lifecycle thresholds (no premium exit, as in the backtest): "
+              f"{thresholds}")
+    return thresholds
+
 
 def _parse_plan(argv):
     """['881:new:label', '842:29:other'] -> [(bt_id, inst_id|None, label)]."""
@@ -71,9 +98,11 @@ def main() -> int:
         try:
             ruleset = _derive_export_payload(bt, "ruleset", db)
             settings = _derive_export_payload(bt, "expert_settings", db)
+            _write_lifecycle_thresholds(settings, ruleset, where=f"backtest {bt_id}")
         except Exception as e:  # noqa: BLE001 -- HTTPException or ValueError, both fatal here
             # The market-condition refusals (unresolved mode gene, a gate on an exit ruleset)
-            # come through here. Print the reason instead of a traceback: it names the leaf and
+            # come through here, as do the lifecycle-threshold refusals (a two-expiry opener with no
+            # single backtest roll window). Print the reason instead of a traceback: it names the leaf and
             # what to do about it, and NOTHING is written -- a half-exported plan is worse than
             # none, because the missing entry is the one the operator would not notice.
             print(f"FATAL: backtest {bt_id} cannot be exported: "

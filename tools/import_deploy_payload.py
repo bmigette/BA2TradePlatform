@@ -33,6 +33,12 @@ found no setup. The check runs FIRST for each entry -- before the instance is cr
 up and before any ruleset is imported -- because every write below commits synchronously, so a
 refusal raised after them would itself produce the half-deployed state it exists to prevent.
 
+A ``classic_options`` payload is REFUSED (whole file, before any write) unless it states every
+setting the live platform requires of such a sleeve -- ``option_lifecycle_service.REQUIRED_SETTINGS``
+plus ``OptionRiskManagement.REQUIRED_RAIL_SETTINGS``, read from the live code -- with the lifecycle
+thresholds in the form that reproduces the backtest (``deploy_option_lifecycle``; written by the
+exporter since 2026-11-13, so an older payload must be re-exported).
+
 For each entry: converts entry/exit TradeRule lists to a live ruleset export via
 ``trade_rules_to_live_export``, imports it as NEW Ruleset+EventAction rows via
 ``RulesImporter.import_multiple_rulesets`` (never touches the existing rulesets -- old ones are
@@ -54,7 +60,9 @@ import os
 import sys
 
 REPO = os.environ.get("BA2_REPO", r"C:\Users\basti\Documents\dev\BA2TradePlatform")
-for p in (REPO, os.path.join(REPO, "packages", "experts")):
+# This script's own directory, ABSOLUTE: deploy_option_lifecycle lives here.
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+for p in (REPO, os.path.join(REPO, "packages", "experts"), _TOOLS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -76,6 +84,18 @@ from ba2_common.core.deploy_parity import (  # noqa: E402
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
 from ba2_common.core.rules_export_import import RulesImporter  # noqa: E402
+from ba2_common.core.OptionRiskManagement import REQUIRED_RAIL_SETTINGS  # noqa: E402
+from ba2_trade_platform.core.option_lifecycle_service import (  # noqa: E402
+    REQUIRED_SETTINGS as LIFECYCLE_REQUIRED_SETTINGS,
+)
+from deploy_option_lifecycle import assert_deployable_lifecycle  # noqa: E402
+
+#: What the live platform requires BY NAME of a ``classic_options`` sleeve: the lifecycle pass's
+#: thresholds (it refuses to manage a sleeve without them, breaker and cover checks included) and
+#: the entry rails (every option entry is refused without them). Built from the live code's OWN
+#: constants, never a copy, so a requirement added upstream is enforced here with no edit.
+LIVE_CLASSIC_OPTIONS_REQUIRED = tuple(dict.fromkeys(LIFECYCLE_REQUIRED_SETTINGS
+                                                    + REQUIRED_RAIL_SETTINGS))
 
 
 def _expert_class(name: str):
@@ -273,6 +293,26 @@ def main() -> int:
         payloads = json.load(f)
 
     print(f"LIVE_DB = {LIVE_DB}")
+    # THE CLASSIC_OPTIONS REQUIREMENTS, checked for EVERY entry before ANY entry is written (each
+    # write below commits on its own, so a refusal on entry 3 after entries 1-2 were deployed would
+    # leave a half-applied plan). Found live 2026-11-13: four instances deployed without the
+    # lifecycle thresholds came up enabled, and the first option they held stopped the live option
+    # pass for good -- no premium management, no breaker update, no cover check. A payload that would
+    # do that is refused here by setting name (deploy_option_lifecycle.assert_deployable_lifecycle).
+    for entry in payloads:
+        try:
+            verified = assert_deployable_lifecycle(
+                entry["settings"]["settings"]["expert_params"],
+                entry["ruleset"]["entry_rules"], entry["ruleset"]["exit_rules"],
+                LIVE_CLASSIC_OPTIONS_REQUIRED, where=entry["label"])
+        except ValueError as e:
+            print(f"FATAL: {e}")
+            print("NOTHING was written (every entry is checked before the first write).")
+            return 1
+        if verified is not None:
+            print(f"{entry['label']}: classic_options -- states every setting the live option pass "
+                  f"requires ({', '.join(LIVE_CLASSIC_OPTIONS_REQUIRED)}); lifecycle thresholds in "
+                  f"the backtest's form: {verified}")
     for entry in payloads:
         inst_id = entry["target_instance_id"]
         label = entry["label"]
