@@ -85,7 +85,10 @@ FMP-key and empty-selection refusals exist once, and the panel is built ON CLICK
 The chart icon on each label's header opens the label GROWTH SIMULATOR
 (``label_growth_dialog.py``): what an amount put into the label YTD / 1 / 3 / 5
 years ago, split by its current effective shares, would be worth today. Read-only,
-fetched on click.
+fetched on click. The rebalance icon beside it, and the "Rebalance tester" button
+under the label list (whole account), open the REBALANCE TESTER
+(``rebalance_tester_dialog.py``): would rebalancing to target every 1 / 3 / 6 / 12
+months have beaten holding. Read-only, same data path; it places no orders.
 
 This repo uses no ``ui.refreshable`` / ``ui.stepper`` / ``ui.aggrid``: refresh is
 ``container.clear()`` followed by rebuilding inside ``with container:``. Blocking
@@ -198,7 +201,8 @@ from ..utils import allocator_protection_view as protect_view
 from ..utils.allocator_protection_view import label_badge_segments, label_extras_text
 from ..utils.portfolio_allocation_view import effective_symbol_weights
 from .allocator_protection_dialog import open_protection_dialog
-from .label_growth_dialog import open_label_growth
+from .label_growth_dialog import open_label_growth, outside_split_text
+from .rebalance_tester_dialog import ACCOUNT_SCOPE as REBALANCE_ACCOUNT_SCOPE, open_rebalance_tester
 from .portfolio_allocation_wizard import (
     notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
@@ -661,6 +665,14 @@ MARKER_LABEL_ICON = 'pf-label-icon'
 MARKER_LABEL_GROWTH_SIM = 'pf-label-growth-sim'
 LABEL_GROWTH_SIM_TOOLTIP = ('Growth simulator: what an amount (default $10,000) put into this label YTD, 1, 3 or '
                             '5 years ago, split by its current shares, would be worth today')
+#: The rebalance icon beside it, and the whole-account button under the label list: the rebalance tester.
+MARKER_LABEL_REBAL_TEST = 'pf-label-rebal-test'
+MARKER_ACCOUNT_REBAL_TEST = 'pf-account-rebal-test'
+LABEL_REBAL_TEST_TOOLTIP = ('Rebalance tester: would rebalancing this label to its shares every 1, 3, 6 or 12 '
+                            'months have beaten holding? A what-if; places no orders')
+ACCOUNT_REBAL_TEST_LABEL = 'Rebalance tester'
+ACCOUNT_REBAL_TEST_TOOLTIP = ('Would rebalancing the whole account (or one label) back to target every 1, 3, 6 or 12 '
+                              'months have beaten holding? A what-if; places no orders')
 #: The orange count beside that icon: symbols in the label whose share is 0% or
 #: unset. Marked because its text is a bare integer that repeats all over the row.
 MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
@@ -2406,6 +2418,32 @@ def _open_label_growth(account_id: int, live: Dict[str, Any], label: str) -> Non
                       excluded=excluded, unset=unset)
 
 
+def rebalance_tester_inputs(live: Dict[str, Any]):
+    """``(label_shares, label_targets, outside)`` for the rebalance tester, AS THE PAGE SHOWS IT NOW: every label's
+    effective split (``label_growth_split``, the growth simulator's), the live label targets, and per label the
+    sentence naming the symbols outside its split. Reads ``live`` only."""
+    label_shares, outside = {}, {}
+    for view in live['views']:
+        shares, excluded, unset = label_growth_split(live, view.label)
+        label_shares[view.label] = shares
+        outside[view.label] = outside_split_text(excluded, unset)
+    return label_shares, _label_targets(live), outside
+
+
+def _open_rebalance_tester(account_id: int, live: Dict[str, Any], scope: str) -> None:
+    """The rebalance icon on a label's header (``scope`` = the label) and the account button under the list
+    (``scope`` = ``REBALANCE_ACCOUNT_SCOPE``). Read-only what-if, fetched on click like the growth simulator; the
+    distributions come from FMP, so with no key it says which setting is missing."""
+    api_key = get_app_setting('FMP_API_KEY')
+    if not api_key:
+        ui.notify('FMP API key not configured. Please set FMP_API_KEY in '
+                  'Settings > App Settings.', type='warning')
+        return
+    label_shares, targets, outside = rebalance_tester_inputs(live)
+    open_rebalance_tester(account_id, label_shares, targets, scope=scope, api_key=api_key,
+                          as_of=date.today(), outside=outside)
+
+
 def _display_names_for(symbols) -> Dict[str, str]:
     """``{SYMBOL: company name}`` for the info panel, fetching what is not on file.
 
@@ -3900,6 +3938,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 .on('click.stop',
                     lambda _e=None, lbl=view.label: _open_label_growth(account_id, live, lbl)) \
                 .tooltip(LABEL_GROWTH_SIM_TOOLTIP)
+            # The rebalance tester, beside it. ``pf-b-sim`` too: it takes the simulator icon's phone sizing and slot.
+            ui.icon('autorenew').classes('cursor-pointer text-secondary-custom pf-b-sim') \
+                .mark(MARKER_LABEL_REBAL_TEST) \
+                .on('click.stop',
+                    lambda _e=None, lbl=view.label: _open_rebalance_tester(account_id, live, lbl)) \
+                .tooltip(LABEL_REBAL_TEST_TOOLTIP)
             # The ⓘ that took the long clause off the header line. Its tooltip is
             # created ONCE and re-texted on every redraw: calling ``.tooltip()``
             # again would add a second tooltip element, and by the tenth keystroke
@@ -4145,6 +4189,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         live['footer'] = ui.label('').style(TABULAR_NUMS) \
             .mark(MARKER_ALLOCATION_FOOTER)
         ui.label('███ current    ╎ target notch').classes('text-xs text-secondary-custom')
+        ui.button(ACCOUNT_REBAL_TEST_LABEL, icon='autorenew',
+                  on_click=lambda: _open_rebalance_tester(account_id, live, REBALANCE_ACCOUNT_SCOPE)) \
+            .props('outline dense').mark(MARKER_ACCOUNT_REBAL_TEST).tooltip(ACCOUNT_REBAL_TEST_TOOLTIP)
     # The denominators, named ONCE for the whole page. The rows are terse
     # ("tgt 15.0% (real 13.5%)") precisely because this line exists; spelling them
     # out per row is what made the old header a hundred characters long.
