@@ -14,7 +14,8 @@ any database), ``alembic/env.py`` does it for autogenerate, and the stores impor
 FIVE tables (the fifth, ``allocator_frozen``, is the operator's per-symbol freeze): ``allocator_protection`` (+ ``allocator_protection_order`` per broker order),
 ``allocator_exclusion`` (the ONE way a symbol is kept out of allocation: the operator's manual
 "disable") and ``allocator_weight_change`` (the audit trail of the automatic weight reductions a
-protective fill makes).
+protective fill makes). A sixth, ``allocator_rebalance_reminder``, holds the per-account interval of
+the page's "rebalance due" reminder.
 """
 from datetime import datetime as DateTime, timezone
 from typing import Any, Dict, List, Optional
@@ -232,3 +233,20 @@ class AllocatorWeightChange(SQLModel, table=True):
     after_pct: float
     detail: str | None = Field(default=None, description="'TP1 filled: 4 of 10 protected sh sold @ 61.5'")
     created_at: DateTime = Field(default_factory=_utcnow, index=True)
+
+
+class AllocatorRebalanceReminder(SQLModel, table=True):
+    """The account's "rebalance due" reminder interval, in whole months (the SIXTH table here).
+
+    One row per account, written only when the operator changes the interval on the allocator page;
+    ABSENT == the documented default (``core.allocator_rebalance_reminder.DEFAULT_REMINDER_MONTHS``),
+    so nothing needs migrating. Display only: the reminder points at the page's existing Review and
+    Submit flow and never places, schedules or pre-accepts an order. In-tree for the same reason as
+    the tables above: live-page state the backtest engine never reads.
+    """
+    __tablename__ = "allocator_rebalance_reminder"
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True, unique=True)
+    interval_months: int = Field(description="Remind when the last completed rebalance run is this many months old")
+    updated_at: DateTime = Field(default_factory=_utcnow)

@@ -15,10 +15,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REVISION_FILE = ROOT / "alembic/versions/a7c3e91d5b24_add_allocator_protection_tables.py"
 EXPECTED_QTY_FILE = ROOT / "alembic/versions/b8d1f4a29c63_allocator_protection_expected_qty.py"
 FROZEN_FILE = ROOT / "alembic/versions/d5a1f93e2c70_add_allocator_frozen_table.py"
+REMINDER_FILE = ROOT / "alembic/versions/e3b7c5a91f20_add_allocator_rebalance_reminder.py"
 TABLES = ["allocator_protection", "allocator_protection_order", "allocator_exclusion",
           "allocator_weight_change"]
 #: the freeze table has its own (later) revision; the first-revision tests above build TABLES only
-ALL_TABLES = TABLES + ["allocator_frozen"]
+ALL_TABLES = TABLES + ["allocator_frozen", "allocator_rebalance_reminder"]
 
 
 def _load(path=None):
@@ -41,6 +42,7 @@ def migrated(tmp_path):
     _run(engine, "upgrade")
     _run(engine, "upgrade", EXPECTED_QTY_FILE)
     _run(engine, "upgrade", FROZEN_FILE)
+    _run(engine, "upgrade", REMINDER_FILE)
     return engine
 
 
@@ -93,6 +95,7 @@ def test_upgrade_twice_is_harmless(migrated):
 
 
 def test_downgrade_drops_every_table_and_tolerates_a_gap(migrated):
+    _run(migrated, "downgrade", REMINDER_FILE)
     _run(migrated, "downgrade", FROZEN_FILE)
     _run(migrated, "downgrade")
     assert [t for t in inspect(migrated).get_table_names() if t.startswith("allocator_")] == []
@@ -148,7 +151,8 @@ def test_frozen_revision_chains_on_the_previous_head_and_is_the_single_head():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert script.get_heads() == ["d5a1f93e2c70"]
+    assert len(script.get_heads()) == 1
+    # d5a1f93e2c70 is no longer the head (e3b7c5a91f20 chains onto it) but stays on the one line
     assert script.get_revision("d5a1f93e2c70").down_revision == "c4e7a9d2f1b8"
 
 
@@ -159,3 +163,24 @@ def test_frozen_revision_is_idempotent_and_has_one_row_per_account_and_symbol(mi
     _run(migrated, "downgrade", FROZEN_FILE)
     assert "allocator_frozen" not in inspect(migrated).get_table_names()
     _run(migrated, "downgrade", FROZEN_FILE)        # nothing left: still fine
+
+
+def test_reminder_revision_chains_on_the_frozen_revision_and_is_the_single_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    assert script.get_heads() == ["e3b7c5a91f20"]
+    assert script.get_revision("e3b7c5a91f20").down_revision == "d5a1f93e2c70"
+
+
+def test_reminder_revision_is_idempotent_one_row_per_account_and_downgrades(migrated, tmp_path):
+    _run(migrated, "upgrade", REMINDER_FILE)          # twice is harmless
+    indexes = {i["name"]: i for i in inspect(migrated).get_indexes("allocator_rebalance_reminder")}
+    assert indexes["ix_allocator_rebalance_reminder_account_id"]["unique"]
+    _run(migrated, "downgrade", REMINDER_FILE)
+    assert "allocator_rebalance_reminder" not in inspect(migrated).get_table_names()
+    # create_all got there first (the app started on this branch before the upgrade): still a no-op
+    engine = create_engine(f"sqlite:///{tmp_path / 'r.sqlite'}")
+    SQLModel.metadata.create_all(engine, tables=[SQLModel.metadata.tables["allocator_rebalance_reminder"]])
+    _run(engine, "upgrade", REMINDER_FILE)
+    assert "allocator_rebalance_reminder" in inspect(engine).get_table_names()

@@ -90,6 +90,12 @@ under the label list (whole account), open the REBALANCE TESTER
 (``rebalance_tester_dialog.py``): would rebalancing to target every 1 / 3 / 6 / 12
 months have beaten holding. Read-only, same data path; it places no orders.
 
+Above the label list, the "REBALANCE DUE" reminder (``ui/utils/rebalance_reminder.py``,
+store ``core/allocator_rebalance_reminder.py``): due when the last completed REBALANCE
+run is older than the account's interval (default 3 months), or when there is none.
+Its button is the toolbar's own Review and Submit handler, so it opens the same dry
+run and nothing is ordered before Submit there. It schedules nothing.
+
 This repo uses no ``ui.refreshable`` / ``ui.stepper`` / ``ui.aggrid``: refresh is
 ``container.clear()`` followed by rebuilding inside ``with container:``. Blocking
 broker work goes through ``asyncio.to_thread``.
@@ -203,6 +209,9 @@ from ..utils.portfolio_allocation_view import effective_symbol_weights
 from .allocator_protection_dialog import open_protection_dialog
 from .label_growth_dialog import open_label_growth, outside_split_text
 from .rebalance_tester_dialog import ACCOUNT_SCOPE as REBALANCE_ACCOUNT_SCOPE, open_rebalance_tester
+from ...core.allocator_rebalance_reminder import (
+    MAX_REMINDER_MONTHS, get_reminder_months, last_rebalance_run_at, set_reminder_months)
+from ..utils.rebalance_reminder import RebalanceReminder, rebalance_reminder
 from .portfolio_allocation_wizard import (
     notify_outcomes, open_allocation_wizard, open_invest_scope, render_income_panel,
     phone_card_css as wizard_phone_card_css,
@@ -2444,6 +2453,40 @@ def _open_rebalance_tester(account_id: int, live: Dict[str, Any], scope: str) ->
                           as_of=date.today(), outside=outside)
 
 
+#: The "rebalance due" reminder above the label list (see ``_render_rebalance_reminder``).
+MARKER_REBAL_REMINDER = 'pf-rebal-reminder'
+MARKER_REBAL_REMINDER_REVIEW = 'pf-rebal-reminder-review'
+MARKER_REBAL_REMINDER_INTERVAL = 'pf-rebal-reminder-interval'
+REBAL_REMINDER_REVIEW_TOOLTIP = ('The same Review and Submit as the toolbar: solves the plan on the current '
+                                 'targets and opens the order preview. Nothing is ordered until you press '
+                                 'Submit there.')
+
+
+def _load_rebalance_reminder(account_id: int):
+    """``(last completed rebalance run time or None, interval months)``. DB reads only; blocking."""
+    return last_rebalance_run_at(account_id), get_reminder_months(account_id)
+
+
+def _render_rebalance_reminder(reminder: RebalanceReminder, *, on_review, on_interval) -> None:
+    """The reminder. DUE (or no run on record): a warning banner with the dates and a Review and Submit button that
+    calls ``on_review`` -- the toolbar's own handler, so the same dry run and the same Submit. Not due: one muted line.
+    Either way the interval box, which writes only the reminder's own setting."""
+    due = reminder.due
+    with ui.element('div').classes(f"alert-banner {'warning' if due else 'info'} w-full p-2") \
+            .mark(MARKER_REBAL_REMINDER):
+        with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+            ui.label(reminder.text).classes('text-sm' if due else 'text-xs text-secondary-custom')
+            if due:
+                ui.button(REVIEW_BUTTON_LABEL, icon='fact_check', on_click=on_review) \
+                    .props('color=primary dense').mark(MARKER_REBAL_REMINDER_REVIEW) \
+                    .tooltip(REBAL_REMINDER_REVIEW_TOOLTIP)
+            ui.number(label='Remind every (months)', value=reminder.interval_months, min=1,
+                      max=MAX_REMINDER_MONTHS, step=1, format='%.0f',
+                      on_change=lambda e: on_interval(e.value)) \
+                .props('dense outlined hide-bottom-space debounce=600').classes('w-44') \
+                .mark(MARKER_REBAL_REMINDER_INTERVAL)
+
+
 def _display_names_for(symbols) -> Dict[str, str]:
     """``{SYMBOL: company name}`` for the info panel, fetching what is not on file.
 
@@ -4589,6 +4632,8 @@ async def content() -> None:
             return
 
         toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS} {ACTIONS_CLASS}')
+        # The "rebalance due" reminder, redrawn by every refresh (a Submit ends with one).
+        reminder_host = ui.column().classes('w-full gap-1')
         body = ui.column().classes('w-full gap-3')
         # THE INCOME PANEL'S OWN HOME, cleared and refilled by ``_refresh``. It used to
         # be drawn into whatever slot happened to be running ``_refresh``: the Refresh
@@ -4649,6 +4694,7 @@ async def content() -> None:
             body.clear()
             with body:
                 _render_labels(account_id, payload, _refresh)
+            await _draw_reminder()
             # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
             # render path and never joined: a slow provider must not hold the page,
             # and a failed top-up costs a tooltip line rather than the table.
@@ -4744,6 +4790,36 @@ async def content() -> None:
                                                   _refresh, on_progress=_record))
             finally:
                 painter.deactivate()
+
+        async def _draw_reminder() -> None:
+            """The "rebalance due" reminder. Its button IS ``_review`` -- the toolbar's Review and Submit, latch,
+            what-if interlock and all -- so it opens the same dry run and nothing goes out before Submit."""
+            try:
+                last_at, months = await asyncio.to_thread(_load_rebalance_reminder, account_id)
+                reminder = rebalance_reminder(last_at, months, date.today())
+            except Exception as e:
+                logger.error(f"Rebalance reminder for account {account_id} could not be loaded: {e}",
+                             exc_info=True)
+                reminder_host.clear()
+                with reminder_host:
+                    ui.label(f'Rebalance reminder could not be loaded: {e}') \
+                        .classes('text-xs text-orange-400').style(class_color_style('text-orange-400'))
+                return
+            reminder_host.clear()          # right before drawing: overlapping refreshes draw one reminder
+            with reminder_host:
+                _render_rebalance_reminder(reminder, on_review=_review, on_interval=_set_reminder_interval)
+
+        async def _set_reminder_interval(value) -> None:
+            try:
+                await asyncio.to_thread(set_reminder_months, account_id, value)
+            except ValueError as e:
+                ui.notify(str(e), type='warning')
+                return
+            except Exception as e:
+                logger.error(f"Saving the rebalance reminder interval failed: {e}", exc_info=True)
+                ui.notify(f'Could not save the reminder interval: {e}', type='negative')
+                return
+            await _draw_reminder()
 
         async def _apply_simulation() -> None:
             """Re-render on the simulated base, and lock Review while it is on."""
