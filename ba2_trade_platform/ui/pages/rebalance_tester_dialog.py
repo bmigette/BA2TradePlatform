@@ -5,23 +5,27 @@
 label or the whole account, optionally with a tilt toward / against the members that moved. Read-only: it places no
 order, schedules nothing and writes nothing; nothing on the page behind it changes.
 
-The arithmetic is ``ui/utils/rebalance_tester_sim.py`` (pure). The DATA PATH IS THE GROWTH SIMULATOR'S:
-``services.label_growth.fetch_label_growth_inputs`` -- the account's own history source (FMP close / Alpaca store,
-split-adjusted, not dividend-adjusted) plus FMP ``adjDividend`` distributions on the same basis, with its refusals (a
-failed download refuses the whole fetch, never reads as "no history") and its redaction. It runs in
-``asyncio.to_thread``, ONCE per symbol per opening: switching scope fetches only the symbols not yet loaded; changing
-the lookback, cost or tilt only re-runs the arithmetic. Every refusal or error is drawn IN the dialog, never a spinner
+The arithmetic is ``ui/utils/rebalance_tester_sim.py`` (pure). The data is the growth simulator's, read symbol by
+symbol by ``services.rebalance_data.fetch_rebalance_inputs`` (the same per-symbol reads: the account's own history
+source -- FMP close / Alpaca store, split-adjusted, not dividend-adjusted -- and FMP ``adjDividend``; every FMP request
+through ``fmp_common.fmp_http_get``'s shared backoff). NO DEADLINE: a whole account downloads to completion behind a
+determinate progress bar ("n of N", the current symbol) with a Cancel that stops at the next symbol. Symbols already
+downloaded in this dialog stay cached: switching scope, Resume after a Cancel, or Retry after a failure downloads only
+what is missing. A symbol that FAILED is named and the scope is refused (no partial result). Changing the lookback,
+cost or tilt only re-runs the arithmetic. The worker thread only RECORDS progress; a timer in the dialog paints it. Every refusal or error is drawn IN the dialog, never a spinner
 left turning; a closed dialog is deleted and a fetch that lands after it is gone draws nothing. CSS: none of its own
 (inline styles and utility classes only), so nothing here can be dropped by the page's after-await rule.
 """
 import asyncio
+import threading
 from datetime import date
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from nicegui import ui
 
 from ...logger import logger
-from ...services.label_growth import fetch_label_growth_inputs, redacted_reason, symbols_to_fetch
+from ...services.label_growth import redacted_reason, symbols_to_fetch
+from ...services.rebalance_data import fetch_rebalance_inputs
 from ..utils import rebalance_tester_sim as sim
 
 MARKER_REBAL_DIALOG = 'pf-rebal-dialog'
@@ -36,6 +40,14 @@ MARKER_REBAL_WINDOW = 'pf-rebal-window'
 MARKER_REBAL_NOTE = 'pf-rebal-note'
 MARKER_REBAL_CHART = 'pf-rebal-chart'
 MARKER_REBAL_TABLE = 'pf-rebal-table'
+MARKER_REBAL_PROGRESS = 'pf-rebal-progress'
+MARKER_REBAL_PROGRESS_TEXT = 'pf-rebal-progress-text'
+MARKER_REBAL_CANCEL = 'pf-rebal-cancel'
+MARKER_REBAL_FAILED = 'pf-rebal-failed'
+MARKER_REBAL_CANCELLED = 'pf-rebal-cancelled'
+MARKER_REBAL_RETRY = 'pf-rebal-retry'
+#: Seconds between paints of the download progress.
+PROGRESS_PAINT_S = 0.25
 
 #: The scope key of the whole account (a label can never be named with a leading NUL).
 ACCOUNT_SCOPE = '\x00account'
@@ -93,7 +105,9 @@ class RebalanceTesterDialog:
         self.api_key = api_key
         self.as_of = as_of
         self.outside = dict(outside or {})
-        self._fetch = fetch or fetch_label_growth_inputs
+        self._fetch = fetch or fetch_rebalance_inputs
+        #: The running download's Cancel; set by the Cancel button, by a newer download, and by closing the dialog.
+        self._cancel: Optional[threading.Event] = None
         self.params = sim.RebalanceParams()
         self.closes: Dict[str, Dict[str, float]] = {}
         self.distributions: Dict[str, Any] = {}
@@ -171,6 +185,8 @@ class RebalanceTesterDialog:
         self.dialog.close()
 
     def _dispose(self) -> None:
+        if self._cancel is not None:
+            self._cancel.set()              # a closed dialog stops its download at the next symbol
         if not self.dialog.is_deleted:
             self.dialog.delete()
 
@@ -179,8 +195,9 @@ class RebalanceTesterDialog:
 
     # -- data ------------------------------------------------------------------------------------------------------
     async def run(self) -> None:
-        """Fetch whatever the current scope still lacks, then compute and draw. Never raises: every failure is drawn
-        in the dialog (and logged). A run superseded by a later scope change draws nothing."""
+        """Download whatever the current scope still lacks (with progress and Cancel), then compute and draw. Never
+        raises: every failure is drawn in the dialog (and logged). A run superseded by a later scope change draws
+        nothing, but what it downloaded is kept."""
         self._generation += 1
         generation = self._generation
         scope = self.scope
@@ -191,24 +208,53 @@ class RebalanceTesterDialog:
             self._render_error('The test cannot run on this split.', _message(e))
             return
         if missing:
-            self._spinner()
+            if self._cancel is not None:
+                self._cancel.set()          # an older scope's download stops at its next symbol
+            cancel = threading.Event()
+            self._cancel = cancel
+            sink = {'done': 0, 'total': len(missing), 'symbol': ''}
+
+            def _record(done: int, total: int, symbol: str) -> None:
+                sink['done'], sink['total'], sink['symbol'] = done, total, symbol
+
+            self._render_progress(sink, cancel)
             try:
-                inputs = await asyncio.to_thread(self._fetch, self.account_id, missing, as_of=self.as_of,
-                                                 api_key=self.api_key)
+                fetched = await asyncio.to_thread(self._fetch, self.account_id, missing, as_of=self.as_of,
+                                                  api_key=self.api_key, on_progress=_record, cancel=cancel)
             except Exception as e:  # noqa: BLE001 -- any provider failure is SHOWN in the dialog, and logged
                 reason = redacted_reason(e)
-                logger.error(f"rebalance tester: loading {missing} for account {self.account_id} failed: {reason}")
+                logger.error(f"rebalance tester: loading {len(missing)} symbol(s) for account {self.account_id} "
+                             f"failed: {reason}")
                 if not self._gone() and generation == self._generation:
                     self._render_error('The prices or distributions could not be loaded.', reason)
                 return
-            self.closes.update(inputs.closes)
-            self.distributions.update(inputs.distributions)
-            self.fetched.update(missing)
-            self.price_source = inputs.price_source
-        if self._gone():
-            logger.info("rebalance tester: closed before its data arrived; nothing drawn")
-            return
-        if generation != self._generation:
+            finally:
+                if self._cancel is cancel:
+                    self._cancel = None
+            # Keep every COMPLETE symbol, even from a superseded or cancelled run; failed ones are never cached.
+            self.closes.update(fetched.closes)
+            self.distributions.update(fetched.distributions)
+            self.fetched.update(fetched.completed)
+            self.price_source = fetched.price_source
+            if self._gone():
+                logger.info("rebalance tester: closed before its data arrived; nothing drawn")
+                return
+            if generation != self._generation:
+                return
+            if fetched.failed:
+                self._render_failed(fetched)
+                return
+            if fetched.cancelled:
+                self._render_cancelled(fetched)
+                return
+            wanted = symbols_to_fetch(weights)
+            if wanted and not any(s in self.closes for s in wanted):
+                # Every symbol empty is a source problem far more often than a scope of unlisted symbols.
+                self._render_error('The price source returned no history.',
+                                   f"The price source ({fetched.price_source}) returned no history for any of "
+                                   f"{', '.join(wanted)}; see the log.")
+                return
+        if self._gone() or generation != self._generation:
             return
         self._recompute()
 
@@ -274,6 +320,57 @@ class RebalanceTesterDialog:
                     ui.label(headline).classes('text-base')
                 ui.label(detail).classes('text-sm').style(_ERROR)
 
+    def _render_progress(self, sink: Dict[str, Any], cancel: threading.Event) -> None:
+        """The download's progress: "n of N", the current symbol, a determinate bar and Cancel. Painted by a timer
+        from ``sink`` (the worker thread only records into it: an element touched from the thread has no client)."""
+        self.body.clear()
+        with self.body:
+            text = ui.label('Starting the download…').classes('text-sm').mark(MARKER_REBAL_PROGRESS_TEXT)
+            bar = ui.linear_progress(value=0.0, show_value=False, size='8px').classes('w-full') \
+                .mark(MARKER_REBAL_PROGRESS)
+            note = ui.label('Prices and distributions are downloaded one symbol at a time; nothing is ordered.') \
+                .classes('text-xs').style(_MUTED)
+
+            def _cancel() -> None:
+                cancel.set()
+                button.disable()
+                note.set_text('Cancelling after the current symbol… what is downloaded stays loaded.')
+
+            button = ui.button('Cancel', icon='stop', on_click=_cancel).props('outline dense') \
+                .mark(MARKER_REBAL_CANCEL)
+
+            def _paint() -> None:
+                text.set_text(progress_text(sink['done'], sink['total'], sink['symbol']))
+                bar.set_value(progress_fraction(sink['done'], sink['total']))
+
+            ui.timer(PROGRESS_PAINT_S, _paint)
+
+    def _render_failed(self, fetched) -> None:
+        """Some symbols failed after the shared retries: name them and refuse the scope; Retry downloads only them."""
+        names = sorted(fetched.failed)
+        self.body.clear()
+        with self.body:
+            with ui.card().classes('w-full p-4').mark(MARKER_REBAL_FAILED):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('error_outline', color='negative')
+                    ui.label(f"{len(names)} of {fetched.total} symbol(s) could not be downloaded, so this scope "
+                             f"has no result.").classes('text-base')
+                for sym in names:
+                    ui.label(f"{sym}: {fetched.failed[sym]}").classes('text-sm').style(_ERROR)
+                ui.label(f"The {len(fetched.completed)} downloaded symbol(s) are kept; Retry downloads only the "
+                         f"failed ones.").classes('text-xs').style(_MUTED)
+                ui.button('Retry', icon='refresh', on_click=self._start_run).props('outline dense') \
+                    .mark(MARKER_REBAL_RETRY)
+
+    def _render_cancelled(self, fetched) -> None:
+        self.body.clear()
+        with self.body:
+            with ui.card().classes('w-full p-4').mark(MARKER_REBAL_CANCELLED):
+                ui.label(f"Download cancelled: {len(fetched.completed)} of {fetched.total} symbol(s) downloaded "
+                         f"and kept.").classes('text-base')
+                ui.button('Resume', icon='play_arrow', on_click=self._start_run).props('outline dense') \
+                    .mark(MARKER_REBAL_RETRY)
+
     def _render(self, scope_notes: Sequence[str]) -> None:
         res = self.result
         self.body.clear()
@@ -303,6 +400,16 @@ class RebalanceTesterDialog:
                      f"REINVESTED on their ex-date (total return). Rebalances at the last session of a month; "
                      f"turnover counts buys and sells. Drawdown Δ: positive = shallower than hold. No taxes, no "
                      f"spreads beyond the cost above.").classes('text-xs').style(_MUTED)
+
+
+def progress_text(done: int, total: int, symbol: str) -> str:
+    """ "Downloading ...: 12 of 90 symbols — AAPL" (``done`` = symbols finished; the current one is ``done + 1``)."""
+    current = f" — {symbol}" if symbol else ''
+    return f"Downloading prices and distributions: {min(done + 1, total)} of {total} symbols{current}"
+
+
+def progress_fraction(done: int, total: int) -> float:
+    return 0.0 if total <= 0 else min(1.0, done / total)
 
 
 def open_rebalance_tester(account_id: int, label_shares: Mapping[str, Mapping[str, float]],

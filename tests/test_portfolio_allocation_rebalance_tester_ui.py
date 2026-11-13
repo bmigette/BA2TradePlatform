@@ -10,7 +10,7 @@ import pytest
 import tests.test_portfolio_allocation_page as pagetests
 from ba2_trade_platform.core.portfolio_allocation_store import set_managed_label
 from ba2_trade_platform.services.errors import PriceSourceUnreachable
-from ba2_trade_platform.services.label_growth import LabelGrowthInputs
+from ba2_trade_platform.services.rebalance_data import RebalanceFetchResult
 from ba2_trade_platform.ui.pages import portfolio_allocation as page
 from ba2_trade_platform.ui.pages import rebalance_tester_dialog as dlg
 from ba2_trade_platform.ui.utils import label_growth_sim as gsim
@@ -34,19 +34,28 @@ def _rising(start, per_day):
 CLOSES = {'AAPL': _rising(100.0, 0.05), 'MSFT': _flat(300.0), 'JEPI': _rising(50.0, 0.01)}
 
 
-def _inputs_for(symbols, closes=CLOSES):
-    have = {s: closes[s] for s in symbols if s in closes}
-    return LabelGrowthInputs(as_of=AS_OF, start=gsim.history_start(AS_OF), closes=have,
-                             distributions={s: gsim.DistributionHistory(events=()) for s in have},
-                             price_source='fmp')
+def _inputs_for(symbols, closes=CLOSES, failed=None):
+    """What ``fetch_rebalance_inputs`` returns for ``symbols``: ``failed`` = ``{symbol: reason}`` that failed."""
+    failed = dict(failed or {})
+    done = sorted(s for s in symbols if s not in failed)
+    have = {s: closes[s] for s in done if s in closes}
+    return RebalanceFetchResult(price_source='fmp', total=len(symbols), completed=done, closes=have,
+                                distributions={s: gsim.DistributionHistory(events=()) for s in have},
+                                failed={s: r for s, r in failed.items() if s in symbols})
 
 
-def _recording_fetch(closes=CLOSES):
+def _recording_fetch(closes=CLOSES, failing=None):
+    """A stand-in for ``fetch_rebalance_inputs``: records each call's symbols, reports progress per symbol like the
+    real one, and fails the symbols in ``failing`` (a dict that the test may empty to let a retry succeed)."""
     calls = []
+    failing = failing if failing is not None else {}
 
-    def fetch(account_id, symbols, *, as_of, api_key):
+    def fetch(account_id, symbols, *, as_of, api_key, on_progress=None, cancel=None):
         calls.append(sorted(symbols))
-        return _inputs_for(symbols, closes)
+        for i, s in enumerate(sorted(symbols)):
+            if on_progress is not None:
+                on_progress(i, len(symbols), s)
+        return _inputs_for(symbols, closes, failing)
     return calls, fetch
 
 
@@ -109,7 +118,7 @@ def test_the_label_icon_opens_the_tester_on_that_label(monkeypatch, nicegui_clie
     pagetests._fmp_key(monkeypatch)
     pagetests._freeze_today(monkeypatch, AS_OF)
     calls, fetch = _recording_fetch()
-    monkeypatch.setattr(dlg, 'fetch_label_growth_inputs', fetch)
+    monkeypatch.setattr(dlg, 'fetch_rebalance_inputs', fetch)
     root = pagetests._draw(nicegui_client, account_id, _two_labels(account_id))
     icon = pagetests._marked(root, page.MARKER_LABEL_REBAL_TEST)[1]          # Income
     _click(nicegui_client, icon)
@@ -127,7 +136,7 @@ def test_the_account_button_opens_the_whole_account_scope(monkeypatch, nicegui_c
     pagetests._fmp_key(monkeypatch)
     pagetests._freeze_today(monkeypatch, AS_OF)
     calls, fetch = _recording_fetch()
-    monkeypatch.setattr(dlg, 'fetch_label_growth_inputs', fetch)
+    monkeypatch.setattr(dlg, 'fetch_rebalance_inputs', fetch)
     seen = {}
     real_open = page.open_rebalance_tester
 
@@ -153,7 +162,7 @@ def test_without_an_fmp_key_it_says_so_and_opens_nothing(monkeypatch, nicegui_cl
     pagetests._fmp_key(monkeypatch, value='')
     sent = pagetests._capture_notifications(monkeypatch)
     calls, fetch = _recording_fetch()
-    monkeypatch.setattr(dlg, 'fetch_label_growth_inputs', fetch)
+    monkeypatch.setattr(dlg, 'fetch_rebalance_inputs', fetch)
     root = pagetests._draw(nicegui_client, account_id, _two_labels(account_id))
     _click(nicegui_client, pagetests._marked(root, page.MARKER_LABEL_REBAL_TEST)[0])
     assert calls == []
@@ -170,7 +179,7 @@ def test_opening_and_using_the_tester_writes_nothing(monkeypatch, nicegui_client
     set_managed_label(account_id, 'ARK26', target_pct=60.0)
     pagetests._fmp_key(monkeypatch)
     calls, fetch = _recording_fetch()
-    monkeypatch.setattr(dlg, 'fetch_label_growth_inputs', fetch)
+    monkeypatch.setattr(dlg, 'fetch_rebalance_inputs', fetch)
     root = pagetests._draw(nicegui_client, account_id, _two_labels(account_id))
 
     def counts():
@@ -279,8 +288,10 @@ def test_a_dialog_closed_during_the_fetch_finishes_quietly(nicegui_client, monke
     monkeypatch.setattr(dlg.logger, 'error', lambda msg, *a, **k: errors.append(str(msg)))
     holder = {}
 
-    def fetch(account_id, symbols, *, as_of, api_key):
-        holder['d'].dialog.delete()
+    def fetch(account_id, symbols, *, as_of, api_key, on_progress=None, cancel=None):
+        holder['cancel'] = cancel
+        holder['d'].dialog.delete()          # the dialog's close handler is not run by a bare delete(): dispose it
+        holder['d']._dispose()
         return _inputs_for(symbols)
 
     async def _run():
@@ -290,6 +301,7 @@ def test_a_dialog_closed_during_the_fetch_finishes_quietly(nicegui_client, monke
             await asyncio.gather(holder['d'].load_task, return_exceptions=True)
     asyncio.run(_run())
     assert holder['d'].load_task.exception() is None and holder['d'].result is None and errors == []
+    assert holder['cancel'].is_set()                 # closing stops the download at its next symbol
 
 
 def test_closing_the_dialog_deletes_it(nicegui_client):
@@ -312,3 +324,83 @@ def test_the_page_inputs_are_the_live_effective_splits_and_targets():
     assert shares == {'A': pytest.approx({'AAPL': 100.0}), 'B': {'JEPI': 100.0}}
     assert targets == {'A': 60.0, 'B': 40.0}
     assert 'TSLA (excluded' in outside['A'] and 'NVDA (no share set)' in outside['B']
+
+
+# ---------------------------------------------------------------------------
+# the progressive download (owner request 2026-11-13)
+# ---------------------------------------------------------------------------
+
+def _press_in(client, button):
+    """A dialog button: its handler starts a task, so run it inside the client and let the task finish."""
+    async def _run():
+        with client:
+            for listener in button._event_listeners.values():
+                if listener.type == 'click':
+                    pagetests._drive(listener.handler, None)
+            await _settle()
+    asyncio.run(_run())
+
+
+def test_a_failed_symbol_is_named_the_scope_refused_and_retry_fetches_only_it(nicegui_client):
+    failing = {'MSFT': 'FMPError: FMP historical-price-full failed for MSFT after 4 attempts (last: HTTP 429)'}
+    calls, fetch = _recording_fetch(failing=failing)
+    d = _open(nicegui_client, SHARES, TARGETS, 'ARK26', fetch)
+    assert calls == [['AAPL', 'MSFT']]
+    assert d.result is None                                         # no partial result
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_FAILED)
+    assert not _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_TABLE)
+    texts = _texts(nicegui_client)
+    assert any(t.startswith('MSFT: FMPError') and 'HTTP 429' in t for t in texts)
+    assert any('1 of 2 symbol(s) could not be downloaded' in t for t in texts)
+    assert d.fetched == {'AAPL'}                                    # the good one is cached, the failed one is not
+    failing.clear()                                                 # the source recovers
+    _press_in(nicegui_client, _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_RETRY)[0])
+    assert calls == [['AAPL', 'MSFT'], ['MSFT']]                    # retry downloads ONLY the failed symbol
+    assert d.result is not None and d.result.refusal is None
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_TABLE)
+
+
+def test_cancel_keeps_what_was_downloaded_and_resume_fetches_the_rest(nicegui_client):
+    calls = []
+
+    def fetch(account_id, symbols, *, as_of, api_key, on_progress=None, cancel=None):
+        calls.append(sorted(symbols))
+        if len(calls) == 1:                  # the user pressed Cancel after the first symbol
+            first = sorted(symbols)[:1]
+            result = _inputs_for(first)
+            result.total, result.cancelled = len(symbols), True
+            return result
+        return _inputs_for(symbols)
+
+    d = _open(nicegui_client, SHARES, TARGETS, dlg.ACCOUNT_SCOPE, fetch)
+    assert calls == [['AAPL', 'JEPI', 'MSFT']]
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_CANCELLED) and d.result is None
+    assert any('Download cancelled: 1 of 3 symbol(s) downloaded and kept.' in t for t in _texts(nicegui_client))
+    _press_in(nicegui_client, _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_RETRY)[0])
+    assert calls == [['AAPL', 'JEPI', 'MSFT'], ['JEPI', 'MSFT']]
+    assert d.result is not None and d.result.refusal is None
+
+
+def test_the_cancel_button_sets_the_downloads_cancel(nicegui_client):
+    seen = {}
+
+    def fetch(account_id, symbols, *, as_of, api_key, on_progress=None, cancel=None):
+        seen['cancel'] = cancel
+        button = _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_CANCEL)[0]     # drawn before the download
+        for listener in button._event_listeners.values():
+            if listener.type == 'click':
+                pagetests._drive(listener.handler, None)
+        seen['set_by_button'] = cancel.is_set()
+        result = _inputs_for([])
+        result.total, result.cancelled = len(symbols), True
+        return result
+
+    _open(nicegui_client, SHARES, TARGETS, 'ARK26', fetch)
+    assert seen['set_by_button'] is True
+    assert _marked_anywhere(nicegui_client, dlg.MARKER_REBAL_CANCELLED)
+
+
+def test_the_progress_shows_n_of_N_and_the_current_symbol():
+    assert dlg.progress_text(0, 90, 'AAPL') == 'Downloading prices and distributions: 1 of 90 symbols — AAPL'
+    assert dlg.progress_text(89, 90, 'ZTS').startswith('Downloading prices and distributions: 90 of 90 symbols')
+    assert dlg.progress_fraction(45, 90) == 0.5 and dlg.progress_fraction(0, 0) == 0.0

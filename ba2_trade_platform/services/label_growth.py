@@ -77,6 +77,16 @@ def distribution_events_from_fmp(payload: Any) -> Tuple[Tuple[str, Optional[floa
     return tuple((e.ex_date.isoformat(), e.adj_dividend) for e in parse_dividends(payload))
 
 
+def distribution_history(api_key: str, symbol: str) -> DistributionHistory:
+    """ONE symbol's distribution history (``adjDividend`` per ex-date). The single per-symbol read: this module's
+    workers and the rebalance tester both call it. The request is ``ba2_providers.symbol_info.fetch_dividends`` ->
+    ``_get_json`` -> ``fmp_common.fmp_http_get`` (429/5xx backoff, Retry-After, the process-wide FMP gate) behind the
+    24 h ``fmp_live_cached`` cache; nothing here retries. Raises ``FMPError`` / ``OSError`` / ``ValueError`` on a
+    failed fetch or an FMP error body."""
+    from ba2_providers.symbol_info import fetch_dividends
+    return DistributionHistory(events=distribution_events_from_fmp(fetch_dividends(api_key, symbol)))
+
+
 def _history_source(account_id: int) -> str:
     from ..core.account_history import history_source_for_account
     return history_source_for_account(account_id)
@@ -131,7 +141,7 @@ def fetch_distributions(api_key: str, symbols: List[str], *,
 
     A symbol whose fetch failed, that was still running at the deadline, or that never got a slot (all busy) gets
     ``events=None`` and the reason. Results that arrive after the deadline are ignored."""
-    from ba2_providers.symbol_info import FMPError, fetch_dividends
+    from ba2_providers.symbol_info import FMPError
     deadline = DIVIDEND_DEADLINE_S if deadline_s is None else deadline_s
     out: Dict[str, DistributionHistory] = {}
     if not symbols:
@@ -155,7 +165,7 @@ def fetch_distributions(api_key: str, symbols: List[str], *,
                         return
                     sym = queue.pop(0)
                 try:
-                    found = DistributionHistory(events=distribution_events_from_fmp(fetch_dividends(api_key, sym)))
+                    found = distribution_history(api_key, sym)
                 except (FMPError, OSError, ValueError) as e:
                     reason = redacted_reason(e)
                     logger.error(f"label growth: distribution history for {sym} could not be fetched: {reason}")

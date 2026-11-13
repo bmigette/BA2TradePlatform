@@ -64,6 +64,22 @@ def _provider(account_id: int):
     return history_provider_for_account(account_id)
 
 
+def history_provider(account_id: int):
+    """The account's own history provider (FMP or its Alpaca store), the one every fetch on this path reads."""
+    return _provider(account_id)
+
+
+def daily_closes(provider, symbol: str, start: date, *, now: Optional[datetime] = None) -> Dict[str, float]:
+    """ONE symbol's ``{YYYY-MM-DD: close}`` from ``start`` through ``now`` from ``provider`` (see
+    :func:`history_provider`). The single per-symbol read of this module: ``fetch_closes`` runs it in its workers and the
+    allocator's rebalance tester calls it symbol by symbol. The provider's own request path applies (for FMP:
+    ``ba2_providers.fmp_common.fmp_http_get`` -- 429/5xx backoff and the process-wide FMP gate); nothing here retries.
+    Raises whatever the provider raises; ``{}`` = the source has nothing for the window."""
+    begin = datetime.combine(start, datetime.min.time())
+    return closes_from_frame(provider.get_ohlcv_data(symbol, start_date=begin, end_date=now or datetime.now(),
+                                                     interval='1d'))
+
+
 def redact_message(text: str) -> str:
     """``text`` with credentials masked: FMP's ``apikey=`` (``fmp_common.redact``) and every other URL / header
     secret the platform log redaction knows (``log_redaction.redact_text``). Idempotent."""
@@ -111,8 +127,7 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
         return out
     providers = {aid: _provider(aid) for aid in by_account}     # a bad source setting is a ValueError (Unmeasurable)
     now = datetime.now()
-    begin = datetime.combine(start, datetime.min.time())
-    slots = sum(1 for _ in range(min(WORKERS, len(jobs))) if _SLOTS.acquire(blocking=False))
+    slots =sum(1 for _ in range(min(WORKERS, len(jobs))) if _SLOTS.acquire(blocking=False))
     if slots == 0:
         raise PriceSourceUnreachable("The price source is busy: every download slot is in use",
                                      {"busy": True, "slots": MAX_CONCURRENT})
@@ -129,8 +144,7 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
                         return
                     aid, sym = queue.pop(0)
                 try:
-                    closes = closes_from_frame(providers[aid].get_ohlcv_data(
-                        sym, start_date=begin, end_date=now, interval='1d'))
+                    closes = daily_closes(providers[aid], sym, start, now=now)
                 except Exception as e:  # noqa: BLE001 -- a provider raises its own types; one symbol's failure = unpriced
                     reason = _redacted(e)
                     logger.warning(f"price history fetch failed for {sym}: {reason}")
