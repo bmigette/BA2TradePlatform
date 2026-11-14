@@ -190,8 +190,8 @@ def _same_process(run, ident: Dict[str, Any]) -> bool:
 def _opt_row_key(db, opt_id: int) -> Optional[str]:
     """The optimization row's random identity (``optimization_config[ROW_KEY]``), or None."""
     from app.models.strategy_optimization import StrategyOptimization as SO
-    row = db.get(SO, opt_id)
-    return None if row is None else (row.optimization_config or {}).get(ROW_KEY)
+    cfg = db.query(SO.optimization_config).filter(SO.id == opt_id).scalar()  # never all_results
+    return (cfg or {}).get(ROW_KEY)
 
 
 def _bt_row_key(db, bt_id: int) -> Optional[str]:
@@ -438,6 +438,14 @@ def _refuse_unless_dead(name: str, opt_id: int, status: str, run, what: str,
     state, why = judge_runner(run, ignore_ended=ignore_ended)
     if state == DEAD:
         return why
+    if run is None and status == "pending":
+        raise ResumeRefused(
+            f"optimization {name!r} (id={opt_id}) is 'pending' with no runner yet: it is most likely "
+            f"QUEUED (a --submit / UI job waiting for the serve worker), which may still start it, "
+            f"so it is not {what}. Check the serve task queue first (UI: Backtesting -> History -> "
+            f"Running jobs; or the task_queue row of type strategy_optimization whose payload has "
+            f"optimization_id {opt_id}) and cancel that queued task, or wait for it to run. Only if "
+            f"no task holds it any more: " + abandon_hint(name, opt_id, confirm=True))
     if run is None:
         raise ResumeRefused(
             f"optimization {name!r} (id={opt_id}) is {status!r} but no runner was recorded for it "
@@ -777,6 +785,11 @@ def abandon_optimization(db, opt_id: int, reason: str, confirm_not_running: bool
     row = db.get(SO, opt_id)
     if row is None:
         raise ResumeRefused(f"optimization {opt_id} does not exist")
+    if row.name and f"~abandoned-{opt_id}" in row.name:
+        return {"already": True, "optimization_id": opt_id, "name": row.name, "renamed": row.name}
+    if row.name and "~interrupted-" in row.name:
+        raise ResumeRefused(f"optimization {opt_id} was already retired by a resume ({row.name!r}; "
+                            f"another row continues it): nothing to abandon")
     if row.status == "completed":
         raise ResumeRefused(f"optimization {opt_id} ({row.name!r}) is completed: not abandoned")
     if not (reason or "").strip():

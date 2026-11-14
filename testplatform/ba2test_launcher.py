@@ -9889,7 +9889,10 @@ def _resolve_chain_seed_source(db, name: str, warm_start_from) -> int:
         sys.exit(f"optimize: --chain-seed-from {name!r}: no optimization has that name")
     if len(rows) > 1:
         sys.exit(f"optimize: --chain-seed-from {name!r}: {len(rows)} optimizations share that name "
-                 f"({', '.join(f'id={i} {st}' for i, st in rows)}); delete the unwanted rows")
+                 f"({', '.join(f'id={i} {st}' for i, st in rows)}). Seed from the completed one "
+                 f"by giving up the others with `ba2-test abandon-interrupted --id <id> --reason "
+                 f"'...'` (each COSTS that row's finished trials; its checkpoint is retired, payload "
+                 f"kept), or retrain the source under a new name")
     if rows[0][1] != "completed":
         sys.exit(f"optimize: --chain-seed-from {name!r}: optimization {rows[0][0]} is "
                  f"{rows[0][1]!r}, not completed")
@@ -10932,6 +10935,10 @@ def _cmd_abandon_interrupted(args) -> int:
             return 2
     finally:
         db.close()
+    if out.get("already"):
+        print(f"abandon-interrupted: optimization #{out['optimization_id']} is already abandoned "
+              f"({out['renamed']!r}); nothing changed.")
+        return 0
     print(f"abandon-interrupted: optimization #{out['optimization_id']} ({out['name']!r}) is now "
           f"{out['renamed']!r}; {out['trials_lost']} finished trial(s) will NOT be reused; "
           + (f"checkpoint {out['checkpoint']} retired as {out['retired_as']} (payload kept)"

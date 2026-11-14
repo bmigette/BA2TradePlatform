@@ -416,3 +416,69 @@ def test_a_kill_while_a_remote_only_job_waits_for_its_workers_is_resumable(stubb
     out = H.handle_strategy_optimization("t", {"optimization_id": new, "resume_of": killed})
     assert out["status"] == "completed", out
     assert _result(new) == {**want, "status": "completed"}
+
+
+# ------------------------------------------------------------------ fourth review
+
+
+def test_abandoning_twice_is_idempotent(stubbed, capsys):
+    name = _uniq("abandon-twice")
+    killed, _ = _kill(name, 18)
+    mod = _launcher()
+    ns = argparse.Namespace(name=None, id=killed, backtest_id=None, reason="test",
+                            confirm_not_running=False)
+    assert mod._cmd_abandon_interrupted(ns) == 0
+    capsys.readouterr()
+    assert mod._cmd_abandon_interrupted(ns) == 0
+    assert "already abandoned" in capsys.readouterr().out
+    db = SessionLocal()
+    try:
+        assert db.get(SO, killed).name == f"{name}~abandoned-{killed}"     # renamed once
+    finally:
+        db.close()
+
+
+def test_a_queued_pending_row_without_runner_says_to_check_the_queue_first(stubbed):
+    name = _uniq("queued")
+    _new_row(_seed_wide_strategy(), name, _config())         # --submit / UI: pending, no runner
+    db = SessionLocal()
+    try:
+        with pytest.raises(R.ResumeRefused) as e:
+            R.plain_launch_gate(db, name)
+    finally:
+        db.close()
+    msg = str(e.value)
+    assert "queued" in msg and "cancel" in msg and "task queue" in msg
+    assert msg.index("cancel") < msg.index("--confirm-not-running")
+
+
+def test_the_row_key_read_never_touches_all_results(stubbed):
+    from sqlalchemy import event
+    oid = _new_row(_seed_wide_strategy(), _uniq("rowkey"), _config())
+    seen = []
+
+    def capture(conn, cursor, statement, *a):
+        seen.append(statement)
+    event.listen(engine, "before_cursor_execute", capture)
+    db = SessionLocal()
+    try:
+        R._opt_row_key(db, oid)
+    finally:
+        db.close()
+        event.remove(engine, "before_cursor_execute", capture)
+    assert seen and not any("all_results" in s for s in seen)
+
+
+def test_the_chain_seed_refusal_states_the_cost_and_names_the_command(stubbed):
+    name = _uniq("chain-dup")
+    _new_row(_seed_wide_strategy(), name, _config())
+    _new_row(_seed_wide_strategy(), name, _config())
+    mod = _launcher()
+    db = SessionLocal()
+    try:
+        with pytest.raises(SystemExit) as e:
+            mod._resolve_chain_seed_source(db, name, None)
+    finally:
+        db.close()
+    msg = str(e.value)
+    assert "share that name" in msg and "abandon-interrupted" in msg and "delete" not in msg.lower()

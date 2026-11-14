@@ -268,3 +268,116 @@ with `optimize --resume-interrupted` when its runner is provably dead
 - **Remote workers:** not tested. The master re-dispatches, and the memo means finished trials are
   not re-sent. A remote worker's trial still running for the killed master is not cancelled (nobody
   is left to cancel it), so it occupies a slot until it ends; its result is never read.
+
+### Operator runbook: stop, start, refusals
+
+**Stop / start.** `bash tools/grid_goal2027.sh stop` kills everything. `start`, with the same PHASE
+and settings from the same checkout, continues where the grid stopped:
+
+| Where the stop landed | What the next start does |
+|---|---|
+| A fold's training (any generation, also before the first trial) | Resumes the job. The dead row becomes `<name>~interrupted-<id>`, and a new row continues from the last checkpoint with every finished trial; nothing finished runs again |
+| The TOP-N persist after training | Re-runs only the missing `TOP<rank>` rows |
+| An out-of-sample test | Re-runs only the genomes whose result was not saved |
+| Between folds / reports | Reuses the stored fold reports (written whole or not at all) |
+
+**Refusals.** The cell goes to ERROR and the log line says which refusal. Never edit or delete rows by
+hand.
+
+| Message says | Meaning | Way out |
+|---|---|---|
+| `LIVE process` | Another process still runs that job (a second grid, an orphan) | Let it finish, or stop it (`grid_goal2027.sh stop`), then `start`: it resumes, nothing is lost |
+| `PAUSED` | A serve task paused the job and that serve still runs | Resume or cancel it in the UI, or stop that serve; then `start` |
+| `UNKNOWN` (start time differs, nothing proves reuse) | Cannot tell whether pid N is still the job | Check `ps -p N -o pid,lstart,args`; stop it if it is the job, then `start` |
+| `another host` | The row belongs to another master | Resume it on that host |
+| `no runner recorded` / `pending with no runner yet` | Started by older code, or a queued `--submit` task | Check the serve task queue first (UI: Backtesting -> History -> Running jobs) and cancel any queued task; then, if no process holds it, abandon it (below) |
+| `is NOT the job this command describes` (lists the differences) | The config, gene space, data digests, rules or code changed since the job started | Run the original command (it resumes), use a new name, or abandon |
+| `code app_version` / `required_package_versions` | The code changed under the job | See `BA2_RESUME_ACROSS_CODE_CHANGE` below, finish on the old checkout, or abandon |
+| `writer is ALIVE / UNKNOWN` (backtest) | A live process may still be saving a re-run row | Let it finish or stop it; if no process writes it, abandon the backtest row |
+| `failed` / `cancelled` | The job failed, and the failure may repeat | Read the error and fix the cause, then abandon to retrain |
+
+**Abandon (the only supported way to give a job up):**
+
+    $PY testplatform/ba2test_launcher.py abandon-interrupted --id <opt_id> --reason "<why>"
+    $PY testplatform/ba2test_launcher.py abandon-interrupted --backtest-id <bt_id> --confirm-not-running --reason "<why>"
+
+Add `--confirm-not-running` only after checking that no process, and no queued task, holds the job.
+Running it twice is harmless. The cost: the job's finished trials are not reused, its checkpoint is
+retired (payload kept in `task_queue`), and the next start trains from generation 0.
+
+**`BA2_RESUME_ACROSS_CODE_CHANGE=1`** lifts only the code-version check; `start` passes it to the
+systemd unit. It is acceptable only when the new code cannot change THIS job's trial results: a fix in
+reporting or in the driver, a broker-only or GA-neutral package change (`ga_neutral_package_paths.py`),
+or docs. Never use it for a change to the backtest engine, an expert, the fitness, the gene space, or
+anything that raised a minimum in `required_package_versions.py`. The new row then records both
+versions in `optimization_config.resumedFrom`.
+
+### End-to-end test recipe (Linux, scratch BA2_HOME, local slots only)
+
+The recipe runs one small job twice: once uninterrupted, and once killed with SIGKILL in the middle of
+a generation and then restarted. Both must end with the same best genome and fitness, the same final
+population and the same set of trials. It takes about 20-40 minutes. Paste the commands into a shell
+on the master host (example: remote227).
+
+```bash
+# 1. a checkout of the branch and a SCRATCH home (its own DB; the cache is the shared one)
+export REPO=/home/debian/ba2-grid/repo-wfresume            # git worktree at feat/wf-resume
+export PY=/opt/ba2worker/ba2-venvs/test/bin/python
+export BA2_HOME=/home/debian/ba2-scratch-wfresume
+mkdir -p $BA2_HOME/test && ln -sfn /opt/ba2worker/Documents/ba2/common $BA2_HOME/common
+export DB_FILE=$BA2_HOME/test/dl_forecasting.db DATABASE_URL=sqlite:///$BA2_HOME/test/dl_forecasting.db
+export PYTHONPATH=$REPO/packages/common:$REPO/packages/providers:$REPO/packages/experts:$REPO/testplatform/backend:$REPO/testplatform
+cd $REPO
+$PY -c 'import app, ba2test_launcher; print(app.__file__, ba2test_launcher.__file__)'   # must be under $REPO
+
+# 2. the FMP key, copied from the grid master's DB (never printed)
+MASTER_DB=/home/debian/ba2-grid/home-goal2027/test/dl_forecasting.db
+$PY -c 'from app.models.database import init_db; init_db()'
+sqlite3 $DB_FILE "ATTACH '$MASTER_DB' AS m; INSERT OR REPLACE INTO appsetting SELECT * FROM m.appsetting WHERE key='FMP_API_KEY';"
+
+# 3. the job (local slots only: no --workers); identical for both runs except the name
+JOB="optimize --expert FMPRating --strategy S2 --universe AAPL,MSFT,NVDA,JPM,XOM \
+  --start 2023-01-01 --end 2024-12-31 --population 16 --generations 4 --parallel 4 --seed 42 \
+  --fitness consistent_annual_return --estimates-source fmp --save-top 2"
+
+# 4. the uninterrupted reference run (foreground)
+$PY testplatform/ba2test_launcher.py $JOB --name e2e-whole 2>&1 | tee e2e-whole.log
+
+# 5. the same job as a transient unit, killed with SIGKILL in the middle of generation 1
+sudo systemd-run --unit=wfresume-e2e -p User=$(id -un) --working-directory=$REPO \
+  --setenv=PYTHONPATH=$PYTHONPATH --setenv=BA2_HOME=$BA2_HOME --setenv=DB_FILE=$DB_FILE \
+  --setenv=DATABASE_URL=$DATABASE_URL --setenv=HOME=$HOME \
+  $PY testplatform/ba2test_launcher.py $JOB --name e2e-cut
+journalctl -u wfresume-e2e -f -n 0 | grep -m1 "Gen 0:"     # generation 0 is checkpointed
+sleep 45                                                   # now inside generation 1
+sudo systemctl kill -s KILL wfresume-e2e; sudo systemctl reset-failed wfresume-e2e
+
+# 6. restart the SAME command. It must print "RESUMING interrupted e2e-cut": the plain launch claims
+#    the dead row (the grid's driver passes --resume-interrupted, which behaves the same)
+$PY testplatform/ba2test_launcher.py $JOB --name e2e-cut 2>&1 | tee e2e-cut.log
+grep -E "RESUMING|continuing optimization|DISCARDING" e2e-cut.log
+
+# 7. compare the two runs, and check that the dead row was kept
+cat > /tmp/e2e_compare.py <<'PYEOF'
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+def get(name):
+    oid, st, fit, params, res = c.execute(
+        "SELECT id, status, best_fitness, best_params, all_results FROM strategy_optimizations "
+        "WHERE name=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    pop = c.execute("SELECT population FROM strategy_optimization_populations "
+                    "WHERE optimization_id=?", (oid,)).fetchone()
+    return st, fit, json.loads(params), sorted(r["key"] for r in json.loads(res)), json.loads(pop[0])
+w, k = get("e2e-whole"), get("e2e-cut")
+for label, a, b in zip(("status", "best_fitness", "best_params", "trial keys", "final population"), w, k):
+    print(f"{label:17s} {'SAME' if a == b else 'DIFFERENT'}")
+print(c.execute("SELECT id, name, status FROM strategy_optimizations "
+                "WHERE name LIKE 'e2e-cut%'").fetchall())
+PYEOF
+$PY /tmp/e2e_compare.py "$DB_FILE"
+```
+
+Expected: every line reads `SAME`, and there are two `e2e-cut` rows: `e2e-cut~interrupted-<id>`
+(failed, kept) and `e2e-cut` (completed). If only the trial keys differ while the best result and the
+population match, a trial stalled or crashed in one run only (an environment issue, not the resume);
+look for `STALLED` or `trial errors` in the logs. Clean up with `rm -rf $BA2_HOME /tmp/e2e_compare.py`.
