@@ -7292,7 +7292,11 @@ def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forw
 
     * universe: a static run takes the current ``--universe``; a screener run reads the current
       ``--screener-store`` (its superset is then recomputed for the test window by
-      ``_test_window_static_universe``, with these exclusions);
+      ``_test_window_static_universe``, with these exclusions). A GATE-ONLY block
+      (``screener_opt.gate_only``, ``--screener-gate-store``: the option grids' per-bar price cap)
+      is a STATIC run: its universe is the static ``--universe``, so it takes the current one, and
+      its gate store is kept as stored (the option walk-forward cell name carries the gate-store
+      path, so a cell is only ever tested with the store it was trained with);
     * exclusions: the stored list PLUS the current one, removed from the universe (an exclusion is
       never lifted by a rebase);
     * market-condition manifests: the current digest per profile, validated for coverage and window
@@ -7302,7 +7306,9 @@ def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forw
     """
     import copy as _copy
     block = _copy.deepcopy(backtest_block)
-    screener = bool(block.get("screener_opt"))
+    # A gate-only screener_opt does not make a screener run (_screener_gate_opt_block: the universe
+    # stays the static --universe and no screener gene is searched).
+    screener = bool(block.get("screener_opt")) and not block["screener_opt"].get("gate_only")
     if screener and spec.get("static_universe") is not None:
         raise ValueError(f"{command}: the run is a screener run; a static --universe cannot replace its universe")
     if not screener and spec.get("screener_store"):
