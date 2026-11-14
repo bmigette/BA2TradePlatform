@@ -4216,6 +4216,14 @@ def _build_warm_start_population(
     if not results:
         return None
     tail = results[-target_size:] if len(results) > target_size else list(results)
+    # Source genes this job does not search are DROPPED: the chromosome has no slot for them, so they can never act
+    # as a trial override (a job's fixed settings, e.g. the --pin-ds-score-weights DS weights, apply instead). Said
+    # loudly, never silently: a warm start from a differently-shaped job is an approximation the log must show.
+    dropped = sorted({k for e in tail for k in (e.get("params") or {}) if k not in optimizer.param_ranges})
+    if dropped:
+        logger.warning(f"warm start from optimization {source_opt.id} ({source_opt.name!r}): {len(dropped)} source "
+                       f"gene(s) are not in this job's gene space and are DROPPED (this job's own settings apply "
+                       f"instead): {dropped}")
     has_stratified = any(c.get("stratify") for c in optimizer.param_ranges.values())
     if has_stratified:
         # A seed from a job without the decision-time gene must not silently become "the first

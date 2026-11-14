@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+from datetime import date
 import os
 import subprocess
 import sys
@@ -494,3 +495,85 @@ class TestGridScript:
         assert run(DS_WEIGHTS="search")[0] == ["--search-ds-factor-weights -dsfw", "rc=0"]
         out, err = run(DS_WEIGHTS="bogus")
         assert out == ["rc=2"] and "DS_WEIGHTS" in err
+
+
+# ----------------------------------------------------------------------------- seeding a pinned job
+#: the factor/section genes a dsfw (searched-weight) job carries and a dspin job does not
+_DSFW_ONLY = {"model:w_technical": 0.2, "model:w_fundamental": 0.7, "model:w_analyst": 0.8, "model:w_earnings": 0.4,
+              "model:tw_mom": 0.0, "model:tw_d200": 0.1, "model:tw_rsi": 0.9, "model:tw_don": 0.9,
+              "model:fw_quality": 1.0, "model:fw_piotroski": 0.0, "model:fw_value": 0.5, "model:fw_growth": 0.5,
+              "model:aw_targets": 1.0, "model:aw_grades": 0.0, "model:mom_lookback_days": 63,
+              "model:analyst_target_window_days": 30, "model:analyst_min_targets": 5}
+
+
+class TestSeedingAPinnedJob:
+    """Every way a pinned job's generation 0 can come from another job: the walk-forward chain seed (by the previous
+    fold's exact name, gene-space checked), ``--warm-start-from`` (lenient encode over this job's genes) and
+    ``--seed-genomes`` / ``seedPopulation`` (strict encode). A seed genome from a dsfw job carries section and
+    factor genes the pinned job does not have: they must never reach a trial as overrides of the pin."""
+
+    @staticmethod
+    def _job():
+        from app.services.genetic import GeneticOptimizer
+        spec = _pinned_spec()
+        strat = _M._build_strategy("S2", "dspin-seed", _DS)
+        space = job_param_space(strat, spec["expert_params"], False)
+        settings = _M._new_job_expert_run_settings(_DS, spec, ["AAPL"], None, strategy_kind="S2")
+        opt = GeneticOptimizer(param_ranges=space, population_size=6, n_generations=1)
+        return strat, space, settings, opt
+
+    @staticmethod
+    def _trial_settings(strat, settings, params):
+        cfg = _build_daily_trial_config(_run_block(settings), decode_params(strat, params), None,
+                                        option_trade_records=False)
+        return cfg["experts"][0]["settings"]
+
+    def test_chain_seed_from_a_dsfw_population_is_refused(self):
+        from app.services.chain_seed import ChainSeedError, build_chain_seed_population, gene_space_signature
+        strat, space, _settings, opt = self._job()
+        dsfw_space = {**space, **{k: {"type": "float", "min": 0.0, "max": 1.0, "step": 0.1} for k in _DSFW_ONLY}}
+        record = {"gene_space": gene_space_signature(dsfw_space), "genes": [[0.0] * len(dsfw_space)],
+                  "fitnesses": [1.0]}
+        src = SimpleNamespace(id=33, name="scr-large-DeterministicScorer-S2-...-dsfw-...-wf1", status="completed",
+                              optimization_config={"backtest": {"end_date": "2023-12-31"}})
+        with pytest.raises(ChainSeedError) as e:
+            build_chain_seed_population(src, record, opt, 6, date(2024, 12, 31))
+        assert "different gene space" in str(e.value) and "model:w_technical" in str(e.value)
+
+    def test_chain_seed_from_the_previous_pinned_fold_keeps_the_pin(self):
+        from app.services.chain_seed import build_chain_seed_population, gene_space_signature
+        strat, space, settings, opt = self._job()
+        seeds = [opt.toolbox.individual() for _ in range(4)]
+        record = {"gene_space": gene_space_signature(space), "genes": [list(s) for s in seeds],
+                  "fitnesses": [1.0, 0.9, 0.8, 0.7]}
+        src = SimpleNamespace(id=34, name="prev-fold-wf1", status="completed",
+                              optimization_config={"backtest": {"end_date": "2023-12-31"}})
+        pop, _info = build_chain_seed_population(src, record, opt, 6, date(2024, 12, 31))
+        for ind in pop:
+            s = self._trial_settings(strat, settings, opt.decode_individual(ind))
+            assert {k: s[k] for k in _EXPECTED_PIN} == _EXPECTED_PIN
+
+    def test_warm_start_from_a_dsfw_job_drops_its_factor_genes_loudly_and_the_pin_wins(self, caplog):
+        import logging
+        from app.services.strategy_optimization_handler import _build_warm_start_population
+        strat, space, settings, opt = self._job()
+        own = opt.decode_individual(opt.toolbox.individual())
+        src = SimpleNamespace(id=35, name="old-dsfw-job",
+                              all_results=[{"params": {**own, **_DSFW_ONLY}, "fitness": 2.0, "trades": 40}])
+        with caplog.at_level(logging.WARNING):
+            pop = _build_warm_start_population(src, opt, 6)
+        assert len(pop) == 6
+        seeded = opt.decode_individual(pop[0])
+        assert not set(seeded) & set(_DSFW_ONLY)
+        s = self._trial_settings(strat, settings, seeded)
+        assert {k: s[k] for k in _EXPECTED_PIN} == _EXPECTED_PIN
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "DROPPED" in msg and "model:w_technical" in msg and "model:tw_rsi" in msg
+
+    def test_strict_seed_genome_with_dsfw_genes_is_refused(self):
+        from app.services.strategy_optimization_handler import _build_seed_population
+        _strat, _space, _settings, opt = self._job()
+        own = opt.decode_individual(opt.toolbox.individual())
+        with pytest.raises(ValueError) as e:
+            _build_seed_population([{**own, **_DSFW_ONLY}], opt, 6)
+        assert "unknown" in str(e.value) and "model:w_technical" in str(e.value)
