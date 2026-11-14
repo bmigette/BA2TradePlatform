@@ -381,3 +381,93 @@ Expected: every line reads `SAME`, and there are two `e2e-cut` rows: `e2e-cut~in
 (failed, kept) and `e2e-cut` (completed). If only the trial keys differ while the best result and the
 population match, a trial stalled or crashed in one run only (an environment issue, not the resume);
 look for `STALLED` or `trial errors` in the logs. Clean up with `rm -rf $BA2_HOME /tmp/e2e_compare.py`.
+
+## Option walk-forward (built 2026-11-14, TEST 2026.11.0202; nothing launched yet)
+
+`tools/run_options_matrix.py --walk-forward` turns every option job (expert x structure, and each
+neutral arm) into a walk-forward CELL. It reuses the stock grid's engine unchanged:
+`app.services.wf_chain` (`CellSpec`, `run_cells`, fold store, early elimination, deferral, refit)
+with `tools/run_walk_forward.py`'s `RealRunner` (selection by `persist_distinct_topn`, out-of-sample
+re-run by `ba2test_launcher._persist_top_backtests(window=)`). Only the driver side is new; the shared
+`wf_optimize_args` moved to `tools/matrix_flags.py` (the stock driver re-exports it, same behaviour).
+The plain mode (no `--walk-forward`) is unchanged: same names, digests and commands.
+
+**Fold defaults (the stock phase-A layout).** `--wf-train-start 2020-01-01`, `--wf-test-years
+2024,2025,2026`, `--wf-first-generations 30`, `--wf-next-generations 15`. ThetaData (floor about 8
+years back) and the Alpha Vantage store (floor 2020-01-01, downloaded through 2025-12-31) both reach
+2020, so the option data window does not force another layout. A store with a later floor (alpaca
+2024-01-18, tastytrade 2022-10-01) is refused by the launcher at fold 1; give it `--wf-train-start`
+and fewer `--wf-test-years`. No FMPRating floor is applied: the option driver has always run
+FMPRating from 2020 (the stock grid floors it at 2022-01-01); pass `--wf-train-start 2022-01-01` for
+an FMPRating-only run if wanted.
+
+**The 2026 holdout rail is respected, not moved.** Before anything runs, the plan is refused when a
+fold TRAINS into `_OPTION_HOLDOUT_START` (read from the launcher the jobs run) or when a passing cell
+could REFIT in this run (no deferred last fold), since the refit trains to the last test end. The
+out-of-sample TESTS may sit in 2026: they are single re-runs, which the rail deliberately does not
+guard. So:
+- **Phase A (now):** `--wf-defer-last-test --wf-data-end 2025-12-31`. wf1 and wf2 are trained and
+  tested (2024, 2025), wf3 is trained on 2020-2025, cells end `PENDING`.
+- **Phase B (January 2027):** the same command without `--wf-data-end`, ONLY after
+  `_OPTION_HOLDOUT_START` has moved as a reviewed change; until then that command is refused with
+  this explanation. The 2026 test, the verdict and the 2020-2026 refit then run.
+- The option data for 2026 (Alpha Vantage/ThetaData chains, the gate store, the manifests) must
+  exist before phase B; the driver does not check option-store coverage.
+
+**Names.** `optwf-<expert>-<structure><spread tag><suffix><vendor tag>[-<arm>-rules1]-d<digest>`,
+never an `optm-` name. The digest covers the cell's base optimize args (no window, name or
+generation budget; `--labels`, `--parallel`, `--workers` excluded as in discovery names), the store
+environment, the launcher path, option-only fixed settings and the stock grid's walk-forward spec
+tokens (train start, test years, defer or data end, budgets, top-N, pass rule). Under
+`--wf-defer-last-test` the data VALUES and LOCATIONS are masked (manifests, universe list,
+`BA2_HOME`, parquet root, launcher path), so phase B rebuilds phase A's names, and the deferred tests
+read the current command's data (`_rebase_run_data`, which rebases exactly the manifests and a
+static universe). `--screener-gate-store` is NOT masked: the rebase does not replace it, so a test
+would silently read the train job's gate store. A new gate-store path is a new cell; refresh the
+store in place to keep the names.
+
+**Trade-count gates (decision, conservative).** Nothing new and nothing tuned for options: the
+selection floor stays `persist_distinct_topn`'s 30 in-sample round-trip rows (one per option LEG)
+over the fold's train window (4-6 years), and a genome with ZERO out-of-sample trades fails its
+fold, as for stocks. Evidence (test DB, 2026-11-14): 21 of 23 option `TOP1-optm-*` rows over
+2020-2025 have more than 30 rows (median 294; the lowest are a pilot with 2 and O_LP with 9). A
+structure that thin errors in fold 1 ("no eligible genome") rather than passing on a handful of
+trades. `--wf-min-trade-rows N` overrides the floor (not part of the cell name; stored fold reports
+re-evaluate). No minimum out-of-sample trade count beyond zero was added: that would be a change to
+the shared verdict (`walk_forward.fail_reasons`) and to the stock grid as well.
+
+**Out-of-sample path.** The test of a fold's genome is the GA's own trial assembly on the test window:
+`select` takes the genome raw from the train job's `all_results`, `_persist_top_backtests(window=)`
+decodes it against the job's stored strategy and builds the trial with `_build_daily_trial_config`.
+`tests/test_option_wf_oos_rerun_genes.py` pins it for a launcher-built O_BULLCS with every searched
+gene off its default: the re-run's trial config equals the GA's for that genome on the test window,
+every gene (the `optsel` selection weights included) moves it, and the persisted out-of-sample row
+carries the whole genome. A mutation that strips the `optsel` genes on that path fails two of the
+tests. The legacy `rerun_handler` path (UI Re-run) is not used by the walk-forward.
+
+**Launch (dry run first; same flags for phase A and B apart from `--wf-data-end`):**
+
+```bash
+python tools/run_options_matrix.py --profile discovery --experts DeterministicScorer --strategies O_BULLCS \
+  --screener-gate-store <store> --max-stock-price 0 --estimates-source fmp \
+  [--option-history-source alphavantage] [--fitness option_car_target_soft30] [--workers <name>] \
+  --walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 \
+  --wf-top-n 3 --wf-report-dir reports/option_wf \
+  --pass-min-oos-return 0 --pass-max-dd-mult 2.5 --pass-max-oos-dd 35 --pass-min-folds 2 \
+  --dry-run
+```
+
+`--start`, `--end` and `--generations` are refused with `--walk-forward` (the chain sets them per
+job); every other option of the driver (profile, store, gates, market conditions, fitness, capital)
+rides on every fold. Reports: `<--wf-report-dir>/<cell>/{fold<k>.json,cell.json,report.md}` and the
+grid `summary.{json,md}`. Resume, stop and refusals follow the runbook above (the runner is the same).
+
+**Not covered.**
+- The small-accounts chain (`tools/grid_option_small_accounts.sh`, unmerged) does not go through
+  `run_options_matrix.py`: each job is `tools/option_style_job.sh`, which execs the launcher with
+  `--strategy O_STYLE --style ... --seed-population <bundle>`. The option driver has no O_STYLE /
+  style-config / seed-bundle support, and `--seed-population` is refused together with
+  `--chain-seed-from` (so a seeded style job cannot be chained), and stage-1 seeds chosen on
+  2020-2025 have seen the 2024 and 2025 test years (look-ahead for folds 1-2). Walk-forward for those
+  jobs needs its own decision: unseeded folds, or seeds restricted to each fold's train window.
+- Nothing was launched: no real optimization, no real out-of-sample re-run, no remote worker.
