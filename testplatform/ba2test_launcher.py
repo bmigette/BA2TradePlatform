@@ -10351,6 +10351,31 @@ def _cmd_optimize(args) -> int:
                                  split=_decision_times_is_split(getattr(args, "decision_times", None)))
     _refuse_reused_history_source_name(_opt_name, history_source, "optimize")
     _refuse_reused_estimates_source_name(_opt_name, estimates_source, "optimize")
+    # --resume-interrupted: what to do with the row a KILLED runner left under this name
+    # (app.services.optimization_resume). "resume" continues below (identity check + retire
+    # before the new row is created), "topn" finishes a cut-off TOP-N persist, "done" is the
+    # SKIP below, "none" an ordinary run; anything else is refused before any work.
+    _resume_stale = None
+    if getattr(args, "resume_interrupted", False):
+        if getattr(args, "rerun", False) or getattr(args, "submit", False) or seed_check_only:
+            print("optimize: --resume-interrupted cannot be combined with --rerun, --submit or "
+                  "--seed-check-only", flush=True)
+            return 2
+        from app.services import optimization_resume as _R
+        _db = SessionLocal()
+        try:
+            _assessed = _R.assess(_db, _opt_name)
+        except _R.ResumeRefused as e:
+            print(f"optimize: --resume-interrupted REFUSED: {e}", flush=True)
+            return 2
+        finally:
+            _db.close()
+        if _assessed.kind == "topn":
+            return _complete_interrupted_topn(_assessed.opt_id, expert, args)
+        if _assessed.kind == "resume":
+            _resume_stale = _assessed.opt_id
+            print(f"optimize: RESUMING interrupted {_opt_name} (optimization #{_resume_stale}: "
+                  f"{_assessed.detail})", flush=True)
     if not getattr(args, "rerun", False) and not seed_check_only:
         _db = SessionLocal()
         try:
@@ -10699,13 +10724,50 @@ def _cmd_optimize(args) -> int:
                 print("optimize: --seed-check-only: bundle accepted; nothing was written")
                 return 0
             db.add(strat); db.commit(); db.refresh(strat)
+        if _resume_stale is not None:
+            # SAME JOB? Everything that decides the search must equal the interrupted row's: the
+            # whole config (GA settings, gene declarations, pins, the run block with its data
+            # digests, universe, exclusions), the decoded gene space, the strategy rules and the
+            # code versions. Any difference is refused (the old row stays as it is).
+            from app.services import optimization_resume as _R
+            from app.services.strategy_optimization_handler import _is_bypass_expert, job_param_space
+            _diffs = _R.identity_differences(
+                db, _resume_stale, new_cfg=cfg, fitness_metric=fitness, optimization_type="genetic",
+                param_space=job_param_space(strat, cfg.get("expert_params"),
+                                            _is_bypass_expert(cfg["backtest"])),
+                entry_rules=strat.entry_rules, exit_rules=strat.exit_rules,
+                versions=_R.code_versions(),
+                allow_code_change=os.environ.get(_R.ACROSS_CODE_CHANGE_ENV) == "1")
+            try:                                 # a second starter may have won the race since
+                _again = _R.assess(db, _opt_name)
+            except _R.ResumeRefused as e:
+                _diffs = [f"re-check: {e}"]
+            else:
+                if (_again.kind, _again.opt_id) != ("resume", _resume_stale):
+                    _diffs = [f"re-check: the row is now {_again.kind!r} (id {_again.opt_id})"]
+            if _diffs:
+                print(f"optimize: --resume-interrupted REFUSED: {_opt_name} (optimization "
+                      f"#{_resume_stale}) is NOT the job this command describes:\n  - "
+                      + "\n  - ".join(_diffs)
+                      + "\n  Run the command the job was started with, or delete that row (and "
+                        "its checkpoint) to train the new job from scratch, or use a new name.",
+                      flush=True)
+                db.delete(strat); db.commit()
+                return 2
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
             fitness_metric=fitness, optimization_type="genetic",
             optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
         )
-        db.add(opt); db.commit(); db.refresh(opt)
+        db.add(opt)
+        if _resume_stale is not None:
+            # ONE transaction: the new row takes the name as the dead one gives it up, so a kill
+            # here can never leave two rows (or none) under the job name.
+            db.flush()
+            _R.retire_optimization(db, _resume_stale, f"resumed as optimization #{opt.id}",
+                                   commit=False)
+        db.commit(); db.refresh(opt)
         opt_id = opt.id
         if _worker_ids:
             print(f"optimize: distributing across worker ids {_worker_ids} + local")
@@ -10737,7 +10799,9 @@ def _cmd_optimize(args) -> int:
               f"Watch it in the UI: Backtesting -> History -> Running jobs.")
         return 0
 
-    res = handle_strategy_optimization("cli-optimize", {"optimization_id": opt_id})
+    res = handle_strategy_optimization(
+        "cli-optimize", {"optimization_id": opt_id,
+                         **({"resume_of": _resume_stale} if _resume_stale is not None else {})})
     if res.get("failure_kind") == "no_measurements" or res.get("status") == "no_measurements":
         # Stall-only search (2026-09-21 review, G2): nothing was measured, so there is no winner to
         # export (and _persist_top_backtests would find no candidate anyway). The row is `failed`
@@ -10760,8 +10824,59 @@ def _cmd_optimize(args) -> int:
     from app.services.strategy_optimization_handler import _last_gen_full_results_by_opt
     nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel),
                                      last_gen_full_results=_last_gen_full_results_by_opt.pop(opt_id, None))
+    _mark_topn_done(opt_id)
     print(f"optimize: top {nsaved} persisted as tagged, saved Backtests (optimization_id={opt_id}); "
           f"run `ba2-test runs list --group {opt_id}` or `ba2-test report`.")
+    return 0
+
+
+def _mark_topn_done(opt_id: int) -> None:
+    """The end-of-job TOP-N persist ran to its end: a later --resume-interrupted leaves it alone."""
+    from app.models.database import SessionLocal
+    from app.services import optimization_resume as _R
+    db = SessionLocal()
+    try:
+        _R.mark_topn_done(db, opt_id)
+    finally:
+        db.close()
+
+
+def _complete_interrupted_topn(opt_id: int, expert: str, args) -> int:
+    """Finish the end-of-job TOP-N persist of a COMPLETED job whose launcher was killed during it.
+
+    The same ranking as the uninterrupted persist (``_rank_measured_candidates`` over the stored
+    all_results, ``--save-top``), the same names (``TOP<rank>-<job>``); a rank whose completed row
+    exists is kept, a half-written (non-completed) one is retired (renamed, never deleted) and
+    re-run with the rest. The final generation's buffered results died with the process, so every
+    missing rank is RE-RUN (its fidelity gate compares it with the GA score)."""
+    from app.models.database import SessionLocal
+    from app.models.backtest import Backtest
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services import optimization_resume as _R
+    db = SessionLocal()
+    try:
+        opt = db.get(StrategyOptimization, opt_id)
+        ranked, _skipped = _rank_measured_candidates(opt.all_results, int(args.save_top),
+                                                     opt.best_params, opt.best_fitness)
+        names = {r: f"TOP{r}-{opt.name or expert}" for r in range(1, len(ranked) + 1)}
+        rows = (db.query(Backtest.id, Backtest.name, Backtest.status)
+                .filter(Backtest.optimization_id == opt_id, Backtest.name.in_(list(names.values())))
+                .order_by(Backtest.id).all())
+        done = {n for _bid, n, st in rows if st == "completed"}
+        for bid, n, st in rows:
+            if st != "completed":
+                print(f"optimize: retiring half-written {n} (backtest {bid}, {st})", flush=True)
+                _R.retire_backtest(db, bid, "the end-of-job TOP-N persist")
+        missing = [r for r in names if names[r] not in done]
+    finally:
+        db.close()
+    print(f"optimize: completing the cut-off TOP-N persist of optimization #{opt_id}: "
+          f"{len(names) - len(missing)} of {len(names)} rank(s) already persisted, re-running "
+          f"{missing or 'none'}", flush=True)
+    if missing:
+        _persist_top_backtests(opt_id, expert, n=len(missing), parallel=int(args.parallel),
+                               candidates=[ranked[r - 1] for r in missing], ranks=missing)
+    _mark_topn_done(opt_id)
     return 0
 
 
@@ -12677,6 +12792,15 @@ def main(argv: "list | None" = None) -> int:
                     help="MLForecast with strategy MLH or MLF only (needs --ml-model-keys): the days_opened gene "
                          "becomes {d-1, d, d+1} clipped at 0 with d = round(H x 7/5) - 1, H = the (single, shared) "
                          "horizon of the --ml-model-keys stores, instead of the 0..6 range.")
+    op.add_argument("--resume-interrupted", action="store_true",
+                    help="Continue a job of this --name whose runner was KILLED (row left "
+                         "'running'/'pending'): the runner must be provably dead (same host, pid "
+                         "gone), and the job identical (config, gene space, data digests, strategy "
+                         "rules, code versions; BA2_RESUME_ACROSS_CODE_CHANGE=1 lifts the last). The "
+                         "dead row is renamed <name>~interrupted-<id> and kept; the new row resumes "
+                         "from the checkpoint with all of the dead row's trials. A COMPLETED job "
+                         "whose end-of-job TOP-N persist was killed gets its missing TOP rows. Any "
+                         "other case is refused (exit 2). Rendered by tools/run_walk_forward.py.")
     op.add_argument("--rerun", action="store_true",
                     help="Run even if an optimization with this --name has already "
                          "COMPLETED. Without it the run is skipped (exit 0) and the "

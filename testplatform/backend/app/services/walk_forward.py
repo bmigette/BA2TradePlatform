@@ -41,6 +41,8 @@ FORBIDDEN_OPTIMIZE_FLAGS = {
                          "window (look-ahead); seeding goes through initial_population_for_fold",
     "--chain-seed-from": "the engine renders it itself (chain seeding, initial_population_for_fold)",
     "--rerun": "it creates a second optimization under the same name and breaks resume",
+    "--resume-interrupted": "the engine renders it itself, only for a row whose runner was killed "
+                            "(tools/run_walk_forward.py RealRunner.run_train)",
     "--submit": "it queues the job and returns before it is completed, so the fold cannot "
                 "continue",
 }
@@ -747,11 +749,22 @@ def _stitch_table(rows: Dict[str, Stitch]) -> str:
     return "\n".join(lines)
 
 
+def atomic_write_text(path: str, text: str) -> None:
+    """Write ``path`` so a reader sees the old file or the whole new one, never a part: a driver
+    killed mid-write (``grid_goal2027.sh stop``) must not leave a truncated report behind."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def write_report(res: WalkForwardResult, out_dir: str) -> Tuple[str, str]:
-    os.makedirs(out_dir, exist_ok=True)
     jp, mp = os.path.join(out_dir, "report.json"), os.path.join(out_dir, "report.md")
-    with open(jp, "w", encoding="utf-8") as fh:
-        json.dump(result_to_json(res), fh, indent=2)
-    with open(mp, "w", encoding="utf-8") as fh:
-        fh.write(render_markdown(res))
+    atomic_write_text(jp, json.dumps(result_to_json(res), indent=2))
+    atomic_write_text(mp, render_markdown(res))
     return jp, mp

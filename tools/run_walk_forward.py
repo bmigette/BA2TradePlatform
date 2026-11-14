@@ -30,9 +30,15 @@ The optimize args go after ``--`` and must NOT contain --start/--end/--name:
   --min-free-gb / --force-memory                     same memory floor as that tool
 
 RESUME. A training job whose StrategyOptimization of that name is already ``completed`` is skipped
-(the rule tools/run_options2_matrix.py uses). A completed out-of-sample Backtest of the same name
-and window is reused rather than re-run. Exit codes: 0 verdict PASS / partial / dry-run, 1 a run
-failed, 2 refused, 3 verdict FAIL.
+(the rule tools/run_options2_matrix.py uses). A training job whose runner was KILLED (row left
+``running``; the recorded runner process is provably gone) is relaunched with
+``--resume-interrupted``: it continues from its last checkpoint with every trial it had finished
+(app.services.optimization_resume); a live, failed, ownerless or different job is refused. A
+completed job whose end-of-job TOP-N persist was killed gets the missing TOP rows the same way. A
+completed out-of-sample Backtest of the same name and window is reused rather than re-run; one left
+half-written by a killed driver is retired (renamed) and re-run, which is safe because the driver
+holds a lock on the prefix (``<out-dir>/.lock``). Exit codes: 0 verdict PASS / partial / dry-run,
+1 a run failed, 2 refused, 3 verdict FAIL.
 """
 from __future__ import annotations
 
@@ -41,6 +47,7 @@ import logging
 import os
 import subprocess
 import sys
+from contextlib import contextmanager, nullcontext
 from datetime import date
 from typing import Dict, List, Optional, Sequence
 
@@ -50,6 +57,7 @@ for _p in (_BACKEND, os.path.join(_REPO, "tools")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from app.services import optimization_resume as RESUME  # noqa: E402
 from app.services import walk_forward as WF  # noqa: E402
 
 
@@ -72,6 +80,7 @@ class RealRunner:
         self._persist_tool = None
         self._launcher = None
         self._opt: Dict[str, tuple] = {}       # train name -> (opt_id, expert)
+        self._exclusive: set = set()           # prefixes whose driver lock this process holds
 
     # -- lazy bootstrap: dry-run and unit tests never touch the backend
     def _tool(self):
@@ -79,7 +88,38 @@ class RealRunner:
             import persist_distinct_topn as P
             self._persist_tool = P
             self._launcher = P._bootstrap()
+            from app.models.database import init_db
+            init_db()                          # an old DB gains the runner table (migration 033)
         return self._persist_tool
+
+    @contextmanager
+    def exclusive(self, prefix: str, lock_path: str):
+        """Hold the driver lock of ``prefix`` (a cell / a walk-forward prefix) for the block: a
+        second driver on the same prefix is refused, a dead driver's lock is taken over. Under it,
+        a non-completed out-of-sample row of this prefix can only be a killed driver's leftover."""
+        try:
+            with RESUME.exclusive(lock_path, prefix):
+                self._exclusive.add(prefix)
+                try:
+                    yield
+                finally:
+                    self._exclusive.discard(prefix)
+        except RESUME.ResumeRefused as e:
+            raise WF.WalkForwardError(str(e)) from e
+
+    def _owns(self, train_name: str) -> bool:
+        return any(train_name.startswith(p + "-wf") for p in self._exclusive)
+
+    def _assess(self, name: str) -> "RESUME.Assessment":
+        self._tool()
+        from app.models.database import SessionLocal
+        db = SessionLocal()
+        try:
+            return RESUME.assess(db, name)
+        except RESUME.ResumeRefused as e:
+            raise WF.WalkForwardError(str(e)) from e
+        finally:
+            db.close()
 
     def launcher_module(self):
         self._tool()
@@ -98,7 +138,8 @@ class RealRunner:
             db.close()
 
     def train_completed(self, name: str) -> bool:
-        """True when the job exists and is completed (the rule of the grid drivers). More than
+        """True when the job exists and is completed (the rule of the grid drivers) AND its
+        end-of-job TOP-N persist was not cut off by a kill (``run_train`` finishes that). More than
         one optimization of the name is REFUSED up front: ``persist_distinct_topn._load_opt`` would
         refuse it later, after the expensive part."""
         rows = self._opts_named(name)
@@ -108,7 +149,9 @@ class RealRunner:
                 f"({', '.join(f'id={i} {st}' for i, st in rows)}). A failed train plus a re-run "
                 f"under the same name does this. Delete the unwanted row(s) from the test DB "
                 f"(or use a new --prefix) so exactly one remains.")
-        return bool(rows) and rows[0][1] == "completed"
+        if not rows or rows[0][1] != "completed":
+            return False
+        return self._assess(name).kind == "done"
 
     def seed_lineage(self, name: str) -> Optional[str]:
         """The seed source this job RECORDED (``optimization_config.seededFrom.name``), or None for
@@ -141,16 +184,23 @@ class RealRunner:
         return {"id": rows[0][0], "completed_at": done.isoformat() if done else None}
 
     def run_train(self, cmd: List[str], name: str) -> None:
-        stale = self._opts_named(name)
-        if stale:
-            raise WF.WalkForwardError(
-                f"optimization {name!r} already exists and is not completed "
-                f"({', '.join(f'id={i} {st}' for i, st in stale)}): re-running would create a "
-                f"duplicate name. Delete that row (or let a running job finish), or use a new "
-                f"--prefix.")
+        """Run the train job. A row its killed runner left (``resume``), or a completed job whose
+        TOP-N persist was cut off (``topn``), is continued with ``--resume-interrupted``: the
+        launcher re-checks liveness, proves it is the same job and resumes it under the same name.
+        Every other existing row is refused here with the reason (live runner, failed, no runner
+        recorded, other host, duplicates): re-running would create a duplicate name."""
+        a = self._assess(name)
+        if a.kind == "done":
+            return
+        if a.kind in ("resume", "topn"):
+            print(f"{name}: optimization #{a.opt_id} {a.detail} -- relaunching with "
+                  f"--resume-interrupted", flush=True)
+            cmd = [*cmd, "--resume-interrupted"]
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         if rc != 0:
-            raise WF.WalkForwardError(f"training job {name!r} exited with code {rc}")
+            raise WF.WalkForwardError(
+                f"training job {name!r} exited with code {rc}"
+                + (" (refused: the launcher printed why)" if rc == 2 else ""))
 
     def select(self, train_name: str, top_n: int) -> List[WF.IsPick]:
         P = self._tool()
@@ -231,10 +281,22 @@ class RealRunner:
                 todo.append(p)
                 continue
             if row[2] != "completed":
-                raise WF.WalkForwardError(
-                    f"Backtest {names[p.rank]!r} (id {row[0]}) exists with status {row[2]!r} (a "
-                    f"crashed or running earlier attempt). Delete it before resuming; re-running "
-                    f"would create a duplicate.")
+                if not self._owns(train_name):
+                    raise WF.WalkForwardError(
+                        f"Backtest {names[p.rank]!r} (id {row[0]}) exists with status {row[2]!r} "
+                        f"(a crashed or running earlier attempt). Delete it before resuming; "
+                        f"re-running would create a duplicate.")
+                # This driver holds the prefix lock, so no live driver writes it: a killed one
+                # left it mid-write (a re-run's row exists only while its result is being saved).
+                _db = SessionLocal()
+                try:
+                    RESUME.retire_backtest(_db, row[0], "its out-of-sample result was being saved")
+                finally:
+                    _db.close()
+                print(f"  retired half-written {names[p.rank]} (backtest {row[0]}, {row[2]}); "
+                      f"re-running it", flush=True)
+                todo.append(p)
+                continue
             same_window = (row[3].date().isoformat(), row[4].date().isoformat()) == window
             if not same_window or row[5] is None or abs(row[5] - p.fitness) > 1e-9:
                 raise WF.WalkForwardError(
@@ -372,6 +434,7 @@ def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
         if getattr(a, k) is None:
             setattr(a, k, v)
     selection = {k: getattr(a, k) for k in defaults}
+    out_dir = a.out_dir or os.path.join(_REPO, "reports", "walk_forward", a.prefix)
     try:
         plan = WF.make_plan(
             a.prefix, _folds_from_args(a), opt_args, _launcher_path(a), a.top_n,
@@ -391,11 +454,12 @@ def main(argv=None, runner: Optional[WF.Runner] = None) -> int:
         if a.dry_run:
             print(WF.render_dry_run(plan))
             return 0
-        res = WF.run_walk_forward(plan, runner)
+        lock = getattr(runner, "exclusive", None)
+        with (lock(a.prefix, os.path.join(out_dir, ".lock")) if callable(lock) else nullcontext()):
+            res = WF.run_walk_forward(plan, runner)
     except WF.WalkForwardError as e:
         print(f"run_walk_forward: {e}", file=sys.stderr)
         return 2
-    out_dir = a.out_dir or os.path.join(_REPO, "reports", "walk_forward", a.prefix)
     jp, mp = WF.write_report(res, out_dir)
     print(WF.render_markdown(res))
     print(f"report: {mp}\n        {jp}")

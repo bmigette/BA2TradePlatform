@@ -451,9 +451,17 @@ cmd_stop() {
   fi
   ps_tiers 1
   echo
-  echo "Stopped mid-job: that job resumes from its last completed generation on the next start (same"
-  echo "name, same gene space). A wf3 interrupted in phase A must COMPLETE before January's data"
-  echo "replaces phase A's, or be deleted and retrained (two-phase plan, boundary rule)."
+  echo "Stopped mid-job. On the next start (same PHASE/settings, same checkout):"
+  echo " - a fold's TRAINING job resumes from its last checkpoint (end of a generation, or every 10"
+  echo "   trials within one) under the same name, keeping every trial it had finished; its dead row"
+  echo "   is kept as <name>~interrupted-<id>. REFUSED (cell ERROR, reason in the log) if anything"
+  echo "   that defines the job changed: config, gene space, data digests/exclusions, strategy rules,"
+  echo "   or the code (TEST version, package minimums; BA2_RESUME_ACROSS_CODE_CHANGE=1 overrides)."
+  echo " - a TOP-N persist cut off after training re-runs only the missing TOP ranks;"
+  echo " - an out-of-sample test re-runs the genomes whose result was not saved; fold reports are"
+  echo "   only ever written whole."
+  echo "A wf3 interrupted in phase A must COMPLETE before January's data replaces phase A's (the"
+  echo "resume refuses the changed data digests), or be deleted and retrained (two-phase plan)."
 }
 
 cmd_status() {
@@ -489,7 +497,7 @@ case "$CMD" in
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
       local_env=()
-      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS; do
+      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS BA2_RESUME_ACROSS_CODE_CHANGE; do
         [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
       done
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1

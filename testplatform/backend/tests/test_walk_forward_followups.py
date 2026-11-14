@@ -209,9 +209,11 @@ def test_duplicate_optimization_name_is_refused_up_front(monkeypatch, host_db):
 
 
 def test_a_non_completed_leftover_blocks_a_second_train_run(monkeypatch, host_db):
+    """A leftover with no recorded runner (started by older code) cannot be proven dead: it still
+    blocks, now with that reason. Dead / live runners: test_wf_resume_runner.py."""
     r, _, _ = _real_runner(monkeypatch, host_db)
     _seed_opt(host_db, "wf-left", status="running")
-    with pytest.raises(WF.WalkForwardError, match="duplicate name"):
+    with pytest.raises(WF.WalkForwardError, match="no runner was recorded"):
         r.run_train(["x"], "wf-left")
 
 

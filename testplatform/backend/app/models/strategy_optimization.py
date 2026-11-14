@@ -79,6 +79,33 @@ class StrategyOptimization(Base):
         }
 
 
+class StrategyOptimizationRunner(Base):
+    """WHO is running (or ran) an optimization row, so an interrupted job can be resumed without
+    ever hijacking a live one (app.services.optimization_resume). One row per optimization,
+    written by the handler when the job starts.
+
+    ``host`` + ``pid`` + ``pid_started`` (the process creation time, epoch seconds) identify the
+    process: on the same host a dead pid, or a pid reused by another process (different creation
+    time), proves the runner is gone. A row owned by another host is never judged dead here.
+    ``code_versions`` = the TEST app version + package minimums the job started under (a resume
+    across a code change is refused by default). ``resumed_from_id`` = the interrupted row this
+    one continues. ``topn_done_at`` = when the launcher's end-of-job TOP-N persist ran to its
+    end (NULL while it is running or after it was killed). A table of its own, not columns on
+    ``strategy_optimizations``: that row carries the multi-MB ``all_results`` blob, and old code
+    never reads this table. Migration 033 mirrors it."""
+
+    __tablename__ = "strategy_optimization_runners"
+
+    optimization_id = Column(Integer, ForeignKey("strategy_optimizations.id"), primary_key=True)
+    host = Column(String(255), nullable=False)
+    pid = Column(Integer, nullable=False)
+    pid_started = Column(Float, nullable=False)
+    code_versions = Column(JSON, nullable=True)
+    resumed_from_id = Column(Integer, nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    topn_done_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class StrategyOptimizationPopulation(Base):
     """The FINAL evaluated population of a completed GA job (walk-forward chain seeding).
 

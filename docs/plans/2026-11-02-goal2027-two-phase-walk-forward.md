@@ -147,3 +147,43 @@ How the merge works:
   mapped pair are recorded in the local DB, so the January copy adds only the new rows, under the same ids.
 - Still-running jobs are skipped until a later copy.
 - It runs in one transaction, and the source is attached read-only.
+
+## Resume of an interrupted fold (built 2026-11-14, TEST 2026.11.0201)
+
+`grid_goal2027.sh stop` kills the whole cgroup, so a fold's training job is left `running`. The
+optimizer has long resumed from its name-keyed checkpoint, but the walk-forward driver refused any
+non-completed row (cell ERROR, row deleted by hand). Now `RealRunner.run_train` relaunches such a job
+with `optimize --resume-interrupted` when its runner is provably dead
+(`app/services/optimization_resume.py`):
+
+- **Liveness.** The handler records each row's runner in `strategy_optimization_runners` (host, pid,
+  process creation time, code versions; migration 033). Dead = same host and the pid is gone or reused.
+  A live runner, another host, a row with no runner record (started by older code), a failed or
+  cancelled row and duplicate names are refused with the reason.
+- **Same job.** The launcher compares the whole optimization config except `seededFrom`,
+  `backtest.backtest_id` and `parallelIndividuals` (data digests, universe and exclusions included), plus the
+  metric, the decoded gene space, the strategy rules and the code versions (TEST version and package
+  minimums; `BA2_RESUME_ACROSS_CODE_CHANGE=1` overrides only these). Any difference is refused. A phase-A
+  wf3 resumed on January's manifests is therefore refused, which enforces the boundary rule above.
+- **Resume.** In one transaction the dead row is renamed `<name>~interrupted-<id>` (status `failed`,
+  kept) and the new row takes the name. The handler resumes from the checkpoint. A checkpoint of
+  another search now fails the job instead of being discarded. All of the dead row's trial records are
+  carried into `all_results` and the trial memo, so no finished trial runs again. Without a checkpoint,
+  generation 0 replays from the memo.
+- **Identical to an uninterrupted run:** the population, the GA/global/numpy RNG states, history and
+  the patience counter (from the checkpoint), the best genome, the final population (the chain seed),
+  and the set of trials in `all_results` (so the top-N selection) are the same. Tests:
+  `test_optimization_resume_handler.py` and `test_ga_resume_equals_uninterrupted.py`. Not identical: the
+  order of `all_results` (parallel completion order is never deterministic), a trial running at the
+  kill (re-run; same result if the backtest is deterministic), a stalled trial (re-run, as an
+  uninterrupted run re-runs it on re-selection), and the end-of-job TOP-N rows (the final generation's
+  buffered results died with the process, so every rank is re-run against the fidelity gate).
+- **Fixed on the way:** a PARTIAL checkpoint written by a generation's last trial was resumed as an
+  end-of-generation one, which dropped that generation's record.
+- **Other stages.** If the TOP-N persist after training is cut off, the job is completed but
+  `topn_done_at` is NULL. The driver relaunches with the flag, which re-runs only the missing
+  `TOP<rank>` rows and retires a half-written one. Each cell runs under a lock file
+  (`<report_dir>/<cell>/.lock`, same liveness rule), so under it a non-completed OOS row (killed while
+  its result was being saved) is retired and re-run. Without the lock it is refused, as before.
+  Fold reports, `cell.json` and the summary are written atomically. Between folds, the next start
+  reuses the stored fold reports.

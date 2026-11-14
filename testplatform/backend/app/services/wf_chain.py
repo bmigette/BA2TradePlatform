@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -200,11 +201,8 @@ def _fold_key(plan: WF.Plan, f: WF.Fold, identities: Optional[List[Any]] = None)
 
 def _save_fold(report_dir: str, plan: WF.Plan, f: WF.Fold, genomes: List[WF.GenomeFold],
                identities: Optional[List[Any]] = None) -> None:
-    path = _fold_path(report_dir, plan.prefix, f.index)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"key": _fold_key(plan, f, identities), "genomes": [asdict(g) for g in genomes]}, fh,
-                  indent=2)
+    WF.atomic_write_text(_fold_path(report_dir, plan.prefix, f.index), json.dumps(
+        {"key": _fold_key(plan, f, identities), "genomes": [asdict(g) for g in genomes]}, indent=2))
 
 
 def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold,
@@ -294,6 +292,10 @@ def cannot_pass(plan: WF.Plan, folds: Sequence[WF.Fold], genomes: Sequence[WF.Ge
     return None
 
 
+def lock_path(report_dir: str, name: str) -> str:
+    return os.path.join(report_dir, name, ".lock")
+
+
 def run_cell(spec: CellSpec, runner: Any, report_dir: str,
              log: Callable[[str], None] = print) -> CellResult:
     """Run (or resume) one cell's chain. Raises ``WalkForwardError`` on a refusal or a failed job;
@@ -301,7 +303,18 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
 
     Verdicts: PASS (refit run), FAIL (no refit; ``eliminated`` says which folds were skipped because
     the cell could no longer pass), PENDING (the deferred last fold is trained, its test waits for
-    the data: the same command with that data tests it and finishes the cell)."""
+    the data: the same command with that data tests it and finishes the cell).
+
+    The whole chain runs under the runner's driver lock for the cell (``<report_dir>/<cell>/.lock``,
+    when the runner has one): a second driver on the same cell is refused, a killed driver's lock
+    is taken over."""
+    lock = getattr(runner, "exclusive", None)
+    with (lock(spec.name, lock_path(report_dir, spec.name)) if callable(lock) else nullcontext()):
+        return _run_cell(spec, runner, report_dir, log)
+
+
+def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
+              log: Callable[[str], None]) -> CellResult:
     plan, folds = make_cell_plan(spec)
     deferred = deferred_fold(folds, spec.data_end, spec.defer_last_test)
     genomes: List[WF.GenomeFold] = []
@@ -385,9 +398,7 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
         "folds": [_fold_summary(spec, runner, plan, f, winners[f.index]) for f in ran],
         "winner_stitch": asdict(res.winner_stitch) if res.winner_stitch else None,
     }
-    os.makedirs(cell_dir, exist_ok=True)
-    with open(os.path.join(cell_dir, "cell.json"), "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2)
+    WF.atomic_write_text(os.path.join(cell_dir, "cell.json"), json.dumps(report, indent=2))
     return CellResult(spec.name, report["verdict"], refit_job, res, report)
 
 
@@ -421,11 +432,9 @@ def render_summary(cells: Sequence[Dict[str, Any]]) -> str:
 
 
 def write_summary(cells: Sequence[Dict[str, Any]], report_dir: str) -> None:
-    os.makedirs(report_dir, exist_ok=True)
-    with open(os.path.join(report_dir, "summary.json"), "w", encoding="utf-8") as fh:
-        json.dump({"cells": list(cells)}, fh, indent=2)
-    with open(os.path.join(report_dir, "summary.md"), "w", encoding="utf-8") as fh:
-        fh.write(render_summary(cells))
+    WF.atomic_write_text(os.path.join(report_dir, "summary.json"),
+                         json.dumps({"cells": list(cells)}, indent=2))
+    WF.atomic_write_text(os.path.join(report_dir, "summary.md"), render_summary(cells))
 
 
 def _load_summary_cells(report_dir: str) -> List[Dict[str, Any]]:

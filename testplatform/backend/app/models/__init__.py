@@ -12,7 +12,8 @@ from .target_set import TargetSet
 from .model import TrainedModel
 from .backtest import Backtest, RobustnessRun
 from .strategy import Strategy
-from .strategy_optimization import StrategyOptimization, StrategyOptimizationPopulation
+from .strategy_optimization import (StrategyOptimization, StrategyOptimizationPopulation,
+                                    StrategyOptimizationRunner)
 
 __all__ = [
     "Base", "engine", "SessionLocal", "get_db",
@@ -29,5 +30,6 @@ __all__ = [
     "RobustnessRun",
     "Strategy",
     "StrategyOptimization",
-    "StrategyOptimizationPopulation"
+    "StrategyOptimizationPopulation",
+    "StrategyOptimizationRunner",
 ]

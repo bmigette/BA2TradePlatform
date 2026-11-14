@@ -840,6 +840,10 @@ class GeneticOptimizer:
         # partial=True means the stored generation was INTERRUPTED mid-evaluation, so resume INTO
         # it rather than after it. The fitness list carries which individuals are already done.
         next_gen = checkpoint.get('generation', 0)
+        # Read by optimize(): a partial checkpoint whose every individual is already evaluated
+        # (written by the generation's LAST trial) is still mid-generation -- that generation is
+        # not recorded in ``history`` yet -- and must not be taken for an end-of-generation one.
+        self._resumed_partial = bool(checkpoint.get('partial'))
         if not checkpoint.get('partial'):
             next_gen += 1
         return next_gen, checkpoint.get('population', []), checkpoint.get('fitnesses')
@@ -1098,9 +1102,12 @@ class GeneticOptimizer:
         # patience unit (P5). Finish what the interrupted run was about to do instead: apply the
         # best update, take the stop decision, then breed. The patience counter / baseline were
         # already derived from ``history`` (which includes k), so they are not touched here. A
-        # PARTIAL checkpoint has no history entry for its generation, so it is not this case.
+        # PARTIAL checkpoint has no history entry for its generation, so it is not this case --
+        # not even when its last trial made every fitness valid (``_resumed_partial``): the loop
+        # below then evaluates nothing and records that generation, as the killed run would have.
         last_done = self.history[-1]['generation'] if self.history else None
         if (initial_population and start_generation > 0 and last_done == start_generation - 1
+                and not getattr(self, '_resumed_partial', False)
                 and all(ind.fitness.valid for ind in population)):
             best_ind = tools.selBest(population, 1)[0]
             best_fit = best_ind.fitness.values[0]

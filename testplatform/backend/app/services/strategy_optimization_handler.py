@@ -1812,6 +1812,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.status = "running"
         opt.started_at = datetime.now()
         db.commit()
+        # WHO runs this row (host, pid, process start, code versions): the evidence a later start
+        # needs to prove this runner dead before it resumes the job, and never hijack a live one.
+        # ``resume_of``: the interrupted row this one continues (optimize --resume-interrupted).
+        resume_of = payload.get("resume_of")
+        resume_of = int(resume_of) if resume_of is not None else None
+        from app.services import optimization_resume as _resume
+        _resume.register_runner(db, opt_id, resumed_from_id=resume_of)
 
         strategy = db.query(StrategyModel).filter(
             StrategyModel.id == opt.strategy_id
@@ -2384,9 +2391,39 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         start_gen, init_pop, init_fits = 0, None, None
         n_protected_seeds = 0
+        # RESUME OF AN INTERRUPTED ROW (optimize --resume-interrupted): every trial the killed
+        # runner finished is in its row's all_results (written after each trial). Re-seed this
+        # run's all_results AND the trial memo from it, so nothing that finished is run again and
+        # all_results ends up holding the same trials as an uninterrupted run (the walk-forward
+        # top-N is selected from it; the checkpoint carries only 20 elites). With no checkpoint
+        # (killed before the first one) the search restarts from generation 0 and replays the
+        # same genomes from the memo.
+        seeded_keys = None
+        if resume_of is not None and not is_brute_force:
+            try:
+                seeded_keys = _seed_from_interrupted_row(db, resume_of, all_results, memo, best)
+            except ValueError as e:
+                return _fail(opt_id, db, f"resume of interrupted optimization {resume_of}: {e}")
+            logger.warning(
+                f"strategy_optimization {opt_id}: resuming interrupted optimization {resume_of}: "
+                f"{len(all_results)} trial record(s) carried over, {len(seeded_keys)} memoized")
         # A brute-force grid has no population to resume or warm-start: never read (or, below,
         # clear) a GA checkpoint for one.
-        ckpt = None if is_brute_force else _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
+        if is_brute_force:
+            ckpt = None
+        elif resume_of is not None:
+            # Asked to RESUME: a checkpoint of another search is a refusal, never the silent
+            # discard-and-restart of the plain path below.
+            ckpt = _load_checkpoint(ckpt_task_id)
+            _stored_fp = (ckpt or {}).get("fingerprint")
+            if _stored_fp and _stored_fp != ckpt_fingerprint:
+                return _fail(
+                    opt_id, db,
+                    f"resume of interrupted optimization {resume_of}: checkpoint {ckpt_task_id} was "
+                    f"written for another search (fingerprint {_stored_fp} != {ckpt_fingerprint}: "
+                    f"gene space, GA budget or a search setting changed). Not resumed.")
+        else:
+            ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
         # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
         # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
         # a confusing failure for what is really "this search already finished". Only reachable
@@ -2424,8 +2461,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # saved S5 row understated the cell.
             #
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
-            # the note this replaces -- see _elite_slice.
-            _seed_all_results_from_checkpoint(ckpt, all_results)
+            # the note this replaces -- see _elite_slice. A resume of an interrupted ROW has the
+            # full record already (seeded_keys above) and does not add the slice twice.
+            if seeded_keys is None:
+                _seed_all_results_from_checkpoint(ckpt, all_results)
+            elif ckpt.get("partial") and init_fits:
+                # A trial lands in the checkpoint (on_result) a moment BEFORE its all_results row
+                # is written; a kill in between leaves a fitness without its record. Re-run those
+                # (deterministic: same fitness) so all_results is complete.
+                n_rerun = 0
+                for _i, _fit in enumerate(init_fits):
+                    if _fit is not None and _trial_key_for(
+                            optimizer.decode_individual(init_pop[_i])) not in seeded_keys:
+                        init_fits[_i] = None
+                        n_rerun += 1
+                if n_rerun:
+                    logger.warning(
+                        f"strategy_optimization {opt_id}: {n_rerun} checkpointed trial(s) had no "
+                        f"record on the interrupted row; re-running them")
             if ga.get(CHAIN_SEED_KEY):
                 # This relaunch inserted a NEW row, so the lineage of the first launch is not on
                 # it: record what is known (the source), flagged as a checkpoint resume.
@@ -3984,6 +4037,32 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _seed_from_interrupted_row(db: Any, stale_id: int, all_results: List[Dict[str, Any]],
+                               memo: Any, best: Dict[str, Any]) -> set:
+    """Carry an interrupted row's trials into a resumed run, in place: every record onto
+    ``all_results`` (in their original order), every MEASURED one into the trial memo (exactly
+    what the killed runner had memoized: a stalled record is kept but not memoized, as in the
+    live loop) and into the live ``best``. Returns the memoized keys. Raises ``ValueError`` when
+    the row is missing or its record is unusable."""
+    from app.services.strategy_fitness import is_measured_result
+    row = db.query(StrategyOptimization).filter(StrategyOptimization.id == stale_id).first()
+    if row is None:
+        raise ValueError("the interrupted row does not exist")
+    records = row.all_results or []
+    if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
+        raise ValueError("its all_results is not a list of trial records")
+    keys = set()
+    for r in records:
+        all_results.append(r)
+        if is_measured_result(r) and r.get("key"):
+            fit = float(r["fitness"])
+            memo.put(r["key"], fit)
+            keys.add(r["key"])
+            if best["fitness"] is None or fit > best["fitness"]:
+                best["fitness"], best["params"] = fit, r.get("params")
+    return keys
 
 
 def _assert_checkpoint_metric_matches(ckpt: Dict[str, Any], metric: str,
