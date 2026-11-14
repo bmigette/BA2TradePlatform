@@ -54,8 +54,8 @@ INTERRUPTIBLE_STATUSES = ("running", "pending")
 #: (``seededFrom``, ``resumedFrom``), a launch timestamp (``backtest.backtest_id``), or the local
 #: slot count (``parallelIndividuals``: execution only, like the worker list, not in the config).
 #: ``seededFrom`` is still compared against the new launch's chain-seed source (identity_differences).
-EXEMPT_CONFIG_PATHS = {("seededFrom",), ("resumedFrom",), ("backtest", "backtest_id"),
-                       ("parallelIndividuals",)}
+EXEMPT_CONFIG_PATHS = {("seededFrom",), ("resumedFrom",), ("discardedCheckpoints",),
+                       ("backtest", "backtest_id"), ("parallelIndividuals",)}
 
 ALIVE, DEAD, UNKNOWN, FOREIGN = "alive", "dead", "unknown", "foreign"
 
@@ -165,22 +165,66 @@ def code_versions() -> Dict[str, Any]:
             "git_commit": info.get("git_commit")}
 
 
+def _same_process(run, ident: Dict[str, Any]) -> bool:
+    """Is the recorded runner ``run`` the process ``ident``? Host + pid, and the kernel start tick
+    when both carry one (immune to clock steps), else the start time."""
+    if run.host != ident["host"] or int(run.pid) != int(ident["pid"]):
+        return False
+    rec, now = run.proc_identity or {}, ident.get("proc_identity") or {}
+    if rec.get("boot_id") and now.get("boot_id") and rec.get("start_ticks") is not None \
+            and now.get("start_ticks") is not None:
+        return rec["boot_id"] == now["boot_id"] and int(rec["start_ticks"]) == int(now["start_ticks"])
+    return abs(float(run.pid_started) - float(ident["pid_started"])) <= _CREATE_TIME_TOL_S
+
+
 def register_runner(db, opt_id: int, *, resumed_from_id: Optional[int] = None,
                     identity: Optional[Dict[str, Any]] = None,
-                    versions: Optional[Dict[str, Any]] = None) -> str:
-    """Record (or replace) who runs ``opt_id``. Called by the handler as the job starts. Returns
-    the run's random token (written into each of its checkpoints)."""
+                    versions: Optional[Dict[str, Any]] = None, commit: bool = True) -> str:
+    """Record who runs ``opt_id`` and return the run's token (written into each of its
+    checkpoints). Called by the launcher when it creates the row (in the same transaction) and by
+    the handler as the job starts.
+
+    The SAME process registering again (the handler after the launcher; a task retry) keeps the
+    record and its token, so the row's own checkpoints stay its own; the run is marked running
+    again (``ended_at`` cleared). Any OTHER process is refused (``ResumeRefused``): it continues an
+    interrupted row only by claiming it into a new row (``optimize --resume-interrupted``)."""
     import uuid
     from app.models.strategy_optimization import StrategyOptimizationRunner as Run
     ident = identity or process_identity()
+    run = runner_of(db, opt_id)
+    if run is not None:
+        if not _same_process(run, ident):
+            state, why = judge_runner(run)
+            raise ResumeRefused(
+                f"optimization {opt_id} is owned by runner pid {run.pid} on {run.host} ({state}: "
+                f"{why}); another process continues it only through optimize --resume-interrupted "
+                f"(a new row that claims it). Not started.")
+        if resumed_from_id is not None and run.resumed_from_id is None:
+            run.resumed_from_id = resumed_from_id
+        run.ended_at = None
+        if commit:
+            db.commit()
+        return run.run_token
     token = uuid.uuid4().hex
-    db.merge(Run(optimization_id=opt_id, host=ident["host"], pid=int(ident["pid"]),
-                 pid_started=float(ident["pid_started"]),
-                 proc_identity=ident.get("proc_identity"), run_token=token,
-                 code_versions=versions if versions is not None else code_versions(),
-                 resumed_from_id=resumed_from_id, started_at=datetime.now(), topn_done_at=None))
-    db.commit()
+    db.add(Run(optimization_id=opt_id, host=ident["host"], pid=int(ident["pid"]),
+               pid_started=float(ident["pid_started"]),
+               proc_identity=ident.get("proc_identity"), run_token=token,
+               code_versions=versions if versions is not None else code_versions(),
+               resumed_from_id=resumed_from_id, started_at=datetime.now(), topn_done_at=None))
+    if commit:
+        db.commit()
     return token
+
+
+def mark_runner_ended(db, opt_id: int, token: str) -> None:
+    """The handler of run ``token`` returned (completed, failed, paused, cancelled, or an
+    exception): that run is no longer live, whatever its process does next (a serve process lives
+    on). Not called on a kill. The launcher's TOP-N persist after a completed handler is still
+    covered: a completed row is judged by ``topn_done_at`` and the process, not by this."""
+    run = runner_of(db, opt_id)
+    if run is not None and run.run_token == token:
+        run.ended_at = datetime.now()
+        db.commit()
 
 
 def mark_topn_done(db, opt_id: int) -> bool:
@@ -200,10 +244,27 @@ def runner_of(db, opt_id: int):
     return db.get(Run, opt_id)
 
 
-def judge_runner(run) -> Tuple[str, str]:
+def judge_runner(run, *, ignore_ended: bool = False) -> Tuple[str, str]:
+    """A recorded run whose handler returned (``ended_at``) is DEAD as a run even if its process
+    lives on (serve). ``ignore_ended``: judge the PROCESS (a completed job's launcher still
+    persisting its TOP-N)."""
     if run is None:
         return UNKNOWN, "no runner was recorded"
+    if run.ended_at is not None and not ignore_ended:
+        return DEAD, f"its handler returned at {run.ended_at}"
     return judge(run.host, run.pid, run.pid_started, run.proc_identity)
+
+
+def newest_record_row(db, opt_id: int) -> Optional[int]:
+    """The newest row of ``opt_id``'s resume lineage that holds trial records. A row that continues
+    another holds that one's records plus its own once it wrote anything; one killed before its
+    first write holds none, so the walk goes on to the row it continues."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    for rid in resume_lineage(db, opt_id):
+        recs = db.query(SO.all_results).filter(SO.id == rid).scalar()
+        if recs:
+            return rid
+    return None
 
 
 def checkpoint_owned_by(db, ckpt: Dict[str, Any], opt_ids: Sequence[int]) -> Optional[int]:
@@ -278,8 +339,9 @@ def _ckpt_hint(name: str, opt_id: int) -> str:
     return checkpoint_task_id(name, opt_id)
 
 
-def _refuse_unless_dead(name: str, opt_id: int, status: str, run, what: str) -> str:
-    state, why = judge_runner(run)
+def _refuse_unless_dead(name: str, opt_id: int, status: str, run, what: str,
+                       ignore_ended: bool = False) -> str:
+    state, why = judge_runner(run, ignore_ended=ignore_ended)
     if state == DEAD:
         return why
     if run is None:
@@ -319,7 +381,7 @@ def assess(db, name: str) -> Assessment:
     if status == "completed":
         if run is not None and run.topn_done_at is None:
             why = _refuse_unless_dead(name, opt_id, "completed (TOP-N persist unfinished)", run,
-                                      "touched")
+                                      "touched", ignore_ended=True)
             return Assessment("topn", opt_id,
                               f"completed; its end-of-job TOP-N persist was cut off ({why})")
         return Assessment("done", opt_id)
@@ -522,6 +584,10 @@ def acquire_lock(path: str, label: str) -> Dict[str, Any]:
     lock file races with the next opener)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    # Held by THIS process only: never passed to a child (exec'd subprocesses and the spawn-based
+    # pools close it). An orphaned child must not keep the cell locked: its own row-level records
+    # (runner, backtest writer) are what stop a resume from touching its work.
+    os.set_inheritable(fd, False)
     try:
         _os_lock(fd)
     except OSError:

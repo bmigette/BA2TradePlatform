@@ -172,21 +172,37 @@ with `optimize --resume-interrupted` when its runner is provably dead
   version and package minimums; `BA2_RESUME_ACROSS_CODE_CHANGE=1` overrides only these, and the new row
   records both versions in `optimization_config.resumedFrom`). Any difference is refused. A phase-A wf3
   resumed on January's manifests is therefore refused, which enforces the boundary rule above.
-- **Atomic claim.** The new row's INSERT and ONE guarded `UPDATE ... WHERE id=? AND name=? AND status IN
-  ('running','pending')` (rename to `<name>~interrupted-<id>`, status `failed`) run in one transaction,
-  and the UPDATE must change exactly one row. A second starter matches no row; it rolls back (its INSERT
-  included) and is refused.
+- **Atomic claim.** The new row's INSERT, its runner record (with `resumed_from_id`) and ONE guarded
+  `UPDATE ... WHERE id=? AND name=? AND status IN ('running','pending')` (rename to
+  `<name>~interrupted-<id>`, status `failed`) run in one transaction, and the UPDATE must change exactly
+  one row. A second starter matches no row; it rolls back (its INSERT included) and is refused. A start
+  killed at any point after the claim leaves a `pending` row that has a runner and a link to the row it
+  continues, so it is itself resumable. The handler then seeds from the newest row of the lineage that
+  holds trial records. Every CLI launch (not `--submit`) registers the runner with the new row.
+- **One run, one token.** The same process registering again (the handler after the launcher, or a
+  task retry) keeps the token, so the row's own checkpoints stay its own. A different process is refused
+  and the row is left untouched; it can only continue the row by claiming it. A handler that returns
+  (any outcome) records `ended_at`, so a paused task in a live serve process is not a live run. A kill
+  never reaches that line.
 - **Checkpoint ownership.** Every checkpoint carries the writing row's id, its run token and the job
-  identity hash (config incl. window and data digests, metric, gene space, rules). A resume uses only a
-  checkpoint of the interrupted row or of a row it continues (id AND token match: SQLite reuses the id of
-  a deleted max-id row), and refuses one of ours without a fingerprint, or with another fingerprint or
-  identity. A checkpoint of ANY OTHER row means the interrupted run died before its first checkpoint.
-  It is discarded with a log line and the run starts clean. Refusing would block a case whose correct
-  answer is known: a clean start is exactly where that run was.
-- **Plain launches** (no flag) still resume a same-name checkpoint, but only while the row that wrote
-  it exists under that name. An orphaned checkpoint (row deleted by hand, or retired by a resume) or one
-  of another job identity is discarded with a log line. Before this change it was resumed, silently,
-  with only its 20 elites in `all_results`.
+  identity hash (config incl. window and data digests, metric, gene space, rules); id AND token must
+  match, because SQLite reuses the id of a deleted max-id row. `_checkpoint_verdict` decides, and every
+  cell is tested with the real handler in `tests/test_checkpoint_matrix.py`:
+
+  | launch \ checkpoint  | none   | own                          | orphan (writer gone) | another LIVE run's |
+  |----------------------|--------|------------------------------|----------------------|--------------------|
+  | fresh start          | gen 0  | resume (retry of this row)   | retire, gen 0        | refuse, untouched  |
+  | plain relaunch       | gen 0  | resume (the dead prior run)  | retire, gen 0        | refuse, untouched  |
+  | --resume-interrupted | replay | resume (strict checks)       | retire, replay       | refuse, untouched  |
+
+  Under `--resume-interrupted` a checkpoint of ours that has no fingerprint, or another fingerprint or
+  identity, fails the job. A checkpoint of any other dead run means the interrupted run died before its
+  first checkpoint, so the run starts clean; refusing would block a case whose correct answer is known.
+  Before this change a plain launch resumed an orphaned checkpoint silently, with only its 20 elites in
+  `all_results`.
+- **Retire, never delete.** A checkpoint that is not used (orphaned, another identity or search, or
+  exhausted) moves with its payload to a COMPLETED task row `<task_id>-r<8 hex>`. The new row records
+  what, whose and why in `optimization_config.discardedCheckpoints`.
 - **Resume.** All of the dead row's trial records are carried into `all_results` and the trial memo,
   so no finished trial runs again. With no checkpoint, or an exhausted one (killed after the last
   generation, before completing), the search is replayed from generation 0 against the memo. The draws
@@ -207,7 +223,16 @@ with `optimize --resume-interrupted` when its runner is provably dead
   its runner dead, the driver relaunches with the flag, which re-runs only the missing `TOP<rank>`
   rows with the uninterrupted ranking. Each cell runs under an OS file lock (`<report_dir>/<cell>/.lock`,
   `fcntl.flock` / `msvcrt.locking`, released by the OS when the holder dies; the file's content only
-  names the holder). Fold reports, `cell.json` and the summary are written atomically.
+  names the holder). The lock belongs to the DRIVER process only: the fd is non-inheritable, the
+  launcher runs as an exec'd subprocess and the re-run pools are spawn-based. Decision: an orphan the
+  killed driver left (an optimize or persist still running) does NOT block the next driver at the cell
+  level. Its own runner or writer record refuses exactly the resume that would touch its work (cell
+  ERROR, "LIVE process"). That is precise, and it never blocks on a harmless orphan. Fold reports,
+  `cell.json` and the summary are written atomically.
+- **Schema.** Migration 033 converges from every starting state, idempotently: no table, the shape of
+  its first version (missing columns ADDed, no table rewrite) or the current one. `init_db()` runs the
+  same reconciliation after `create_all` (which never alters a table), so the CLI path ends at the same
+  schema (tested).
 - **Remote workers:** not tested. The master re-dispatches, and the memo means finished trials are
   not re-sent. A remote worker's trial still running for the killed master is not cancelled (nobody
   is left to cancel it), so it occupies a slot until it ends; its result is never read.

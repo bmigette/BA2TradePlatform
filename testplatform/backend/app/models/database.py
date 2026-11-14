@@ -78,5 +78,35 @@ def get_db():
 
 
 def init_db():
-    """Initialize database - create all tables"""
+    """Initialize database - create all tables, then reconcile the resume tables' columns.
+
+    ``create_all`` never alters an existing table, so a DB holding an EARLIER shape of the
+    migration-033 tables (``strategy_optimization_runners`` without ``run_token``...) would keep it
+    and the handler would fail on "no such column". The 033 upgrade is idempotent and only ADDs
+    missing nullable columns, so every CLI start converges on the model's schema too."""
     Base.metadata.create_all(bind=engine)
+    reconcile_resume_tables(engine)
+
+
+def reconcile_resume_tables(bind) -> bool:
+    """Run migration 033's idempotent upgrade on ``bind`` (SQLite only). True when it changed
+    something."""
+    if bind.dialect.name != "sqlite":
+        return False
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "db_migrate", "033_add_strategy_optimization_runners.py")
+    spec = importlib.util.spec_from_file_location("_migration_033", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    raw = bind.raw_connection()
+    try:
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            changed = mod.upgrade(raw.cursor(), raw)
+        if changed:
+            print(f"init_db: migration 033{out.getvalue().rstrip()}", flush=True)
+        return changed
+    finally:
+        raw.close()

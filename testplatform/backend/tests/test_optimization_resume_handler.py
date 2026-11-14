@@ -344,5 +344,51 @@ def test_a_fresh_start_discards_an_orphaned_checkpoint(whole, caplog):
     calls = []
     caplog.set_level("WARNING")
     assert _run(fresh, calls)["status"] == "completed"
-    assert "DISCARDING orphaned checkpoint" in caplog.text
+    assert "DISCARDING checkpoint" in caplog.text and "is orphaned" in caplog.text
     assert _result(fresh) == {**want, "status": "completed"} and len(calls) == n_whole
+
+
+def test_a_start_killed_right_after_its_claim_is_itself_resumable(whole):
+    """The claim committed (dead row retired, new row `pending` with its runner and the link to
+    the row it continues), then the process died before the handler ran: the next start resumes
+    the pending row, finds the first row's checkpoint through the lineage and its trials through
+    the newest row holding any, and ends with the uninterrupted result."""
+    want, n_whole = whole
+    name = _uniq("res-claimkill")
+    killed, done = _kill(name, 18)
+    _, pending = _launch_resume(name)            # claimed ...
+    _make_dead(pending)                          # ... and killed before the handler started
+    db = SessionLocal()
+    try:
+        assert db.get(StrategyOptimization, pending).status == "pending"
+        assert db.get(StrategyOptimizationRunner, pending).resumed_from_id == killed
+        a = R.assess(db, name)
+        assert (a.kind, a.opt_id) == ("resume", pending)
+    finally:
+        db.close()
+    stale, resumed = _launch_resume(name)
+    assert stale == pending
+    calls = []
+    caplog_free = _run(resumed, calls, payload={"resume_of": pending})
+    assert caplog_free["status"] == "completed", caplog_free
+    assert _result(resumed) == {**want, "status": "completed"}
+    assert done + len(calls) == n_whole                # resumed, nothing re-run
+
+
+def test_the_handler_leaves_a_row_owned_by_another_process_untouched(stubbed):
+    name = _uniq("res-owned")
+    killed, _ = _kill(name, 18)                  # its runner: another (dead) process
+    db = SessionLocal()
+    try:
+        before = db.get(StrategyOptimizationRunner, killed).run_token
+    finally:
+        db.close()
+    out = _run(killed, [])                       # a plain re-run of THAT row by this process
+    assert out["status"] == "failed" and "--resume-interrupted" in out["error"]
+    db = SessionLocal()
+    try:
+        row = db.get(StrategyOptimization, killed)
+        assert row.status == "running" and row.name == name          # not touched
+        assert db.get(StrategyOptimizationRunner, killed).run_token == before
+    finally:
+        db.close()

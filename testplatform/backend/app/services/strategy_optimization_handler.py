@@ -1803,22 +1803,30 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         return {"status": "failed", "error": "optimization_id is required"}
 
     db = SessionLocal()
+    run_token = None
+    from app.services import optimization_resume as _resume
     try:
         opt = db.query(StrategyOptimization).filter(
             StrategyOptimization.id == opt_id
         ).first()
         if not opt:
             return {"status": "failed", "error": f"StrategyOptimization {opt_id} not found"}
-        opt.status = "running"
-        opt.started_at = datetime.now()
-        db.commit()
-        # WHO runs this row (host, pid, process start, code versions): the evidence a later start
-        # needs to prove this runner dead before it resumes the job, and never hijack a live one.
+        # WHO runs this row (host, pid, process start, code versions), BEFORE the row is touched:
+        # the evidence a later start needs to prove this runner dead before it resumes the job.
+        # The launcher registered this same process when it created the row (the token is kept);
+        # a row owned by ANOTHER process is refused here and left exactly as it is.
         # ``resume_of``: the interrupted row this one continues (optimize --resume-interrupted).
         resume_of = payload.get("resume_of")
         resume_of = int(resume_of) if resume_of is not None else None
-        from app.services import optimization_resume as _resume
-        run_token = _resume.register_runner(db, opt_id, resumed_from_id=resume_of)
+        try:
+            run_token = _resume.register_runner(db, opt_id, resumed_from_id=resume_of)
+        except _resume.ResumeRefused as e:
+            db.rollback()
+            logger.error(f"strategy_optimization {opt_id} NOT started: {e}")
+            return {"status": "failed", "error": str(e)}
+        opt.status = "running"
+        opt.started_at = datetime.now()
+        db.commit()
         if resume_of is not None:
             # Both code versions, durably on THIS row (a resume across a code change is allowed
             # only by BA2_RESUME_ACROSS_CODE_CHANGE=1; this is where it stays visible).
@@ -2408,71 +2416,66 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         start_gen, init_pop, init_fits = 0, None, None
         n_protected_seeds = 0
-        # WHICH CHECKPOINT, AND WHOSE TRIALS (app.services.optimization_resume).
+        # WHICH CHECKPOINT, AND WHOSE TRIALS (app.services.optimization_resume;
+        # the full matrix is _checkpoint_verdict's docstring, tested in test_checkpoint_matrix.py).
         #
-        # RESUME OF AN INTERRUPTED ROW (optimize --resume-interrupted, ``resume_of``): only a
-        # checkpoint written by that row (or a row it continues) is used, and only with a matching
-        # fingerprint AND job identity; anything else of ours is a refusal. A checkpoint written by
-        # ANOTHER row is foreign: the interrupted run died before its first checkpoint, so it is
-        # discarded (said so) and the run starts clean, which is exactly where the interrupted one
-        # was. Either way every trial the dead row finished is re-seeded into all_results and the
-        # trial memo from its record (written after each trial), so nothing runs again and
-        # all_results holds the trials of an uninterrupted run (the walk-forward top-N is selected
-        # from it; a checkpoint carries only 20 elites).
+        # A checkpoint is USED only when it belongs to this job's own run: the interrupted row or a
+        # row it continues (resume), the previous dead run of this name or this very row on a
+        # retry (plain launch). Used under --resume-interrupted it must also carry this search's
+        # fingerprint and job identity (window, data digests, config, rules), else the job FAILS.
+        # A checkpoint that belongs to a run that is still LIVE (or cannot be judged) is never
+        # touched: the job fails. Any other checkpoint (orphaned, another job identity, exhausted,
+        # another search) is RETIRED -- moved to a task row of its own with its payload, never
+        # deleted -- and noted on this row (``discardedCheckpoints``); the run starts clean.
         #
-        # PLAIN LAUNCH: a checkpoint of this name is resumed (as before) only while the row that
-        # wrote it still exists, and its trials are re-seeded from that row the same way. An
-        # ORPHANED checkpoint (its row deleted by hand) or one of another job identity is
-        # discarded (said so): resuming it would keep only its 20 elites in all_results.
+        # Every trial the continued run finished is re-seeded into all_results and the trial memo
+        # from its record (written after each trial), so nothing runs again and all_results holds
+        # the trials of an uninterrupted run (a checkpoint carries only 20 elites). With no usable
+        # checkpoint the search replays from generation 0 against that memo.
         seeded_keys = None
         source_row = None
         if is_brute_force:
             ckpt = None           # a grid has no population to resume or warm-start
-        elif resume_of is not None:
+        else:
             ckpt = _load_checkpoint(ckpt_task_id)
-            source_row = resume_of
+            _lineage = _resume.resume_lineage(db, resume_of) if resume_of is not None else None
+            if resume_of is not None:
+                source_row = _resume.newest_record_row(db, resume_of)
             if ckpt is not None:
-                _lineage = _resume.resume_lineage(db, resume_of)
-                if _resume.checkpoint_owned_by(db, ckpt, _lineage) is None:
-                    logger.warning(
-                        f"strategy_optimization {opt_id}: DISCARDING checkpoint {ckpt_task_id} "
-                        f"(generation {ckpt.get('generation')}, written by optimization "
-                        f"{ckpt.get('optimization_id')!r}, run {ckpt.get('run_token')!r}): it is not "
-                        f"the interrupted row's "
-                        f"(lineage {_lineage}), which died before its first checkpoint. Starting "
-                        f"clean from generation 0; its finished trials replay from the memo.")
-                    _clear_checkpoint(ckpt_task_id)
-                    ckpt = None
-                else:
+                _verdict, _detail = _checkpoint_verdict(db, ckpt, opt, _lineage)
+                if _verdict == "refuse":
+                    return _fail(opt_id, db, f"checkpoint {ckpt_task_id} (generation "
+                                             f"{ckpt.get('generation')}) {_detail}: not touched, "
+                                             f"not started.")
+                _why = None if _verdict == "use" else _detail
+                if _why is None:
+                    _stored_fp = ckpt.get("fingerprint")
                     _problem = (
-                        "carries no fingerprint" if not ckpt.get("fingerprint") else
-                        f"was written for another search (fingerprint {ckpt['fingerprint']} != "
+                        "carries no fingerprint" if not _stored_fp and resume_of is not None else
+                        f"was written for another search (fingerprint {_stored_fp} != "
                         f"{ckpt_fingerprint}: gene space, GA budget or a search setting changed)"
-                        if ckpt["fingerprint"] != ckpt_fingerprint else
+                        if _stored_fp and _stored_fp != ckpt_fingerprint else
                         f"carries job identity {ckpt.get('job_identity')!r} != {job_identity!r} "
                         f"(window, data digests, config or rules changed)"
-                        if ckpt.get("job_identity") != job_identity else None)
-                    if _problem:
+                        if ckpt.get("job_identity") not in (None, job_identity) or (
+                            resume_of is not None and ckpt.get("job_identity") != job_identity)
+                        else None)
+                    if _problem and resume_of is not None:
                         return _fail(opt_id, db, f"resume of interrupted optimization {resume_of}: "
                                                  f"checkpoint {ckpt_task_id} {_problem}. Not resumed.")
-        else:
-            ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
-            if ckpt is not None and not _checkpoint_exhausted(ckpt, ga["generations"]):
-                _writer = _checkpoint_writer(db, ckpt, opt)
-                _why = ("it carries another job identity (window, data digests, config or rules "
-                        "changed)" if ckpt.get("job_identity") not in (None, job_identity) else
-                        "the row that wrote it no longer exists (deleted by hand?)"
-                        if _writer is None else None)
-                if _why:
-                    logger.warning(
-                        f"strategy_optimization {opt_id}: DISCARDING orphaned checkpoint "
-                        f"{ckpt_task_id} (generation {ckpt.get('generation')}): {_why}; resuming "
-                        f"it would keep only its {len(ckpt.get('top_results') or [])} elites in "
-                        f"all_results. Starting from generation 0.")
-                    _clear_checkpoint(ckpt_task_id)
+                    if _problem:
+                        _why = _problem
+                    elif _checkpoint_exhausted(ckpt, ga["generations"]):
+                        _why = (f"it is EXHAUSTED (generation {ckpt.get('generation')} of "
+                                f"{ga['generations']}: its run died after the last generation); the "
+                                f"search replays from generation 0 against the memo")
+                    elif resume_of is None:
+                        source_row = _detail
+                if _why is not None:
+                    _note_discarded_checkpoint(db, opt, ckpt_task_id, ckpt, _why)
+                    if _verdict == "use" and resume_of is None and "EXHAUSTED" in _why:
+                        source_row = _detail          # replay the dead run's trials from the memo
                     ckpt = None
-                else:
-                    source_row = _writer
         if source_row is not None:
             try:
                 seeded_keys = _seed_from_interrupted_row(db, source_row, all_results, memo, best)
@@ -2481,28 +2484,6 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             logger.warning(
                 f"strategy_optimization {opt_id}: continuing optimization {source_row}: "
                 f"{len(all_results)} trial record(s) carried over, {len(seeded_keys)} memoized")
-        # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
-        # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
-        # a confusing failure for what is really "this search already finished". Only reachable
-        # when a run reached the last generation and then died before _clear_checkpoint (or when a
-        # NEW job reuses a dead job's name), so discarding and searching from scratch is both the
-        # safe reading and the one that produces a result. A PARTIAL checkpoint on the final
-        # generation is the exception -- see _checkpoint_exhausted. For a RESUME the search is
-        # REPLAYED from generation 0 against the memo of every finished trial: the same RNG draws,
-        # nothing runs again, the uninterrupted result.
-        if _checkpoint_exhausted(ckpt, ga["generations"]):
-            if seeded_keys is not None:
-                logger.warning(
-                    f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is EXHAUSTED "
-                    f"(generation {ckpt.get('generation')} of {ga['generations']}: the run died "
-                    f"after its last generation). REPLAYING from generation 0 against the memo of "
-                    f"{len(seeded_keys)} finished trials; no trial runs again.")
-            else:
-                logger.warning(
-                    f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
-                    f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
-            _clear_checkpoint(ckpt_task_id)
-            ckpt = None
         if ckpt:
             # REFUSE a checkpoint scored under a different objective, BEFORE anything is resumed.
             _assert_checkpoint_robustness_matches(ckpt, robust_on, opt.name, ckpt_task_id)
@@ -2945,6 +2926,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         logger.error(f"strategy_optimization {opt_id} crashed: {e}", exc_info=True)
         return _fail(opt_id, db, str(e))
     finally:
+        # This run's handler is returning (any outcome, an exception included; a kill never gets
+        # here): it is no longer a live run even if this process lives on (serve, a paused task).
+        if run_token is not None:
+            try:
+                db.rollback()
+                _resume.mark_runner_ended(db, opt_id, run_token)
+            except Exception as e:  # noqa: BLE001 -- the outcome above must not be masked
+                logger.error(f"strategy_optimization {opt_id}: could not record the end of run "
+                             f"{run_token}: {e}; a later resume will judge its process instead")
         db.close()
 
 
@@ -4104,6 +4094,89 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _checkpoint_verdict(db: Any, ckpt: Dict[str, Any], opt: Any,
+                        lineage: Optional[List[int]]) -> Tuple[str, Any]:
+    """What a starting run does with the checkpoint stored under its job name:
+    ``("use", writer_row_id)``, ``("retire", why)`` or ``("refuse", why)``.
+
+    ``lineage`` = the resume lineage under ``--resume-interrupted`` (None for a plain launch).
+
+    | checkpoint written by                         | plain launch           | --resume-interrupted |
+    |-----------------------------------------------|------------------------|----------------------|
+    | this row, same run token (a retry)            | use                    | use                  |
+    | the interrupted row / a row it continues      | -                      | use (strict checks)  |
+    | a dead earlier run of this name (row exists)  | use                    | retire               |
+    | a row that is gone, or whose id was reused    | retire (orphan)        | retire               |
+    | a row whose run is LIVE or cannot be judged   | refuse                 | refuse               |
+    | legacy (no writer recorded)                   | use if exactly one other row of the name, else retire | retire |
+
+    "Dead earlier run" under --resume-interrupted means another row of the name is not the one
+    being resumed: impossible after assess() unless that row was retired, so its checkpoint is
+    not this job's state. The caller then applies the fingerprint / identity / exhausted checks."""
+    from app.services import optimization_resume as _resume
+    wid = ckpt.get("optimization_id")
+    if wid is None:
+        if lineage is not None:
+            return "retire", "names no writer (written before checkpoints did), so it cannot be " \
+                             "proven to be the interrupted row's"
+        w = _checkpoint_writer(db, ckpt, opt)
+        return ("use", w) if w is not None else \
+            ("retire", "is orphaned: a legacy checkpoint with no other row of this name")
+    wid = int(wid)
+    if _resume.checkpoint_owned_by(db, ckpt, [wid]) is None:
+        return "retire", (f"is orphaned: its writer optimization {wid} no longer exists, or that id "
+                          f"now belongs to another run (run token mismatch)")
+    if wid == opt.id or (lineage is not None and wid in lineage):
+        return "use", wid
+    state, why = _resume.judge_runner(_resume.runner_of(db, wid))
+    if state != _resume.DEAD:
+        return "refuse", f"belongs to optimization {wid}, whose run is {state.upper()} ({why})"
+    name = db.query(StrategyOptimization.name).filter(StrategyOptimization.id == wid).scalar()
+    if lineage is None and name == opt.name:
+        return "use", wid
+    return "retire", (f"was written by optimization {wid} ({name!r}), a dead run that is not this "
+                      f"job's " + ("interrupted run" if lineage is not None else
+                                   "previous run (it was retired)"))
+
+
+def _note_discarded_checkpoint(db: Any, opt: Any, task_id: str, ckpt: Dict[str, Any],
+                               why: str) -> None:
+    """RETIRE a checkpoint this run will not use: its payload moves to a task row of its own
+    (kept, never deleted), and this row records what, whose and why (``discardedCheckpoints``)."""
+    retired = _retire_checkpoint(task_id, why)
+    note = {"task_id": task_id, "retired_as": retired, "generation": ckpt.get("generation"),
+            "partial": ckpt.get("partial"), "written_by": ckpt.get("optimization_id"),
+            "run_token": ckpt.get("run_token"), "why": why, "at": datetime.now().isoformat()}
+    opt.optimization_config = {**(opt.optimization_config or {}), "discardedCheckpoints": [
+        *((opt.optimization_config or {}).get("discardedCheckpoints") or []), note]}
+    db.commit()
+    logger.warning(f"strategy_optimization {opt.id}: DISCARDING checkpoint {task_id} (generation "
+                   f"{note['generation']}, written by optimization {note['written_by']!r}): it "
+                   f"{why}. Retired (payload kept) as task {retired}; starting clean.")
+
+
+def _retire_checkpoint(task_id: str, why: str) -> str:
+    """Move the checkpoint stored under ``task_id`` to a new COMPLETED task row
+    ``<task_id>-r<8 hex>`` (payload kept) and empty the original. Returns the new task id. Raises
+    on failure: a checkpoint is never lost quietly."""
+    import uuid
+    db = SessionLocal()
+    try:
+        t = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
+        if t is None or not t.checkpoint_data:
+            raise ValueError(f"no checkpoint stored under {task_id}")
+        rid = f"{task_id}-r{uuid.uuid4().hex[:8]}"
+        db.add(TaskQueue(task_id=rid, task_type="strategy_optimization", name=rid,
+                         description=f"RETIRED GA checkpoint of {task_id}: {why}",
+                         status=TaskStatus.COMPLETED.value, checkpoint_data=t.checkpoint_data))
+        t.checkpoint_data = None
+        t.status = TaskStatus.COMPLETED.value
+        db.commit()
+        return rid
+    finally:
+        db.close()
 
 
 def _checkpoint_writer(db: Any, ckpt: Dict[str, Any], opt: Any) -> Optional[int]:

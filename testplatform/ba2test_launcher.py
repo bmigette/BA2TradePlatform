@@ -10741,7 +10741,15 @@ def _cmd_optimize(args) -> int:
                 fitness_metric=fitness, optimization_type="genetic",
                 optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
             )
-            db.add(opt); db.commit(); db.refresh(opt)
+            db.add(opt)
+            if not getattr(args, "submit", False):
+                # This process runs the handler: record it with the row, so a kill before the
+                # handler starts leaves a resumable row, not an ownerless one. (Never for --submit:
+                # the serve process runs that row, and this one exits at once.)
+                from app.services import optimization_resume as _R
+                db.flush()
+                _R.register_runner(db, opt.id, commit=False)
+            db.commit(); db.refresh(opt)
         opt_id = opt.id
         if _worker_ids:
             print(f"optimize: distributing across worker ids {_worker_ids} + local")
@@ -10839,6 +10847,10 @@ def _create_resumed_row(db, stale_id: int, name: str, cfg: dict, strat, fitness:
     try:
         db.add(opt)
         db.flush()
+        # The new row's runner (this process, which runs its handler) and the link to the row it
+        # continues are written IN the claim transaction: a kill at any point after the claim
+        # leaves a row that is itself resumable (dead runner, resumed_from_id recorded).
+        _R.register_runner(db, opt.id, resumed_from_id=stale_id, commit=False)
         _R.claim_and_retire(db, stale_id, name, f"resumed as optimization #{opt.id}")
         db.commit()
     except Exception:

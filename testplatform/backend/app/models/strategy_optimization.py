@@ -110,6 +110,8 @@ class StrategyOptimizationRunner(Base):
     resumed_from_id = Column(Integer, nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     topn_done_at = Column(DateTime(timezone=True), nullable=True)
+    # When the handler of this run returned (any outcome). NULL while it runs or after a kill.
+    ended_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class BacktestWriter(Base):

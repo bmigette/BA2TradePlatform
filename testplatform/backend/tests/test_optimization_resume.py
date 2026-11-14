@@ -169,7 +169,11 @@ def test_completed_row_whose_topn_was_cut_is_topn(S):
         assert (a.kind, a.opt_id) == ("topn", oid)
     finally:
         db.close()
-    _register(S, oid, _dead_identity(), topn_done=True)
+    db = S()
+    try:
+        R.mark_topn_done(db, oid)                 # the persist finished after all
+    finally:
+        db.close()
     db = S()
     try:
         assert R.assess(db, n).kind == "done"
@@ -488,3 +492,93 @@ def test_lock_file_content_plays_no_part_in_the_decision(tmp_path):
     p.write_text(json.dumps({"host": "remote-box", "pid": 1, "label": "x"}))
     with R.exclusive(str(p), "x"):
         pass
+
+
+# ------------------------------------------------------------------ registration (one run, one token)
+
+
+def test_the_same_process_registering_again_keeps_its_token(S):
+    """The launcher registers the row, then its handler; a task retry registers again. The token
+    must not change, or the row's own checkpoints would stop being its own."""
+    oid = _opt(S, _name("same"))
+    db = S()
+    try:
+        t1 = R.register_runner(db, oid, resumed_from_id=7)
+        t2 = R.register_runner(db, oid)
+        assert t1 == t2 and R.runner_of(db, oid).resumed_from_id == 7
+    finally:
+        db.close()
+
+
+def test_another_process_cannot_register_on_an_owned_row(S):
+    oid = _opt(S, _name("other"))
+    _register(S, oid, _dead_identity())
+    db = S()
+    try:
+        token = R.runner_of(db, oid).run_token
+        with pytest.raises(R.ResumeRefused, match="only through optimize --resume-interrupted"):
+            R.register_runner(db, oid)
+        assert R.runner_of(db, oid).run_token == token
+    finally:
+        db.close()
+
+
+def test_a_run_whose_handler_returned_is_not_live_even_if_its_process_is(S):
+    """A paused task in a serve process: the process lives on, the run does not."""
+    n = _name("ended")
+    oid = _opt(S, n)
+    db = S()
+    try:
+        token = R.register_runner(db, oid)
+        with pytest.raises(R.ResumeRefused, match="LIVE process"):
+            R.assess(db, n)
+        R.mark_runner_ended(db, oid, token)
+        assert R.assess(db, n).kind == "resume"
+        R.register_runner(db, oid)                 # the same process takes it up again
+        with pytest.raises(R.ResumeRefused, match="LIVE process"):
+            R.assess(db, n)
+    finally:
+        db.close()
+
+
+_HOLDER_WITH_CHILD = r"""
+import subprocess, sys, time
+sys.path.insert(0, sys.argv[2])
+from app.services import optimization_resume as R
+h = R.acquire_lock(sys.argv[1], "cell-a")
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+print("locked", child.pid, flush=True)
+time.sleep(120)
+"""
+
+
+def test_a_child_of_the_driver_does_not_keep_the_cell_lock(tmp_path):
+    """The lock belongs to the driver process only (non-inheritable fd; exec'd children and the
+    spawn pools never get it). An orphan the driver started does not block the next driver at the
+    CELL level: its own runner / writer record refuses any resume that would touch its work."""
+    import psutil
+    p = str(tmp_path / ".lock")
+    backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER_WITH_CHILD, p, backend],
+                              stdout=subprocess.PIPE, text=True)
+    child = None
+    try:
+        word, child_pid = holder.stdout.readline().split()
+        assert word == "locked"
+        child = psutil.Process(int(child_pid))
+        driver_pid = json.loads(open(p, encoding="utf-8").read())["pid"]
+        for pid in {holder.pid, driver_pid}:          # kill the driver, NOT its child
+            psutil.Process(pid).kill()
+        holder.wait()
+        psutil.wait_procs([psutil.Process(driver_pid)] if psutil.pid_exists(driver_pid) else [],
+                          timeout=10)
+        assert child.is_running()
+        with R.exclusive(p, "cell-a"):                # the orphan child does not hold it
+            pass
+    finally:
+        if child is not None and child.is_running():
+            for c in child.children(recursive=True):
+                c.kill()
+            child.kill()
+        if holder.poll() is None:
+            holder.kill()

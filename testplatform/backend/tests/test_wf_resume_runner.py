@@ -115,7 +115,11 @@ def test_a_cut_off_topn_persist_reopens_a_completed_job(monkeypatch, host_db, la
     assert r.train_completed("rs-topn-wf1") is False
     r.run_train(["ba2-test", "optimize"], "rs-topn-wf1")
     assert calls == [["ba2-test", "optimize", "--resume-interrupted"]]
-    _register(host_db, oid, _dead(), topn_done=True)
+    db = host_db()
+    try:
+        R.mark_topn_done(db, oid)                 # the relaunch finished the persist
+    finally:
+        db.close()
     assert r.train_completed("rs-topn-wf1") is True
 
 

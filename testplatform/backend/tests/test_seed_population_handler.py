@@ -202,26 +202,49 @@ def test_absent_or_false_flag_leaves_generation_zero_to_optimize(monkeypatch):
     assert out["status"] == "completed" and cap["init"] is None
 
 
-def test_checkpoint_wins_over_seeds(monkeypatch):
+def test_checkpoint_wins_over_seeds(monkeypatch, caplog):
+    """A relaunch of a SEEDED job whose first run was killed after its first checkpoint resumes
+    that checkpoint: the seeds are not built again. Real handler, checkpoint store and resume
+    rules (the first run's row exists and its run ended); only the backtest is the stub."""
+    import uuid
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+
     seed = _full_seed(monkeypatch)
-    called = {}
+    monkeypatch.setattr(H, "GeneticOptimizer", GeneticOptimizer)      # drop _full_seed's spy
+    name = f"seeded-relaunch-{uuid.uuid4().hex[:8]}"
 
-    def fake_resume(self, ckpt):
-        called["resumed"] = True
-        raise RuntimeError("stop after the branch is taken")
+    class _Killed(BaseException):
+        pass
 
-    monkeypatch.setattr(H, "_load_checkpoint", lambda *a, **k: {"generation": 0})
-    monkeypatch.setattr(GeneticOptimizer, "resume_from_checkpoint", fake_resume)
-    monkeypatch.setattr(H, "_assert_checkpoint_robustness_matches", lambda *a, **k: None)
-    monkeypatch.setattr(H, "_assert_checkpoint_metric_matches", lambda *a, **k: None)
-    monkeypatch.setattr(H, "_checkpoint_exhausted", lambda *a, **k: False)
-    # the checkpoint's writing row exists (a checkpoint with none is orphaned and discarded)
-    monkeypatch.setattr(H, "_checkpoint_writer", lambda *a, **k: 1)
-    monkeypatch.setattr(H, "_seed_from_interrupted_row", lambda *a, **k: set())
+    calls = []
+
+    def dies_in_generation_1(cfg, hoisted, decoded):
+        calls.append(1)
+        if len(calls) == 11:                     # population 8: generation 0 is checkpointed
+            raise _Killed()
+        return T._deterministic_stub(cfg, hoisted, decoded)
+
+    def launch():
+        oid = T._seed_opt(T._seed_strategy(), config=T._ga_config(generations=3,
+                                                                  seedPopulation=[seed]))
+        db = SessionLocal()
+        try:
+            db.get(StrategyOptimization, oid).name = name
+            db.commit()
+        finally:
+            db.close()
+        return H.handle_strategy_optimization("t-ckpt", {"optimization_id": oid})
+
+    monkeypatch.setattr(H, "_run_trial_backtest", dies_in_generation_1)
+    with pytest.raises(_Killed):
+        launch()
+    monkeypatch.setattr(H, "_run_trial_backtest", T._deterministic_stub)
     monkeypatch.setattr(H, "_build_seed_population",
                         lambda *a, **k: pytest.fail("seeds must not be built on a resume"))
-    try:
-        _run("t-ckpt", generations=2, seedPopulation=[seed])
-    except RuntimeError:
-        pass
-    assert called.get("resumed")
+    caplog.set_level("WARNING")
+    out = launch()
+    assert out["status"] == "completed", out
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("RESUMING" in m and name in m for m in msgs), msgs
+    assert not any("at generation 0/" in m for m in msgs)
