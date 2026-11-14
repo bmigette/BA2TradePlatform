@@ -36,7 +36,9 @@ A strategy is in the plan if it ranked in its expert's pooled goal2020 top 5 by 
   `-from2022`.
 - **DeterministicScorer × SQM × xl** is the one cell outside the strategy plan. It is the exploration
   `quality_momentum` recipe as a GA cell (§2.8, evidence below). Every DeterministicScorer cell, this one
-  included, also searches the DS factor genes (`--search-ds-factor-weights`, name token `dsfw`). Cells
+  included, also searches the DS factor genes (`--search-ds-factor-weights`, name token `dsfw`). *Since
+  2026-11-14 the wrapper PINS the DS score weights instead (`--pin-ds-score-weights`, `dspin`, §2.8 "Pinned score
+  weights"); `DS_WEIGHTS=search` restores the `dsfw` cells.* Cells
   whose expert has an audited exploration dimension also carry `--search-exploration-ranges` (`explr`, §2.9).
 - The ML forecast expert ([2026-10-25-ml-forecast-expert-design.md](2026-10-25-ml-forecast-expert-design.md))
   joins as extra cells only if its pilot shows an edge.
@@ -317,6 +319,47 @@ Open points:
    `tw_mom` is its only positive weight and the momentum lookback exceeds the symbol's history) has `total_w` 0 and
    `technical_score` returns a literal 0.0 with no components, i.e. a silent neutral score that still carries
    `w_technical`. `dsfw` does not change it.
+
+**Pinned score weights** (`--pin-ds-score-weights`, name token `dspin`; owner decision 2026-11-14). A signal study
+(470k observations, 2020-2025, large caps) found that the score built from GA-chosen DS weights has zero or negative
+out-of-sample predictive power in 2024-2025. Only momentum, the 200-day trend and Piotroski held up; value, growth and
+the earnings section added nothing. The analyst price-target leg is sparse in history (absent in 2020, nearly empty
+from March 2023 to February 2024) but rich live, so its weight must not be fitted. The pin therefore FIXES the score
+coefficients, and the GA tunes only the thresholds, exits, sizing and the other non-score genes.
+
+| Setting | Value | Intent |
+|---|---|---|
+| `w_technical`, `w_fundamental`, `w_analyst` | 0.6, 0.3, 0.1 | technical : fundamental = 2 : 1; the analyst section is 10% |
+| `w_earnings` | 0.0 | earnings section off (its data is not fetched) |
+| `tw_mom`, `tw_d200`, `tw_rsi`, `tw_don` | 0.5, 0.5, 0, 0 | momentum and 200-day trend, equal |
+| `fw_piotroski`, `fw_quality`, `fw_value`, `fw_growth` | 1, 0, 0, 0 | Piotroski only |
+| `aw_grades`, `aw_targets` | 0.75, 0.25 | grades-dominant, 3 : 1 |
+| `w_macro`, `mw_trend_index`, `mw_vix`, `mw_credit`, `mw_yield_curve`, `mw_sahm` | 0.2, 0.43, 0.21, 0.14, 0.14, 0.08 | the DS defaults, stated explicitly |
+
+- **What DS computes.** DS renormalises the positive weights inside each section and across sections, so these are
+  ratios and a 0 is legal (the component is dropped). With every section present, the raw score weighs momentum,
+  trend and Piotroski 0.30 each and the analyst section 0.10 (grades 0.075, targets 0.025). With the analyst section
+  missing (`skip_on_missing_section` "skip", the default), the three are exactly one third each. With only the
+  grades leg present, grades carries the full 0.10. The RSI boost under a low ADX multiplies a 0 weight and stays 0.
+- **What stays searched.** `macro_mode` stays a gene (how the regime gates or scales the score, not a coefficient),
+  as do `theta_buy`, `theta_sell`, `k_stop`, `k_target`, the target-model genes, the RM, time and market genes.
+  `mom_lookback_days` and the analyst target window and minimum are not genes; they stay at the DS defaults (252,
+  90, 3). `w_macro` only acts under `macro_mode` "input", which is not a gene choice.
+- **Path.** `ba2test_launcher._apply_ds_score_pin` adds the dict to the DeterministicScorer spec's
+  `fixed_settings` and removes `w_technical`, `w_fundamental`, `w_analyst` and `w_earnings` from its genes. The
+  values therefore take the path of every fixed setting: the run block's expert settings, each trial
+  (`_build_daily_trial_config`), the TOP-N and walk-forward re-runs, `expertFixedSettings` on each persisted row, and
+  the export. `_check_ds_score_pin_applied` refuses a job whose gene space still holds a pinned key or whose run
+  settings do not carry every pinned value. The confidence ceiling is the theoretical 93 (as under `dsfw`): the
+  measured 50 holds only for the default weights.
+- **Refusals.** The flag is refused together with `--search-ds-factor-weights` and for any expert other than
+  DeterministicScorer. The capband driver forwards it to DeterministicScorer jobs only and requires `dspin` (and no
+  `dsfw`) in `--name-suffix`.
+- **Grid wrapper.** `grid_goal2027.sh` pins by default on every DS step (`ds-*`, `s9-ds-*`, `s8-ds-*`) and on
+  `sqm-xl`: SQM buys on the DS `bullish` signal, so its entries depend on the score. `DS_WEIGHTS=search` restores
+  the `dsfw` cells and their names byte for byte. Only DeterministicScorer names change; every other job name and
+  command is unchanged (dry-run diff of all 30 steps, phases A and B). Note that SQM was modelled on the exploration
+  `quality_momentum` recipe (`fw_quality` 0.6, `mom_lookback_days` 126), which the pin does not reproduce.
 
 ## 3. Data preparation (January 2027)
 

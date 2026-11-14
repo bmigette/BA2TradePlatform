@@ -19,6 +19,7 @@ from ba2_common.core.provider_utils import parse_provider_date
 from ba2_common.core.knowability import intraday_decision_clock, published_known
 from ba2_common.logger import get_expert_logger
 from ba2_experts.price_target_basis import log_skipped_unadjusted, split_adjusted_target
+from ba2_experts.analyst_grades import GRADES_FIELD_ALIASES
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_providers.fmp_common import fmp_http_get, FMPError, TTLCache, fmp_history_disk_cached
@@ -626,16 +627,11 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
     # are ever used; rows after as_of are ignored.
     # ------------------------------------------------------------------
 
-    # grades-historical rows use FMP's verbose ``analystRatings*`` field names;
-    # map each rating bucket to the short names _calculate_recommendation expects.
-    # Both forms are accepted so the reconstruction is robust to FMP field casing.
-    _GRADES_FIELD_ALIASES = {
-        "strongBuy": ("analystRatingsStrongBuy", "strongBuy"),
-        "buy": ("analystRatingsbuy", "analystRatingsBuy", "buy"),
-        "hold": ("analystRatingsHold", "hold"),
-        "sell": ("analystRatingsSell", "sell"),
-        "strongSell": ("analystRatingsStrongSell", "strongSell"),
-    }
+    # grades-historical rows use FMP's verbose ``analystRatings*`` field names; the ONE
+    # mapping to the short names _calculate_recommendation expects lives in
+    # ba2_experts.analyst_grades (DeterministicScorer reads rows through it too). This
+    # name is kept as a reference to that table, not a copy.
+    _GRADES_FIELD_ALIASES = GRADES_FIELD_ALIASES
 
     def _fetch_grades_historical(self, symbol: str) -> list:
         """Fetch the FULL dated analyst-grade history for a symbol (backtest path).
@@ -709,6 +705,8 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
             return None
         latest = max(eligible, key=lambda r: _memo_provider_date(r, "date"))
 
+        # Unchanged FMPRating behaviour (a bucket with no readable field counts 0): results of
+        # stored and running backtests must not move. Only the alias TABLE is shared with DS.
         def _val(row, names):
             for n in names:
                 if n in row and row[n] is not None:

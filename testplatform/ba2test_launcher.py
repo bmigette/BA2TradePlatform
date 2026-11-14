@@ -6875,6 +6875,30 @@ _SEARCH_MARKET_PROFILE: bool = False
 _SEARCH_DS_FACTOR_WEIGHTS: bool = False
 _DS_FACTOR_EXPERT = "DeterministicScorer"
 
+#: ``--pin-ds-score-weights`` (name token ``dspin``; owner decision 2026-11-14): the DeterministicScorer SCORE
+#: COEFFICIENTS are fixed settings, not genes -- the alternative to ``--search-ds-factor-weights``, mutually exclusive
+#: with it. A 470k-observation signal study (2020-2025, large caps) found the GA-chosen weights carry no
+#: out-of-sample signal in 2024-2025; only momentum, the 200-day trend and Piotroski held up, and the analyst
+#: price-target leg is sparse in history but rich live, so no weight may be fitted to it. Values (design doc 2.8,
+#: "Pinned score weights"): DS renormalises positive weights inside a section and across sections, so these are
+#: ratios. technical : fundamental : analyst = 0.6 : 0.3 : 0.1 with tw_mom = tw_d200 and fw_piotroski alone gives
+#: momentum, trend and Piotroski 0.30 each and the analyst section 0.10 (grades 0.075, targets 0.025); when the analyst
+#: section is missing (``skip_on_missing_section`` "skip") the three are exactly one third each. 0 is a legal weight
+#: everywhere (a 0 sub-weight drops the component; ``w_earnings`` 0 skips the section and its data fetch). The macro
+#: weights are the DS settings defaults, written explicitly so the job (and its deploy) never depends on a default
+#: that later moves; ``w_macro`` only acts under ``macro_mode`` "input", which is not a gene choice. ``macro_mode``
+#: itself (how the regime gates/scales the score), the thresholds, ``k_stop``/``k_target`` and the target-model genes
+#: stay searched. Literal values on purpose: a test pins them to the intent and the macro ones to the DS defaults.
+_PIN_DS_SCORE_WEIGHTS: bool = False
+_DS_PINNED_SCORE_WEIGHTS = {
+    "w_technical": 0.6, "w_fundamental": 0.3, "w_analyst": 0.1, "w_earnings": 0.0,
+    "tw_mom": 0.5, "tw_d200": 0.5, "tw_rsi": 0.0, "tw_don": 0.0,
+    "fw_piotroski": 1.0, "fw_quality": 0.0, "fw_value": 0.0, "fw_growth": 0.0,
+    "aw_grades": 0.75, "aw_targets": 0.25,
+    "w_macro": 0.2, "mw_trend_index": 0.43, "mw_vix": 0.21, "mw_credit": 0.14, "mw_yield_curve": 0.14,
+    "mw_sahm": 0.08,
+}
+
 #: ``--search-exploration-ranges`` (goal2027 item 2.9, name token ``explr``): closes the gaps the audit of the
 #: exploration phase-1 families found between what they varied by hand and what the goal2027 cells search (design
 #: doc 2.9). Today that is the TIME-EXIT lattice of the cells below (every exploration timeout and its control must
@@ -7561,6 +7585,62 @@ def _resolve_search_ds_factor_weights(raw, command: str, expert: "str | None" = 
                  f"reads the tw_*/fw_*/mom_lookback_days settings, so the genes would be searched but dead")
     _SEARCH_DS_FACTOR_WEIGHTS = True
     return True
+
+
+def _resolve_pin_ds_score_weights(raw, command: str, expert: "str | None" = None) -> bool:
+    """Parse ``--pin-ds-score-weights``; sets and returns the module global. Call it AFTER
+    ``_resolve_search_ds_factor_weights``: the two are mutually exclusive (one pins what the other searches) and that
+    is refused here. Refuses (exit) for any expert but DeterministicScorer: the settings would be written but never
+    read. Always ASSIGNS the global (False included), like the other opt-in gene resolvers."""
+    global _PIN_DS_SCORE_WEIGHTS
+    _PIN_DS_SCORE_WEIGHTS = False
+    if not raw:
+        return False
+    if _SEARCH_DS_FACTOR_WEIGHTS:
+        sys.exit(f"{command}: --pin-ds-score-weights and --search-ds-factor-weights are mutually exclusive (one "
+                 f"pins the DS score weights, the other searches them)")
+    if expert is not None and expert != _DS_FACTOR_EXPERT:
+        sys.exit(f"{command}: --pin-ds-score-weights is for {_DS_FACTOR_EXPERT} jobs only; {expert!r} never reads "
+                 f"the w_*/tw_*/fw_*/aw_*/mw_* settings, so the pin would be written but dead")
+    _PIN_DS_SCORE_WEIGHTS = True
+    return True
+
+
+def _apply_ds_score_pin(spec: dict, expert: str, command: str) -> dict:
+    """The expert spec for this job under ``--pin-ds-score-weights``: ``_DS_PINNED_SCORE_WEIGHTS`` added to the spec's
+    ``fixed_settings`` (the path every fixed setting takes: ``_expert_run_settings`` -> the run block's expert
+    settings -> every trial, the TOP-N / walk-forward re-runs and ``expertFixedSettings`` -> the export), and every
+    pinned key removed from ``expert_params`` (no gene; the remaining genes keep their order). Flag off returns
+    ``spec`` itself. A spec that already fixes a pinned key to another value is refused, never overridden."""
+    if not _PIN_DS_SCORE_WEIGHTS:
+        return spec
+    if expert != _DS_FACTOR_EXPERT:
+        sys.exit(f"{command}: --pin-ds-score-weights is for {_DS_FACTOR_EXPERT} jobs only, not {expert!r}")
+    import copy
+    out = copy.deepcopy(spec)
+    fixed = out.setdefault("fixed_settings", {})
+    clash = {k: fixed[k] for k, v in _DS_PINNED_SCORE_WEIGHTS.items() if k in fixed and fixed[k] != v}
+    if clash:
+        sys.exit(f"{command}: --pin-ds-score-weights: the {expert} spec already fixes {clash}, which disagrees with "
+                 f"the pin; refusing to choose one silently")
+    fixed.update(_DS_PINNED_SCORE_WEIGHTS)
+    out["expert_params"] = {k: v for k, v in out["expert_params"].items() if k not in _DS_PINNED_SCORE_WEIGHTS}
+    return out
+
+
+def _check_ds_score_pin_applied(command: str, expert: str, expert_params: dict, run_settings: dict) -> None:
+    """Refuse (exit) a ``--pin-ds-score-weights`` job whose built gene space still carries a pinned key or whose run
+    settings do not state every pinned value: the pin must demonstrably reach the expert, never be skipped. No-op
+    when the flag is off or for another expert."""
+    if not _PIN_DS_SCORE_WEIGHTS or expert != _DS_FACTOR_EXPERT:
+        return
+    genes = sorted(k for k in expert_params if k in _DS_PINNED_SCORE_WEIGHTS)
+    if genes:
+        sys.exit(f"{command}: --pin-ds-score-weights: the pinned settings {genes} are still GA genes in this job")
+    wrong = {k: run_settings.get(k, "<missing>") for k, v in _DS_PINNED_SCORE_WEIGHTS.items()
+             if k not in run_settings or run_settings[k] != v}
+    if wrong:
+        sys.exit(f"{command}: --pin-ds-score-weights: the run settings do not carry the pin: {wrong}")
 
 
 def _resolve_search_exploration_ranges(raw, command: str, expert: "str | None" = None) -> bool:
@@ -9614,8 +9694,11 @@ _DS_FACTOR_CONFIDENCE_CEILING = 93.0
 
 
 def _confidence_ceiling_for(expert: str):
-    """The confidence ceiling of ``expert`` for the job being built (flag-off: ``_EXPERT_CONFIDENCE_CEILING``)."""
-    if _SEARCH_DS_FACTOR_WEIGHTS and expert == _DS_FACTOR_EXPERT:
+    """The confidence ceiling of ``expert`` for the job being built (flag-off: ``_EXPERT_CONFIDENCE_CEILING``).
+
+    ``--pin-ds-score-weights`` takes the theoretical bound too: the 50.0 was measured under the DEFAULT weights, and
+    the pin (three correlated legs, no value/growth/RSI dilution) is a weighting that measurement never saw."""
+    if (_SEARCH_DS_FACTOR_WEIGHTS or _PIN_DS_SCORE_WEIGHTS) and expert == _DS_FACTOR_EXPERT:
         return _DS_FACTOR_CONFIDENCE_CEILING
     return _EXPERT_CONFIDENCE_CEILING.get(expert)
 
@@ -10135,6 +10218,7 @@ def _cmd_optimize(args) -> int:
                                 getattr(args, "sizing_mode", None), "optimize")
     _resolve_search_market_profile(getattr(args, "search_market_profile", False), "optimize")
     _resolve_search_ds_factor_weights(getattr(args, "search_ds_factor_weights", False), "optimize", args.expert)
+    _resolve_pin_ds_score_weights(getattr(args, "pin_ds_score_weights", False), "optimize", args.expert)  # AFTER search
     _resolve_search_exploration_ranges(getattr(args, "search_exploration_ranges", False), "optimize", args.expert)
     if getattr(args, "screen_preset", None):
         _screener_launch_inputs(args)       # refuse a bad preset combination up front (before any DB work)
@@ -10154,6 +10238,7 @@ def _cmd_optimize(args) -> int:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
     spec = _apply_ml_model_keys(spec, getattr(args, "ml_model_keys", None), expert, "optimize")
     spec = _apply_ml_rank_top_n(spec, getattr(args, "ml_rank_top_n", None), expert, args.strategy, "optimize")
+    spec = _apply_ds_score_pin(spec, expert, "optimize")      # flag off: the same spec object
     ml_hold_range = _ml_hold_from_horizon_range(getattr(args, "ml_hold_from_horizon", False),
                                                 getattr(args, "ml_model_keys", None), expert, args.strategy, "optimize")
     # BEFORE the fitness checks and the build: both read the style's members.
@@ -10573,6 +10658,10 @@ def _cmd_optimize(args) -> int:
                                     **_sizing_mode_gene_space(), **_ds_factor_gene_space()})),
             "backtest": backtest_block,
         }
+        # --pin-ds-score-weights: refuse a job whose gene space still carries a pinned key or whose run settings lost
+        # one (no-op without the flag).
+        _check_ds_score_pin_applied("optimize", expert, cfg["expert_params"],
+                                    backtest_block["experts"][0]["settings"])
         _apply_lattice_anchor(cfg, args.strategy, getattr(args, "lattice_anchor", None))
         _apply_early_stop_min_rel(cfg, getattr(args, "early_stop_min_rel", None))
         if getattr(args, "warm_start_from", None) is not None:
@@ -10717,6 +10806,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_search_sizing_mode(False, None, "optimize-batch")   # the gene is optimize-only; reset the global
     _resolve_search_market_profile(False, "optimize-batch")      # likewise
     _resolve_search_ds_factor_weights(False, "optimize-batch")   # likewise
+    _resolve_pin_ds_score_weights(False, "optimize-batch")       # likewise
     _resolve_search_exploration_ranges(False, "optimize-batch")  # likewise
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -12634,6 +12724,15 @@ def main(argv: "list | None" = None) -> int:
                          "to 0.8. DS normalises weights, so only ratios matter; a section whose sub-weights are all "
                          "zero is switched OFF (section weight 0), never scored as a silent 0. Refused for any "
                          "other expert. Name the job distinctly ('dsfw'): its gene space differs.")
+    op.add_argument("--pin-ds-score-weights", action="store_true", default=False,
+                    help="DeterministicScorer jobs only (owner 2026-11-14): FIX the DS score coefficients instead of "
+                         "searching them -- momentum, 200-day trend and Piotroski one third each of the "
+                         "technical+fundamental score, plus a grades-dominant analyst section at 10%% "
+                         "(w_technical 0.6, w_fundamental 0.3, w_analyst 0.1, w_earnings 0, tw_mom = tw_d200 = 0.5, "
+                         "fw_piotroski 1, aw_grades 0.75, aw_targets 0.25, macro weights at their defaults). The "
+                         "section-weight genes leave the search space; thresholds, exits, sizing and every other gene "
+                         "stay. Mutually exclusive with --search-ds-factor-weights; refused for any other expert. "
+                         "Name the job distinctly ('dspin').")
     op.add_argument("--search-exploration-ranges", action="store_true", default=False,
                     help="goal2027 item 2.9: close the gaps between the exploration phase-1 families and the "
                          "searched genes (design doc 2.9 holds the audit). The time-exit threshold of "

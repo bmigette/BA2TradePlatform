@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from ba2_common.core.knowability import intraday_decision_clock, published_known
+from ba2_experts.analyst_grades import grade_bucket_counts, warn_unrecognised_row
 from ba2_experts.price_target_basis import log_skipped_unadjusted, split_adjusted_target
 
 DEF_WINDOW_DAYS = 90
@@ -27,23 +28,23 @@ DEF_MIN_TARGETS = 3
 DEF_AW_GRADES = 0.5          # sub-weights inside the ANALYST section
 DEF_AW_TARGETS = 0.5
 
-# FMP grades-historical buckets
-_UP = ("strongBuy", "buy")
-_DOWN = ("strongSell", "sell")
-_HOLD = ("hold",)
-
-
 def _as_utc(d: datetime) -> datetime:
     """Force a datetime to tz-aware UTC so naive/aware operands never mix."""
     from datetime import timezone
     return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
 
 
-def _bucket_counts(row: Dict[str, Any]) -> tuple:
-    """(upgrades, holds, downgrades) from one grades-historical row."""
-    def n(keys):
-        return sum(int(row.get(k) or 0) for k in keys)
-    return n(_UP), n(_HOLD), n(_DOWN)
+def _bucket_counts(row: Dict[str, Any]) -> Optional[tuple]:
+    """(buy-side, holds, sell-side) from one grades-historical row, or None if unreadable.
+
+    Read through the shared ``grade_bucket_counts`` (FMPRating uses the same one): FMP rows
+    carry ``analystRatings*`` names, and a private short-name reader scored no row at all.
+    """
+    c = grade_bucket_counts(row)
+    if c is None:
+        warn_unrecognised_row("DeterministicScorer.revision_momentum", row)
+        return None
+    return c["strongBuy"] + c["buy"], c["hold"], c["strongSell"] + c["sell"]
 
 
 def revision_momentum(grades_rows: List[Dict[str, Any]], as_of: datetime,
@@ -79,7 +80,10 @@ def revision_momentum(grades_rows: List[Dict[str, Any]], as_of: datetime,
         d = _as_utc(d)
         if d > as_of or d < cutoff:
             continue
-        up, hold, down = _bucket_counts(row)
+        counts = _bucket_counts(row)
+        if counts is None:
+            continue
+        up, hold, down = counts
         total_row = up + hold + down
         if total_row == 0:
             continue
