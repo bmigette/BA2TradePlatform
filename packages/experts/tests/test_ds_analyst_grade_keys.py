@@ -64,11 +64,25 @@ def test_shared_helper_refuses_an_unrecognised_row():
 
 
 def test_fmprating_and_ds_use_the_one_helper():
-    """One mapping, two callers: FMPRating's as-of reconstruction and DS's revision momentum."""
+    """One alias TABLE, two callers: FMPRating's as-of reconstruction and DS's revision momentum."""
     import importlib
     from ba2_experts import analyst_grades as G
     FR = importlib.import_module("ba2_experts.FMPRating")
-    assert FR.grade_bucket_counts is G.grade_bucket_counts
+    assert FR.FMPRating._GRADES_FIELD_ALIASES is G.GRADES_FIELD_ALIASES
     assert A.grade_bucket_counts is G.grade_bucket_counts
     counts = FR.FMPRating._counts_as_of([dict(r) for r in _AAPL_ROWS], _AS_OF)
     assert counts == [G.grade_bucket_counts(_AAPL_ROWS[0])]
+
+
+def test_fmprating_partial_row_reading_is_unchanged():
+    """FMPRating keeps its pre-fix reading (a missing bucket counts 0) so stored results do not move;
+    DS refuses the same row instead of reading zeros."""
+    import importlib
+    from ba2_experts import analyst_grades as G
+    FR = importlib.import_module("ba2_experts.FMPRating")
+    row = {"date": _AAPL_ROWS[0]["date"], "analystRatingsStrongBuy": 5, "analystRatingsBuy": 3}
+    assert FR.FMPRating._counts_as_of([row], _AS_OF) == [
+        {"strongBuy": 5, "buy": 3, "hold": 0, "sell": 0, "strongSell": 0}]
+    assert G.grade_bucket_counts(row) is None
+    both = dict(row, analystRatingsbuy=9, analystRatingsHold=1, analystRatingsSell=0, analystRatingsStrongSell=0)
+    assert G.grade_bucket_counts(both)["buy"] == 9        # the pre-fix alias order: ...buy first

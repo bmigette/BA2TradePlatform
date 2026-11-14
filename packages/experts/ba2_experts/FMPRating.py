@@ -19,8 +19,7 @@ from ba2_common.core.provider_utils import parse_provider_date
 from ba2_common.core.knowability import intraday_decision_clock, published_known
 from ba2_common.logger import get_expert_logger
 from ba2_experts.price_target_basis import log_skipped_unadjusted, split_adjusted_target
-from ba2_experts.analyst_grades import (GRADES_FIELD_ALIASES, grade_bucket_counts,
-                                        warn_unrecognised_row)
+from ba2_experts.analyst_grades import GRADES_FIELD_ALIASES
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 from ba2_providers.fmp_common import fmp_http_get, FMPError, TTLCache, fmp_history_disk_cached
@@ -705,12 +704,19 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
         if not eligible:
             return None
         latest = max(eligible, key=lambda r: _memo_provider_date(r, "date"))
-        counts = grade_bucket_counts(latest)
-        if counts is None:
-            # Unreadable buckets are a schema change, not zero analysts: no coverage, loudly.
-            warn_unrecognised_row("FMPRating._counts_as_of", latest)
-            return None
-        return [counts]
+
+        # Unchanged FMPRating behaviour (a bucket with no readable field counts 0): results of
+        # stored and running backtests must not move. Only the alias TABLE is shared with DS.
+        def _val(row, names):
+            for n in names:
+                if n in row and row[n] is not None:
+                    try:
+                        return int(row[n])
+                    except (TypeError, ValueError):
+                        return 0
+            return 0
+
+        return [{k: _val(latest, aliases) for k, aliases in cls._GRADES_FIELD_ALIASES.items()}]
 
     @staticmethod
     def _consensus_target_as_of(price_target_history: list, as_of: datetime,

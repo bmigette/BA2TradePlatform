@@ -18,7 +18,7 @@ _logger = logging.getLogger(__name__)
 #: bucket -> accepted field names, first present wins.
 GRADES_FIELD_ALIASES: Dict[str, tuple] = {
     "strongBuy": ("analystRatingsStrongBuy", "strongBuy"),
-    "buy": ("analystRatingsBuy", "analystRatingsbuy", "buy"),
+    "buy": ("analystRatingsbuy", "analystRatingsBuy", "buy"),
     "hold": ("analystRatingsHold", "hold"),
     "sell": ("analystRatingsSell", "sell"),
     "strongSell": ("analystRatingsStrongSell", "strongSell"),
@@ -40,7 +40,7 @@ def grade_bucket_counts(row: Dict[str, Any]) -> Optional[Dict[str, int]]:
             return None
         try:
             out[bucket] = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
     return out
 
