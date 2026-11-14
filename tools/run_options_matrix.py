@@ -65,9 +65,35 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
         [--strategies OS1,OS2,OS3,O_CC,O_STK] [--experts FMPRating] \
         [--start 2023-01-01] [--end 2025-12-31] [--population 40] [--generations 8] \
         [--fitness <override>] [--initial-capital 20000] [--dry-run]
+
+WALK-FORWARD (--walk-forward; docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md, section
+"Option walk-forward"). Every (expert, structure[, neutral arm]) job becomes a CELL run as an
+anchored, expanding chain by the SAME engine the stock grid uses (app.services.wf_chain +
+tools/run_walk_forward.py's RealRunner; nothing is forked):
+
+    <cell>-wf1   train 2020-01-01..2023-12-31  cold start (--wf-first-generations, default 30)  test 2024
+    <cell>-wf2   train 2020-01-01..2024-12-31  seeded from wf1 (--wf-next-generations, 15)        test 2025
+    <cell>-wf3   train 2020-01-01..2025-12-31  seeded from wf2                                    test 2026
+    <cell>-refit train 2020-01-01..2026-12-31  seeded from wf3, PASSING cells only
+
+Defaults mirror the stock grid's phase A (--wf-train-start 2020-01-01, --wf-test-years
+2024,2025,2026); every other knob of the plain driver (profile, store, gates, fitness, ...) rides
+on every job. --start/--end/--generations are REFUSED (the chain sets them per job). A cell is named
+optwf-<expert>-<structure><suffix>[-<arm>-rules1]-d<digest>; the digest covers its optimize args
+and the walk-forward spec, so a changed spec never resumes an older cell. Out-of-sample tests re-run
+the fold's top-N behaviour-distinct genomes through ba2test_launcher._persist_top_backtests(window=)
+(the GA's own decode + trial-config path), locally, one at a time by default.
+THE 2026 HOLDOUT RAIL (ba2test_launcher._OPTION_HOLDOUT_START) is respected, not bypassed: a plan
+whose fold TRAINS into it, or whose refit would, is refused before anything runs. Today that means:
+    phase A (now):  --wf-defer-last-test --wf-data-end 2025-12-31   (wf1 and wf2 tested, wf3 trained,
+                    cells PENDING)
+    phase B (2027): the same command without --wf-data-end, AFTER the rail has been moved as a
+                    reviewed change (the 2026 test is allowed by the rail; the 2020-2026 refit is not)
+No default for the verdict: --wf-top-n, --wf-report-dir, --pass-min-oos-return, --pass-max-dd-mult
+and --pass-min-folds are required. --dry-run prints every cell's chain and runs nothing.
 """
 import argparse
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 import json
 import math
@@ -87,7 +113,8 @@ from matrix_flags import (  # noqa: E402
     finish_matrix, is_analysis_failure_reason, note_job_exit,
     add_refused_decision_times_flag, cap_passthrough, refuse_decision_times_and_announce,
     add_estimates_source_flag, estimates_source_of, estimates_source_tokens, with_estimates_source_name,
-    add_option_history_source_flag, option_store_tokens, with_option_history_source_name)
+    add_option_history_source_flag, option_store_tokens, with_option_history_source_name,
+    wf_optimize_args)
 from ba2_common.core.option_spread_model import (  # noqa: E402
     LEGACY_PCT_MODEL, SPREAD_MODEL_VERSION, SPREAD_MODELS)
 
@@ -247,11 +274,12 @@ def _spread_name_tag(model: str) -> str:
     return "-s" + (m.group(1) + m.group(2) + m.group(3) if m else re.sub(r"[^a-z0-9]", "", model))
 
 
-def _jobs(experts, strategies, name_suffix=""):
-    """Yield (name, expert, strategy) in priority order (per expert: groups then equity)."""
+def _jobs(experts, strategies, name_suffix="", prefix="optm"):
+    """Yield (name, expert, strategy) in priority order (per expert: groups then equity).
+    ``prefix`` is ``optm`` for plain jobs and ``optwf`` for walk-forward cells."""
     for expert in experts:
         for s in strategies:
-            yield (f"optm-{expert}-{s}{name_suffix}", expert, s)
+            yield (f"{prefix}-{expert}-{s}{name_suffix}", expert, s)
 
 
 def _market_condition_passthrough(args) -> list:
@@ -321,7 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--start", default="2020-01-01",
                     help="Backtest start (default 2020-01-01, the goal2020 window; requires the "
                          "options cache -- and the serving vendor's history floor -- to reach "
-                         "that far back, which is why the store below defaults to thetadata).")
+                         "that far back, which is why the store below defaults to thetadata). "
+                         "Refused with --walk-forward (use --wf-train-start).")
     ap.add_argument("--options-store", default="thetadata",
                     help="Options store serving the run, forwarded to the launcher per job "
                          "(default thetadata -- floor 2018-09-14, the only vendor reaching a "
@@ -355,7 +384,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "name (checkpoint) with an ungated one.")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
-                         "walk-forward holdout and the launcher refuses to search into it).")
+                         "walk-forward holdout and the launcher refuses to search into it). "
+                         "Refused with --walk-forward (use --wf-test-years / --wf-data-end).")
     ap.add_argument("--population", type=int, default=None)
     ap.add_argument("--generations", type=int, default=None)
     ap.add_argument("--early-stop", type=int, default=None,
@@ -484,11 +514,201 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-stock-price", type=float, default=100.0,
                     help="Max underlying price for the gate-only entry gate (default 100 — the "
                          "$20k-account cap). 0 disables the price filter.")
+    add_walk_forward_flags(ap)
     return ap
+
+
+# ------------------------------------------------------------------------------------------------
+# Walk-forward mode (see the module docstring). The flag names and their meaning are the stock
+# grid's (tools/run_screener_capband_matrix.py), so one runbook covers both; every flag below except
+# --walk-forward itself is REFUSED without --walk-forward, and the verdict's inputs have NO default.
+# ------------------------------------------------------------------------------------------------
+
+#: Valued walk-forward flags (dest names): None = not given.
+_WF_VALUED = ("wf_train_start", "wf_test_years", "wf_data_end", "wf_first_generations",
+              "wf_next_generations", "wf_top_n", "wf_report_dir", "wf_test_parallel",
+              "wf_min_free_gb", "wf_min_trade_rows", "pass_min_oos_return", "pass_max_dd_mult",
+              "pass_max_oos_dd", "wf_name_pass_max_dd_mult", "pass_min_folds")
+_WF_SWITCHES = ("wf_defer_last_test", "wf_run_all_folds", "wf_force_memory",
+                "pass_min_oos_return_exclusive")
+_WF_REQUIRED = ("wf_top_n", "wf_report_dir", "pass_min_oos_return", "pass_max_dd_mult",
+                "pass_min_folds")
+#: The stock grid's phase-A fold layout (docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md).
+#: ThetaData and Alpha Vantage both reach 2020-01-01, so the option data window does not force
+#: another layout; a vendor with a later floor is refused by the launcher at fold 1's launch.
+WF_DEFAULT_TRAIN_START = "2020-01-01"
+WF_DEFAULT_TEST_YEARS = "2024,2025,2026"
+WF_DEFAULT_FIRST_GENERATIONS = 30
+WF_DEFAULT_NEXT_GENERATIONS = 15
+
+
+def add_walk_forward_flags(ap) -> None:
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="Run each job as a walk-forward CELL <cell>-wf1/-wf2/-wf3 (+ -refit for a "
+                         "passing cell) instead of one optimize job. See the module docstring.")
+    ap.add_argument("--wf-train-start", default=None, metavar="YYYY-MM-DD",
+                    help=f"First day every fold trains from (default {WF_DEFAULT_TRAIN_START}).")
+    ap.add_argument("--wf-test-years", default=None, metavar="Y,Y,..",
+                    help=f"Test years, one fold each (default {WF_DEFAULT_TEST_YEARS}).")
+    ap.add_argument("--wf-data-end", default=None, metavar="YYYY-MM-DD",
+                    help="Last day of data: clamps the LAST test window and the refit end, or, with "
+                         "--wf-defer-last-test and a date before the last test year, trains that "
+                         "fold now and tests it later.")
+    ap.add_argument("--wf-defer-last-test", action="store_true",
+                    help="Two-phase year (stock phase A/B): with a --wf-data-end BEFORE the last test "
+                         "year, train the last fold now and test it later (cell PENDING). Rerun the "
+                         "SAME command without --wf-data-end once the data exists. Keep the flag on "
+                         "both runs (it is part of the cell name; the data end is not).")
+    ap.add_argument("--wf-run-all-folds", action="store_true",
+                    help="Run every fold even after the cell can no longer pass (default: stop, FAIL).")
+    ap.add_argument("--wf-first-generations", type=int, default=None,
+                    help=f"Generation budget of fold 1 (cold start; default "
+                         f"{WF_DEFAULT_FIRST_GENERATIONS}).")
+    ap.add_argument("--wf-next-generations", type=int, default=None,
+                    help=f"Generation budget of the seeded folds and the refit (default "
+                         f"{WF_DEFAULT_NEXT_GENERATIONS}).")
+    ap.add_argument("--wf-top-n", type=int, default=None,
+                    help="Behaviour-distinct top genomes per fold re-run out of sample (REQUIRED).")
+    ap.add_argument("--wf-report-dir", default=None,
+                    help="Directory for the per-cell reports, the stored fold reports and the grid "
+                         "summary (REQUIRED).")
+    ap.add_argument("--wf-test-parallel", type=int, default=None,
+                    help="Out-of-sample re-runs at a time (default 1).")
+    ap.add_argument("--wf-min-free-gb", type=float, default=None,
+                    help="Free-memory floor for the out-of-sample re-runs (default 20; Linux only).")
+    ap.add_argument("--wf-force-memory", action="store_true", help="Ignore --wf-min-free-gb.")
+    ap.add_argument("--wf-min-trade-rows", type=int, default=None,
+                    help="Selection floor: a genome with fewer IN-SAMPLE round-trip rows (one per "
+                         "option LEG, the engine's total_trades) over the fold's train window is not "
+                         "tested. Default: tools/persist_distinct_topn.py's own default (30), the "
+                         "value the stock grid uses. Not part of the cell name (the stored fold "
+                         "reports re-evaluate when it changes).")
+    ap.add_argument("--pass-min-oos-return", type=float, default=None,
+                    help="Percent: a fold's TOTAL out-of-sample return must reach this (REQUIRED).")
+    ap.add_argument("--pass-min-oos-return-exclusive", action="store_true",
+                    help="Strict return rule: a fold passes only ABOVE --pass-min-oos-return.")
+    ap.add_argument("--pass-max-dd-mult", type=float, default=None,
+                    help="OOS |maxDD| must be <= this x IS |maxDD| (REQUIRED).")
+    ap.add_argument("--pass-max-oos-dd", type=float, default=None,
+                    help="Percent, optional: OOS |maxDD| must ALSO be <= this absolute cap.")
+    ap.add_argument("--wf-name-pass-max-dd-mult", type=float, default=None,
+                    help="Name the cells as if --pass-max-dd-mult were this value (a pass rule "
+                         "changed mid-grid keeps the cells' names and completed jobs).")
+    ap.add_argument("--pass-min-folds", type=int, default=None,
+                    help="Fold winners that must pass for the cell to pass (REQUIRED).")
+    ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
+                    help="A test year whose fold winner MUST pass (repeatable).")
+
+
+def _wf_import():
+    """The walk-forward engine lives in the test backend; imported lazily so a plain run of this
+    driver never touches the backend."""
+    backend = os.path.join(os.path.dirname(_TOOLS_DIR), "testplatform", "backend")
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    from app.services import walk_forward as WF
+    from app.services import wf_chain as C
+    return WF, C
+
+
+def _resolve_walk_forward(ap, args, explicit_job_window) -> None:
+    """Validate the walk-forward flags and, with --walk-forward, build the fold plan.
+
+    Sets ``args.wf_folds`` / ``args.wf_deferred`` (the fold the run trains but does not test) and
+    gives ``args.start`` / ``args.end`` the chain's overall span (train start .. refit end): the
+    base command of a cell carries it, like the stock cells, and wf_optimize_args strips it."""
+    if not args.walk_forward:
+        stray = [("--" + k.replace("_", "-")) for k in _WF_VALUED if getattr(args, k) is not None]
+        stray += [("--" + k.replace("_", "-")) for k in _WF_SWITCHES if getattr(args, k)]
+        stray += ["--pass-require-fold"] if args.pass_require_fold else []
+        if stray:
+            ap.error(f"{', '.join(stray)} need --walk-forward")
+        return
+    if explicit_job_window:
+        ap.error(f"--walk-forward: {', '.join(explicit_job_window)} cannot be given: the chain sets "
+                 f"each job's window and budget (use --wf-train-start, --wf-test-years, "
+                 f"--wf-data-end, --wf-first-generations, --wf-next-generations)")
+    need = [("--" + k.replace("_", "-")) for k in _WF_REQUIRED if getattr(args, k) is None]
+    if need:
+        ap.error(f"--walk-forward requires {', '.join(need)} (no defaults: the verdict is only as "
+                 f"honest as its thresholds)")
+    for key in ("wf_top_n", "wf_first_generations", "wf_next_generations", "wf_test_parallel"):
+        value = getattr(args, key)
+        if value is not None and value < 1:
+            ap.error(f"--{key.replace('_', '-')} must be >= 1")
+    if args.wf_min_trade_rows is not None and args.wf_min_trade_rows < 0:
+        ap.error("--wf-min-trade-rows must be >= 0")
+    if args.wf_train_start is None:
+        args.wf_train_start = WF_DEFAULT_TRAIN_START
+    if args.wf_test_years is None:
+        args.wf_test_years = WF_DEFAULT_TEST_YEARS
+    if args.wf_first_generations is None:
+        args.wf_first_generations = WF_DEFAULT_FIRST_GENERATIONS
+    if args.wf_next_generations is None:
+        args.wf_next_generations = WF_DEFAULT_NEXT_GENERATIONS
+    if args.wf_test_parallel is None:
+        args.wf_test_parallel = 1
+    if args.wf_min_free_gb is None:
+        args.wf_min_free_gb = 20.0
+    try:
+        args.wf_train_start_d = date.fromisoformat(args.wf_train_start)
+        args.wf_data_end_d = date.fromisoformat(args.wf_data_end) if args.wf_data_end else None
+        args.wf_years_l = [int(y) for y in args.wf_test_years.split(",") if y.strip()]
+    except ValueError as e:
+        ap.error(f"--wf-train-start/--wf-data-end/--wf-test-years: {e}")
+    WF, C = _wf_import()
+    try:
+        args.wf_folds = C.build_cell_folds(args.wf_train_start_d, args.wf_years_l,
+                                           args.wf_data_end_d, None, args.wf_defer_last_test)
+    except WF.WalkForwardError as e:
+        ap.error(f"--walk-forward: {e}")
+    args.wf_deferred = C.deferred_fold(args.wf_folds, args.wf_data_end_d, args.wf_defer_last_test)
+    args.start = args.wf_folds[0].train_start.isoformat()
+    args.end = C.refit_window(args.wf_folds)[1].isoformat()
+
+
+def wf_holdout_refusal(folds, deferred, holdout: date) -> Optional[str]:
+    """Why this plan would run a job into the option holdout (``holdout`` =
+    ``ba2test_launcher._OPTION_HOLDOUT_START`` of the launcher the jobs run), or None.
+
+    The rail guards every optimize job of a pure-option structure; this driver has always kept ALL
+    its jobs (the O_CC/O_PP/O_STK overlays too) out of the holdout. A fold whose TRAIN window reaches
+    it is refused; so is a plan that can REFIT in this run (no deferred last fold), because the
+    refit trains up to the last test end. Out-of-sample TESTS inside the holdout are allowed: they
+    are single re-runs, which the rail deliberately does not guard -- testing on the holdout is its
+    purpose. Refused here, before anything runs, rather than by the launcher after the folds ran."""
+    for f in folds:
+        if f.train_end >= holdout:
+            return (f"fold {f.index} trains to {f.train_end}, inside the reserved option holdout "
+                    f"(from {holdout}); test years after the holdout start cannot be trained for")
+    if deferred is None and folds[-1].test_end >= holdout:
+        return (f"a passing cell's refit would train {folds[0].train_start}..{folds[-1].test_end}, "
+                f"into the reserved option holdout (from {holdout}), which the launcher refuses. "
+                f"Now (phase A): add --wf-defer-last-test --wf-data-end "
+                f"{(holdout - timedelta(days=1)).isoformat()} (the last fold is trained, its test "
+                f"and the refit wait). Phase B: move _OPTION_HOLDOUT_START in ba2test_launcher.py as "
+                f"a reviewed change first")
+    return None
+
+
+def _explicit_flags(ap, argv, dests) -> list:
+    """The ``--<dest>`` flags among ``dests`` the command line GAVE (whatever their value, even
+    the default's): ``argv`` is parsed once more with those defaults set to None, then the
+    parser's own defaults are restored. Abbreviations and ``--flag=value`` are argparse's."""
+    saved = {d: ap.get_default(d) for d in dests}
+    ap.set_defaults(**{d: None for d in dests})
+    try:
+        probe = ap.parse_args(argv)
+    finally:
+        ap.set_defaults(**saved)
+    return ["--" + d.replace("_", "-") for d in dests if getattr(probe, d) is not None]
 
 
 def resolve_args(ap, argv=None):
     args = ap.parse_args(argv)
+    # --walk-forward refuses an explicit job window / budget (the chain sets them per job).
+    explicit_job_window = _explicit_flags(ap, argv, ("start", "end", "generations")) \
+        if args.walk_forward else []
     discovery = args.profile == "discovery"
     modes = [m.strip() for m in args.neutral_entry_modes.split(",")]
     if (not modes or len(modes) != len(set(modes))
@@ -549,6 +769,7 @@ def resolve_args(ap, argv=None):
             ap.error(f"--benchmark-regime-gates: {bad} emit no SPY regime gates (option "
                      f"structures only; O_CC/O_PP/O_STK are not gated). Pass --strategies "
                      f"explicitly (the discovery default list includes O_CC/O_PP)")
+    _resolve_walk_forward(ap, args, explicit_job_window)
     try:
         start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
     except ValueError:
@@ -557,7 +778,9 @@ def resolve_args(ap, argv=None):
         ap.error("--start must not be after --end")
     # Scope to this option-grid driver, including the equity-entry overlays/control.
     # Do not extend the backend's pure-option rail into unrelated equity optimizations.
-    if end >= date(2026, 1, 1):
+    # (Walk-forward: args.end is the chain's span, not a search window; every job of the chain is
+    # checked against the launcher's rail by wf_holdout_refusal instead.)
+    if not args.walk_forward and end >= date(2026, 1, 1):
         ap.error("Option-grid search must end before the reserved 2026 holdout")
     for key in ("population", "generations", "parallel", "initial_capital",
                 "early_stop", "equity_cap", "fitness_trade_scale_cap", "fitness_trade_scale_target"):
@@ -690,37 +913,12 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     Cache contents/code changes at the same paths still require a fresh name suffix.
     """
     cmd = build_cmd(args, launcher, "", expert, strat, universe, neutral_entry_mode)
-    tokens = cmd[cmd.index("optimize") + 1:]
-    # --estimates-source fmp is the legacy implicit source: kept out of the experiment identity so every
-    # job from before the flag keeps its name (a non-fmp source joins the config, hence the name).
-    for _i in range(len(tokens) - 1):
-        if tokens[_i] == "--estimates-source" and tokens[_i + 1] == "fmp":
-            tokens = tokens[:_i] + tokens[_i + 2:]
-            break
-    for _i in range(len(tokens) - 1):     # likewise the legacy implicit option vendor
-        if tokens[_i] == "--option-history-source" and tokens[_i + 1] == "thetadata":
-            tokens = tokens[:_i] + tokens[_i + 2:]
-            break
-    config = {}
-    i = 0
-    while i < len(tokens):
-        flag = tokens[i]
-        if flag in ("--fitness-trade-scale", "--fitness-win-rate-factor",
-                    "--no-robust-fitness", "--option-size-within-fill-volume",
-                    "--benchmark-regime-gates"):
-            config[flag] = True
-            i += 1
-        else:
-            # --labels is METADATA, not search configuration: it must not move the job
-            # identity, or adding a label would rename every job and orphan its GA
-            # checkpoint. Same reasoning as --name/--parallel/--workers.
-            if flag not in ("--name", "--parallel", "--workers", "--labels"):
-                config[flag] = tokens[i + 1]
-            i += 2
-    identity = {"schema": 1, "args": config, "launcher": os.path.abspath(launcher),
-                "store": {key: os.environ.get(key) for key in (
-                    "BA2_HOME", "BACKTEST_OPTIONS_STORE", "BACKTEST_OPTIONS_PARQUET_ROOT",
-                    "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")}}
+    # --estimates-source fmp / --option-history-source thetadata: the legacy implicit choices, kept
+    # out of the experiment identity so every job from before the flags keeps its name.
+    tokens = _drop_legacy_implicit(cmd[cmd.index("optimize") + 1:])
+    identity = {"schema": 1, "args": _identity_config(tokens),
+                "launcher": os.path.abspath(launcher),
+                "store": {key: os.environ.get(key) for key in _IDENTITY_ENV_KEYS}}
     # Settings the launcher fixes for option jobs only are not on the command line, so they are
     # folded in explicitly -- and ONLY when present, so every job without them (every FMPRating
     # job, every pre-existing name) keeps its digest byte for byte.
@@ -731,20 +929,215 @@ def discovery_name(args, launcher, name, expert, strat, universe, neutral_entry_
     return f"{name}-d{digest}"
 
 
-def planned_jobs(args, launcher, experts, strategies, universe):
-    """Separate neutral arms without changing any other job/checkpoint identity."""
+#: The environment that chooses or prices a job's option data (part of every digest identity).
+_IDENTITY_ENV_KEYS = ("BA2_HOME", "BACKTEST_OPTIONS_STORE", "BACKTEST_OPTIONS_PARQUET_ROOT",
+                      "BACKTEST_OPTIONS_RISK_FREE_RATE", "TASTYTRADE_OPTIONS_HISTORY_FLOOR")
+#: Of those, the ones that only say WHERE the data lives (masked under --wf-defer-last-test).
+_LOCATION_ENV_KEYS = ("BA2_HOME", "BACKTEST_OPTIONS_PARQUET_ROOT")
+_BOOLEAN_FLAGS = ("--fitness-trade-scale", "--fitness-win-rate-factor", "--no-robust-fitness",
+                  "--option-size-within-fill-volume", "--benchmark-regime-gates")
+
+
+def _drop_legacy_implicit(tokens: list) -> list:
+    """--estimates-source fmp and --option-history-source thetadata are the legacy implicit
+    choices: kept out of every identity so every job from before the flags keeps its name."""
+    tokens = list(tokens)
+    for flag, legacy in (("--estimates-source", "fmp"), ("--option-history-source", "thetadata")):
+        for _i in range(len(tokens) - 1):
+            if tokens[_i] == flag and tokens[_i + 1] == legacy:
+                tokens = tokens[:_i] + tokens[_i + 2:]
+                break
+    return tokens
+
+
+def _identity_config(tokens: list) -> dict:
+    """The search configuration an ``optimize`` arg list states, as {flag: value}. --labels is
+    METADATA, not search configuration: it must not move the job identity, or adding a label
+    would rename every job and orphan its GA checkpoint. Same reasoning as --name/--parallel/
+    --workers."""
+    config = {}
+    i = 0
+    while i < len(tokens):
+        flag = tokens[i]
+        if flag in _BOOLEAN_FLAGS:
+            config[flag] = True
+            i += 1
+        else:
+            if flag not in ("--name", "--parallel", "--workers", "--labels"):
+                config[flag] = tokens[i + 1]
+            i += 2
+    return config
+
+
+#: Values that say WHICH data a cell reads (the market-condition snapshots and the universe list).
+#: Under --wf-defer-last-test they are not part of the cell name, exactly as in the stock grid
+#: (run_screener_capband_matrix._DATA_FLAGS): January's rebuilt data must find phase A's jobs, and
+#: the deferred tests read the current values (ba2test_launcher._rebase_run_data, which rebases
+#: precisely these two for a static-universe run). NOT --screener-gate-store: the rebase does not
+#: replace it, so a test would silently read the TRAIN job's gate store; a new gate-store path is
+#: therefore a new cell (refresh the store in place to keep the names).
+_WF_DEFER_MASKED_FLAGS = ("--market-condition-manifest", "--universe")
+
+
+def wf_spec_tokens(args) -> list:
+    """The walk-forward spec of a cell's NAME: the stock grid's tokens, in its order. A changed
+    budget, window, top-N or pass rule must never resume an older cell's jobs; under
+    --wf-defer-last-test the data end is NOT part of it (phase B must find phase A's jobs)."""
+    return ["--wf-spec", args.wf_train_start, args.wf_test_years,
+            "defer" if args.wf_defer_last_test else str(args.wf_data_end),
+            str(args.wf_first_generations), str(args.wf_next_generations), str(args.wf_top_n),
+            str(args.pass_min_oos_return),
+            str(args.pass_max_dd_mult if args.wf_name_pass_max_dd_mult is None
+                else args.wf_name_pass_max_dd_mult),
+            str(args.pass_min_folds),
+            ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
+            "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"]
+
+
+def wf_cell_name(args, launcher, name, expert, strat, cmd) -> str:
+    """``name`` (``optwf-...``) + ``-d<digest>`` of the cell's identity: its walk-forward base
+    args (``wf_optimize_args``: no window, name or generation budget), the store environment, the
+    launcher, the option-only fixed settings and the walk-forward spec. Under
+    --wf-defer-last-test the data values and locations (manifests, universe, BA2_HOME, parquet
+    root, launcher path) are masked so the phase-B run, on new data, rebuilds every name."""
+    tokens = _drop_legacy_implicit(wf_optimize_args(cmd))
+    defer = args.wf_defer_last_test
+    if defer:
+        tokens = [("<data>" if k and tokens[k - 1] in _WF_DEFER_MASKED_FLAGS else t)
+                  for k, t in enumerate(tokens)]
+    identity = {"schema": "optwf-1", "args": _identity_config(tokens),
+                "store": {key: ("<location>" if defer and key in _LOCATION_ENV_KEYS
+                                else os.environ.get(key)) for key in _IDENTITY_ENV_KEYS},
+                "launcher": "<location>" if defer else os.path.abspath(launcher),
+                "wf": wf_spec_tokens(args)}
+    fixed = option_fixed_settings(launcher, expert, strat)
+    if fixed:
+        identity["option_fixed_settings"] = fixed
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
+    return f"{name}-d{digest}"
+
+
+def _planned_arms(args, experts, strategies, prefix):
+    """(base name, expert, structure, neutral entry mode) of every job/cell, neutral arms split."""
     suffix = _spread_name_tag(args.option_spread_model) + args.name_suffix
     suffix += with_option_history_source_name('', args)   # '' for thetadata; '-optalphavantage' otherwise
-    for name, expert, strategy in _jobs(experts, strategies, suffix):
+    for name, expert, strategy in _jobs(experts, strategies, suffix, prefix):
         modes = args.neutral_entry_modes.split(",") if strategy in _NEUTRAL_STRUCTURES else ["legacy"]
         for mode in modes:
-            arm_name = name if mode == "legacy" else name + "-" + mode + "-rules1"
-            if args.profile == "discovery":
-                arm_name = discovery_name(args, launcher, arm_name, expert, strategy, universe, mode)
-            yield arm_name, expert, strategy, mode
+            yield (name if mode == "legacy" else name + "-" + mode + "-rules1"), expert, strategy, mode
+
+
+def planned_jobs(args, launcher, experts, strategies, universe):
+    """Separate neutral arms without changing any other job/checkpoint identity."""
+    for arm_name, expert, strategy, mode in _planned_arms(args, experts, strategies, "optm"):
+        if args.profile == "discovery":
+            arm_name = discovery_name(args, launcher, arm_name, expert, strategy, universe, mode)
+        yield arm_name, expert, strategy, mode
 
 
 _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
+
+
+def _wf_selection(args) -> dict:
+    """The selection knobs every fold uses: tools/persist_distinct_topn.py's declared defaults
+    (read from its parser by run_walk_forward.selection_defaults, as the stock grid does), with
+    --wf-min-trade-rows replacing the trade-row floor when given."""
+    import run_walk_forward as RWF
+    selection = dict(RWF.selection_defaults())
+    if args.wf_min_trade_rows is not None:
+        selection["min_trade_rows"] = args.wf_min_trade_rows
+    return selection
+
+
+def _make_wf_runner(args, selection):
+    """The real runner (ba2-test subprocess + test DB), shared by every cell. Its selection knobs
+    are the ones recorded in the cell specs (and so in every stored fold report's key)."""
+    from types import SimpleNamespace
+
+    import run_walk_forward as RWF
+    return RWF.RealRunner(SimpleNamespace(**selection, min_free_gb=args.wf_min_free_gb,
+                                          force_memory=args.wf_force_memory))
+
+
+def wf_cell_specs(args, launcher, experts, strategies, universe, selection) -> list:
+    """One ``wf_chain.CellSpec`` per (expert, structure, neutral arm), built from the SAME
+    ``build_cmd`` as a plain job; each spec's plan is validated here, before anything runs."""
+    WF, C = _wf_import()
+    specs = []
+    for base, expert, strat, mode in _planned_arms(args, experts, strategies, "optwf"):
+        cmd = build_cmd(args, launcher, base, expert, strat, universe, mode)
+        name = wf_cell_name(args, launcher, base, expert, strat, cmd)
+        spec = C.CellSpec(
+            name=name, optimize_args=wf_optimize_args(cmd), launcher=cmd[:cmd.index("optimize")],
+            train_start=args.wf_train_start_d, test_years=args.wf_years_l,
+            data_end=args.wf_data_end_d, first_generations=args.wf_first_generations,
+            next_generations=args.wf_next_generations, top_n=args.wf_top_n,
+            thresholds=WF.Thresholds(args.pass_min_oos_return, args.pass_max_dd_mult,
+                                     args.pass_min_folds, args.pass_max_oos_dd),
+            require_test_years=tuple(args.pass_require_fold),
+            exclusive_return=args.pass_min_oos_return_exclusive,
+            defer_last_test=args.wf_defer_last_test, run_all_folds=args.wf_run_all_folds,
+            test_parallel=args.wf_test_parallel, selection=dict(selection),
+            expert=expert, strategy=strat, band="options" if mode == "legacy" else f"options/{mode}",
+            floor=None)
+        try:
+            C.make_cell_plan(spec)
+        except WF.WalkForwardError as e:
+            raise SystemExit(f"--walk-forward {name}: {e}")
+        specs.append(spec)
+    return specs
+
+
+def _run_walk_forward(ap, args, launcher, experts, strategies, universe) -> int:
+    """--walk-forward: every job becomes a cell run by app.services.wf_chain (the stock grid's
+    engine) with tools/run_walk_forward.py's RealRunner. Dry-run prints each chain."""
+    WF, C = _wf_import()
+    holdout = _launcher_module(launcher)._OPTION_HOLDOUT_START
+    why = wf_holdout_refusal(args.wf_folds, args.wf_deferred, holdout)
+    if why is not None:
+        ap.error(f"--walk-forward: {why}")
+    selection = _wf_selection(args)
+    specs = wf_cell_specs(args, launcher, experts, strategies, universe, selection)
+    done = _completed_names()
+    print(f"options walk-forward: {len(specs)} cell(s) (experts={experts}, strategies={strategies}, "
+          f"universe={len(universe.split(','))} symbols); reports under {args.wf_report_dir}")
+    print(f"Folds: train from {args.wf_train_start}, test years {args.wf_test_years}"
+          + (f", data end {args.wf_data_end}" if args.wf_data_end else "")
+          + (" (last test DEFERRED)" if args.wf_deferred is not None else "")
+          + f"; generations {args.wf_first_generations} (fold 1) / {args.wf_next_generations} "
+          f"(seeded folds, refit); population={args.population}, patience={args.early_stop}, "
+          f"seed={args.seed}; option holdout from {holdout} (launcher rail)")
+    print(f"Selection: top {args.wf_top_n} behaviour-distinct genomes per fold, {selection}")
+    print(f"Objective: fitness={args.fitness or 'per-job default'}, robust_fitness="
+          f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
+          " -- scores are NOT comparable across the robustness setting.")
+    if args.dry_run:
+        for spec in specs:
+            plan, folds = C.make_cell_plan(spec)
+            print(f"\n=== cell {spec.name} ({spec.expert} {spec.strategy} / {spec.band}) ===")
+            for f in folds:
+                job = WF.train_job_name(spec.name, f.index)
+                print(f"  {'DONE' if job in done else 'TODO'}  {job}")
+            print(WF.render_dry_run(plan))
+            later = C.deferred_fold(folds, spec.data_end, spec.defer_last_test)
+            if later is not None:
+                print(f"  fold {later.index}: TEST DEFERRED -- the data ends {spec.data_end}; this run "
+                      f"only TRAINS {WF.train_job_name(spec.name, later.index)}. Rerun the same "
+                      f"command without --wf-data-end to test it, decide the cell and refit.")
+                continue
+            print("  refit (only if the cell passes): " + " ".join(C.refit_command(spec, folds)))
+        print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
+        return 0
+    if args.screener_gate_store and not Path(args.screener_gate_store).exists():
+        ap.error(f"Screener gate store does not exist: {args.screener_gate_store}")
+    runner = _make_wf_runner(args, selection)
+    cells = C.run_cells(specs, lambda _spec: runner, args.wf_report_dir)
+    for c in cells:
+        print(f"  {c['verdict']:7s} {c['cell']}" + (f"  refit={c['refit_job']}" if c["refit_job"] else "")
+              + (f"  ({c['error']})" if c.get("error") else ""), flush=True)
+        if c["verdict"] == "ERROR":
+            note_job_exit(_FAILED_JOBS, c["cell"], 1, c["error"])
+    return finish_matrix(_FAILED_JOBS, "options matrix driver (walk-forward)")
 
 
 def main(argv=None) -> int:
@@ -764,6 +1157,8 @@ def main(argv=None) -> int:
         launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
         if not os.path.exists(launcher):
             launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
+    if args.walk_forward:
+        return _run_walk_forward(ap, args, launcher, experts, strategies, universe)
     jobs = list(planned_jobs(args, launcher, experts, strategies, universe))
     if args.profile == "discovery":
         print("DISCOVERY: permitted singles only; all remain eligible for composition. "
