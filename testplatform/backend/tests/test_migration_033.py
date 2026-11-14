@@ -26,7 +26,8 @@ def _old_db(tmp_path):
     path = tmp_path / "old.sqlite"
     eng = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(eng, tables=[t for n, t in Base.metadata.tables.items()
-                                          if n != "strategy_optimization_runners"])
+                                          if n not in ("strategy_optimization_runners",
+                                                                       "backtest_writers")])
     eng.dispose()
     c = sqlite3.connect(path)
     c.execute("INSERT INTO strategies (id, name) VALUES (1, 's')")
@@ -43,7 +44,7 @@ def _columns(cur, table):
 
 
 def test_upgrade_creates_the_model_table_once_and_touches_nothing_else(tmp_path):
-    from app.models.strategy_optimization import StrategyOptimizationRunner
+    from app.models.strategy_optimization import BacktestWriter, StrategyOptimizationRunner
     m = _load()
     conn = sqlite3.connect(_old_db(tmp_path))
     cur = conn.cursor()

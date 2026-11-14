@@ -10724,50 +10724,24 @@ def _cmd_optimize(args) -> int:
                 print("optimize: --seed-check-only: bundle accepted; nothing was written")
                 return 0
             db.add(strat); db.commit(); db.refresh(strat)
+        _worker_ids = _worker_ids_from_args(args)
         if _resume_stale is not None:
-            # SAME JOB? Everything that decides the search must equal the interrupted row's: the
-            # whole config (GA settings, gene declarations, pins, the run block with its data
-            # digests, universe, exclusions), the decoded gene space, the strategy rules and the
-            # code versions. Any difference is refused (the old row stays as it is).
             from app.services import optimization_resume as _R
-            from app.services.strategy_optimization_handler import _is_bypass_expert, job_param_space
-            _diffs = _R.identity_differences(
-                db, _resume_stale, new_cfg=cfg, fitness_metric=fitness, optimization_type="genetic",
-                param_space=job_param_space(strat, cfg.get("expert_params"),
-                                            _is_bypass_expert(cfg["backtest"])),
-                entry_rules=strat.entry_rules, exit_rules=strat.exit_rules,
-                versions=_R.code_versions(),
-                allow_code_change=os.environ.get(_R.ACROSS_CODE_CHANGE_ENV) == "1")
-            try:                                 # a second starter may have won the race since
-                _again = _R.assess(db, _opt_name)
+            try:
+                opt = _create_resumed_row(db, _resume_stale, _opt_name, cfg, strat, fitness,
+                                          _worker_ids)
             except _R.ResumeRefused as e:
-                _diffs = [f"re-check: {e}"]
-            else:
-                if (_again.kind, _again.opt_id) != ("resume", _resume_stale):
-                    _diffs = [f"re-check: the row is now {_again.kind!r} (id {_again.opt_id})"]
-            if _diffs:
-                print(f"optimize: --resume-interrupted REFUSED: {_opt_name} (optimization "
-                      f"#{_resume_stale}) is NOT the job this command describes:\n  - "
-                      + "\n  - ".join(_diffs)
-                      + "\n  Run the command the job was started with, or delete that row (and "
-                        "its checkpoint) to train the new job from scratch, or use a new name.",
-                      flush=True)
+                print(f"optimize: --resume-interrupted REFUSED: {e}", flush=True)
+                db.rollback()
                 db.delete(strat); db.commit()
                 return 2
-        _worker_ids = _worker_ids_from_args(args)
-        opt = StrategyOptimization(
-            strategy_id=strat.id, name=args.name or f"opt-{expert}",
-            fitness_metric=fitness, optimization_type="genetic",
-            optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
-        )
-        db.add(opt)
-        if _resume_stale is not None:
-            # ONE transaction: the new row takes the name as the dead one gives it up, so a kill
-            # here can never leave two rows (or none) under the job name.
-            db.flush()
-            _R.retire_optimization(db, _resume_stale, f"resumed as optimization #{opt.id}",
-                                   commit=False)
-        db.commit(); db.refresh(opt)
+        else:
+            opt = StrategyOptimization(
+                strategy_id=strat.id, name=args.name or f"opt-{expert}",
+                fitness_metric=fitness, optimization_type="genetic",
+                optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
+            )
+            db.add(opt); db.commit(); db.refresh(opt)
         opt_id = opt.id
         if _worker_ids:
             print(f"optimize: distributing across worker ids {_worker_ids} + local")
@@ -10830,6 +10804,50 @@ def _cmd_optimize(args) -> int:
     return 0
 
 
+def _create_resumed_row(db, stale_id: int, name: str, cfg: dict, strat, fitness: str,
+                        worker_ids) -> "StrategyOptimization":
+    """``optimize --resume-interrupted``: create the row that continues interrupted optimization
+    ``stale_id`` under ``name``, or raise ``ResumeRefused``.
+
+    SAME JOB? Everything that decides the search must equal the interrupted row's: the whole config
+    (GA settings, gene declarations, pins, the run block with its window, data digests, universe,
+    exclusions), the chain-seed source it used, the decoded gene space, the strategy rules and the
+    code versions (BA2_RESUME_ACROSS_CODE_CHANGE=1 lifts only the last).
+
+    CLAIM, atomically: the INSERT of the new row and ONE guarded UPDATE that renames the dead row
+    only while it still carries ``name`` and an interruptible status run in ONE transaction. Two
+    starters that both passed the checks serialise on SQLite's write lock; the second one's UPDATE
+    matches no row and the whole transaction (its INSERT included) is rolled back and refused."""
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services import optimization_resume as _R
+    from app.services.strategy_optimization_handler import _is_bypass_expert, job_param_space
+    diffs = _R.identity_differences(
+        db, stale_id, new_cfg=cfg, fitness_metric=fitness, optimization_type="genetic",
+        param_space=job_param_space(strat, cfg.get("expert_params"), _is_bypass_expert(cfg["backtest"])),
+        entry_rules=strat.entry_rules, exit_rules=strat.exit_rules, versions=_R.code_versions(),
+        allow_code_change=os.environ.get(_R.ACROSS_CODE_CHANGE_ENV) == "1")
+    if diffs:
+        raise _R.ResumeRefused(
+            f"{name} (optimization #{stale_id}) is NOT the job this command describes:\n  - "
+            + "\n  - ".join(diffs)
+            + "\n  Run the command the job was started with, or delete that row (its checkpoint is "
+              "then discarded as orphaned) to train the new job from scratch, or use a new name.")
+    db.commit()            # end any read: the claim's transaction starts with its first write
+    opt = StrategyOptimization(
+        strategy_id=strat.id, name=name, fitness_metric=fitness, optimization_type="genetic",
+        optimization_config=cfg, worker_ids=(worker_ids or None), status="pending")
+    try:
+        db.add(opt)
+        db.flush()
+        _R.claim_and_retire(db, stale_id, name, f"resumed as optimization #{opt.id}")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(opt)
+    return opt
+
+
 def _mark_topn_done(opt_id: int) -> None:
     """The end-of-job TOP-N persist ran to its end: a later --resume-interrupted leaves it alone."""
     from app.models.database import SessionLocal
@@ -10864,9 +10882,14 @@ def _complete_interrupted_topn(opt_id: int, expert: str, args) -> int:
                 .order_by(Backtest.id).all())
         done = {n for _bid, n, st in rows if st == "completed"}
         for bid, n, st in rows:
-            if st != "completed":
-                print(f"optimize: retiring half-written {n} (backtest {bid}, {st})", flush=True)
-                _R.retire_backtest(db, bid, "the end-of-job TOP-N persist")
+            if st != "completed" and n not in done:
+                # only once its recorded writer is proven dead (it may still be saving it)
+                try:
+                    _R.retire_dead_backtest(db, bid, n, "the end-of-job TOP-N persist")
+                except _R.ResumeRefused as e:
+                    print(f"optimize: --resume-interrupted REFUSED: {e}", flush=True)
+                    return 2
+                print(f"optimize: retired half-written {n} (backtest {bid}, {st})", flush=True)
         missing = [r for r in names if names[r] not in done]
     finally:
         db.close()
@@ -11649,7 +11672,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 initial_capital=float(bt_block["initial_capital"]),
                 status="running", started_at=_dt.now(),
             )
-            db.add(bt); db.commit(); db.refresh(bt)
+            # The row and WHO writes it, in one commit: a resume retires a half-written row only
+            # once this writer is proven dead (optimization_resume.retire_dead_backtest).
+            from app.services import optimization_resume as _R
+            db.add(bt); db.flush()
+            _R.register_backtest_writer(db, bt.id)
+            db.commit(); db.refresh(bt)
             # Record BOTH fitness views onto the results blob before it is mapped to the row.
             # compute_fitness writes fitness_raw / fitness_robust / robustness INTO the dict it is
             # given, and _persist_results copies everything that is not a curve/trade list into

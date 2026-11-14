@@ -264,6 +264,8 @@ def test_checkpoint_resumed_chain_job_still_records_its_seed_source(monkeypatch)
             "best_fitness": max(stored["fitnesses"]), "robust_fitness": False,
             "fitness_metric": "sharpe", "top_results": []}
     monkeypatch.setattr(H, "_load_checkpoint", lambda task_id, fingerprint=None: dict(ckpt))
+    # the killed first launch, which wrote the checkpoint (a checkpoint without it is orphaned)
+    _rename(T._seed_opt(sid, config=T._ga_config(populationSize=8, generations=2)), "res-wf2")
     tgt, out = _run(sid, "res-wf2", populationSize=8, generations=2, chainSeedFromOptimizationId=src)
     assert out["status"] == "completed", out
     seeded = _cfg(tgt)["seededFrom"]

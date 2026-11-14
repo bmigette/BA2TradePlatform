@@ -33,11 +33,19 @@ from .test_wf_matrix_chain import GOOD, ChainRunner, _spec
 
 
 def _dead():
-    import psutil
-    p = subprocess.Popen([sys.executable, "-c", "pass"])
-    started = psutil.Process(p.pid).create_time()
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    ident = R.process_identity(p.pid)
     p.wait()
-    return {"host": R.this_host(), "pid": p.pid, "pid_started": started}
+    return ident
+
+
+def _writer(S, bt_id, identity):
+    db = S()
+    try:
+        R.register_backtest_writer(db, bt_id, identity=identity)
+        db.commit()
+    finally:
+        db.close()
 
 
 def _register(S, opt_id, identity, topn_done=False):
@@ -143,9 +151,16 @@ def test_a_half_written_oos_row_is_retired_and_rerun_under_the_cell_lock(monkeyp
     r._launcher = fake
     half = _seed_bt(host_db, oid, f"WF1-OOS-R1-{job}", datetime(2026, 1, 1), datetime(2026, 6, 30),
                     status="running")
+    _writer(host_db, half, R.process_identity())            # its writer is still alive
     # without the lock: refused as before (another driver may be writing it)
     with pytest.raises(WF.WalkForwardError, match="running"):
         r.run_oos(job, _fold(), [_pick(1)], "WF1-OOS-R", ["OOS"], 1)
+    # with the lock but a LIVE writer (an orphaned persist after only the driver was killed)
+    with r.exclusive("rs-oos", str(tmp_path / ".lock")):
+        with pytest.raises(WF.WalkForwardError, match="writer is ALIVE"):
+            r.run_oos(job, _fold(), [_pick(1)], "WF1-OOS-R", ["OOS"], 1)
+    assert fake.calls == []
+    _writer(host_db, half, _dead())
     with r.exclusive("rs-oos", str(tmp_path / ".lock")):
         out = r.run_oos(job, _fold(), [_pick(1)], "WF1-OOS-R", ["OOS"], 1)
     assert fake.calls == [[1]] and not out[1].reused and out[1].total_return == 3.0
@@ -158,7 +173,8 @@ def test_a_half_written_oos_row_is_retired_and_rerun_under_the_cell_lock(monkeyp
         assert [b.status for b in same] == ["completed"]            # exactly one, no duplicate
     finally:
         db.close()
-    assert not (tmp_path / ".lock").exists()
+    with R.exclusive(str(tmp_path / ".lock"), "rs-oos"):        # released
+        pass
 
 
 # ------------------------------------------------------------------ the cell lock
@@ -181,7 +197,8 @@ def test_a_cell_runs_under_its_lock_and_a_second_driver_is_refused(tmp_path):
     res = C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None)
     assert res.verdict == "PASS"
     assert r.locked == [C.lock_path(str(tmp_path), "cell")]
-    assert not os.path.exists(C.lock_path(str(tmp_path), "cell"))
+    with R.exclusive(C.lock_path(str(tmp_path), "cell"), "cell"):   # released after the cell
+        pass
     # a live driver holds the cell: the next one records ERROR for it and runs nothing
     with R.exclusive(C.lock_path(str(tmp_path), "cell"), "cell"):
         again = _LockingRunner([GOOD, GOOD, GOOD])
@@ -272,6 +289,9 @@ def test_launcher_completes_a_cut_off_topn_persist(host_db, monkeypatch):
     monkeypatch.setattr(mod, "_persist_top_backtests",
                         lambda opt_id, expert, **kw: seen.append((opt_id, kw["ranks"],
                                                                   [c[2] for c in kw["candidates"]])))
+    _writer(host_db, half, R.process_identity())              # still being written: hands off
+    assert mod._cmd_optimize(_opt_args("rs-l-topn")) == 2 and seen == []
+    _writer(host_db, half, _dead())
     assert mod._cmd_optimize(_opt_args("rs-l-topn")) == 0
     assert seen == [(oid, [2, 3], [2.0, 1.0])]
     db = host_db()
@@ -280,3 +300,35 @@ def test_launcher_completes_a_cut_off_topn_persist(host_db, monkeypatch):
         assert db.get(Run, oid).topn_done_at is not None
     finally:
         db.close()
+
+
+def test_topn_completion_persists_exactly_what_the_uninterrupted_persist_would(host_db,
+                                                                              monkeypatch):
+    """Same ranking as the end-of-job persist (``_persist_top_backtests`` with no candidates ranks
+    ``_rank_measured_candidates(all_results, save_top, best_params, best_fitness)`` as 1..n):
+    with stalled records and fitness ties in all_results, the completion re-runs ranks 2..n with
+    the very candidates the uninterrupted persist would have given those ranks."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    mod = _launcher_module()
+    recs = ([{"params": {"g": i}, "key": f"k{i}", "fitness": f, "trades": 5}
+             for i, f in enumerate([5.0, 4.0, 4.0, 3.5, 3.0, 2.0])]
+            + [{"params": {"g": 99}, "key": "kst", "fitness": -1e9, "trades": 0,
+                "status": "stalled"}])
+    oid = _seed_opt(host_db, "rs-l-rank", status="completed")
+    db = host_db()
+    try:
+        row = db.get(SO, oid)
+        row.all_results, row.best_params, row.best_fitness = recs, {"g": 0}, 5.0
+        db.commit()
+    finally:
+        db.close()
+    _register(host_db, oid, _dead())
+    _seed_bt(host_db, oid, "TOP1-rs-l-rank", datetime(2020, 1, 1), datetime(2025, 12, 31))
+    uninterrupted, _ = mod._rank_measured_candidates(recs, 4, {"g": 0}, 5.0)
+    seen = []
+    monkeypatch.setattr(mod, "_persist_top_backtests",
+                        lambda opt_id, expert, **kw: seen.append((kw["ranks"], kw["candidates"],
+                                                                  kw.get("name_prefix", "TOP"))))
+    assert mod._cmd_optimize(_opt_args("rs-l-rank", save_top=4)) == 0
+    assert seen == [([2, 3, 4], list(uninterrupted[1:]), "TOP")]
+    assert len(uninterrupted) == 4 and all(c[2] > -1e8 for c in uninterrupted)   # stall excluded

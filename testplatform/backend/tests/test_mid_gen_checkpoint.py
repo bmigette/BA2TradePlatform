@@ -660,6 +660,9 @@ def _run_with_seeded_checkpoint(H, created, job_name, *, generations, ckpt):
     import app.services.genetic as genetic_mod
 
     sid = _ckpt_strategy_id()
+    # The row whose (killed) run wrote the checkpoint: a relaunch inserts a NEW row next to it. A
+    # checkpoint with no such row is orphaned and discarded (test_optimization_resume_handler).
+    _seed_named_opt(sid, job_name, generations)
     opt_id = _seed_named_opt(sid, job_name, generations)
     tid = H.checkpoint_task_id(job_name, opt_id)
     created.append(tid)

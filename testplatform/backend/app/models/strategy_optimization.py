@@ -84,9 +84,11 @@ class StrategyOptimizationRunner(Base):
     ever hijacking a live one (app.services.optimization_resume). One row per optimization,
     written by the handler when the job starts.
 
-    ``host`` + ``pid`` + ``pid_started`` (the process creation time, epoch seconds) identify the
-    process: on the same host a dead pid, or a pid reused by another process (different creation
-    time), proves the runner is gone. A row owned by another host is never judged dead here.
+    ``host`` + ``pid`` + ``pid_started`` (the process creation time, epoch seconds) +
+    ``proc_identity`` (Linux boot id + kernel start tick, command-line hash) identify the process:
+    on the same host a pid that no longer exists, or whose ``proc_identity`` proves reuse, is dead;
+    a start-time mismatch alone is UNKNOWN (a clock step moves it), never dead. A row owned by
+    another host is never judged here (optimization_resume.judge).
     ``code_versions`` = the TEST app version + package minimums the job started under (a resume
     across a code change is refused by default). ``resumed_from_id`` = the interrupted row this
     one continues. ``topn_done_at`` = when the launcher's end-of-job TOP-N persist ran to its
@@ -100,10 +102,29 @@ class StrategyOptimizationRunner(Base):
     host = Column(String(255), nullable=False)
     pid = Column(Integer, nullable=False)
     pid_started = Column(Float, nullable=False)
+    proc_identity = Column(JSON, nullable=True)       # boot id + kernel start tick / cmdline hash
+    # Random per RUN, written into every checkpoint of it: a checkpoint is this run's only if the
+    # tokens match (SQLite reuses the id of a deleted max-id row, so the id alone is not proof).
+    run_token = Column(String(64), nullable=True)
     code_versions = Column(JSON, nullable=True)
     resumed_from_id = Column(Integer, nullable=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now())
     topn_done_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class BacktestWriter(Base):
+    """The process writing a re-run Backtest row (end-of-job TOP-N, walk-forward out-of-sample),
+    recorded with the row: a row left non-completed is only retired once this writer is proven
+    dead (optimization_resume.retire_dead_backtest). Migration 033 mirrors it."""
+
+    __tablename__ = "backtest_writers"
+
+    backtest_id = Column(Integer, ForeignKey("backtests.id"), primary_key=True)
+    host = Column(String(255), nullable=False)
+    pid = Column(Integer, nullable=False)
+    pid_started = Column(Float, nullable=False)
+    proc_identity = Column(JSON, nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class StrategyOptimizationPopulation(Base):

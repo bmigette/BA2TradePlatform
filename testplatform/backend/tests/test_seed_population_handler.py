@@ -215,6 +215,9 @@ def test_checkpoint_wins_over_seeds(monkeypatch):
     monkeypatch.setattr(H, "_assert_checkpoint_robustness_matches", lambda *a, **k: None)
     monkeypatch.setattr(H, "_assert_checkpoint_metric_matches", lambda *a, **k: None)
     monkeypatch.setattr(H, "_checkpoint_exhausted", lambda *a, **k: False)
+    # the checkpoint's writing row exists (a checkpoint with none is orphaned and discarded)
+    monkeypatch.setattr(H, "_checkpoint_writer", lambda *a, **k: 1)
+    monkeypatch.setattr(H, "_seed_from_interrupted_row", lambda *a, **k: set())
     monkeypatch.setattr(H, "_build_seed_population",
                         lambda *a, **k: pytest.fail("seeds must not be built on a resume"))
     try:

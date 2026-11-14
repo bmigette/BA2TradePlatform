@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 import pytest
 
@@ -64,12 +65,11 @@ def _opt(S, name, status="running", cfg=None, ranges=None, rules=None):
 
 
 def _dead_identity():
-    """A process that existed and is gone: a finished child's pid + its real creation time."""
-    p = subprocess.Popen([sys.executable, "-c", "pass"])
-    import psutil
-    started = psutil.Process(p.pid).create_time()
+    """A process that existed and is gone: a finished child's pid + its recorded identity."""
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    ident = R.process_identity(p.pid)
     p.wait()
-    return {"host": R.this_host(), "pid": p.pid, "pid_started": started}
+    return ident
 
 
 def _register(S, opt_id, identity, versions=None, topn_done=False):
@@ -85,26 +85,57 @@ def _register(S, opt_id, identity, versions=None, topn_done=False):
 
 # ------------------------------------------------------------------ liveness
 
+LINUX_ME = {"boot_id": "boot-1", "start_ticks": 4242, "cmdline_sha": "me"}
+
+
+def _as_linux(monkeypatch, now):
+    """Read the process identity as Linux /proc would give it."""
+    monkeypatch.setattr(R, "proc_identity", lambda pid: dict(now))
+
 
 def test_this_process_is_alive():
     me = R.process_identity()
-    assert R.process_alive(me["host"], me["pid"], me["pid_started"]) is True
+    assert R.judge(me["host"], me["pid"], me["pid_started"], me["proc_identity"])[0] == R.ALIVE
 
 
 def test_a_finished_process_is_dead():
     d = _dead_identity()
-    assert R.process_alive(d["host"], d["pid"], d["pid_started"]) is False
+    assert R.judge(d["host"], d["pid"], d["pid_started"], d["proc_identity"])[0] == R.DEAD
 
 
-def test_a_reused_pid_is_dead():
-    """The pid exists but belongs to a process created at another time: not our runner."""
+def test_a_start_time_mismatch_alone_is_unknown_never_dead():
+    """A clock step on a VM moves psutil's create_time on Linux: the LIVE runner must not be
+    judged dead. Same pid, same command line, start time off by an hour: UNKNOWN (refused)."""
     me = R.process_identity()
-    assert R.process_alive(me["host"], me["pid"], me["pid_started"] - 3600.0) is False
+    state, why = R.judge(me["host"], me["pid"], me["pid_started"] - 3600.0,
+                         {"cmdline_sha": me["proc_identity"].get("cmdline_sha")})
+    assert state == R.UNKNOWN and "clock step" in why
 
 
-def test_another_host_is_unknown_never_dead():
+def test_linux_start_tick_decides_whatever_the_wall_clock_says(monkeypatch):
     me = R.process_identity()
-    assert R.process_alive("some-other-box", me["pid"], me["pid_started"]) is None
+    _as_linux(monkeypatch, LINUX_ME)
+    # same kernel start tick, create_time shifted by a clock step: ALIVE
+    assert R.judge(me["host"], me["pid"], me["pid_started"] - 3600.0, LINUX_ME)[0] == R.ALIVE
+    # another start tick in the same boot: the pid was reused -> DEAD
+    assert R.judge(me["host"], me["pid"], me["pid_started"],
+                   {**LINUX_ME, "start_ticks": 1})[0] == R.DEAD
+    # recorded in another boot: that process cannot be alive -> DEAD
+    assert R.judge(me["host"], me["pid"], me["pid_started"],
+                   {**LINUX_ME, "boot_id": "boot-0"})[0] == R.DEAD
+
+
+def test_another_command_line_proves_reuse():
+    me = R.process_identity()
+    state, why = R.judge(me["host"], me["pid"], me["pid_started"] - 3600.0,
+                         {"cmdline_sha": "some-other-command"})
+    assert state == R.DEAD and "reused" in why
+
+
+def test_nothing_recorded_is_unknown_and_another_host_is_foreign():
+    me = R.process_identity()
+    assert R.judge(None, me["pid"], None)[0] == R.UNKNOWN
+    assert R.judge("some-other-box", me["pid"], me["pid_started"])[0] == R.FOREIGN
 
 
 # ------------------------------------------------------------------ assess
@@ -154,6 +185,34 @@ def test_running_row_of_a_dead_runner_is_resumable(S):
     try:
         a = R.assess(db, n)
         assert (a.kind, a.opt_id) == ("resume", oid)
+    finally:
+        db.close()
+
+
+def test_running_row_whose_runner_cannot_be_proven_dead_is_refused(S):
+    n = _name("unknown")
+    oid = _opt(S, n)
+    me = R.process_identity()
+    _register(S, oid, {**me, "pid_started": me["pid_started"] - 3600.0,
+                       "proc_identity": {"cmdline_sha": me["proc_identity"].get("cmdline_sha")}})
+    db = S()
+    try:
+        with pytest.raises(R.ResumeRefused, match="UNKNOWN.*only a runner proven dead"):
+            R.assess(db, n)
+    finally:
+        db.close()
+
+
+def test_completed_row_whose_topn_persist_is_still_running_is_refused(S):
+    """The launcher of a completed job may still be persisting its TOP-N (only the driver was
+    killed): never touched while that process lives."""
+    n = _name("topn-live")
+    oid = _opt(S, n, status="completed")
+    _register(S, oid, R.process_identity())
+    db = S()
+    try:
+        with pytest.raises(R.ResumeRefused, match="LIVE process"):
+            R.assess(db, n)
     finally:
         db.close()
 
@@ -287,16 +346,37 @@ def test_a_code_version_change_is_a_difference_unless_allowed(S):
     assert any("required_package_versions" in x for x in _diffs(S, oid, versions=raised))
 
 
-# ------------------------------------------------------------------ retire
+def test_seeded_from_must_match_the_new_chain_seed_source(S):
+    """No checkpoint yet means the chain seed is applied again: it must be the same source row."""
+    oid = _stale(S, cfg={**_cfg(chainSeedFromOptimizationId=5),
+                         "seededFrom": {"kind": "chain", "optimization_id": 5, "name": "c-wf1"}})
+    assert _diffs(S, oid, new_cfg=_cfg(chainSeedFromOptimizationId=5)) == []
+    d = _diffs(S, oid, new_cfg=_cfg(chainSeedFromOptimizationId=6))
+    assert any(x.startswith("seededFrom") for x in d)
 
 
-def test_retire_frees_the_name_and_keeps_the_row(S):
+def test_job_identity_hash_follows_window_and_data_but_not_exempt_keys():
+    h = lambda cfg: R.job_identity_hash(cfg, "sharpe", "genetic", {"x": {}}, [{"id": "r"}], [])
+    base = h(_cfg())
+    moved = _cfg()
+    moved["backtest"]["end_date"] = "2024-12-31"
+    digest = _cfg()
+    digest["backtest"]["market_condition_manifests"] = {"ohlcv-v1": "sha-B"}
+    assert h(moved) != base and h(digest) != base
+    assert h({**_cfg(parallelIndividuals=9), "seededFrom": {"x": 1}, "resumedFrom": {"y": 2}}) == base
+
+
+# ------------------------------------------------------------------ claim / retire
+
+
+def test_claim_frees_the_name_and_keeps_the_row(S):
     from app.models.strategy_optimization import StrategyOptimization as SO
     n = _name("ret")
     oid = _opt(S, n)
     db = S()
     try:
-        new_name = R.retire_optimization(db, oid, "resumed as #77")
+        new_name = R.claim_and_retire(db, oid, n, "resumed as #77")
+        db.commit()
         row = db.get(SO, oid)
         assert row.name == new_name == f"{n}~interrupted-{oid}"
         assert row.status == "failed" and "INTERRUPTED" in row.error_message
@@ -307,28 +387,104 @@ def test_retire_frees_the_name_and_keeps_the_row(S):
         db.close()
 
 
+def test_two_competing_claims_only_one_wins(S):
+    """Both starters passed assess(); the second claim matches no row and is refused, and its
+    whole transaction (the new row it inserted) is rolled back."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    n = _name("race")
+    oid = _opt(S, n)
+    _register(S, oid, _dead_identity())
+    a, b = S(), S()
+    try:
+        assert R.assess(a, n).kind == "resume" and R.assess(b, n).kind == "resume"
+        sid = a.get(SO, oid).strategy_id
+        for db in (a, b):
+            db.commit()
+        a.add(SO(strategy_id=sid, name=n, fitness_metric="sharpe", optimization_type="genetic",
+                 optimization_config=_cfg(), status="pending"))
+        a.flush()
+        R.claim_and_retire(a, oid, n, "A")
+        a.commit()
+        b.add(SO(strategy_id=sid, name=n, fitness_metric="sharpe", optimization_type="genetic",
+                 optimization_config=_cfg(), status="pending"))
+        b.flush()
+        with pytest.raises(R.ResumeRefused, match="claimed by another starter"):
+            R.claim_and_retire(b, oid, n, "B")
+        b.rollback()
+        rows = a.query(SO.status, SO.error_message).filter(SO.name == n).all()
+        assert [r[0] for r in rows] == ["pending"]                       # exactly one new row
+        assert "A" in a.get(SO, oid).error_message
+    finally:
+        a.close()
+        b.close()
+
+
+def test_a_half_written_backtest_is_retired_only_when_its_writer_is_dead(S):
+    from app.models.backtest import Backtest
+    db = S()
+    try:
+        bt = Backtest(name=_name("WF1-OOS-R1"), engine_type="daily_expert", status="running",
+                      initial_capital=1.0, start_date=datetime(2026, 1, 1), end_date=datetime(2026, 6, 30))
+        db.add(bt); db.flush()
+        R.register_backtest_writer(db, bt.id, identity=R.process_identity())
+        db.commit()
+        with pytest.raises(R.ResumeRefused, match="ALIVE"):
+            R.retire_dead_backtest(db, bt.id, bt.name, "test")
+        legacy = Backtest(name=_name("TOP2"), engine_type="daily_expert", status="running",
+                          initial_capital=1.0, start_date=datetime(2026, 1, 1),
+                          end_date=datetime(2026, 6, 30))
+        db.add(legacy); db.commit()
+        with pytest.raises(R.ResumeRefused, match="UNKNOWN.*no writer was recorded"):
+            R.retire_dead_backtest(db, legacy.id, legacy.name, "test")
+        R.register_backtest_writer(db, bt.id, identity=_dead_identity())
+        db.commit()
+        assert R.retire_dead_backtest(db, bt.id, bt.name, "test").endswith(f"~interrupted-{bt.id}")
+    finally:
+        db.close()
+
+
 # ------------------------------------------------------------------ the driver's lock
 
 
-def test_lock_is_exclusive_against_a_live_holder_and_taken_from_a_dead_one(tmp_path):
+_HOLDER = r"""
+import sys, time
+sys.path.insert(0, sys.argv[2])
+from app.services import optimization_resume as R
+h = R.acquire_lock(sys.argv[1], "cell-a")
+print("locked", flush=True)
+time.sleep(120)
+"""
+
+
+def test_lock_is_an_os_lock_held_by_a_live_process_and_freed_by_its_death(tmp_path):
     p = str(tmp_path / "cell" / ".lock")
-    with R.exclusive(p, "cell-a"):
+    backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    holder = subprocess.Popen([sys.executable, "-c", _HOLDER, p, backend], stdout=subprocess.PIPE,
+                              text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(R.ResumeRefused, match="held by a LIVE process"):
+            R.acquire_lock(p, "cell-a")
+    finally:
+        # our own child (and the interpreter a venv launcher starts under it), by pid: what
+        # `grid stop` does to a driver
+        import psutil
+        for proc in psutil.Process(holder.pid).children(recursive=True):
+            proc.kill()
+        holder.kill()
+        holder.wait()
+    with R.exclusive(p, "cell-a"):  # the OS released it with the dead holder
         held = json.loads(open(p, encoding="utf-8").read())
         assert held["pid"] == os.getpid() and held["label"] == "cell-a"
-        # a second driver while the holder (this process) lives: refused
         with pytest.raises(R.ResumeRefused, match="LIVE process"):
-            R.acquire_lock(p, "cell-a")
-    assert not os.path.exists(p)                    # released
-    with open(p, "w", encoding="utf-8") as fh:      # a killed driver's leftover
-        json.dump({**_dead_identity(), "label": "cell-a"}, fh)
-    with R.exclusive(p, "cell-a"):
-        assert json.loads(open(p, encoding="utf-8").read())["pid"] == os.getpid()
+            R.acquire_lock(p, "cell-a")          # a second driver, same host, while we live
+    with R.exclusive(p, "cell-a"):               # released on exit: re-acquirable
+        pass
 
 
-def test_lock_of_another_host_is_refused(tmp_path):
-    p = str(tmp_path / ".lock")
-    with open(p, "w", encoding="utf-8") as fh:
-        json.dump({"host": "remote-box", "pid": 1, "pid_started": 1.0, "label": "x"}, fh)
-    with pytest.raises(R.ResumeRefused, match="remote-box"):
-        with R.exclusive(p, "x"):
-            pass
+def test_lock_file_content_plays_no_part_in_the_decision(tmp_path):
+    """A leftover file naming nobody (or anybody) is not a lock: only the OS lock is."""
+    p = tmp_path / ".lock"
+    p.write_text(json.dumps({"host": "remote-box", "pid": 1, "label": "x"}))
+    with R.exclusive(str(p), "x"):
+        pass

@@ -1818,7 +1818,16 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         resume_of = payload.get("resume_of")
         resume_of = int(resume_of) if resume_of is not None else None
         from app.services import optimization_resume as _resume
-        _resume.register_runner(db, opt_id, resumed_from_id=resume_of)
+        run_token = _resume.register_runner(db, opt_id, resumed_from_id=resume_of)
+        if resume_of is not None:
+            # Both code versions, durably on THIS row (a resume across a code change is allowed
+            # only by BA2_RESUME_ACROSS_CODE_CHANGE=1; this is where it stays visible).
+            _was = _resume.runner_of(db, resume_of)
+            opt.optimization_config = {**(opt.optimization_config or {}), "resumedFrom": {
+                "optimization_id": resume_of,
+                "code_versions_before": _was.code_versions if _was is not None else None,
+                "code_versions_now": _resume.runner_of(db, opt_id).code_versions}}
+            db.commit()
 
         strategy = db.query(StrategyModel).filter(
             StrategyModel.id == opt.strategy_id
@@ -1905,6 +1914,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             return _fail(opt_id, db, str(e))
         opt.parameter_ranges = param_space
         db.commit()
+        # The job's identity (config incl. window and data digests, metric, gene space, rules):
+        # written into every checkpoint, and a checkpoint is only resumed under the same one.
+        job_identity = _resume.job_identity_hash(
+            ga, opt.fitness_metric, opt.optimization_type or "genetic", param_space,
+            strategy.entry_rules, strategy.exit_rules)
 
         # Detach the Strategy into a session-free snapshot BEFORE the (possibly parallel) trial
         # loop. The fitness threads call decode_params(strategy, ...) concurrently, but the
@@ -2086,6 +2100,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         def checkpoint_cb(generation: int, population: list, partial: bool = False):
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
+            data["job_identity"] = job_identity      # ... or a changed window / data / config
+            data["optimization_id"] = opt_id         # the row whose run this is (resume lineage)
+            data["run_token"] = run_token            # ... and which run of it (ids are reused)
             data["partial"] = partial               # resume INTO this generation, not after it
             # The objective's robustness setting, so a resume cannot mix two incomparable
             # scales in one population (the fingerprint covers the GENE SPACE, not the metric).
@@ -2391,50 +2408,99 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         start_gen, init_pop, init_fits = 0, None, None
         n_protected_seeds = 0
-        # RESUME OF AN INTERRUPTED ROW (optimize --resume-interrupted): every trial the killed
-        # runner finished is in its row's all_results (written after each trial). Re-seed this
-        # run's all_results AND the trial memo from it, so nothing that finished is run again and
-        # all_results ends up holding the same trials as an uninterrupted run (the walk-forward
-        # top-N is selected from it; the checkpoint carries only 20 elites). With no checkpoint
-        # (killed before the first one) the search restarts from generation 0 and replays the
-        # same genomes from the memo.
+        # WHICH CHECKPOINT, AND WHOSE TRIALS (app.services.optimization_resume).
+        #
+        # RESUME OF AN INTERRUPTED ROW (optimize --resume-interrupted, ``resume_of``): only a
+        # checkpoint written by that row (or a row it continues) is used, and only with a matching
+        # fingerprint AND job identity; anything else of ours is a refusal. A checkpoint written by
+        # ANOTHER row is foreign: the interrupted run died before its first checkpoint, so it is
+        # discarded (said so) and the run starts clean, which is exactly where the interrupted one
+        # was. Either way every trial the dead row finished is re-seeded into all_results and the
+        # trial memo from its record (written after each trial), so nothing runs again and
+        # all_results holds the trials of an uninterrupted run (the walk-forward top-N is selected
+        # from it; a checkpoint carries only 20 elites).
+        #
+        # PLAIN LAUNCH: a checkpoint of this name is resumed (as before) only while the row that
+        # wrote it still exists, and its trials are re-seeded from that row the same way. An
+        # ORPHANED checkpoint (its row deleted by hand) or one of another job identity is
+        # discarded (said so): resuming it would keep only its 20 elites in all_results.
         seeded_keys = None
-        if resume_of is not None and not is_brute_force:
-            try:
-                seeded_keys = _seed_from_interrupted_row(db, resume_of, all_results, memo, best)
-            except ValueError as e:
-                return _fail(opt_id, db, f"resume of interrupted optimization {resume_of}: {e}")
-            logger.warning(
-                f"strategy_optimization {opt_id}: resuming interrupted optimization {resume_of}: "
-                f"{len(all_results)} trial record(s) carried over, {len(seeded_keys)} memoized")
-        # A brute-force grid has no population to resume or warm-start: never read (or, below,
-        # clear) a GA checkpoint for one.
+        source_row = None
         if is_brute_force:
-            ckpt = None
+            ckpt = None           # a grid has no population to resume or warm-start
         elif resume_of is not None:
-            # Asked to RESUME: a checkpoint of another search is a refusal, never the silent
-            # discard-and-restart of the plain path below.
             ckpt = _load_checkpoint(ckpt_task_id)
-            _stored_fp = (ckpt or {}).get("fingerprint")
-            if _stored_fp and _stored_fp != ckpt_fingerprint:
-                return _fail(
-                    opt_id, db,
-                    f"resume of interrupted optimization {resume_of}: checkpoint {ckpt_task_id} was "
-                    f"written for another search (fingerprint {_stored_fp} != {ckpt_fingerprint}: "
-                    f"gene space, GA budget or a search setting changed). Not resumed.")
+            source_row = resume_of
+            if ckpt is not None:
+                _lineage = _resume.resume_lineage(db, resume_of)
+                if _resume.checkpoint_owned_by(db, ckpt, _lineage) is None:
+                    logger.warning(
+                        f"strategy_optimization {opt_id}: DISCARDING checkpoint {ckpt_task_id} "
+                        f"(generation {ckpt.get('generation')}, written by optimization "
+                        f"{ckpt.get('optimization_id')!r}, run {ckpt.get('run_token')!r}): it is not "
+                        f"the interrupted row's "
+                        f"(lineage {_lineage}), which died before its first checkpoint. Starting "
+                        f"clean from generation 0; its finished trials replay from the memo.")
+                    _clear_checkpoint(ckpt_task_id)
+                    ckpt = None
+                else:
+                    _problem = (
+                        "carries no fingerprint" if not ckpt.get("fingerprint") else
+                        f"was written for another search (fingerprint {ckpt['fingerprint']} != "
+                        f"{ckpt_fingerprint}: gene space, GA budget or a search setting changed)"
+                        if ckpt["fingerprint"] != ckpt_fingerprint else
+                        f"carries job identity {ckpt.get('job_identity')!r} != {job_identity!r} "
+                        f"(window, data digests, config or rules changed)"
+                        if ckpt.get("job_identity") != job_identity else None)
+                    if _problem:
+                        return _fail(opt_id, db, f"resume of interrupted optimization {resume_of}: "
+                                                 f"checkpoint {ckpt_task_id} {_problem}. Not resumed.")
         else:
             ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
+            if ckpt is not None and not _checkpoint_exhausted(ckpt, ga["generations"]):
+                _writer = _checkpoint_writer(db, ckpt, opt)
+                _why = ("it carries another job identity (window, data digests, config or rules "
+                        "changed)" if ckpt.get("job_identity") not in (None, job_identity) else
+                        "the row that wrote it no longer exists (deleted by hand?)"
+                        if _writer is None else None)
+                if _why:
+                    logger.warning(
+                        f"strategy_optimization {opt_id}: DISCARDING orphaned checkpoint "
+                        f"{ckpt_task_id} (generation {ckpt.get('generation')}): {_why}; resuming "
+                        f"it would keep only its {len(ckpt.get('top_results') or [])} elites in "
+                        f"all_results. Starting from generation 0.")
+                    _clear_checkpoint(ckpt_task_id)
+                    ckpt = None
+                else:
+                    source_row = _writer
+        if source_row is not None:
+            try:
+                seeded_keys = _seed_from_interrupted_row(db, source_row, all_results, memo, best)
+            except ValueError as e:
+                return _fail(opt_id, db, f"resume of interrupted optimization {source_row}: {e}")
+            logger.warning(
+                f"strategy_optimization {opt_id}: continuing optimization {source_row}: "
+                f"{len(all_results)} trial record(s) carried over, {len(seeded_keys)} memoized")
         # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
         # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
         # a confusing failure for what is really "this search already finished". Only reachable
         # when a run reached the last generation and then died before _clear_checkpoint (or when a
         # NEW job reuses a dead job's name), so discarding and searching from scratch is both the
         # safe reading and the one that produces a result. A PARTIAL checkpoint on the final
-        # generation is the exception -- see _checkpoint_exhausted.
+        # generation is the exception -- see _checkpoint_exhausted. For a RESUME the search is
+        # REPLAYED from generation 0 against the memo of every finished trial: the same RNG draws,
+        # nothing runs again, the uninterrupted result.
         if _checkpoint_exhausted(ckpt, ga["generations"]):
-            logger.warning(
-                f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
-                f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
+            if seeded_keys is not None:
+                logger.warning(
+                    f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is EXHAUSTED "
+                    f"(generation {ckpt.get('generation')} of {ga['generations']}: the run died "
+                    f"after its last generation). REPLAYING from generation 0 against the memo of "
+                    f"{len(seeded_keys)} finished trials; no trial runs again.")
+            else:
+                logger.warning(
+                    f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
+                    f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
             _clear_checkpoint(ckpt_task_id)
             ckpt = None
         if ckpt:
@@ -2461,14 +2527,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # saved S5 row understated the cell.
             #
             # Re-seeding from the checkpoint's bounded elite slice fixes that. Cheap, contrary to
-            # the note this replaces -- see _elite_slice. A resume of an interrupted ROW has the
-            # full record already (seeded_keys above) and does not add the slice twice.
+            # the note this replaces -- see _elite_slice. A run that continues a row has its
+            # full record already (seeded_keys above) and does not add the slice.
             if seeded_keys is None:
                 _seed_all_results_from_checkpoint(ckpt, all_results)
-            elif ckpt.get("partial") and init_fits:
+            elif resume_of is not None and ckpt.get("partial") and init_fits:
                 # A trial lands in the checkpoint (on_result) a moment BEFORE its all_results row
                 # is written; a kill in between leaves a fitness without its record. Re-run those
-                # (deterministic: same fitness) so all_results is complete.
+                # (deterministic: same fitness) so all_results is complete. (Resume only: a plain
+                # relaunch keeps the checkpoint's fitnesses, as it always did.)
                 n_rerun = 0
                 for _i, _fit in enumerate(init_fits):
                     if _fit is not None and _trial_key_for(
@@ -2478,7 +2545,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if n_rerun:
                     logger.warning(
                         f"strategy_optimization {opt_id}: {n_rerun} checkpointed trial(s) had no "
-                        f"record on the interrupted row; re-running them")
+                        f"record on optimization {source_row}; re-running them")
             if ga.get(CHAIN_SEED_KEY):
                 # This relaunch inserted a NEW row, so the lineage of the first launch is not on
                 # it: record what is known (the source), flagged as a checkpoint resume.
@@ -4037,6 +4104,25 @@ def _seed_all_results_from_checkpoint(
     if not isinstance(carried, list):
         return
     all_results.extend(r for r in carried if isinstance(r, dict))
+
+
+def _checkpoint_writer(db: Any, ckpt: Dict[str, Any], opt: Any) -> Optional[int]:
+    """The EXISTING row of this job's name whose run wrote ``ckpt`` (never ``opt`` itself), or None
+    (orphaned: deleted, or retired by a resume that already continues it). A checkpoint written
+    before checkpoints named their writer is attributed to the one other row of the job's name,
+    when there is exactly one."""
+    from app.services import optimization_resume as _resume
+    wid = ckpt.get("optimization_id")
+    if wid is not None:
+        found = db.query(StrategyOptimization.name).filter(
+            StrategyOptimization.id == int(wid)).scalar()
+        if found != opt.name or int(wid) == opt.id:
+            return None
+        # a deleted row's id reused by a new row of this name: the run token tells them apart
+        return _resume.checkpoint_owned_by(db, ckpt, [int(wid)])
+    ids = [i for (i,) in db.query(StrategyOptimization.id).filter(
+        StrategyOptimization.name == opt.name, StrategyOptimization.id != opt.id).all()]
+    return ids[0] if len(ids) == 1 else None
 
 
 def _seed_from_interrupted_row(db: Any, stale_id: int, all_results: List[Dict[str, Any]],

@@ -36,8 +36,8 @@ RESUME. A training job whose StrategyOptimization of that name is already ``comp
 (app.services.optimization_resume); a live, failed, ownerless or different job is refused. A
 completed job whose end-of-job TOP-N persist was killed gets the missing TOP rows the same way. A
 completed out-of-sample Backtest of the same name and window is reused rather than re-run; one left
-half-written by a killed driver is retired (renamed) and re-run, which is safe because the driver
-holds a lock on the prefix (``<out-dir>/.lock``). Exit codes: 0 verdict PASS / partial / dry-run,
+half-written is retired (renamed) and re-run only while this driver holds the prefix's OS lock
+(``<out-dir>/.lock``) AND the process recorded as the row's writer is proven dead. Exit codes: 0 verdict PASS / partial / dry-run,
 1 a run failed, 2 refused, 3 verdict FAIL.
 """
 from __future__ import annotations
@@ -286,11 +286,15 @@ class RealRunner:
                         f"Backtest {names[p.rank]!r} (id {row[0]}) exists with status {row[2]!r} "
                         f"(a crashed or running earlier attempt). Delete it before resuming; "
                         f"re-running would create a duplicate.")
-                # This driver holds the prefix lock, so no live driver writes it: a killed one
-                # left it mid-write (a re-run's row exists only while its result is being saved).
+                # This driver holds the prefix lock (no other DRIVER runs it), and the row is only
+                # retired once the process recorded as its writer is proven dead: a writer that is
+                # alive or cannot be judged may still be saving it, so that is a refusal.
                 _db = SessionLocal()
                 try:
-                    RESUME.retire_backtest(_db, row[0], "its out-of-sample result was being saved")
+                    RESUME.retire_dead_backtest(_db, row[0], names[p.rank],
+                                                "its out-of-sample result was being saved")
+                except RESUME.ResumeRefused as e:
+                    raise WF.WalkForwardError(str(e)) from e
                 finally:
                     _db.close()
                 print(f"  retired half-written {names[p.rank]} (backtest {row[0]}, {row[2]}); "

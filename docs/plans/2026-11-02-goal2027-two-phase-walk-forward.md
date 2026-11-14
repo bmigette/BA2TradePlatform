@@ -156,34 +156,58 @@ non-completed row (cell ERROR, row deleted by hand). Now `RealRunner.run_train` 
 with `optimize --resume-interrupted` when its runner is provably dead
 (`app/services/optimization_resume.py`):
 
-- **Liveness.** The handler records each row's runner in `strategy_optimization_runners` (host, pid,
-  process creation time, code versions; migration 033). Dead = same host and the pid is gone or reused.
-  A live runner, another host, a row with no runner record (started by older code), a failed or
-  cancelled row and duplicate names are refused with the reason.
-- **Same job.** The launcher compares the whole optimization config except `seededFrom`,
-  `backtest.backtest_id` and `parallelIndividuals` (data digests, universe and exclusions included), plus the
-  metric, the decoded gene space, the strategy rules and the code versions (TEST version and package
-  minimums; `BA2_RESUME_ACROSS_CODE_CHANGE=1` overrides only these). Any difference is refused. A phase-A
-  wf3 resumed on January's manifests is therefore refused, which enforces the boundary rule above.
-- **Resume.** In one transaction the dead row is renamed `<name>~interrupted-<id>` (status `failed`,
-  kept) and the new row takes the name. The handler resumes from the checkpoint. A checkpoint of
-  another search now fails the job instead of being discarded. All of the dead row's trial records are
-  carried into `all_results` and the trial memo, so no finished trial runs again. Without a checkpoint,
-  generation 0 replays from the memo.
+- **Liveness (`judge`).** The handler records each row's runner in `strategy_optimization_runners`
+  (migration 033): host, pid, process start time, and an independent identity (Linux boot id plus the
+  kernel start tick from `/proc/<pid>/stat`, and a hash of the command line), with the code versions
+  and a random run token. **Dead** means the pid is gone, or that identity proves the pid was reused
+  (other boot, other start tick, other command line). A pid that still exists with a start time that
+  does not match, and no such proof, is **unknown** and refused: a clock step on a VM moves psutil's
+  Linux start time, so a mismatch alone is not proof. A live runner, another host, a row with no runner
+  record (started by older code), a failed or cancelled row and duplicate names are refused with the
+  reason.
+- **Same job.** The launcher (`_create_resumed_row`) compares the whole optimization config except
+  `seededFrom`, `resumedFrom`, `backtest.backtest_id` and `parallelIndividuals` (window, data digests,
+  universe and exclusions included). It also compares the chain-seed source the row really used
+  (`seededFrom`), the metric, the decoded gene space, the strategy rules and the code versions (TEST
+  version and package minimums; `BA2_RESUME_ACROSS_CODE_CHANGE=1` overrides only these, and the new row
+  records both versions in `optimization_config.resumedFrom`). Any difference is refused. A phase-A wf3
+  resumed on January's manifests is therefore refused, which enforces the boundary rule above.
+- **Atomic claim.** The new row's INSERT and ONE guarded `UPDATE ... WHERE id=? AND name=? AND status IN
+  ('running','pending')` (rename to `<name>~interrupted-<id>`, status `failed`) run in one transaction,
+  and the UPDATE must change exactly one row. A second starter matches no row; it rolls back (its INSERT
+  included) and is refused.
+- **Checkpoint ownership.** Every checkpoint carries the writing row's id, its run token and the job
+  identity hash (config incl. window and data digests, metric, gene space, rules). A resume uses only a
+  checkpoint of the interrupted row or of a row it continues (id AND token match: SQLite reuses the id of
+  a deleted max-id row), and refuses one of ours without a fingerprint, or with another fingerprint or
+  identity. A checkpoint of ANY OTHER row means the interrupted run died before its first checkpoint.
+  It is discarded with a log line and the run starts clean. Refusing would block a case whose correct
+  answer is known: a clean start is exactly where that run was.
+- **Plain launches** (no flag) still resume a same-name checkpoint, but only while the row that wrote
+  it exists under that name. An orphaned checkpoint (row deleted by hand, or retired by a resume) or one
+  of another job identity is discarded with a log line. Before this change it was resumed, silently,
+  with only its 20 elites in `all_results`.
+- **Resume.** All of the dead row's trial records are carried into `all_results` and the trial memo,
+  so no finished trial runs again. With no checkpoint, or an exhausted one (killed after the last
+  generation, before completing), the search is replayed from generation 0 against the memo. The draws
+  are the same and no trial runs again (tested).
 - **Identical to an uninterrupted run:** the population, the GA/global/numpy RNG states, history and
-  the patience counter (from the checkpoint), the best genome, the final population (the chain seed),
-  and the set of trials in `all_results` (so the top-N selection) are the same. Tests:
+  the patience counter, the best genome, the final population (the chain seed), and the set of trials
+  in `all_results` (so the top-N selection) are the same. Tests:
   `test_optimization_resume_handler.py` and `test_ga_resume_equals_uninterrupted.py`. Not identical: the
   order of `all_results` (parallel completion order is never deterministic), a trial running at the
-  kill (re-run; same result if the backtest is deterministic), a stalled trial (re-run, as an
-  uninterrupted run re-runs it on re-selection), and the end-of-job TOP-N rows (the final generation's
-  buffered results died with the process, so every rank is re-run against the fidelity gate).
+  kill (re-run), a stalled trial (re-run), and the end-of-job TOP-N rows (re-run against the fidelity
+  gate, because the final generation's buffered results died with the process).
 - **Fixed on the way:** a PARTIAL checkpoint written by a generation's last trial was resumed as an
   end-of-generation one, which dropped that generation's record.
-- **Other stages.** If the TOP-N persist after training is cut off, the job is completed but
-  `topn_done_at` is NULL. The driver relaunches with the flag, which re-runs only the missing
-  `TOP<rank>` rows and retires a half-written one. Each cell runs under a lock file
-  (`<report_dir>/<cell>/.lock`, same liveness rule), so under it a non-completed OOS row (killed while
-  its result was being saved) is retired and re-run. Without the lock it is refused, as before.
-  Fold reports, `cell.json` and the summary are written atomically. Between folds, the next start
-  reuses the stored fold reports.
+- **Other stages.** Re-run Backtest rows (TOP-N, out-of-sample) record their writer in
+  `backtest_writers`. A half-written row is retired only when that writer is proven dead; a live or
+  unknown writer, which can be an orphaned persist after only the driver was killed, is refused. If
+  the TOP-N persist after training is cut off, the job is completed but `topn_done_at` is NULL. With
+  its runner dead, the driver relaunches with the flag, which re-runs only the missing `TOP<rank>`
+  rows with the uninterrupted ranking. Each cell runs under an OS file lock (`<report_dir>/<cell>/.lock`,
+  `fcntl.flock` / `msvcrt.locking`, released by the OS when the holder dies; the file's content only
+  names the holder). Fold reports, `cell.json` and the summary are written atomically.
+- **Remote workers:** not tested. The master re-dispatches, and the memo means finished trials are
+  not re-sent. A remote worker's trial still running for the killed master is not cancelled (nobody
+  is left to cancel it), so it occupies a slot until it ends; its result is never read.
