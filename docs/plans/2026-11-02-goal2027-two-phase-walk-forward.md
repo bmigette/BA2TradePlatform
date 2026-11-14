@@ -426,6 +426,17 @@ static universe). `--screener-gate-store` is NOT masked: the rebase does not rep
 would silently read the train job's gate store. A new gate-store path is a new cell; refresh the
 store in place to keep the names.
 
+**Gate-only blocks in the phase-B rebase (fixed 2026-11-14).** `--screener-gate-store` stores
+`screener_opt = {gate_only: True, ...}` on the run block while the universe stays the static `--universe`.
+`_rebase_run_data` used to take any `screener_opt` for a screener run and refused the option command's
+`--universe`, so no deferred option test with a gate store could run. A gate-only block is now rebased as
+a static run (current universe, stored exclusions kept, gate store kept); real screener blocks are
+unchanged (`tests/test_wf_test_data_rebase.py`). The rest of the test path already told the two apart:
+`_test_window_static_universe` only touches blocks carrying the screener superset rule (a gate-only
+block has none), and `_build_hoisted_state` reads `gate_only` exactly as the GA does. Tests:
+`tests/test_option_wf_gate_only_rebase.py` (real launcher; the deferred fold through `run_fold` ->
+`RealRunner.run_oos` -> `_persist_top_backtests` with the cell's own args).
+
 **Trade-count gates (decision, conservative).** Nothing new and nothing tuned for options: the
 selection floor stays `persist_distinct_topn`'s 30 in-sample round-trip rows (one per option LEG)
 over the fold's train window (4-6 years), and a genome with ZERO out-of-sample trades fails its

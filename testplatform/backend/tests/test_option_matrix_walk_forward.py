@@ -318,3 +318,22 @@ def test_plain_job_names_are_unchanged_by_the_refactor(env):
     assert len(names) == 2
     assert names[0].startswith("optm-FMPRating-O_IC-spow0922-hold-rules1-d")
     assert names[1].startswith("optm-FMPRating-O_IC-spow0922-low_confidence-rules1-d")
+
+
+def test_a_changed_drawdown_cap_rejudges_the_stored_fold_reports_without_rerunning(env):
+    """--pass-max-oos-dd is not part of the cell name, so the second run finds the same cell and its
+    stored fold reports; wf_chain._load_fold keeps their metrics and recomputes only the verdict
+    under the new cap (nothing is trained or tested again)."""
+    import json
+    assert M.main(_argv(env, *PHASE_A)) == 0                     # GOOD: OOS maxDD -10%
+    cell = env.fake.order[0][:-4]
+    trained, tested = list(env.fake.trained), list(env.fake.tested)
+    assert M.main(_argv(env, *PHASE_A, "--pass-max-oos-dd", "5")) == 0
+    assert env.fake.trained == trained and env.fake.tested == tested          # nothing ran again
+    with open(os.path.join(env.report, cell, "fold1.json"), encoding="utf-8") as fh:
+        fold1 = json.load(fh)
+    assert fold1["key"]["thresholds"]["max_oos_dd"] == 5.0
+    assert all("OOS |maxDD| 10.00% > the 5% cap" in g["fail_reasons"] for g in fold1["genomes"])
+    with open(os.path.join(env.report, cell, "cell.json"), encoding="utf-8") as fh:
+        doc = json.load(fh)
+    assert doc["verdict"] == "FAIL" and doc["eliminated"]["before_fold"] == 3
