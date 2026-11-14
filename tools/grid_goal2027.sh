@@ -40,10 +40,12 @@
 # GENES per kind (design 1.3):
 #   classic (S1-S7, Senate too): sizing gene, ATR searched, SPY-stress regime overlay searched (rgov:
 #            on/off + size/stop/TP scales), market profile gene + exits, SL loosen,
-#            SPY regime entry gates (spy-trend, spy-vol), entry/manage time genes; DS adds the factor
-#            genes; explr where the pair has ranges.
-#   sqm:     sizing, time and factor genes + explr; no market, SPY, ATR or SL-loosen genes (SQM's
-#            stop is its own gene and min_stop_loss_pct is pinned; its market/SPY flags are refused).
+#            SPY regime entry gates (spy-trend, spy-vol), entry/manage time genes; DS PINS its score
+#            weights (dspin; DS_WEIGHTS=search = the searched factor genes, dsfw); explr where the pair
+#            has ranges.
+#   sqm:     sizing and time genes, the DS score pin (or DS_WEIGHTS=search) + explr; no market, SPY, ATR
+#            or SL-loosen genes (SQM's stop is its own gene and min_stop_loss_pct is pinned; its
+#            market/SPY flags are refused).
 #   rank:    FactorRanker is a bypass expert: no RM, market, SPY, sizing or schedule genes.
 set -u
 cd "$(dirname "$0")/.."
@@ -96,6 +98,8 @@ WF_TOP_N="${WF_TOP_N:-3}"
 EARLY_STOP="${EARLY_STOP:-5}"
 EARLY_STOP_MIN_REL="${EARLY_STOP_MIN_REL:-0.01}"
 SUFFIX_BASE="${SUFFIX_BASE:--goal2027}"
+# DS score weights: pin (default; name token dspin) or search (the original dsfw cells). See ds_weight_args.
+DS_WEIGHTS="${DS_WEIGHTS:-pin}"
 # LATE STEPS (owner: S8/S9 run after EVERY other cell so they can still be vetoed; S9 before S8, S8 last of all). sN-<expert>-<band>
 # runs ONLY strategy SN (the matrix's --late-strategy: the plan's late_strategies section) for FMPRating (fr) and
 # DeterministicScorer (ds). Their split scope and rsi+spy exits are implied by the key, so their names carry no
@@ -230,6 +234,7 @@ preflight() {
   # (needs the AV estimates namespace prewarmed); fmp = no historical estimates (estimate readers refuse in BT).
   case "${ESTIMATES_SOURCE:-}" in fmp|alphavantage) ;; *) echo "FATAL: ESTIMATES_SOURCE must be fmp or alphavantage" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
+  ds_weight_args >/dev/null || exit 2
   check_checkout || exit 1
   check_home || exit 1
   check_venv || exit 1
@@ -272,8 +277,20 @@ EOF
   fi
 }
 
+# DeterministicScorer score weights (owner 2026-11-14; design 2.8 "Pinned score weights"): every DS step (ds-*,
+# s9-ds-*, s8-ds-*, sqm-xl) PINS them by default -- momentum, 200-day trend and Piotroski in equal thirds plus a small
+# grades-dominant analyst section -- because the GA-searched weights (dsfw) did not hold out of sample. Prints
+# "<driver flag> <name token>". DS_WEIGHTS=search restores the searched cells (dsfw) and their names exactly.
+ds_weight_args() {
+  case "$DS_WEIGHTS" in
+    pin)    echo "--pin-ds-score-weights -dspin" ;;
+    search) echo "--search-ds-factor-weights -dsfw" ;;
+    *) echo "FATAL: DS_WEIGHTS must be pin (default) or search, got '$DS_WEIGHTS'" >&2; return 2 ;;
+  esac
+}
+
 # ------------------------------------------------------------------------------------------- one step
-run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
+run_step() {                      # $1 = step id; $2 = "dry" for --dry-run
   local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}" late=""
   [ "$step" = "senate" ] && { kind=senate; band=senate; }
   case "$step" in s8-*|s9-*)
@@ -282,6 +299,7 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
   esac
   local expert; expert="$(expert_of "$kind")"
   local end; end="$(data_end)"
+  local dsw
   local sp st; sp="$(spread_for "$band")"; st="$(stress_for "$band")"
   local args=(--bands "$band" --skip-experts "$(skip_all_but "$expert")"
       --start "$TRAIN_START" --fitness "$FITNESS" --interval "$INTERVAL" --store "$STORE"
@@ -329,12 +347,15 @@ run_step() {                       # $1 = step id; $2 = "dry" for --dry-run
       # PullbackReversion (long only) runs S2 on the cap bands; its entry is a daily dip, so the screener
       # cadence is daily and the entry scan runs every weekday (no weekday genes: _daily_entry in the launcher). The matrix runs it only when asked.
       if [ "$kind" = "pb" ]; then args+=(--pullback-strategies S2 --cadence-days 1); fi
-      if [ "$kind" = "ds" ]; then args+=(--search-ds-factor-weights); suffix="${suffix}-dsfw"; fi
+      if [ "$kind" = "ds" ]; then
+        dsw="$(ds_weight_args)" || return 2; args+=("${dsw% *}"); suffix="${suffix}${dsw#* }"
+      fi
       if [ "$kind" != "senate" ] && [ "$kind" != "pb" ]; then args+=(--search-exploration-ranges); suffix="${suffix}-explr"; fi ;;
     sqm)
-      args+=(--strategies SQM --decision-times split --search-sizing-mode --search-ds-factor-weights
+      dsw="$(ds_weight_args)" || return 2
+      args+=(--strategies SQM --decision-times split --search-sizing-mode "${dsw% *}"
              --search-exploration-ranges --exclude-symbols "@$EXCLUDE_FILE")
-      suffix="${suffix}-sizegene-dsfw-explr" ;;
+      suffix="${suffix}-sizegene${dsw#* }-explr" ;;
     rank)
       : ;;   # bypass expert: no RM/market/sizing/schedule genes, full universe (atr27 rule)
   esac
@@ -468,7 +489,7 @@ case "$CMD" in
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
       local_env=()
-      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES; do
+      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS; do
         [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
       done
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1

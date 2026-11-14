@@ -277,6 +277,15 @@ def ds_factor_gene_tokens(args, expert) -> list:
     return []
 
 
+def ds_score_pin_tokens(args, expert) -> list:
+    """`--pin-ds-score-weights` for a DeterministicScorer job when the matrix PINS the DS score weights (owner
+    2026-11-14; the alternative to `--search-ds-factor-weights`), else []. Every other expert never reads those
+    settings and the launcher refuses the flag for them, so it is not forwarded (the caller prints a NOTE)."""
+    if getattr(args, "pin_ds_score_weights", False) and expert == "DeterministicScorer":
+        return ["--pin-ds-score-weights"]
+    return []
+
+
 #: Must equal ``ba2test_launcher._EXPLORATION_RANGE_PAIRS`` (pinned by test): the drivers cannot import the launcher.
 EXPLORATION_RANGE_PAIRS = {
     "FMPRating": {"S2"},
@@ -816,6 +825,12 @@ def main() -> int:
                          "the analyst target window and minimum; w_analyst widened to 0.8) in every "
                          "DeterministicScorer job (goal2027 item 2.8). REQUIRES --name-suffix to contain 'dsfw'. "
                          "Not forwarded to any other expert's job; folds into the job's name digest.")
+    ap.add_argument("--pin-ds-score-weights", action="store_true", default=False,
+                    help="FIX the DeterministicScorer score weights (momentum, 200-day trend and Piotroski in equal "
+                         "thirds plus a small grades-dominant analyst section; launcher --pin-ds-score-weights) in "
+                         "every DeterministicScorer job instead of searching them. Mutually exclusive with "
+                         "--search-ds-factor-weights. REQUIRES --name-suffix to contain 'dspin' (and not 'dsfw'). "
+                         "Not forwarded to any other expert's job; folds into the job's name digest.")
     ap.add_argument("--benchmark-regime-gates", action="store_true", default=False,
                     help="Search the SPY regime ENTRY gates (spy-trend, spy-vol mode genes with an off value; goal2027 "
                          "2.3) on every S1-S7 job. REQUIRES --name-suffix to contain 'spyreg'. Not forwarded to the "
@@ -1087,6 +1102,15 @@ def main() -> int:
             ap.error(f"--search-ds-factor-weights requires --name-suffix to contain 'dsfw' "
                      f"(got {args.name_suffix!r}): its gene space differs from a fixed-weight run's, so it "
                      f"must not share a job name. Example: --name-suffix goal2027-dsfw")
+    if args.pin_ds_score_weights:
+        if args.search_ds_factor_weights:
+            ap.error("--pin-ds-score-weights and --search-ds-factor-weights are mutually exclusive (one pins the DS "
+                     "score weights, the other searches them)")
+        _sfx = args.name_suffix.replace("_", "").lower()
+        if "dspin" not in _sfx or "dsfw" in _sfx:
+            ap.error(f"--pin-ds-score-weights requires --name-suffix to contain 'dspin' and not 'dsfw' "
+                     f"(got {args.name_suffix!r}): its gene space differs from a searched-weight run's, so it "
+                     f"must not share or resemble a dsfw job name. Example: --name-suffix goal2027-dspin")
     if args.sizing_mode:
         token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
         if token not in args.name_suffix.replace("_", "").lower():
@@ -1319,6 +1343,13 @@ def main() -> int:
         if args.search_ds_factor_weights and not ds_tokens:
             print(f"[{i}/{len(jobs)}] NOTE {name}: {expert} is not DeterministicScorer, DS factor genes not applied",
                   flush=True)
+        # --pin-ds-score-weights: appended right after (same reasoning); digest on its own. Only DS jobs get it, so every
+        # other job's command, and therefore its name, is unchanged.
+        dp_tokens = ds_score_pin_tokens(args, expert)
+        cmd += dp_tokens
+        if args.pin_ds_score_weights and not dp_tokens:
+            print(f"[{i}/{len(jobs)}] NOTE {name}: {expert} is not DeterministicScorer, DS score pin not applied",
+                  flush=True)
         # --search-exploration-ranges: appended last (same reasoning); digest on its own.
         er_tokens = exploration_range_tokens(args, expert, strat)
         cmd += er_tokens
@@ -1356,7 +1387,7 @@ def main() -> int:
             str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
             "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
-        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
+        if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or dp_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
             job_name = _job_name(name, ident + wf_tokens)
