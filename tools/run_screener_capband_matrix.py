@@ -622,24 +622,10 @@ def load_strategy_plan(path, skip_experts=frozenset()) -> dict:
 _FAILED_JOBS: list = []   # (job name, exit code, reason) of every job that exited non-zero
 
 
-_WF_STRIP = ("--start", "--end", "--name", "--generations")
-
-
-def wf_optimize_args(cmd: list) -> list:
-    """A cell's base ``optimize`` args for the walk-forward chain: the command the plain driver
-    would run, minus the executable, ``optimize`` and the four flags the chain sets per job
-    (``--start --end --name --generations``). Everything else (cap band, screener, strategy,
-    spread, stress, time genes, early stop, ...) is the cell's own and rides on every job."""
-    out, skip = [], False
-    for tok in cmd[2:]:
-        if skip:
-            skip = False
-            continue
-        if tok in _WF_STRIP:
-            skip = True
-            continue
-        out.append(tok)
-    return out
+# A cell's base ``optimize`` args for the walk-forward chain (cap band, screener, strategy, spread,
+# stress, time genes, early stop, ... minus --start/--end/--name/--generations): shared with the
+# option driver, so it lives in matrix_flags.
+from matrix_flags import wf_optimize_args  # noqa: E402,F401
 
 
 def _wf_selection_defaults() -> dict:

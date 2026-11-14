@@ -294,6 +294,27 @@ def job_name_with_digest(name: str, cmd: List[str]) -> str:
     return f"{name}-d{digest}"
 
 
+#: The four ``optimize`` flags a walk-forward chain sets PER JOB (``walk_forward.train_command`` and
+#: ``wf_chain.refit_command``): the cell's own value of each is dropped from its base args.
+WF_PER_JOB_FLAGS = ("--start", "--end", "--name", "--generations")
+
+
+def wf_optimize_args(cmd: list) -> list:
+    """A cell's base ``optimize`` args for the walk-forward chain: the command the plain driver
+    would run, minus everything up to and including ``optimize`` and the four flags the chain sets
+    per job (``WF_PER_JOB_FLAGS``). Everything else rides on every job of the chain. Shared by the
+    stock (``run_screener_capband_matrix.py``) and option (``run_options_matrix.py``) drivers."""
+    out, skip = [], False
+    for tok in cmd[cmd.index("optimize") + 1:]:
+        if skip:
+            skip = False
+            continue
+        if tok in WF_PER_JOB_FLAGS:
+            skip = True
+            continue
+        out.append(tok)
+    return out
+
 
 # --------------------------------------------------------------------------------------------------
 # Failed jobs are REPORTED, never silently dropped (owner decision 2026-10-07: a job whose analyses fail
