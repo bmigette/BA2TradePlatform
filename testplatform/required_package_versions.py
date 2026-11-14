@@ -20,5 +20,5 @@
 REQUIRED_PACKAGE_VERSIONS = {
     "ba2_common": "2026.11.00050",
     "ba2_providers": "2026.11.00026",
-    "ba2_experts": "2026.11.00017",
+    "ba2_experts": "2026.11.00018",
 }
