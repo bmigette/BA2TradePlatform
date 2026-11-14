@@ -4,7 +4,9 @@ REAL handler, checkpoint store and resume service (only the backtest is a determ
 | launch \\ checkpoint      | none   | own                         | orphan (writer gone) | another LIVE run's |
 |--------------------------|--------|-----------------------------|----------------------|--------------------|
 | fresh (no other row)     | gen 0  | resume (retry of this row)  | retire, gen 0        | refuse, untouched  |
-| plain relaunch           | gen 0  | resume (the dead prior run) | retire, gen 0        | refuse, untouched  |
+| plain relaunch           | gen 0  | prior row terminal: resume; | retire, gen 0        | refuse, untouched  |
+|                          |        | still running: refuse (the  |                      |                    |
+|                          |        | launcher claims it instead) |                      |                    |
 | --resume-interrupted     | replay | resume (strict)             | retire, replay       | refuse, untouched  |
 
 "gen 0" / "replay": the search starts at generation 0; a replay re-reads the dead row's finished
@@ -171,11 +173,31 @@ def test_relaunch_none_starts_at_generation_0(whole, caplog):
     assert _result(oid)["best_fitness"] == want["best_fitness"]
 
 
-def test_relaunch_own_resumes_the_dead_prior_run_with_its_full_record(whole, caplog):
+def test_relaunch_own_of_an_unclaimed_dead_row_is_refused_and_untouched(stubbed, caplog):
+    """The prior run is dead but its row is still `running`: continuing its checkpoint from a new
+    row would leave two non-terminal rows of one name. `ba2-test optimize` claims it instead
+    (test_resume_third_review.py); the bare handler refuses."""
+    name = _uniq("mx-r-own-open")
+    prior, _ = _kill(name, 18)
+    payload = _ckpt(name)
+    oid = _new_row(_seed_wide_strategy(), name, _config())
+    out, calls, _ = _go(oid, caplog)
+    assert out["status"] == "failed" and "claims the row" in out["error"] and calls == 0
+    assert _ckpt(name) == payload
+
+
+def test_relaunch_own_of_a_terminal_prior_run_resumes_with_its_full_record(whole, caplog):
+    """A plain retry of a FAILED job (the grids' rule: not completed -> run again) continues its
+    checkpoint with all of its trials."""
     want, n = whole
     name = _uniq("mx-r-own")
     prior, done = _kill(name, 18)
-    _make_dead(prior)
+    db = SessionLocal()
+    try:
+        db.get(StrategyOptimization, prior).status = "failed"
+        db.commit()
+    finally:
+        db.close()
     oid = _new_row(_seed_wide_strategy(), name, _config())
     out, calls, resumed = _go(oid, caplog)
     assert out["status"] == "completed" and resumed and done + calls == n

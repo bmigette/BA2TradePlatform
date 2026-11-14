@@ -1804,6 +1804,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
     db = SessionLocal()
     run_token = None
+    paused = False
     from app.services import optimization_resume as _resume
     try:
         opt = db.query(StrategyOptimization).filter(
@@ -2895,6 +2896,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         )
         if last_gen_full_results:
             _last_gen_full_results_by_opt[opt_id] = last_gen_full_results
+        if not payload.get("topn_by_launcher"):
+            # No launcher will persist a TOP-N for this run (a --submit / UI job): nothing is
+            # pending, so it must not read as a cut-off TOP-N persist later.
+            _resume.mark_topn_done(db, opt_id)
         return {
             "status": "completed",
             "optimization_id": opt_id,
@@ -2919,8 +2924,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 logger.warning(f"strategy_optimization {opt_id}: could not mark the row cancelled: {e}")
             logger.warning(f"strategy_optimization {opt_id}: CANCELLED")
             return {"status": "cancelled", "optimization_id": opt_id}
+        paused = True
         return {"status": "paused"}
     except InterruptedError:
+        paused = True
         return {"status": "paused"}
     except Exception as e:  # noqa: BLE001 — any crash must fail the row, not the worker
         logger.error(f"strategy_optimization {opt_id} crashed: {e}", exc_info=True)
@@ -2931,7 +2938,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         if run_token is not None:
             try:
                 db.rollback()
-                _resume.mark_runner_ended(db, opt_id, run_token)
+                _resume.mark_runner_ended(db, opt_id, run_token, paused=paused)
             except Exception as e:  # noqa: BLE001 -- the outcome above must not be masked
                 logger.error(f"strategy_optimization {opt_id}: could not record the end of run "
                              f"{run_token}: {e}; a later resume will judge its process instead")
@@ -4107,7 +4114,8 @@ def _checkpoint_verdict(db: Any, ckpt: Dict[str, Any], opt: Any,
     |-----------------------------------------------|------------------------|----------------------|
     | this row, same run token (a retry)            | use                    | use                  |
     | the interrupted row / a row it continues      | -                      | use (strict checks)  |
-    | a dead earlier run of this name (row exists)  | use                    | retire               |
+    | a dead earlier run of this name, row terminal | use                    | retire               |
+    | ... row still running / pending (not claimed) | refuse (claim it)      | retire               |
     | a row that is gone, or whose id was reused    | retire (orphan)        | retire               |
     | a row whose run is LIVE or cannot be judged   | refuse                 | refuse               |
     | legacy (no writer recorded)                   | use if exactly one other row of the name, else retire | retire |
@@ -4122,8 +4130,14 @@ def _checkpoint_verdict(db: Any, ckpt: Dict[str, Any], opt: Any,
             return "retire", "names no writer (written before checkpoints did), so it cannot be " \
                              "proven to be the interrupted row's"
         w = _checkpoint_writer(db, ckpt, opt)
-        return ("use", w) if w is not None else \
-            ("retire", "is orphaned: a legacy checkpoint with no other row of this name")
+        if w is None:
+            return "retire", "is orphaned: a legacy checkpoint with no other row of this name"
+        w_status = db.query(StrategyOptimization.status).filter(StrategyOptimization.id == w).scalar()
+        if w_status in _resume.INTERRUPTIBLE_STATUSES:
+            return "refuse", (f"is a legacy checkpoint of optimization {w}, which is still "
+                              f"{w_status!r}: continue that row with `ba2-test optimize` (it claims "
+                              f"it) or give it up with {_resume.ABANDON_CMD} --id {w}")
+        return "use", w
     wid = int(wid)
     if _resume.checkpoint_owned_by(db, ckpt, [wid]) is None:
         return "retire", (f"is orphaned: its writer optimization {wid} no longer exists, or that id "
@@ -4133,8 +4147,15 @@ def _checkpoint_verdict(db: Any, ckpt: Dict[str, Any], opt: Any,
     state, why = _resume.judge_runner(_resume.runner_of(db, wid))
     if state != _resume.DEAD:
         return "refuse", f"belongs to optimization {wid}, whose run is {state.upper()} ({why})"
-    name = db.query(StrategyOptimization.name).filter(StrategyOptimization.id == wid).scalar()
+    name, status = db.query(StrategyOptimization.name, StrategyOptimization.status).filter(
+        StrategyOptimization.id == wid).first()
     if lineage is None and name == opt.name:
+        if status in _resume.INTERRUPTIBLE_STATUSES:
+            # Continuing it here would leave that row non-terminal beside this one: it must be
+            # CLAIMED first (the launcher does that for a dead row; --resume-interrupted too).
+            return "refuse", (f"belongs to optimization {wid}, which is still {status!r} (its run "
+                              f"is dead): continue it with `ba2-test optimize` (it claims the row) "
+                              f"or give it up with {_resume.ABANDON_CMD} --id {wid}")
         return "use", wid
     return "retire", (f"was written by optimization {wid} ({name!r}), a dead run that is not this "
                       f"job's " + ("interrupted run" if lineage is not None else

@@ -147,8 +147,9 @@ class RealRunner:
             raise WF.WalkForwardError(
                 f"{len(rows)} optimizations are named {name!r} "
                 f"({', '.join(f'id={i} {st}' for i, st in rows)}). A failed train plus a re-run "
-                f"under the same name does this. Delete the unwanted row(s) from the test DB "
-                f"(or use a new --prefix) so exactly one remains.")
+                f"under the same name does this. Give up each unwanted non-completed row with "
+                f"{RESUME.ABANDON_CMD} --id <id> --reason '...' (COSTS that row's finished "
+                f"trials; its checkpoint is retired, payload kept), or use a new --prefix.")
         if not rows or rows[0][1] != "completed":
             return False
         return self._assess(name).kind == "done"
@@ -284,8 +285,12 @@ class RealRunner:
                 if not self._owns(train_name):
                     raise WF.WalkForwardError(
                         f"Backtest {names[p.rank]!r} (id {row[0]}) exists with status {row[2]!r} "
-                        f"(a crashed or running earlier attempt). Delete it before resuming; "
-                        f"re-running would create a duplicate.")
+                        f"(a crashed or running earlier attempt) and this run holds no driver lock "
+                        f"on {train_name!r}: not touched (re-running would create a duplicate). Run "
+                        f"it through the walk-forward driver (it retires the row once its writer is "
+                        f"proven dead and re-runs only that genome), or, if you have checked that "
+                        f"no process writes it: {RESUME.ABANDON_CMD} --backtest-id {row[0]} "
+                        f"--confirm-not-running --reason '...'.")
                 # This driver holds the prefix lock (no other DRIVER runs it), and the row is only
                 # retired once the process recorded as its writer is proven dead: a writer that is
                 # alive or cannot be judged may still be saving it, so that is a refusal.

@@ -203,9 +203,9 @@ def test_absent_or_false_flag_leaves_generation_zero_to_optimize(monkeypatch):
 
 
 def test_checkpoint_wins_over_seeds(monkeypatch, caplog):
-    """A relaunch of a SEEDED job whose first run was killed after its first checkpoint resumes
-    that checkpoint: the seeds are not built again. Real handler, checkpoint store and resume
-    rules (the first run's row exists and its run ended); only the backtest is the stub."""
+    """A retry of a SEEDED job whose first run was killed after its first checkpoint resumes that
+    checkpoint: the seeds are not built again. Real handler, checkpoint store and resume rules;
+    only the backtest is the stub."""
     import uuid
     from app.models.database import SessionLocal
     from app.models.strategy_optimization import StrategyOptimization
@@ -225,15 +225,16 @@ def test_checkpoint_wins_over_seeds(monkeypatch, caplog):
             raise _Killed()
         return T._deterministic_stub(cfg, hoisted, decoded)
 
-    def launch():
-        oid = T._seed_opt(T._seed_strategy(), config=T._ga_config(generations=3,
-                                                                  seedPopulation=[seed]))
-        db = SessionLocal()
-        try:
-            db.get(StrategyOptimization, oid).name = name
-            db.commit()
-        finally:
-            db.close()
+    oid = T._seed_opt(T._seed_strategy(), config=T._ga_config(generations=3,
+                                                              seedPopulation=[seed]))
+    db = SessionLocal()
+    try:
+        db.get(StrategyOptimization, oid).name = name
+        db.commit()
+    finally:
+        db.close()
+
+    def launch():                                # the same row, retried by the same process
         return H.handle_strategy_optimization("t-ckpt", {"optimization_id": oid})
 
     monkeypatch.setattr(H, "_run_trial_backtest", dies_in_generation_1)

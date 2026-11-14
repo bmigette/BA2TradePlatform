@@ -660,10 +660,18 @@ def _run_with_seeded_checkpoint(H, created, job_name, *, generations, ckpt):
     import app.services.genetic as genetic_mod
 
     sid = _ckpt_strategy_id()
-    # The row whose (killed) run wrote the checkpoint: a relaunch inserts a NEW row next to it. A
-    # checkpoint with no such row is orphaned and discarded (test_optimization_resume_handler).
-    _seed_named_opt(sid, job_name, generations)
     opt_id = _seed_named_opt(sid, job_name, generations)
+    # A retry of the SAME row by the same process (a paused / retried task): the checkpoint is its
+    # own (row id + run token). A checkpoint with no such owner is orphaned and retired
+    # (test_checkpoint_matrix.py).
+    from app.models.database import SessionLocal
+    from app.services import optimization_resume as R
+    _db = SessionLocal()
+    try:
+        _token = R.register_runner(_db, opt_id)
+    finally:
+        _db.close()
+    ckpt = {**ckpt, "optimization_id": opt_id, "run_token": _token}
     tid = H.checkpoint_task_id(job_name, opt_id)
     created.append(tid)
     # No "fingerprint" key: _load_checkpoint accepts a stored checkpoint that has none, which

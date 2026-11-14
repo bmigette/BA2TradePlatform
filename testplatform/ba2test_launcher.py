@@ -10391,6 +10391,34 @@ def _cmd_optimize(args) -> int:
                   f"#{_prior[0]} (best fitness {_prior[1]}). Pass --rerun to run it "
                   f"again.", flush=True)
             return 0
+    # A launch WITHOUT --resume-interrupted (other grids, a hand launch) never runs beside a
+    # non-terminal row of its name: a dead one is CLAIMED and resumed exactly as with the flag
+    # (identity check included), a live / paused / unprovable one is refused.
+    _supersede = None
+    if _resume_stale is None and not seed_check_only and not getattr(args, "resume_interrupted", False):
+        from app.services import optimization_resume as _R
+        _db = SessionLocal()
+        try:
+            _gate, _stale = _R.plain_launch_gate(_db, _opt_name)
+        except _R.ResumeRefused as e:
+            print(f"optimize: REFUSED: {e}", flush=True)
+            return 2
+        finally:
+            _db.close()
+        if _gate == "supersede":
+            _supersede, _stale = _stale, None
+            print(f"optimize: optimization #{_supersede} of {_opt_name} never ran (its launcher "
+                  f"died first): the new row supersedes it", flush=True)
+        if _stale is not None:
+            if getattr(args, "submit", False):
+                print(f"optimize: REFUSED: {_opt_name} has an interrupted row (optimization "
+                      f"#{_stale}); resume it with `ba2-test optimize` (not --submit: the claim "
+                      f"needs the process that runs it) or give it up with {_R.ABANDON_CMD} --id "
+                      f"{_stale} --reason '...'.", flush=True)
+                return 2
+            _resume_stale = _stale
+            print(f"optimize: RESUMING interrupted {_opt_name} (optimization #{_stale}; its "
+                  f"runner is dead)", flush=True)
 
     db = SessionLocal()
     try:
@@ -10748,7 +10776,16 @@ def _cmd_optimize(args) -> int:
                 # the serve process runs that row, and this one exits at once.)
                 from app.services import optimization_resume as _R
                 db.flush()
-                _R.register_runner(db, opt.id, commit=False)
+                try:
+                    _R.register_runner(db, opt.id, commit=False)
+                    if _supersede is not None:      # same transaction, guarded like a claim
+                        _R.claim_and_retire(db, _supersede, _opt_name,
+                                            f"never ran; superseded by optimization #{opt.id}")
+                except _R.ResumeRefused as e:
+                    print(f"optimize: REFUSED: {e}", flush=True)
+                    db.rollback()
+                    db.delete(strat); db.commit()
+                    return 2
             db.commit(); db.refresh(opt)
         opt_id = opt.id
         if _worker_ids:
@@ -10781,9 +10818,12 @@ def _cmd_optimize(args) -> int:
               f"Watch it in the UI: Backtesting -> History -> Running jobs.")
         return 0
 
-    res = handle_strategy_optimization(
-        "cli-optimize", {"optimization_id": opt_id,
-                         **({"resume_of": _resume_stale} if _resume_stale is not None else {})})
+    try:
+        res = handle_strategy_optimization(
+            "cli-optimize", {"optimization_id": opt_id, "topn_by_launcher": True,
+                             **({"resume_of": _resume_stale} if _resume_stale is not None else {})})
+    finally:
+        _end_launcher_run(opt_id)
     if res.get("failure_kind") == "no_measurements" or res.get("status") == "no_measurements":
         # Stall-only search (2026-09-21 review, G2): nothing was measured, so there is no winner to
         # export (and _persist_top_backtests would find no candidate anyway). The row is `failed`
@@ -10838,8 +10878,8 @@ def _create_resumed_row(db, stale_id: int, name: str, cfg: dict, strat, fitness:
         raise _R.ResumeRefused(
             f"{name} (optimization #{stale_id}) is NOT the job this command describes:\n  - "
             + "\n  - ".join(diffs)
-            + "\n  Run the command the job was started with, or delete that row (its checkpoint is "
-              "then discarded as orphaned) to train the new job from scratch, or use a new name.")
+            + "\n  Run the command the job was started with (it resumes, nothing is lost), or use a "
+              "new name, or give the old job up: " + _R.abandon_hint(name, stale_id))
     db.commit()            # end any read: the claim's transaction starts with its first write
     opt = StrategyOptimization(
         strategy_id=strat.id, name=name, fitness_metric=fitness, optimization_type="genetic",
@@ -10858,6 +10898,61 @@ def _create_resumed_row(db, stale_id: int, name: str, cfg: dict, strat, fitness:
         raise
     db.refresh(opt)
     return opt
+
+
+def _cmd_abandon_interrupted(args) -> int:
+    """Give up an interrupted / failed optimization (or a half-written re-run Backtest) cleanly,
+    instead of deleting it by hand: see optimization_resume.abandon_optimization."""
+    import app.models  # noqa: F401
+    from app.models.database import SessionLocal, init_db
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services import optimization_resume as _R
+    init_db()
+    db = SessionLocal()
+    try:
+        try:
+            if args.backtest_id is not None:
+                new = _R.abandon_backtest(db, args.backtest_id, args.reason, args.confirm_not_running)
+                print(f"abandon-interrupted: backtest {args.backtest_id} retired as {new!r} (kept); "
+                      f"its genome is re-run on the next start.")
+                return 0
+            opt_id = args.id
+            if opt_id is None:
+                rows = db.query(StrategyOptimization.id).filter(
+                    StrategyOptimization.name == args.name,
+                    StrategyOptimization.status != "completed").all()
+                if len(rows) != 1:
+                    print(f"abandon-interrupted: {len(rows)} non-completed optimizations are named "
+                          f"{args.name!r}; pass --id", flush=True)
+                    return 2
+                opt_id = rows[0][0]
+            out = _R.abandon_optimization(db, opt_id, args.reason, args.confirm_not_running)
+        except _R.ResumeRefused as e:
+            print(f"abandon-interrupted: REFUSED: {e}", flush=True)
+            return 2
+    finally:
+        db.close()
+    print(f"abandon-interrupted: optimization #{out['optimization_id']} ({out['name']!r}) is now "
+          f"{out['renamed']!r}; {out['trials_lost']} finished trial(s) will NOT be reused; "
+          + (f"checkpoint {out['checkpoint']} retired as {out['retired_as']} (payload kept)"
+             if out["retired_as"] else "it had no checkpoint of its own")
+          + f". The next start of {out['name']!r} trains from generation 0.")
+    return 0
+
+
+def _end_launcher_run(opt_id: int) -> None:
+    """The handler call this launcher made for ``opt_id`` returned (or raised): end this process's
+    run record if the handler did not (it does on every real path; a stubbed one does not), so the
+    row is never judged LIVE after it. A paused end is kept."""
+    from app.models.database import SessionLocal
+    from app.services import optimization_resume as _R
+    db = SessionLocal()
+    try:
+        run = _R.runner_of(db, opt_id)
+        if run is not None and run.ended_at is None and run.pid == os.getpid()                 and run.host == _R.this_host():
+            _R.mark_runner_ended(db, opt_id, run.run_token)
+    finally:
+        db.close()
 
 
 def _mark_topn_done(opt_id: int) -> None:
@@ -12298,6 +12393,18 @@ def main(argv: "list | None" = None) -> int:
     p = argparse.ArgumentParser(prog="ba2-test", description="BA2 Test Platform CLI.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    ab = sub.add_parser("abandon-interrupted",
+                        help="Give up an interrupted / failed optimization (or a half-written re-run "
+                             "Backtest) cleanly: renamed and kept, checkpoint retired (payload kept), "
+                             "run marked ended. COSTS the finished trials: the next start trains from "
+                             "generation 0. Refused while its run is live or paused.")
+    _abt = ab.add_mutually_exclusive_group(required=True)
+    _abt.add_argument("--name", help="the job name (its single non-completed optimization)")
+    _abt.add_argument("--id", type=int, help="the optimization id")
+    _abt.add_argument("--backtest-id", type=int, help="a non-completed re-run Backtest row")
+    ab.add_argument("--reason", required=True, help="recorded on the row")
+    ab.add_argument("--confirm-not-running", action="store_true",
+                    help="you checked that no process runs it (needed when its run cannot be judged)")
     s = sub.add_parser("serve", help="Launch the API and/or the React frontend.")
     s.add_argument("--mode", default="both", choices=["both", "back", "front"],
                    help="What to start: both (default), back (API only), front (Vite UI only).")
@@ -13248,6 +13355,7 @@ def main(argv: "list | None" = None) -> int:
         "replay": lambda: _cmd_replay(args),
         "report": lambda: _cmd_report(args),
         "optimize": lambda: _cmd_optimize(args),
+        "abandon-interrupted": lambda: _cmd_abandon_interrupted(args),
         "optimize-batch": lambda: _cmd_optimize_batch(args),
         "worker": lambda: _cmd_worker(args),
         "ml-search": lambda: _cmd_ml_search(args),

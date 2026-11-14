@@ -99,6 +99,9 @@ class StrategyOptimizationRunner(Base):
     __tablename__ = "strategy_optimization_runners"
 
     optimization_id = Column(Integer, ForeignKey("strategy_optimizations.id"), primary_key=True)
+    # The row's random key (also in its optimization_config): binds this record to THAT row
+    # (SQLite reuses a deleted max-id row's id); a record whose key does not match is purged.
+    row_key = Column(String(64), nullable=True)
     host = Column(String(255), nullable=False)
     pid = Column(Integer, nullable=False)
     pid_started = Column(Float, nullable=False)
@@ -112,6 +115,7 @@ class StrategyOptimizationRunner(Base):
     topn_done_at = Column(DateTime(timezone=True), nullable=True)
     # When the handler of this run returned (any outcome). NULL while it runs or after a kill.
     ended_at = Column(DateTime(timezone=True), nullable=True)
+    ended_as = Column(String(16), nullable=True)      # paused | returned | abandoned
 
 
 class BacktestWriter(Base):
@@ -122,6 +126,7 @@ class BacktestWriter(Base):
     __tablename__ = "backtest_writers"
 
     backtest_id = Column(Integer, ForeignKey("backtests.id"), primary_key=True)
+    row_key = Column(String(300), nullable=True)   # "<created_at>|<name>": binds it to THAT row
     host = Column(String(255), nullable=False)
     pid = Column(Integer, nullable=False)
     pid_started = Column(Float, nullable=False)

@@ -55,9 +55,19 @@ INTERRUPTIBLE_STATUSES = ("running", "pending")
 #: slot count (``parallelIndividuals``: execution only, like the worker list, not in the config).
 #: ``seededFrom`` is still compared against the new launch's chain-seed source (identity_differences).
 EXEMPT_CONFIG_PATHS = {("seededFrom",), ("resumedFrom",), ("discardedCheckpoints",),
-                       ("backtest", "backtest_id"), ("parallelIndividuals",)}
+                       ("resumeRowKey",), ("backtest", "backtest_id"), ("parallelIndividuals",)}
+
+#: ``optimization_config`` key holding the row's random identity; the runner record stores the same
+#: value (``row_key``). SQLite reuses a deleted max-id row's id, never this key.
+ROW_KEY = "resumeRowKey"
 
 ALIVE, DEAD, UNKNOWN, FOREIGN = "alive", "dead", "unknown", "foreign"
+#: A run whose handler returned PAUSED while its process (a serve worker) lives: its task can
+#: resume it there, so it is not resumable elsewhere (refused like a live run).
+PAUSED = "paused"
+
+#: The supported way to give up an interrupted job (no hand edits of the DB).
+ABANDON_CMD = "ba2-test abandon-interrupted"
 
 _CREATE_TIME_TOL_S = 2.0
 
@@ -177,20 +187,57 @@ def _same_process(run, ident: Dict[str, Any]) -> bool:
     return abs(float(run.pid_started) - float(ident["pid_started"])) <= _CREATE_TIME_TOL_S
 
 
+def _opt_row_key(db, opt_id: int) -> Optional[str]:
+    """The optimization row's random identity (``optimization_config[ROW_KEY]``), or None."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    row = db.get(SO, opt_id)
+    return None if row is None else (row.optimization_config or {}).get(ROW_KEY)
+
+
+def _bt_row_key(db, bt_id: int) -> Optional[str]:
+    """A Backtest row's identity beyond its id: creation time + name (the AFTER DELETE trigger of
+    migration 033 removes a writer record with its row in any case)."""
+    from app.models.backtest import Backtest
+    r = db.query(Backtest.created_at, Backtest.name).filter(Backtest.id == bt_id).first()
+    return None if r is None else f"{r[0]}|{r[1]}"
+
+
+def _taken_over(db, opt_id: int) -> Optional[str]:
+    """Why row ``opt_id`` may no longer be run by anyone: claimed by a resume, or retired."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    from app.models.strategy_optimization import StrategyOptimizationRunner as Run
+    for (succ,) in db.query(Run.optimization_id).filter(Run.resumed_from_id == opt_id).all():
+        if runner_of(db, succ) is not None:
+            return f"it was claimed by optimization {succ} (--resume-interrupted)"
+    name = db.query(SO.name).filter(SO.id == opt_id).scalar()
+    if name and ("~interrupted-" in name or "~abandoned-" in name):
+        return f"it was retired as {name!r}"
+    return None
+
+
 def register_runner(db, opt_id: int, *, resumed_from_id: Optional[int] = None,
                     identity: Optional[Dict[str, Any]] = None,
                     versions: Optional[Dict[str, Any]] = None, commit: bool = True) -> str:
     """Record who runs ``opt_id`` and return the run's token (written into each of its
     checkpoints). Called by the launcher when it creates the row (in the same transaction) and by
-    the handler as the job starts.
+    the handler as the job starts or a paused task resumes.
 
-    The SAME process registering again (the handler after the launcher; a task retry) keeps the
-    record and its token, so the row's own checkpoints stay its own; the run is marked running
-    again (``ended_at`` cleared). Any OTHER process is refused (``ResumeRefused``): it continues an
-    interrupted row only by claiming it into a new row (``optimize --resume-interrupted``)."""
+    Refused (``ResumeRefused``, nothing changed) when the row was taken over (claimed by a resume,
+    or retired), or is owned by ANOTHER process: that one continues it only by claiming it into a
+    new row (``optimize --resume-interrupted``). The SAME process registering again keeps the
+    record and its token, so the row's own checkpoints stay its own (``ended_at`` cleared). The
+    record is bound to the row's random key (``row_key`` = ``optimization_config[ROW_KEY]``): a
+    record left by a deleted row whose id SQLite reused is purged by ``runner_of``, never
+    inherited."""
     import uuid
+    from app.models.strategy_optimization import StrategyOptimization as SO
     from app.models.strategy_optimization import StrategyOptimizationRunner as Run
     ident = identity or process_identity()
+    if db.get(SO, opt_id) is None:
+        raise ResumeRefused(f"optimization {opt_id} does not exist")
+    taken = _taken_over(db, opt_id)
+    if taken:
+        raise ResumeRefused(f"optimization {opt_id} must not be run here: {taken}. Not started.")
     run = runner_of(db, opt_id)
     if run is not None:
         if not _same_process(run, ident):
@@ -201,13 +248,16 @@ def register_runner(db, opt_id: int, *, resumed_from_id: Optional[int] = None,
                 f"(a new row that claims it). Not started.")
         if resumed_from_id is not None and run.resumed_from_id is None:
             run.resumed_from_id = resumed_from_id
-        run.ended_at = None
+        run.ended_at, run.ended_as = None, None
         if commit:
             db.commit()
         return run.run_token
     token = uuid.uuid4().hex
-    db.add(Run(optimization_id=opt_id, host=ident["host"], pid=int(ident["pid"]),
-               pid_started=float(ident["pid_started"]),
+    row = db.get(SO, opt_id)
+    key = (row.optimization_config or {}).get(ROW_KEY) or uuid.uuid4().hex
+    row.optimization_config = {**(row.optimization_config or {}), ROW_KEY: key}
+    db.add(Run(optimization_id=opt_id, row_key=key, host=ident["host"],
+               pid=int(ident["pid"]), pid_started=float(ident["pid_started"]),
                proc_identity=ident.get("proc_identity"), run_token=token,
                code_versions=versions if versions is not None else code_versions(),
                resumed_from_id=resumed_from_id, started_at=datetime.now(), topn_done_at=None))
@@ -216,14 +266,16 @@ def register_runner(db, opt_id: int, *, resumed_from_id: Optional[int] = None,
     return token
 
 
-def mark_runner_ended(db, opt_id: int, token: str) -> None:
-    """The handler of run ``token`` returned (completed, failed, paused, cancelled, or an
-    exception): that run is no longer live, whatever its process does next (a serve process lives
-    on). Not called on a kill. The launcher's TOP-N persist after a completed handler is still
-    covered: a completed row is judged by ``topn_done_at`` and the process, not by this."""
+def mark_runner_ended(db, opt_id: int, token: str, paused: bool = False) -> None:
+    """The handler of run ``token`` returned (any outcome, an exception included): that run is no
+    longer live. ``paused``: it returned PAUSED, so its task may resume it in the same process
+    (judged PAUSED while that process lives). Not called on a kill. The launcher's TOP-N persist
+    after a completed handler is still covered: a completed row is judged by ``topn_done_at`` and
+    the process, not by this."""
     run = runner_of(db, opt_id)
     if run is not None and run.run_token == token:
         run.ended_at = datetime.now()
+        run.ended_as = "paused" if paused else "returned"
         db.commit()
 
 
@@ -240,17 +292,33 @@ def mark_topn_done(db, opt_id: int) -> bool:
 
 
 def runner_of(db, opt_id: int):
+    """The runner record of row ``opt_id``, or None. A record whose bound row key does not match
+    the row (the row was deleted and its id reused, or is gone) belongs to NO row: it is purged
+    (deleted in the caller's transaction) and None is returned."""
     from app.models.strategy_optimization import StrategyOptimizationRunner as Run
-    return db.get(Run, opt_id)
+    run = db.get(Run, opt_id)
+    if run is None:
+        return None
+    if run.row_key is None or run.row_key != _opt_row_key(db, opt_id):
+        db.delete(run)
+        db.flush()
+        return None
+    return run
 
 
 def judge_runner(run, *, ignore_ended: bool = False) -> Tuple[str, str]:
     """A recorded run whose handler returned (``ended_at``) is DEAD as a run even if its process
-    lives on (serve). ``ignore_ended``: judge the PROCESS (a completed job's launcher still
-    persisting its TOP-N)."""
+    lives on, unless it returned PAUSED in a process that still lives (PAUSED). ``ignore_ended``:
+    judge the PROCESS (a completed job's launcher still persisting its TOP-N)."""
     if run is None:
         return UNKNOWN, "no runner was recorded"
     if run.ended_at is not None and not ignore_ended:
+        if run.ended_as == "paused":
+            state, why = judge(run.host, run.pid, run.pid_started, run.proc_identity)
+            if state == ALIVE:
+                return PAUSED, (f"paused at {run.ended_at} in live process pid {run.pid}: its task "
+                                f"can resume it there")
+            return state, why
         return DEAD, f"its handler returned at {run.ended_at}"
     return judge(run.host, run.pid, run.pid_started, run.proc_identity)
 
@@ -293,19 +361,34 @@ def resume_lineage(db, opt_id: int, limit: int = 50) -> List[int]:
 
 
 def register_backtest_writer(db, bt_id: int, identity: Optional[Dict[str, Any]] = None) -> None:
-    """Record the process writing Backtest ``bt_id`` (the caller commits, with the row itself)."""
+    """Record the process writing Backtest ``bt_id`` (the caller commits, with the row itself),
+    bound to the row's creation time like a runner record."""
     from app.models.strategy_optimization import BacktestWriter
     ident = identity or process_identity()
-    db.merge(BacktestWriter(backtest_id=bt_id, host=ident["host"], pid=int(ident["pid"]),
+    db.merge(BacktestWriter(backtest_id=bt_id, row_key=_bt_row_key(db, bt_id),
+                            host=ident["host"], pid=int(ident["pid"]),
                             pid_started=float(ident["pid_started"]),
                             proc_identity=ident.get("proc_identity"), started_at=datetime.now()))
 
 
-def judge_backtest_writer(db, bt_id: int) -> Tuple[str, str]:
+def writer_of(db, bt_id: int):
+    """The writer record of Backtest ``bt_id``, or None; a record not bound to this row (its id
+    was reused) is purged, as in ``runner_of``."""
     from app.models.strategy_optimization import BacktestWriter
     w = db.get(BacktestWriter, bt_id)
     if w is None:
-        return UNKNOWN, "no writer was recorded (a row written by older code)"
+        return None
+    if w.row_key is None or w.row_key != _bt_row_key(db, bt_id):
+        db.delete(w)
+        db.flush()
+        return None
+    return w
+
+
+def judge_backtest_writer(db, bt_id: int) -> Tuple[str, str]:
+    w = writer_of(db, bt_id)
+    if w is None:
+        return UNKNOWN, "no writer was recorded for this row"
     return judge(w.host, w.pid, w.pid_started, w.proc_identity)
 
 
@@ -316,8 +399,10 @@ def retire_dead_backtest(db, bt_id: int, label: str, note: str) -> str:
     if state != DEAD:
         raise ResumeRefused(
             f"{label} (backtest {bt_id}) is not completed and its writer is {state.upper()}: {why}. "
-            f"Not touched (it may still be being written). Let that process finish, or stop it; if no "
-            f"process writes it, delete row {bt_id}.")
+            f"Not touched (it may still be being written). Let that process finish, or stop it. If "
+            f"you have checked that no process writes it: {ABANDON_CMD} --backtest-id {bt_id} "
+            f"--confirm-not-running --reason '...' (the row is renamed and kept; that genome is "
+            f"re-run on the next start, nothing else is lost).")
     return retire_backtest(db, bt_id, note)
 
 
@@ -339,6 +424,15 @@ def _ckpt_hint(name: str, opt_id: int) -> str:
     return checkpoint_task_id(name, opt_id)
 
 
+def abandon_hint(name: str, opt_id: int, confirm: bool = False) -> str:
+    """The precise cost of giving the job up, and the supported command (never a hand edit)."""
+    return (f"To give it up: {ABANDON_CMD} --id {opt_id}"
+            + (" --confirm-not-running" if confirm else "")
+            + f" --reason '...'. That COSTS its finished trials (they are not reused) and retires "
+              f"its checkpoint {_ckpt_hint(name, opt_id)} (payload kept in the task queue): the next "
+              f"start of {name!r} trains from generation 0.")
+
+
 def _refuse_unless_dead(name: str, opt_id: int, status: str, run, what: str,
                        ignore_ended: bool = False) -> str:
     state, why = judge_runner(run, ignore_ended=ignore_ended)
@@ -347,19 +441,58 @@ def _refuse_unless_dead(name: str, opt_id: int, status: str, run, what: str,
     if run is None:
         raise ResumeRefused(
             f"optimization {name!r} (id={opt_id}) is {status!r} but no runner was recorded for it "
-            f"(started by code older than the runner table, or killed before the handler began): "
-            f"whether a process still runs it cannot be proven, so it is not {what}. If none "
-            f"does, delete row id={opt_id}; a fresh start then discards its checkpoint "
-            f"{_ckpt_hint(name, opt_id)} (orphaned) and trains from generation 0.")
+            f"(started by code older than the runner table): whether a process still runs it cannot "
+            f"be proven, so it is not {what}. If you have checked that no process runs it: "
+            + abandon_hint(name, opt_id, confirm=True))
     if state == ALIVE:
         raise ResumeRefused(
             f"optimization {name!r} (id={opt_id}) is {status!r} in a LIVE process ({why}; host "
             f"{run.host}, since {run.started_at}): it is not {what} (two runners on one row). Let it "
-            f"finish, or stop that process and start again.")
+            f"finish, or stop that process and start again (it then resumes, nothing is lost).")
+    if state == PAUSED:
+        raise ResumeRefused(
+            f"optimization {name!r} (id={opt_id}) is PAUSED: {why}. It is not {what}: resume it "
+            f"there (nothing is lost), or cancel that task and stop the process; it can then be "
+            f"resumed here.")
     raise ResumeRefused(
         f"optimization {name!r} (id={opt_id}) is {status!r} and its runner is {state.upper()}: "
         f"{why}. It is not {what}: only a runner proven dead is replaced. Check pid {run.pid} on "
-        f"{run.host}; stop it if it is the job, then start again.")
+        f"{run.host}; stop it if it is the job, then start again (it then resumes, nothing is "
+        f"lost). " + abandon_hint(name, opt_id, confirm=True))
+
+
+def plain_launch_gate(db, name: str) -> Tuple[Optional[str], Optional[int]]:
+    """A launch WITHOUT --resume-interrupted (other grids, a hand launch). Returns
+    ``(None, None)`` when it may simply create its row; ``("claim", id)`` for the ONE dead
+    non-terminal row of ``name``, which it must claim and resume (identity check) rather than run
+    beside; ``("supersede", id)`` for a dead ``pending`` row that never ran and continues nothing
+    (no trial, no checkpoint of its own, no ``resumed_from_id``): nothing to resume, so the new row
+    retires it in its own transaction, whatever its config. Raises for a live, paused or unprovable
+    non-terminal row, or more than one: two non-terminal rows of one name never exist. Terminal rows
+    (completed, failed, cancelled) are not in the way, as before."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    rows = (db.query(SO.id, SO.status).filter(SO.name == name,
+                                               SO.status.in_(INTERRUPTIBLE_STATUSES))
+            .order_by(SO.id).all())
+    if not rows:
+        return None, None
+    if len(rows) > 1:
+        raise ResumeRefused(
+            f"{len(rows)} non-terminal optimizations are named {name!r} "
+            f"({', '.join(f'id={i} {st}' for i, st in rows)}): none is resumed. Give up the extra "
+            f"ones with {ABANDON_CMD} --id <id> --reason '...' (each COSTS that row's finished "
+            f"trials; its checkpoint is retired, payload kept).")
+    opt_id, status = rows[0]
+    run = runner_of(db, opt_id)
+    _refuse_unless_dead(name, opt_id, status, run, "replaced by a new row")
+    if status == "pending" and (run is None or run.resumed_from_id is None):
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        from app.services import strategy_optimization_handler as H
+        recs = db.query(SO.all_results).filter(SO.id == opt_id).scalar()
+        ckpt = H._load_checkpoint(H.checkpoint_task_id(name, opt_id))
+        if not recs and (ckpt is None or checkpoint_owned_by(db, ckpt, [opt_id]) is None):
+            return "supersede", opt_id
+    return "claim", opt_id
 
 
 def assess(db, name: str) -> Assessment:
@@ -374,8 +507,9 @@ def assess(db, name: str) -> Assessment:
         raise ResumeRefused(
             f"{len(rows)} optimizations are named {name!r} "
             f"({', '.join(f'id={i} {st}' for i, st, _ in rows)}). A failed train plus a re-run "
-            f"under the same name does this. Delete the unwanted row(s) from the test DB "
-            f"(or use a new --prefix) so exactly one remains.")
+            f"under the same name does this. Give up each unwanted non-completed row with "
+            f"{ABANDON_CMD} --id <id> --reason '...' (COSTS that row's finished trials; its "
+            f"checkpoint is retired, payload kept), or use a new --prefix.")
     opt_id, status, err = rows[0]
     run = runner_of(db, opt_id)
     if status == "completed":
@@ -390,8 +524,8 @@ def assess(db, name: str) -> Assessment:
             f"optimization {name!r} (id={opt_id}) exists with status {status!r}"
             + (f" ({(err or '')[:300]})" if err else "")
             + ": a failed or cancelled job is not resumed automatically (its failure may repeat). "
-              "Read the error; then delete that row (a fresh start discards its orphaned checkpoint "
-            + f"{_ckpt_hint(name, opt_id)}), or use a new --prefix.")
+              "Read the error and fix its cause. " + abandon_hint(name, opt_id)
+            + " Or use a new --prefix.")
     why = _refuse_unless_dead(name, opt_id, status, run, "resumed")
     return Assessment("resume", opt_id, f"{status}; {why}")
 
@@ -622,3 +756,75 @@ def exclusive(path: str, label: str) -> Iterator[Dict[str, Any]]:
         yield handle["me"]
     finally:
         release_lock(handle)
+
+
+# --------------------------------------------------------------------------------- abandon
+
+
+def abandon_optimization(db, opt_id: int, reason: str, confirm_not_running: bool = False
+                         ) -> Dict[str, Any]:
+    """Give up an interrupted (or failed / cancelled) optimization cleanly, instead of deleting it
+    by hand: the row is renamed ``<name>~abandoned-<id>`` and set ``failed`` with the reason, its
+    run is marked ended, and its OWN checkpoint is retired (payload kept). Its finished trials are
+    not reused: the next start of the name trains from generation 0.
+
+    A completed row, a LIVE or PAUSED run are refused. A run that cannot be judged (no runner
+    record, another host, unknown) needs ``confirm_not_running`` (the operator checked). The row is
+    renamed BEFORE the checkpoint is retired: a kill in between leaves a checkpoint whose writer is
+    retired, which the next start retires itself."""
+    from app.models.strategy_optimization import StrategyOptimization as SO
+    from app.services import strategy_optimization_handler as H
+    row = db.get(SO, opt_id)
+    if row is None:
+        raise ResumeRefused(f"optimization {opt_id} does not exist")
+    if row.status == "completed":
+        raise ResumeRefused(f"optimization {opt_id} ({row.name!r}) is completed: not abandoned")
+    if not (reason or "").strip():
+        raise ResumeRefused("a --reason is required")
+    run = runner_of(db, opt_id)
+    state, why = judge_runner(run)
+    if state in (ALIVE, PAUSED) or (state != DEAD and not confirm_not_running):
+        raise ResumeRefused(
+            f"optimization {opt_id} ({row.name!r}) is not abandoned: its run is {state.upper()} "
+            f"({why})." + ("" if state in (ALIVE, PAUSED) else
+                           " If you have checked that no process runs it, add --confirm-not-running."))
+    name, n_trials = row.name, len(row.all_results or [])
+    tid = H.checkpoint_task_id(name, opt_id)
+    ckpt = H._load_checkpoint(tid)
+    others = db.query(SO.id).filter(SO.name == name, SO.id != opt_id).count()
+    own_ckpt = ckpt is not None and (
+        checkpoint_owned_by(db, ckpt, [opt_id]) is not None
+        or (ckpt.get("optimization_id") is None and others == 0))
+    now = datetime.now()
+    row.name = f"{name}~abandoned-{opt_id}"
+    row.status = "failed"
+    row.completed_at = now
+    row.error_message = (f"ABANDONED by operator ({reason}); was {name!r}, {n_trials} finished "
+                         f"trial(s) not reused")[:1000]
+    if run is not None:
+        run.ended_at = run.ended_at or now
+        run.ended_as = "abandoned"
+    db.commit()
+    retired = H._retire_checkpoint(tid, f"abandoned with optimization {opt_id}: {reason}") \
+        if own_ckpt else None
+    return {"optimization_id": opt_id, "name": name, "renamed": row.name, "trials_lost": n_trials,
+            "checkpoint": tid if own_ckpt else None, "retired_as": retired}
+
+
+def abandon_backtest(db, bt_id: int, reason: str, confirm_not_running: bool = False) -> str:
+    """Give up a non-completed re-run Backtest row (renamed, ``failed``, kept): the genome is
+    re-run on the next start. Refused while its recorded writer lives; a writer that cannot be
+    judged needs ``confirm_not_running``."""
+    from app.models.backtest import Backtest
+    row = db.get(Backtest, bt_id)
+    if row is None or row.status == "completed":
+        raise ResumeRefused(f"backtest {bt_id} does not exist or is completed: not abandoned")
+    if not (reason or "").strip():
+        raise ResumeRefused("a --reason is required")
+    state, why = judge_backtest_writer(db, bt_id)
+    if state == ALIVE or (state != DEAD and not confirm_not_running):
+        raise ResumeRefused(f"backtest {bt_id} is not abandoned: its writer is {state.upper()} ({why})"
+                            + ("" if state == ALIVE else
+                               ". If you have checked that no process writes it, add "
+                               "--confirm-not-running."))
+    return retire_backtest(db, bt_id, f"abandoned by operator ({reason})")

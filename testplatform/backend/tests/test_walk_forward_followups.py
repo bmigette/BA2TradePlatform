@@ -205,7 +205,7 @@ def test_duplicate_optimization_name_is_refused_up_front(monkeypatch, host_db):
     with pytest.raises(WF.WalkForwardError) as e:
         r.train_completed("wf-dup")
     assert f"id={a} failed" in str(e.value) and f"id={b} completed" in str(e.value)
-    assert "Delete" in str(e.value)
+    assert "abandon-interrupted" in str(e.value)
 
 
 def test_a_non_completed_leftover_blocks_a_second_train_run(monkeypatch, host_db):

@@ -10,7 +10,8 @@ finished and when the handler returned. `backtest_writers` records the process w
 Backtest row (top-N, out-of-sample) the same way. See app.services.optimization_resume and
 docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md ("Resume of an interrupted fold").
 
-Every starting state converges on the same schema, idempotently: no table (both created), a table
+Every starting state converges on the same schema, idempotently (plus two AFTER DELETE triggers
+that remove a row's runner / writer record with the row, and a purge of records already orphaned): no table (both created), a table
 from an EARLIER version of this migration (each missing column added with ALTER TABLE ADD COLUMN:
 no table rewrite, existing rows keep NULL), or the current shape (nothing to do). A fresh DB gets
 the same columns from `Base.metadata.create_all` (pinned by tests/test_migration_033.py). Code from
@@ -22,6 +23,7 @@ before this migration never reads these tables. No other table is touched. House
 _COLUMNS = {
     "strategy_optimization_runners": [
         ("optimization_id", "INTEGER PRIMARY KEY REFERENCES strategy_optimizations(id)"),
+        ("row_key", "VARCHAR(64)"),
         ("host", "VARCHAR(255) NOT NULL"),
         ("pid", "INTEGER NOT NULL"),
         ("pid_started", "FLOAT NOT NULL"),
@@ -32,9 +34,11 @@ _COLUMNS = {
         ("started_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
         ("topn_done_at", "DATETIME"),
         ("ended_at", "DATETIME"),
+        ("ended_as", "VARCHAR(16)"),
     ],
     "backtest_writers": [
         ("backtest_id", "INTEGER PRIMARY KEY REFERENCES backtests(id)"),
+        ("row_key", "VARCHAR(300)"),
         ("host", "VARCHAR(255) NOT NULL"),
         ("pid", "INTEGER NOT NULL"),
         ("pid_started", "FLOAT NOT NULL"),
@@ -45,7 +49,28 @@ _COLUMNS = {
 
 # Columns a later version added: nullable and without a constant-needing default, so ALTER TABLE ADD
 # COLUMN accepts them on a table that already holds rows.
-_ADDABLE = {"proc_identity", "run_token", "ended_at"}
+_ADDABLE = {"proc_identity", "run_token", "ended_at", "ended_as", "row_key"}
+
+# A record never outlives its row: an operator's hand DELETE of a row removes its record in the same
+# statement, so an id SQLite reuses for a later row starts clean. (The record is also bound to the
+# row's identity and purged on read when it does not match: app.services.optimization_resume.)
+_TRIGGERS = {
+    "trg_runner_follows_optimization":
+        "CREATE TRIGGER trg_runner_follows_optimization AFTER DELETE ON strategy_optimizations "
+        "BEGIN DELETE FROM strategy_optimization_runners WHERE optimization_id = OLD.id; END",
+    "trg_writer_follows_backtest":
+        "CREATE TRIGGER trg_writer_follows_backtest AFTER DELETE ON backtests "
+        "BEGIN DELETE FROM backtest_writers WHERE backtest_id = OLD.id; END",
+}
+
+# Records whose row is already gone (deleted before the triggers existed).
+_PURGE = (
+    ("strategy_optimization_runners",
+     "DELETE FROM strategy_optimization_runners WHERE optimization_id NOT IN "
+     "(SELECT id FROM strategy_optimizations)"),
+    ("backtest_writers",
+     "DELETE FROM backtest_writers WHERE backtest_id NOT IN (SELECT id FROM backtests)"),
+)
 
 
 def _table_exists(cursor, name):
@@ -76,6 +101,15 @@ def upgrade(cursor, conn):
                                    f"knows; inspect the table before migrating")
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
             changed.append(f"added {table}.{name}")
+    for trig, ddl in _TRIGGERS.items():
+        cursor.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?", (trig,))
+        if cursor.fetchone() is None:
+            cursor.execute(ddl)
+            changed.append(f"created trigger {trig}")
+    for table, sql in _PURGE:
+        cursor.execute(sql)
+        if cursor.rowcount and cursor.rowcount > 0:
+            changed.append(f"purged {cursor.rowcount} orphaned {table} record(s)")
     conn.commit()
     print("  - " + ("; ".join(changed) if changed else
                     "strategy_optimization_runners / backtest_writers up to date; nothing to do"))
@@ -83,6 +117,8 @@ def upgrade(cursor, conn):
 
 
 def downgrade(cursor, conn):
+    for trig in _TRIGGERS:
+        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
     present = [t for t in _COLUMNS if _table_exists(cursor, t)]
     for t in present:
         cursor.execute(f"DROP TABLE {t}")

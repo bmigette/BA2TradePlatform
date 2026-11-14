@@ -181,9 +181,41 @@ with `optimize --resume-interrupted` when its runner is provably dead
   holds trial records. Every CLI launch (not `--submit`) registers the runner with the new row.
 - **One run, one token.** The same process registering again (the handler after the launcher, or a
   task retry) keeps the token, so the row's own checkpoints stay its own. A different process is refused
-  and the row is left untouched; it can only continue the row by claiming it. A handler that returns
-  (any outcome) records `ended_at`, so a paused task in a live serve process is not a live run. A kill
-  never reaches that line.
+  and the row is left untouched; it can only continue the row by claiming it. So is a row that was
+  claimed or retired, even by the same process: a paused serve task resumed after its row was claimed
+  refuses. A handler that returns records `ended_at` and `ended_as`; a kill never reaches that line.
+- **Paused runs (decision).** A run that returned PAUSED in a process that still lives is not
+  resumable elsewhere: `assess` and the plain launch refuse it as PAUSED. Its task can resume it there,
+  or the operator cancels it. Once its process is dead it is resumable like any killed run.
+- **Records never outlive their row.** Runner and writer records are bound to their row: an
+  optimization's random `resumeRowKey` is stored in its config and on the record; a Backtest's creation
+  time and name. A record that does not match is purged on read. Migration 033 also adds AFTER DELETE
+  triggers that remove the record with its row, and purges records already orphaned. A hand DELETE
+  followed by a new row that reuses the id (SQLite reuses a deleted max id) starts clean. That holds for
+  the same pid or another, with or without the triggers (tested).
+- **No two non-terminal rows of one name.** A launch without the flag (other grids, a hand launch)
+  CLAIMS a dead running or pending row of its name, with the same identity check. It supersedes a
+  `pending` row that never ran (no trial, no checkpoint, not a continuation), and refuses beside a
+  live, paused or unprovable one. `--submit` refuses beside a dead one: the claim needs the process
+  that runs the row. Terminal rows (completed, failed, cancelled) are not in the way, as before. The
+  handler refuses to continue a checkpoint whose writer row is still non-terminal and unclaimed.
+- **Abandoning a job: `ba2-test abandon-interrupted --id N | --name X | --backtest-id N --reason ...
+  [--confirm-not-running]`.** It replaces hand DELETEs, which caused the confusion of 2026-11-14. The row
+  is renamed `<name>~abandoned-<id>`, set `failed` with the reason and kept, its run is marked ended,
+  and its own checkpoint is retired (payload kept). It is refused for a live or paused run, and needs
+  `--confirm-not-running` for a run it cannot judge. It prints the cost: the finished trials are not
+  reused, and the next start trains from generation 0. Every refusal message names this command and
+  that cost.
+- **Kill points before the first trial.** Between the claim and the handler: the `pending` row has its
+  runner and link, so it is resumable (tested). In the handler before the first trial, the long wait of
+  a remote-only job (0 local slots) is `DistributedEvaluator.start` (worker version check and cache
+  push). The row is `running` with a runner and no trial or checkpoint, and the next start claims it
+  and ends with the uninterrupted result (tested). A `--submit` row waiting in the serve queue has no
+  runner until serve starts it: it is refused as unprovable (it may still run). Give it up with
+  `--confirm-not-running` once that serve is known to be gone.
+- **Strategy rows** are deleted when a claim is refused. A launcher killed between creating its
+  Strategy row and the claim leaves an unreferenced Strategy row, as every killed launch always has:
+  harmless, and not cleaned up.
 - **Checkpoint ownership.** Every checkpoint carries the writing row's id, its run token and the job
   identity hash (config incl. window and data digests, metric, gene space, rules); id AND token must
   match, because SQLite reuses the id of a deleted max-id row. `_checkpoint_verdict` decides, and every

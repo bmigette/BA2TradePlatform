@@ -564,7 +564,8 @@ def _seed_named_opt(T, sid, name, config):
         db.close()
 
 
-def _handler_run(monkeypatch, H, T, sid, name, config, pause_at, tag):
+def _handler_run(monkeypatch, H, T, sid, name, config, pause_at, tag, opt_id=None):
+    """``opt_id``: run THAT row again (the serve queue resuming a paused task) instead of a new one."""
     seen, resumed = {}, {}
     Real = H.GeneticOptimizer
 
@@ -582,7 +583,8 @@ def _handler_run(monkeypatch, H, T, sid, name, config, pause_at, tag):
     monkeypatch.setattr(H, "GeneticOptimizer", _Spy)
     real_q = H.get_task_queue()
     monkeypatch.setattr(H, "get_task_queue", lambda: _PausingQueue(real_q, seen, pause_at))
-    opt_id = _seed_named_opt(T, sid, name, config)
+    opt_id = opt_id if opt_id is not None else _seed_named_opt(T, sid, name, config)
+    seen["opt_id"] = opt_id
     out = H.handle_strategy_optimization(f"t-{tag}", {"optimization_id": opt_id})
     return out, seen, resumed
 
@@ -598,7 +600,7 @@ def test_resume_through_the_handlers_checkpoint_store_restores_the_rule_state(mo
     cfg = T._ga_config(populationSize=6, generations=10, earlyStoppingGenerations=50,
                        **{EARLY_STOP_MIN_REL_KEY: 0.01})
 
-    out, _, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=7, tag="p1")
+    out, first, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=7, tag="p1")
     assert out["status"] == "paused", out
     assert not resumed, "the first run must start fresh"
     stored = H._load_checkpoint(H.checkpoint_task_id(name, 0))
@@ -607,7 +609,9 @@ def test_resume_through_the_handlers_checkpoint_store_restores_the_rule_state(mo
     assert expect == (stored["no_improvement_count"], stored["early_stop_baseline"])
     assert expect[0] > 0, "precondition: the pause must land mid-patience"
 
-    out, seen, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=None, tag="p2")
+    # the paused task is resumed: the SAME row, in the same process
+    out, seen, resumed = _handler_run(monkeypatch, H, T, sid, name, cfg, pause_at=None, tag="p2",
+                                      opt_id=first["opt_id"])
     assert out["status"] == "completed", out
     assert resumed["start"] == 6
     assert (resumed["clock"], resumed["baseline"]) == expect
@@ -623,7 +627,17 @@ def test_a_legacy_checkpoint_is_discarded_not_resumed_under_the_rule(monkeypatch
     H._clear_checkpoint(H.checkpoint_task_id(name, 0))
     sid = T._seed_strategy()
     legacy = T._ga_config(populationSize=6, generations=10, earlyStoppingGenerations=50)
-    out, _, _ = _handler_run(monkeypatch, H, T, sid, name, legacy, pause_at=7, tag="l1")
+    out, first, _ = _handler_run(monkeypatch, H, T, sid, name, legacy, pause_at=7, tag="l1")
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.services import optimization_resume as R
+    db = SessionLocal()
+    try:                    # the paused task was cancelled: its row is terminal, its run over
+        db.get(StrategyOptimization, first["opt_id"]).status = "cancelled"
+        R.runner_of(db, first["opt_id"]).ended_as = "returned"
+        db.commit()
+    finally:
+        db.close()
     assert out["status"] == "paused", out
     assert H._load_checkpoint(H.checkpoint_task_id(name, 0))["generation"] == 5
 

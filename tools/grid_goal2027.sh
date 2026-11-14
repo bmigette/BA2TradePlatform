@@ -461,8 +461,10 @@ cmd_stop() {
   echo " - a TOP-N persist cut off after training re-runs only the missing TOP ranks;"
   echo " - an out-of-sample test re-runs the genomes whose result was not saved; fold reports are"
   echo "   only ever written whole."
+  echo "Never DELETE a row by hand: to give a job up, bash: \$PY testplatform/ba2test_launcher.py"
+  echo "abandon-interrupted --id <id> --reason '...' (costs its finished trials; it retrains from 0)."
   echo "A wf3 interrupted in phase A must COMPLETE before January's data replaces phase A's (the"
-  echo "resume refuses the changed data digests), or be deleted and retrained (two-phase plan)."
+  echo "resume refuses the changed data digests), or be abandoned and retrained (two-phase plan)."
 }
 
 cmd_status() {
