@@ -56,6 +56,9 @@ FORBIDDEN_OPTIMIZE_FLAGS = {
     "--submit": "it queues the job and returns before it is completed, so the fold cannot "
                 "continue",
 }
+#: Real ``optimize`` flags that are themselves a prefix of a forbidden flag (pinned against the real
+#: parser in tests/test_wf_forbidden_abbreviations.py): an EXACT match, which argparse prefers.
+EXACT_FLAGS_SHADOWING_FORBIDDEN = ("--seed",)
 
 
 class WalkForwardError(Exception):
@@ -178,11 +181,15 @@ def check_user_optimize_args(args: Sequence[str]) -> None:
     tests/test_wf_ui_review.py). A token is therefore refused when its option part (before ``=``) is
     a PREFIX of a forbidden flag: argparse would either resolve it to that flag or refuse it as
     ambiguous, and no other optimize flag is itself such a prefix (pinned by the same test), so
-    nothing valid is refused."""
+    nothing valid is refused -- except the flags in ``EXACT_FLAGS_SHADOWING_FORBIDDEN``: ``--seed``
+    (the RNG seed every grid passes) is a prefix of the three seed-file flags, and argparse takes an
+    EXACT match before any abbreviation, so ``--seed`` / ``--seed=N`` is the RNG seed and allowed."""
     for a in args:
         if not a.startswith("--") or a == "--":
             continue
         opt = a.split("=", 1)[0]
+        if opt in EXACT_FLAGS_SHADOWING_FORBIDDEN:
+            continue
         for flag, why in FORBIDDEN_OPTIMIZE_FLAGS.items():
             if len(opt) > 2 and flag.startswith(opt):
                 raise WalkForwardError(
