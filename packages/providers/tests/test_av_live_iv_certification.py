@@ -137,7 +137,7 @@ def test_a_fetched_chain_is_cached_per_symbol_session(world):
     ("throttled", "rate limit (Alpha Vantage)"),
     ("http", "Alpha Vantage request failed"),
     ("empty", "serves no chain"),
-    ("budget", "no slot in the shared Alpha Vantage budget"),
+    ("budget", "chain not prefetched; rate budget exhausted"),
 ])
 def test_every_failure_is_an_unknown_with_its_reason_and_is_not_cached(world, case, expect, caplog):
     root, mapped = world

@@ -71,6 +71,16 @@ def chain_quotes_from_frame(t, first_s: str, last_s: str, where: str = "") -> Di
             "bid": f8("bid"), "ask": f8("ask")}
 
 
+def _contract_day_keys(p: dict) -> np.ndarray:
+    """One fixed-width byte key per row -- (bar day, expiry day, call flag, strike bits) -- so the
+    staged-day merge is a vectorised ``np.isin`` with exactly the (occ_symbol, bar_date) semantics of
+    compaction (the OCC symbol is (expiry, type, strike) for the symbol's own root)."""
+    strike = np.where(p["strike"] == 0.0, 0.0, p["strike"])          # -0.0 and 0.0 are one strike
+    rows = np.stack([p["bar"].astype(np.int64), p["exp"].astype(np.int64), p["call"].astype(np.int64),
+                     np.ascontiguousarray(strike, dtype=np.float64).view(np.int64)], axis=1)
+    return np.ascontiguousarray(rows).view(np.dtype((np.void, 32))).ravel()
+
+
 def _group_by_session(parts: List[dict]) -> Dict[date, ChainQuotes]:
     if not parts:
         return {}
@@ -241,13 +251,10 @@ class AlphaVantageParquetChainSource(_ParquetTreeChainSource):
             # contract's partition row of that day, and a contract the staged day lacks KEEPS its
             # partition row. (expiry, type, strike) identifies the contract: ``map_chain`` admits only
             # the symbol's own OCC root, so the OCC symbol is exactly those three.
-            staged_keys = {(int(b), int(e), bool(c), float(k)) for p in staged
-                           for b, e, c, k in zip(p["bar"], p["exp"], p["call"], p["strike"])}
+            staged_keys = np.concatenate([_contract_day_keys(p) for p in staged])
             trimmed = []
             for p in parts:
-                keep = np.fromiter(((int(b), int(e), bool(c), float(k)) not in staged_keys
-                                    for b, e, c, k in zip(p["bar"], p["exp"], p["call"], p["strike"])),
-                                   dtype=bool, count=len(p["bar"]))
+                keep = ~np.isin(_contract_day_keys(p), staged_keys)
                 if keep.any():
                     trimmed.append({k: v[keep] for k, v in p.items()})
             parts = trimmed
