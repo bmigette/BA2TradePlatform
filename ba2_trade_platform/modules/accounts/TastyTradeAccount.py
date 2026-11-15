@@ -1002,6 +1002,45 @@ class TastyTradeAccount(AccountInterface):
                 return float(value)
         return None
 
+    # ------------------------------------------------------------------
+    # Option chain QUOTE SNAPSHOT (iv-v1 live quote source; MARKET DATA ONLY)
+    # ------------------------------------------------------------------
+    #: Real exchange quotes (dxFeed via REST). Certified equal to Alpha Vantage's end-of-day chain for
+    #: 2026-11-13 (docs/plans/2026-11-15-option-iv-conditions.md 6.6). Used as a quote source only:
+    #: choosing this account as the live IV chain source never routes an order to it.
+    supports_option_chain_quote_snapshot = True
+    option_chain_quote_source_kind = "tastytrade"
+    #: Pause between two market-data batches of one underlying.
+    _OPTION_QUOTE_PAUSE_SECONDS = 0.2
+
+    def get_option_chain_quote_snapshot(self, underlying: str, *, expiry_min: date, expiry_max: date,
+                                        strike_band: float):
+        """Read-only: the chain listing + ``/market-data/by-type`` (<= 100 contracts per call) through this
+        account's own session (``_run_async``; no second login, nothing written back). See
+        ``ba2_providers.options.tastytrade_quotes``."""
+        import httpx
+
+        from ba2_common.core.option_chain_quotes import OptionChainQuotesFetchError
+        from ba2_providers.options.tastytrade_quotes import fetch_chain_quote_snapshot
+
+        if not self._check_authentication():
+            raise OptionChainQuotesFetchError(
+                f"TastyTradeAccount {self.id}: not authenticated with the broker ({self._authentication_error})")
+
+        def get_json(path, params):
+            return self._run_async(self._session._get(path, params=params), timeout=60)
+
+        try:
+            return fetch_chain_quote_snapshot(
+                get_json, underlying, expiry_min=expiry_min, expiry_max=expiry_max, strike_band=strike_band,
+                account_id=int(self.id), pause=lambda: self._sleep(self._OPTION_QUOTE_PAUSE_SECONDS))
+        except OptionChainQuotesFetchError:
+            raise
+        except (TastytradeError, httpx.HTTPError, TimeoutError, ConnectionError, OSError) as e:
+            raise OptionChainQuotesFetchError(
+                f"TastyTrade option quotes for {underlying}: "
+                f"{self._describe_broker_error(e, 'the option chain quote fetch')}") from e
+
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """Fetch a single price or a bulk price map.
 

@@ -28,6 +28,8 @@ def test_the_registration_is_silent_and_registers_the_alphavantage_reader(caplog
         seam_wiring._register_live_chain_readers()
         assert logged == []
         assert live_chain_reader_factory("alphavantage") is make_reader
+        from ba2_trade_platform.modules.dataproviders.options.iv_chain_prefetch import make_broker_chain_reader
+        assert live_chain_reader_factory("broker") is make_broker_chain_reader
         assert live_chain_reader_factory("thetadata") is None
     finally:
         clear_live_chain_readers()
@@ -112,6 +114,7 @@ def test_the_prefetch_job_is_scheduled_with_a_gate_and_removed_after_the_last_on
 
     jm = _bare_job_manager()
     monkeypatch.setattr(ivp, "has_active_iv_gates", lambda: True)
+    monkeypatch.setattr(ivp, "configured_source_value", lambda: "alphavantage")
     jm._schedule_iv_chain_prefetch_job()
     assert jm._scheduler.added == [IV_CHAIN_PREFETCH_JOB_ID] and IV_CHAIN_PREFETCH_JOB_ID in jm._scheduled_jobs
     monkeypatch.setattr(ivp, "has_active_iv_gates", lambda: False)
@@ -159,11 +162,11 @@ def test_a_restart_inside_the_window_runs_the_prefetch_once(monkeypatch):
     ran = threading.Event()
     jm = _bare_job_manager()
     monkeypatch.setattr(jm, "_execute_iv_chain_prefetch", ran.set)
-    monkeypatch.setattr(ivp, "in_prefetch_window", lambda now=None: False)
+    monkeypatch.setattr(ivp, "in_window", lambda now=None: False)
     jm._scheduled_jobs[IV_CHAIN_PREFETCH_JOB_ID] = object()
     jm._iv_chain_prefetch_catchup_if_due()
     assert not ran.wait(0.2)
-    monkeypatch.setattr(ivp, "in_prefetch_window", lambda now=None: True)
+    monkeypatch.setattr(ivp, "in_window", lambda now=None: True)
     jm._iv_chain_prefetch_catchup_if_due()
     assert ran.wait(2.0)
     ran.clear()

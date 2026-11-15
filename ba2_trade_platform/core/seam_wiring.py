@@ -113,6 +113,23 @@ def _register_live_chain_readers() -> None:
 
     register_live_chain_reader("alphavantage", make_reader)
 
+    # BROKER quote source (app setting iv_live_chain_source = account:<id>): the account definition's class
+    # is resolved WITHOUT instantiating it (no login) when the resolver is built; the reader only reads
+    # what the capture job cached between the prior close and the next open.
+    try:
+        from ..modules.dataproviders.options.iv_chain_prefetch import make_broker_chain_reader
+    except ImportError as e:
+        broker_reason = (f"market-condition profile iv-v1: the live broker chain reader could not be imported "
+                         f"({type(e).__name__}: {e}); its gates refuse every live entry")
+        logger.warning(broker_reason)
+
+        def make_broker_chain_reader(profile, **_kw):
+            from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+
+            return LiveUnavailableMarketConditionReader(profile, broker_reason)
+
+    register_live_chain_reader("broker", make_broker_chain_reader)
+
 
 def wire_all_seams() -> None:
     """Inject every live implementation into the package seams. Idempotent.

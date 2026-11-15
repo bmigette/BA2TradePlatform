@@ -932,21 +932,22 @@ class JobManager:
             logger.error(f"Error scheduling the pre-open ATM-IV warm job: {e}", exc_info=True)
 
     def _schedule_iv_chain_prefetch_job(self):
-        """Schedule the iv-v1 chain prefetch (Mon-Fri 06:30 ET) ONLY while an enabled expert has an
-        ACTIVE iv-v1 gate trained on alphavantage. Without one nothing is scheduled and nothing is
-        logged -- every existing installation. Re-evaluated at startup, on a full refresh AND on a
-        single expert's schedule refresh (an expert added, enabled, disabled, or its ruleset/profile
-        changed); when the last gate goes, the job is unscheduled here, and the job itself re-checks
-        before doing anything. Started inside the prefetch window (after 06:30, before the deadline),
-        it also runs once right away (``_iv_chain_prefetch_catchup_if_due``)."""
+        """Schedule the ONE iv-v1 chain job, parameterised by the live IV chain source (app setting
+        ``iv_live_chain_source``; ``iv_chain_prefetch.schedule_spec``): the Alpha Vantage prefetch (Mon-Fri
+        06:30 ET) or the broker capture (every 30 min, effective only between the prior close and the next
+        open). ONLY while an enabled expert has an ACTIVE iv-v1 gate trained on alphavantage AND a source
+        is set. Without a gate nothing is scheduled and nothing is logged -- every existing installation.
+        Re-evaluated at startup, on a full refresh AND on a single expert's schedule refresh; when the last
+        gate goes, the job is unscheduled here, and the job itself re-checks before doing anything. Started
+        inside the source's window, it also runs once right away (``_iv_chain_prefetch_catchup_if_due``)."""
         try:
             from ..modules.dataproviders.options import iv_chain_prefetch as ivp
-            active = ivp.has_active_iv_gates()
+            spec = ivp.schedule_spec()
         except Exception as e:  # noqa: BLE001 -- the check must never block the scheduler
-            logger.warning(f"iv-v1 chain prefetch: could not determine whether an iv gate is active ({e}); "
-                           f"not scheduled -- gates fetch on demand")
+            logger.warning(f"iv-v1 chain job: could not determine whether an iv gate is active ({e}); "
+                           f"not scheduled")
             return
-        if not active:
+        if spec is None:
             if IV_CHAIN_PREFETCH_JOB_ID in self._scheduled_jobs:
                 try:
                     self._scheduler.remove_job(IV_CHAIN_PREFETCH_JOB_ID)
@@ -955,14 +956,12 @@ class JobManager:
                 self._scheduled_jobs.pop(IV_CHAIN_PREFETCH_JOB_ID, None)
             return
         try:
-            trigger = CronTrigger(hour=ivp.PREFETCH_HOUR, minute=ivp.PREFETCH_MINUTE,
-                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            trigger = CronTrigger(timezone=_MARKET_TZ, **spec["cron"])
             job = self._scheduler.add_job(func=self._execute_iv_chain_prefetch, trigger=trigger,
-                                          id=IV_CHAIN_PREFETCH_JOB_ID, name="iv-v1 Chain Prefetch Job",
+                                          id=IV_CHAIN_PREFETCH_JOB_ID, name="iv-v1 Chain Job",
                                           replace_existing=True, max_instances=1, coalesce=True)
             self._scheduled_jobs[IV_CHAIN_PREFETCH_JOB_ID] = job
-            logger.info(f"iv-v1 chain prefetch scheduled for {ivp.PREFETCH_HOUR:02d}:{ivp.PREFETCH_MINUTE:02d} "
-                        f"America/New_York, Mon-Fri (deadline {ivp.DEADLINE_HOUR:02d}:{ivp.DEADLINE_MINUTE:02d})")
+            logger.info(f"iv-v1 chain job scheduled: {spec['describe']}")
         except Exception as e:
             logger.error(f"Error scheduling the iv-v1 chain prefetch job: {e}", exc_info=True)
 
@@ -971,9 +970,9 @@ class JobManager:
         prefetch once now, on its own thread (stoppable: ``av_live_chain.request_stop``)."""
         try:
             from ..modules.dataproviders.options import iv_chain_prefetch as ivp
-            if IV_CHAIN_PREFETCH_JOB_ID in self._scheduled_jobs and ivp.in_prefetch_window():
+            if IV_CHAIN_PREFETCH_JOB_ID in self._scheduled_jobs and ivp.in_window():
                 import threading as _th
-                logger.info("iv-v1 chain prefetch: app started inside the prefetch window; running it now")
+                logger.info("iv-v1 chain job: app started inside the fetch window; running it now")
                 _th.Thread(target=self._execute_iv_chain_prefetch, name="iv-chain-prefetch-catchup",
                            daemon=True).start()
         except Exception as e:  # noqa: BLE001 -- a catch-up must never block the start
@@ -982,7 +981,7 @@ class JobManager:
     def _execute_iv_chain_prefetch(self):
         try:
             from ..modules.dataproviders.options import iv_chain_prefetch as ivp
-            ivp.run_prefetch_once()
+            ivp.run_once()
         except Exception as e:
             logger.error(f"Error executing the iv-v1 chain prefetch: {e}", exc_info=True)
 
