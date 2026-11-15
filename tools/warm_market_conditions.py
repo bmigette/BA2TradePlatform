@@ -272,14 +272,39 @@ def cmd_verify(args) -> int:
             print(f"verification failed: {refusal}", file=sys.stderr)
             return EXIT_ACTIONABLE
         report = W.verify(args.manifest, root)
+        quality = _chain_quality_verdict(root, args)
     except FileNotFoundError as e:
         print(f"verification failed: {e}", file=sys.stderr)
         return EXIT_ACTIONABLE
     except ManifestError as e:
         print(f"verification failed: {e}", file=sys.stderr)
         return EXIT_ACTIONABLE
-    _out(report.to_dict())
+    out = report.to_dict()
+    if quality is not None:
+        out["chain_quality"] = quality
+    _out(out)
+    if quality is not None and quality["refused"]:
+        print("verification failed: chain quality -- " + " | ".join(quality["refused"]), file=sys.stderr)
+        return EXIT_ACTIONABLE
     return EXIT_OK if report.ok else EXIT_ACTIONABLE
+
+
+def _chain_quality_verdict(root: str, args):
+    """For a CHAIN-profile manifest (iv-v1): the recorded chain quality against the thresholds
+    (``market_condition_iv_quality``), else None. Refused symbols fail the verification."""
+    from ba2_common.core.market_condition_iv_quality import quality_from_manifest, quality_problems
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    from ba2_common.core.market_conditions import is_chain_profile
+
+    bare = args.manifest.split(":", 1)[1] if args.manifest.startswith("sha256:") else args.manifest
+    manifest = MarketConditionStore(root).read_manifest(bare)
+    if not is_chain_profile(manifest["profile"]):
+        return None
+    accept = [x.strip().upper() for x in (args.iv_accept_symbols or "").split(",") if x.strip()]
+    refused, accepted = quality_problems(quality_from_manifest(manifest), max_run=args.iv_max_run,
+                                         max_rate=args.iv_max_rate, accept=accept)
+    return {"max_run": args.iv_max_run, "max_rate": args.iv_max_rate, "accepted_symbols": accept,
+            "refused": refused, "accepted": accepted}
 
 
 def cmd_prepare_host(args) -> int:
@@ -393,6 +418,14 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("verify", parents=[common, hs], help="re-hash every object a manifest references")
     v.add_argument("--manifest", required=True)
     v.add_argument("--cache-root", default=None)
+    from ba2_common.core.market_condition_iv_quality import MAX_RATE, MAX_RUN
+    v.add_argument("--iv-max-run", type=int, default=MAX_RUN,
+                   help=f"CHAIN profiles (iv-v1): refuse a symbol whose IV30/IV60 is unknown for more than "
+                        f"this many consecutive sessions while the stock trades (default {MAX_RUN})")
+    v.add_argument("--iv-max-rate", type=float, default=MAX_RATE,
+                   help=f"CHAIN profiles: ... or on more than this share of them (default {MAX_RATE})")
+    v.add_argument("--iv-accept-symbols", default=None, metavar="SYM[,SYM...]",
+                   help="CHAIN profiles: symbols whose chain-quality breach is ACCEPTED (reported, not refused)")
     v.set_defaults(func=cmd_verify)
 
     h = sub.add_parser("prepare-host", parents=[common, hs],

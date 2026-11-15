@@ -6212,6 +6212,25 @@ _MARKET_CONDITION_PROFILES: "tuple[str, ...]" = ()
 #: not for these commands.
 _MARKET_CONDITION_MANIFESTS: dict = {}
 
+#: iv-v1 chain-quality thresholds of this run (``--iv-quality-*``; see
+#: ``ba2_common.core.market_condition_iv_quality``). ``None`` = the module defaults.
+_IV_QUALITY: dict = {"max_run": None, "max_rate": None, "accept": ()}
+
+
+def _resolve_iv_quality(args) -> dict:
+    """Read ``--iv-quality-max-run/-max-rate/-accept`` into the module global; returns it."""
+    global _IV_QUALITY
+    accept = tuple(sorted({t.strip().upper() for t in str(getattr(args, "iv_quality_accept", None) or "").split(",")
+                           if t.strip()}))
+    _IV_QUALITY = {"max_run": getattr(args, "iv_quality_max_run", None),
+                   "max_rate": getattr(args, "iv_quality_max_rate", None), "accept": accept}
+    return _IV_QUALITY
+
+
+#: The ``options_store`` an option job must read for a chain manifest built from each recorded
+#: ``option_source`` (``ba2_providers.market_conditions.option_chain_source``).
+_OPTIONS_STORE_FOR_OPTION_SOURCE = {"thetadata-eod-parquet-v1": "thetadata"}
+
 
 def _market_condition_setting_value() -> str:
     """The ``market_condition_profile`` EXPERT SETTING this run writes onto every option job.
@@ -7202,6 +7221,11 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
             check_market_condition_window(check_config, SimpleNamespace(mapped_reader=reader))
         except ValueError as e:
             sys.exit(f"{command}: {e}")
+        if facts.get("option_source"):
+            _check_chain_manifest(command, profile, digest, facts, reader, backtest_block, kind,
+                                  universe, start, end)
+            if _IV_QUALITY["accept"]:
+                facts["iv_quality_accepted"] = list(_IV_QUALITY["accept"])
         manifests[profile] = digest
         facts_by_profile[profile] = facts
         warmed[profile] = len(reader.symbols())
@@ -7249,6 +7273,49 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     print(f"{command}: market-condition {shown}; {len(genes)} added genes; population and "
           f"generations are NOT scaled by the profile(s)")
     return recorded
+
+
+def _check_chain_manifest(command: str, profile: str, digest: str, facts: dict, reader, backtest_block: dict,
+                          kind: str, universe: list, start, end) -> None:
+    """Launch-time refusals for a CHAIN-profile snapshot (iv-v1), review 2026-11-15.
+
+    * THE OPTION SOURCE. An OPTION job must read the same chain store the snapshot was built from: a
+      ThetaData-built iv snapshot gating an AlphaVantage-store job would gate on one vendor's chain
+      and trade another's. (An equity job trades no chain, so only the record applies to it.)
+    * THE CHAIN QUALITY over exactly this run's sessions: a symbol whose IV is unknown for a long
+      run, or for too large a share, while the stock trades is refused by name unless accepted with
+      ``--iv-quality-accept`` (thresholds ``--iv-quality-max-run/-max-rate``). This is what keeps a
+      broken chain from hiding behind ``insufficient_history`` / a leading ``missing_session``.
+    """
+    from ba2_common.core.market_condition_iv_quality import (
+        MAX_RATE, MAX_RUN, quality_for_window, quality_problems,
+    )
+
+    source = facts["option_source"]
+    store = backtest_block.get("options_store")
+    if kind and kind in _OPTION_STRATEGY_KEYS:
+        want = _OPTIONS_STORE_FOR_OPTION_SOURCE.get(source)
+        if want is None or store != want:
+            sys.exit(f"{command}: market-condition manifest {digest} ({profile}) was built from option source "
+                     f"{source!r}, which is the {want!r} store, but this option job reads options_store "
+                     f"{store!r}. A gate on one vendor's chain must not filter trades priced on another's: "
+                     f"run the job on {want!r} or build the snapshot from the job's store.")
+    from app.services.backtest.price_source import _is_intraday
+    quality = quality_for_window(reader, universe, start, end,
+                                 intraday=_is_intraday(backtest_block.get("execution_interval") or "1d"))
+    max_run = MAX_RUN if _IV_QUALITY["max_run"] is None else int(_IV_QUALITY["max_run"])
+    max_rate = MAX_RATE if _IV_QUALITY["max_rate"] is None else float(_IV_QUALITY["max_rate"])
+    refused, accepted = quality_problems(quality, max_run=max_run, max_rate=max_rate,
+                                         accept=_IV_QUALITY["accept"])
+    for line in accepted:
+        print(f"{command}: ACCEPTED chain-quality breach (--iv-quality-accept): {line}")
+    if refused:
+        shown = " | ".join(refused[:20]) + (f" | ... and {len(refused) - 20} more" if len(refused) > 20 else "")
+        sys.exit(f"{command}: market-condition manifest {digest} ({profile}): {len(refused)} symbol(s) have "
+                 f"an unknown implied volatility for a run longer than {max_run} sessions or on more than "
+                 f"{max_rate:.0%} of this run's sessions while the stock trades -- a broken or late option "
+                 f"chain, which every iv gate would silently refuse: {shown}. Drop them from the universe, "
+                 f"repair the chain and re-warm, or accept them by name with --iv-quality-accept.")
 
 
 def _data_rebase_from_optimize_args(tokens) -> dict:
@@ -10224,6 +10291,7 @@ def _cmd_optimize(args) -> int:
     _resolve_pullback_gates(getattr(args, "pullback_gates", False), "optimize")
     _resolve_regime_split_entry(getattr(args, "regime_split_entry", None), "optimize")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None), "optimize")
+    _resolve_iv_quality(args)
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize")
@@ -11062,6 +11130,7 @@ def _cmd_optimize_batch(args) -> int:
     _resolve_regime_split_entry(getattr(args, "regime_split_entry", None), "optimize-batch")
     _resolve_market_condition_manifests(getattr(args, "market_condition_manifest", None),
                                         "optimize-batch")
+    _resolve_iv_quality(args)
     _resolve_market_condition_mode(getattr(args, "market_condition_mode", None), "optimize-batch")
     _resolve_market_exit_kinds(getattr(args, "market_exit", None), "optimize-batch")
     _resolve_search_sl_loosen(getattr(args, "search_sl_loosen", False), "optimize-batch")
@@ -12326,6 +12395,15 @@ def _add_market_condition_args(p) -> None:
                         "each worker would compute the indicators from whatever cache it "
                         "happened to hold. Refused at launch when it does not cover the run's "
                         "universe.")
+    p.add_argument("--iv-quality-max-run", type=int, default=None, metavar="SESSIONS",
+                   help="iv-v1 only: refuse a symbol whose IV30/IV60 is unknown for more than this many "
+                        "consecutive sessions of the run while the stock trades (default "
+                        "market_condition_iv_quality.MAX_RUN = 20).")
+    p.add_argument("--iv-quality-max-rate", type=float, default=None, metavar="SHARE",
+                   help="iv-v1 only: ... or on more than this share of them (default MAX_RATE = 0.40).")
+    p.add_argument("--iv-quality-accept", default=None, metavar="SYM[,SYM...]",
+                   help="iv-v1 only: symbols whose chain-quality breach is ACCEPTED explicitly (reported "
+                        "and recorded on the run, not refused).")
     p.add_argument("--benchmark-regime-gates", action="store_true", default=False,
                    help="OPT-IN, option structures (O_*, groups, O_WHEEL) and the equity S1-S7 "
                         "(goal2027; refused for any other key). Append two SPY-regime entry gates "

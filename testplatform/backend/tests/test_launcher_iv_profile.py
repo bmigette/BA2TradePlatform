@@ -146,9 +146,11 @@ def test_the_all_off_control_decodes_to_profile_none(iv_on, monkeypatch):
 
 
 # --------------------------------------------------------------------------- the trial config
-def _publish_iv_manifest(root, symbols=("AAA", "BBB")):
+def _publish_iv_manifest(root, symbols=("AAA", "BBB"), bad=()):
+    """``bad`` symbols: IV30/IV60 (and the ratios) ``insufficient_history`` on every session while the
+    realized vol is valid -- a broken chain hiding behind a legitimate-looking status."""
     from ba2_common.core.market_condition_store import MarketConditionStore
-    from ba2_common.core.market_conditions import STATUS_VALID
+    from ba2_common.core.market_conditions import STATUS_INSUFFICIENT_HISTORY, STATUS_VALID
 
     profile = PROFILES[IV_PROFILE]
     fields = [f.name for f in profile.fields]
@@ -156,8 +158,13 @@ def _publish_iv_manifest(root, symbols=("AAA", "BBB")):
     store = MarketConditionStore(root)
     objects = []
     for symbol in symbols:
-        rows = [{"session": s, "values": [1.5, 1.05, 0.3, 0.28, 0.2], "status": [STATUS_VALID] * len(fields),
-                 "reasons": [""] * len(fields), "window_digest": "sha256:" + "1" * 64, "raw_shard_ref": "",
+        if symbol in bad:
+            vals, sts = [None, None, None, None, 0.2], [STATUS_INSUFFICIENT_HISTORY] * 4 + [STATUS_VALID]
+        else:
+            vals, sts = [1.5, 1.05, 0.3, 0.28, 0.2], [STATUS_VALID] * len(fields)
+        rows = [{"session": s, "values": vals, "status": sts,
+                 "reasons": ["" if st == STATUS_VALID else "no expiry" for st in sts],
+                 "window_digest": "sha256:" + "1" * 64, "raw_shard_ref": "",
                  "raw_row_lo": 0, "raw_row_hi": 0} for s in sessions]
         for month in sorted({(r["session"].year, r["session"].month) for r in rows}):
             entry, _ = store.write_feature_object(
@@ -235,3 +242,47 @@ def test_an_ohlcv_manifest_records_no_option_source_fact(monkeypatch, tmp_path):
     monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
     facts = mod._market_condition_manifest_facts(digest, "ohlcv-v1")
     assert "option_source" not in facts
+
+
+# --------------------------------------------------------------------------- review 2026-11-15
+def _cfg(strat, **over):
+    cfg = {"backtest_id": "iv", "start_date": MC_START, "end_date": MC_END,
+           "enabled_instruments": ["AAA", "BBB"], "experts": [{"class": "FMPRating", "settings": {}}],
+           "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+           "entry_action": getattr(strat, "entry_action", None)}
+    cfg.update(over)
+    return cfg
+
+
+def test_an_iv_manifest_from_another_option_store_is_refused_on_an_option_job(iv_on, iv_snapshot, monkeypatch):
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {IV_PROFILE: iv_snapshot})
+    strat = _built("O_IC")
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize", _cfg(strat, options_store="alphavantage"), strat, "O_IC")
+    assert "thetadata-eod-parquet-v1" in str(e.value) and "alphavantage" in str(e.value)
+    # the matching store passes, and an equity job (no chain traded) is not held to a store
+    mod._apply_market_conditions("optimize", _cfg(strat, options_store="thetadata"), strat, "O_IC")
+    mod._apply_market_conditions("optimize", _cfg(strat, options_store="sqlite"), strat, "S1")
+
+
+def test_a_broken_chain_is_refused_at_launch_unless_accepted(iv_on, tmp_path, monkeypatch):
+    import ba2_common.config as bc
+
+    store, digest = _publish_iv_manifest(tmp_path / "cache2", bad=("AAA",))
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {IV_PROFILE: digest})
+    strat = _built("O_IC")
+    mod._resolve_iv_quality(type("A", (), {})())
+    with pytest.raises(SystemExit) as e:
+        mod._apply_market_conditions("optimize", _cfg(strat, options_store="thetadata"), strat, "O_IC")
+    msg = str(e.value)
+    assert "AAA" in msg and "BBB" not in msg.split("silently refuse:")[1] and "--iv-quality-accept" in msg
+    # accepted by name: launches, and the acceptance is recorded on the run
+    args = type("A", (), {"iv_quality_accept": "aaa", "iv_quality_max_run": None, "iv_quality_max_rate": None})()
+    mod._resolve_iv_quality(args)
+    try:
+        cfg = _cfg(strat, options_store="thetadata")
+        recorded = mod._apply_market_conditions("optimize", cfg, strat, "O_IC")
+        assert recorded["facts"][IV_PROFILE]["iv_quality_accepted"] == ["AAA"]
+    finally:
+        mod._resolve_iv_quality(type("A", (), {})())

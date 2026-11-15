@@ -300,6 +300,11 @@ def _market_condition_passthrough(args) -> list:
     out = ["--market-condition-profile", profile]
     if getattr(args, "market_condition_manifest", None):
         out += ["--market-condition-manifest", args.market_condition_manifest]
+    # iv-v1 chain-quality overrides: forwarded ONLY when stated, so every existing argv is unchanged.
+    for flag, attr in (("--iv-quality-max-run", "iv_quality_max_run"), ("--iv-quality-max-rate", "iv_quality_max_rate"),
+                       ("--iv-quality-accept", "iv_quality_accept")):
+        if getattr(args, attr, None) is not None:
+            out += [flag, str(getattr(args, attr))]
     return out
 
 
@@ -506,6 +511,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "Bare digests are matched to the profiles in order; profile=digest "
                          "pairs are explicit. Part of the identity digest too: a different "
                          "snapshot is a different experiment, not a resume.")
+    ap.add_argument("--iv-quality-max-run", type=int, default=None,
+                    help="iv-v1: forwarded to every job (launcher --iv-quality-max-run); default the launcher's")
+    ap.add_argument("--iv-quality-max-rate", type=float, default=None,
+                    help="iv-v1: forwarded to every job (launcher --iv-quality-max-rate)")
+    ap.add_argument("--iv-quality-accept", default=None, metavar="SYM[,SYM...]",
+                    help="iv-v1: symbols whose chain-quality breach is accepted (launcher --iv-quality-accept)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "

@@ -211,3 +211,66 @@ def test_the_mapped_reader_serves_the_published_iv_rows(root):
     want = dict(store.iter_rows(store.read_manifest(rep.manifest_digest), "AAA"))
     for session in (START, date(2025, 4, 1), END):
         assert dict(reader.observe("AAA", session).by_field()) == dict(want[session].by_field())
+
+
+# --------------------------------------------------------------------------- chain quality (review 2026-11-15)
+def _verify_cli():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[3] / "tools" / "warm_market_conditions.py"
+    spec = importlib.util.spec_from_file_location("warm_mc_cli_iv", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_build_records_chain_quality_and_verify_refuses_a_late_chain(root, capsys):
+    """AAA's tree starts 20 sessions AFTER the window does while its bars run throughout: a leading
+    missing_session run that window coverage exempts as "pre-listing". The build records it as a
+    chain-quality run, and verify refuses the symbol unless it is accepted by name."""
+    from types import SimpleNamespace
+
+    rows = _sessions(START - timedelta(days=7), END)
+    late = set(rows[:22])
+    _write_tree(root, "AAA", rows, fetched_through=END + timedelta(days=30), skip=late)
+    plan = _plan(root, universe=("AAA", "BBB"))
+    rep = _build(plan)
+    assert rep.ok, rep
+    q = rep.iv_quality
+    expected = sum(1 for d in late if d >= date.fromisoformat(plan.first_row_session))
+    assert expected > 15
+    assert q["AAA"][FIELD_ATM_IV_30]["longest_run"] == expected
+    assert q["AAA"][FIELD_ATM_IV_30]["run_first"] == plan.first_row_session
+    assert q["BBB"][FIELD_ATM_IV_30]["longest_run"] == 1             # the single interior hole
+    m = MarketConditionStore(str(root)).read_manifest(rep.manifest_digest)
+    kinds = {e["kind"] for e in m["coverage"]["AAA"]["exceptions"]}
+    assert {"iv_quality", "chain_quality"} <= kinds
+
+    cli = _verify_cli()
+    args = SimpleNamespace(manifest=rep.manifest_digest, iv_max_run=20, iv_max_rate=0.40, iv_accept_symbols=None)
+    verdict = cli._chain_quality_verdict(str(root), args)
+    assert [r.split(":")[0] for r in verdict["refused"]] == ["AAA"]
+    assert cli.main(["--quiet", "verify", "--manifest", rep.manifest_digest, "--cache-root", str(root),
+                         "--ohlcv-history-source", "fmp"]) == 1
+    assert cli.main(["--quiet", "verify", "--manifest", rep.manifest_digest, "--cache-root", str(root),
+                         "--ohlcv-history-source", "fmp", "--iv-accept-symbols", "AAA"]) == 0
+    assert cli.main(["--quiet", "verify", "--manifest", rep.manifest_digest, "--cache-root", str(root),
+                         "--ohlcv-history-source", "fmp", "--iv-max-run", "30", "--iv-max-rate", "0.5"]) == 0
+
+
+def test_conflicting_duplicate_quotes_are_counted_in_coverage(root):
+    import pandas as pd
+
+    sdir = root / "ThetaDataOptionsProvider" / "AAA"
+    part = sorted(p for p in sdir.iterdir() if p.name.startswith("exp="))[3]
+    f = next(part.glob("*.parquet"))
+    df = pd.read_parquet(f)
+    dup = df[df["bar_date"] == START.isoformat()].iloc[:5].copy()
+    assert len(dup) == 5
+    dup["bid"] = dup["bid"] + 0.5
+    pd.concat([df, dup]).to_parquet(f, index=False)
+    rep = _build(_plan(root, universe=("AAA",)))
+    assert rep.ok, rep
+    m = MarketConditionStore(str(root)).read_manifest(rep.manifest_digest)
+    cq = [e for e in m["coverage"]["AAA"]["exceptions"] if e["kind"] == "chain_quality"][0]
+    assert cq["conflicting_quotes_dropped"] >= 10

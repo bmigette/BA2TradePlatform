@@ -1013,6 +1013,8 @@ class BuildReport:
     exceptions: Dict[str, List[Dict[str, Any]]] = dc_field(default_factory=dict)
     errors: List[str] = dc_field(default_factory=list)
     waited_symbols: List[str] = dc_field(default_factory=list)
+    #: CHAIN PROFILES: ``{symbol: {field: quality}}`` (``market_condition_iv_quality``); empty otherwise.
+    iv_quality: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1349,6 +1351,7 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
         by_month.setdefault(month_of(w.session), []).append(w)
     chains = _YearChains(chain_source, sym, counters) if chain_compute is not None else None
     no_chain_ok_bars: List[date] = []      # sessions with a usable OHLCV window but no chain rows
+    conflicting_quotes = 0                 # quotes dropped as conflicting duplicates (ChainQuotes)
 
     objects: List[ObjectEntry] = []
     statuses: List[Tuple[date, List[str]]] = []
@@ -1371,6 +1374,8 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                 ch = chains.get(w.session)
                 if ch is None and w.ok:
                     no_chain_ok_bars.append(w.session)
+                if ch is not None:
+                    conflicting_quotes += ch.conflicts_dropped
                 keyed.append(_replace(w, digest=chain_row_digest(w.digest, ch.digest() if ch is not None else None)))
             ws = keyed
             for w in ws:
@@ -1451,6 +1456,17 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                       "reaches_last_row": no_chain_ok_bars[-1] == last_row})
         log(f"build {sym}: {len(no_chain_ok_bars)} session(s) with bars but no option chain rows "
             f"({no_chain_ok_bars[0]}..{no_chain_ok_bars[-1]}): missing_session")
+    if chains is not None:
+        # CHAIN QUALITY (review 2026-11-15): the holes insufficient_history would hide -- see
+        # market_condition_iv_quality. Recorded in THIS symbol's coverage (chain profiles only).
+        from ba2_common.core.market_condition_iv_quality import quality_from_statuses
+
+        ordered = sorted(statuses, key=lambda x: x[0])
+        by_field = {f: [st[j] for _s, st in ordered] for j, f in enumerate(fields)}
+        quality = quality_from_statuses([s_ for s_, _st in ordered], by_field)
+        for field, q in quality.items():
+            extra.append({"kind": "iv_quality", "field": field, **q})
+        extra.append({"kind": "chain_quality", "conflicting_quotes_dropped": int(conflicting_quotes)})
     counters.add("rows_total", len(windows))
     counters.add("symbols_built")
     # Records for objects this build superseded are no longer resume hints: drop them -- but
@@ -1678,6 +1694,19 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
             except OSError:
                 pass
     report.manifest_digest = digest
+    if chain_source is not None:
+        from ba2_common.core.market_condition_iv_quality import (
+            MAX_RATE, MAX_RUN, quality_from_manifest, quality_problems, worst_symbols,
+        )
+        report.iv_quality = quality_from_manifest(manifest)
+        worst = worst_symbols(report.iv_quality)
+        log("chain quality, worst symbols (longest run of unknown IV while the stock trades, rate): "
+            + ", ".join(f"{s} {run} ({rate:.0%})" for s, run, rate in worst))
+        refused, _accepted = quality_problems(report.iv_quality)
+        if refused:
+            log(f"chain quality: {len(refused)} symbol(s) breach the default thresholds (run > {MAX_RUN} "
+                f"sessions or rate > {MAX_RATE:.0%}); verify and the launcher will refuse them unless "
+                f"accepted explicitly: " + " | ".join(refused[:10]))
     report.ok, report.exit_code = True, 0
     report.elapsed_s = {"plan": plan_.elapsed_s, "fetch": round(fetch_elapsed, 4), "build": round(build_elapsed, 4),
                         "publish": round(time.monotonic() - t_pub, 4), "total": round(time.monotonic() - t_total, 4)}
