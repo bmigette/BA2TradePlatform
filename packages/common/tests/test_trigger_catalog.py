@@ -115,14 +115,19 @@ def test_the_counts_the_design_agreed():
     opened the evaluated position.
 
     83 -> 84 / options 13 -> 14 (2026-11-06): ``structure_share``, a style member's share of the
-    sleeve (plan 2026-11-06 structure-share-condition)."""
+    sleeve (plan 2026-11-06 structure-share-condition).
+
+    84 -> 89 / market 21 -> 26: five market triggers added after the last pin (the SPY regime
+    gates of plan 2026-10-24 among them) were never reflected here -- this test already failed
+    on the branch base before iv-v1. 89 -> 94 / market 26 -> 31 (2026-11-15): the five iv-v1 fields
+    (docs/plans/2026-11-15-option-iv-conditions.md)."""
     assert category_counts() == {
-        "all": 84,
+        "all": 94,
         "position": 19,
         "signal": 26,
         "targets": 10,
         "options": 14,
-        "market": 21,
+        "market": 31,
         "timing": 12,
     }
 

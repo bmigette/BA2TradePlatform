@@ -638,6 +638,14 @@ class ExpertEventType(str, Enum):
     N_STRUCTURE_STATE = "structure_state"
     N_STRUCTURE_BARS_SINCE_BOS = "structure_bars_since_bos"
     N_STRUCTURE_BARS_SINCE_CHOCH = "structure_bars_since_choch"
+    # Profile ``iv-v1`` (docs/plans/2026-11-15-option-iv-conditions.md): ATM implied volatility
+    # from the prior session's end-of-day option chain. All five stored fields get a member; the
+    # first two are the searched gates.
+    N_UNDERLYING_IV_RV_RATIO = "underlying_iv_rv_ratio_30_20"
+    N_UNDERLYING_IV_TERM_SLOPE = "underlying_iv_term_slope_30_60"
+    N_UNDERLYING_ATM_IV_30 = "underlying_atm_iv_30"
+    N_UNDERLYING_ATM_IV_60 = "underlying_atm_iv_60"
+    N_UNDERLYING_REALIZED_VOL_20 = "underlying_realized_vol_20"
     # BENCHMARK (SPY) REGIME ENTRY GATES (plan docs/plans/2026-10-24-spy-regime-gate.md). Two
     # CATEGORICAL fields compared with ``==`` against a mode code (``benchmark_regime`` tables);
     # they read the market-wide regime, not a per-instrument feature row, so they are NOT in
@@ -868,6 +876,11 @@ def get_numeric_event_values():
         ExpertEventType.N_STRUCTURE_STATE.value,
         ExpertEventType.N_STRUCTURE_BARS_SINCE_BOS.value,
         ExpertEventType.N_STRUCTURE_BARS_SINCE_CHOCH.value,
+        ExpertEventType.N_UNDERLYING_IV_RV_RATIO.value,
+        ExpertEventType.N_UNDERLYING_IV_TERM_SLOPE.value,
+        ExpertEventType.N_UNDERLYING_ATM_IV_30.value,
+        ExpertEventType.N_UNDERLYING_ATM_IV_60.value,
+        ExpertEventType.N_UNDERLYING_REALIZED_VOL_20.value,
     ]
 
 

@@ -51,13 +51,16 @@ from ba2_common.core.market_condition_source import (
 )
 from ba2_common.core.market_conditions import (
     COMPUTE_BY_PROFILE,
+    LIVE_UNAVAILABLE_PROFILES,
     PROFILES,
     STATUS_MISSING_SESSION,
+    STATUS_NO_CONTEXT,
     STATUS_VALID,
     WINDOW,
     FeatureRow,
     Observation,
     calc_version_accepted,
+    is_chain_profile,
 )
 
 __all__ = [
@@ -70,6 +73,8 @@ __all__ = [
     "FMPCacheMarketConditionReader",
     "CapturingMarketConditionReader",
     "ReplayMarketConditionReader",
+    "LiveUnavailableMarketConditionReader",
+    "ChainProfileNeedsManifest",
     "CAPTURE_PROVIDER",
     "CAPTURE_METHOD",
     "CAPTURE_SCHEMA",
@@ -110,6 +115,13 @@ CAPTURE_METHOD = "window"
 CAPTURE_SCHEMA = "market_condition_window/v1"
 
 _ABSENT = object()
+
+
+class ChainProfileNeedsManifest(ValueError):
+    """A profile whose rows need an option chain (``market_conditions.is_chain_profile``) was asked
+    for without a pinned manifest. Such a profile cannot be computed from bars: the only source of
+    its rows is a published snapshot built from the option chain store, so the reader REFUSES
+    rather than serving every gate ``missing_session`` (or inventing a fallback)."""
 
 
 class MarketConditionVersionMismatch(RuntimeError):
@@ -154,7 +166,14 @@ class WindowMarketConditionReader:
         if profile not in PROFILES:
             raise KeyError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)!r}")
         if profile not in COMPUTE_BY_PROFILE:
-            raise KeyError(f"no calculator registered for profile {profile!r} in COMPUTE_BY_PROFILE")
+            if not is_chain_profile(profile):
+                raise KeyError(f"no calculator registered for profile {profile!r} in COMPUTE_BY_PROFILE")
+            if mapped is None:
+                raise ChainProfileNeedsManifest(
+                    f"market-condition profile {profile!r} is computed from the option chain, not "
+                    f"from bars: it is served ONLY from a published manifest (build one with "
+                    f"tools/warm_market_conditions.py plan/build --option-root ..., then pin its "
+                    f"digest). There is no compute-on-miss path for it.")
         #: A ``MappedMarketConditionReader`` over a pinned manifest, or None (compute on miss).
         #: When set, ``_bars``/the calculator are never reached -- see the module docstring.
         if mapped is not None and mapped.profile != profile:
@@ -381,6 +400,45 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
         if path is None:
             return None
         return read_fmp_daily_cache(path)
+
+
+class LiveUnavailableMarketConditionReader:
+    """The LIVE reader of a profile that has no live data source (``LIVE_UNAVAILABLE_PROFILES``).
+
+    Every observation is the profile's fields at ``no_context`` with the registry's reason: the
+    gate never passes, the evaluator records the unknown, and the reason names the open decision.
+    An expert that combines this profile with others keeps its other profiles' readers -- only
+    these fields refuse. One ERROR per process per profile when the first one is built (the live
+    decision scope adds one ERROR per decision pass naming the expert).
+
+    It deliberately carries no ``mapped_reader`` (there is nothing to coverage-check) and is never
+    wrapped for capture (there is no window to retain); ``live_unavailable`` marks it for both.
+    """
+
+    live_unavailable = True
+    mapped_reader = None
+    _logged: set = set()
+    _log_lock = threading.Lock()
+
+    def __init__(self, profile: str):
+        if profile not in LIVE_UNAVAILABLE_PROFILES:
+            raise KeyError(f"profile {profile!r} has a live source; build its normal reader")
+        self.profile = profile
+        self.calc_version = PROFILES[profile].calc_version
+        self.reason = LIVE_UNAVAILABLE_PROFILES[profile]
+        #: observations refused (visibility for tests and diagnostics).
+        self.refused = 0
+        with self._log_lock:
+            first = profile not in self._logged
+            self._logged.add(profile)
+        if first:
+            from ba2_common.logger import logger
+
+            logger.error(f"{self.reason} Every live gate on its fields refuses the entry.")
+
+    def observe(self, symbol: str, session: date) -> Optional[FeatureRow]:
+        self.refused += 1
+        return FeatureRow.uniform(PROFILES[self.profile], STATUS_NO_CONTEXT, self.reason)
 
 
 # ---------------------------------------------------------------------------
@@ -736,18 +794,28 @@ def capturing_reader_for(reader: Any, capture: Any, *, source_profile: str,
     profile's capturer; each one dedupes on its own key, so a repeat read records nothing.
     """
     if isinstance(reader, CompositeMarketConditionReader):
-        capturers = [CapturingMarketConditionReader(r, capture, source_profile=source_profile,
-                                                    timing_policy=timing_policy)
-                     for r in reader.readers]
+        # A live-unavailable profile has no window to retain: it is passed through unwrapped (its
+        # refusals are reasons, not observations of a source) and the others are captured.
+        wrapped = [r if getattr(r, "live_unavailable", False)
+                   else CapturingMarketConditionReader(r, capture, source_profile=source_profile,
+                                                       timing_policy=timing_policy)
+                   for r in reader.readers]
+        capturers = [w for w in wrapped if isinstance(w, CapturingMarketConditionReader)]
 
         def record(symbol: str, session: date, row: Any = None) -> None:
             for capturer in capturers:
                 capturer.record(symbol, session, row)
 
-        return CompositeMarketConditionReader(capturers), record
+        return CompositeMarketConditionReader(wrapped), record
+    if getattr(reader, "live_unavailable", False):
+        return reader, _record_nothing
     capturer = CapturingMarketConditionReader(reader, capture, source_profile=source_profile,
                                               timing_policy=timing_policy)
     return capturer, capturer.record
+
+
+def _record_nothing(symbol: str, session: date, row: Any = None) -> None:
+    """The recorder of a live-unavailable reader: there is no window to record."""
 
 
 def market_condition_reader_for(readers: Sequence[Any]) -> Any:

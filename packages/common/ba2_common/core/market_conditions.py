@@ -1271,3 +1271,174 @@ def _compute_ta_structure_v1(o, h, l, c, v) -> FeatureRow:
 
 register_profile(TA_STRUCTURE_V1)
 COMPUTE_BY_PROFILE[TA_STRUCTURE_V1.name] = _compute_ta_structure_v1
+
+
+# ===========================================================================================
+# iv-v1 -- option implied-volatility measurements (docs/plans/2026-11-15-option-iv-conditions.md)
+# ===========================================================================================
+# Two SEARCHED gates for premium-selling structures and three stored components:
+#
+# * ``underlying_iv_rv_ratio_30_20``  -- ATM 30-day implied vol / 20-session realized vol
+# * ``underlying_iv_term_slope_30_60`` -- ATM 30-day / ATM 60-day implied vol (> 1 = inverted)
+# * ``underlying_atm_iv_30`` / ``underlying_atm_iv_60`` / ``underlying_realized_vol_20``
+#
+# INPUT CONTRACT. Unlike the two OHLCV profiles a row needs TWO inputs for its session S (the
+# ``prior_session_v1`` data session, exactly like every other profile -- the timing comes from the
+# shared resolver/context, not from here): S's END-OF-DAY option chain (bid/ask, as
+# ``implied_vol.ChainQuotes``) and the same validated 128-session OHLCV window ending at S that
+# ohlcv-v1 reads. The implied vols come from the chain alone (``implied_vol.atm_iv_term``); the
+# realized vol uses the window's closes with the RV ratio's conventions (``math.log`` returns,
+# ``math.fsum`` sample std, ddof = 1) over the last 20 returns, annualised by sqrt(252) because,
+# unlike the 5/20 ratio, it is compared with an annualised implied vol.
+#
+# The profile is therefore NOT in ``COMPUTE_BY_PROFILE`` (it cannot be computed from bars alone):
+# its calculator is ``CHAIN_COMPUTE_BY_PROFILE[profile](session, chain, bars, window_status,
+# window_reason)``. A reader serves it ONLY from a published manifest (the store build reads the
+# option chain tree); nothing computes it on a miss.
+#
+# MISSING VALUES (the existing policy, unchanged: an unknown never passes an active gate and is
+# counted per status in ``market_unknown_input_by_reason``):
+#
+# * the chain has NO rows at all for the session -> ``missing_session`` (a source hole: the status
+#   a missing OHLCV bar gets, so launch-time window coverage refuses an unexplained interior run
+#   exactly as it does for bars, and a leading run before the options listed is exempt);
+# * the chain exists but cannot define the measurement (no forward, crossed/zero quotes, no
+#   strike near the money, no expiry on one side of 30/60 days) -> ``insufficient_history``: a
+#   LEGITIMATELY undefined observation, the precedent being ta-structure-v1's "no confirmed pivot";
+# * the realized leg inherits the OHLCV window's status (``missing_session`` / ``invalid_prices`` /
+#   ``insufficient_history``) exactly as ohlcv-v1's RV ratio does;
+# * a ratio takes the status of its first unknown component (the 30-day IV first); a ZERO realized
+#   vol makes the IV/RV ratio ``insufficient_history`` (undefined), never infinity.
+from ba2_common.core import implied_vol as _iv  # noqa: E402  (pure; imports nothing from here)
+
+IV_PROFILE = "iv-v1"
+IV_CALC_VERSION = _iv.IV_CALC_VERSION
+
+FIELD_IV_RV_RATIO = "underlying_iv_rv_ratio_30_20"
+FIELD_IV_TERM_SLOPE = "underlying_iv_term_slope_30_60"
+FIELD_ATM_IV_30 = "underlying_atm_iv_30"
+FIELD_ATM_IV_60 = "underlying_atm_iv_60"
+FIELD_REALIZED_VOL_20 = "underlying_realized_vol_20"
+IV_FIELDS = (FIELD_IV_RV_RATIO, FIELD_IV_TERM_SLOPE, FIELD_ATM_IV_30, FIELD_ATM_IV_60, FIELD_REALIZED_VOL_20)
+
+#: Trading sessions per year for annualising the 20-session realized vol.
+RV_ANNUALIZATION = 252
+_RV20 = 20
+
+IV_V1 = ProfileSpec(name=IV_PROFILE, calc_version=IV_CALC_VERSION, fields=(
+    FieldSpec(name=FIELD_IV_RV_RATIO, kind="numeric", short="ivrv", searched=True,
+              value_min=0.6, value_max=2.0, value_step=0.1, anchor_op=">", anchor_value=1.2,
+              ui_name="Implied / realized volatility",
+              unit="ratio of ATM 30-day implied volatility to 20-session realized volatility (both annualized)"),
+    FieldSpec(name=FIELD_IV_TERM_SLOPE, kind="numeric", short="ivterm", searched=True,
+              value_min=0.85, value_max=1.20, value_step=0.05, anchor_op=">", anchor_value=1.0,
+              ui_name="Implied volatility term slope",
+              unit="ratio of ATM 30-day to ATM 60-day implied volatility (above 1 = inverted)"),
+    FieldSpec(name=FIELD_ATM_IV_30, kind="numeric", short="iv30", searched=False,
+              value_min=0.10, value_max=1.00, value_step=0.05, anchor_op=">", anchor_value=0.30,
+              ui_name="ATM 30-day implied volatility", unit="annualized volatility (0.30 = 30%)"),
+    FieldSpec(name=FIELD_ATM_IV_60, kind="numeric", short="iv60", searched=False,
+              value_min=0.10, value_max=1.00, value_step=0.05, anchor_op=">", anchor_value=0.30,
+              ui_name="ATM 60-day implied volatility", unit="annualized volatility (0.30 = 30%)"),
+    FieldSpec(name=FIELD_REALIZED_VOL_20, kind="numeric", short="rv20", searched=False,
+              value_min=0.10, value_max=1.00, value_step=0.05, anchor_op=">", anchor_value=0.30,
+              ui_name="20-session realized volatility",
+              unit="annualized volatility: sample std of 20 daily log returns x sqrt(252)"),
+))
+
+
+def realized_vol_20(c) -> Observation:
+    """Annualised 20-session realized vol: fsum sample std (ddof=1) of the last 20 log returns of
+    ``c`` times sqrt(252). Same return/std conventions as :func:`realized_vol_ratio`. Zero is a
+    valid measurement (twenty-one identical closes)."""
+    c = _f64(c)
+    need = _RV20 + 1
+    if len(c) < need:
+        return Observation(None, STATUS_INSUFFICIENT_HISTORY, f"insufficient history: {len(c)} of {need} closes")
+    tail = c[-need:]
+    bad = np.flatnonzero(~np.isfinite(tail) | (tail <= 0))
+    if bad.size:
+        idx = len(c) - need + int(bad[0])
+        return Observation(None, STATUS_INVALID_PRICES, f"index {idx} (close non-finite or non-positive)")
+    tl = tail.tolist()
+    r = [math.log(tl[j] / tl[j - 1]) for j in range(1, len(tl))]
+    value = _fsum_sample_std(r) * math.sqrt(RV_ANNUALIZATION)
+    if not math.isfinite(value):
+        return Observation(None, STATUS_INVALID_PRICES, "non-finite realized volatility")
+    return Observation(value, STATUS_VALID)
+
+
+def _iv_obs(value: Optional[float], reason: str, empty: bool) -> Observation:
+    if value is not None:
+        return Observation(float(value), STATUS_VALID)
+    return Observation(None, STATUS_MISSING_SESSION if empty else STATUS_INSUFFICIENT_HISTORY, reason)
+
+
+def _ratio(num: Observation, den: Observation, what: str) -> Observation:
+    for part in (num, den):
+        if part.status != STATUS_VALID:
+            return Observation(None, part.status, f"{what}: {part.reason}" if part.reason else what)
+    if den.value == 0.0:
+        return Observation(None, STATUS_INSUFFICIENT_HISTORY, f"{what}: zero denominator")
+    value = num.value / den.value
+    if not math.isfinite(value):
+        return Observation(None, STATUS_INVALID_PRICES, f"{what}: non-finite ratio")
+    return Observation(value, STATUS_VALID)
+
+
+def compute_iv_v1(session: Any, chain: Any = None, bars: Optional[Sequence[Any]] = None,
+                  window_status: str = STATUS_VALID, window_reason: str = "") -> FeatureRow:
+    """The five ``iv-v1`` observations of ``session`` (a ``datetime.date``).
+
+    ``chain`` = the session's end-of-day quotes (``implied_vol.ChainQuotes``; ``None`` or empty ->
+    the implied fields are ``missing_session``). ``bars`` = ``(o, h, l, c, v)``, the validated
+    ``WINDOW``-session OHLCV window ending at ``session``, when ``window_status`` is valid;
+    otherwise ``window_status`` / ``window_reason`` say why the window could not be assembled and
+    the realized fields carry them."""
+    term = _iv.atm_iv_term(chain if chain is not None else _iv.ChainQuotes.empty(), session)
+    iv30 = _iv_obs(term.iv30, term.iv30_reason, term.empty)
+    iv60 = _iv_obs(term.iv60, term.iv60_reason, term.empty)
+    if window_status != STATUS_VALID:
+        rv20 = Observation(None, window_status, window_reason)
+    elif bars is None:
+        raise ValueError("compute_iv_v1: a valid window status needs the window's bars")
+    else:
+        o, h, l, c, v = (_f64(x) for x in bars)
+        if len(c) != WINDOW or len({len(o), len(h), len(l), len(c), len(v)}) != 1:
+            raise ValueError(f"compute_iv_v1: expected exactly {WINDOW} bars per column, got {len(c)}")
+        problem = _invalid_bar_reason(o, h, l, c, v)
+        rv20 = Observation(None, STATUS_INVALID_PRICES, problem) if problem is not None else realized_vol_20(c)
+    values = {
+        FIELD_IV_RV_RATIO: _ratio(iv30, rv20, "implied/realized"),
+        FIELD_IV_TERM_SLOPE: _ratio(iv30, iv60, "term slope"),
+        FIELD_ATM_IV_30: iv30,
+        FIELD_ATM_IV_60: iv60,
+        FIELD_REALIZED_VOL_20: rv20,
+    }
+    return FeatureRow(values=values, calc_versions={f: IV_CALC_VERSION for f in values})
+
+
+register_profile(IV_V1)
+
+#: profile -> ``fn(session, chain, bars, window_status, window_reason) -> FeatureRow`` for the
+#: profiles whose rows need an option chain. A registered profile is in exactly one of this and
+#: ``COMPUTE_BY_PROFILE``; a chain profile is served only from a published manifest.
+CHAIN_COMPUTE_BY_PROFILE: Dict[str, Callable[..., FeatureRow]] = {IV_PROFILE: compute_iv_v1}
+
+#: profile -> why the LIVE platform cannot serve it. The live resolver serves such a profile with a
+#: reader that refuses every observation (``no_context`` + this reason, one ERROR per process): its
+#: gates never pass live, loudly and countably, and the expert's other profiles are unaffected.
+LIVE_UNAVAILABLE_PROFILES: Dict[str, str] = {
+    IV_PROFILE: (
+        "market-condition profile 'iv-v1' has NO live data source: it needs the PRIOR session's "
+        "end-of-day option chain with bid/ask (the backtest reads the ThetaData EOD store), and "
+        "no live account or provider wired into this platform serves that (Alpaca and TastyTrade "
+        "carry no historical option quotes; the live Alpaca chain is the current intraday "
+        "snapshot). Its gates refuse every live entry until a live EOD-chain adapter is decided "
+        "and built (docs/plans/2026-11-15-option-iv-conditions.md)."),
+}
+
+
+def is_chain_profile(profile: str) -> bool:
+    """Whether ``profile``'s rows need an option chain (served only from a published manifest)."""
+    return profile in CHAIN_COMPUTE_BY_PROFILE

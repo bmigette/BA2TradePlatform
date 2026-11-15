@@ -95,6 +95,10 @@ _FIELD_ABBR: Dict[str, str] = {
     "close_vs_prior_high_20_atr": "vsPriorHi", "close_vs_prior_low_20_atr": "vsPriorLo",
     "structure_state": "swing",
     "structure_bars_since_bos": "sinceBos", "structure_bars_since_choch": "sinceChoch",
+    # iv-v1: the fallback would render all five as "underlyingIv"/"underlyingAt"/"underlyingRe".
+    "underlying_iv_rv_ratio_30_20": "ivRv", "underlying_iv_term_slope_30_60": "ivTerm",
+    "underlying_atm_iv_30": "iv30", "underlying_atm_iv_60": "iv60",
+    "underlying_realized_vol_20": "rv20",
 }
 _OP_TOKEN: Dict[str, str] = {
     ">": "gt", ">=": "gte", "<": "lt", "<=": "lte", "==": "eq", "!=": "ne",

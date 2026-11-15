@@ -731,7 +731,15 @@ class LiveMarketConditionResolver:
         operator may legitimately run un-pinned -- but it must be impossible to miss, so the
         decision scope reports it once per PASS rather than once per process.
         """
-        return tuple(p for p, mapped in zip(self.profiles, self.mapped_readers) if mapped is None)
+        unavailable = set(self.live_unavailable_profiles())
+        return tuple(p for p, mapped in zip(self.profiles, self.mapped_readers)
+                     if mapped is None and p not in unavailable)
+
+    def live_unavailable_profiles(self) -> Tuple[str, ...]:
+        """The served profiles with NO live data source (``LIVE_UNAVAILABLE_PROFILES``), whose
+        reader refuses every observation. Reported once per decision pass, by name."""
+        readers = getattr(self.reader, "readers", None) or (self.reader,)
+        return tuple(r.profile for r in readers if getattr(r, "live_unavailable", False))
 
     def no_context_reason_for(self, symbol: Any) -> Optional[str]:
         """Why THIS symbol has no context, or None to fall back to the generic reason.
@@ -946,10 +954,19 @@ def _report_unpinned_profiles(resolver: "LiveMarketConditionResolver",
     profile being warmed). It is raised to an ERROR, per pass, naming the expert and the
     profiles, so it cannot be mistaken for the pinned configuration the design assumes.
     """
+    from ba2_common.logger import logger
+
+    unavailable = resolver.live_unavailable_profiles()
+    if unavailable:
+        from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES
+
+        logger.error(
+            f"expert instance {expert_instance_id} gates on market-condition profile(s) "
+            f"{list(unavailable)} that have NO live data source; every entry gate on their fields "
+            f"refuses this pass. " + " ".join(LIVE_UNAVAILABLE_PROFILES[p] for p in unavailable))
     unpinned = resolver.research_mode_profiles()
     if not unpinned:
         return
-    from ba2_common.logger import logger
 
     logger.error(
         f"market-condition profile(s) {list(unpinned)} serve expert instance "
@@ -1116,7 +1133,15 @@ def resolver_for_profiles(profiles: Sequence[str], *,
     if source_profile != SOURCE_PROFILE_FMP_DAILY:
         # the reader must read the cache of the profile the resolver stamps on its capture
         reader_kwargs["source_profile"] = source_profile
-    readers = [_fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
+    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES
+    from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+
+    # A profile with NO live source (iv-v1: the prior session's EOD option chain) is served by a
+    # reader that refuses every observation with its reason -- never by the FMP-cache reader,
+    # which cannot compute it, and never from a historical snapshot, which holds no row for the
+    # session a live decision reads.
+    readers = [LiveUnavailableMarketConditionReader(name) if name in LIVE_UNAVAILABLE_PROFILES
+               else _fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
                for name in names]
     return LiveMarketConditionResolver(
         names, reader=market_condition_reader_for(readers), source_profile=source_profile,

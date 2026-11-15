@@ -73,6 +73,12 @@ STRICT_FIELD_NAMES = frozenset({
     "structure_state",
     "structure_bars_since_bos",
     "structure_bars_since_choch",
+    # iv-v1 (docs/plans/2026-11-15-option-iv-conditions.md): all five stored fields.
+    "underlying_iv_rv_ratio_30_20",
+    "underlying_iv_term_slope_30_60",
+    "underlying_atm_iv_30",
+    "underlying_atm_iv_60",
+    "underlying_realized_vol_20",
     # SPY benchmark regime gates (plan 2026-10-24-spy-regime-gate): no profile serves them.
     "spy_trend_regime",
     "spy_vol_regime",
