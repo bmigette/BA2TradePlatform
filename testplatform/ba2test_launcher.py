@@ -7247,6 +7247,66 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
     return recorded
 
 
+_OPTIMIZE_PARSER = None
+
+
+def _optimize_parser():
+    """The REAL ``optimize`` sub-parser ``main`` builds, captured without running anything (``main`` is
+    entered with ``parse_args`` intercepted; the working directory and ``_CALLER_CWD`` are restored).
+    Cached per process. The one source of truth for how an optimize token list is READ."""
+    global _OPTIMIZE_PARSER, _CALLER_CWD
+    if _OPTIMIZE_PARSER is None:
+        class _Captured(Exception):
+            pass
+
+        def _capture(self, args=None, namespace=None):
+            raise _Captured(self)
+
+        real, cwd, caller = argparse.ArgumentParser.parse_args, os.getcwd(), _CALLER_CWD
+        argparse.ArgumentParser.parse_args = _capture
+        try:
+            main(["optimize"])
+            raise RuntimeError("ba2test_launcher.main returned before parsing")
+        except _Captured as e:
+            top = e.args[0]
+        finally:
+            argparse.ArgumentParser.parse_args = real
+            os.chdir(cwd)
+            _CALLER_CWD = caller
+        sub = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction))
+        _OPTIMIZE_PARSER = sub.choices["optimize"]
+    return _OPTIMIZE_PARSER
+
+
+def _canonical_optimize_tokens(tokens) -> list:
+    """``tokens`` (optimize args) as argparse READS them, spelled out: every ``--option`` resolved to its
+    full flag (an exact match first, else the ONE flag it abbreviates -- the optimize parser allows
+    abbreviations) and ``--flag=value`` split into ``--flag value``. An option argparse would refuse
+    (unknown, ambiguous, a value given to a switch) raises ``ValueError`` naming it. Values and the
+    order of the tokens are kept, so a repeated flag still means "the last one wins"."""
+    actions = _optimize_parser()._option_string_actions
+    longs = [s for s in actions if s.startswith("--")]
+    out = []
+    for t in tokens:
+        if not isinstance(t, str) or not t.startswith("--") or t == "--":
+            out.append(t)
+            continue
+        opt, eq, val = t.partition("=")
+        if opt in actions:
+            full = opt
+        else:
+            hits = [s for s in longs if s.startswith(opt)]
+            if len(hits) != 1:
+                raise ValueError(f"optimize option {opt!r} is "
+                                 + (f"ambiguous ({', '.join(sorted(hits))})" if hits else "unknown")
+                                 + ": spell the flag out")
+            full = hits[0]
+        if eq and actions[full].nargs == 0:
+            raise ValueError(f"optimize switch {full} takes no value, got {t!r}")
+        out += [full, val] if eq else [full]
+    return out
+
+
 def _data_rebase_from_optimize_args(tokens) -> dict:
     """The DATA choices an ``optimize`` command line states, for ``_rebase_run_data``.
 
@@ -7256,11 +7316,16 @@ def _data_rebase_from_optimize_args(tokens) -> dict:
     (``--screener-store`` of a screener job, else None), ``manifests`` (``{profile: digest}`` from
     ``--market-condition-manifest``, both spellings, else None) and ``exclude_symbols`` (the current
     ``--exclude-symbols``; ``[]`` when the command excludes nothing). Pure: no launcher global is set.
+
+    The tokens are read the way the TRAIN job's argparse read them (``_canonical_optimize_tokens``:
+    abbreviations and ``--flag=value`` resolved) and a repeated flag's LAST value wins, as in argparse
+    -- an operator override after the recipe must reach the test exactly as it reached the training.
     """
-    tokens = list(tokens)
+    tokens = _canonical_optimize_tokens(list(tokens))
 
     def value(flag):
-        return tokens[tokens.index(flag) + 1] if flag in tokens and tokens.index(flag) + 1 < len(tokens) else None
+        at = [i for i, t in enumerate(tokens[:-1]) if t == flag]
+        return tokens[at[-1] + 1] if at else None
 
     screener = "--screener" in tokens
     universe = value("--universe")

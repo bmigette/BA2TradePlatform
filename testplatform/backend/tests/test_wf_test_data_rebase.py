@@ -59,6 +59,33 @@ def test_spec_of_a_daily_panel_screener_command_names_its_panel(L):
     assert "screener_panel" not in L._data_rebase_from_optimize_args(["--universe", "AAPL", "--screener-panel", "P"])
 
 
+def test_the_last_value_wins_as_in_the_training_argparse(L):
+    """An operator override after the recipe (option_style_job.sh extra args) trains on the LAST value;
+    the deferred test must read the same one, whichever spelling the override used."""
+    base = ["--universe", "AAPL", "--screener", "--screener-store", "S1", "--screener-panel", "P1",
+            "--market-condition-profile", "ohlcv-v1", "--market-condition-manifest", "ohlcv-v1=aa"]
+    for override in (["--screener-panel", "P2"], ["--screener-panel=P2"], ["--screener-pan", "P2"],
+                     ["--screener-pan=P2"]):
+        assert L._data_rebase_from_optimize_args(base + override)["screener_panel"] == "P2"
+    spec = L._data_rebase_from_optimize_args(base + ["--screener-store=S2", "--market-condition-man", "ohlcv-v1=bb"])
+    assert spec["screener_store"] == "S2" and spec["manifests"] == {"ohlcv-v1": "bb"}
+
+
+def test_the_canonical_reading_is_the_real_parsers(L):
+    """Abbreviations resolve to the flag the real optimize parser resolves them to; an ambiguous or unknown
+    option is refused by name (argparse would refuse the training command too)."""
+    parser = L._optimize_parser()
+    assert parser.allow_abbrev is True
+    assert L._canonical_optimize_tokens(["--screener-pan=P", "--seed", "4", "--seed=5"]) == \
+        ["--screener-panel", "P", "--seed", "4", "--seed", "5"]
+    with pytest.raises(ValueError, match="ambiguous"):
+        L._canonical_optimize_tokens(["--screener-", "x"])
+    with pytest.raises(ValueError, match="unknown"):
+        L._canonical_optimize_tokens(["--no-such-flag", "x"])
+    with pytest.raises(ValueError, match="takes no value"):
+        L._canonical_optimize_tokens(["--screener=1"])
+
+
 def _panel(tmp_path, fingerprint, criteria):
     import json
     d = tmp_path / "screener" / "daily_panel" / fingerprint
