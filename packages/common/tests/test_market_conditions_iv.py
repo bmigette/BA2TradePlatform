@@ -330,7 +330,9 @@ def test_an_iv_expert_is_built_with_its_recorded_option_source(instances, monkey
     pir.resolver_for(2)
     pir.resolver_for(3)
     assert [kw.get("option_source") for _p, kw in built] == ["alphavantage", "thetadata"]
-    assert (2, ("iv-v1",), "alphavantage") in pir._resolvers and (3, ("iv-v1",), "thetadata") in pir._resolvers
+    # the key also carries the live IV chain source (app setting) and the broker universe bound (None here)
+    assert (2, ("iv-v1",), "alphavantage", None, None) in pir._resolvers
+    assert (3, ("iv-v1",), "thetadata", None, None) in pir._resolvers
 
 
 def test_a_thetadata_trained_iv_gate_is_refused_live_by_name():

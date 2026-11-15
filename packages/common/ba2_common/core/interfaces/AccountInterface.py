@@ -2,7 +2,7 @@ import math
 import threading
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
 from ba2_common.core.types import (
@@ -73,6 +73,29 @@ class AccountInterface(ReadOnlyAccountInterface):
     #: buying power REFUSES sizing loudly instead. Default False: Alpaca, TastyTrade and every fake keep
     #: the existing fallback chain byte for byte.
     buying_power_is_mandatory = False
+
+    #: OPTION CHAIN QUOTE SOURCE (iv-v1 live, ``ba2_common.core.option_chain_quotes``). True on a class that
+    #: implements :meth:`get_option_chain_quote_snapshot` with REAL exchange quotes (an entitlement may
+    #: still be checked per call). Lists the account in the Settings "Live IV chain source" dropdown. The
+    #: account is then used for MARKET DATA ONLY -- never for orders -- and may differ from the expert's
+    #: trading account. ``option_chain_quote_source_kind`` names the vendor for the certified source
+    #: pairings (``market_conditions.LIVE_SERVING_PAIRINGS``).
+    supports_option_chain_quote_snapshot = False
+    option_chain_quote_source_kind: Optional[str] = None
+
+    def get_option_chain_quote_snapshot(self, underlying: str, *, expiry_min: date, expiry_max: date,
+                                        strike_band: float) -> Any:
+        """The broker's latest quote of every contract of ``underlying`` with an expiry in
+        ``[expiry_min, expiry_max]`` and a strike within ``strike_band`` of the underlying's last close,
+        as an ``option_chain_quotes.OptionChainQuoteSnapshot``. Read-only market data.
+
+        Raises ``OptionChainQuotesUnsupported`` (this default: the account has no implementation) or
+        ``OptionChainQuotesFetchError`` (the request failed; retried later)."""
+        from ba2_common.core.option_chain_quotes import OptionChainQuotesUnsupported
+
+        raise OptionChainQuotesUnsupported(
+            f"{type(self).__name__} does not provide option chain quotes (no implementation); choose a "
+            f"supported quote-source account (TastyTrade) or 'alphavantage' for the live IV chain source")
 
     #: One RLock per ACCOUNT ID, serialising ``submit_order`` from validation through the
     #: broker call. The account-wide exposure ceiling is a read-decide-act sequence against

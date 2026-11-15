@@ -40,13 +40,95 @@ from ba2_common.core.market_conditions import (
 
 __all__ = ["IvEvidence", "ChainLiveReader", "register_live_chain_reader", "live_chain_reader_factory",
            "clear_live_chain_readers", "CapturingChainReader", "ReplayChainReader", "CAPTURE_METHOD_CHAIN",
-           "CAPTURE_SCHEMA_CHAIN", "chain_bytes", "chain_from_bytes"]
+           "CAPTURE_SCHEMA_CHAIN", "chain_bytes", "chain_from_bytes", "LIVE_CHAIN_SOURCE_SETTING",
+           "SOURCE_ALPHAVANTAGE", "SOURCE_BROKER", "LiveChainSource", "parse_live_chain_source",
+           "configured_live_chain_source_value", "bounded_iv_universe", "UNIVERSE_SETTING"]
 
 CAPTURE_METHOD_CHAIN = "chain_window"
 CAPTURE_SCHEMA_CHAIN = "market_condition_chain_window/v1"
 MEMO_SIZE = 4000
 
-#: option source -> ``factory(profile, *, cache_root, source_profile) -> ChainLiveReader``.
+#: APP SETTING choosing WHERE live reads the prior session's chain: blank (unset: every active iv gate
+#: refuses, naming it), ``alphavantage``, or ``account:<id>`` (a quote-source account definition, used for
+#: MARKET DATA ONLY -- never for orders -- and possibly different from the expert's trading account).
+LIVE_CHAIN_SOURCE_SETTING = "iv_live_chain_source"
+SOURCE_ALPHAVANTAGE = "alphavantage"
+SOURCE_BROKER = "broker"
+#: The expert setting that bounds a screener expert's universe (``MarketExpertInterface``).
+UNIVERSE_SETTING = "screener_symbol_universe"
+
+
+@dataclass(frozen=True)
+class LiveChainSource:
+    raw: str
+    source: str                       # SOURCE_ALPHAVANTAGE | SOURCE_BROKER
+    account_id: Optional[int] = None
+
+
+def parse_live_chain_source(value: Any) -> Optional[LiveChainSource]:
+    """The app setting's value -> :class:`LiveChainSource`; None when blank. ValueError when malformed."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.lower() == SOURCE_ALPHAVANTAGE:
+        return LiveChainSource(raw, SOURCE_ALPHAVANTAGE)
+    if raw.lower().startswith("account:"):
+        ident = raw.split(":", 1)[1].strip()
+        if not ident.isdigit() or int(ident) <= 0:
+            raise ValueError(f"{raw!r}: expected account:<account definition id>")
+        return LiveChainSource(raw, SOURCE_BROKER, int(ident))
+    raise ValueError(f"{raw!r}: expected blank, 'alphavantage' or 'account:<account definition id>'")
+
+
+def configured_live_chain_source_value() -> Optional[str]:
+    """The stored app setting (None when absent, blank or unreadable -- an unreadable DB reads as unset,
+    so the gates refuse naming the setting)."""
+    try:
+        from ba2_common.config import get_app_setting
+
+        value = get_app_setting(LIVE_CHAIN_SOURCE_SETTING)
+    except Exception as e:  # noqa: BLE001 -- a settings read must never take the decision pass down
+        from ba2_common.core.failure_modes import absorb_if_benign
+
+        absorb_if_benign(e, OSError, ValueError, LookupError, RuntimeError)
+        return None
+    value = str(value or "").strip()
+    return value or None
+
+
+def _universe_tokens(raw: Any) -> list:
+    text = str(raw or "")
+    for sep in (";", "\n", "\t", " "):
+        text = text.replace(sep, ",")
+    return sorted({t.strip().upper() for t in text.split(",") if t.strip()})
+
+
+def bounded_iv_universe(expert: Any) -> Tuple[Optional[list], str]:
+    """``(symbols, reason)``: the symbols an expert's iv gates can ever be asked about, when BOUNDED --
+    its fixed instruments, or (a screener expert) its ``screener_symbol_universe`` -- else
+    ``(None, reason)`` naming what to set. A broker quote source can only serve chains captured between
+    the close and the next open, so it needs this bound to know what to capture."""
+    from ba2_common.core.market_condition_live import UNIVERSE_SENTINELS
+
+    names = [str(n).strip().upper() for n in (expert.get_enabled_instruments() or ()) if str(n).strip()]
+    sentinels = sorted({n for n in names if n in UNIVERSE_SENTINELS})
+    fixed = sorted({n for n in names if n not in UNIVERSE_SENTINELS})
+    if not sentinels:
+        if not fixed:
+            return None, "the expert has no enabled instruments"
+        return fixed, ""
+    if sentinels == ["SCREENER"]:
+        universe = _universe_tokens(expert.settings.get(UNIVERSE_SETTING))
+        if universe:
+            return sorted(set(universe) | set(fixed)), ""
+        return None, (f"its screener picks names at the decision from the WHOLE market ({UNIVERSE_SETTING} is "
+                      f"empty); a broker quote source can only serve chains captured after the prior close, so "
+                      f"set {UNIVERSE_SETTING} to the names it may pick")
+    return None, (f"its instruments are chosen at analysis time ({', '.join(sentinels)}) with no bounded "
+                  f"universe; a broker quote source can only serve chains captured after the prior close")
+
+
+#: option source -> ``factory(profile, *, cache_root, source_profile[, account_id]) -> ChainLiveReader``.
 _LIVE_CHAIN_READERS: Dict[str, Callable[..., Any]] = {}
 _REG_LOCK = threading.Lock()
 
@@ -81,6 +163,9 @@ class IvEvidence:
     window_reason: str = ""
     failure: str = ""
     session: Optional[date] = None
+    #: what the serving source reported about the chain (broker: summary-date counts, updated-at range,
+    #: account id); recorded with the capture evidence.
+    source_facts: Optional[Dict[str, Any]] = None
 
 
 def chain_bytes(chain: Any) -> bytes:
@@ -176,6 +261,8 @@ class ChainLiveReader:
     live_chain = True
     mapped_reader = None
     option_source = ""
+    #: the certified-pairing kind this reader serves (``market_conditions.LIVE_SERVING_PAIRINGS``).
+    serving_kind = ""
     #: consecutive HTTP failures in one pass after which the pass refuses further fetches outright.
     CIRCUIT_AFTER = 3
 
@@ -345,6 +432,14 @@ def _identity(reader: Any, symbol: str, session: date, source_profile: str, timi
             "timing_policy": timing_policy, "calc_version": reader.calc_version}
 
 
+def _jsonable(facts: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    if facts is None:
+        return None
+    import json
+
+    return json.loads(json.dumps(dict(facts), default=str))
+
+
 class CapturingChainReader:
     """Record every row a :class:`ChainLiveReader` serves, with its evidence, once per
     (symbol, session, evidence digest). Recording is evidence, never a dependency."""
@@ -423,6 +518,9 @@ class CapturingChainReader:
             "window_digest": win_dg,
             "window_f8_b64": base64.b64encode(win_raw).decode("ascii") if win_raw is not None else None,
             "window_status": ev.window_status, "window_reason": ev.window_reason,
+            # which source served the chain (alphavantage | broker:<kind>) and what it reported about it
+            "serving_kind": getattr(self.inner, "serving_kind", "") or self.inner.option_source,
+            "source_facts": _jsonable(ev.source_facts),
         }
         self._capture.record_observation(
             provider=CAPTURE_PROVIDER, method=CAPTURE_METHOD_CHAIN,

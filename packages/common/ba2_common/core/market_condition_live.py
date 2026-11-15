@@ -1082,24 +1082,57 @@ def is_chain_profile(profile: str) -> bool:
     return _is(profile)
 
 
+_UNSET = object()
+
+
 def _chain_live_reader(profile: str, option_source: Optional[str], cache_root: Optional[str],
-                       source_profile: str) -> Any:
-    """The live reader of a CHAIN profile for gates trained on ``option_source``: the registered
-    reader of that source, or a :class:`LiveUnavailableMarketConditionReader` naming why not."""
-    from ba2_common.core.market_conditions import live_unavailable_reason
-    from ba2_common.core.market_condition_iv_live import live_chain_reader_factory
+                       source_profile: str, live_chain_source: Any = _UNSET,
+                       unavailable_reason: Optional[str] = None) -> Any:
+    """The live reader of a CHAIN profile for gates trained on ``option_source``, served by the
+    configured LIVE IV CHAIN SOURCE (app setting ``iv_live_chain_source``: ``alphavantage`` or
+    ``account:<id>``), or a :class:`LiveUnavailableMarketConditionReader` naming why not: the trained
+    source is unknown, the setting is unset or malformed, no reader is wired, the account cannot serve
+    quotes, the pairing (trained -> serving kind) is not certified, or ``unavailable_reason`` (the
+    expert's universe is unbounded for a broker source)."""
+    from ba2_common.core.market_conditions import live_unavailable_reason, pairing_unavailable_reason
+    from ba2_common.core.market_condition_iv_live import (
+        LIVE_CHAIN_SOURCE_SETTING, SOURCE_BROKER, configured_live_chain_source_value, live_chain_reader_factory,
+        parse_live_chain_source,
+    )
     from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
 
+    def unavailable(why: str) -> Any:
+        return LiveUnavailableMarketConditionReader(profile, why)
+
     reason = live_unavailable_reason(profile, option_source)
-    if reason is None:
-        factory = live_chain_reader_factory(option_source)
-        if factory is None:
-            reason = (f"market-condition profile {profile!r}: no live reader is wired for option source "
-                      f"{option_source!r} in this process (ba2_trade_platform seam_wiring registers it); "
-                      f"its gates refuse every live entry")
-        else:
-            return factory(profile, cache_root=cache_root, source_profile=source_profile)
-    return LiveUnavailableMarketConditionReader(profile, reason)
+    if reason is not None:
+        return unavailable(reason)
+    raw = configured_live_chain_source_value() if live_chain_source is _UNSET else live_chain_source
+    try:
+        choice = parse_live_chain_source(raw)
+    except ValueError as e:
+        return unavailable(f"market-condition profile {profile!r}: app setting {LIVE_CHAIN_SOURCE_SETTING} is "
+                           f"malformed ({e}); its gates refuse every live entry")
+    if choice is None:
+        return unavailable(f"market-condition profile {profile!r}: app setting {LIVE_CHAIN_SOURCE_SETTING} is not "
+                           f"set -- choose where live reads the prior session's option chain ('alphavantage' or "
+                           f"a quote-source account, Settings > Data providers); its gates refuse every live "
+                           f"entry")
+    if unavailable_reason and choice.source == SOURCE_BROKER:
+        return unavailable(f"market-condition profile {profile!r}: {unavailable_reason}; its gates refuse every "
+                           f"live entry")
+    factory = live_chain_reader_factory(choice.source)
+    if factory is None:
+        return unavailable(f"market-condition profile {profile!r}: no live reader is wired for live IV chain "
+                           f"source {choice.source!r} in this process (ba2_trade_platform seam_wiring registers "
+                           f"it); its gates refuse every live entry")
+    extra = {"account_id": choice.account_id} if choice.source == SOURCE_BROKER else {}
+    reader = factory(profile, cache_root=cache_root, source_profile=source_profile, **extra)
+    if getattr(reader, "live_unavailable", False):
+        return reader
+    kind = getattr(reader, "serving_kind", "") or getattr(reader, "option_source", "")
+    why = pairing_unavailable_reason(profile, option_source, kind)
+    return unavailable(why) if why else reader
 
 
 def certify_cache_root(cache_root: Optional[str] = None) -> Tuple[str, Any]:
@@ -1151,7 +1184,9 @@ def resolver_for_profiles(profiles: Sequence[str], *,
                           manifest_digests: Optional[Mapping[str, str]] = None,
                           cache_root: Optional[str] = None,
                           gap_fill: Optional[str] = None,
-                          option_source: Optional[str] = None) -> "LiveMarketConditionResolver":
+                          option_source: Optional[str] = None,
+                          live_chain_source: Any = _UNSET,
+                          chain_unavailable_reason: Optional[str] = None) -> "LiveMarketConditionResolver":
     """A live resolver serving ``profiles``: ONE reader per profile, joined by
     ``market_condition_reader_for`` (the reader itself for a single profile, a
     ``CompositeMarketConditionReader`` for several -- the same join the backtest seam makes, so
@@ -1191,7 +1226,8 @@ def resolver_for_profiles(profiles: Sequence[str], *,
     # A CHAIN profile (iv-v1) is never served by the FMP-cache reader (it cannot compute it) nor from
     # a historical snapshot (no row for the session a live decision reads): it gets the live reader of
     # the option source its gates were trained on, or a reader that refuses with the reason.
-    readers = [_chain_live_reader(name, option_source, cache_root, source_profile) if is_chain_profile(name)
+    readers = [_chain_live_reader(name, option_source, cache_root, source_profile, live_chain_source,
+                                  chain_unavailable_reason) if is_chain_profile(name)
                else _fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
                for name in names]
     return LiveMarketConditionResolver(
@@ -1356,11 +1392,15 @@ class PerInstanceMarketConditionResolver:
             return None
         key = (int(expert_instance_id), profiles)
         option_source = None
+        chain_extra: Dict[str, Any] = {}
         if any(is_chain_profile(p) for p in profiles):
             # ONLY for an expert gating on a chain profile (iv-v1): every other expert's key, build and
             # settings reads are exactly what they were before chain profiles existed.
             option_source = self.option_source_for(expert_instance_id)
-            key = key + (option_source,)
+            live_source = self._live_chain_source_value()
+            bound_reason = self.universe_unbounded_reason(expert_instance_id, live_source)
+            chain_extra = {"live_chain_source": live_source, "chain_unavailable_reason": bound_reason}
+            key = key + (option_source, live_source, bound_reason)
         with self._lock:
             hit = self._resolvers.get(key)
         # ``_build`` never returns None, so a plain ``.get`` is unambiguous. The empty-setting
@@ -1368,7 +1408,8 @@ class PerInstanceMarketConditionResolver:
         # dict the host already caches is cheaper than a second cache to invalidate.
         if hit is not None:
             return hit
-        resolver = self._build(profiles) if option_source is None and len(key) == 2             else self._build(profiles, option_source=option_source)
+        resolver = self._build(profiles) if option_source is None and len(key) == 2 \
+            else self._build(profiles, option_source=option_source, **chain_extra)
         with self._lock:
             # Another thread may have built it first; either object is correct, and keeping the
             # one already published means concurrent passes share a reader (and its memo).
@@ -1391,7 +1432,33 @@ class PerInstanceMarketConditionResolver:
         value = str(value or "").strip()
         return value or None
 
-    def _build(self, profiles: Tuple[str, ...], *, option_source: Optional[str] = None) -> Any:
+    def _live_chain_source_value(self) -> Optional[str]:
+        from ba2_common.core.market_condition_iv_live import configured_live_chain_source_value
+
+        return configured_live_chain_source_value()
+
+    def universe_unbounded_reason(self, expert_instance_id: Any, live_source: Optional[str]) -> Optional[str]:
+        """For a BROKER live source only: why the expert's universe is not bounded (a screener with an
+        empty ``screener_symbol_universe``, an analysis-time selection), else None."""
+        from ba2_common.core.instance_resolver import get_instance_resolver
+        from ba2_common.core.market_condition_iv_live import SOURCE_BROKER, bounded_iv_universe, parse_live_chain_source
+
+        try:
+            choice = parse_live_chain_source(live_source)
+        except ValueError:
+            return None                    # the reader refuses with the malformed-setting reason
+        if choice is None or choice.source != SOURCE_BROKER:
+            return None
+        try:
+            expert = get_instance_resolver().get_expert_instance(int(expert_instance_id))
+            symbols, reason = bounded_iv_universe(expert)
+        except Exception as e:  # noqa: BLE001 -- same contract as profiles_for
+            absorb_if_benign(e, ValueError, LookupError, InstanceResolverNotConfigured)
+            return f"expert instance {expert_instance_id}'s universe could not be read ({type(e).__name__}: {e})"
+        return None if symbols else f"expert instance {expert_instance_id}: {reason}"
+
+    def _build(self, profiles: Tuple[str, ...], *, option_source: Optional[str] = None,
+               live_chain_source: Any = _UNSET, chain_unavailable_reason: Optional[str] = None) -> Any:
         from ba2_common.logger import logger
 
         try:
@@ -1423,6 +1490,8 @@ class PerInstanceMarketConditionResolver:
             return degraded
         digests = manifest_digests_from_env(profiles, self._environ)
         extra = {"option_source": option_source} if option_source is not None else {}
+        if live_chain_source is not _UNSET:
+            extra.update(live_chain_source=live_chain_source, chain_unavailable_reason=chain_unavailable_reason)
         resolver = resolver_for_profiles(profiles, source_profile=self.source_profile,
                                          manifest_digests=digests, cache_root=root, **extra)
         # Best effort, and only now: this runs on the first decision pass for the expert, when

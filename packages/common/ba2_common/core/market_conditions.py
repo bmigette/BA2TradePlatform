@@ -1450,6 +1450,39 @@ def live_unavailable_reason(profile: str, option_source: Optional[str] = None) -
     return None
 
 
+#: CERTIFIED-EQUIVALENT live serving: profile -> trained option source -> the live SERVING kinds allowed
+#: to serve its gates. ``alphavantage`` = the vendor's HISTORICAL_OPTIONS chain of the prior session;
+#: ``broker:<kind>`` = a quote-source account's snapshot captured between the prior session's close and
+#: the next open (``option_chain_quotes``). A pairing is listed only with evidence that it serves the SAME
+#: end-of-day quotes the gates were trained on (:data:`PAIRING_EVIDENCE`); everything else is refused.
+LIVE_SERVING_PAIRINGS: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    IV_PROFILE: {"alphavantage": ("alphavantage", "broker:tastytrade")},
+}
+
+#: (trained source, serving kind) -> the evidence the pairing rests on (also in the design note).
+PAIRING_EVIDENCE: Dict[Tuple[str, str], str] = {
+    ("alphavantage", "alphavantage"): "same vendor, same endpoint as the store (live = store, tests pin it)",
+    ("alphavantage", "broker:tastytrade"): (
+        "TastyTrade REST market data fetched Sunday 2026-11-15 for session 2026-11-13: 8 underlyings "
+        "(MSFT KO AAPL JPM XOM NVDA ISRG EMN), 3,478 contracts, 100% identical bid/ask with the Alpha "
+        "Vantage chain and identical iv-v1 fields (1 session; tools/certify_broker_iv_chain.py extends it)"),
+}
+
+
+def pairing_unavailable_reason(profile: str, trained_source: Optional[str], serving_kind: str) -> Optional[str]:
+    """Why ``serving_kind`` may not serve ``profile`` gates trained on ``trained_source``; None when the
+    pairing is certified (or the profile is not a chain profile)."""
+    if profile not in CHAIN_COMPUTE_BY_PROFILE:
+        return None
+    allowed = LIVE_SERVING_PAIRINGS.get(profile, {}).get(str(trained_source or ""), ())
+    if serving_kind in allowed:
+        return None
+    return (f"market-condition profile {profile!r}: gates trained on {trained_source!r} may be served live "
+            f"only by {list(allowed)} (certified-equivalent pairings); the configured live IV chain source "
+            f"serves {serving_kind!r}, which is not certified for them. Its gates refuse every live entry "
+            f"(docs/plans/2026-11-15-option-iv-conditions.md).")
+
+
 def is_chain_profile(profile: str) -> bool:
     """Whether ``profile``'s rows need an option chain (served only from a published manifest)."""
     return profile in CHAIN_COMPUTE_BY_PROFILE
