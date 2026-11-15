@@ -949,6 +949,34 @@ def init_rerun_task_queue(max_workers: int = 2):
     return _rerun_task_queue
 
 
+# Dedicated WALK-FORWARD queue: one worker by default (WALK_FORWARD_WORKERS), because a walk-forward
+# run is a chain of full GA train jobs that can hold its worker for days (the handler watches a
+# driver process, app.services.wf_runs). Its own pool so it never takes a main-queue worker.
+_wf_task_queue: Optional[TaskQueueService] = None
+
+
+def get_wf_task_queue() -> TaskQueueService:
+    """Get the dedicated walk-forward task queue instance."""
+    global _wf_task_queue
+    if _wf_task_queue is None:
+        _wf_task_queue = TaskQueueService(max_workers=1, task_types=['walk_forward'],
+                                          name="WalkForwardTaskQueue")
+    return _wf_task_queue
+
+
+def init_wf_task_queue(max_workers: int = 1):
+    """Initialize and start the dedicated walk-forward task queue."""
+    import os
+    global _wf_task_queue
+    _wf_task_queue = TaskQueueService(max_workers=max(1, int(max_workers)),
+                                      task_types=['walk_forward'], name="WalkForwardTaskQueue")
+    if os.getenv('PYTEST_CURRENT_TEST') is None:
+        _wf_task_queue.start()
+    else:
+        logger.info("Test mode detected - skipping walk-forward task queue worker startup")
+    return _wf_task_queue
+
+
 # Dedicated OHLCV task queue — isolated so it can be resized without affecting
 # training jobs, backtests, or other task types.
 _ohlcv_task_queue: Optional[TaskQueueService] = None

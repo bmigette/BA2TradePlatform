@@ -280,7 +280,8 @@ async def startup_event():
     # Initialize task queue
     from app.services.task_queue import init_task_queue, get_task_queue, init_ohlcv_task_queue, get_ohlcv_task_queue, init_training_task_queue, get_training_task_queue, init_backtest_task_queue, get_backtest_task_queue, init_rerun_task_queue, get_rerun_task_queue
     # Main queue: lightweight I/O tasks only (datasets, news)
-    init_task_queue(max_workers=4, exclude_task_types=['ohlcv_cache_fetch', 'training_job', 'backtest', 'rerun_backtest'])
+    init_task_queue(max_workers=4, exclude_task_types=['ohlcv_cache_fetch', 'training_job', 'backtest', 'rerun_backtest',
+                                                       'walk_forward'])
     logger.info("Main task queue initialized with 4 workers (excludes ohlcv, training, backtest)")
 
     # Register task handlers on the main queue
@@ -349,8 +350,28 @@ async def startup_event():
     ohlcv_queue.register_handler('ohlcv_cache_fetch', handle_ohlcv_cache_fetch)
     logger.info("OHLCV task queue initialized with 3 workers")
 
+    # Dedicated WALK-FORWARD queue (app.services.wf_runs): its handler starts and watches the chain's
+    # driver process; one run at a time by default (WALK_FORWARD_WORKERS).
+    from app.services.task_queue import init_wf_task_queue, get_wf_task_queue
+    from app.services.wf_runs import handle_walk_forward
+    init_wf_task_queue(max_workers=int(_os.getenv('WALK_FORWARD_WORKERS', '1')))
+    get_wf_task_queue().register_handler('walk_forward', handle_walk_forward)
+    logger.info("Walk-forward task queue initialized")
+
     # Recover interrupted jobs (crashed while running)
     recover_interrupted_jobs()
+    try:
+        from app.models.database import SessionLocal as _SL
+        from app.services.wf_runs import recover_interrupted as _wf_recover
+        _db = _SL()
+        try:
+            _n = _wf_recover(_db)
+        finally:
+            _db.close()
+        if _n:
+            logger.warning(f"{_n} walk-forward run(s) interrupted by the restart marked 'error' (resumable)")
+    except Exception as e:  # noqa: BLE001 -- startup must not die on it; logged loudly with the traceback
+        logger.error(f"walk-forward recovery failed: {e}", exc_info=True)
 
     # NOTE: DB cleanup (clear_completed_results) is NOT run on startup — it can
     # take minutes on large databases and block the server from starting.
@@ -462,6 +483,7 @@ async def global_exception_handler(request, exc):
 # Import and include routers
 from app.api import datasets, jobs, workers, dashboard, models, backtests, ml, settings, websocket, tasks, indicator_collections, tools, target_sets, strategies, admin, cache, experts, rules, ruleset_meta, data_build
 from app.api import ml_search as ml_search_api
+from app.api import walk_forward as walk_forward_api
 
 app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 app.include_router(tools.router, prefix="/api/tools", tags=["tools"])
@@ -489,6 +511,7 @@ app.include_router(ml_search_api.router, prefix="/api/ml-search", tags=["ml-sear
 app.include_router(experts.router, tags=["experts"])
 # ruleset_meta carries its own /api prefix -> /api/ruleset/vocabulary, /api/ruleset/exit-presets
 app.include_router(ruleset_meta.router, tags=["ruleset-meta"])
+app.include_router(walk_forward_api.router)
 
 # Additional routers (will be added as we build features)
 # from app.api import models, backtests, profiles, providers, settings
