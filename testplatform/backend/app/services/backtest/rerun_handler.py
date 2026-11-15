@@ -90,8 +90,9 @@ def _gene_params(strategy_params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def is_fixed_screen(screener_opt: Dict[str, Any]) -> bool:
-    """True for a stored ``screener_opt`` of a FIXED screen (``--screen-preset``, or any launch that searched no
-    screener gene): the launch recorded ``declared_ranges`` as an EMPTY dict (``screener_launch.declared_ranges_of``
+    """True for a stored ``screener_opt`` whose launch declared no RANGE gene -- a FIXED screen (``--screen-preset``)
+    or a job searching only a choice gene (an ordering; ``recompute_static_universe`` then still uses its ranges):
+    the launch recorded ``declared_ranges`` as an EMPTY dict (``screener_launch.declared_ranges_of``
     of a gene set with nothing searched). Its static universe was computed from the stored base settings alone (no
     gene to loosen), so a recompute does the same. A block without the key (from before the declaration) is NOT one:
     its gene ranges are unknown, and a recompute refuses rather than assume there were none."""
@@ -129,9 +130,14 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
             f"--recompute-universe: optimization of row {row_id} stores no screener gene ranges "
             f"(parameter_ranges has no 'screener:*' keys) and its screener_opt does not record a fixed screen "
             f"(declared_ranges == {{}}): the loosest values cannot be derived")
-    if ranges and is_fixed_screen(so):
+    # The declaration lists only RANGE genes (``screener_launch.declared_ranges_of`` skips choice genes, as does the
+    # handler's warm-start check), so a job that searched only a choice gene (``screener_sort_metric``: an ordering,
+    # it never changes which names pass) also records ``{}``. Its ranges still go through the normal path below,
+    # exactly as at launch (``loosest_filter_variants`` validates the choices and skips the ordering gene).
+    ranged = sorted(g for g, s in ranges.items() if not (isinstance(s, dict) and s.get("type") == "choice"))
+    if ranged and is_fixed_screen(so):
         raise us.ScreenerUniverseError(
-            f"--recompute-universe: optimization of row {row_id} searched screener genes {sorted(ranges)} but its "
+            f"--recompute-universe: optimization of row {row_id} searched screener genes {ranged} but its "
             f"screener_opt records a fixed screen (declared_ranges == {{}}): the stored config contradicts itself")
     interval = bt_block["execution_interval"]
     excluded = list(bt_block.get("excluded_instruments") or [])

@@ -211,3 +211,35 @@ def test_in_place_rerun_with_recompute_universe_of_a_fixed_screen_oos_row(env, m
     assert cfg["screener_universe_recompute_note"]["static_universe_size"] == len(fresh)
     assert set(cfg["enabled_instruments"]) <= set(fresh) and cfg["enabled_instruments"]
     assert cfg["screener_runtime"]["settings"]["max_stocks"] == PRESET_KEYS["max_stocks"]
+
+
+def test_a_job_that_searched_only_a_choice_gene_recomputes_like_its_launch(env, client, seed_strategy):
+    """``declared_ranges`` lists RANGE genes only, so a job searching ONLY ``screener_sort_metric`` (an ordering:
+    it never changes which names pass) also stores ``{}`` while its parameter_ranges carry the choice gene. That is
+    not a contradiction: its universe takes the ranges path, exactly as its launch did. Stored by the real API launch
+    (the CLI always searches the full gene set or none)."""
+    from app.services import strategy_optimization_handler as H
+    from app.services.backtest import rerun_handler as RH
+    only_sort = {"sort_metric": dict(S.PARAM_RANGES["sort_metric"])}
+    body = S._api_body(env, screener_opt={"exclude_uncached": True, "param_ranges": only_sort,
+                                                         "base_settings": dict(PRESET_KEYS)})
+    body["optimization_config"]["backtest"]["universe"]["screener_param_ranges"] = only_sort
+    r = S._post(client, seed_strategy, body)
+    assert r.status_code == 200, r.text
+    cfg = r.json()["optimizationConfig"]
+    blk = cfg["backtest"]
+    assert blk["screener_opt"]["declared_ranges"] == {}                  # the choice gene is not declared
+    ranges = H.job_param_space(seed_strategy, cfg["expert_params"], H._is_bypass_expert(blk))
+    assert [k for k in ranges if k.startswith("screener:")] == ["screener:screener_sort_metric"]
+    _, (te_start, te_end) = _windows(env)
+    out = RH.recompute_static_universe({**blk, "start_date": te_start, "end_date": te_end}, ranges, row_id=5)
+    req = sl.ScreenerLaunchRequest(store=env["store"], start=te_start, end=te_end, interval="1d", history_source="fmp",
+                                   base_settings=dict(PRESET_KEYS), scr_opt={"screener_sort_metric": dict(us.SCREENER_OPT[
+                                       "screener_sort_metric"])}, cadence_days=7, bypass=False, panel=env["panel"],
+                                   exclude_uncached=True)
+    fresh = [x for x in sl.prepare_screener_launch(req, emit=lambda m: None).enabled if x != S.UNCACHED]
+    assert out["enabled_instruments"] == fresh and fresh                 # the launch's superset, on the test window
+    # a RANGE gene with the same empty declaration is still the contradiction
+    bad = {**ranges, "screener:screener_market_cap_min": dict(us.SCREENER_OPT["screener_market_cap_min"])}
+    with pytest.raises(us.ScreenerUniverseError, match="contradicts itself"):
+        RH.recompute_static_universe(blk, bad, row_id=6)
