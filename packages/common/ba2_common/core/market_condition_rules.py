@@ -496,3 +496,23 @@ def assert_market_fields_live_servable(rules: Any, where: str = "rules") -> None
         f"{where}: market-condition leaf/leaves {shown} read profile(s) {profiles} that have NO "
         f"live data source, so live would refuse every entry they gate. "
         + " ".join(LIVE_UNAVAILABLE_PROFILES[p] for p in profiles))
+
+
+def drop_unread_live_unavailable_profiles(profiles: Sequence[str], *rule_sets: Any
+                                          ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """``(kept, dropped)``: the profiles with NO live source (``LIVE_UNAVAILABLE_PROFILES``) that no
+    leaf of ``rule_sets`` reads are dropped; every other profile is kept, in order.
+
+    For the deploy importer (review 2026-11-15): a genome whose iv genes all decoded OFF still
+    carries ``iv-v1`` in its setting, and live would then build a refusing reader and report "NO
+    live data source" every pass for a profile nothing reads. Dropping it changes no decision --
+    with no leaf on the profile, its rows are never read in the backtest either."""
+    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES, PROFILES
+
+    read = {str(leaf.get("field")) for rules in rule_sets
+            for _label, leaf in iter_market_condition_leaves(rules)}
+    kept, dropped = [], []
+    for p in profiles:
+        unread = p in LIVE_UNAVAILABLE_PROFILES and not ({f.name for f in PROFILES[p].fields} & read)
+        (dropped if unread else kept).append(p)
+    return tuple(kept), tuple(dropped)
