@@ -505,11 +505,16 @@ class TestMarketEnabledKeepsEntryRules:
 
 # ----------------------------------------------------------------------------- registry coverage / validation
 class TestRegistryCoverage:
-    def test_every_registered_profile_is_covered_by_the_choices(self):
+    def test_the_two_ohlcv_profiles_are_covered_by_the_choices(self):
         from app.services.strategy_param_space import assert_market_profiles_covered
-        assert_market_profiles_covered()      # today: ohlcv-v1 and ta-structure-v1 only
+        assert_market_profiles_covered({"ohlcv-v1", "ta-structure-v1"})
+        # iv-v1 is registered (2026-11-15) but NOT selectable by the persisted choice list
+        with pytest.raises(ValueError, match="iv-v1"):
+            assert_market_profiles_covered({"ohlcv-v1", "iv-v1"})
 
-    def test_a_third_profile_fails_loudly(self):
+    def test_a_third_profile_fails_loudly_only_when_the_strategy_reads_it(self):
+        """SCOPED (2026-11-15): registering a profile the choices cannot select must not refuse every
+        market:profile job -- only one whose strategy carries a leaf of that profile."""
         from ba2_common.core.market_conditions import FieldSpec, ProfileSpec, registered_profile
         from app.services.strategy_param_space import assert_market_profiles_covered
         spec = ProfileSpec(name="third-v1", calc_version="t/1", fields=(
@@ -517,9 +522,12 @@ class TestRegistryCoverage:
                       codes={"a": 1, "b": 2}, ui_name="t"),))
         with registered_profile(spec):
             with pytest.raises(ValueError, match="third-v1"):
-                assert_market_profiles_covered()
+                assert_market_profiles_covered({"third-v1"})
+            assert market_profile_members(_strategy_template_only())["leaf_profile"] == {}
+            reading = SimpleNamespace(entry_rules=[{"id": "e", "conditions": {"id": "r", "type": "AND", "conditions": [
+                {"id": "s1-market-third3", "field": "third_state", "op": "==", "value": 1.0}]}}], exit_rules=[])
             with pytest.raises(ValueError, match="third-v1"):
-                market_profile_members(_strategy_template_only())
+                market_profile_members(reading)
 
     def test_members_only_computed_when_the_space_has_the_gene(self, strat_profile, strat_enabled):
         from app.services.strategy_optimization_handler import market_members_for_space

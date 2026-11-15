@@ -73,7 +73,8 @@ _ba2_db.configure_db(LIVE_DB)
 
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
 from ba2_common.core.market_condition_rules import (  # noqa: E402
-    PROFILE_SETTING, assert_market_conditions_resolved, assert_market_fields_served,
+    PROFILE_SETTING, assert_market_conditions_resolved, assert_market_fields_live_servable,
+    assert_market_fields_served,
     assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
@@ -360,6 +361,9 @@ def main() -> int:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
             assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
+            # iv-v1 (no live source): a gate on it would refuse every live entry -- refused here.
+            assert_market_fields_live_servable(entry_rules, f"{label}: entry rules")
+            assert_market_fields_live_servable(exit_rules, f"{label}: exit rules")
             assert_market_rule_actions(exit_rules, f"{label}: exit rules")
             assert_market_conditions_resolved(entry_rules, f"{label}: entry rules")
             assert_market_conditions_resolved(exit_rules, f"{label}: exit rules")

@@ -474,3 +474,25 @@ def assert_market_fields_served(rules: Any, profiles: Sequence[str], *, where: s
     assert_fields_served(((label, str(leaf.get("field")))
                           for label, leaf in iter_market_condition_leaves(rules, where)),
                          profiles, where=where, setting=setting)
+
+
+def assert_market_fields_live_servable(rules: Any, where: str = "rules") -> None:
+    """Refuse a market leaf whose profile has NO live data source (``LIVE_UNAVAILABLE_PROFILES``).
+
+    The deploy importer's twin of :func:`assert_market_fields_served`, for the same failure: such a
+    gate never passes live (the live reader refuses every observation), so the strategy would be
+    deployed unable to enter on that rule. A payload whose setting merely LISTS such a profile
+    while none of its leaves reads it (every mode decoded off) is fine -- nothing reads it."""
+    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES, PROFILES
+
+    owner = {f.name: p for p in LIVE_UNAVAILABLE_PROFILES for f in PROFILES[p].fields}
+    hits = [(label, str(leaf.get("field"))) for label, leaf in iter_market_condition_leaves(rules, where)
+            if leaf.get("field") in owner]
+    if not hits:
+        return
+    profiles = sorted({owner[f] for _l, f in hits})
+    shown = "; ".join(f"{label} ({field})" for label, field in hits)
+    raise ValueError(
+        f"{where}: market-condition leaf/leaves {shown} read profile(s) {profiles} that have NO "
+        f"live data source, so live would refuse every entry they gate. "
+        + " ".join(LIVE_UNAVAILABLE_PROFILES[p] for p in profiles))

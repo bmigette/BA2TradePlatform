@@ -6819,6 +6819,10 @@ def _market_condition_manifest_facts(digest: str, profile: str) -> dict:
         "window_start": reader.manifest.get("window_start"),
         "window_end": reader.manifest.get("window_end"),
     }
+    # A CHAIN profile (iv-v1) also names the option chain store its rows were built from. Only
+    # recorded when the manifest carries it, so an OHLCV run's recorded block is byte-identical.
+    if reader.manifest.get("option_source"):
+        facts["option_source"] = reader.manifest["option_source"]
     _MARKET_CONDITION_FACTS[key] = facts
     return facts
 

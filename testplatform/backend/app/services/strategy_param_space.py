@@ -83,7 +83,7 @@ quick-load path, not by this module.
 """
 import copy
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from ba2_common.core.market_conditions import field_codes, field_spec
 from ba2_common.core.rule_models import MODE_OFF, NUMERIC_MODE_CHOICES, leaf_mode_kind
@@ -194,17 +194,20 @@ _MARKET_PROFILE_SELECTION = {
 }
 
 
-def assert_market_profiles_covered() -> None:
-    """Every profile in the market-condition registry must be one ``market:profile`` can select. A third profile
-    would otherwise decode as "not selected" (silently off) in every genome; fail loudly instead."""
-    from ba2_common.core.market_conditions import PROFILES
+def assert_market_profiles_covered(used: Iterable[str]) -> None:
+    """Every profile a strategy's market LEAVES read must be one ``market:profile`` can select: a leaf of any other
+    profile would decode as "not selected" (silently off) in every genome; fail loudly instead.
 
+    SCOPED TO THE PROFILES IN USE (2026-11-15, iv-v1). It used to refuse any registered profile outside the
+    choice list, so registering a third profile (``iv-v1``) refused every ``--search-market-profile`` job even
+    when no leaf of it was on the strategy. The failure it guards -- a leaf the gene can never select -- needs
+    the leaf; the choice list itself is a persisted contract and is NOT extended here."""
     known = {MARKET_PROFILE_OHLCV, MARKET_PROFILE_STRUCTURE}
-    extra = sorted(set(PROFILES) - known)
+    extra = sorted(set(used) - known)
     if extra:
-        raise ValueError(f"market-condition profile(s) {extra} are registered but MARKET_PROFILE_CHOICES "
-                         f"{MARKET_PROFILE_CHOICES} cannot select them; extend the choice list (a persisted "
-                         f"contract) before using {MARKET_PROFILE_GENE}")
+        raise ValueError(f"market-condition profile(s) {extra} have leaves on this strategy but MARKET_PROFILE_CHOICES "
+                         f"{MARKET_PROFILE_CHOICES} cannot select them; drop {MARKET_PROFILE_GENE} for this job, or "
+                         f"extend the choice list (a persisted contract) first")
 
 
 def market_profile_selection(value: Any) -> frozenset:
@@ -227,7 +230,6 @@ def market_profile_members(strategy) -> Dict[str, Any]:
     """
     from ba2_common.core.market_conditions import PROFILES
 
-    assert_market_profiles_covered()
     owner: Dict[str, str] = {}
     for pname, prof in PROFILES.items():
         for f in prof.fields:
@@ -258,6 +260,7 @@ def market_profile_members(strategy) -> Dict[str, Any]:
             # market leaves among its ordinary gates, so gating the RULE would drop the whole entry.
             if attr == "exit_rules" and rule.get("id") in rule_ids:
                 rule_leaves[rule["id"]] = sink
+    assert_market_profiles_covered(set(leaf_profile.values()))
     rule_profiles = {rid: frozenset(leaf_profile[c] for c in leaves) for rid, leaves in rule_leaves.items()}
     return {"leaf_profile": leaf_profile, "rule_profiles": rule_profiles, "rule_leaves": rule_leaves}
 
