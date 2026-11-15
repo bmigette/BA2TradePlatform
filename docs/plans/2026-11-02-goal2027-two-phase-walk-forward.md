@@ -507,6 +507,22 @@ fold reports, early elimination, deferral, refit). Without `--walk-forward` the 
   would ERROR after training fold 1. The chain skips those two jobs in walk-forward mode with that
   reason in its status file. The holdout rail and the DGS3MO check (`refresh_fred_cache.py
   --check-rate-window` over the cell's span) are checked before anything trains.
+- **Abbreviations (review 2026-11-15).** The launcher's optimize parser accepts abbreviations
+  (`--seed-pop b.json` IS `--seed-population`). The engine refuses any option that is a prefix of a
+  forbidden flag (cherry-picked 26f7f0d1 from `feat/wf-ui`; the exact RNG `--seed` stays allowed), and
+  the style driver reads the recipe and the overrides through the real parser
+  (`ba2test_launcher._canonical_optimize_tokens`: exact match, else the one flag an abbreviation
+  names, `--flag=value` split; ambiguous or unknown refused), so every refusal, the masked name and
+  every fold command see what argparse acts on. The deferred test's data reading
+  (`_data_rebase_from_optimize_args`) does the same and takes the LAST value of a repeated flag, as the
+  training did.
+- **Data identity across runs.** `<report dir>/<cell>/data_identity.json` is written on the first run
+  (copied into `cell.json`). STRICT, refused on any change: the universe (file content and list), the
+  market-condition profiles, the option store and history source. EVOLVING, a WARNING naming the change
+  with the first-run and latest values kept: the manifests, the daily panel (its manifest's fingerprint,
+  criteria version and sessions) and the screener store. The option matrix walk-forward has the same
+  guard (universe, profile, store; manifests evolving); the stock grid is unchanged. The panel exposes
+  no per-date digests, so the overlapping 2020-2025 values of a phase-B panel are NOT compared.
 - **Out-of-sample path:** `tests/test_option_style_wf_oos_rerun_genes.py` pins a launcher-built
   `long10k` with both profiles and the SPY gates (every member gene, `optsel`, market-condition and
   SPY genes, screener genes) through `select` -> `_persist_top_backtests(window=)`.
@@ -524,8 +540,9 @@ bash tools/option_style_job.sh long s2C none --fitness option_long --estimates-s
 Phase B (January 2027, after `_OPTION_HOLDOUT_START` has moved as a reviewed change and the 2026 data
 exists): the same command without `--wf-data-end 2025-12-31`, with the 2026 panel, store and manifests
 in the environment (`SCREENER_PANEL`, `SCREENER_STORE`, `MC_OHLCV`, `MC_TA`); keep
-`--wf-defer-last-test`. The job script's own DGS3MO check still covers 2020-2025 only; the driver
-checks the 2026 window itself.
+`--wf-defer-last-test`. A walk-forward cell skips the job script's fixed 2020-2025 DGS3MO check; the
+driver checks the cell's real span (through 2026 in phase B). Expect a WARNING naming the new
+manifests, panel and store (the data identity record).
 
 **Launch the small-accounts chain as cells** (jobs 1-5; every job reads the Alpha Vantage store, so the
 names carry `-optalphavantage`). Phase A:
@@ -535,7 +552,12 @@ WF_ARGS="--walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 --wf-top-n
   bash tools/grid_option_small_accounts.sh
 ```
 
-Logs `s3L10-wf_run.log` ..., status `s3chain_small-wf.status`; no seed bundles are needed. Phase B: the
+The chain prints which mode it runs in at start (an exported `WF_ARGS` left in the environment turns the
+plain chain into walk-forward). Each job first runs its own `--dry-run` as a preflight: a refusal (a style
+or universe file missing from the checkout, a refused flag, the holdout, a changed data identity) is
+recorded with the driver's reason and only that job is skipped. Logs `s3L10-wf_run.log` and
+`s3L10-wf_preflight.log` ..., status `s3chain_small-wf.status` with each cell's VERDICT (PASS / FAIL /
+PENDING / ERROR); no seed bundles are needed. Phase B: the
 same `WF_ARGS` without `--wf-data-end 2025-12-31`, plus `AV_END=2026-12-31` (the AV completeness check)
 and the 2026 data in the job environment as above. A single small-account cell is
 `OPTION_HISTORY_SOURCE=alphavantage bash tools/option_style_job.sh long10k s3L10 none --fitness
@@ -549,8 +571,18 @@ Linux). In trial-years, before early stopping, that is about 1.6x the plain 30-g
 job; phase B adds `--wf-top-n` re-runs and, for a passing cell, a 15-generation refit on 7 years
 (about 2.2x in total). The chain's five cells are 15 train jobs and up to 30 re-runs in phase A.
 
+**Merge order.** The two scripts were imported verbatim from `feat/premium-mandatory-loss-exit`
+(537d38f1), but what they reference is still only there: the small-account styles (`premium_stop`,
+`mid_share`, `burst10k`, `wheel50k_ndx`, `cheap10k`) in `tools/option_styles.stage2.json`,
+`tools/options_universe_nasdaq.txt`, `download_av_option_chains.py --require-complete` and the `ndx30` /
+`cheap50` screen presets. Merge `feat/premium-mandatory-loss-exit` into dev FIRST, then this branch (its
+copies of the two scripts are the same blobs plus the walk-forward switch). On a checkout without it, the
+driver's preflight refuses the missing style or universe file by name, and the chain reports a failing
+AV completeness check as such, not as an incomplete store.
+
 **Not covered.**
 - Small-account jobs 6 and 7 (fixed screens, see above).
+- Comparing a phase-B panel's 2020-2025 values with phase A's (no per-date digests in the panel).
 - Nothing was launched: no real optimization, no real out-of-sample re-run, no remote worker. The
   style path was exercised with fake runners, a recording fake interpreter for the shell scripts, and
   the real launcher's re-run path with the backtest engine call replaced.
