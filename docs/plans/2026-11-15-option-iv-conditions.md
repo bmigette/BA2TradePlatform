@@ -40,8 +40,9 @@ keyed without the expiry.
    Exact duplicate rows collapse to one. A strike quoted twice with different prices is dropped. The
    chain is never resolved by taking the first row.
 2. Candidate expiries are those 7 to 130 calendar days out.
-3. Forward per expiry, from put-call parity on the as-traded strikes, undiscounted. Take the strike
-   K* where the call and put mids are closest (ties go to the lowest strike); the forward is
+3. Forward per expiry, from put-call parity on the as-traded strikes, undiscounted. Only two-sided
+   quotes count (bid > 0, ask >= bid); the study also admitted a zero bid. Take the strike K* where
+   the call and put mids are closest (ties go to the lowest strike); the forward is
    `F = K* + C_mid - P_mid`. Forward outliers (more than 10% from the median forward) are dropped.
 4. Black-76 inversion of the mid. `T = dte/365`. Bisection on [0.01, 5] for 45 steps; a result pinned
    at either bound counts as no inversion. A quote is inverted only if it is two-sided and sane: bid > 0,
@@ -53,7 +54,20 @@ keyed without the expiry.
 6. Constant maturity, with total variance linear in calendar days. IV30 is interpolated between the
    nearest usable expiry in [7, 30] and the nearest in (30, 75]. IV60 uses [21, 60] and (60, 130].
    Both sides are required: there is no extrapolation and no flat single-expiry fallback. The study's
-   flagged "single" fallback was deliberately dropped.
+   flagged "single" fallback was deliberately dropped. The one exception is an expiry exactly on the
+   target day, which is the constant-maturity value by itself.
+7. **Discounting is ignored (D = 1), deliberately.** This biases the IV slightly low when rates are
+   high. A true 0.30 vol recovers 0.2987 at 30 days and 0.2974 at 60 days at r = 5.3% (2023–24),
+   and 0.3000 at r = 0.05% (2020–21). That is under 0.5% of the level; the gate steps are 5–8% of it.
+   The term slope reads about +0.4% high in a high-rate regime. I measured the alternative,
+   estimating D per expiry from the put-call-parity slope across strikes, on real chains: AAPL, MSFT,
+   JPM, XOM, KO and AMD, March of 2021, 2023 and 2024, 20–75 day expiries, strikes within 10% of F,
+   321 expiry fits. The D error ran from −0.02 to +0.04 (p10 to p90). The implied rate's median was
+   −0.9% in 2021, and −8% and −12% in 2023 and 2024 against a true ~5.2%. That noise is far larger
+   than the bias it would remove; American early exercise and dividends distort parity across
+   strikes. This pure module has no rate source, so D = 1 stays.
+   (`test_the_documented_discount_bias_of_d_equals_one` pins the bias.) After these changes the study
+   parity still holds exactly: AAPL, KO and AMD, 2023, 102 bracketed rows each, max |diff| 7e-15.
 
 Realized vol uses the conventions of `underlying_realized_vol_ratio_5_20`: the same validated
 128-session OHLCV window from the same source, ending at the same session, and the same
@@ -61,6 +75,20 @@ Realized vol uses the conventions of `underlying_realized_vol_ratio_5_20`: the s
 sqrt(252), because it is compared with an annualised IV.
 
 ## 4. Timing and no look-ahead
+
+**Verified on real data: `bar_date` is the quote's own session.** I computed the parity forward of
+the nearest expiry (7 days or more) for `bar_date` D−1, D and D+1 around large gap days. In every
+case it tracks the close of its own `bar_date`, not the close of the day before or after:
+
+- AAPL 2024-06-11, 2025-04-03, 2025-04-09
+- META 2024-02-02, 2022-10-27
+- AMZN 2022-02-04 (as-traded ×20)
+- NFLX 2022-04-20 (×10)
+- TSLA 2024-10-24
+- MSFT 2023-04-26
+
+For example, META 2024-02-02: F = 475.40 against a close of 474.99 on D and 394.78 on D−1. TSLA
+2024-10-24: F = 260.82 against 260.48 on D and 213.65 on D−1. The rows are not one session late.
 
 A row for session S holds S's end-of-day chain (`bar_date == S`, contracts expiring after S) and the
 OHLCV window ending at S. The row is keyed by the data session, exactly like the other profiles.
@@ -91,6 +119,23 @@ How `iv-v1` maps onto that policy:
 Because the profile has no compute-on-miss path, a reader without a pinned manifest refuses with
 `ChainProfileNeedsManifest`.
 
+**Chain quality** (`market_condition_iv_quality.py`). `insufficient_history` and a leading
+`missing_session` run are both exempt from window coverage. A broken chain can hide behind either:
+a missing expiry partition, blank or truncated quotes, or a tree that starts years after the bars.
+So for each symbol and for IV30 and IV60, the build measures the sessions where the stock has a
+usable OHLCV window (RV20 valid) but the IV is unknown for any reason. It records the share of such
+sessions and the longest contiguous run with its dates, plus the count of quotes dropped as
+conflicting duplicates. These go into the symbol's coverage record (`iv_quality` and
+`chain_quality` entries; chain manifests only), and the worst symbols are printed at the end of the
+build.
+
+- `verify` refuses a symbol whose longest run exceeds 20 sessions or whose share exceeds 40%. The
+  overrides are `--iv-max-run`, `--iv-max-rate` and `--iv-accept-symbols`.
+- The launcher applies the same thresholds, but over exactly the sessions the run reads (from the
+  mapped statuses). Its overrides are `--iv-quality-max-run`, `--iv-quality-max-rate` and
+  `--iv-quality-accept`; the matrix driver forwards them only when they are set. Accepted symbols
+  are recorded on the run (`iv_quality_accepted`).
+
 ## 6. Live source: NOT available. Live refuses (open decision)
 
 Live would need the prior session's end-of-day chain with bid and ask. What the platform can read
@@ -110,7 +155,9 @@ The live resolver therefore serves `iv-v1` with `LiveUnavailableMarketConditionR
 - An ERROR is logged once per process, plus one per decision pass naming the expert.
 - The expert's other profiles keep their readers.
 - The deploy importer refuses a payload with an `iv-v1` leaf, because the strategy could never enter
-  live. A genome whose iv genes all decoded to off still imports.
+  live. A genome whose iv genes all decoded to off imports with `iv-v1` DROPPED from its profile
+  setting. Nothing reads it, so no decision changes, and live does not report a missing source for
+  a profile that is never read.
 
 The options for the owner:
 
@@ -175,7 +222,9 @@ python tools/run_options_matrix.py ... --market-condition-profile ohlcv-v1,iv-v1
     --market-condition-manifest ohlcv-v1=<digest>,iv-v1=<digest>
 ```
 
-Each profile needs its own manifest. The profiles combine through the existing composite reader.
+Each profile needs its own manifest. On an option job, the launcher refuses an iv manifest whose
+`option_source` is not the job's options store: `thetadata-eod-parquet-v1` requires
+`options_store=thetadata`. Equity jobs trade no chain and are not held to a store. The profiles combine through the existing composite reader.
 Genes appear in registry order (ohlcv-v1, then ta-structure-v1, then iv-v1), whatever order the flag
 lists them in. Profile `none` and the two existing profiles emit exactly what they did before.
 
