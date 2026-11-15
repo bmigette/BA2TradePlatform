@@ -183,8 +183,38 @@ def _call_with_deadline(fn: Callable[[], Any], deadline_s: float, stop: Optional
     return box.get("value")
 
 
-class AlphaVantageLiveChainReader(ChainLiveReader):
+class DailyWindowMixin:
+    """The OHLCV window and the memo freshness key every live chain reader shares (the ohlcv-v1 live
+    reader's daily cache and freshness rule). Needs ``cache_root`` and ``source_profile``."""
+
+    cache_root: str
+    source_profile: str
+
+    def _memo_extra(self, symbol: str) -> Tuple[Any, ...]:
+        """The daily-bar file's (path, mtime, size): a row computed from a stale or missing file is
+        recomputed as soon as the file changes (the ohlcv-v1 live reader's freshness rule)."""
+        path = fmp_daily_cache_path(symbol, self.cache_root, source_profile=self.source_profile)
+        if path is None:
+            return (None,)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return (path, None)
+        return (path, st.st_mtime_ns, st.st_size)
+
+    def _window(self, symbol: str, session: date):
+        path = fmp_daily_cache_path(symbol, self.cache_root, source_profile=self.source_profile)
+        if path is None:
+            return None, STATUS_MISSING_SESSION, f"no daily bar cache for {symbol}"
+        win = assemble_window(*read_fmp_daily_cache(path), session)
+        if not win.ok:
+            return None, win.status, win.reason
+        return win.arrays(), STATUS_VALID, ""
+
+
+class AlphaVantageLiveChainReader(DailyWindowMixin, ChainLiveReader):
     option_source = "alphavantage"
+    serving_kind = "alphavantage"
 
     def __init__(self, profile: str = "iv-v1", *, cache_root: Optional[str] = None,
                  source_profile: str = SOURCE_PROFILE_FMP_DAILY,
@@ -202,18 +232,6 @@ class AlphaVantageLiveChainReader(ChainLiveReader):
         self._fetch_lock = threading.Lock()
         #: provider calls made (visibility for tests).
         self.calls = 0
-
-    def _memo_extra(self, symbol: str) -> Tuple[Any, ...]:
-        """The daily-bar file's (path, mtime, size): a row computed from a stale or missing file is
-        recomputed as soon as the file changes (the ohlcv-v1 live reader's freshness rule)."""
-        path = fmp_daily_cache_path(symbol, self.cache_root, source_profile=self.source_profile)
-        if path is None:
-            return (None,)
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
-            return (path, None)
-        return (path, st.st_mtime_ns, st.st_size)
 
     def _chain_path(self, symbol: str, session: date) -> str:
         return chain_path(self.cache_root, symbol, session)
@@ -244,15 +262,6 @@ class AlphaVantageLiveChainReader(ChainLiveReader):
             self.note_http_success()
         return frame, failure, kind
 
-    def _window(self, symbol: str, session: date):
-        path = fmp_daily_cache_path(symbol, self.cache_root, source_profile=self.source_profile)
-        if path is None:
-            return None, STATUS_MISSING_SESSION, f"no daily bar cache for {symbol}"
-        win = assemble_window(*read_fmp_daily_cache(path), session)
-        if not win.ok:
-            return None, win.status, win.reason
-        return win.arrays(), STATUS_VALID, ""
-
     def _evidence(self, symbol: str, session: date) -> IvEvidence:
         frame, failure, kind = self._chain_frame(symbol, session)
         if failure:
@@ -265,17 +274,17 @@ class AlphaVantageLiveChainReader(ChainLiveReader):
 
 
 # ----------------------------------------------------------------------------------- shared helpers
-def chain_path(cache_root: str, symbol: str, session: date) -> str:
-    return os.path.join(cache_root, LIVE_CHAIN_DIR, symbol.upper(), f"{session.isoformat()}.parquet")
+def chain_path(cache_root: str, symbol: str, session: date, chain_dir: str = LIVE_CHAIN_DIR) -> str:
+    return os.path.join(cache_root, chain_dir, symbol.upper(), f"{session.isoformat()}.parquet")
 
 
-def read_cached(cache_root: str, symbol: str, session: date):
+def read_cached(cache_root: str, symbol: str, session: date, chain_dir: str = LIVE_CHAIN_DIR):
     """The cached mapped frame, or None. A file that fails to read is DELETED (it is refetched) -- after
     a re-stat, so a file another instance replaced meanwhile is never removed."""
     import pandas as pd
     import pyarrow as pa
 
-    path = chain_path(cache_root, symbol, session)
+    path = chain_path(cache_root, symbol, session, chain_dir)
     try:
         before = os.stat(path)
     except FileNotFoundError:
@@ -380,14 +389,14 @@ def fetch_and_cache(cache_root: str, symbol: str, session: date, *, api_key: Cal
 
 
 def maintain_cache(cache_root: str, keep_sessions: int = KEEP_SESSIONS, *, part_age_s: float = 3600.0,
-                   reference: Optional[date] = None) -> Dict[str, int]:
+                   reference: Optional[date] = None, chain_dir: str = LIVE_CHAIN_DIR) -> Dict[str, int]:
     """Remove stale ``*.part`` files, keep only the newest ``keep_sessions`` sessions per symbol, and
     remove a symbol whose newest session is older than the ``keep_sessions`` sessions ending at
     ``reference`` (default: the session a live decision now reads). Runs from the prefetch, never
     from a gate."""
     from ba2_common.core.market_calendar import regular_sessions_ending_at
 
-    root = os.path.join(cache_root, LIVE_CHAIN_DIR)
+    root = os.path.join(cache_root, chain_dir)
     out = {"parts_removed": 0, "sessions_pruned": 0, "symbols_removed": 0}
     if not os.path.isdir(root):
         return out
@@ -403,6 +412,8 @@ def maintain_cache(cache_root: str, keep_sessions: int = KEEP_SESSIONS, *, part_
         except OSError:
             pass
     for sdir in glob.glob(os.path.join(root, "*")):
+        if os.path.basename(sdir).startswith("_"):
+            continue                                 # bookkeeping (capture manifests), not a symbol
         files = sorted(glob.glob(os.path.join(sdir, "????-??-??.parquet")))
         stale = not files or os.path.basename(files[-1])[:10] < cutoff
         for old in (files if stale else files[:-keep_sessions] if keep_sessions > 0 else files):
@@ -421,17 +432,20 @@ def maintain_cache(cache_root: str, keep_sessions: int = KEEP_SESSIONS, *, part_
     return out
 
 
-def recent_symbols(cache_root: str, sessions: int, reference: Optional[date] = None) -> list:
+def recent_symbols(cache_root: str, sessions: int, reference: Optional[date] = None,
+                   chain_dir: str = LIVE_CHAIN_DIR) -> list:
     """Symbols with a cached chain for one of the ``sessions`` regular sessions ending at ``reference``
     (by the FILE'S session date, never its age on disk)."""
     from ba2_common.core.market_calendar import regular_sessions_ending_at
 
-    root = os.path.join(cache_root, LIVE_CHAIN_DIR)
+    root = os.path.join(cache_root, chain_dir)
     if not os.path.isdir(root):
         return []
     wanted = {d.isoformat() for d in regular_sessions_ending_at(reference or _live_prior_session(), sessions)}
     out = []
     for sym in sorted(os.listdir(root)):
+        if sym.startswith("_"):
+            continue
         try:
             names = os.listdir(os.path.join(root, sym))
         except OSError:

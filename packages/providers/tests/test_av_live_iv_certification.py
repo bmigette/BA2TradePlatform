@@ -175,17 +175,24 @@ def test_the_resolver_serves_alphavantage_and_refuses_other_sources(world):
 
     root, _ = world
     clear_live_chain_readers()
+    av = {"live_chain_source": "alphavantage"}          # the app setting iv_live_chain_source
     try:
-        r = live.resolver_for_profiles((IV_PROFILE,), option_source="alphavantage", cache_root=str(root))
+        r = live.resolver_for_profiles((IV_PROFILE,), option_source="alphavantage", cache_root=str(root), **av)
         assert isinstance(r.reader, LiveUnavailableMarketConditionReader)     # not wired in this process
         assert "no live reader is wired" in r.reader.reason
         register_live_chain_reader("alphavantage", make_reader)
-        r = live.resolver_for_profiles((IV_PROFILE,), option_source="alphavantage", cache_root=str(root))
+        r = live.resolver_for_profiles((IV_PROFILE,), option_source="alphavantage", cache_root=str(root), **av)
         assert isinstance(r.reader, AlphaVantageLiveChainReader)
         assert r.live_unavailable_profiles() == () and r.research_mode_profiles() == ()
         for src in ("thetadata", None):
-            r = live.resolver_for_profiles((IV_PROFILE,), option_source=src, cache_root=str(root))
+            r = live.resolver_for_profiles((IV_PROFILE,), option_source=src, cache_root=str(root), **av)
             assert isinstance(r.reader, LiveUnavailableMarketConditionReader)
+        # the setting unset (or malformed): refused, naming it
+        for raw, expect in ((None, "is not set"), ("vendorx", "malformed")):
+            r = live.resolver_for_profiles((IV_PROFILE,), option_source="alphavantage", cache_root=str(root),
+                                           live_chain_source=raw)
+            assert isinstance(r.reader, LiveUnavailableMarketConditionReader)
+            assert "iv_live_chain_source" in r.reader.reason and expect in r.reader.reason
     finally:
         clear_live_chain_readers()
 
