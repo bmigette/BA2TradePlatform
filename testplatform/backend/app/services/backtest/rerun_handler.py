@@ -89,6 +89,15 @@ def _gene_params(strategy_params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def is_fixed_screen(screener_opt: Dict[str, Any]) -> bool:
+    """True for a stored ``screener_opt`` of a FIXED screen (``--screen-preset``, or any launch that searched no
+    screener gene): the launch recorded ``declared_ranges`` as an EMPTY dict (``screener_launch.declared_ranges_of``
+    of a gene set with nothing searched). Its static universe was computed from the stored base settings alone (no
+    gene to loosen), so a recompute does the same. A block without the key (from before the declaration) is NOT one:
+    its gene ranges are unknown, and a recompute refuses rather than assume there were none."""
+    return isinstance(screener_opt, dict) and screener_opt.get("declared_ranges") == {}
+
+
 def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *, row_id: Any = None
                               ) -> Dict[str, Any]:
     """A COPY of ``bt_block`` whose ``enabled_instruments`` is recomputed under the superset rule
@@ -96,6 +105,11 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     (``parameter_ranges``, ``screener:<gene>`` keys), the stored base settings, the block's window and its
     recorded exclusions, then stamped ``screener_universe_rule``. Refuses (``ScreenerUniverseError``)
     when the ranges are absent or a gene has no role: it never guesses a loosest value.
+
+    A FIXED screen (``is_fixed_screen``: the launch recorded ``declared_ranges == {}``, e.g. ``--screen-preset xl``)
+    searched no screener gene, so it has no ranges by construction: its universe is recomputed from the stored base
+    settings (the preset's criteria) with NO gene ranges, exactly as ``screener_launch.prepare_screener_launch``
+    computed it at launch (``gene_ranges_from_opt({}) == {}``), point-in-time over the block's own window.
 
     Symbols with no cached OHLCV for the execution interval (or daily) are EXCLUDED from the screen,
     recorded in ``excluded_instruments`` and logged as a WARNING naming them (the launch default is to
@@ -108,12 +122,17 @@ def recompute_static_universe(bt_block: Dict[str, Any], parameter_ranges: Any, *
     from app.services.backtest.history_source import load_job_store
     from app.services.backtest import screener_launch as _sl
 
+    so = bt_block["screener_opt"]
     ranges = us.gene_ranges_from_parameter_ranges(parameter_ranges if isinstance(parameter_ranges, dict) else {})
-    if not ranges:
+    if not ranges and not is_fixed_screen(so):
         raise us.ScreenerUniverseError(
             f"--recompute-universe: optimization of row {row_id} stores no screener gene ranges "
-            f"(parameter_ranges has no 'screener:*' keys): the loosest values cannot be derived")
-    so = bt_block["screener_opt"]
+            f"(parameter_ranges has no 'screener:*' keys) and its screener_opt does not record a fixed screen "
+            f"(declared_ranges == {{}}): the loosest values cannot be derived")
+    if ranges and is_fixed_screen(so):
+        raise us.ScreenerUniverseError(
+            f"--recompute-universe: optimization of row {row_id} searched screener genes {sorted(ranges)} but its "
+            f"screener_opt records a fixed screen (declared_ranges == {{}}): the stored config contradicts itself")
     interval = bt_block["execution_interval"]
     excluded = list(bt_block.get("excluded_instruments") or [])
     if so.get("criteria_version"):
