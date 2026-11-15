@@ -55,10 +55,12 @@ def test_upgrade_creates_the_model_table_once_and_touches_nothing_else(tmp_path)
     assert _columns(cur, "strategy_optimizations") == before
     cur.execute("SELECT id, name, status FROM strategy_optimizations")
     assert cur.fetchall() == [(7, "cell-wf1", "completed")]
-    # the name is unique, as in the model
-    cur.execute("INSERT INTO walk_forward_runs (name, source, status) VALUES ('c', 'cli', 'running')")
+    # one row per (name, lane), as in the model: the same cell name in another lane is another row
+    ins = "INSERT INTO walk_forward_runs (name, lane_key, source, status) VALUES (?, ?, 'cli', 'running')"
+    cur.execute(ins, ("c", "/reports/goal2027_wf"))
+    cur.execute(ins, ("c", "/reports/other_lane"))
     with pytest.raises(sqlite3.IntegrityError):
-        cur.execute("INSERT INTO walk_forward_runs (name, source, status) VALUES ('c', 'ui', 'pending')")
+        cur.execute(ins, ("c", "/reports/goal2027_wf"))
     conn.close()
 
 
@@ -67,10 +69,11 @@ def test_upgrade_adds_the_columns_an_earlier_shape_lacks_and_keeps_its_rows(tmp_
     m = _load()
     conn = sqlite3.connect(_old_db(tmp_path))
     cur = conn.cursor()
-    cur.execute("CREATE TABLE walk_forward_runs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL "
-                "UNIQUE, source VARCHAR(16) NOT NULL, status VARCHAR(24) NOT NULL, report JSON)")
-    cur.execute("INSERT INTO walk_forward_runs (name, source, status, report) "
-                "VALUES ('old', 'cli', 'pass', '{}')")
+    cur.execute("CREATE TABLE walk_forward_runs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, "
+                "lane_key VARCHAR(1024) NOT NULL, source VARCHAR(16) NOT NULL, status VARCHAR(24) "
+                "NOT NULL, report JSON, UNIQUE (name, lane_key))")
+    cur.execute("INSERT INTO walk_forward_runs (name, lane_key, source, status, report) "
+                "VALUES ('old', '/r', 'cli', 'pass', '{}')")
     conn.commit()
     assert m.upgrade(cur, conn) is True
     assert set(_columns(cur, "walk_forward_runs")) == {c.name for c in WalkForwardRun.__table__.columns}
@@ -80,11 +83,17 @@ def test_upgrade_adds_the_columns_an_earlier_shape_lacks_and_keeps_its_rows(tmp_
     conn.close()
 
 
-def test_a_table_without_its_core_is_refused(tmp_path):
+@pytest.mark.parametrize("ddl", [
+    "CREATE TABLE walk_forward_runs (id INTEGER PRIMARY KEY, label TEXT)",
+    # an early draft keyed on the name alone: no lane (the uniqueness cannot be ALTERed in)
+    "CREATE TABLE walk_forward_runs (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL UNIQUE, "
+    "source VARCHAR(16) NOT NULL, status VARCHAR(24) NOT NULL)",
+])
+def test_a_table_without_its_core_is_refused(tmp_path, ddl):
     m = _load()
     conn = sqlite3.connect(_old_db(tmp_path))
     cur = conn.cursor()
-    cur.execute("CREATE TABLE walk_forward_runs (id INTEGER PRIMARY KEY, label TEXT)")
+    cur.execute(ddl)
     with pytest.raises(RuntimeError, match="core column"):
         m.upgrade(cur, conn)
     conn.close()

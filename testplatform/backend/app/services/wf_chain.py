@@ -312,8 +312,11 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
 
     DB row: when the runner offers ``wf_store(spec, report_dir)`` (the real runner does), the chain
     ALSO writes its ``walk_forward_runs`` row as it advances (app.services.wf_store), after the
-    files each time. The files and their resume semantics are unchanged. A failed DB write raises
-    (the cell fails loudly); an exception of the chain is recorded on the row, then re-raised."""
+    files each time. The files and their resume semantics are unchanged. One row per (cell, report
+    directory). A failed DB write of a grid / CLI chain is retried, then logged once as an ERROR and
+    the chain carries on without its row (the files are the source of truth; the importer repairs
+    the row); for a UI run it raises. An exception of the chain is recorded on the row, then
+    re-raised unchanged (a failure to record it is logged, never raised in its place)."""
     lock = getattr(runner, "exclusive", None)
     make_store = getattr(runner, "wf_store", None)
     store = make_store(spec, report_dir) if callable(make_store) else None
@@ -323,7 +326,13 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
         try:
             return _run_cell(spec, runner, report_dir, log, store)
         except BaseException as e:
-            store.fail(e)
+            # Recording the failure must never mask or replace it: a KeyboardInterrupt stays a
+            # KeyboardInterrupt (run_cells must not carry on with the grid after Ctrl-C).
+            try:
+                store.fail(e)
+            except Exception as fe:  # noqa: BLE001 -- logged; the chain's own exception is re-raised
+                logger.error("[%s] could not record the chain's %s on its walk_forward_runs row "
+                             "(%s: %s)", spec.name, type(e).__name__, type(fe).__name__, fe)
             raise
 
 

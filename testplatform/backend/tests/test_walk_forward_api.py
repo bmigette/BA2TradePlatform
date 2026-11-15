@@ -30,6 +30,12 @@ def _tables():
     yield engine
 
 
+@pytest.fixture(autouse=True)
+def _ui_report_dir(tmp_path, monkeypatch):
+    """UI runs live in the default report directory (BA2_HOME/test/walk_forward): a tmp one here."""
+    monkeypatch.setattr(R, "default_report_dir", lambda: str(tmp_path / "wf_ui"))
+
+
 @pytest.fixture
 def client(_tables):
     from fastapi.testclient import TestClient
@@ -181,10 +187,10 @@ def test_a_created_run_driven_through_the_chain_is_listed_and_shown(client, db, 
     d = client.post("/api/walk-forward/runs", json=_req("wfapi-run")).json()
     row = _row(db, d["id"])
     runner = ApiRunner([GOOD, GOOD, GOOD], prefix="wfapi-run")
-    res = R.drive(d["id"], row.driver_token, runner, task_id=d["taskId"], report_dir=str(tmp_path),
+    res = R.drive(d["id"], row.driver_token, runner, task_id=d["taskId"],
                   log=lambda *_: None)
     assert res.verdict == "PASS"
-    assert (tmp_path / "wfapi-run" / "cell.json").exists()          # the files, as always
+    assert (tmp_path / "wf_ui" / "wfapi-run" / "cell.json").exists()          # the files, as always
     lst = client.get("/api/walk-forward/runs").json()["runs"]
     mine = next(x for x in lst if x["id"] == d["id"])
     assert mine["status"] == "pass" and (mine["foldsDone"], mine["plannedFolds"]) == (3, 3)
@@ -235,7 +241,7 @@ def test_resume_of_a_deferred_run_with_the_full_data_tests_the_last_fold(client,
     d = client.post("/api/walk-forward/runs",
                     json=_req("wfapi-2ph", data_end="2025-12-31", defer_last_test=True)).json()
     runner = ApiRunner([GOOD, GOOD, GOOD], prefix="wfapi-2ph")
-    R.drive(d["id"], _row(db, d["id"]).driver_token, runner, report_dir=str(tmp_path),
+    R.drive(d["id"], _row(db, d["id"]).driver_token, runner,
             log=lambda *_: None)
     assert _row(db, d["id"]).status == "deferred-pending"
     _task_done(d["taskId"])                     # what the handler does when the driver exits
@@ -245,7 +251,7 @@ def test_resume_of_a_deferred_run_with_the_full_data_tests_the_last_fold(client,
     row = _row(db, d["id"])
     assert row.spec["data_end"] is None and row.status == "pending"
     again = ApiRunner([GOOD, GOOD, GOOD], prefix="wfapi-2ph", completed=set(runner.completed))
-    assert R.drive(d["id"], row.driver_token, again, report_dir=str(tmp_path),
+    assert R.drive(d["id"], row.driver_token, again,
                    log=lambda *_: None).verdict == "PASS"
     assert _row(db, d["id"]).status == "pass"
 
@@ -253,7 +259,7 @@ def test_resume_of_a_deferred_run_with_the_full_data_tests_the_last_fold(client,
 def test_imported_and_cli_rows_are_view_only(client, db, tmp_path):
     from app.models.walk_forward_run import WalkForwardRun
     for name, source in (("wfapi-imp", "import"), ("wfapi-cli", "cli")):
-        db.add(WalkForwardRun(name=name, source=source, status="error", spec={"optimize_args": None},
+        db.add(WalkForwardRun(name=name, lane_key="/lane", source=source, status="error", spec={"optimize_args": None},
                               report={"folds": []}))
     db.commit()
     imp = db.query(WalkForwardRun).filter(WalkForwardRun.name == "wfapi-imp").first()
@@ -336,7 +342,7 @@ def test_startup_recovery_marks_an_orphaned_ui_run_as_error(db):
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     from app.services.optimization_resume import this_host
-    db.add(WalkForwardRun(name="wfapi-orphan", source="ui", status="running", task_id="gone",
+    db.add(WalkForwardRun(name="wfapi-orphan", lane_key="/lane", source="ui", status="running", task_id="gone",
                           driver_host=this_host(), driver_pid=p.pid, driver_pid_started=1.0))
     db.commit()
     assert R.recover_interrupted(db) >= 1
@@ -367,7 +373,7 @@ def test_oos_equity_chains_the_fold_winners_curves(client, db):
                 "test_start": f"{2023 + k}-01-01", "test_end": f"{2023 + k}-12-31",
                 "ranks": [{"fold": k, "rank": 1, "oos_backtest_id": bid}]}
 
-    row = WalkForwardRun(name="wfapi-eq", source="import", status="pass",
+    row = WalkForwardRun(name="wfapi-eq", lane_key="/lane", source="import", status="pass",
                          report={"folds": [fold(1, ids[0]), fold(2, ids[1])]})
     db.add(row)
     db.commit()

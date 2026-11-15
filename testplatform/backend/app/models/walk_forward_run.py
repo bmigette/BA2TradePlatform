@@ -9,24 +9,38 @@ Small columns first, the two JSON documents LAST: a list query selects only the 
 SQLite then never reads the (possibly large) ``report`` blob (same rule as backtests, see
 Backtest.__table_args__).
 """
-from sqlalchemy import Column, DateTime, Float, Integer, JSON, String, Text
+import os
+
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from .database import Base
 
 #: Lifecycle of a row. ``deferred-pending``: the last fold is trained and its test waits for data
-#: (two-phase walk-forward, ``--wf-defer-last-test``).
-WF_STATUSES = ("pending", "running", "deferred-pending", "pass", "fail", "error", "cancelled")
-WF_TERMINAL = ("deferred-pending", "pass", "fail", "error", "cancelled")
+#: (two-phase walk-forward, ``--wf-defer-last-test``). ``incomplete``: an IMPORTED chain whose files
+#: carry no verdict and no grid-summary entry (its driver had not finished, or was killed).
+WF_STATUSES = ("pending", "running", "deferred-pending", "pass", "fail", "error", "cancelled",
+               "incomplete")
+WF_TERMINAL = ("deferred-pending", "pass", "fail", "error", "cancelled", "incomplete")
 WF_SOURCES = ("ui", "cli", "import")
+
+
+def lane_key(report_dir: str) -> str:
+    """The identity of a chain's report directory (its LANE): normalised absolute path. Two report
+    directories using the same cell name (goal2027 and another lane, or a copy imported from another
+    host) are different chains with different rows; within one lane the chain's driver lock
+    (``<report_dir>/<name>/.lock``) makes one driver at a time."""
+    return os.path.normcase(os.path.abspath(report_dir))
 
 
 class WalkForwardRun(Base):
     __tablename__ = "walk_forward_runs"
 
     id = Column(Integer, primary_key=True, index=True)
-    # The chain prefix: its train jobs are <name>-wf<k>, the refit <name>-refit. One row per name.
-    name = Column(String(255), nullable=False, unique=True)
+    # The chain prefix: its train jobs are <name>-wf<k>, the refit <name>-refit.
+    name = Column(String(255), nullable=False)
+    # lane_key(report_dir): one row per (name, lane). See lane_key.
+    lane_key = Column(String(1024), nullable=False)
     source = Column(String(16), nullable=False)            # ui | cli | import
     expert = Column(String(100), nullable=True)
     strategy = Column(String(50), nullable=True)
@@ -40,6 +54,7 @@ class WalkForwardRun(Base):
     stitched_return = Column(Float, nullable=True)
     worst_oos_dd = Column(Float, nullable=True)
     stitched_trades = Column(Integer, nullable=True)
+    stitch_partial = Column(Boolean, nullable=True)       # the stitch covers the folds done so far
     error_message = Column(Text, nullable=True)
     # The task-queue task running it (UI runs) and the token of the driver that owns the row now.
     task_id = Column(String(64), nullable=True)
@@ -48,13 +63,15 @@ class WalkForwardRun(Base):
     driver_pid = Column(Integer, nullable=True)
     driver_pid_started = Column(Float, nullable=True)
     driver_identity = Column(JSON, nullable=True)
-    report_dir = Column(String(1024), nullable=True)
+    report_dir = Column(String(1024), nullable=True)     # the chain's report directory (absolute)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     spec = Column(JSON, nullable=True)
     report = Column(JSON, nullable=True)
+
+    __table_args__ = (UniqueConstraint("name", "lane_key", name="uq_walk_forward_runs_name_lane"),)
 
     def __repr__(self):
         return f"<WalkForwardRun(id={self.id}, name={self.name!r}, status={self.status!r})>"

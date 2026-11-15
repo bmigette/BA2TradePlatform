@@ -6,7 +6,7 @@ process per run, so the chain's train jobs, out-of-sample re-runs, launcher glob
 never live inside the API server. It runs the SAME chain as the goal2027 grid: the stored
 ``wf_chain.CellSpec``, re-validated by ``wf_runs.preflight``, through ``wf_chain.run_cell`` with
 tools/run_walk_forward.py's ``RealRunner``; the chain writes its report files under the run's report
-directory and keeps the row current.
+directory (the row's lane: always the row's own, there is no override) and keeps the row current.
 
   python tools/run_wf_run.py --run-id 12 --token <the row's driver token> [--task-id T]
 
@@ -32,7 +32,6 @@ def main(argv=None) -> int:
     ap.add_argument("--run-id", type=int, required=True)
     ap.add_argument("--token", required=True)
     ap.add_argument("--task-id", default=None)
-    ap.add_argument("--report-dir", default=None, help="default: the row's report directory")
     ap.add_argument("--min-free-gb", type=float, default=20.0,
                     help="memory floor of the out-of-sample re-runs (as tools/run_walk_forward.py)")
     ap.add_argument("--force-memory", action="store_true")
@@ -46,7 +45,7 @@ def main(argv=None) -> int:
                                             force_memory=a.force_memory))
     runner.launcher_module()                   # bootstrap: backend path, DB wiring, init_db()
     try:
-        res = wf_runs.drive(a.run_id, a.token, runner, task_id=a.task_id, report_dir=a.report_dir)
+        res = wf_runs.drive(a.run_id, a.token, runner, task_id=a.task_id)
     except WF.WalkForwardError as e:
         print(f"run_wf_run: {e}", file=sys.stderr, flush=True)
         return 2

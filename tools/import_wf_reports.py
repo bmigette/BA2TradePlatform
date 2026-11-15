@@ -7,10 +7,12 @@ Walk-forward page), e.g. a ``reports/goal2027_wf/`` copied from the host that ra
   python tools/import_wf_reports.py reports/walk_forward/<prefix>  # a tools/run_walk_forward.py report
 
 Reads ``cell.json`` / ``report.json`` / ``fold<k>.json`` / ``summary.json`` (app.services.wf_store);
-never writes them. IDEMPOTENT: an unchanged chain is left alone, a changed one updated. A row this DB's
+never writes them. A row is (cell name, report directory): a copy of another host's grid gets its own rows,
+never this DB's rows of the same cell names in another directory. IDEMPOTENT: an unchanged chain is left alone, a changed one updated. A row this DB's
 own runs wrote (the UI, or the grid on this host) is never overwritten unless --replace-live. Imported
 rows are view-only: they carry no optimize args, so they cannot be resumed here. Their train job and
-out-of-sample backtest links appear only when those rows exist in THIS DB with the recorded id/name.
+out-of-sample backtest links appear only when those rows exist in THIS DB with the recorded id/name. A
+chain whose files are corrupt is listed as "error" and skipped; the others are imported; exit code 2.
 The DB is the test platform's (DATABASE_URL, default BA2_HOME/test/dl_forecasting.db).
 """
 from __future__ import annotations
@@ -50,6 +52,8 @@ def main(argv=None) -> int:
             continue
         for name, action in done:
             print(f"  {action:10s} {name}")
+            if action.startswith("error"):
+                rc = 2                         # a corrupt chain: reported, the others imported
         print(f"{d}: {len(done)} chain(s)" + (" (dry run, nothing written)" if a.dry_run else ""))
     return rc
 

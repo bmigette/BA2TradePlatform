@@ -18,14 +18,18 @@ the same shape. The report is JSON, keyed like the engine's own records: every r
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from app.services import walk_forward as WF
 from app.services.walk_forward import WalkForwardError
+
+logger = logging.getLogger(__name__)
 
 REPORT_SCHEMA = 1
 
@@ -137,13 +141,18 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
                  walk_forward: Optional[Dict[str, Any]] = None,
                  thresholds: Optional[Dict[str, Any]] = None,
                  selection: Optional[Dict[str, Any]] = None, top_n: Optional[int] = None,
-                 refit_running: Optional[str] = None) -> Dict[str, Any]:
+                 refit_running: Optional[str] = None, planned_known: bool = True) -> Dict[str, Any]:
     """The row's report: one entry per planned fold (windows, state, train job + optimization id, the
     top-N ranks as ``asdict(GenomeFold)``), the stitched out-of-sample result (the final one from
     ``walk_forward`` when the chain finished, else the stitch of the folds done so far), the verdict,
     refit / deferred / eliminated blocks of the cell report, and the thresholds used.
 
-    ``states``: planned | running | done | deferred | eliminated per fold index."""
+    ``states``: planned | running | done | deferred | eliminated per fold index. ``planned_known``
+    False: the number of planned folds is not recorded anywhere (an imported chain with fold files
+    only); ``folds`` then lists the folds known, not the plan.
+
+    ``overall_passed`` is only ever set for a PASS / FAIL verdict: a PENDING or unfinished chain has
+    no overall verdict, whatever an intermediate aggregate said."""
     generations, identities, seeded_from = generations or {}, identities or {}, seeded_from or {}
     cell_folds = {int(x["fold"]): x for x in (cell or {}).get("folds", [])}
     folds = []
@@ -169,6 +178,7 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
     stitch = ((walk_forward or {}).get("winner_stitch") if final
               else _partial_stitch(windows, genomes, done))
     c = cell or {}
+    decided = c.get("verdict") in ("PASS", "FAIL")
     return {
         "schema": REPORT_SCHEMA,
         "name": name,
@@ -181,7 +191,8 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
         "winners_passed": (walk_forward or {}).get("winners_passed",
                                                    sum(1 for f in folds if f["state"] == "done"
                                                        and f["winner_passed"])),
-        "overall_passed": (walk_forward or {}).get("overall_passed"),
+        "overall_passed": (walk_forward or {}).get("overall_passed") if decided else None,
+        "planned_folds_known": planned_known,
         "complete": (walk_forward or {}).get("complete"),
         "notes": (walk_forward or {}).get("notes") or [],
         "required_failed": c.get("required_failed") or (walk_forward or {}).get("required_failed") or [],
@@ -200,11 +211,12 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
 def summary_columns(report: Dict[str, Any]) -> Dict[str, Any]:
     """The light list columns of a report: folds done/planned and the stitched out-of-sample result."""
     st = report.get("winner_stitch") or {}
-    return {"planned_folds": len(report["folds"]),
+    return {"planned_folds": len(report["folds"]) if report.get("planned_folds_known", True) else None,
             "folds_done": sum(1 for f in report["folds"] if f["state"] == "done"),
             "stitched_return": st.get("total_return"),
             "worst_oos_dd": st.get("worst_fold_dd"),
-            "stitched_trades": st.get("trades")}
+            "stitched_trades": st.get("trades"),
+            "stitch_partial": bool(report.get("stitch_partial"))}
 
 
 # --------------------------------------------------------------------------------- live writer
@@ -218,25 +230,44 @@ def _session_factory(factory: Optional[Callable] = None) -> Callable:
 
 
 class RunStore:
-    """The live writer of ONE chain's row (by name), driven by ``wf_chain.run_cell``.
+    """The live writer of ONE chain's row, identified by (name, lane of ``report_dir``), driven by
+    ``wf_chain.run_cell``.
 
-    ``begin`` claims the row for this driver: it refuses a row another driver is still running
-    (recorded process alive or not provably dead), so a second driver never overwrites a live run's
-    row. Only a store that has begun writes anything afterwards (``fail`` before ``begin`` is a no-op:
-    a refused driver must not mark the live run's row as failed). Every write commits at once and
-    raises on failure."""
+    OWNERSHIP (``begin``). One row per (cell name, report directory): two lanes using the same cell
+    name never share a row. Within a lane, ``run_cell`` holds the chain's driver lock
+    (``<report_dir>/<name>/.lock``, the real runner's ``exclusive``) BEFORE ``begin``, so for a
+    grid / CLI chain (``source="cli"``) any other driver of that row is gone: a ``running`` row left
+    by a stopped grid is taken over, never refused, and the row records who drives it now (report
+    directory, host, pid). A UI run (``source="ui"``) is additionally owned by its start token: a
+    ``running`` row driven under another token is refused while that driver is not provably dead.
+    Taking over a row also makes it this driver's (``source``), so a later re-import never
+    overwrites live progress with older files.
 
-    def __init__(self, name: str, *, source: str = "cli", token: Optional[str] = None,
-                 task_id: Optional[str] = None, report_dir: Optional[str] = None,
+    FAILURES. ``source="ui"``: every write raises (the UI run fails loudly; its row is all the UI
+    has). ``source="cli"``: a write is retried with backoff; when it still fails, ONE loud ERROR is
+    logged, the store goes DEGRADED (no further attempts) and the chain carries on: the report files
+    are the source of truth and ``tools/import_wf_reports.py <report_dir>`` repairs the row. An
+    ownership refusal in ``begin`` is fatal for both. ``fail`` before ``begin`` (a refused driver) is
+    a no-op."""
+
+    RETRY_DELAYS = (0.5, 1.0, 2.0)
+
+    def __init__(self, name: str, *, report_dir: str, source: str = "cli",
+                 token: Optional[str] = None, task_id: Optional[str] = None,
                  session_factory: Optional[Callable] = None, identity: Optional[Dict] = None):
+        from app.models.walk_forward_run import lane_key
+        if source not in ("cli", "ui"):
+            raise ValueError(f"RunStore source must be 'cli' or 'ui', got {source!r}")
         self.name = name
         self.source = source
         self.token = token
         self.task_id = task_id
-        self.report_dir = report_dir
+        self.report_dir = os.path.abspath(report_dir)
+        self.lane = lane_key(report_dir)
         self._S = _session_factory(session_factory)
         self._identity = identity
         self.begun = False
+        self.degraded = False
         self.windows: List[Dict[str, Any]] = []
         self.genomes: Dict[int, List[Dict[str, Any]]] = {}
         self.states: Dict[int, str] = {}
@@ -252,6 +283,11 @@ class RunStore:
             self._identity = process_identity()
         return self._identity
 
+    def _query(self, db):
+        from app.models.walk_forward_run import WalkForwardRun
+        return db.query(WalkForwardRun).filter(WalkForwardRun.name == self.name,
+                                               WalkForwardRun.lane_key == self.lane)
+
     def _report(self, cell=None, walk_forward=None) -> Dict[str, Any]:
         th = self.spec_json.get("thresholds")
         return build_report(
@@ -265,25 +301,75 @@ class RunStore:
             selection=self.spec_json.get("selection"), top_n=self.spec_json.get("top_n"),
             refit_running=self.refit_running)
 
-    def _write(self, **values) -> None:
-        from app.models.walk_forward_run import WalkForwardRun
-        db = self._S()
-        try:
-            row = db.query(WalkForwardRun).filter(WalkForwardRun.name == self.name).first()
-            if row is None:
-                raise WalkForwardError(f"walk_forward_runs row {self.name!r} disappeared while its "
-                                       f"chain was running")
-            for k, v in values.items():
-                setattr(row, k, v)
-            row.updated_at = _now()
-            db.commit()
-        finally:
-            db.close()
+    def _attempt(self, what: str, fn: Callable[[], None]) -> None:
+        """Run one DB write: fatal for a UI run; retried, then degraded (logged once) for a grid one."""
+        if self.degraded:
+            return
+        if self.source == "ui":
+            fn()
+            return
+        last: Optional[Exception] = None
+        for delay in (0.0, *self.RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            try:
+                fn()
+                return
+            except WalkForwardError:
+                raise                     # an ownership refusal, not a DB failure
+            except Exception as e:  # noqa: BLE001 -- a DB failure of the side record; see below
+                last = e
+        self.degraded = True
+        logger.error(
+            "[%s] walk_forward_runs row could NOT be written (%s, %d attempts: %s: %s). The chain "
+            "CONTINUES and this cell's row is no longer updated; the report files under %s are the "
+            "source of truth -- repair the row with: python tools/import_wf_reports.py %s",
+            self.name, what, 1 + len(self.RETRY_DELAYS), type(last).__name__, last,
+            os.path.join(self.report_dir, self.name), self.report_dir)
 
-    def _write_report(self, cell=None, walk_forward=None, **extra) -> Dict[str, Any]:
+    def _write(self, **values) -> None:
+        def go():
+            db = self._S()
+            try:
+                row = self._query(db).first()
+                if row is None:
+                    raise RuntimeError(f"walk_forward_runs row {self.name!r} ({self.report_dir}) "
+                                       f"disappeared while its chain was running")
+                for k, v in values.items():
+                    setattr(row, k, v)
+                row.updated_at = _now()
+                db.commit()
+            finally:
+                db.close()
+        self._attempt(", ".join(sorted(values)) or "update", go)
+
+    def _write_report(self, cell=None, walk_forward=None, **extra) -> None:
         report = self._report(cell, walk_forward)
         self._write(report=report, **summary_columns(report), **extra)
-        return report
+
+    def _stored_folds(self, folds: Sequence[WF.Fold]) -> None:
+        """Seed the report from fold reports already on disk (a resumed chain, or a grid cell started
+        before rows existed), so a restart does not blank the displayed result. Only a file whose
+        windows are this fold's is used; the chain re-validates it (``_load_fold``) and re-reports
+        the fold when it reuses or re-evaluates it."""
+        for f in folds:
+            path = os.path.join(self.report_dir, self.name, f"fold{f.index}.json")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                key = doc["key"]
+                if (key["train"] != [f.train_start.isoformat(), f.train_end.isoformat()]
+                        or key["test"] != [f.test_start.isoformat(), f.test_end.isoformat()]):
+                    continue
+                self.genomes[f.index] = [asdict(WF.GenomeFold(**g)) for g in doc["genomes"]]
+                if key.get("train_jobs"):
+                    self.identities[f.index] = key["train_jobs"][-1]
+                self.states[f.index] = "done"
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                logger.warning("[%s] stored fold report %s not shown on the row (%s: %s); the chain "
+                               "decides about it", self.name, path, type(e).__name__, e)
 
     # -- the chain's events
     def begin(self, spec: Any, folds: Sequence[WF.Fold], deferred: Optional[WF.Fold]) -> None:
@@ -294,47 +380,54 @@ class RunStore:
         self.states = {f.index: "planned" for f in folds}
         self.generations = {f.index: (spec.first_generations if f.index == 1 else spec.next_generations)
                             for f in folds}
+        self._stored_folds(folds)
         drv = self._driver()
-        db = self._S()
-        try:
-            row = db.query(WalkForwardRun).filter(WalkForwardRun.name == self.name).first()
-            if row is not None and row.status == "running" and row.driver_token != self.token:
-                state, why = judge(row.driver_host, row.driver_pid, row.driver_pid_started,
-                                   row.driver_identity)
-                mine = (row.driver_host, row.driver_pid) == (drv["host"], drv["pid"])
-                if state != DEAD and not mine:
-                    raise WalkForwardError(
-                        f"walk-forward run {self.name!r} is being run by another driver "
-                        f"(pid {row.driver_pid} on {row.driver_host}: {why})"
-                        + ("" if state == ALIVE else "; it is not provably dead, so it is not "
-                                                     "taken over"))
-            if row is None:
-                row = WalkForwardRun(name=self.name, source=self.source, status="running",
-                                     created_at=_now())
-                db.add(row)
-            row.status = "running"
-            row.expert, row.strategy, row.band = spec.expert, spec.strategy, spec.band
-            row.spec = {**self.spec_json, "name": self.name}
-            row.error_message = None
-            row.completed_at = None
-            row.started_at = _now()
-            row.updated_at = row.started_at
-            row.current_fold = None
-            row.progress_message = "starting"
-            row.driver_token = self.token
-            row.driver_host, row.driver_pid = drv["host"], drv["pid"]
-            row.driver_pid_started, row.driver_identity = drv["pid_started"], drv.get("proc_identity")
-            if self.task_id is not None:
-                row.task_id = self.task_id
-            if self.report_dir is not None:
-                row.report_dir = os.path.abspath(self.report_dir)
-            report = self._report()
-            row.report = report
-            for k, v in summary_columns(report).items():
-                setattr(row, k, v)
-            db.commit()
-        finally:
-            db.close()
+
+        def go():
+            db = self._S()
+            try:
+                row = self._query(db).first()
+                if (row is not None and self.source == "ui" and row.status == "running"
+                        and row.driver_token != self.token):
+                    state, why = judge(row.driver_host, row.driver_pid, row.driver_pid_started,
+                                       row.driver_identity)
+                    mine = (row.driver_host, row.driver_pid) == (drv["host"], drv["pid"])
+                    if state != DEAD and not mine:
+                        raise WalkForwardError(
+                            f"walk-forward run {self.name!r} is being run by another driver "
+                            f"(pid {row.driver_pid} on {row.driver_host}: {why})"
+                            + ("" if state == ALIVE else "; it is not provably dead, so it is not "
+                                                         "taken over"))
+                if row is not None and row.status == "running" and row.driver_pid is not None:
+                    logger.info("[%s] taking over the walk_forward_runs row last driven by pid %s on "
+                                "%s (%s)", self.name, row.driver_pid, row.driver_host, row.source)
+                if row is None:
+                    row = WalkForwardRun(name=self.name, lane_key=self.lane, created_at=_now())
+                    db.add(row)
+                row.source = self.source
+                row.status = "running"
+                row.expert, row.strategy, row.band = spec.expert, spec.strategy, spec.band
+                row.spec = {**self.spec_json, "name": self.name}
+                row.error_message = None
+                row.completed_at = None
+                row.started_at = _now()
+                row.updated_at = row.started_at
+                row.current_fold = None
+                row.progress_message = "starting"
+                row.driver_token = self.token
+                row.driver_host, row.driver_pid = drv["host"], drv["pid"]
+                row.driver_pid_started, row.driver_identity = drv["pid_started"], drv.get("proc_identity")
+                if self.task_id is not None:
+                    row.task_id = self.task_id
+                row.report_dir = self.report_dir
+                report = self._report()
+                row.report = report
+                for k, v in summary_columns(report).items():
+                    setattr(row, k, v)
+                db.commit()
+            finally:
+                db.close()
+        self._attempt("begin", go)
         self.begun = True
 
     def fold_started(self, f: WF.Fold) -> None:
@@ -355,6 +448,7 @@ class RunStore:
 
     def fold_deferred(self, f: WF.Fold) -> None:
         self.states[f.index] = "deferred"
+        self.genomes.pop(f.index, None)
         self._write_report(progress_message=f"fold {f.index}: trained; its test "
                                             f"{f.test_start}..{f.test_end} waits for the data")
 
@@ -365,10 +459,10 @@ class RunStore:
     def finish(self, cell: Dict[str, Any], res: WF.WalkForwardResult) -> None:
         self.refit_running = None
         el = cell.get("eliminated")
-        if el:
-            for k in self.states:
-                if k >= int(el["before_fold"]) and self.states[k] == "planned":
-                    self.states[k] = "eliminated"
+        for k in list(self.states):
+            if el and k >= int(el["before_fold"]):
+                self.states[k] = "eliminated"
+                self.genomes.pop(k, None)
         status = VERDICT_STATUS[cell["verdict"]]
         self._write_report(cell, WF.result_to_json(res), status=status, current_fold=None,
                            progress_message=f"verdict {cell['verdict']}",
@@ -403,13 +497,23 @@ def _fold_files(cell_dir: str) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def _has_fold_files(d: str) -> bool:
+    """Whether ``d`` holds fold<k>.json files (by name only: a corrupt file is reported per chain)."""
+    return any(re.fullmatch(r"fold(\d+)\.json", fn) for fn in os.listdir(d))
+
+
 def report_from_files(name: str, cell_dir: Optional[str],
-                      summary_cell: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                      summary_cell: Optional[Dict[str, Any]] = None,
+                      base_dir: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """(row values, report) of one chain from its report files: ``cell.json`` (the cell's final report,
     wf_chain), ``report.json`` (the engine's aggregate, also what ``tools/run_walk_forward.py`` writes)
     and ``fold<k>.json`` (the stored per-fold records, present for every completed fold even when the
     chain later failed). ``summary_cell`` is the cell's entry in the grid's ``summary.json``, the
-    latest word on its verdict (an ERROR there wins over an older ``cell.json``)."""
+    latest word on its verdict (an ERROR there wins over an older ``cell.json``). ``base_dir``: the
+    chain's report directory (the parent of its cell directory), which is the row's lane.
+
+    A corrupt or incomplete file raises (``ValueError`` / ``KeyError`` / ``TypeError`` / ``OSError``):
+    the importer records that chain as an import error and goes on with the others."""
     cell = _read_json(os.path.join(cell_dir, "cell.json")) if cell_dir else None
     wf = _read_json(os.path.join(cell_dir, "report.json")) if cell_dir else None
     fold_docs = _fold_files(cell_dir) if cell_dir else {}
@@ -420,6 +524,8 @@ def report_from_files(name: str, cell_dir: Optional[str],
     identities: Dict[int, Optional[Dict[str, Any]]] = {}
     states: Dict[int, str] = {}
     for k, doc in fold_docs.items():
+        if not isinstance(doc, dict) or not isinstance(doc.get("key"), dict):
+            raise KeyError(f"fold{k}.json has no 'key' record")
         key = doc["key"]
         windows[k] = {"index": k, "train_start": key["train"][0], "train_end": key["train"][1],
                       "test_start": key["test"][0], "test_end": key["test"][1]}
@@ -448,6 +554,8 @@ def report_from_files(name: str, cell_dir: Optional[str],
                       "test_start": d["test"][0], "test_end": d["test"][1]}
         states[k] = "deferred"
     planned = max(windows) if windows else 0
+    # The plan's size is recorded by report.json only (all folds when complete, else the PARTIAL note).
+    planned_known = wf is not None
     for note in (wf or {}).get("notes", []):
         m = _PARTIAL.search(note)
         if m:
@@ -473,10 +581,11 @@ def report_from_files(name: str, cell_dir: Optional[str],
         genomes=[g for k in sorted(genomes) for g in genomes[k]], states=states,
         generations=generations, identities=identities, seeded_from=seeded, cell=final_cell,
         walk_forward=wf if (cell is not None or verdict in ("PASS", "FAIL")) and wf is not None else None,
-        thresholds=th, selection=(wf or {}).get("selection"), top_n=(wf or {}).get("top_n"))
-    # No verdict anywhere: the chain had not finished when the files were copied (or its driver was
-    # killed): shown as running, the state of its last write.
-    status = VERDICT_STATUS[verdict] if verdict else "running"
+        thresholds=th, selection=(wf or {}).get("selection"), top_n=(wf or {}).get("top_n"),
+        planned_known=planned_known)
+    # No verdict anywhere and no summary entry: the chain had not finished when the files were copied
+    # (or its driver was killed). Said as such, never as a live "running".
+    status = VERDICT_STATUS[verdict] if verdict else "incomplete"
     sc = summary_cell or {}
     src = cell or sc
     windows_known = [w for w in report["folds"] if w["train_start"]]
@@ -495,59 +604,70 @@ def report_from_files(name: str, cell_dir: Optional[str],
         "expert": src.get("expert"), "strategy": src.get("strategy"), "band": src.get("band"),
         "status": status, "spec": spec, "report": report,
         "error_message": sc.get("error"),
-        "report_dir": os.path.abspath(cell_dir) if cell_dir else None,
+        "report_dir": os.path.abspath(base_dir) if base_dir else None,
         **summary_columns(report),
     }
     return values, report
 
 
-def _cells_in(report_dir: str) -> List[Tuple[str, Optional[str], Optional[Dict[str, Any]]]]:
-    """(name, cell dir or None, summary entry or None) of every chain in ``report_dir``: a grid
-    directory (``summary.json`` + one sub-directory per cell), or ONE chain's directory."""
+def _cells_in(report_dir: str) -> List[Tuple[str, Optional[str], Optional[Dict[str, Any]], str]]:
+    """(name, cell dir or None, summary entry or None, base dir) of every chain in ``report_dir``: a
+    grid directory (``summary.json`` + one sub-directory per cell; base = it), or ONE chain's
+    directory (base = its parent)."""
     report_dir = os.path.abspath(report_dir)
     if not os.path.isdir(report_dir):
         raise WalkForwardError(f"{report_dir} is not a directory")
     own = any(os.path.exists(os.path.join(report_dir, f)) for f in ("cell.json", "report.json")) \
-        or _fold_files(report_dir)
+        or _has_fold_files(report_dir)
     if own:
-        return [(os.path.basename(report_dir.rstrip(os.sep)), report_dir, None)]
+        return [(os.path.basename(report_dir.rstrip(os.sep)), report_dir, None,
+                 os.path.dirname(report_dir.rstrip(os.sep)))]
     summary = _read_json(os.path.join(report_dir, "summary.json"))
     by_name = {c["cell"]: c for c in (summary or {}).get("cells", [])}
     names = set(by_name)
     for d in os.listdir(report_dir):
         p = os.path.join(report_dir, d)
         if os.path.isdir(p) and (any(os.path.exists(os.path.join(p, f)) for f in ("cell.json", "report.json"))
-                                 or _fold_files(p)):
+                                 or _has_fold_files(p)):
             names.add(d)
     out = []
     for n in sorted(names):
         p = os.path.join(report_dir, n)
-        out.append((n, p if os.path.isdir(p) else None, by_name.get(n)))
+        out.append((n, p if os.path.isdir(p) else None, by_name.get(n), report_dir))
     return out
 
 
 def import_report_dir(report_dir: str, session_factory: Optional[Callable] = None, *,
                       replace_live: bool = False, dry_run: bool = False) -> List[Tuple[str, str]]:
     """Load every chain of ``report_dir`` into ``walk_forward_runs``; returns (name, action) with action
-    created | updated | unchanged | skipped (<why>). IDEMPOTENT: an imported row whose content is equal
-    is left alone. A row this DB's own runs wrote (source ui / cli) is never overwritten unless
-    ``replace_live``: it is the live record of the same chain."""
-    from app.models.walk_forward_run import WalkForwardRun
+    created | updated | unchanged | skipped (<why>) | error (<why>). The row of a chain is (name,
+    lane of its report directory): importing a copy of another host's grid never touches this DB's
+    own rows of the same cell names in another directory. IDEMPOTENT: an imported row whose content is
+    equal is left alone. A row this DB's own runs wrote in the SAME lane (source ui / cli) is never
+    overwritten unless ``replace_live``. A chain whose files are corrupt is reported as an error and
+    the others are still imported."""
+    from app.models.walk_forward_run import WalkForwardRun, lane_key
     S = _session_factory(session_factory)
     out: List[Tuple[str, str]] = []
-    for name, cell_dir, summary_cell in _cells_in(report_dir):
-        values, _ = report_from_files(name, cell_dir, summary_cell)
+    for name, cell_dir, summary_cell, base in _cells_in(report_dir):
+        try:
+            values, _ = report_from_files(name, cell_dir, summary_cell, base)
+        except (WalkForwardError, OSError, ValueError, KeyError, TypeError) as e:
+            out.append((name, f"error ({type(e).__name__}: {e}); not imported"))
+            continue
+        lane = lane_key(base)
         db = S()
         try:
-            row = db.query(WalkForwardRun).filter(WalkForwardRun.name == name).first()
+            row = (db.query(WalkForwardRun)
+                   .filter(WalkForwardRun.name == name, WalkForwardRun.lane_key == lane).first())
             if row is not None and row.source != "import" and not replace_live:
                 out.append((name, f"skipped (a {row.source} row of this DB; --replace-live to "
                                   f"overwrite it)"))
                 continue
             if row is None:
                 if not dry_run:
-                    db.add(WalkForwardRun(name=name, source="import", created_at=_now(),
-                                          updated_at=_now(), **values))
+                    db.add(WalkForwardRun(name=name, lane_key=lane, source="import",
+                                          created_at=_now(), updated_at=_now(), **values))
                     db.commit()
                 out.append((name, "created"))
                 continue

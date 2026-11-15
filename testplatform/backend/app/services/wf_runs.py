@@ -229,11 +229,12 @@ def create_run(db, req: Dict[str, Any], L: Any = None) -> Any:
     from app.models.walk_forward_run import WalkForwardRun
     spec = spec_from_request(req)
     preflight(spec, L)
-    if db.query(WalkForwardRun.id).filter(WalkForwardRun.name == spec.name).first() is not None:
+    if name_taken(db, spec.name):
         raise WalkForwardError(f"a walk-forward run named {spec.name!r} already exists; resume it "
                                f"or choose another name")
     token = uuid.uuid4().hex
-    row = WalkForwardRun(name=spec.name, source="ui", status="pending", expert=spec.expert,
+    row = WalkForwardRun(name=spec.name, lane_key=ui_lane(), source="ui", status="pending",
+                         expert=spec.expert,
                          strategy=spec.strategy, band=spec.band,
                          spec={**S.spec_to_json(spec), "name": spec.name},
                          planned_folds=len(C.make_cell_plan(spec)[1]), folds_done=0,
@@ -247,6 +248,20 @@ def create_run(db, req: Dict[str, Any], L: Any = None) -> Any:
     db.commit()
     db.refresh(row)
     return row
+
+
+def ui_lane() -> str:
+    """The lane (report directory) every UI run lives in."""
+    from app.models.walk_forward_run import lane_key
+    return lane_key(default_report_dir())
+
+
+def name_taken(db, name: str) -> bool:
+    """A UI run of this name exists already (rows of other lanes, e.g. the goal2027 grid's cell of the
+    same name, are other chains; their train job NAMES are still shared, see ``existing_jobs``)."""
+    from app.models.walk_forward_run import WalkForwardRun
+    return db.query(WalkForwardRun.id).filter(WalkForwardRun.name == name,
+                                              WalkForwardRun.lane_key == ui_lane()).first() is not None
 
 
 def task_state(task_id: Optional[str]) -> Optional[str]:
@@ -312,20 +327,27 @@ def kill_tree(pid: int) -> None:
     import psutil
     try:
         root = psutil.Process(pid)
+        procs = root.children(recursive=True) + [root]
     except psutil.NoSuchProcess:
         return
-    procs = root.children(recursive=True) + [root]
+    except psutil.AccessDenied as e:
+        logger.error(f"walk-forward: cannot list the process tree of pid {pid} ({e}); killing it alone")
+        procs = [root]
     for p in procs:
         try:
             p.terminate()
         except psutil.NoSuchProcess:
             pass
+        except psutil.AccessDenied as e:
+            logger.error(f"walk-forward: no permission to terminate pid {p.pid} ({e})")
     _gone, alive = psutil.wait_procs(procs, timeout=10)
     for p in alive:
         try:
             p.kill()
         except psutil.NoSuchProcess:
             pass
+        except psutil.AccessDenied as e:
+            logger.error(f"walk-forward: no permission to kill pid {p.pid} ({e}); it may still run")
 
 
 def _mark_if_owned(run_id: int, token: str, status: str, message: str) -> bool:
@@ -377,7 +399,7 @@ def cancel_run(db, row) -> Any:
 
 
 def drive(run_id: int, token: str, runner: Any, *, task_id: Optional[str] = None,
-          report_dir: Optional[str] = None, L: Any = None, log: Callable[[str], None] = print,
+          L: Any = None, log: Callable[[str], None] = print,
           session_factory: Optional[Callable] = None) -> C.CellResult:
     """Run (or resume) the stored run ``run_id`` with ``runner`` (the real one in tools/run_wf_run.py):
     the stored spec, re-validated by ``preflight``, through ``wf_chain.run_cell``. The runner must
@@ -393,7 +415,11 @@ def drive(run_id: int, token: str, runner: Any, *, task_id: Optional[str] = None
         if row.driver_token != token:
             raise WalkForwardError(f"walk-forward run {row.name!r} is owned by another start "
                                    f"(token mismatch): this driver does not run it")
-        spec_json, out_dir = dict(row.spec), report_dir or row.report_dir or default_report_dir()
+        if not row.report_dir:
+            raise WalkForwardError(f"walk-forward run {row.name!r} records no report directory")
+        # The row's report directory IS its lane (one row per name and report directory): the chain
+        # always runs there, so its files, its .lock and its row stay one chain.
+        spec_json, out_dir = dict(row.spec), row.report_dir
     finally:
         db.close()
     if not callable(getattr(runner, "wf_store", None)):
@@ -443,8 +469,12 @@ def handle_walk_forward(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
             time.sleep(2.0)
             reason = tq.stop_reason(task_id)
             if reason in (STOP_CANCELLED, STOP_PAUSED):
-                kill_tree(proc.pid)
-                proc.wait(timeout=30)
+                try:
+                    kill_tree(proc.pid)
+                    proc.wait(timeout=30)
+                except Exception as e:  # noqa: BLE001 -- the row is still marked below; logged loudly
+                    logger.error(f"walk-forward: stopping the driver of run {run_id} failed: {e}",
+                                 exc_info=True)
                 break
     if reason in (STOP_CANCELLED, STOP_PAUSED):
         _mark_if_owned(run_id, token, "cancelled", "cancelled" if reason == STOP_CANCELLED

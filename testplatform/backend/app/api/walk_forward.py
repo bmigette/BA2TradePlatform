@@ -25,8 +25,8 @@ router = APIRouter(prefix="/api/walk-forward", tags=["walk-forward"])
 #: Small columns only: the list never reads the report / spec blobs.
 _LIGHT = ("id", "name", "source", "expert", "strategy", "band", "status", "planned_folds",
           "folds_done", "current_fold", "progress_message", "stitched_return", "worst_oos_dd",
-          "stitched_trades", "error_message", "task_id", "created_at", "started_at", "updated_at",
-          "completed_at")
+          "stitched_trades", "stitch_partial", "error_message", "task_id", "report_dir", "created_at",
+          "started_at", "updated_at", "completed_at")
 
 
 def _iso(v):
@@ -108,9 +108,8 @@ def preview(req: RunRequest, db: Session = Depends(get_db)):
         plan = R.preflight(spec)
     except WalkForwardError as e:
         raise _refused(e)
-    exists = db.query(WalkForwardRun.id).filter(WalkForwardRun.name == spec.name).first()
     return {**plan, "existingJobs": R.existing_jobs(db, plan["jobs"]),
-            "nameTaken": exists is not None}
+            "nameTaken": R.name_taken(db, spec.name)}
 
 
 @router.get("/runs")
@@ -185,7 +184,9 @@ def _log_tail(row, lines: int = 80) -> Optional[List[str]]:
 
 def _detail(db, row: WalkForwardRun) -> Dict[str, Any]:
     out = _light({c: getattr(row, c) for c in _LIGHT})
-    report = row.report or {"folds": []}
+    report = dict(row.report or {"folds": []})
+    if report.get("verdict") not in ("PASS", "FAIL"):
+        report["overall_passed"] = None       # PENDING / unfinished: no consumer may read a pass
     jobs = _jobs(db, report)
     task = R.task_state(row.task_id)
     driver = R.driver_state(row) if row.status in ("pending", "running") else None

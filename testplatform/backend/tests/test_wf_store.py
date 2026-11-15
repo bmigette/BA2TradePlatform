@@ -45,12 +45,12 @@ class StoreRunner(ChainRunner):
     """ChainRunner that offers the DB writer, like the real runner, plus a hook to look at the row
     while the chain runs."""
 
-    def __init__(self, oos_by_fold, Sf, on_oos=None, **kw):
+    def __init__(self, oos_by_fold, Sf, on_oos=None, source="cli", token="tok", **kw):
         super().__init__(oos_by_fold, **kw)
-        self.Sf, self.on_oos = Sf, on_oos
+        self.Sf, self.on_oos, self.source, self.token = Sf, on_oos, source, token
 
     def wf_store(self, spec, report_dir):
-        return S.RunStore(spec.name, source="cli", token="tok", report_dir=report_dir,
+        return S.RunStore(spec.name, source=self.source, token=self.token, report_dir=report_dir,
                           session_factory=self.Sf)
 
     def train_identity(self, name):
@@ -182,37 +182,111 @@ def test_a_chain_error_is_recorded_on_the_row_and_re_raised(tmp_path, wfdb):
     assert (tmp_path / "cell" / "fold1.json").exists()
 
 
-def test_a_failed_db_write_is_loud(tmp_path, wfdb):
-    class Broken:
-        def __init__(self):
-            self.db = wfdb()
+class Broken:
+    """A session whose commit always fails (the DB is unwritable)."""
+    factory = None
 
-        def __getattr__(self, n):
-            return getattr(self.db, n)
+    def __init__(self):
+        self.db = Broken.factory()
 
-        def commit(self):
-            raise RuntimeError("disk I/O error")
+    def __getattr__(self, n):
+        return getattr(self.db, n)
 
-    r = StoreRunner([GOOD, GOOD, GOOD], wfdb)
+    def commit(self):
+        raise RuntimeError("disk I/O error")
+
+
+def test_a_failed_db_write_fails_a_ui_run_loudly(tmp_path, wfdb):
+    Broken.factory = wfdb
+    r = StoreRunner([GOOD, GOOD, GOOD], wfdb, source="ui")
     r.Sf = Broken
     with pytest.raises(RuntimeError, match="disk I/O error"):
         C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None)
-    assert r.trained == []                             # nothing ran without its row
+    assert r.trained == []                             # a UI run never runs without its row
 
 
-def test_a_live_driver_row_is_not_taken_over_and_a_dead_one_is(tmp_path, wfdb):
-    from app.models.walk_forward_run import WalkForwardRun
+def test_a_failed_db_write_never_fails_a_grid_cell(tmp_path, wfdb, monkeypatch, caplog):
+    """source cli: retried, then ONE loud ERROR naming the repair path, and the chain runs on: the
+    report files are the source of truth, the summary says the cell's real verdict."""
+    Broken.factory = wfdb
+    monkeypatch.setattr(S.RunStore, "RETRY_DELAYS", (0.0, 0.0, 0.0))
+    r = StoreRunner([GOOD, GOOD, GOOD], wfdb)
+    r.Sf = Broken
+    with caplog.at_level("ERROR", logger="app.services.wf_store"):
+        cells = C.run_cells([_spec()], lambda _s: r, str(tmp_path), log=lambda *_: None)
+    assert cells[0]["verdict"] == "PASS" and ("train", "cell-refit") in r.events
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert summary["cells"][0]["verdict"] == "PASS"
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert len(errors) == 1 and "import_wf_reports.py" in errors[0].getMessage()
+    assert "4 attempts" in errors[0].getMessage()
+    assert _row(wfdb) is None                          # nothing was written; the importer repairs it
+    assert S.import_report_dir(str(tmp_path), wfdb) == [("cell", "created")]
+    assert _row(wfdb).status == "pass"
+
+
+def test_a_grid_cell_whose_finish_write_fails_is_not_an_error_in_the_summary(tmp_path, wfdb,
+                                                                              monkeypatch):
+    monkeypatch.setattr(S.RunStore, "RETRY_DELAYS", (0.0, 0.0, 0.0))
+
+    def finish(self, cell, res):
+        def go():
+            raise RuntimeError("database is locked")
+        self._attempt("finish", go)
+    monkeypatch.setattr(S.RunStore, "finish", finish)
+    cells = C.run_cells([_spec()], lambda _s: StoreRunner([GOOD, GOOD, GOOD], wfdb), str(tmp_path),
+                        log=lambda *_: None)
+    assert cells[0]["verdict"] == "PASS"
+    cell = json.loads((tmp_path / "cell" / "cell.json").read_text(encoding="utf-8"))
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    assert cell["verdict"] == summary["cells"][0]["verdict"] == "PASS"
+
+
+def test_recording_a_failure_never_replaces_it_and_ctrl_c_stops_the_grid(tmp_path, wfdb, monkeypatch):
+    class Interrupted(StoreRunner):
+        def run_train(self, cmd, name):
+            if name.endswith("-wf2"):
+                raise KeyboardInterrupt
+            super().run_train(cmd, name)
+
+    def broken_fail(self, exc):
+        raise RuntimeError("cannot write the error either")
+    monkeypatch.setattr(S.RunStore, "fail", broken_fail)
+    second = []
+
+    def make(spec):
+        if spec.name == "other":
+            second.append(spec.name)
+        return Interrupted([GOOD, GOOD, GOOD], wfdb, source="ui", prefix=spec.name)
+
+    with pytest.raises(KeyboardInterrupt):
+        C.run_cells([_spec(), _spec(name="other")], make, str(tmp_path), log=lambda *_: None)
+    assert second == []                                # the grid did not carry on after Ctrl-C
+    # an ordinary chain error is re-raised as itself, not as the failure to record it
+    with pytest.raises(WF.WalkForwardError, match="exited with code 1"):
+        C.run_cell(_spec(), BoomStore([GOOD, GOOD, GOOD], wfdb, source="ui"),
+                   str(tmp_path / "again"), log=lambda *_: None)
+
+
+def _live_row(wfdb, report_dir, source, token):
+    """A 'running' row whose recorded driver is a LIVE process (not this one)."""
+    from app.models.walk_forward_run import WalkForwardRun, lane_key
     live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    ident = R.process_identity(live.pid)
+    db = wfdb()
+    db.add(WalkForwardRun(name="cell", lane_key=lane_key(str(report_dir)), source=source,
+                          status="running", driver_token=token, driver_host=ident["host"],
+                          driver_pid=ident["pid"], driver_pid_started=ident["pid_started"],
+                          driver_identity=ident["proc_identity"]))
+    db.commit()
+    db.close()
+    return live
+
+
+def test_a_ui_run_never_takes_over_a_row_another_live_start_drives(tmp_path, wfdb):
+    live = _live_row(wfdb, tmp_path, "ui", "other")
     try:
-        ident = R.process_identity(live.pid)
-        db = wfdb()
-        db.add(WalkForwardRun(name="cell", source="ui", status="running", driver_token="other",
-                              driver_host=ident["host"], driver_pid=ident["pid"],
-                              driver_pid_started=ident["pid_started"],
-                              driver_identity=ident["proc_identity"]))
-        db.commit()
-        db.close()
-        r = StoreRunner([GOOD, GOOD, GOOD], wfdb)
+        r = StoreRunner([GOOD, GOOD, GOOD], wfdb, source="ui")
         with pytest.raises(WF.WalkForwardError, match="another driver"):
             C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None)
         row = _row(wfdb)
@@ -222,9 +296,78 @@ def test_a_live_driver_row_is_not_taken_over_and_a_dead_one_is(tmp_path, wfdb):
         live.kill()
         live.wait()
     # the same row once its driver is dead: taken over, run to the end
-    C.run_cell(_spec(), StoreRunner([GOOD, GOOD, GOOD], wfdb), str(tmp_path), log=lambda *_: None)
+    C.run_cell(_spec(), StoreRunner([GOOD, GOOD, GOOD], wfdb, source="ui"), str(tmp_path),
+               log=lambda *_: None)
     row = _row(wfdb)
     assert row.status == "pass" and row.driver_token == "tok" and row.source == "ui"
+
+
+def test_a_grid_cell_takes_over_a_stale_running_row_with_no_token(tmp_path, wfdb):
+    """The None-token case: grid rows carry no token. Within a lane the chain's .lock decides, so a
+    'running' row a stopped grid left (even with a pid that is alive now) is taken over, never an
+    ERROR, and the row then says who drives it."""
+    live = _live_row(wfdb, tmp_path, "cli", None)
+    try:
+        r = StoreRunner([GOOD, GOOD, GOOD], wfdb, token=None)
+        assert C.run_cell(_spec(), r, str(tmp_path), log=lambda *_: None).verdict == "PASS"
+    finally:
+        live.kill()
+        live.wait()
+    row = _row(wfdb)
+    assert row.status == "pass" and row.driver_token is None and row.driver_pid == os.getpid()
+    assert row.report_dir == os.path.abspath(str(tmp_path)) and row.driver_host == R.this_host()
+
+
+def test_two_lanes_with_the_same_cell_name_keep_separate_rows(tmp_path, wfdb):
+    from app.models.walk_forward_run import WalkForwardRun
+    C.run_cell(_spec(), StoreRunner([GOOD, GOOD, GOOD], wfdb), str(tmp_path / "goal2027_wf"),
+               log=lambda *_: None)
+    C.run_cell(_spec(), StoreRunner([GOOD, GOOD, BAD], wfdb), str(tmp_path / "other_lane"),
+               log=lambda *_: None)
+    db = wfdb()
+    try:
+        rows = (db.query(WalkForwardRun).filter(WalkForwardRun.name == "cell")
+                .order_by(WalkForwardRun.id).all())
+        assert [(os.path.basename(r.report_dir), r.status) for r in rows] == [
+            ("goal2027_wf", "pass"), ("other_lane", "fail")]
+    finally:
+        db.close()
+
+
+def test_a_restart_shows_the_stored_folds_from_begin_on(tmp_path, wfdb):
+    """A resumed chain (or a grid cell started before rows existed): begin seeds the row from the fold
+    reports on disk instead of showing every fold planned."""
+    C.run_cell(_spec(), ChainRunner([GOOD, GOOD, GOOD]), str(tmp_path), log=lambda *_: None)
+    spec = _spec()
+    plan, folds = C.make_cell_plan(spec)
+    st = S.RunStore("cell", report_dir=str(tmp_path), session_factory=wfdb)
+    st.begin(spec, folds, None)
+    row = _row(wfdb)
+    assert [f["state"] for f in row.report["folds"]] == ["done", "done", "done"]
+    assert row.folds_done == 3 and row.stitched_return == pytest.approx(WF.compound([5.0] * 3))
+    assert row.stitch_partial is True and row.status == "running"
+    # a fold file of other windows (another plan) is not shown
+    other = _spec(test_years=[2025, 2026])
+    st2 = S.RunStore("cell", report_dir=str(tmp_path), session_factory=wfdb)
+    st2.begin(other, C.make_cell_plan(other)[1], None)
+    assert [f["state"] for f in _row(wfdb).report["folds"]] == ["planned", "planned"]
+
+
+def test_reimport_after_a_live_takeover_keeps_the_live_progress(tmp_path, wfdb):
+    out = _grid(tmp_path)
+    assert dict(S.import_report_dir(str(out), wfdb))["okcell"] == "created"
+    seen = {}
+
+    def look(fold):
+        if fold.index == 2:
+            seen["import"] = S.import_report_dir(str(out), wfdb)
+            r = _row(wfdb, "okcell")
+            seen["row"] = (r.source, r.status, r.current_fold)
+
+    C.run_cell(_spec(name="okcell"), StoreRunner([GOOD, GOOD, GOOD], wfdb, on_oos=look, prefix="okcell"),
+               str(out), log=lambda *_: None)
+    assert dict(seen["import"])["okcell"].startswith("skipped")
+    assert seen["row"] == ("cli", "running", 2)              # the live progress was kept
 
 
 def test_spec_json_round_trips_to_the_same_cell_spec():
@@ -289,7 +432,7 @@ def test_import_loads_a_grid_dir_and_is_idempotent(tmp_path, wfdb):
 def test_import_never_overwrites_a_live_row_unless_asked(tmp_path, wfdb):
     out = _grid(tmp_path)
     C.run_cell(_spec(name="okcell"), StoreRunner([GOOD, GOOD, GOOD], wfdb, prefix="okcell"),
-               str(tmp_path / "live"), log=lambda *_: None)
+               str(out), log=lambda *_: None)
     got = dict(S.import_report_dir(str(out), wfdb))
     assert got["okcell"].startswith("skipped") and _row(wfdb, "okcell").source == "cli"
     assert dict(S.import_report_dir(str(out), wfdb, replace_live=True))["okcell"] == "updated"

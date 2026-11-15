@@ -1,7 +1,8 @@
 """
 Migration 034: add the `walk_forward_runs` table (walk-forward results in the DB, for the UI).
 
-One row per walk-forward chain (one goal2027 cell, or one run created in the UI): its spec, status,
+One row per walk-forward chain, identified by (cell name, report-directory lane), so two lanes using the
+same cell name keep separate rows (one goal2027 cell, or one run created in the UI): its spec, status,
 progress and the full per-fold report as JSON. Written by app.services.wf_store while the chain runs
 (in addition to the report files, which are unchanged) and by tools/import_wf_reports.py for a report
 directory produced elsewhere. See app.models.walk_forward_run.
@@ -20,7 +21,8 @@ TABLE = "walk_forward_runs"
 #: core; any column missing from an existing table is ADDED (all of them are nullable).
 _COLUMNS = [
     ("id", "INTEGER PRIMARY KEY"),
-    ("name", "VARCHAR(255) NOT NULL UNIQUE"),
+    ("name", "VARCHAR(255) NOT NULL"),
+    ("lane_key", "VARCHAR(1024) NOT NULL"),
     ("source", "VARCHAR(16) NOT NULL"),
     ("expert", "VARCHAR(100)"),
     ("strategy", "VARCHAR(50)"),
@@ -33,6 +35,7 @@ _COLUMNS = [
     ("stitched_return", "FLOAT"),
     ("worst_oos_dd", "FLOAT"),
     ("stitched_trades", "INTEGER"),
+    ("stitch_partial", "BOOLEAN"),
     ("error_message", "TEXT"),
     ("task_id", "VARCHAR(64)"),
     ("driver_token", "VARCHAR(64)"),
@@ -49,9 +52,12 @@ _COLUMNS = [
     ("report", "JSON"),
 ]
 
+#: One row per (cell name, report-directory lane): app.models.walk_forward_run.lane_key.
+_UNIQUE = "CONSTRAINT uq_walk_forward_runs_name_lane UNIQUE (name, lane_key)"
+
 #: The core a table must already have for the ADD COLUMN path (anything else is not a shape this
-#: migration knows).
-_CORE = {"id", "name", "source", "status"}
+#: migration knows). ``lane_key`` is core: it carries the uniqueness, which ALTER TABLE cannot add.
+_CORE = {"id", "name", "lane_key", "source", "status"}
 
 _INDEX = "CREATE INDEX IF NOT EXISTS ix_walk_forward_runs_id ON walk_forward_runs (id)"
 
@@ -71,7 +77,7 @@ def upgrade(cursor, conn):
     changed = []
     if not _table_exists(cursor, TABLE):
         cursor.execute(f"CREATE TABLE {TABLE} (\n    "
-                       + ",\n    ".join(f"{n} {d}" for n, d in _COLUMNS) + "\n)")
+                       + ",\n    ".join([f"{n} {d}" for n, d in _COLUMNS] + [_UNIQUE]) + "\n)")
         changed.append(f"created {TABLE}")
     else:
         have = _columns(cursor, TABLE)
