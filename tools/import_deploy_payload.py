@@ -359,11 +359,11 @@ def main() -> int:
         # before anything is written.
         try:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
-            assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
-            assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
-            # iv-v1 (no live source): a gate on it would refuse every live entry -- refused here.
+            # iv-v1 has no live source: a gate on it would refuse every live entry -- refused here.
             assert_market_fields_live_servable(entry_rules, f"{label}: entry rules")
             assert_market_fields_live_servable(exit_rules, f"{label}: exit rules")
+            assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
+            assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
             assert_market_rule_actions(exit_rules, f"{label}: exit rules")
             assert_market_conditions_resolved(entry_rules, f"{label}: entry rules")
             assert_market_conditions_resolved(exit_rules, f"{label}: exit rules")
