@@ -222,23 +222,56 @@ allows 75 calls/minute, and the option download takes 60 of them.
 | `ON_DEMAND_PER_MINUTE` | 10 | decision-path share of the shared `_av_rate_budget.json` (owner `iv_live:<pid>`) |
 | `PREFETCH_PER_MINUTE` | 12 | prefetch share |
 | `HTTP_TIMEOUT_S` | 12 | HTTP timeout per call |
+| `REQUEST_DEADLINE_S` | 15 | total time one request may take, response included |
 | `BUDGET_WAIT_S` | 5 | longest wait for a budget slot on the decision path |
-| `KEEP_SESSIONS` | 10 | cached sessions kept per symbol |
+| `CIRCUIT_AFTER` | 3 | consecutive HTTP failures in a pass before further requests are refused |
+| `KEEP_SESSIONS` | 10 | cached sessions kept per symbol; a symbol whose newest chain is older is removed |
 
-On the decision path, the first budget refusal waits at most 5 s and then latches "budget
-exhausted" until the budget window frees a slot. Every further uncached symbol in the pass is
-refused immediately, so a pass cannot stall.
+On the decision path, nothing can stall a pass:
+
+- The first budget refusal waits at most 5 s, then latches "budget exhausted" until the budget
+  window frees a slot. Every further uncached symbol in the pass is refused immediately.
+- Each request has a total deadline of 15 s.
+- After 3 consecutive HTTP failures in a pass, the pass refuses further requests (circuit open).
+- After waiting for a budget slot, the cache is checked again, so app instances prefetching in
+  lockstep fetch each chain only once. The prefetch also adds a small random delay.
+
+**Budget oversubscription while the download runs.** The nominal shares add up to more than the
+key allows: 60 (download) + 12 x instances (prefetch) + 10 x instances (decision path). With three
+app instances that is 126 against 75. The shared `_av_rate_budget.json` still enforces the key's 75
+across every owner, so AV is never over-called. The cost is that the live owners get fewer slots
+while the download takes its 60. Operator guidance while the download runs:
+
+- Run the download with `--calls-per-minute 40` between 06:00 and 10:30 ET, or pause it over that
+  window.
+- Otherwise expect a slower prefetch, and more "chain not prefetched; rate budget exhausted"
+  refusals at the decision.
 
 **Prefetch** (off the decision path). The live `JobManager` runs it Mon–Fri at 06:30 ET, with a
-09:45 ET deadline. The job is scheduled only while an enabled expert has an active iv gate trained
-on alphavantage; otherwise nothing is scheduled or logged. It fetches the prior session's chain for
-each gated expert's candidate symbols, waits for budget slots instead of refusing, resumes from the
-disk cache, and leaves what it could not fetch to the decision path.
-`tools/prefetch_iv_chains.py` runs the same prefetch by hand.
+09:45 ET deadline. It fetches the prior session's chain for each gated expert's candidate symbols,
+waits for budget slots instead of refusing, resumes from the disk cache, and leaves what it could
+not fetch to the decision path. `tools/prefetch_iv_chains.py` runs the same prefetch by hand.
+
+- **When it is scheduled.** Only while an enabled expert has an active iv gate trained on
+  alphavantage; otherwise nothing is scheduled or logged. This is re-evaluated at startup, on a full
+  refresh, and on a single expert's refresh (an expert added, enabled or disabled, or its ruleset or
+  profile changed).
+- **Catch-up.** An app started inside the window runs it once immediately.
+- **Stopping.** It stops at its next check (each symbol, inside every budget wait, while waiting on
+  a request) when the JobManager stops or shuts down, and at interpreter exit (`atexit`). A restart
+  at 07:00 is therefore never held until the deadline.
+- **Failures.** A symbol that fails (bad data, I/O) is recorded and the run continues.
+  `os.replace` is retried briefly on a Windows sharing violation, since app instances share the
+  cache folder.
 
 - **Candidates.** For an expert with static enabled instruments, those instruments. For an expert
-  whose universe is chosen at analysis time (a screener), the symbols it evaluated in recent
-  sessions, i.e. those in the live chain cache; the rest of its universe stays on demand.
+  whose universe is chosen at analysis time (a screener), the symbols with a cached chain for one of
+  the last 5 sessions, judged by the file's session date and never by its age on disk.
+- **Screener limit.** The live screener runs at the decision on live FMP quotes. Running it at
+  06:30 would screen on pre-market quotes (a different set), cost a full screen of FMP calls, and
+  trigger its capture side effects, so the prefetch does not run it. A screener name that is new
+  today is fetched on demand at up to 10/min; beyond that it is refused for the pass with the
+  explicit reason "chain not prefetched; rate budget exhausted", summarised once per pass.
 - **Typical size.** A stage-1 option expert runs on the 97-symbol top-100 universe, which takes
   about 8 minutes at 12/min. The 820-symbol large-cap universe, if fully static, takes about
   68 minutes and finishes around 07:40 ET. Both finish well before a 10:00 decision.
@@ -259,18 +292,35 @@ fallback source and no approximation.
 - **Startup.** If the reader module cannot be imported, startup continues with one WARNING, and iv
   gates refuse with that reason.
 
-**Live date contract.** Live is stricter than the store's `map_chain`, which treats an undated row
-as the requested day; the store behaviour is unchanged. Every dated row must carry the requested
-session, and at most 1% of rows may lack a date; otherwise the chain is refused.
+**One acceptance rule for the store and live** (the owner's backtest/live identity rule). Both paths
+accept and map a raw AV payload with the same function, `alphavantage.map_chain`. It drops rows
+with an unparsable OCC symbol, a foreign (adjusted) root, another date, or no price at all, and it
+takes an undated row as the requested day. A chain it empties is cached live as an empty frame, so
+it reads MISSING, exactly as the store records it. `test_store_and_live_agree_on_every_raw_payload_including_rejected_chains`
+pins that live equals the store for payloads with other-dated rows, undated rows, an adjusted root,
+priceless rows, and a fully rejected chain.
+
+The rule was chosen from data:
+
+- **Download ledgers:** 570,947 symbol-days and 328.9M raw rows; `map_chain` dropped 117,821 rows
+  (0.036%), on 1.08% of symbol-days.
+- **Worst days, classified with raw calls:** HST 2025-12-31, FUTU 2026-04-16 and BE 2024-11-14 were
+  every one priceless rows (no quote, no trade), all correctly dated.
+- **Seven raw chains, 11,910 rows** (these three, XSP, and the earlier MSFT and KO probes): no
+  other-dated and no undated row.
+
+The earlier stricter live check, which refused the whole chain, was removed. It could have refused
+live a symbol-day that the backtest traded.
 
 | Failure | Reason recorded |
 |---|---|
 | no key | `alpha_vantage_api_key is not set ...`. Only an active gate ever asks for the key, so a blank key breaks nothing else. |
 | AV throttle or premium notice | `rate limit (Alpha Vantage): ...` |
-| no budget slot within 20 s | `rate limit: no slot in the shared Alpha Vantage budget ...` |
-| HTTP or transport error | `Alpha Vantage request failed: ...`, with the key redacted |
-| empty chain (not published yet, or no listed options) | `Alpha Vantage serves no chain ... yet` |
-| chain for another date, or no usable contract | named as such |
+| no budget slot within 5 s, or the latch is set | `chain not prefetched; rate budget exhausted ...` |
+| HTTP or transport error, or the 15 s deadline | `Alpha Vantage request failed: ...`, with the key redacted |
+| circuit open (3 consecutive HTTP failures this pass) | `Alpha Vantage failed 3 times in a row this pass ...` |
+| empty response (not published yet, or no listed options) | `Alpha Vantage serves no chain ... yet` |
+| every row rejected by `map_chain` | not a refusal: the row reads MISSING, as in the store |
 | chain exists but cannot define the value | the calculator's `insufficient_history`, exactly as in the backtest |
 
 **Refused sources.** For a `thetadata`-trained gate, or a gate with no recorded source, live serves a
@@ -281,7 +331,9 @@ importer refuses such leaves and accepts leaves trained on `alphavantage`.
 its evidence: the chain arrays and the 128x5 window bytes, each with a digest
 (schema `market_condition_chain_window/v1`). The chain is trimmed to the narrowest strike band
 around each expiry's forward (±15%, then ±30%, then ±50%) whose recomputed row is identical to the
-live row, falling back to the full chain, and it is then zlib-compressed. In the test, the stored
+live row, falling back to the full chain, and it is then zlib-compressed. The trim runs only for
+a row not recorded yet. The payload also carries `chain_served_digest`, the digest of the chain as
+served and cached, which ties the replay evidence to what AV delivered. In the test, the stored
 chain is under 40% of the raw bytes, which keeps a 100-symbol decision in the low single-digit MB.
 Uncompressed payloads still replay. `ReplayChainReader` re-verifies both digests,
 recomputes the row with the shared function, and refuses (`ReplayMiss`) evidence that is missing,
