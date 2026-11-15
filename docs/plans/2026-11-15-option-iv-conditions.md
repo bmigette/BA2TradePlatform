@@ -142,9 +142,9 @@ build.
 
 ### 6.1 Option sources
 
-| `option_source` | Store (read-only) | Live |
+| `option_source` (trained on) | Store (read-only) | Live |
 |---|---|---|
-| `alphavantage` | `<CACHE>/AlphaVantageOptionsProvider/` (`tools/download_av_option_chains.py`): the ThetaData partition layout plus not-yet-compacted `_days/` and a `_ledger.jsonl` | **served**: `HISTORICAL_OPTIONS&date=<prior session>` |
+| `alphavantage` | `<CACHE>/AlphaVantageOptionsProvider/` (`tools/download_av_option_chains.py`): the ThetaData partition layout plus not-yet-compacted `_days/` and a `_ledger.jsonl` | **served** by the configured live IV chain source (section 6.6): `alphavantage` (`HISTORICAL_OPTIONS&date=<prior session>`) or `tastytrade` (captured snapshot) |
 | `thetadata` | `<CACHE>/ThetaDataOptionsProvider/` | refused, by name |
 
 The source is always named explicitly: `--option-source` is required for chain profiles. It is
@@ -154,7 +154,7 @@ absent everywhere else.
 
 - The launcher refuses an option job whose options store differs from the manifest's source.
 - The backtest seam refuses a setting that contradicts the pinned manifest.
-- Live serves only `alphavantage`.
+- Live serves only gates trained on `alphavantage`, from `alphavantage` or `tastytrade` (section 6.6).
 - IV always comes from our function on bid/ask; AV's `implied_volatility` and greeks columns are
   never read.
 
@@ -363,22 +363,121 @@ compared.
 
 ### 6.4 Operator steps for live iv gates
 
-1. Set `alpha_vantage_api_key` in the live app's settings. **Live iv gates need an ongoing Alpha
-   Vantage subscription whose plan includes `HISTORICAL_OPTIONS`.** The live fetch shares that key's
-   75 calls/minute with the option download through `_av_rate_budget.json`.
+1. Choose the live IV chain source (Settings > Data Provider API Keys > "Live IV chain source", app
+   setting `iv_live_chain_source`). **Unset, every active iv gate refuses**, naming the setting.
+   - `tastytrade` (recommended; no Alpha Vantage subscription needed in live): enter the TastyTrade
+     MARKET-DATA credentials under Broker API Keys (`tastytrade_market_client_secret`,
+     `tastytrade_market_refresh_token`; a separate read-only OAuth grant is enough). With them blank,
+     the gates refuse naming both settings. Experts with an iv gate need a BOUNDED universe (fixed
+     instruments, or a non-empty `screener_symbol_universe`).
+   - `alphavantage`: set `alpha_vantage_api_key`; needs an ongoing plan that includes
+     `HISTORICAL_OPTIONS`. The live fetch shares that key's 75 calls/minute with the option download
+     through `_av_rate_budget.json`.
 2. Train on the AV store: `--options-store alphavantage --option-history-source alphavantage` and an
    iv manifest built with `--option-source alphavantage`.
 3. Deploy as usual. The payload carries `market_condition_profile` and
    `market_condition_option_source = alphavantage`, and the importer accepts the iv leaves.
-4. Watch the log for `iv-v1 live (alphavantage)` WARNINGs and the per-pass ERROR of a refused source.
+4. Reload (`/api/reload`) after changing the source or the credentials.
+5. Watch the log for `iv-v1 live (<source>)` WARNINGs, the capture summaries
+   (`iv-v1 tastytrade chain capture <session>: ...`) and the per-pass ERROR of a refused source.
+6. While the Alpha Vantage store (or an AV key) still covers recent sessions, run
+   `tools/certify_broker_iv_chain.py` daily after the close and keep `reports/iv_broker_certification.jsonl`.
+
+### 6.6 Live IV chain source: `tastytrade` (broker snapshot, captured)
+
+**Owner decision 2026-11-15.** The Alpha Vantage subscription is not kept for live. The backtest store
+stays Alpha Vantage. Live reads the prior session's chain from TastyTrade market data, with
+APP-LEVEL market-data credentials (no account definition, no order or account endpoint).
+
+**Why TastyTrade, and not Alpaca.** Both measured on Sunday 2026-11-15 for session 2026-11-13, same
+eight underlyings (MSFT KO AAPL JPM XOM NVDA ISRG EMN), same mapping and `compute_iv_v1`:
+
+| | Alpaca (our keys) | TastyTrade |
+|---|---|---|
+| Feed | indicative only (`feed=opra` -> 403 "OPRA agreement is not signed") | real exchange quotes (dxFeed) |
+| Bid/ask identical to Alpha Vantage, near the money | 0% (median mid differs 0.5-0.8%) | **100%** (3,478 contracts) |
+| iv-v1 fields | IV30 differs up to 1.3%; term slope flips up to 1.7% of symbol-sessions | **identical** |
+| Prior-session quotes after the close | yes (latest quote 15:59:59 ET Friday) | yes (`summary-date` 2026-11-13 on every contract) |
+
+A broker feed is only ever eligible when its quotes are real OPRA quotes; an "indicative" feed is not.
+
+**Pairing (certified-equivalent serving).** `market_conditions.LIVE_SERVING_PAIRINGS`: gates trained on
+`alphavantage` may be served by `alphavantage` or `tastytrade`; anything else is refused by name. The
+pairing rests on ONE session so far (2026-11-13, 8 underlyings, 3,478 contracts, 100% identical quotes,
+identical fields; `PAIRING_EVIDENCE`). `tools/certify_broker_iv_chain.py` extends the record: for a
+symbol list and a session it compares the TastyTrade snapshot with the Alpha Vantage chain -- from the
+LOCAL AV store (no subscription needed) or the AV API -- and appends per-contract equality, the four
+fields, their differences and the GA-threshold flips to `reports/iv_broker_certification.jsonl`.
+
+**The market-data client** (`ba2_providers/options/tastytrade_quotes.py`, `TastyTradeMarketDataClient`):
+OAuth refresh-token exchange (15-minute access token; TastyTrade does not rotate refresh tokens, so
+nothing is written back), then only `GET /option-chains/{sym}/nested` and `GET /market-data/by-type`
+(<= 100 contracts per call); any other path raises before a request. Credentials never appear in a
+message, log or repr. Per underlying: 1 chain + 1 underlying + ceil(contracts/100) market-data calls --
+about 3 s per symbol with a 0.2 s pause; ~5 min for 97 names, ~45 min for 820.
+
+**What is fetched.** Expiries 7..130 days after S (the iv-v1 window), strikes within
+`FETCH_STRIKE_BAND` = 20% of the underlying's close of S. Measured: a 15% band reproduces the full-chain
+row exactly on all eight underlyings; tests pin 15% and 20% on the recorded fixtures.
+
+**Validity by DATA (owner: the broker must not have flushed its snapshot when we download).**
+`option_chain_quotes.validate_prior_session_snapshot(snapshot, S)`:
+
+1. **Refused** when ANY contract is filed under a later session (`summary-date > S`) or was updated
+   at/after the next session's open: today's session has started quoting.
+2. The near-money contracts (7..130-day expiries, strike within 5% of the close) must number at least 4,
+   and at least 90% of them must be quotes OF S: `summary-date == S`, `updated-at` between S's close
+   (NYSE calendar, early closes included) and the next open, bid and ask present. Otherwise **refused**
+   as "snapshot not the prior-session close" (flushed, nulled, stale).
+3. The underlying's close must be filed under S.
+
+`prev-close-date` is not used (it reads 1970-01-01 or an old date on many contracts). An accepted
+snapshot keeps only the contracts that are quotes of S (another contract counts as a missing quote);
+zero bids far from the money are normal and go through the shared acceptance rule unchanged
+(`alphavantage.map_chain`, as AV-shaped rows). A refused snapshot is **never cached** and is retried at
+the next attempt. The cached chain carries the facts (summary-date counts, min/max `updated-at`,
+near-money counts, source) in its parquet metadata, and the capture evidence records them with the
+serving source and the served-chain digest.
+
+**Capture window** (`iv_chain_prefetch`, constants documented here; conservative until the weekday
+behaviour is observed with `tools/probe_broker_iv_snapshot.py`): the ONE scheduler entry (parameterised
+by the source) fires at :15 and :45 of every hour; an attempt runs only from **20:15 ET** on S's date
+(`updated-at` values ran until ~20:00 ET) until **10 minutes before the next open** (09:20 ET), and once
+at app start inside that window. Every attempt is validated on the data, so an early or late attempt can
+only refuse, never store a wrong chain. The decision pass never fetches for this source.
+
+**What is captured.** Exactly the union of the BOUNDED universes of the enabled experts with an active
+iv gate: fixed instruments, or a screener's `screener_symbol_universe`. An expert with an unbounded
+universe (a screener with an empty `screener_symbol_universe`, a dynamic/expert selection) is refused
+loudly when the job is scheduled and at its gates, naming the setting.
+
+**Refusals at the decision** (each counted per kind in the pass summary):
+
+| Situation | Reason |
+|---|---|
+| source unset / malformed | `app setting iv_live_chain_source is not set ...` / `... malformed` |
+| `tastytrade` with blank credentials | `... market-data credentials are not set (app settings tastytrade_market_client_secret and tastytrade_market_refresh_token)` |
+| no capture ran for S (app down from close to open) | `no broker chain capture ran for session S ...; a broker snapshot cannot be backfilled` |
+| a screener pick outside the captured universe | `SYM is not in the captured universe for S ...` |
+| the capture refused / failed for the symbol | `the S chain of SYM was not captured: refused: snapshot not the prior-session close ...` |
+| unbounded expert universe | `... screener_symbol_universe is empty ...` |
+
+**No backfill.** TastyTrade (like Alpaca: `/v1beta1/options/quotes` -> 404) offers no historical option
+quotes, so a missed capture is a refused session.
+
+**IBKR** (not built): would need an OPRA options market-data subscription; the adapter's "frozen" market
+data should return the last values after the close, but whether they equal the closing NBBO and how slow
+a chain capture is with ~100 market-data lines are unknown, and the adapter has never run live.
 
 ### 6.5 Backward compatibility
 
 For anything that does not use `iv-v1`, decisions, settings, stored configs, manifests, digests and
 INFO-and-above logs are unchanged:
 
-- **No new declared or mandatory setting and no migration.** `market_condition_option_source` is
-  written only onto iv jobs, and absent means "no chain profile".
+- **No mandatory setting and no migration.** `market_condition_option_source` is written only onto
+  iv jobs, and absent means "no chain profile". The three new app settings (`iv_live_chain_source`,
+  `tastytrade_market_client_secret`, `tastytrade_market_refresh_token`) are optional, have no default,
+  and are read only for experts with an iv gate; blank credentials break nothing.
 - **The per-instance resolver** reads the source setting, and adds it to its cache key, only for
   experts that name a chain profile (`test_an_ohlcv_expert_never_reads_or_keys_on_an_option_source`).
 - **The live host registration** is silent and inert (`tests/test_iv_live_seam_registration.py`).
