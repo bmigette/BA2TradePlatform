@@ -17,6 +17,11 @@ new, are available to **both option structures and the equity strategies
 S1–S7**. A new equity grid using them follows; existing equity results and
 the running goal2020 outputs are not re-run or re-labelled.
 
+Amendment 3 (2026-11-15, implied volatility): a third profile, `iv-v1`, adds the gates IV30/RV20 and
+IV30/IV60. Its rows are computed from the prior session's end-of-day option chain plus the same
+OHLCV window, served only from a published manifest, and refused live (no live source yet). See
+[2026-11-15-option-iv-conditions.md](2026-11-15-option-iv-conditions.md).
+
 ## 1. Intended result
 
 Each option structure can learn whether to require a rising/falling underlying,

@@ -199,8 +199,9 @@ def _style(m, name, spec_path=None):
 #: ONE screener-enabled case, which is the only shape that emits the six ``screener:*`` genes
 #: (the launcher merges them only under ``--screener``); and ONE market-condition case, which
 #: is the only shape that emits the profile's ``cond:<id>:mode`` genes -- both profiles at once
-#: so the case covers the numeric mode leaves AND ``ta-structure-v1``'s categorical one.
-_ALL_PROFILES = ("ohlcv-v1", "ta-structure-v1")
+#: so the case covers the numeric mode leaves AND ``ta-structure-v1``'s categorical one. ``iv-v1``
+#: (2026-11-15) is selected too: its two numeric leaves are mode genes like the others.
+_ALL_PROFILES = ("ohlcv-v1", "ta-structure-v1", "iv-v1")
 
 AUDIT_CASES = ([(k, "FMPRating", False, ()) for k in OPTION_KEYS]
                + [("O_ERN", "FMPEarningsEvent", False, ()),
