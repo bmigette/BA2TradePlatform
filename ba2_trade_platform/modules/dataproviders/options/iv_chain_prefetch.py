@@ -2,9 +2,10 @@
 parameterised by the LIVE IV CHAIN SOURCE (app setting ``iv_live_chain_source``):
 
 * ``alphavantage`` -> the PREFETCH below (06:30-09:45 ET of the decision day; on-demand stays possible);
-* ``account:<id>`` (a quote-source account, market data only) -> the BROKER CAPTURE: between the prior
-  session's close and the next open only (a broker snapshot is the prior-session chain only then, and
-  cannot be backfilled). Attempts every 30 minutes from ``CAPTURE_START`` (20:15 ET on the session's
+* ``tastytrade`` (TastyTrade market data with the app-level market-data credentials
+  ``tastytrade_market_client_secret`` / ``tastytrade_market_refresh_token``; no account definition, no
+  order or account endpoint) -> the BROKER CAPTURE: between the prior session's close and the next open
+  only (a broker snapshot is the prior-session chain only then, and cannot be backfilled). Attempts every 30 minutes from ``CAPTURE_START`` (20:15 ET on the session's
   date) to ``CAPTURE_END_BEFORE_OPEN`` before the next open (09:20 ET), plus a catch-up at app start
   inside that window; every attempt is validated on the data (``option_chain_quotes``), so an early or
   late attempt can only refuse, never store a wrong chain. The captured set is exactly the union of the
@@ -185,6 +186,11 @@ def run_prefetch_once(now: datetime = None) -> Dict[str, Any]:
 
 
 # =========================================================================================== source dispatch
+#: App settings of the TastyTrade MARKET-DATA credentials (blank allowed: the source then refuses).
+TT_SECRET_SETTING = "tastytrade_market_client_secret"
+TT_REFRESH_SETTING = "tastytrade_market_refresh_token"
+
+
 def configured_source_value():
     from ba2_common.core.market_condition_iv_live import configured_live_chain_source_value
 
@@ -201,52 +207,47 @@ def configured_source():
         return None
 
 
-def quote_source_account(account_id: int) -> Tuple[Any, str, str]:
-    """``(account class, kind, reason)`` of a quote-source account definition WITHOUT instantiating it (no
-    login). ``reason`` is non-empty when it cannot serve option chain quotes."""
-    from ba2_common.core.db import get_instance
-    from ba2_common.core.models import AccountDefinition
-
-    from ...accounts import get_account_class
-
-    try:
-        acc = get_instance(AccountDefinition, int(account_id))
-    except LookupError as e:                      # InstanceNotFound
-        return None, "", f"quote-source account definition {account_id} not found ({type(e).__name__})"
-    if acc is None:
-        return None, "", f"quote-source account definition {account_id} not found"
-    cls = get_account_class(acc.provider)
-    if cls is None:
-        return None, "", f"quote-source account {account_id}: unknown provider {acc.provider!r}"
-    if not getattr(cls, "supports_option_chain_quote_snapshot", False):
-        return cls, "", (f"quote-source account {account_id} ({acc.provider}) does not provide option chain quotes; "
-                         f"choose a TastyTrade account or 'alphavantage' for {_setting()}")
-    return cls, str(getattr(cls, "option_chain_quote_source_kind", "") or ""), ""
-
-
 def _setting() -> str:
     from ba2_common.core.market_condition_iv_live import LIVE_CHAIN_SOURCE_SETTING
 
     return LIVE_CHAIN_SOURCE_SETTING
 
 
-def make_broker_chain_reader(profile: str, *, account_id: int, cache_root=None, source_profile=None):
-    """The ``broker`` factory ``seam_wiring`` registers: the reader of the quote-source account's captured
-    chains, or a refusing reader naming why the account cannot serve them."""
+def tastytrade_market_data_client():
+    """The market-data-only TastyTrade client over the app-level credentials (blank values allowed: the
+    client then reports itself not ``configured``). Never logs or returns the credentials."""
+    from ba2_common.config import get_app_setting
+    from ba2_providers.options.tastytrade_quotes import TastyTradeMarketDataClient
+
+    return TastyTradeMarketDataClient(get_app_setting(TT_SECRET_SETTING), get_app_setting(TT_REFRESH_SETTING))
+
+
+def tastytrade_credentials_reason() -> str:
+    """Non-empty when the TastyTrade market-data credentials are not set (names the settings)."""
+    if tastytrade_market_data_client().configured:
+        return ""
+    return (f"the live IV chain source is 'tastytrade' but its market-data credentials are not set (app settings "
+            f"{TT_SECRET_SETTING} and {TT_REFRESH_SETTING})")
+
+
+def make_tastytrade_chain_reader(profile: str, *, cache_root=None, source_profile=None):
+    """The ``tastytrade`` factory ``seam_wiring`` registers: the reader of the captured chains, or a refusing
+    reader naming the blank credential settings."""
     from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
     from ba2_common.core.market_condition_source import SOURCE_PROFILE_FMP_DAILY
     from ba2_providers.market_conditions.broker_live_chain import make_reader
 
-    _cls, kind, reason = quote_source_account(account_id)
+    reason = tastytrade_credentials_reason()
     if reason:
-        return LiveUnavailableMarketConditionReader(profile, f"market-condition profile {profile!r}: {reason}")
-    return make_reader(profile, account_id=int(account_id), serving_kind=f"broker:{kind}", cache_root=cache_root,
+        return LiveUnavailableMarketConditionReader(profile, f"market-condition profile {profile!r}: {reason}; "
+                                                             f"its gates refuse every live entry")
+    return make_reader(profile, source="tastytrade", cache_root=cache_root,
                        source_profile=source_profile or SOURCE_PROFILE_FMP_DAILY)
 
 
 def capture_universe(instances=None) -> Tuple[List[str], Dict[int, str]]:
     """``(symbols, unbounded)``: the union of the iv-gated experts' bounded universes, and the instances
-    whose universe is unbounded (with the reason; they cannot be served by a broker source)."""
+    whose universe is unbounded (with the reason; a captured source cannot serve them)."""
     from ba2_common.core.market_condition_iv_live import bounded_iv_universe
 
     symbols: set = set()
@@ -301,90 +302,84 @@ def schedule_spec():
         return None
     if choice is None:
         logger.error(f"iv-v1: active iv gates exist but app setting {_setting()} is not set; nothing is fetched and "
-                     f"the gates refuse every live entry (choose 'alphavantage' or a quote-source account)")
+                     f"the gates refuse every live entry (choose 'alphavantage' or 'tastytrade')")
         return None
     if choice.source == SOURCE_ALPHAVANTAGE:
         return {"source": "alphavantage", "cron": {"hour": PREFETCH_HOUR, "minute": PREFETCH_MINUTE,
                                                    "day_of_week": "mon-fri"},
                 "describe": f"Alpha Vantage prefetch {PREFETCH_HOUR:02d}:{PREFETCH_MINUTE:02d} America/New_York, "
                             f"Mon-Fri (deadline {DEADLINE_HOUR:02d}:{DEADLINE_MINUTE:02d})"}
+    reason = tastytrade_credentials_reason()
+    if reason:
+        logger.error(f"iv-v1: {reason}; the capture still runs on schedule and records the refusal, the gates refuse")
     _symbols, unbounded = capture_universe()
     if unbounded:
-        logger.error(f"iv-v1 broker capture: expert instance(s) {sorted(unbounded)} have an unbounded universe and "
-                     f"cannot be served by a broker quote source; their iv gates refuse ({next(iter(unbounded.values()))})")
-    return {"source": f"account:{choice.account_id}", "cron": {"minute": CAPTURE_CRON_MINUTES},
-            "describe": f"broker capture (account {choice.account_id}) every 30 min from "
-                        f"{CAPTURE_START_HOUR:02d}:{CAPTURE_START_MINUTE:02d} America/New_York until "
-                        f"{CAPTURE_END_BEFORE_OPEN_MINUTES} min before the next open"}
+        logger.error(f"iv-v1 {choice.source} capture: expert instance(s) {sorted(unbounded)} have an unbounded universe "
+                     f"and cannot be served by a captured source; their iv gates refuse "
+                     f"({next(iter(unbounded.values()))})")
+    return {"source": choice.source, "cron": {"minute": CAPTURE_CRON_MINUTES},
+            "describe": f"{choice.source} chain capture every 30 min from {CAPTURE_START_HOUR:02d}:"
+                        f"{CAPTURE_START_MINUTE:02d} America/New_York until {CAPTURE_END_BEFORE_OPEN_MINUTES} min "
+                        f"before the next open"}
 
 
 def in_window(now: datetime = None) -> bool:
     """Whether the configured source's fetch window is open now (the start-up catch-up)."""
-    from ba2_common.core.market_condition_iv_live import SOURCE_ALPHAVANTAGE
-
     choice = configured_source()
     if choice is None:
         return False
-    if choice.source == SOURCE_ALPHAVANTAGE:
+    if not choice.captured:
         return in_prefetch_window(now)
     return capture_target(now) is not None
 
 
 def run_once(now: datetime = None) -> Dict[str, Any]:
     """The scheduler entry: dispatch on the configured source (no-op without an active gate)."""
-    from ba2_common.core.market_condition_iv_live import SOURCE_ALPHAVANTAGE
-
     if not has_active_iv_gates():
         return {"skipped": "no active iv-v1 gate"}
     choice = configured_source()
     if choice is None:
         return {"skipped": f"{_setting()} not set (or malformed)"}
-    if choice.source == SOURCE_ALPHAVANTAGE:
+    if not choice.captured:
         return run_prefetch_once(now)
-    return run_capture_once(choice.account_id, now)
+    return run_capture_once(now)
 
 
-def run_capture_once(account_id: int, now: datetime = None, *, account: Any = None, cache_root: str = None,
+def run_capture_once(now: datetime = None, *, client: Any = None, cache_root: str = None,
                      instances=None) -> Dict[str, Any]:
-    """One broker capture attempt for the session whose window is open now (no-op outside it)."""
-    from ba2_common.core.market_conditions import pairing_unavailable_reason
+    """One TastyTrade capture attempt for the session whose window is open now (no-op outside it). Every
+    snapshot is validated on its data before it is cached; blank or rejected credentials record the
+    refusal for every symbol (the gates then say why)."""
     from ba2_common.core.option_chain_quotes import FETCH_STRIKE_BAND, fetch_expiry_window
     from ba2_providers.market_conditions.broker_live_chain import capture_chains
+    from ba2_providers.options.tastytrade_quotes import fetch_chain_quote_snapshot
 
     now = now or datetime.now(timezone.utc)
     target = capture_target(now)
     if target is None:
         return {"skipped": "outside the broker capture window"}
     session, _start, end = target
-    _cls, kind, reason = quote_source_account(account_id)
-    if reason:
-        logger.error(f"iv-v1 broker capture: {reason}; nothing captured, the iv gates refuse")
-        return {"skipped": reason}
-    why = pairing_unavailable_reason(IV_PROFILE, OPTION_SOURCE, f"broker:{kind}")
-    if why:
-        logger.error(f"iv-v1 broker capture: {why}")
-        return {"skipped": why}
     symbols, unbounded = capture_universe(instances)
     if not symbols:
         return {"skipped": "no bounded universe to capture", "unbounded": unbounded}
-    if account is None:
-        from ...core.utils import get_account_instance_from_id
-        account = get_account_instance_from_id(int(account_id))
+    client = client or tastytrade_market_data_client()
     lo, hi = fetch_expiry_window(session)
 
     def snapshot(sym):
-        return account.get_option_chain_quote_snapshot(sym, expiry_min=lo, expiry_max=hi,
-                                                       strike_band=FETCH_STRIKE_BAND)
+        return fetch_chain_quote_snapshot(client.get_json, sym, expiry_min=lo, expiry_max=hi,
+                                          strike_band=FETCH_STRIKE_BAND, pause=lambda: time.sleep(0.2))
 
     remaining_s = max(0.0, (end - now.astimezone(timezone.utc)).total_seconds())
-    report = capture_chains(symbols, session, snapshot_fn=snapshot, account_id=int(account_id),
-                            serving_kind=f"broker:{kind}", cache_root=cache_root,
+    report = capture_chains(symbols, session, snapshot_fn=snapshot, source="tastytrade", cache_root=cache_root,
                             deadline=time.monotonic() + remaining_s, log=logger.info)
     report["unbounded_instances"] = unbounded
+    report["requests"] = getattr(client, "requests", None)
     if report["refused"] or report["failed"] or report["unsupported"]:
+        from zoneinfo import ZoneInfo
+
         shown = ", ".join(list(report["refused"])[:5] + list(report["failed"])[:5])
-        logger.warning(f"iv-v1 broker capture {session}: {len(report['refused'])} refused (not the prior-session "
-                       f"close), {len(report['failed'])} failed{' -- ' + report['unsupported'] if report['unsupported'] else ''}"
-                       f" ({shown}); retried at the next attempt until "
-                       f"{end.astimezone(__import__('zoneinfo').ZoneInfo('America/New_York')):%H:%M} ET")
+        logger.warning(f"iv-v1 tastytrade capture {session}: {len(report['refused'])} refused (not the prior-session "
+                       f"close), {len(report['failed'])} failed"
+                       f"{' -- ' + report['unsupported'] if report['unsupported'] else ''} ({shown}); retried at the "
+                       f"next attempt until {end.astimezone(ZoneInfo('America/New_York')):%H:%M} ET")
     return report

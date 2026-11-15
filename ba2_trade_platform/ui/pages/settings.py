@@ -878,6 +878,8 @@ class AppSettingsTab:
         'scheduled_session_guard_enabled': 'session_guard_input',
         'data_provider_estimates': 'estimates_provider_input',
         'iv_live_chain_source': 'iv_chain_source_input',
+        'tastytrade_market_client_secret': 'tt_market_secret_input',
+        'tastytrade_market_refresh_token': 'tt_market_refresh_input',
     }
 
     def _shown_value(self, key: str):
@@ -1029,6 +1031,10 @@ class AppSettingsTab:
                 self.alpaca_key_input = _secret_input(label='Alpaca API Key', value=self._shown_value('alpaca_api_key')).classes('flex-1')
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
             self.alpaca_secret_input = _secret_input(label='Alpaca API Secret', value=self._shown_value('alpaca_api_secret')).classes('w-full')
+            self.tt_market_secret_input = _secret_input(label='TastyTrade market-data OAuth client secret', value=self._shown_value('tastytrade_market_client_secret')).classes('w-full')
+            self.tt_market_refresh_input = _secret_input(label='TastyTrade market-data OAuth refresh token', value=self._shown_value('tastytrade_market_refresh_token')).classes('w-full')
+            ui.label('Market data only (iv-v1 live IV chain source "tastytrade"): option chains and quotes, never orders. '
+                     'A read-only token is enough; may stay empty.').classes('text-xs text-gray-500')
         
         from .api_token_card import render_api_token_card
         render_api_token_card()
@@ -1070,34 +1076,18 @@ class AppSettingsTab:
 
         ui.button('Save All Settings', on_click=self.save_settings, icon='save').classes('mt-4').props('color=primary')
 
-    def _iv_chain_source_options(self) -> dict:
-        """Choices of the live IV chain source: unset, Alpha Vantage, and every account definition whose
-        class serves REAL option chain quotes (``supports_option_chain_quote_snapshot``)."""
-        from ...modules.accounts import get_account_class
-        opts = {'': 'Not set (active iv gates refuse)', 'alphavantage': 'Alpha Vantage (HISTORICAL_OPTIONS)'}
-        with get_db() as session:
-            for acc in session.exec(select(AccountDefinition)).all():
-                cls = get_account_class(acc.provider)
-                if cls is not None and getattr(cls, 'supports_option_chain_quote_snapshot', False):
-                    from ba2_common.core.market_conditions import pairing_unavailable_reason
-                    kind = f"broker:{getattr(cls, 'option_chain_quote_source_kind', '')}"
-                    note = '' if pairing_unavailable_reason('iv-v1', 'alphavantage', kind) is None \
-                        else ' (NOT certified: iv gates refuse)'
-                    opts[f'account:{acc.id}'] = f'Account {acc.id}: {acc.name} ({acc.provider}) - quote source only{note}'
-        current = self._shown_value('iv_live_chain_source') or ''
-        if current not in opts:
-            opts[current] = f'{current} (not a quote-source account)'
-        return opts
-
     def _render_iv_chain_source(self):
-        self.iv_chain_source_input = ui.select(
-            self._iv_chain_source_options(), label='Live IV chain source (iv-v1 gates)',
-            value=self._shown_value('iv_live_chain_source') or '').classes('w-full mt-2')
+        labels = {'': 'Not set (active iv gates refuse)', 'alphavantage': 'Alpha Vantage (HISTORICAL_OPTIONS)',
+                  'tastytrade': 'TastyTrade market data (credentials under Broker API Keys)'}
+        current = self._shown_value('iv_live_chain_source') or ''
+        if current not in labels:
+            labels[current] = f'{current} (not a valid source)'
+        self.iv_chain_source_input = ui.select(labels, label='Live IV chain source (iv-v1 gates)',
+                                               value=current).classes('w-full mt-2')
         ui.label('Where live reads the PRIOR session\'s option chain for iv-v1 market-condition gates. '
-                 'A quote-source account is used for MARKET DATA ONLY -- never for orders -- and may differ '
-                 'from the expert\'s trading account; its chain is captured between the close and the next '
-                 'open. Unset: experts without an iv gate are unaffected, an active iv gate refuses every '
-                 'entry. Takes effect after a reload.').classes('text-xs text-gray-500')
+                 'TastyTrade: captured between the close and the next open with the market-data credentials '
+                 '(market data only, never orders). Unset: experts without an iv gate are unaffected, an '
+                 'active iv gate refuses every entry. Takes effect after a reload.').classes('text-xs text-gray-500')
 
     def _save_app_setting(self, session, key: str, value: str):
         """Helper method to save an app setting."""

@@ -113,22 +113,22 @@ def _register_live_chain_readers() -> None:
 
     register_live_chain_reader("alphavantage", make_reader)
 
-    # BROKER quote source (app setting iv_live_chain_source = account:<id>): the account definition's class
-    # is resolved WITHOUT instantiating it (no login) when the resolver is built; the reader only reads
-    # what the capture job cached between the prior close and the next open.
+    # TASTYTRADE market data (app setting iv_live_chain_source = tastytrade, app-level market-data credentials):
+    # the reader only reads what the capture job cached between the prior close and the next open; building
+    # it reads two settings and makes no call.
     try:
-        from ..modules.dataproviders.options.iv_chain_prefetch import make_broker_chain_reader
+        from ..modules.dataproviders.options.iv_chain_prefetch import make_tastytrade_chain_reader
     except ImportError as e:
-        broker_reason = (f"market-condition profile iv-v1: the live broker chain reader could not be imported "
-                         f"({type(e).__name__}: {e}); its gates refuse every live entry")
-        logger.warning(broker_reason)
+        tt_reason = (f"market-condition profile iv-v1: the live TastyTrade chain reader could not be imported "
+                     f"({type(e).__name__}: {e}); its gates refuse every live entry")
+        logger.warning(tt_reason)
 
-        def make_broker_chain_reader(profile, **_kw):
+        def make_tastytrade_chain_reader(profile, **_kw):
             from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
 
-            return LiveUnavailableMarketConditionReader(profile, broker_reason)
+            return LiveUnavailableMarketConditionReader(profile, tt_reason)
 
-    register_live_chain_reader("broker", make_broker_chain_reader)
+    register_live_chain_reader("tastytrade", make_tastytrade_chain_reader)
 
 
 def wire_all_seams() -> None:

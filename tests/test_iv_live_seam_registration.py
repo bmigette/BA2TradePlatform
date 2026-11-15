@@ -28,8 +28,8 @@ def test_the_registration_is_silent_and_registers_the_alphavantage_reader(caplog
         seam_wiring._register_live_chain_readers()
         assert logged == []
         assert live_chain_reader_factory("alphavantage") is make_reader
-        from ba2_trade_platform.modules.dataproviders.options.iv_chain_prefetch import make_broker_chain_reader
-        assert live_chain_reader_factory("broker") is make_broker_chain_reader
+        from ba2_trade_platform.modules.dataproviders.options.iv_chain_prefetch import make_tastytrade_chain_reader
+        assert live_chain_reader_factory("tastytrade") is make_tastytrade_chain_reader
         assert live_chain_reader_factory("thetadata") is None
     finally:
         clear_live_chain_readers()

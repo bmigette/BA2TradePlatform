@@ -52,13 +52,19 @@ APP_SETTINGS_DEFINITIONS: Dict[str, Dict[str, Any]] = {
                                 "description": "Analyst-estimates data provider"},
     # LIVE IV CHAIN SOURCE of the iv-v1 market-condition gates (ba2_common.core.market_condition_iv_live):
     # blank = unset (experts without an iv gate are unaffected; an ACTIVE iv gate refuses, naming this
-    # setting), "alphavantage", or "account:<id>" -- an account definition used as a QUOTE SOURCE for
-    # market data only (never for orders; may differ from the expert's trading account). No default.
-    "iv_live_chain_source": {"type": "str", "required": False,
+    # setting), "alphavantage" (HISTORICAL_OPTIONS) or "tastytrade" (market data with the TastyTrade
+    # market-data credentials below; never an account definition, never an order). No default.
+    "iv_live_chain_source": {"type": "str", "required": False, "choices": ["", "alphavantage", "tastytrade"],
                              "description": "Live IV chain source (iv-v1 gates)"},
     # Broker API keys
     "alpaca_api_key": {"type": "str", "required": False, "description": "Alpaca API Key"},
     "alpaca_api_secret": {"type": "str", "required": False, "description": "Alpaca API Secret"},
+    # TastyTrade MARKET-DATA credentials (OAuth client secret + refresh token; a read-only token is
+    # enough). Used only by the iv-v1 chain capture (option chain listing + /market-data/by-type).
+    "tastytrade_market_client_secret": {"type": "str", "required": False,
+                                        "description": "TastyTrade market-data OAuth client secret"},
+    "tastytrade_market_refresh_token": {"type": "str", "required": False,
+                                        "description": "TastyTrade market-data OAuth refresh token"},
     # System settings
     "worker_count": {"type": "int", "required": False, "default": 4, "min": 1, "max": 20,
                      "description": "Worker Count"},

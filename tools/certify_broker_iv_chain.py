@@ -13,12 +13,15 @@ The Alpha Vantage side comes from:
     shared rate budget (``_av_rate_budget.json``).
 
 A broker snapshot is the prior-session chain only between S's close and the next open: run it then
-(``--session`` defaults to the most recent closed session). The pairing ``alphavantage -> broker:tastytrade``
+(``--session`` defaults to the most recent closed session). The pairing ``alphavantage -> tastytrade``
 rests on this evidence (docs/plans/2026-11-15-option-iv-conditions.md 6.6): run it daily while an AV key or
 the store covers the session, and keep the report.
 
     python tools/certify_broker_iv_chain.py --symbols MSFT,KO,AAPL [--session YYYY-MM-DD]
-        [--av-source store|api] [--report reports/iv_broker_certification.jsonl] [--db PATH] [--account-id N]
+        [--av-source store|api] [--report reports/iv_broker_certification.jsonl] [--db-file PATH]
+        [--use-account-id N]
+
+Credentials as in probe_broker_iv_snapshot.py (app-level market-data credentials, or --use-account-id).
 
 READ-ONLY (DB mode=ro, market-data endpoints only); never prints secrets.
 """
@@ -106,8 +109,7 @@ def _av_chain_api(symbol: str, session: date, db: str, cache_root: str):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--db", default=T.DEFAULT_DB)
-    ap.add_argument("--account-id", type=int)
+    T.add_common_args(ap)
     ap.add_argument("--symbols", required=True)
     ap.add_argument("--session", type=date.fromisoformat)
     ap.add_argument("--av-source", choices=("store", "api"), default="store")
@@ -121,40 +123,37 @@ def main(argv=None) -> int:
     if ns.cache_root is None:
         from ba2_common.core import native_cache
         ns.cache_root = native_cache.CACHE_FOLDER
-    account_id = T.quote_source_account_id(ns.db, ns.account_id)
     session = ns.session or T.last_closed_session()
     windows = AlphaVantageLiveChainReader("iv-v1", cache_root=ns.cache_root)
-    get_json, close = T.tastytrade_get_json(ns.db, account_id)
+    client = T.market_data_client(ns.db_file, ns.use_account_id)
     os.makedirs(os.path.dirname(os.path.abspath(ns.report)), exist_ok=True)
-    try:
-        for sym in [s.strip().upper() for s in ns.symbols.split(",") if s.strip()]:
-            rec: Dict[str, Any] = {"at": datetime.now(timezone.utc).isoformat(), "account_id": account_id,
-                                   "serving_kind": "broker:tastytrade", "av_source": ns.av_source}
-            snap = T.snapshot(get_json, sym, session, account_id)
-            verdict = validate_prior_session_snapshot(snap, session)
-            if not verdict.ok:
-                rec.update(symbol=sym, session=session.isoformat(), refused=verdict.reason, facts=verdict.facts)
+    for sym in [s.strip().upper() for s in ns.symbols.split(",") if s.strip()]:
+        rec: Dict[str, Any] = {"at": datetime.now(timezone.utc).isoformat(), "serving_kind": "tastytrade",
+                               "credentials": "account" if ns.use_account_id else "app",
+                               "av_source": ns.av_source}
+        snap = T.snapshot(client, sym, session)
+        verdict = validate_prior_session_snapshot(snap, session)
+        if not verdict.ok:
+            rec.update(symbol=sym, session=session.isoformat(), refused=verdict.reason, facts=verdict.facts)
+        else:
+            frame, _stats = map_snapshot(sym, session, verdict.kept)
+            broker_chain = chain_quotes(frame, sym, session)
+            av_chain = (_av_chain_store(sym, session, ns.cache_root) if ns.av_source == "store"
+                        else _av_chain_api(sym, session, ns.db_file, ns.cache_root))
+            if av_chain is None:
+                rec.update(symbol=sym, session=session.isoformat(),
+                           refused=f"the Alpha Vantage {ns.av_source} has no chain for {sym} on {session}")
             else:
-                frame, _stats = map_snapshot(sym, session, verdict.kept)
-                broker_chain = chain_quotes(frame, sym, session)
-                av_chain = (_av_chain_store(sym, session, ns.cache_root) if ns.av_source == "store"
-                            else _av_chain_api(sym, session, ns.db, ns.cache_root))
-                if av_chain is None:
-                    rec.update(symbol=sym, session=session.isoformat(),
-                               refused=f"the Alpha Vantage {ns.av_source} has no chain for {sym} on {session}")
-                else:
-                    win, ws, wr = windows._window(sym, session)
-                    rec.update(compare(sym, session, broker_chain, av_chain, win, ws, wr, snap.spot))
-                    rec["facts"] = verdict.facts
-            with open(ns.report, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, default=str) + "\n")
-            short = (f"refused: {rec['refused']}" if "refused" in rec else
-                     f"identical quotes {rec['identical_quotes_share']:.4f} (near money "
-                     f"{rec['identical_quotes_share_near_money']}), identical rows {rec['identical_rows']}, "
-                     f"flips {sum(v['flipped'] for v in rec['gate_flips'].values())}")
-            print(f"{sym} {session}: {short}")
-    finally:
-        close()
+                win, ws, wr = windows._window(sym, session)
+                rec.update(compare(sym, session, broker_chain, av_chain, win, ws, wr, snap.spot))
+                rec["facts"] = verdict.facts
+        with open(ns.report, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+        short = (f"refused: {rec['refused']}" if "refused" in rec else
+                 f"identical quotes {rec['identical_quotes_share']:.4f} (near money "
+                 f"{rec['identical_quotes_share_near_money']}), identical rows {rec['identical_rows']}, "
+                 f"flips {sum(v['flipped'] for v in rec['gate_flips'].values())}")
+        print(f"{sym} {session}: {short}")
     print(f"appended to {ns.report}")
     return 0
 
