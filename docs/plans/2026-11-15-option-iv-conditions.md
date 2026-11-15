@@ -194,19 +194,74 @@ the ohlcv-v1 live reader reads (FMP or Alpaca daily cache, `assemble_window`), a
 against the rows of a store built by the real downloader code from the same raw rows. **Tolerance:
 none (exact equality)**, because both sides run the same code on the same numbers.
 
-**On demand.** The reader is built only for an expert whose setting names `iv-v1` with source
-`alphavantage`, and the deploy importer drops `iv-v1` from a setting no leaf reads. A chain is
-fetched only when a market leaf of that expert is evaluated for the symbol. Every fetched chain is
-cached on disk at `<CACHE>/market_conditions_live/alphavantage/<SYM>/<session>.parquet`, so repeat
-passes, restarts and other experts make no further call. Rows are also memoised per reader.
+**When a chain is fetched.**
 
-**Rate budget.** Calls go through the shared `_av_rate_budget.json`
-(owner `iv_live:<pid>`, 10/min of the key's 75), waiting at most 20 s for a slot.
+- The reader is built only for an expert whose setting names `iv-v1` with source `alphavantage`,
+  and the deploy importer drops `iv-v1` from a setting no leaf reads.
+- A chain is fetched only when an **iv field** is read. The composite reader resolves a chain
+  profile's fields lazily (`_LazyChainRow`), so an OHLCV leaf never causes an AV call. A composite
+  without a chain reader still returns the plain `FeatureRow` with the same memo key.
+- The capture recorder records only evidence already held (`peek_evidence`); it never fetches.
+- Computed rows are memoised per reader. A refusal is memoised only for the current decision pass:
+  a second leaf on the same symbol costs nothing, and the next pass retries. The composite's own
+  memo holds the lazy row, so a transient failure is never served from it.
 
-**Failure policy.** Every failure produces the profile's fields at `no_context` with the reason, one
-WARNING per (symbol, session, reason), and is never memoised or cached, so the next pass retries.
-The gate never passes and the evaluator counts the unknown. There is no fallback source and no
-approximation.
+**Cache.** One file per chain:
+`<CACHE>/market_conditions_live/alphavantage/<SYM>/<session>.parquet`.
+
+- It holds only the six columns the computation reads, written atomically.
+- A file that fails to read is deleted and refetched.
+- `maintain_cache` removes `*.part` files older than an hour and keeps the newest 10 sessions per
+  symbol. The prefetch runs it, never the decision path.
+
+**Rate budget and the numbers.** These are settings-free constants in `av_live_chain.py`. The key
+allows 75 calls/minute, and the option download takes 60 of them.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `ON_DEMAND_PER_MINUTE` | 10 | decision-path share of the shared `_av_rate_budget.json` (owner `iv_live:<pid>`) |
+| `PREFETCH_PER_MINUTE` | 12 | prefetch share |
+| `HTTP_TIMEOUT_S` | 12 | HTTP timeout per call |
+| `BUDGET_WAIT_S` | 5 | longest wait for a budget slot on the decision path |
+| `KEEP_SESSIONS` | 10 | cached sessions kept per symbol |
+
+On the decision path, the first budget refusal waits at most 5 s and then latches "budget
+exhausted" until the budget window frees a slot. Every further uncached symbol in the pass is
+refused immediately, so a pass cannot stall.
+
+**Prefetch** (off the decision path). The live `JobManager` runs it Mon–Fri at 06:30 ET, with a
+09:45 ET deadline. The job is scheduled only while an enabled expert has an active iv gate trained
+on alphavantage; otherwise nothing is scheduled or logged. It fetches the prior session's chain for
+each gated expert's candidate symbols, waits for budget slots instead of refusing, resumes from the
+disk cache, and leaves what it could not fetch to the decision path.
+`tools/prefetch_iv_chains.py` runs the same prefetch by hand.
+
+- **Candidates.** For an expert with static enabled instruments, those instruments. For an expert
+  whose universe is chosen at analysis time (a screener), the symbols it evaluated in recent
+  sessions, i.e. those in the live chain cache; the rest of its universe stays on demand.
+- **Typical size.** A stage-1 option expert runs on the 97-symbol top-100 universe, which takes
+  about 8 minutes at 12/min. The 820-symbol large-cap universe, if fully static, takes about
+  68 minutes and finishes around 07:40 ET. Both finish well before a 10:00 decision.
+- **Remainder.** Symbols the prefetch could not cover are fetched on demand at the decision, at up
+  to 10/min; beyond that they are refused for the pass and retried the next pass. I did not raise
+  the live share: the prefetch covers every knowable universe before the decision, and the key is
+  shared with the download.
+
+**Failure policy.** Every failure produces the profile's fields at `no_context` with the reason. The
+gate never passes, the evaluator counts the unknown, and nothing is cached. The decision scope logs
+**one summary WARNING per reason per pass**, with the count and the first symbols. There is no
+fallback source and no approximation.
+
+- **Expected faults** (I/O, parse, the data contract) become this unknown.
+- **A programming error propagates** (enforce-mode convention, `absorb_if_benign`). The live entry
+  pass evaluates each recommendation in its own try/except, so it fails only that symbol's
+  evaluation.
+- **Startup.** If the reader module cannot be imported, startup continues with one WARNING, and iv
+  gates refuse with that reason.
+
+**Live date contract.** Live is stricter than the store's `map_chain`, which treats an undated row
+as the requested day; the store behaviour is unchanged. Every dated row must carry the requested
+session, and at most 1% of rows may lack a date; otherwise the chain is refused.
 
 | Failure | Reason recorded |
 |---|---|
@@ -223,8 +278,12 @@ approximation.
 importer refuses such leaves and accepts leaves trained on `alphavantage`.
 
 **Capture and replay.** Capture records each served row's values, statuses and reasons together with
-its evidence: the normalized chain arrays and the 128x5 window bytes, each with a digest
-(schema `market_condition_chain_window/v1`). `ReplayChainReader` re-verifies both digests,
+its evidence: the chain arrays and the 128x5 window bytes, each with a digest
+(schema `market_condition_chain_window/v1`). The chain is trimmed to the narrowest strike band
+around each expiry's forward (±15%, then ±30%, then ±50%) whose recomputed row is identical to the
+live row, falling back to the full chain, and it is then zlib-compressed. In the test, the stored
+chain is under 40% of the raw bytes, which keeps a 100-symbol decision in the low single-digit MB.
+Uncompressed payloads still replay. `ReplayChainReader` re-verifies both digests,
 recomputes the row with the shared function, and refuses (`ReplayMiss`) evidence that is missing,
 tampered with, or recomputes differently. A recorded refusal replays as the same refusal.
 
@@ -277,8 +336,11 @@ INFO-and-above logs are unchanged:
 - **The ohlcv-v1 and ta-structure-v1 live readers** are untouched. The all-off and profile-none
   goldens and every existing market-condition test pass.
 
-For a running prod instance (8081) with no iv gate, pulling this code changes nothing: one silent
-dictionary registration at startup and no new reads, calls or log lines.
+For a running prod instance (8081) with no iv gate, pulling this code changes no decision,
+setting or INFO-and-above log line. At startup there is one silent registration. Whenever the
+scheduler (re)builds its system jobs, there is one read-only query of the `market_condition_profile`
+setting rows, which finds no iv-v1 and stops there: no job is scheduled and no expert is
+instantiated for it. No AV call is ever made.
 
 ## 7. Building the store
 
@@ -304,9 +366,15 @@ python tools/warm_market_conditions.py prepare-host --manifest <digest> --ohlcv-
   `option_chain_missing`.
 - **Manifest.** The manifest records `option_source` (`alphavantage` or `thetadata`). This is an
   optional key, so OHLCV manifests are byte-identical.
-- **AV store.** The build also reads not-yet-compacted staged days; a staged day replaces that day's
-  partition rows, exactly as compaction does. `fetched_through` comes from the download ledger, and a
-  torn last line is ignored.
+- **AV store.** The build also reads not-yet-compacted staged days and merges them exactly as
+  `AvOptionStore.compact` does: a staged row replaces the same contract's row of that day, and
+  contracts the staged day lacks keep their rows. A store built mid-download therefore equals one
+  built after compaction (tested, including the digest). `fetched_through` comes from the download
+  ledger, and a torn last line is ignored.
+- **Gap fill.** The build refuses a `--gap-fill` policy for iv-v1. The live reader reads the unfilled
+  window, and the store must equal live.
+- **Old manifests.** Manifests built before the rename record `thetadata-eod-parquet-v1`; that name is
+  read as `thetadata` (`manifest_option_source`) and never rewritten or refused.
 - **Not retained.** The store does not retain the chain itself: the parquet tree is the evidence, so
   `retained_window` does not serve chain-profile rows. Live decisions are captured with their chain
   evidence (section 6.2).
