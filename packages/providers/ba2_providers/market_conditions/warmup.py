@@ -753,6 +753,11 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     validate_gap_fill(gap_fill)
     if profile not in PROFILES or (profile not in COMPUTE_BY_PROFILE and not is_chain_profile(profile)):
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
+    if gap_fill is not None and is_chain_profile(profile):
+        # The LIVE iv reader assembles its realized-vol window WITHOUT a fill (as the ohlcv-v1 live
+        # reader does), so a filled store would serve rows live can never reproduce: refused.
+        raise WarmupConfigError(f"profile {profile!r} refuses a gap-fill policy ({gap_fill!r}): its live "
+                                f"reader reads the unfilled window, and the store must equal live")
     if (option_root is not None or option_source is not None) and not is_chain_profile(profile):
         raise WarmupConfigError(f"option_root/option_source are only for chain profiles {sorted(CHAIN_COMPUTE_BY_PROFILE)}; "
                                 f"{profile!r} is computed from bars alone")

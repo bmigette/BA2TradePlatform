@@ -181,8 +181,9 @@ class ThetaDataParquetChainSource(_ParquetTreeChainSource):
 
 class AlphaVantageParquetChainSource(_ParquetTreeChainSource):
     """The Alpha Vantage store: the compacted partitions PLUS the staged ``_days`` a running download
-    has not compacted yet. A staged day REPLACES that day's partition rows (compaction keeps the
-    staged rows, ``AvOptionStore.compact``), so a read mid-download sees what compaction will write.
+    has not compacted yet, merged exactly as ``AvOptionStore.compact`` will merge them (a staged row
+    replaces the same contract's row of that day; other contracts keep theirs), so a store built
+    mid-download equals one built after compaction.
     ``fetched_through`` is the ledger's last fetched date (ok or empty), the download's own record."""
 
     option_source = OPTION_SOURCE_ALPHAVANTAGE
@@ -234,11 +235,19 @@ class AlphaVantageParquetChainSource(_ParquetTreeChainSource):
                 if part:
                     staged.append(part)
         parts = self._partition_parts(sdir, first, last)
-        if staged_days:
-            drop = np.array(sorted(staged_days), dtype=np.int64)
+        if staged:
+            # EXACTLY what ``AvOptionStore.compact`` writes: it concatenates the partition and the staged
+            # rows and keeps the LAST of each (occ_symbol, bar_date) -- a staged row REPLACES the same
+            # contract's partition row of that day, and a contract the staged day lacks KEEPS its
+            # partition row. (expiry, type, strike) identifies the contract: ``map_chain`` admits only
+            # the symbol's own OCC root, so the OCC symbol is exactly those three.
+            staged_keys = {(int(b), int(e), bool(c), float(k)) for p in staged
+                           for b, e, c, k in zip(p["bar"], p["exp"], p["call"], p["strike"])}
             trimmed = []
             for p in parts:
-                keep = ~np.isin(p["bar"], drop)
+                keep = np.fromiter(((int(b), int(e), bool(c), float(k)) not in staged_keys
+                                    for b, e, c, k in zip(p["bar"], p["exp"], p["call"], p["strike"])),
+                                   dtype=bool, count=len(p["bar"]))
                 if keep.any():
                     trimmed.append({k: v[keep] for k, v in p.items()})
             parts = trimmed

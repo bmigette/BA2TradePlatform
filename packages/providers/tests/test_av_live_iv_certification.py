@@ -98,7 +98,7 @@ def _live_reader(root, *, fetch=None, key=KEY, budget=None):
     chains from the fake fetch (cached under <root>/market_conditions_live/alphavantage)."""
     calls = []
 
-    def default_fetch(symbol, session, api_key):
+    def default_fetch(symbol, session, api_key, timeout=None):
         calls.append((symbol, session, api_key))
         return _av_rows(symbol, session)
 
@@ -143,7 +143,7 @@ def test_every_failure_is_an_unknown_with_its_reason_and_is_not_cached(world, ca
     root, mapped = world
     state = {"fail": True}
 
-    def fetch(symbol, session, api_key):
+    def fetch(symbol, session, api_key, timeout=None):
         if state["fail"]:
             if case == "throttled":
                 raise AlphaVantageThrottled("Thank you for using Alpha Vantage! ... premium ... per minute")

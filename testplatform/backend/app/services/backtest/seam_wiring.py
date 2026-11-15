@@ -502,8 +502,10 @@ def _check_option_source_setting(config: Dict[str, Any], profile: str, reader: A
     ``market_condition_option_source`` that names ANOTHER store contradicts it (the deployed twin would
     be served a different vendor's chain than the one these trials gated on): refused. Absent setting:
     nothing to compare (every run before the setting existed). Not a chain profile: no-op."""
+    from ba2_common.core.market_condition_store import manifest_option_source
+
     mapped = getattr(reader, "mapped_reader", None)
-    built = (mapped.manifest.get("option_source") if mapped is not None else None)
+    built = manifest_option_source(mapped.manifest) if mapped is not None else None
     if not built:
         return
     from ba2_common.core.market_condition_rules import OPTION_SOURCE_SETTING

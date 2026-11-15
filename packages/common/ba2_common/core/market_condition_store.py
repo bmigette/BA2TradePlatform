@@ -131,6 +131,18 @@ MANIFEST_KEYS = (
 #: OHLCV source stays in ``source_profile``, which the backtest seam compares with the job's history.
 OPTIONAL_MANIFEST_KEYS = ("gap_fill_policy", "option_source")
 
+#: Earlier spellings of an ``option_source`` (manifests built before the 2026-11-15 rename). A READ
+#: maps them to the current name; the manifest itself (and so its identity) is never rewritten.
+OPTION_SOURCE_ALIASES = {"thetadata-eod-parquet-v1": "thetadata"}
+
+
+def manifest_option_source(manifest: Mapping[str, Any]) -> Optional[str]:
+    """The manifest's ``option_source`` under its CURRENT name (None when it carries none)."""
+    raw = manifest.get("option_source")
+    if not raw:
+        return None
+    return OPTION_SOURCE_ALIASES.get(str(raw), str(raw))
+
 #: How long a reader waits on one notification while another thread indexes a manifest.
 _INDEX_WAIT_S = 1.0
 

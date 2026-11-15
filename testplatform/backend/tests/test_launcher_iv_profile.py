@@ -146,7 +146,7 @@ def test_the_all_off_control_decodes_to_profile_none(iv_on, monkeypatch):
 
 
 # --------------------------------------------------------------------------- the trial config
-def _publish_iv_manifest(root, symbols=("AAA", "BBB"), bad=()):
+def _publish_iv_manifest(root, symbols=("AAA", "BBB"), bad=(), option_source="thetadata"):
     """``bad`` symbols: IV30/IV60 (and the ratios) ``insufficient_history`` on every session while the
     realized vol is valid -- a broken chain hiding behind a legitimate-looking status."""
     from ba2_common.core.market_condition_store import MarketConditionStore
@@ -174,7 +174,7 @@ def _publish_iv_manifest(root, symbols=("AAA", "BBB"), bad=()):
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[], coverage={s: {"rows": len(sessions)} for s in symbols},
         universe=list(symbols), sessions=sessions, window_start=date.fromisoformat(MC_START),
-        window_end=date.fromisoformat(MC_END), option_source="thetadata")
+        window_end=date.fromisoformat(MC_END), option_source=option_source)
     return store, store.write_manifest(manifest)
 
 
@@ -347,3 +347,18 @@ def test_the_backtest_seam_refuses_a_setting_that_contradicts_the_snapshot(iv_sn
                                      IV_PROFILE, reader)
     # not a chain manifest: never consulted
     _check_option_source_setting(ok, "ohlcv-v1", SimpleNamespace(mapped_reader=SimpleNamespace(manifest={})))
+
+
+def test_a_manifest_with_the_old_source_spelling_is_still_accepted(iv_on, tmp_path, monkeypatch):
+    """Review 2026-11-15 item 9: a manifest built before the rename records
+    ``thetadata-eod-parquet-v1``; it is read as ``thetadata`` (never rewritten, never refused)."""
+    import ba2_common.config as bc
+
+    store, digest = _publish_iv_manifest(tmp_path / "old", option_source="thetadata-eod-parquet-v1")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {IV_PROFILE: digest})
+    strat = _built("O_IC")
+    cfg = _cfg(strat, options_store="thetadata")
+    recorded = mod._apply_market_conditions("optimize", cfg, strat, "O_IC")
+    assert recorded["facts"][IV_PROFILE]["option_source"] == "thetadata"
+    assert cfg["experts"][0]["settings"]["market_condition_option_source"] == "thetadata"
