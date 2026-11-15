@@ -124,7 +124,12 @@ MANIFEST_KEYS = (
 #: ``gap_fill_policy`` -- one of ``market_condition_source.GAP_FILL_POLICIES`` (e.g.
 #: ``"previous"``), present only when the manifest's rows were built over a gap-filled source
 #: series. Absent == the historical default (no fill).
-OPTIONAL_MANIFEST_KEYS = ("gap_fill_policy",)
+#:
+#: ``option_source`` -- the option chain store a CHAIN profile's rows were built from (e.g.
+#: ``"thetadata-eod-parquet-v1"``, see ``ba2_providers.market_conditions.option_chain_source``).
+#: Present only on chain-profile manifests (``market_conditions.CHAIN_COMPUTE_BY_PROFILE``); the
+#: OHLCV source stays in ``source_profile``, which the backtest seam compares with the job's history.
+OPTIONAL_MANIFEST_KEYS = ("gap_fill_policy", "option_source")
 
 #: How long a reader waits on one notification while another thread indexes a manifest.
 _INDEX_WAIT_S = 1.0
@@ -476,7 +481,8 @@ class MarketConditionStore:
                       coverage: Mapping[str, Any], universe: Iterable[str], sessions: Iterable[date],
                       window_start: date, window_end: date,
                       created_at: Optional[str] = None,
-                      gap_fill_policy: Optional[str] = None) -> Dict[str, Any]:
+                      gap_fill_policy: Optional[str] = None,
+                      option_source: Optional[str] = None) -> Dict[str, Any]:
         """``gap_fill_policy`` (default None = no fill, unchanged byte-for-byte from before this
         parameter existed) is omitted from the manifest entirely when None, and set to the policy
         name otherwise -- see :data:`OPTIONAL_MANIFEST_KEYS`."""
@@ -499,6 +505,8 @@ class MarketConditionStore:
         }
         if gap_fill_policy is not None:
             manifest["gap_fill_policy"] = gap_fill_policy
+        if option_source is not None:
+            manifest["option_source"] = option_source
         return manifest
 
     @staticmethod

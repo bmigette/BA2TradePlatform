@@ -58,6 +58,18 @@ NEGATIVE ROWS. A row whose window cannot be assembled (young listing, hole, stal
 published with its status and reason and an identity over the bars that DO exist in its span
 (``unavailable_window_digest``): when the bar arrives the identity changes and the row is rebuilt.
 
+CHAIN PROFILES (``market_conditions.CHAIN_COMPUTE_BY_PROFILE``, today ``iv-v1``). A row needs the
+session's END-OF-DAY option chain as well as the OHLCV window, so :func:`plan` takes an
+``option_root`` (default ``<cache_root>/ThetaDataOptionsProvider``) and inventories it per symbol
+(``no_option_chain`` / ``option_chain_stale_tail`` are blocking, never fetched: the option backfill
+is its own tool), and :func:`build` reads it READ-ONLY one calendar year per symbol at a time
+(``option_chain_source.ThetaDataParquetChainSource``). Every OHLCV step above is unchanged and
+shared: the same snapshot, certification, split checks, windows and raw shards. Each row's identity
+is ``chain_row_digest(window digest, chain digest)``, so a re-run reuses a row only when BOTH its
+bars and its quotes are unchanged; the manifest records the chain source in its optional
+``option_source`` key. The chain itself is not retained in the store (the parquet tree is the
+evidence), so ``retained_window`` does not serve chain-profile rows.
+
 Local coordination files (claims, host slots, progress records) live under
 ``<cache_root>/_derived/market_conditions_build``: machine-local, never mirrored by cache sync.
 """
@@ -102,12 +114,14 @@ from ba2_common.core.market_condition_store import (
     unavailable_window_digest,
 )
 from ba2_common.core.market_conditions import (
+    CHAIN_COMPUTE_BY_PROFILE,
     COMPUTE_BY_PROFILE,
     PROFILES,
     STATUS_VALID,
     STATUSES,
     WINDOW,
     FeatureRow,
+    is_chain_profile,
 )
 from ba2_common.core.market_conditions_batch import BATCH_BY_PROFILE
 from ba2_common.core.split_basis import (
@@ -224,6 +238,14 @@ class SymbolInventory:
     #: WHOLE plan/build must not crash for it, so it is isolated here and waived the same way an
     #: unreadable split calendar is.
     gap_fill_error: Optional[str] = None
+    #: CHAIN PROFILES only (None for every OHLCV profile, so an old saved plan loads unchanged):
+    #: whether the option chain tree has a directory for the symbol, and the date its backfill
+    #: fetched it through (``ThetaDataParquetChainSource.fetched_through``).
+    option_chain: Optional[bool] = None
+    option_chain_through: Optional[str] = None
+    #: The tree was fetched through a date BEFORE the plan's last row: the rows after it would
+    #: read missing_session as a trailing run, which the window check cannot tell from a delisting.
+    option_chain_stale: bool = False
 
     @property
     def fetch_needed(self) -> bool:
@@ -262,6 +284,12 @@ class SymbolInventory:
         if self.refetch_required:
             items.append({"symbol": self.symbol, "kind": "refetch_required",
                           "splits": [c for c in self.split_checks if c["verdict"] in REFETCH_VERDICTS]})
+        # Never fetchable here: the option tree is written by the option backfill, not by a warmup.
+        if self.option_chain is False:
+            items.append({"symbol": self.symbol, "kind": "no_option_chain", "fetchable": False})
+        elif self.option_chain_stale:
+            items.append({"symbol": self.symbol, "kind": "option_chain_stale_tail", "fetchable": False,
+                          "fetched_through": self.option_chain_through})
         return items
 
 
@@ -302,6 +330,10 @@ class MarketConditionWarmPlan:
     #: ``gap_fill`` key at all; ``MarketConditionWarmPlan(**d)`` then uses this default (None),
     #: so loading it is unaffected by this field's existence.
     gap_fill: Optional[str] = None
+    #: CHAIN PROFILES only (None otherwise): the option chain tree the build reads, and the
+    #: ``option_source`` identity the manifest records.
+    option_root: Optional[str] = None
+    option_source: Optional[str] = None
 
     # -- views
     def symbol(self, sym: str) -> SymbolInventory:
@@ -706,7 +738,7 @@ def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.n
 def plan(profile: str, universe: Sequence[str], start: date, end: date,
          source_profile: str = SOURCE_PROFILE_FMP_DAILY, cache_root: Optional[os.PathLike] = None, *,
          source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop,
-         gap_fill: Optional[str] = None) -> MarketConditionWarmPlan:
+         gap_fill: Optional[str] = None, option_root: Optional[os.PathLike] = None) -> MarketConditionWarmPlan:
     """Inventory + preflight for warming ``profile`` over ``universe`` and decisions in ``[start, end]``.
 
     ``source`` supplies the split calendar (default: the FMP source for ``cache_root``).
@@ -717,8 +749,11 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     optional ``gap_fill_policy`` key."""
     t0 = time.monotonic()
     validate_gap_fill(gap_fill)
-    if profile not in PROFILES or profile not in COMPUTE_BY_PROFILE:
+    if profile not in PROFILES or (profile not in COMPUTE_BY_PROFILE and not is_chain_profile(profile)):
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
+    if option_root is not None and not is_chain_profile(profile):
+        raise WarmupConfigError(f"option_root is only for chain profiles {sorted(CHAIN_COMPUTE_BY_PROFILE)}; "
+                                f"{profile!r} is computed from bars alone")
     if source_profile not in SOURCE_PROFILE_BY_HISTORY.values():
         raise WarmupConfigError(f"unsupported source profile {source_profile!r}; "
                                 f"known: {sorted(SOURCE_PROFILE_BY_HISTORY.values())}")
@@ -777,6 +812,16 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     store = MarketConditionStore(cache_root)
     index = _ManifestIndex(store, profile, symbols, source_profile)
     fields = [f.name for f in PROFILES[profile].fields]
+    chain_source = None
+    if is_chain_profile(profile):
+        from ba2_providers.market_conditions.option_chain_source import (
+            ThetaDataParquetChainSource, default_option_root,
+        )
+        try:
+            chain_source = ThetaDataParquetChainSource(
+                os.fspath(option_root) if option_root is not None else default_option_root(cache_root))
+        except FileNotFoundError as e:
+            raise WarmupConfigError(f"profile {profile!r} reads an option chain tree: {e}") from e
     inventories = []
     for sym in symbols:
         inv = SymbolInventory(symbol=sym)
@@ -801,6 +846,11 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         except Exception as e:  # noqa: BLE001 -- a preflight error for this symbol, never a note
             inv.split_calendar_error = f"{type(e).__name__}: {e}"
             preflight.append(inv.split_calendar_preflight_message())
+        if chain_source is not None:
+            inv.option_chain = chain_source.has_symbol(sym)
+            through = chain_source.fetched_through(sym) if inv.option_chain else None
+            inv.option_chain_through = through.isoformat() if through else None
+            inv.option_chain_stale = bool(through is not None and through < last_row)
         inventories.append(inv)
         log(f"plan {sym}: raw={inv.raw_state} rows={inv.rows_required} reusable={inv.rows_reusable} "
             f"refetch_required={inv.refetch_required}"
@@ -815,7 +865,9 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
         earliest_raw_bar=str(cal[0]), certification=cert_dict, preflight_errors=preflight,
         symbols=inventories, created_at=datetime.now(timezone.utc).isoformat(),
         elapsed_s=round(time.monotonic() - t0, 4), provider_calls=int(source.calls - calls0),
-        provider_bytes=int(source.bytes - bytes0), gap_fill=gap_fill)
+        provider_bytes=int(source.bytes - bytes0), gap_fill=gap_fill,
+        option_root=chain_source.root if chain_source is not None else None,
+        option_source=chain_source.option_source if chain_source is not None else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1208,14 +1260,45 @@ def _batch_rows(batch: Optional[Callable[..., List[Optional[FeatureRow]]]],
     return out
 
 
+def chain_row_digest(window_digest: str, chain_digest: Optional[str]) -> str:
+    """The identity of a CHAIN-profile row: its OHLCV window digest and its session's chain digest
+    together (``"none"`` when the session had no chain rows), so a re-build reuses a row only when
+    both inputs are unchanged."""
+    import hashlib
+
+    payload = f"mc-chain-row/v1\x00{window_digest}\x00{chain_digest or 'none'}".encode("ascii")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+class _YearChains:
+    """One symbol's EOD chains, loaded one CALENDAR YEAR at a time (bounded memory)."""
+
+    def __init__(self, source: Any, symbol: str, counters: "_Counters"):
+        self.source, self.symbol, self.counters = source, symbol, counters
+        self._year: Optional[int] = None
+        self._chains: Dict[date, Any] = {}
+
+    def get(self, session: date) -> Any:
+        if session.year != self._year:
+            before = getattr(self.source, "files_read", 0)
+            self._chains = self.source.chains(self.symbol, date(session.year, 1, 1), date(session.year, 12, 31))
+            self._year = session.year
+            self.counters.add("chain_files_read", getattr(self.source, "files_read", 0) - before)
+            self.counters.add("chain_sessions", len(self._chains))
+        return self._chains.get(session)
+
+
 def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: MarketConditionWarmPlan,
                   inv: SymbolInventory, cal: np.ndarray, counters: _Counters,
                   extra_exceptions: List[Dict[str, Any]], log: Callable[[str], None],
-                  claim: Optional["_FileClaim"] = None) -> _SymbolResult:
+                  claim: Optional["_FileClaim"] = None, chain_source: Optional[Any] = None) -> _SymbolResult:
     profile = PROFILES[plan_.profile]
     fields = [f.name for f in profile.fields]
-    compute = COMPUTE_BY_PROFILE[plan_.profile]
-    batch = BATCH_BY_PROFILE.get(plan_.profile)
+    chain_compute = CHAIN_COMPUTE_BY_PROFILE.get(plan_.profile)
+    compute = None if chain_compute is not None else COMPUTE_BY_PROFILE[plan_.profile]
+    if chain_compute is not None and chain_source is None:
+        raise WarmupConfigError(f"profile {plan_.profile!r} needs its option chain source to build")
+    batch = None if chain_compute is not None else BATCH_BY_PROFILE.get(plan_.profile)
     sym = inv.symbol
     n_rows = plan_.row_sessions
 
@@ -1251,17 +1334,21 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
     windows = _row_windows(build_snap, cal, n_rows)
     candidates = _load_candidates(store, index, plan_.cache_root, profile.name, sym, verify_hashes=True,
                                   fields=fields)
-    reusable: Dict[date, Tuple[_Candidate, int]] = {}
     current = {w.session: w for w in windows}
+    # Candidate rows by month, so reuse is decided per month: a CHAIN profile only knows a row's
+    # identity once that month's chains are loaded (one year at a time). Iteration order (and so
+    # which candidate wins a session) is the candidates' own, exactly as when this was global.
+    cand_rows_by_month: Dict[str, List[Tuple[_Candidate, int, date, str]]] = {}
     for cand in candidates:
         for i, (s, dg) in enumerate(zip(cand.sessions, cand.digests)):
-            w = current.get(s)
-            if w is not None and w.digest == dg and s not in reusable:
-                reusable[s] = (cand, i)
+            if s in current:
+                cand_rows_by_month.setdefault(month_of(s), []).append((cand, i, s, dg))
 
     by_month: Dict[str, List[_RowWindow]] = {}
     for w in windows:
         by_month.setdefault(month_of(w.session), []).append(w)
+    chains = _YearChains(chain_source, sym, counters) if chain_compute is not None else None
+    no_chain_ok_bars: List[date] = []      # sessions with a usable OHLCV window but no chain rows
 
     objects: List[ObjectEntry] = []
     statuses: List[Tuple[date, List[str]]] = []
@@ -1276,6 +1363,22 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                 used_raw[sha] = raw_by_sha[sha]
     for month in sorted(by_month):
         ws = by_month[month]
+        if chains is not None:
+            from dataclasses import replace as _replace
+
+            keyed = []
+            for w in ws:
+                ch = chains.get(w.session)
+                if ch is None and w.ok:
+                    no_chain_ok_bars.append(w.session)
+                keyed.append(_replace(w, digest=chain_row_digest(w.digest, ch.digest() if ch is not None else None)))
+            ws = keyed
+            for w in ws:
+                current[w.session] = w
+        reusable: Dict[date, Tuple[_Candidate, int]] = {}
+        for cand, i, s, dg in cand_rows_by_month.get(month, ()):
+            if current[s].digest == dg and s not in reusable:
+                reusable[s] = (cand, i)
         wanted = {w.session for w in ws}
         whole = [c for c in candidates if c.entry.month == month
                  and all(s in wanted and current[s].digest == dg for s, dg in zip(c.sessions, c.digests))]
@@ -1310,7 +1413,12 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
                 rec = _copied_record(hit[0], hit[1], fields, w, ref)
                 counters.add("rows_reused")
             else:
-                if w.ok and w.session in batch_rows:
+                if chain_compute is not None:
+                    b = build_snap.bars[w.lo:w.hi]
+                    row = chain_compute(w.session, chains.get(w.session),
+                                        (b[:, 0], b[:, 1], b[:, 2], b[:, 3], b[:, 4]) if w.ok else None,
+                                        STATUS_VALID if w.ok else w.status, w.reason)
+                elif w.ok and w.session in batch_rows:
                     row = batch_rows[w.session]
                 elif w.ok:
                     b = build_snap.bars[w.lo:w.hi]
@@ -1332,6 +1440,17 @@ def _build_symbol(store: MarketConditionStore, index: _ManifestIndex, plan_: Mar
         # claim) finds this object before any manifest names it -- after re-hashing it.
         _write_progress(plan_.cache_root, profile.name, entry, index.calc_version)
 
+    if no_chain_ok_bars:
+        # Recorded, never silent: sessions whose bars exist but whose chain has no rows. A TRAILING
+        # run of them ending at the last row is a chain that stops while the underlying trades --
+        # the window check would read it as a delisting, so it is named here and in the report.
+        last_row = date.fromisoformat(plan_.last_row_session)
+        extra.append({"kind": "option_chain_missing", "sessions": len(no_chain_ok_bars),
+                      "first_session": no_chain_ok_bars[0].isoformat(),
+                      "last_session": no_chain_ok_bars[-1].isoformat(),
+                      "reaches_last_row": no_chain_ok_bars[-1] == last_row})
+        log(f"build {sym}: {len(no_chain_ok_bars)} session(s) with bars but no option chain rows "
+            f"({no_chain_ok_bars[0]}..{no_chain_ok_bars[-1]}): missing_session")
     counters.add("rows_total", len(windows))
     counters.add("symbols_built")
     # Records for objects this build superseded are no longer resume hints: drop them -- but
@@ -1437,12 +1556,30 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
             excluded[inv.symbol] = [{"kind": "split_calendar_unavailable", "error": inv.split_calendar_error}]
         elif inv.gap_fill_error:
             excluded[inv.symbol] = [{"kind": "gap_fill_refused", "error": inv.gap_fill_error}]
+        elif inv.option_chain is False:
+            # Reached only with allow_exclusions (no_option_chain is a non-fetchable blocking item):
+            # a symbol with no chain at all is LEFT OUT, never published as a whole run of
+            # missing_session rows that every gate on it would refuse.
+            excluded[inv.symbol] = [{"kind": "no_option_chain"}]
     fetch_elapsed = time.monotonic() - t_fetch
 
     # -- build
     t_build = time.monotonic()
     store = MarketConditionStore(plan_.cache_root)
     index = _ManifestIndex(store, plan_.profile, plan_.universe, plan_.source_profile)
+    chain_source = None
+    if is_chain_profile(plan_.profile):
+        from ba2_providers.market_conditions.option_chain_source import ThetaDataParquetChainSource
+
+        if not plan_.option_root or not plan_.option_source:
+            raise WarmupConfigError(f"plan for chain profile {plan_.profile!r} carries no option_root/"
+                                    f"option_source: re-run plan")
+        chain_source = ThetaDataParquetChainSource(plan_.option_root)
+        if chain_source.option_source != plan_.option_source:
+            raise WarmupConfigError(f"plan option_source {plan_.option_source!r} is not the reader's "
+                                    f"{chain_source.option_source!r}")
+        for key in ("chain_files_read", "chain_sessions"):
+            counters.values.setdefault(key, 0)
     results: Dict[str, _SymbolResult] = {}
     errors: List[str] = []
     waited: List[str] = []
@@ -1461,7 +1598,8 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
         was_waiting = claim.acquire(on_wait=lambda: log(f"build {sym}: waiting for another builder"))
         try:
             with _HostSlot(plan_.cache_root):
-                res = _build_symbol(store, index, plan_, inv, cal, counters, extra, log, claim=claim)
+                res = _build_symbol(store, index, plan_, inv, cal, counters, extra, log, claim=claim,
+                                    chain_source=chain_source)
             if claim.lost:
                 # Another builder broke our claim as stale and owns this symbol now; whatever we
                 # produced is not ours to publish. Re-take the claim and rebuild from what the new
@@ -1530,7 +1668,7 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
         objects=objects, raw_objects=raw.values(), coverage={s: r.coverage for s, r in results.items()},
         universe=plan_.universe, sessions=[c.astype(object) for c in cal[WINDOW - 1:]],
         window_start=date.fromisoformat(plan_.start), window_end=date.fromisoformat(plan_.end),
-        gap_fill_policy=plan_.gap_fill)
+        gap_fill_policy=plan_.gap_fill, option_source=plan_.option_source)
     digest = store.write_manifest(manifest)
     for r in results.values():
         d = _progress_dir(plan_.cache_root, plan_.profile, r.symbol)
