@@ -180,6 +180,7 @@ export const WF_STATUS_STYLES: Record<WfStatus, string> = {
   fail: 'bg-red-600 text-white border-red-600',
   error: 'bg-rose-800 text-white border-rose-800',
   cancelled: 'bg-slate-500 text-white border-slate-500',
+  incomplete: 'bg-yellow-700 text-white border-yellow-700',
 };
 
 /** Fraction (0..1) of `iso` between `lo` and `hi` (ISO dates), for the fold timeline. */

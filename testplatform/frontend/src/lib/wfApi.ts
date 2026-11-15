@@ -27,7 +27,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   return r.json();
 }
 
-export type WfStatus = 'pending' | 'running' | 'deferred-pending' | 'pass' | 'fail' | 'error' | 'cancelled';
+export type WfStatus = 'pending' | 'running' | 'deferred-pending' | 'pass' | 'fail' | 'error' | 'cancelled' | 'incomplete';
 
 export interface WfRunLight {
   id: number;
@@ -44,8 +44,12 @@ export interface WfRunLight {
   stitchedReturn: number | null;
   worstOosDd: number | null;
   stitchedTrades: number | null;
+  /** The stitch covers only the folds done so far (running, failed or imported unfinished). */
+  stitchPartial: boolean | null;
   errorMessage: string | null;
   taskId: string | null;
+  /** The chain's report directory (its lane): one row per name and report directory. */
+  reportDir: string | null;
   createdAt: string | null;
   startedAt: string | null;
   updatedAt: string | null;
@@ -109,6 +113,7 @@ export interface WfReport {
   rank_stitches?: Record<string, WfStitch>;
   winners_passed?: number;
   overall_passed?: boolean | null;
+  planned_folds_known?: boolean;
   notes?: string[];
   required_failed?: number[];
   refit_job?: string | null;
@@ -134,7 +139,6 @@ export interface WfJobInfo {
 export interface WfRunDetail extends WfRunLight {
   spec: Record<string, unknown> | null;
   report: WfReport;
-  reportDir: string | null;
   driverHost: string | null;
   driverPid: number | null;
   driverState: string | null;

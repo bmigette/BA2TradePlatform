@@ -103,10 +103,10 @@ export default function WalkForward() {
                     <td className="py-2 pr-3">{r.expert ?? '—'} / {r.strategy ?? '—'}{r.band ? <span className="text-gray-400"> · {r.band}</span> : null}</td>
                     <td className="py-2 pr-3">{r.foldsDone ?? 0}/{r.plannedFolds ?? '?'}{r.status === 'running' && r.currentFold ? <span className="text-xs text-blue-500"> (fold {r.currentFold})</span> : null}</td>
                     <td className="py-2 pr-3"><WfStatusBadge status={r.status} /></td>
-                    <td className={`py-2 pr-3 text-right ${r.stitchedReturn == null ? '' : r.stitchedReturn >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{fmtPct(r.stitchedReturn)}</td>
+                    <td className={`py-2 pr-3 text-right ${r.stitchedReturn == null ? '' : r.stitchedReturn >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{fmtPct(r.stitchedReturn)}{r.stitchPartial && r.stitchedReturn != null ? <span className="text-[10px] text-amber-500" title="the folds done so far"> partial</span> : null}</td>
                     <td className="py-2 pr-3 text-right">{fmtDd(r.worstOosDd)}</td>
                     <td className="py-2 pr-3 text-right">{r.stitchedTrades ?? '—'}</td>
-                    <td className="py-2 pr-3 text-xs text-gray-500 dark:text-gray-400">{r.source}</td>
+                    <td className="py-2 pr-3 text-xs text-gray-500 dark:text-gray-400" title={r.reportDir ?? ''}>{r.source}</td>
                     <td className="py-2 pr-3 text-xs text-gray-500 dark:text-gray-400">{fmtWhen(r.updatedAt ?? r.createdAt)}</td>
                   </tr>
                 ))}

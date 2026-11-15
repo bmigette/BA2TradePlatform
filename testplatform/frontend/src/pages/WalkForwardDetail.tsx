@@ -252,7 +252,7 @@ export default function WalkForwardDetail() {
               {run.name} <WfStatusBadge status={run.status} />
             </h1>
             <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-              {run.expert ?? '—'} / {run.strategy ?? '—'}{run.band ? ` · ${run.band}` : ''} · {run.foldsDone ?? 0}/{run.plannedFolds ?? '?'} folds ·
+              {run.expert ?? '—'} / {run.strategy ?? '—'}{run.band ? ` · ${run.band}` : ''} · {run.foldsDone ?? 0}/{run.plannedFolds ?? '?'} folds{run.plannedFolds == null ? ' (plan size not recorded)' : ''} ·
               source {run.source}{run.source === 'import' ? ' (view only)' : run.source === 'cli' ? ' (grid / CLI driver)' : ''}
             </p>
           </div>
