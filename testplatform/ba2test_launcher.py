@@ -6229,7 +6229,7 @@ def _resolve_iv_quality(args) -> dict:
 
 #: The ``options_store`` an option job must read for a chain manifest built from each recorded
 #: ``option_source`` (``ba2_providers.market_conditions.option_chain_source``).
-_OPTIONS_STORE_FOR_OPTION_SOURCE = {"thetadata-eod-parquet-v1": "thetadata"}
+_OPTIONS_STORE_FOR_OPTION_SOURCE = {"thetadata": "thetadata", "alphavantage": "alphavantage"}
 
 
 def _market_condition_setting_value() -> str:

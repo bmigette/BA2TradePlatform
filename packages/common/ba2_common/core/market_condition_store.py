@@ -126,7 +126,7 @@ MANIFEST_KEYS = (
 #: series. Absent == the historical default (no fill).
 #:
 #: ``option_source`` -- the option chain store a CHAIN profile's rows were built from (e.g.
-#: ``"thetadata-eod-parquet-v1"``, see ``ba2_providers.market_conditions.option_chain_source``).
+#: ``"thetadata"`` or ``"alphavantage"``, see ``ba2_providers.market_conditions.option_chain_source``).
 #: Present only on chain-profile manifests (``market_conditions.CHAIN_COMPUTE_BY_PROFILE``); the
 #: OHLCV source stays in ``source_profile``, which the backtest seam compares with the job's history.
 OPTIONAL_MANIFEST_KEYS = ("gap_fill_policy", "option_source")

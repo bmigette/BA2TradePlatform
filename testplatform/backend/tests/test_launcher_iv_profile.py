@@ -174,7 +174,7 @@ def _publish_iv_manifest(root, symbols=("AAA", "BBB"), bad=()):
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[], coverage={s: {"rows": len(sessions)} for s in symbols},
         universe=list(symbols), sessions=sessions, window_start=date.fromisoformat(MC_START),
-        window_end=date.fromisoformat(MC_END), option_source="thetadata-eod-parquet-v1")
+        window_end=date.fromisoformat(MC_END), option_source="thetadata")
     return store, store.write_manifest(manifest)
 
 
@@ -199,7 +199,7 @@ def test_a_decoded_iv_genome_reaches_the_trial_config_whole(iv_on, iv_snapshot, 
         "entry_action": getattr(strat, "entry_action", None),
     }
     recorded = mod._apply_market_conditions("optimize", backtest_cfg, strat)
-    assert recorded["facts"][IV_PROFILE]["option_source"] == "thetadata-eod-parquet-v1"
+    assert recorded["facts"][IV_PROFILE]["option_source"] == "thetadata"
     assert recorded["gene_count"] == 4
     backtest_cfg = json.loads(json.dumps(backtest_cfg, default=str))
     genome = {"cond:o_ic-market-ivrv:mode": "above", "cond:o_ic-market-ivrv:value": 1.4,
@@ -259,7 +259,7 @@ def test_an_iv_manifest_from_another_option_store_is_refused_on_an_option_job(iv
     strat = _built("O_IC")
     with pytest.raises(SystemExit) as e:
         mod._apply_market_conditions("optimize", _cfg(strat, options_store="alphavantage"), strat, "O_IC")
-    assert "thetadata-eod-parquet-v1" in str(e.value) and "alphavantage" in str(e.value)
+    assert "thetadata" in str(e.value) and "alphavantage" in str(e.value)
     # the matching store passes, and an equity job (no chain traded) is not held to a store
     mod._apply_market_conditions("optimize", _cfg(strat, options_store="thetadata"), strat, "O_IC")
     mod._apply_market_conditions("optimize", _cfg(strat, options_store="sqlite"), strat, "S1")

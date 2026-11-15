@@ -28,9 +28,9 @@ ONE preparation for a whole search (design section 4.4). Typical use:
     # 3. Prove a published snapshot (re-hashes every referenced object).
     python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source fmp
 
-    # 1c. A CHAIN profile (iv-v1) also reads the ThetaData EOD option tree, READ-ONLY; the OHLCV
-    #     steps are the same. --option-root defaults to <CACHE>/ThetaDataOptionsProvider.
-    python tools/warm_market_conditions.py plan --profile iv-v1 --universe-file U.txt \
+    # 1c. A CHAIN profile (iv-v1) also reads an EOD option store, READ-ONLY, named explicitly with
+    #     --option-source thetadata|alphavantage; the OHLCV steps are the same.
+    python tools/warm_market_conditions.py plan --profile iv-v1 --option-source alphavantage --universe-file U.txt \
         --start 2020-01-02 --end 2025-12-31 --ohlcv-history-source alpaca --out iv_plan.json
     python tools/warm_market_conditions.py build --plan iv_plan.json --cache-only --concurrency 1 \
         --ohlcv-history-source alpaca --print-digest
@@ -190,7 +190,8 @@ def cmd_plan(args) -> int:
         plan = W.plan(args.profile, universe, args.start, args.end, source_profile, root,
                       source=make_source(root, args.ohlcv_history_source), log=_logger(args),
                       gap_fill=args.gap_fill,
-                      **({"option_root": os.path.abspath(args.option_root)} if args.option_root else {}))
+                      **({"option_root": os.path.abspath(args.option_root)} if args.option_root else {}),
+                      **({"option_source": args.option_source} if args.option_source else {}))
     except W.WarmupConfigError as e:  # includes a source whose provider writes elsewhere
         print(f"configuration error: {e}", file=sys.stderr)
         return EXIT_CONFIG
@@ -373,10 +374,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "forward into a missing/invalid session inside its own listed range "
                         "(never before its first bar or after its last). Default: no fill, "
                         "byte-identical to every plan/manifest built before this flag existed.")
+    p.add_argument("--option-source", default=None, choices=("thetadata", "alphavantage"),
+                   help="CHAIN profiles only (iv-v1), REQUIRED for them: the option chain store the rows "
+                        "are built from, read READ-ONLY and recorded in the manifest (option_source). Name "
+                        "the store the option jobs will read (--options-store); the launcher refuses a "
+                        "mismatch. Refused for a profile computed from bars alone.")
     p.add_argument("--option-root", default=None,
-                   help="CHAIN profiles only (iv-v1): the end-of-day option chain tree read READ-ONLY. "
-                        "Default <CACHE>/ThetaDataOptionsProvider (the ThetaData EOD backfill). Refused for "
-                        "a profile computed from bars alone.")
+                   help="CHAIN profiles only: the store's root (default <CACHE>/ThetaDataOptionsProvider or "
+                        "<CACHE>/AlphaVantageOptionsProvider per --option-source).")
     p.set_defaults(func=cmd_plan)
 
     r = sub.add_parser("repair", parents=[common, hs],

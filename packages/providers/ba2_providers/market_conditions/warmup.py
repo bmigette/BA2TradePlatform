@@ -60,10 +60,11 @@ published with its status and reason and an identity over the bars that DO exist
 
 CHAIN PROFILES (``market_conditions.CHAIN_COMPUTE_BY_PROFILE``, today ``iv-v1``). A row needs the
 session's END-OF-DAY option chain as well as the OHLCV window, so :func:`plan` takes an
-``option_root`` (default ``<cache_root>/ThetaDataOptionsProvider``) and inventories it per symbol
+``option_source`` (``thetadata`` | ``alphavantage``, REQUIRED -- never a default vendor) and an
+optional ``option_root`` (default ``<cache_root>/<that store's provider dir>``), and inventories it per symbol
 (``no_option_chain`` / ``option_chain_stale_tail`` are blocking, never fetched: the option backfill
 is its own tool), and :func:`build` reads it READ-ONLY one calendar year per symbol at a time
-(``option_chain_source.ThetaDataParquetChainSource``). Every OHLCV step above is unchanged and
+(``option_chain_source.chain_source_for``). Every OHLCV step above is unchanged and
 shared: the same snapshot, certification, split checks, windows and raw shards. Each row's identity
 is ``chain_row_digest(window digest, chain digest)``, so a re-run reuses a row only when BOTH its
 bars and its quotes are unchanged; the manifest records the chain source in its optional
@@ -240,7 +241,7 @@ class SymbolInventory:
     gap_fill_error: Optional[str] = None
     #: CHAIN PROFILES only (None for every OHLCV profile, so an old saved plan loads unchanged):
     #: whether the option chain tree has a directory for the symbol, and the date its backfill
-    #: fetched it through (``ThetaDataParquetChainSource.fetched_through``).
+    #: fetched it through (the chain source's ``fetched_through``).
     option_chain: Optional[bool] = None
     option_chain_through: Optional[str] = None
     #: The tree was fetched through a date BEFORE the plan's last row: the rows after it would
@@ -738,7 +739,8 @@ def _inventory_symbol(inv: SymbolInventory, snap: Optional[_Snapshot], cal: np.n
 def plan(profile: str, universe: Sequence[str], start: date, end: date,
          source_profile: str = SOURCE_PROFILE_FMP_DAILY, cache_root: Optional[os.PathLike] = None, *,
          source: Optional[WarmupSource] = None, log: Callable[[str], None] = _log_noop,
-         gap_fill: Optional[str] = None, option_root: Optional[os.PathLike] = None) -> MarketConditionWarmPlan:
+         gap_fill: Optional[str] = None, option_root: Optional[os.PathLike] = None,
+         option_source: Optional[str] = None) -> MarketConditionWarmPlan:
     """Inventory + preflight for warming ``profile`` over ``universe`` and decisions in ``[start, end]``.
 
     ``source`` supplies the split calendar (default: the FMP source for ``cache_root``).
@@ -751,8 +753,8 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     validate_gap_fill(gap_fill)
     if profile not in PROFILES or (profile not in COMPUTE_BY_PROFILE and not is_chain_profile(profile)):
         raise WarmupConfigError(f"unknown market-condition profile {profile!r}; registered: {sorted(PROFILES)}")
-    if option_root is not None and not is_chain_profile(profile):
-        raise WarmupConfigError(f"option_root is only for chain profiles {sorted(CHAIN_COMPUTE_BY_PROFILE)}; "
+    if (option_root is not None or option_source is not None) and not is_chain_profile(profile):
+        raise WarmupConfigError(f"option_root/option_source are only for chain profiles {sorted(CHAIN_COMPUTE_BY_PROFILE)}; "
                                 f"{profile!r} is computed from bars alone")
     if source_profile not in SOURCE_PROFILE_BY_HISTORY.values():
         raise WarmupConfigError(f"unsupported source profile {source_profile!r}; "
@@ -814,12 +816,14 @@ def plan(profile: str, universe: Sequence[str], start: date, end: date,
     fields = [f.name for f in PROFILES[profile].fields]
     chain_source = None
     if is_chain_profile(profile):
-        from ba2_providers.market_conditions.option_chain_source import (
-            ThetaDataParquetChainSource, default_option_root,
-        )
+        from ba2_providers.market_conditions.option_chain_source import OPTION_SOURCES, chain_source_for
+
+        if option_source not in OPTION_SOURCES:
+            raise WarmupConfigError(f"profile {profile!r} reads an option chain store: name it explicitly "
+                                    f"(option_source one of {sorted(OPTION_SOURCES)}), got {option_source!r}")
         try:
-            chain_source = ThetaDataParquetChainSource(
-                os.fspath(option_root) if option_root is not None else default_option_root(cache_root))
+            chain_source = chain_source_for(option_source, os.fspath(option_root) if option_root is not None
+                                            else None, cache_root=cache_root)
         except FileNotFoundError as e:
             raise WarmupConfigError(f"profile {profile!r} reads an option chain tree: {e}") from e
     inventories = []
@@ -1585,12 +1589,12 @@ def build(plan_: MarketConditionWarmPlan, *, fetch_missing: bool, concurrency: i
     index = _ManifestIndex(store, plan_.profile, plan_.universe, plan_.source_profile)
     chain_source = None
     if is_chain_profile(plan_.profile):
-        from ba2_providers.market_conditions.option_chain_source import ThetaDataParquetChainSource
+        from ba2_providers.market_conditions.option_chain_source import chain_source_for
 
         if not plan_.option_root or not plan_.option_source:
             raise WarmupConfigError(f"plan for chain profile {plan_.profile!r} carries no option_root/"
                                     f"option_source: re-run plan")
-        chain_source = ThetaDataParquetChainSource(plan_.option_root)
+        chain_source = chain_source_for(plan_.option_source, plan_.option_root)
         if chain_source.option_source != plan_.option_source:
             raise WarmupConfigError(f"plan option_source {plan_.option_source!r} is not the reader's "
                                     f"{chain_source.option_source!r}")

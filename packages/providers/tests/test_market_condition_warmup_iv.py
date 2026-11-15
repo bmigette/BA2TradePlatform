@@ -34,7 +34,7 @@ from ba2_common.core.market_conditions import (
 )
 from ba2_providers.market_conditions import warmup as W
 from ba2_providers.market_conditions.option_chain_source import (
-    OPTION_SOURCE_THETADATA_EOD, ThetaDataParquetChainSource,
+    OPTION_SOURCE_THETADATA, ThetaDataParquetChainSource,
 )
 
 from .test_market_condition_warmup import CERT, TRUTH, FakeSource, _sessions, _write
@@ -51,9 +51,10 @@ def _fridays(a: date, b: date):
         d += timedelta(days=7)
 
 
-def _write_tree(root: Path, symbol: str, sessions, *, fetched_through: date, skip=(), bump=None):
+def _write_tree(root: Path, symbol: str, sessions, *, fetched_through: date, skip=(), bump=None,
+                provider="ThetaDataOptionsProvider"):
     """One parquet per expiry, every session with 7 <= dte <= 130, strikes around 100."""
-    sdir = root / "ThetaDataOptionsProvider" / symbol
+    sdir = root / provider / symbol
     by_exp = {}
     for s in sessions:
         if s in skip:
@@ -100,6 +101,7 @@ def fast_claims(monkeypatch):
 
 
 def _plan(root, universe=("AAA", "BBB", "CCC"), **kw):
+    kw.setdefault("option_source", "thetadata")
     p = W.plan(IV_PROFILE, universe, START, END, cache_root=str(root), source=FakeSource(str(root)), **kw)
     return W.MarketConditionWarmPlan.from_dict(json.loads(p.to_json()))
 
@@ -110,7 +112,7 @@ def _build(plan, **kw):
 
 def test_plan_inventories_the_chain_and_refuses_a_symbol_without_one(root):
     plan = _plan(root)
-    assert plan.option_source == OPTION_SOURCE_THETADATA_EOD
+    assert plan.option_source == OPTION_SOURCE_THETADATA
     assert plan.option_root == os.path.abspath(str(root / "ThetaDataOptionsProvider"))
     assert plan.symbol("AAA").option_chain is True
     assert plan.symbol("CCC").option_chain is False
@@ -141,7 +143,7 @@ def test_build_publishes_rows_equal_to_the_calculator_and_reuses_them(root):
     assert "CCC" in rep.excluded and rep.excluded["CCC"][0]["kind"] == "no_option_chain"
     store = MarketConditionStore(str(root))
     m = store.read_manifest(rep.manifest_digest)
-    assert m["profile"] == IV_PROFILE and m["option_source"] == OPTION_SOURCE_THETADATA_EOD
+    assert m["profile"] == IV_PROFILE and m["option_source"] == OPTION_SOURCE_THETADATA
     assert m["calc_version"] == "iv-v1/calc-1"
     assert sorted({o["symbol"] for o in m["objects"]}) == ["AAA", "BBB"]
 
@@ -274,3 +276,65 @@ def test_conflicting_duplicate_quotes_are_counted_in_coverage(root):
     m = MarketConditionStore(str(root)).read_manifest(rep.manifest_digest)
     cq = [e for e in m["coverage"]["AAA"]["exceptions"] if e["kind"] == "chain_quality"][0]
     assert cq["conflicting_quotes_dropped"] >= 10
+
+
+
+# --------------------------------------------------------------------------- the Alpha Vantage store
+def _av_tree(root: Path, symbol: str, sessions, *, staged=()):
+    """The AV store layout: the same partitions, a ledger of fetched days, and ``staged`` days that a
+    running download has not compacted yet (written to ``_days/`` with DIFFERENT quotes, which must
+    REPLACE the partition rows of that day)."""
+    import pandas as pd
+
+    _write_tree(root, symbol, sessions, fetched_through=END + timedelta(days=30), provider="AlphaVantageOptionsProvider")
+    sdir = root / "AlphaVantageOptionsProvider" / symbol
+    lines = [json.dumps({"d": d.isoformat(), "s": "ok", "rows": 1}) for d in sessions]
+    (sdir / "_ledger.jsonl").write_text(chr(10).join(lines) + chr(10) + '{"d": "torn', encoding="utf-8")
+    if staged:
+        (sdir / "_days").mkdir(exist_ok=True)
+        for d in staged:
+            rows = []
+            for e in _fridays(d + timedelta(days=7), d + timedelta(days=130)):
+                dte = (e - d).days
+                for K in np.arange(80.0, 125.0, 2.5):
+                    for typ in ("call", "put"):
+                        p = ivm.black76_price(100.0, float(K), dte / 365.0, 0.45, typ == "call")
+                        rows.append({"option_type": typ, "strike": float(K), "expiry": e.isoformat(),
+                                     "bar_date": d.isoformat(), "bid": max(p - 0.02, 0.0), "ask": p + 0.02,
+                                     "iv": 9.99})
+            pd.DataFrame(rows).to_parquet(sdir / "_days" / f"{d.isoformat()}.parquet", index=False)
+
+
+def test_the_option_source_must_be_named(root):
+    with pytest.raises(W.WarmupConfigError, match="name it explicitly"):
+        W.plan(IV_PROFILE, ["AAA"], START, END, cache_root=str(root), source=FakeSource(str(root)))
+
+
+def test_an_alphavantage_build_reads_partitions_staged_days_and_the_ledger(root):
+    from ba2_providers.market_conditions.option_chain_source import (
+        OPTION_SOURCE_ALPHAVANTAGE, AlphaVantageParquetChainSource,
+    )
+
+    rows = _sessions(START - timedelta(days=7), END)
+    staged = date(2025, 4, 1)
+    _av_tree(root, "AAA", rows, staged=(staged,))
+    src = AlphaVantageParquetChainSource(str(root / "AlphaVantageOptionsProvider"))
+    assert src.fetched_through("AAA") == rows[-1]          # the ledger, torn last line ignored
+    plan = _plan(root, universe=("AAA",), option_source="alphavantage")
+    assert plan.option_source == OPTION_SOURCE_ALPHAVANTAGE
+    assert plan.option_root.endswith("AlphaVantageOptionsProvider")
+    rep = _build(plan)
+    assert rep.ok, rep
+    m = MarketConditionStore(str(root)).read_manifest(rep.manifest_digest)
+    assert m["option_source"] == "alphavantage"
+    by = dict(MarketConditionStore(str(root)).iter_rows(m, "AAA"))
+    # the staged day's quotes (vol 0.45) replaced the partition's (vol ~0.25): IV30 ~ 0.45
+    assert by[staged].by_field()[FIELD_ATM_IV_30].value == pytest.approx(0.45, abs=5e-3)
+    assert by[date(2025, 4, 2)].by_field()[FIELD_ATM_IV_30].value < 0.30
+    # identical quotes give identical rows whichever store holds them
+    th = _build(_plan(root, universe=("AAA",), option_source="thetadata"))
+    mt = MarketConditionStore(str(root)).read_manifest(th.manifest_digest)
+    bt = dict(MarketConditionStore(str(root)).iter_rows(mt, "AAA"))
+    same = [d for d in by if d != staged]
+    assert all(dict(by[d].by_field()) == dict(bt[d].by_field()) for d in same)
+    assert th.manifest_digest != rep.manifest_digest        # option_source is part of the identity

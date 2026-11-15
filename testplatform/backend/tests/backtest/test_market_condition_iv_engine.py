@@ -67,7 +67,7 @@ def _publish(root, profile_name, symbol, values, status=STATUS_VALID):
         profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
         objects=objects, raw_objects=[], coverage={symbol: {"rows": len(sessions)}}, universe=[symbol],
         sessions=sessions, window_start=sessions[0], window_end=sessions[-1],
-        option_source="thetadata-eod-parquet-v1" if profile_name == IV_PROFILE else None)
+        option_source="thetadata" if profile_name == IV_PROFILE else None)
     return store.write_manifest(manifest)
 
 
