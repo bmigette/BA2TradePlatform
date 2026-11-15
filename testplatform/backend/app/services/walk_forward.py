@@ -40,12 +40,25 @@ FORBIDDEN_OPTIMIZE_FLAGS = {
     "--warm-start-from": "it imports another job's population, which may have seen the test "
                          "window (look-ahead); seeding goes through initial_population_for_fold",
     "--chain-seed-from": "the engine renders it itself (chain seeding, initial_population_for_fold)",
+    # Seed files chosen OUTSIDE the chain (stage-1 winners, live settings) were picked with knowledge
+    # of every year they were selected on, the folds' test years included; and the launcher refuses
+    # them beside --chain-seed-from, so a chained fold 2 would fail only after fold 1 had trained.
+    "--seed-population": "an external seed bundle was chosen with knowledge of later years "
+                         "(look-ahead) and the launcher refuses it beside --chain-seed-from; a "
+                         "walk-forward fold 1 is a cold start and each fold seeds only the next",
+    "--seed-genomes": "external seed genomes were chosen with knowledge of later years "
+                      "(look-ahead) and the launcher refuses them beside --chain-seed-from; a "
+                      "walk-forward fold 1 is a cold start and each fold seeds only the next",
+    "--seed-check-only": "it writes no optimization row, so the fold could never complete",
     "--rerun": "it creates a second optimization under the same name and breaks resume",
     "--resume-interrupted": "the engine renders it itself, only for a row whose runner was killed "
                             "(tools/run_walk_forward.py RealRunner.run_train)",
     "--submit": "it queues the job and returns before it is completed, so the fold cannot "
                 "continue",
 }
+#: Real ``optimize`` flags that are themselves a prefix of a forbidden flag (pinned against the real
+#: parser in tests/test_wf_forbidden_abbreviations.py): an EXACT match, which argparse prefers.
+EXACT_FLAGS_SHADOWING_FORBIDDEN = ("--seed",)
 
 
 class WalkForwardError(Exception):
@@ -161,12 +174,28 @@ def validate_folds(folds: Sequence[Fold], embargo_days: int = 0) -> None:
 
 def check_user_optimize_args(args: Sequence[str]) -> None:
     """The wrapped optimize args must not carry the window, the job name, or a flag that imports
-    state from another job / queues the job: see ``FORBIDDEN_OPTIMIZE_FLAGS``."""
+    state from another job / queues the job: see ``FORBIDDEN_OPTIMIZE_FLAGS``.
+
+    ABBREVIATIONS. ``ba2-test optimize`` parses with argparse's default ``allow_abbrev=True``, so
+    ``--warm-start-f 7`` or ``--subm`` IS that flag (measured against the real parser,
+    tests/test_wf_ui_review.py). A token is therefore refused when its option part (before ``=``) is
+    a PREFIX of a forbidden flag: argparse would either resolve it to that flag or refuse it as
+    ambiguous, and no other optimize flag is itself such a prefix (pinned by the same test), so
+    nothing valid is refused -- except the flags in ``EXACT_FLAGS_SHADOWING_FORBIDDEN``: ``--seed``
+    (the RNG seed every grid passes) is a prefix of the three seed-file flags, and argparse takes an
+    EXACT match before any abbreviation, so ``--seed`` / ``--seed=N`` is the RNG seed and allowed."""
     for a in args:
+        if not a.startswith("--") or a == "--":
+            continue
+        opt = a.split("=", 1)[0]
+        if opt in EXACT_FLAGS_SHADOWING_FORBIDDEN:
+            continue
         for flag, why in FORBIDDEN_OPTIMIZE_FLAGS.items():
-            if a == flag or a.startswith(flag + "="):
+            if len(opt) > 2 and flag.startswith(opt):
                 raise WalkForwardError(
-                    f"optimize args must not contain {flag} ({why}); got {a!r}")
+                    f"optimize args must not contain {flag} ({why}); got {a!r}"
+                    + ("" if opt == flag else f" (argparse reads {opt!r} as an abbreviation of "
+                                              f"{flag})"))
 
 
 def optimize_arg_value(args: Sequence[str], flag: str) -> Optional[str]:
@@ -526,8 +555,10 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
               require_test_years: Sequence[int] = (), exclusive_return: bool = False,
               rebase_test_data: bool = False) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
-        raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or "") or re.fullmatch(r"\.+", prefix):
+        # (only dots: '.' / '..' would make <report_dir>/<prefix> the report dir or its parent)
+        raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-' "
+                               f"(not only dots)")
     if top_n < 1:
         raise WalkForwardError(f"--top-n must be >= 1, got {top_n}")
     if test_parallel < 1:

@@ -50,6 +50,83 @@ def test_spec_of_a_static_command_with_positional_manifests(L):
                     "manifests": {"ohlcv-v1": "aa", "ta-structure-v1": "bb"}, "exclude_symbols": []}
 
 
+def test_spec_of_a_daily_panel_screener_command_names_its_panel(L):
+    """An option STYLE job's screen reads the daily panel (``--screener-panel``), not only the store.
+    The key appears only when the command states a panel, so every other command's spec is unchanged."""
+    spec = L._data_rebase_from_optimize_args(
+        ["--universe", "AAPL", "--screener", "--screener-store", "S2", "--screener-panel", "/c/daily_panel/P2"])
+    assert spec["screener_panel"] == "/c/daily_panel/P2" and spec["screener_store"] == "S2"
+    assert "screener_panel" not in L._data_rebase_from_optimize_args(["--universe", "AAPL", "--screener-panel", "P"])
+
+
+def test_the_last_value_wins_as_in_the_training_argparse(L):
+    """An operator override after the recipe (option_style_job.sh extra args) trains on the LAST value;
+    the deferred test must read the same one, whichever spelling the override used."""
+    base = ["--universe", "AAPL", "--screener", "--screener-store", "S1", "--screener-panel", "P1",
+            "--market-condition-profile", "ohlcv-v1", "--market-condition-manifest", "ohlcv-v1=aa"]
+    for override in (["--screener-panel", "P2"], ["--screener-panel=P2"], ["--screener-pan", "P2"],
+                     ["--screener-pan=P2"]):
+        assert L._data_rebase_from_optimize_args(base + override)["screener_panel"] == "P2"
+    spec = L._data_rebase_from_optimize_args(base + ["--screener-store=S2", "--market-condition-man", "ohlcv-v1=bb"])
+    assert spec["screener_store"] == "S2" and spec["manifests"] == {"ohlcv-v1": "bb"}
+
+
+def test_the_canonical_reading_is_the_real_parsers(L):
+    """Abbreviations resolve to the flag the real optimize parser resolves them to; an ambiguous or unknown
+    option is refused by name (argparse would refuse the training command too)."""
+    parser = L._optimize_parser()
+    assert parser.allow_abbrev is True
+    assert L._canonical_optimize_tokens(["--screener-pan=P", "--seed", "4", "--seed=5"]) == \
+        ["--screener-panel", "P", "--seed", "4", "--seed", "5"]
+    with pytest.raises(ValueError, match="ambiguous"):
+        L._canonical_optimize_tokens(["--screener-", "x"])
+    with pytest.raises(ValueError, match="unknown"):
+        L._canonical_optimize_tokens(["--no-such-flag", "x"])
+    with pytest.raises(ValueError, match="takes no value"):
+        L._canonical_optimize_tokens(["--screener=1"])
+
+
+def _panel(tmp_path, fingerprint, criteria):
+    import json
+    d = tmp_path / "screener" / "daily_panel" / fingerprint
+    d.mkdir(parents=True)
+    (d / "manifest.json").write_text(json.dumps({"panel_fingerprint": fingerprint, "criteria_version": criteria}))
+    return str(d)
+
+
+def _panel_block(**so):
+    return _static_block(screener_opt={"store": "OLD", "panel": "screener/daily_panel/P1", "panel_fingerprint": "P1",
+                                       "criteria_version": "c1", "universe_restriction": {"symbols": ["AAPL"]}, **so})
+
+
+def test_a_daily_panel_run_is_tested_on_the_current_commands_panel(L, tmp_path, monkeypatch):
+    """Phase B (January): the deferred test of a style cell reads the panel the CURRENT command names
+    (its criteria version must be the train job's); everything else of the screen block is kept."""
+    import ba2_common.config as cfg
+    monkeypatch.setattr(cfg, "CACHE_FOLDER", str(tmp_path))
+    new = _panel(tmp_path, "P2", "c1")
+    out = L._rebase_run_data(_panel_block(), _spec_dict(screener_store="NEW", screener_panel=new))
+    so = out["screener_opt"]
+    assert (so["panel"], so["panel_fingerprint"], so["store"]) == ("screener/daily_panel/P2", "P2", "NEW")
+    assert so["universe_restriction"] == {"symbols": ["AAPL"]} and so["criteria_version"] == "c1"
+
+
+def test_a_panel_of_other_criteria_or_for_a_store_only_run_is_refused(L, tmp_path, monkeypatch):
+    import ba2_common.config as cfg
+    monkeypatch.setattr(cfg, "CACHE_FOLDER", str(tmp_path))
+    other = _panel(tmp_path, "P3", "c2")
+    with pytest.raises(ValueError, match="criteria"):
+        L._rebase_run_data(_panel_block(), _spec_dict(screener_store="S", screener_panel=other))
+    with pytest.raises(ValueError, match="daily-panel"):
+        L._rebase_run_data(_static_block(screener_opt={"store": "S"}),
+                           _spec_dict(screener_store="S", screener_panel=other))
+
+
+def test_a_panel_run_tested_without_a_panel_keeps_the_stored_one(L):
+    out = L._rebase_run_data(_panel_block(), _spec_dict(screener_store="NEW"))
+    assert out["screener_opt"]["panel_fingerprint"] == "P1"
+
+
 def test_spec_refuses_a_manifest_count_that_does_not_match_the_profiles(L):
     with pytest.raises(ValueError, match="profile"):
         L._data_rebase_from_optimize_args(["--universe", "A", "--market-condition-profile", "ohlcv-v1,ta-structure-v1",
