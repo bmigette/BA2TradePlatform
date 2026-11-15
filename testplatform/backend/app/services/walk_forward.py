@@ -40,6 +40,16 @@ FORBIDDEN_OPTIMIZE_FLAGS = {
     "--warm-start-from": "it imports another job's population, which may have seen the test "
                          "window (look-ahead); seeding goes through initial_population_for_fold",
     "--chain-seed-from": "the engine renders it itself (chain seeding, initial_population_for_fold)",
+    # Seed files chosen OUTSIDE the chain (stage-1 winners, live settings) were picked with knowledge
+    # of every year they were selected on, the folds' test years included; and the launcher refuses
+    # them beside --chain-seed-from, so a chained fold 2 would fail only after fold 1 had trained.
+    "--seed-population": "an external seed bundle was chosen with knowledge of later years "
+                         "(look-ahead) and the launcher refuses it beside --chain-seed-from; a "
+                         "walk-forward fold 1 is a cold start and each fold seeds only the next",
+    "--seed-genomes": "external seed genomes were chosen with knowledge of later years "
+                      "(look-ahead) and the launcher refuses them beside --chain-seed-from; a "
+                      "walk-forward fold 1 is a cold start and each fold seeds only the next",
+    "--seed-check-only": "it writes no optimization row, so the fold could never complete",
     "--rerun": "it creates a second optimization under the same name and breaks resume",
     "--resume-interrupted": "the engine renders it itself, only for a row whose runner was killed "
                             "(tools/run_walk_forward.py RealRunner.run_train)",

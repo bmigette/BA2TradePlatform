@@ -128,8 +128,20 @@ def test_user_args_with_window_or_name_are_refused(args):
         WF.check_user_optimize_args(args)
 
 
+@pytest.mark.parametrize("args", [["--seed-population", "bundle.json"], ["--seed-population=b.json"],
+                                  ["--seed-genomes", "live.json"], ["--seed-check-only"]])
+def test_external_seed_files_are_refused_with_the_look_ahead_reason(args):
+    """A seed file chosen outside the chain (stage-1 winners, live settings) has seen the folds'
+    test years; the launcher also refuses it beside --chain-seed-from, so fold 2 would fail only
+    after fold 1 trained. Refused before anything runs."""
+    with pytest.raises(WF.WalkForwardError, match="must not contain") as e:
+        WF.check_user_optimize_args(["--strategy", "O_STYLE", *args])
+    assert ("look-ahead" in str(e.value)) or ("never complete" in str(e.value))
+
+
 def test_user_args_without_them_are_accepted():
     WF.check_user_optimize_args(["--expert", "FMPRating", "--startup-x", "1"])
+    WF.check_user_optimize_args(["--seed", "42"])          # the RNG seed is not a seed file
 
 
 def test_thresholds_must_fit_the_fold_count():
