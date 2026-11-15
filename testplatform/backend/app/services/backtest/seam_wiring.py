@@ -482,6 +482,7 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
             warn_research_mode(profile, "backtest reader")
         reader = BacktestMarketConditionReader(price_source, profile, manifest_digest=digest,
                                            source_profile=job_source_profile)
+        _check_option_source_setting(config, profile, reader)
         # PER PROFILE: each snapshot was warmed separately and can cover a different set of
         # symbols (and a different window), so "is this run served" is a question with one answer
         # per profile -- both halves of it.
@@ -494,6 +495,26 @@ def install_backtest_market_conditions(config: Dict[str, Any], price_source: Any
         TradeConditions.set_market_condition_context_resolver(_dispatch_market_condition_context)
     _market_condition_tl.resolver = resolver
     return resolver
+
+
+def _check_option_source_setting(config: Dict[str, Any], profile: str, reader: Any) -> None:
+    """A CHAIN-profile snapshot (iv-v1) records the option store it was built from; an expert setting
+    ``market_condition_option_source`` that names ANOTHER store contradicts it (the deployed twin would
+    be served a different vendor's chain than the one these trials gated on): refused. Absent setting:
+    nothing to compare (every run before the setting existed). Not a chain profile: no-op."""
+    mapped = getattr(reader, "mapped_reader", None)
+    built = (mapped.manifest.get("option_source") if mapped is not None else None)
+    if not built:
+        return
+    from ba2_common.core.market_condition_rules import OPTION_SOURCE_SETTING
+
+    named = {str(s.get("settings", {}).get(OPTION_SOURCE_SETTING)) for s in (config.get("experts") or ())
+             if isinstance(s, dict) and isinstance(s.get("settings"), dict)
+             and s["settings"].get(OPTION_SOURCE_SETTING)}
+    wrong = sorted(n for n in named if n != built)
+    if wrong:
+        raise ValueError(f"market-condition profile {profile!r}: the pinned snapshot was built from option "
+                         f"source {built!r} but the run's expert setting {OPTION_SOURCE_SETTING} says {wrong}")
 
 
 #: How many missing symbols a message names before it says "and N more".

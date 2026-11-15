@@ -70,11 +70,14 @@ def test_chain_profile_is_not_computable_from_bars_and_has_no_live_source():
     assert mc.is_chain_profile(IV_PROFILE)
     assert IV_PROFILE not in mc.COMPUTE_BY_PROFILE
     assert mc.CHAIN_COMPUTE_BY_PROFILE[IV_PROFILE] is mc.compute_iv_v1
-    assert IV_PROFILE in mc.LIVE_UNAVAILABLE_PROFILES
+    assert mc.LIVE_OPTION_SOURCES[IV_PROFILE] == ("alphavantage",)
+    assert mc.live_unavailable_reason(IV_PROFILE, "alphavantage") is None
+    assert "thetadata" in mc.live_unavailable_reason(IV_PROFILE, "thetadata")
+    assert "NO option source" in mc.live_unavailable_reason(IV_PROFILE, None)
     # the two OHLCV profiles are untouched by the addition
     for p in ("ohlcv-v1", "ta-structure-v1"):
         assert p in mc.COMPUTE_BY_PROFILE and not mc.is_chain_profile(p)
-        assert p not in mc.LIVE_UNAVAILABLE_PROFILES
+        assert mc.live_unavailable_reason(p, None) is None
 
 
 def test_every_iv_field_is_an_event_type_and_a_strict_deployable_name():
@@ -211,7 +214,7 @@ def test_the_live_resolver_refuses_iv_and_keeps_the_ohlcv_reader(monkeypatch):
     assert resolver.research_mode_profiles() == ("ohlcv-v1",)
     row = readers[1].observe("AAPL", SESSION).by_field()
     assert {o.status for o in row.values()} == {STATUS_NO_CONTEXT}
-    assert all("NO live data source" in o.reason for o in row.values())
+    assert all("NO option source" in o.reason for o in row.values())
     merged = resolver.reader.observe("AAPL", SESSION)
     assert merged.by_field()[FIELD_IV_RV_RATIO].status == STATUS_NO_CONTEXT
     assert merged.by_field()["underlying_adx_14"].status == STATUS_MISSING_SESSION
@@ -244,7 +247,7 @@ def test_a_live_gate_on_an_iv_field_never_passes():
     from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
     from ba2_common.core.TradeConditions import market_condition_condition_class
 
-    reader = LiveUnavailableMarketConditionReader(IV_PROFILE)
+    reader = LiveUnavailableMarketConditionReader(IV_PROFILE, mc.live_unavailable_reason(IV_PROFILE, "thetadata"))
     ctx = MarketConditionContext(
         decision_time=datetime(2024, 3, 4, 15, 0, tzinfo=timezone.utc), session_label=date(2024, 3, 4),
         prior_session=SESSION, source_profile="fmp-daily-split-adjusted-v1",
@@ -261,3 +264,80 @@ def test_a_live_gate_on_an_iv_field_never_passes():
             assert cond.last_status == STATUS_NO_CONTEXT
     finally:
         TradeConditions.set_market_condition_context_resolver(saved)
+
+
+# --------------------------------------------------------------------------- live source binding (2026-11-15)
+class _Expert:
+    def __init__(self, settings):
+        self.settings = settings
+
+
+class _Resolver:
+    def __init__(self, experts):
+        self.experts = experts
+        self.reads = []
+
+    def get_expert_instance(self, iid):
+        self.reads.append(iid)
+        return self.experts[iid]
+
+
+@pytest.fixture
+def instances(monkeypatch):
+    from ba2_common.core import instance_resolver
+    from ba2_common.core import market_condition_live as live
+
+    experts = {1: _Expert({"market_condition_profile": "ohlcv-v1"}),
+               2: _Expert({"market_condition_profile": "iv-v1", "market_condition_option_source": "alphavantage"}),
+               3: _Expert({"market_condition_profile": "iv-v1", "market_condition_option_source": "thetadata"}),
+               4: _Expert({})}
+    res = _Resolver(experts)
+    monkeypatch.setattr(instance_resolver, "get_instance_resolver", lambda: res)
+    monkeypatch.setattr(live, "certify_cache_root", lambda root=None: ("/x", type("R", (), {"consistent": True})()))
+    built = []
+
+    def fake_profiles(profiles, **kw):
+        built.append((profiles, kw))
+        return ("resolver", profiles, kw.get("option_source"))
+    monkeypatch.setattr(live, "resolver_for_profiles", fake_profiles)
+    return live.PerInstanceMarketConditionResolver(), built, res
+
+
+def test_an_ohlcv_expert_never_reads_or_keys_on_an_option_source(instances, monkeypatch):
+    """BACKWARD COMPATIBILITY: an expert without a chain profile is built exactly as before -- no
+    option-source read, a (id, profiles) cache key, and no option_source argument."""
+    pir, built, _res = instances
+    calls = []
+    monkeypatch.setattr(type(pir), "option_source_for", lambda self, iid: calls.append(iid))
+    monkeypatch.setattr(type(pir), "refresh_coverage", lambda *a, **k: None, raising=False)
+    from ba2_common.core import market_condition_live as live
+    monkeypatch.setattr(live, "resolver_for_profiles",
+                        lambda profiles, **kw: built.append((profiles, kw)) or type("L", (), {
+                            "refresh_coverage": lambda self: None, "source_profile": "s"})())
+    pir.resolver_for(1)
+    assert calls == []
+    assert list(pir._resolvers) == [(1, ("ohlcv-v1",))]
+    assert "option_source" not in built[-1][1]
+    assert pir.resolver_for(4) is None
+
+
+def test_an_iv_expert_is_built_with_its_recorded_option_source(instances, monkeypatch):
+    pir, built, _res = instances
+    from ba2_common.core import market_condition_live as live
+    monkeypatch.setattr(live, "resolver_for_profiles",
+                        lambda profiles, **kw: built.append((profiles, kw)) or type("L", (), {
+                            "refresh_coverage": lambda self: None, "source_profile": "s"})())
+    pir.resolver_for(2)
+    pir.resolver_for(3)
+    assert [kw.get("option_source") for _p, kw in built] == ["alphavantage", "thetadata"]
+    assert (2, ("iv-v1",), "alphavantage") in pir._resolvers and (3, ("iv-v1",), "thetadata") in pir._resolvers
+
+
+def test_a_thetadata_trained_iv_gate_is_refused_live_by_name():
+    from ba2_common.core import market_condition_live as live
+    from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+
+    r = live.resolver_for_profiles((IV_PROFILE,), option_source="thetadata")
+    assert isinstance(r.reader, LiveUnavailableMarketConditionReader)
+    assert "trained on option source 'thetadata'" in r.reader.reason
+    assert r.live_unavailable_profiles() == (IV_PROFILE,)

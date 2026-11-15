@@ -732,12 +732,16 @@ class LiveMarketConditionResolver:
         decision scope reports it once per PASS rather than once per process.
         """
         unavailable = set(self.live_unavailable_profiles())
+        readers = getattr(self.reader, "readers", None) or (self.reader,)
+        # A CHAIN reader (iv-v1 live) is not "computing on a miss from the FMP cache": it is the live
+        # source of that profile by design, so it is not reported as an unpinned research profile.
+        chain = {r.profile for r in readers if getattr(r, "live_chain", False)}
         return tuple(p for p, mapped in zip(self.profiles, self.mapped_readers)
-                     if mapped is None and p not in unavailable)
+                     if mapped is None and p not in unavailable and p not in chain)
 
     def live_unavailable_profiles(self) -> Tuple[str, ...]:
-        """The served profiles with NO live data source (``LIVE_UNAVAILABLE_PROFILES``), whose
-        reader refuses every observation. Reported once per decision pass, by name."""
+        """The served profiles live cannot serve for this expert (a refusing reader, see
+        ``market_conditions.live_unavailable_reason``). Reported once per decision pass, by name."""
         readers = getattr(self.reader, "readers", None) or (self.reader,)
         return tuple(r.profile for r in readers if getattr(r, "live_unavailable", False))
 
@@ -958,12 +962,12 @@ def _report_unpinned_profiles(resolver: "LiveMarketConditionResolver",
 
     unavailable = resolver.live_unavailable_profiles()
     if unavailable:
-        from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES
-
+        readers = getattr(resolver.reader, "readers", None) or (resolver.reader,)
+        reasons = [r.reason for r in readers if getattr(r, "live_unavailable", False)]
         logger.error(
             f"expert instance {expert_instance_id} gates on market-condition profile(s) "
-            f"{list(unavailable)} that have NO live data source; every entry gate on their fields "
-            f"refuses this pass. " + " ".join(LIVE_UNAVAILABLE_PROFILES[p] for p in unavailable))
+            f"{list(unavailable)} that live cannot serve for it; every entry gate on their fields "
+            f"refuses this pass. " + " ".join(reasons))
     unpinned = resolver.research_mode_profiles()
     if not unpinned:
         return
@@ -1048,6 +1052,32 @@ def submit_in_decision_context(executor: Any, fn: Callable, *args, **kwargs):
     return executor.submit(ctx.run, functools.partial(fn, *args, **kwargs))
 
 
+def is_chain_profile(profile: str) -> bool:
+    from ba2_common.core.market_conditions import is_chain_profile as _is
+
+    return _is(profile)
+
+
+def _chain_live_reader(profile: str, option_source: Optional[str], cache_root: Optional[str],
+                       source_profile: str) -> Any:
+    """The live reader of a CHAIN profile for gates trained on ``option_source``: the registered
+    reader of that source, or a :class:`LiveUnavailableMarketConditionReader` naming why not."""
+    from ba2_common.core.market_conditions import live_unavailable_reason
+    from ba2_common.core.market_condition_iv_live import live_chain_reader_factory
+    from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+
+    reason = live_unavailable_reason(profile, option_source)
+    if reason is None:
+        factory = live_chain_reader_factory(option_source)
+        if factory is None:
+            reason = (f"market-condition profile {profile!r}: no live reader is wired for option source "
+                      f"{option_source!r} in this process (ba2_trade_platform seam_wiring registers it); "
+                      f"its gates refuse every live entry")
+        else:
+            return factory(profile, cache_root=cache_root, source_profile=source_profile)
+    return LiveUnavailableMarketConditionReader(profile, reason)
+
+
 def certify_cache_root(cache_root: Optional[str] = None) -> Tuple[str, Any]:
     """``(root, report)`` for the FMP cache the live readers will read, MEMOISED per root.
 
@@ -1096,7 +1126,8 @@ def resolver_for_profiles(profiles: Sequence[str], *,
                           source_profile: str = SOURCE_PROFILE_FMP_DAILY,
                           manifest_digests: Optional[Mapping[str, str]] = None,
                           cache_root: Optional[str] = None,
-                          gap_fill: Optional[str] = None) -> "LiveMarketConditionResolver":
+                          gap_fill: Optional[str] = None,
+                          option_source: Optional[str] = None) -> "LiveMarketConditionResolver":
     """A live resolver serving ``profiles``: ONE reader per profile, joined by
     ``market_condition_reader_for`` (the reader itself for a single profile, a
     ``CompositeMarketConditionReader`` for several -- the same join the backtest seam makes, so
@@ -1133,14 +1164,10 @@ def resolver_for_profiles(profiles: Sequence[str], *,
     if source_profile != SOURCE_PROFILE_FMP_DAILY:
         # the reader must read the cache of the profile the resolver stamps on its capture
         reader_kwargs["source_profile"] = source_profile
-    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES
-    from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
-
-    # A profile with NO live source (iv-v1: the prior session's EOD option chain) is served by a
-    # reader that refuses every observation with its reason -- never by the FMP-cache reader,
-    # which cannot compute it, and never from a historical snapshot, which holds no row for the
-    # session a live decision reads.
-    readers = [LiveUnavailableMarketConditionReader(name) if name in LIVE_UNAVAILABLE_PROFILES
+    # A CHAIN profile (iv-v1) is never served by the FMP-cache reader (it cannot compute it) nor from
+    # a historical snapshot (no row for the session a live decision reads): it gets the live reader of
+    # the option source its gates were trained on, or a reader that refuses with the reason.
+    readers = [_chain_live_reader(name, option_source, cache_root, source_profile) if is_chain_profile(name)
                else _fmp_cache_reader(name, cache_root, manifest_digest=digests.get(name), **reader_kwargs)
                for name in names]
     return LiveMarketConditionResolver(
@@ -1304,6 +1331,12 @@ class PerInstanceMarketConditionResolver:
         if not profiles:
             return None
         key = (int(expert_instance_id), profiles)
+        option_source = None
+        if any(is_chain_profile(p) for p in profiles):
+            # ONLY for an expert gating on a chain profile (iv-v1): every other expert's key, build and
+            # settings reads are exactly what they were before chain profiles existed.
+            option_source = self.option_source_for(expert_instance_id)
+            key = key + (option_source,)
         with self._lock:
             hit = self._resolvers.get(key)
         # ``_build`` never returns None, so a plain ``.get`` is unambiguous. The empty-setting
@@ -1311,14 +1344,30 @@ class PerInstanceMarketConditionResolver:
         # dict the host already caches is cheaper than a second cache to invalidate.
         if hit is not None:
             return hit
-        resolver = self._build(profiles)
+        resolver = self._build(profiles) if option_source is None and len(key) == 2             else self._build(profiles, option_source=option_source)
         with self._lock:
             # Another thread may have built it first; either object is correct, and keeping the
             # one already published means concurrent passes share a reader (and its memo).
             resolver = self._resolvers.setdefault(key, resolver)
         return resolver
 
-    def _build(self, profiles: Tuple[str, ...]) -> Any:
+    def option_source_for(self, expert_instance_id: Any) -> Optional[str]:
+        """The option source the expert's chain-profile gates were trained on (the undeclared,
+        optional setting ``market_condition_option_source``); None when absent or unreadable --
+        the chain reader then refuses with that reason."""
+        from ba2_common.core.instance_resolver import get_instance_resolver
+        from ba2_common.core.market_condition_rules import OPTION_SOURCE_SETTING
+
+        try:
+            expert = get_instance_resolver().get_expert_instance(int(expert_instance_id))
+            value = expert.settings.get(OPTION_SOURCE_SETTING)
+        except Exception as e:  # noqa: BLE001 -- same contract as profiles_for
+            absorb_if_benign(e, ValueError, LookupError, InstanceResolverNotConfigured)
+            return None
+        value = str(value or "").strip()
+        return value or None
+
+    def _build(self, profiles: Tuple[str, ...], *, option_source: Optional[str] = None) -> Any:
         from ba2_common.logger import logger
 
         try:
@@ -1349,8 +1398,9 @@ class PerInstanceMarketConditionResolver:
                 f"{SourceCertificationError(report)}")
             return degraded
         digests = manifest_digests_from_env(profiles, self._environ)
+        extra = {"option_source": option_source} if option_source is not None else {}
         resolver = resolver_for_profiles(profiles, source_profile=self.source_profile,
-                                         manifest_digests=digests, cache_root=root)
+                                         manifest_digests=digests, cache_root=root, **extra)
         # Best effort, and only now: this runs on the first decision pass for the expert, when
         # the DB is open, so an operator finds the uncovered symbols in the log before the pass
         # decides rather than after a week of a sleeve not entering.

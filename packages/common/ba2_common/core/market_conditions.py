@@ -1425,18 +1425,29 @@ register_profile(IV_V1)
 #: ``COMPUTE_BY_PROFILE``; a chain profile is served only from a published manifest.
 CHAIN_COMPUTE_BY_PROFILE: Dict[str, Callable[..., FeatureRow]] = {IV_PROFILE: compute_iv_v1}
 
-#: profile -> why the LIVE platform cannot serve it. The live resolver serves such a profile with a
-#: reader that refuses every observation (``no_context`` + this reason, one ERROR per process): its
-#: gates never pass live, loudly and countably, and the expert's other profiles are unaffected.
-LIVE_UNAVAILABLE_PROFILES: Dict[str, str] = {
-    IV_PROFILE: (
-        "market-condition profile 'iv-v1' has NO live data source: it needs the PRIOR session's "
-        "end-of-day option chain with bid/ask (the backtest reads the ThetaData EOD store), and "
-        "no live account or provider wired into this platform serves that (Alpaca and TastyTrade "
-        "carry no historical option quotes; the live Alpaca chain is the current intraday "
-        "snapshot). Its gates refuse every live entry until a live EOD-chain adapter is decided "
-        "and built (docs/plans/2026-11-15-option-iv-conditions.md)."),
-}
+#: CHAIN profile -> the option sources whose prior-session end-of-day chain the LIVE platform can
+#: read (owner decision 2026-11-15: the option reruns read the Alpha Vantage store, and live reads
+#: the same vendor's HISTORICAL_OPTIONS chain for the previous session). A gate trained on any other
+#: source (ThetaData) is refused live, loudly: live has no equivalent of that store.
+LIVE_OPTION_SOURCES: Dict[str, Tuple[str, ...]] = {IV_PROFILE: ("alphavantage",)}
+
+
+def live_unavailable_reason(profile: str, option_source: Optional[str] = None) -> Optional[str]:
+    """Why live cannot serve ``profile`` for gates trained on ``option_source``; None when it can
+    (or when the profile is not a chain profile at all -- the OHLCV profiles have their own path)."""
+    if profile not in CHAIN_COMPUTE_BY_PROFILE:
+        return None
+    served = LIVE_OPTION_SOURCES.get(profile, ())
+    doc = "docs/plans/2026-11-15-option-iv-conditions.md"
+    if not option_source:
+        return (f"market-condition profile {profile!r}: the expert records NO option source for its gates "
+                f"(setting market_condition_option_source is empty), so live cannot tell which chain they "
+                f"were trained on; live serves {list(served)} only. Its gates refuse every live entry ({doc}).")
+    if option_source not in served:
+        return (f"market-condition profile {profile!r}: the gates were trained on option source "
+                f"{option_source!r}, which live cannot read (live serves {list(served)} only: the prior "
+                f"session's end-of-day chain of that vendor). Its gates refuse every live entry ({doc}).")
+    return None
 
 
 def is_chain_profile(profile: str) -> bool:

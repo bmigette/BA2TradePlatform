@@ -35,7 +35,7 @@ payload can carry it, whereas a registry entry is code that travels.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable, Iterator, List, Mapping, Sequence, Tuple
+from typing import Any, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.rule_builders import EXIT_ACTION
 from ba2_common.core.rule_models import MODE_OFF
@@ -476,43 +476,51 @@ def assert_market_fields_served(rules: Any, profiles: Sequence[str], *, where: s
                          profiles, where=where, setting=setting)
 
 
-def assert_market_fields_live_servable(rules: Any, where: str = "rules") -> None:
-    """Refuse a market leaf whose profile has NO live data source (``LIVE_UNAVAILABLE_PROFILES``).
+#: The expert setting recording which option store a CHAIN profile's gates were trained on
+#: (``thetadata`` | ``alphavantage``). OPTIONAL and UNDECLARED: absent on every expert that does not
+#: gate on a chain profile (nothing changes for them), written by the launcher onto iv-v1 jobs and
+#: carried by the deploy payload. Live serves a chain profile only for a source it can read.
+OPTION_SOURCE_SETTING = "market_condition_option_source"
 
-    The deploy importer's twin of :func:`assert_market_fields_served`, for the same failure: such a
-    gate never passes live (the live reader refuses every observation), so the strategy would be
-    deployed unable to enter on that rule. A payload whose setting merely LISTS such a profile
-    while none of its leaves reads it (every mode decoded off) is fine -- nothing reads it."""
-    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES, PROFILES
 
-    owner = {f.name: p for p in LIVE_UNAVAILABLE_PROFILES for f in PROFILES[p].fields}
+def assert_market_fields_live_servable(rules: Any, where: str = "rules",
+                                       option_source: Optional[str] = None) -> None:
+    """Refuse a market leaf of a CHAIN profile that live cannot serve for gates trained on
+    ``option_source`` (``market_conditions.live_unavailable_reason``): such a gate never passes live,
+    so the strategy would be deployed unable to enter on that rule. A leaf trained on a source live
+    reads (``alphavantage``) is accepted; a payload whose setting merely LISTS a chain profile while
+    no leaf reads it is fine -- nothing reads it."""
+    from ba2_common.core.market_conditions import CHAIN_COMPUTE_BY_PROFILE, PROFILES, live_unavailable_reason
+
+    owner = {f.name: p for p in CHAIN_COMPUTE_BY_PROFILE for f in PROFILES[p].fields}
     hits = [(label, str(leaf.get("field"))) for label, leaf in iter_market_condition_leaves(rules, where)
             if leaf.get("field") in owner]
-    if not hits:
+    reasons = {owner[f]: live_unavailable_reason(owner[f], option_source) for _l, f in hits}
+    bad = [(label, field) for label, field in hits if reasons[owner[field]]]
+    if not bad:
         return
-    profiles = sorted({owner[f] for _l, f in hits})
-    shown = "; ".join(f"{label} ({field})" for label, field in hits)
+    profiles = sorted({owner[f] for _l, f in bad})
+    shown = "; ".join(f"{label} ({field})" for label, field in bad)
     raise ValueError(
-        f"{where}: market-condition leaf/leaves {shown} read profile(s) {profiles} that have NO "
-        f"live data source, so live would refuse every entry they gate. "
-        + " ".join(LIVE_UNAVAILABLE_PROFILES[p] for p in profiles))
+        f"{where}: market-condition leaf/leaves {shown} read profile(s) {profiles} that live cannot "
+        f"serve, so live would refuse every entry they gate. " + " ".join(reasons[p] for p in profiles))
 
 
-def drop_unread_live_unavailable_profiles(profiles: Sequence[str], *rule_sets: Any
-                                          ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """``(kept, dropped)``: the profiles with NO live source (``LIVE_UNAVAILABLE_PROFILES``) that no
-    leaf of ``rule_sets`` reads are dropped; every other profile is kept, in order.
+def drop_unread_chain_profiles(profiles: Sequence[str], *rule_sets: Any
+                               ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """``(kept, dropped)``: the CHAIN profiles (``iv-v1``) that no leaf of ``rule_sets`` reads are
+    dropped; every other profile is kept, in order.
 
     For the deploy importer (review 2026-11-15): a genome whose iv genes all decoded OFF still
-    carries ``iv-v1`` in its setting, and live would then build a refusing reader and report "NO
-    live data source" every pass for a profile nothing reads. Dropping it changes no decision --
-    with no leaf on the profile, its rows are never read in the backtest either."""
-    from ba2_common.core.market_conditions import LIVE_UNAVAILABLE_PROFILES, PROFILES
+    carries ``iv-v1`` in its setting, and live would then build a chain reader (or report a refusal)
+    every pass for a profile nothing reads. Dropping it changes no decision -- with no leaf on the
+    profile, its rows are never read in the backtest either."""
+    from ba2_common.core.market_conditions import CHAIN_COMPUTE_BY_PROFILE, PROFILES
 
     read = {str(leaf.get("field")) for rules in rule_sets
             for _label, leaf in iter_market_condition_leaves(rules)}
     kept, dropped = [], []
     for p in profiles:
-        unread = p in LIVE_UNAVAILABLE_PROFILES and not ({f.name for f in PROFILES[p].fields} & read)
+        unread = p in CHAIN_COMPUTE_BY_PROFILE and not ({f.name for f in PROFILES[p].fields} & read)
         (dropped if unread else kept).append(p)
     return tuple(kept), tuple(dropped)

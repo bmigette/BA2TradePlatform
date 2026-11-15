@@ -84,11 +84,18 @@ def test_the_served_check_requires_the_iv_profile_in_the_setting():
         assert_market_fields_served(rules, ("ohlcv-v1",), where="entry")
 
 
-def test_the_live_import_refuses_an_iv_gate_with_the_open_decision():
+def test_the_live_import_refuses_an_iv_gate_live_cannot_serve():
     rules = _decoded(_ON)["entry_rules"]
-    with pytest.raises(ValueError, match="NO live data source") as e:
-        assert_market_fields_live_servable(rules, "ivdeploy: entry rules")
-    assert "o_bullps-market-ivrv" in str(e.value) and "iv-v1" in str(e.value)
+    for source, msg in ((None, "NO option source"), ("thetadata", "trained on option source 'thetadata'")):
+        with pytest.raises(ValueError, match=msg) as e:
+            assert_market_fields_live_servable(rules, "ivdeploy: entry rules", source)
+        assert "o_bullps-market-ivrv" in str(e.value) and "iv-v1" in str(e.value)
+
+
+def test_the_live_import_accepts_an_iv_gate_trained_on_alphavantage():
+    """Owner decision 2026-11-15: live reads the Alpha Vantage prior-session chain."""
+    rules = _decoded(_ON)["entry_rules"]
+    assert_market_fields_live_servable(rules, "ivdeploy: entry rules", "alphavantage")
 
 
 def test_an_all_off_iv_genome_imports():
@@ -99,25 +106,25 @@ def test_an_all_off_iv_genome_imports():
 
 def test_the_importer_drops_an_unread_iv_profile_and_keeps_a_read_one():
     """Review 2026-11-15: an all-off iv genome still carries iv-v1 in its setting; live would build a
-    refusing reader and log "NO live data source" every pass for a profile nothing reads."""
-    from ba2_common.core.market_condition_rules import drop_unread_live_unavailable_profiles
+    chain reader (or a refusing one) every pass for a profile nothing reads."""
+    from ba2_common.core.market_condition_rules import drop_unread_chain_profiles
 
     off = _decoded(_OFF)
-    assert drop_unread_live_unavailable_profiles(("ohlcv-v1", IV_PROFILE), off["entry_rules"], off["exit_rules"]) \
+    assert drop_unread_chain_profiles(("ohlcv-v1", IV_PROFILE), off["entry_rules"], off["exit_rules"]) \
         == (("ohlcv-v1",), (IV_PROFILE,))
-    assert drop_unread_live_unavailable_profiles((IV_PROFILE,), off["entry_rules"]) == ((), (IV_PROFILE,))
+    assert drop_unread_chain_profiles((IV_PROFILE,), off["entry_rules"]) == ((), (IV_PROFILE,))
     on = _decoded(_ON)
-    assert drop_unread_live_unavailable_profiles((IV_PROFILE,), on["entry_rules"], on["exit_rules"]) \
+    assert drop_unread_chain_profiles((IV_PROFILE,), on["entry_rules"], on["exit_rules"]) \
         == ((IV_PROFILE,), ())
     # an OHLCV profile nothing reads is NOT this helper's business: it has a live source
-    assert drop_unread_live_unavailable_profiles(("ohlcv-v1",), off["entry_rules"]) == (("ohlcv-v1",), ())
+    assert drop_unread_chain_profiles(("ohlcv-v1",), off["entry_rules"]) == (("ohlcv-v1",), ())
 
 
 def test_the_import_tool_drops_it_before_the_served_and_live_checks():
     tools = os.path.normpath(os.path.join(_ROOT, "..", "..", "tools"))
     body = open(os.path.join(tools, "import_deploy_payload.py"), encoding="utf-8").read()
     body = body[body.index("def main("):]
-    drop = body.index("drop_unread_live_unavailable_profiles(mc_profiles, entry_rules, exit_rules)")
+    drop = body.index("drop_unread_chain_profiles(mc_profiles, entry_rules, exit_rules)")
     assert drop < body.index("assert_market_fields_live_servable(entry_rules")
     assert drop < body.index("assert_market_fields_served(entry_rules")
     assert drop < body.index("save_settings(")

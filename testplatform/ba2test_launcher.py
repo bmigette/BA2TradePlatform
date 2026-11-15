@@ -7244,6 +7244,13 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
                  f"both read, so a job without it would be gated in the config and ungated the "
                  f"moment its genome is deployed.")
     setting_value = _market_condition_setting_value()
+    # The option store a CHAIN profile's snapshot was built from (iv-v1 only; absent otherwise, so
+    # every other job's expert settings are byte-identical): live serves the gate only for a source it
+    # can read, and the deploy importer checks it. One chain profile exists, so one source.
+    from ba2_common.core.market_condition_rules import OPTION_SOURCE_SETTING
+    chain_sources = sorted({f["option_source"] for f in facts_by_profile.values() if f.get("option_source")})
+    if len(chain_sources) > 1:
+        sys.exit(f"{command}: chain-profile snapshots built from different option sources {chain_sources}")
     for spec in specs:
         # ``"settings": None`` is a real shape -- it is exactly what the READER at
         # seam_wiring.market_condition_profile_setting guards with its isinstance check -- and
@@ -7252,6 +7259,8 @@ def _apply_market_conditions(command: str, backtest_block: dict, strat, kind: st
         if not isinstance(spec.get("settings"), dict):
             spec["settings"] = {}
         spec["settings"][PROFILE_SETTING] = setting_value
+        if chain_sources:
+            spec["settings"][OPTION_SOURCE_SETTING] = chain_sources[0]
     # The RESOLVED list is recorded too. It is redundant with the setting BY CONSTRUCTION -- the
     # seam refuses a config where the two disagree -- and it is what every stored-config consumer
     # (re-runs, robustness variants, top-N persist, tools/backtest_parity.py) already reads.

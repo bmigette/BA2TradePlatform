@@ -286,3 +286,64 @@ def test_a_broken_chain_is_refused_at_launch_unless_accepted(iv_on, tmp_path, mo
         assert recorded["facts"][IV_PROFILE]["iv_quality_accepted"] == ["AAA"]
     finally:
         mod._resolve_iv_quality(type("A", (), {})())
+
+
+# --------------------------------------------------------------------------- option source binding (2026-11-15)
+def _ohlcv_manifest(root):
+    from ba2_common.core.market_condition_store import MarketConditionStore
+    from ba2_common.core.market_conditions import STATUS_VALID
+
+    profile = PROFILES["ohlcv-v1"]
+    sessions = [date(2025, 6, 27), date(2025, 6, 30), date(2025, 7, 1)]
+    store = MarketConditionStore(root)
+    objects = []
+    for sym in ("AAA", "BBB"):
+        for month in ((2025, 6), (2025, 7)):
+            rows = [{"session": s, "values": [0.0, 20.0, 1.0], "status": [STATUS_VALID] * 3, "reasons": [""] * 3,
+                     "window_digest": "sha256:" + "3" * 64, "raw_shard_ref": "", "raw_row_lo": 0, "raw_row_hi": 0}
+                    for s in sessions if (s.year, s.month) == month]
+            objects.append(store.write_feature_object(profile, sym, rows)[0])
+    return store, store.write_manifest(store.make_manifest(
+        profile, source_profile="fmp-daily-split-adjusted-v1", timing_policy="prior_session_v1",
+        objects=objects, raw_objects=[], coverage={s: {"rows": 3} for s in ("AAA", "BBB")},
+        universe=["AAA", "BBB"], sessions=sessions, window_start=date.fromisoformat(MC_START),
+        window_end=date.fromisoformat(MC_END)))
+
+
+def test_an_iv_job_records_its_option_source_and_an_ohlcv_job_does_not(iv_snapshot, tmp_path, monkeypatch):
+    """BACKWARD COMPATIBILITY: the new expert setting appears ONLY on a job gated on a chain profile."""
+    import ba2_common.config as bc
+    from ba2_common.core.market_condition_rules import OPTION_SOURCE_SETTING
+
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", (IV_PROFILE,))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {IV_PROFILE: iv_snapshot})
+    strat = _built("O_IC")
+    cfg = _cfg(strat, options_store="thetadata")
+    mod._apply_market_conditions("optimize", cfg, strat, "O_IC")
+    assert cfg["experts"][0]["settings"][OPTION_SOURCE_SETTING] == "thetadata"
+
+    store, digest = _ohlcv_manifest(tmp_path / "c3")
+    monkeypatch.setattr(bc, "CACHE_FOLDER", str(store.cache_root))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_PROFILES", ("ohlcv-v1",))
+    monkeypatch.setattr(mod, "_MARKET_CONDITION_MANIFESTS", {"ohlcv-v1": digest})
+    strat = _built("O_IC")
+    cfg = _cfg(strat, options_store="thetadata")
+    recorded = mod._apply_market_conditions("optimize", cfg, strat, "O_IC")
+    assert OPTION_SOURCE_SETTING not in cfg["experts"][0]["settings"]
+    assert "option_source" not in recorded["facts"]["ohlcv-v1"]
+
+
+def test_the_backtest_seam_refuses_a_setting_that_contradicts_the_snapshot(iv_snapshot):
+    from types import SimpleNamespace
+
+    from app.services.backtest.seam_wiring import _check_option_source_setting
+
+    reader = SimpleNamespace(mapped_reader=SimpleNamespace(manifest={"option_source": "thetadata"}))
+    ok = {"experts": [{"settings": {"market_condition_option_source": "thetadata"}}]}
+    _check_option_source_setting(ok, IV_PROFILE, reader)
+    _check_option_source_setting({"experts": [{"settings": {}}]}, IV_PROFILE, reader)        # absent: fine
+    with pytest.raises(ValueError, match="alphavantage"):
+        _check_option_source_setting({"experts": [{"settings": {"market_condition_option_source": "alphavantage"}}]},
+                                     IV_PROFILE, reader)
+    # not a chain manifest: never consulted
+    _check_option_source_setting(ok, "ohlcv-v1", SimpleNamespace(mapped_reader=SimpleNamespace(manifest={})))

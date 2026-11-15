@@ -74,7 +74,7 @@ _ba2_db.configure_db(LIVE_DB)
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
 from ba2_common.core.market_condition_rules import (  # noqa: E402
     PROFILE_SETTING, assert_market_conditions_resolved, assert_market_fields_live_servable,
-    assert_market_fields_served, drop_unread_live_unavailable_profiles,
+    assert_market_fields_served, drop_unread_chain_profiles, OPTION_SOURCE_SETTING,
     assert_market_rule_actions, parse_profile_setting,
 )
 from ba2_common.core.deploy_parity import (  # noqa: E402
@@ -361,14 +361,15 @@ def main() -> int:
             mc_profiles = parse_profile_setting(expert_params.get(PROFILE_SETTING))
             # A profile with no live source that NO leaf reads (an all-off iv genome) is dropped from the
             # setting: it decides nothing, and live would report "NO live data source" every pass.
-            mc_profiles, _unread = drop_unread_live_unavailable_profiles(mc_profiles, entry_rules, exit_rules)
+            mc_profiles, _unread = drop_unread_chain_profiles(mc_profiles, entry_rules, exit_rules)
             if _unread:
                 expert_params[PROFILE_SETTING] = ",".join(mc_profiles)
                 print(f"NOTE: {label}: dropped market-condition profile(s) {list(_unread)} from "
-                      f"{PROFILE_SETTING}: no rule leaf reads them and they have no live source")
-            # iv-v1 has no live source: a gate on it would refuse every live entry -- refused here.
-            assert_market_fields_live_servable(entry_rules, f"{label}: entry rules")
-            assert_market_fields_live_servable(exit_rules, f"{label}: exit rules")
+                      f"{PROFILE_SETTING}: no rule leaf reads them")
+            # an iv-v1 gate is deployable only if trained on an option source live reads (alphavantage).
+            _osrc = expert_params.get(OPTION_SOURCE_SETTING)
+            assert_market_fields_live_servable(entry_rules, f"{label}: entry rules", _osrc)
+            assert_market_fields_live_servable(exit_rules, f"{label}: exit rules", _osrc)
             assert_market_fields_served(entry_rules, mc_profiles, where=f"{label}: entry rules")
             assert_market_fields_served(exit_rules, mc_profiles, where=f"{label}: exit rules")
             assert_market_rule_actions(exit_rules, f"{label}: exit rules")

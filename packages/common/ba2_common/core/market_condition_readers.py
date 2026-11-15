@@ -51,7 +51,6 @@ from ba2_common.core.market_condition_source import (
 )
 from ba2_common.core.market_conditions import (
     COMPUTE_BY_PROFILE,
-    LIVE_UNAVAILABLE_PROFILES,
     PROFILES,
     STATUS_MISSING_SESSION,
     STATUS_NO_CONTEXT,
@@ -403,10 +402,12 @@ class FMPCacheMarketConditionReader(WindowMarketConditionReader):
 
 
 class LiveUnavailableMarketConditionReader:
-    """The LIVE reader of a profile that has no live data source (``LIVE_UNAVAILABLE_PROFILES``).
+    """The LIVE reader of a chain profile live cannot serve for this expert
+    (``market_conditions.live_unavailable_reason``: no option source recorded, a source live cannot
+    read, or no live reader wired for it).
 
-    Every observation is the profile's fields at ``no_context`` with the registry's reason: the
-    gate never passes, the evaluator records the unknown, and the reason names the open decision.
+    Every observation is the profile's fields at ``no_context`` with that reason: the gate never
+    passes, the evaluator records the unknown, and the reason names the cause.
     An expert that combines this profile with others keeps its other profiles' readers -- only
     these fields refuse. One ERROR per process per profile when the first one is built (the live
     decision scope adds one ERROR per decision pass naming the expert).
@@ -420,17 +421,17 @@ class LiveUnavailableMarketConditionReader:
     _logged: set = set()
     _log_lock = threading.Lock()
 
-    def __init__(self, profile: str):
-        if profile not in LIVE_UNAVAILABLE_PROFILES:
-            raise KeyError(f"profile {profile!r} has a live source; build its normal reader")
+    def __init__(self, profile: str, reason: str):
+        if not reason:
+            raise ValueError(f"a refusing reader for {profile!r} needs its reason")
         self.profile = profile
         self.calc_version = PROFILES[profile].calc_version
-        self.reason = LIVE_UNAVAILABLE_PROFILES[profile]
+        self.reason = reason
         #: observations refused (visibility for tests and diagnostics).
         self.refused = 0
         with self._log_lock:
-            first = profile not in self._logged
-            self._logged.add(profile)
+            first = (profile, reason) not in self._logged
+            self._logged.add((profile, reason))
         if first:
             from ba2_common.logger import logger
 
@@ -796,11 +797,8 @@ def capturing_reader_for(reader: Any, capture: Any, *, source_profile: str,
     if isinstance(reader, CompositeMarketConditionReader):
         # A live-unavailable profile has no window to retain: it is passed through unwrapped (its
         # refusals are reasons, not observations of a source) and the others are captured.
-        wrapped = [r if getattr(r, "live_unavailable", False)
-                   else CapturingMarketConditionReader(r, capture, source_profile=source_profile,
-                                                       timing_policy=timing_policy)
-                   for r in reader.readers]
-        capturers = [w for w in wrapped if isinstance(w, CapturingMarketConditionReader)]
+        wrapped = [_capturer_for(r, capture, source_profile, timing_policy) for r in reader.readers]
+        capturers = [w for w in wrapped if not getattr(w, "live_unavailable", False)]
 
         def record(symbol: str, session: date, row: Any = None) -> None:
             for capturer in capturers:
@@ -809,9 +807,25 @@ def capturing_reader_for(reader: Any, capture: Any, *, source_profile: str,
         return CompositeMarketConditionReader(wrapped), record
     if getattr(reader, "live_unavailable", False):
         return reader, _record_nothing
+    if getattr(reader, "live_chain", False):
+        capturer = _capturer_for(reader, capture, source_profile, timing_policy)
+        return capturer, capturer.record
     capturer = CapturingMarketConditionReader(reader, capture, source_profile=source_profile,
                                               timing_policy=timing_policy)
     return capturer, capturer.record
+
+
+def _capturer_for(reader: Any, capture: Any, source_profile: str, timing_policy: str) -> Any:
+    """The capture wrapper of ONE profile's live reader: a refusing reader passes through (nothing to
+    record), a chain-profile reader records its chain + window evidence, a window reader its window."""
+    if getattr(reader, "live_unavailable", False):
+        return reader
+    if getattr(reader, "live_chain", False):
+        from ba2_common.core.market_condition_iv_live import CapturingChainReader
+
+        return CapturingChainReader(reader, capture, source_profile=source_profile, timing_policy=timing_policy)
+    return CapturingMarketConditionReader(reader, capture, source_profile=source_profile,
+                                          timing_policy=timing_policy)
 
 
 def _record_nothing(symbol: str, session: date, row: Any = None) -> None:

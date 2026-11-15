@@ -91,6 +91,14 @@ def live_estimates_source_from_settings() -> str:
 
 
 
+def _register_live_chain_readers() -> None:
+    """Register each live option source's chain reader with ba2_common (which may not import providers)."""
+    from ba2_common.core.market_condition_iv_live import register_live_chain_reader
+    from ba2_providers.market_conditions.av_live_chain import make_reader
+
+    register_live_chain_reader("alphavantage", make_reader)
+
+
 def wire_all_seams() -> None:
     """Inject every live implementation into the package seams. Idempotent.
 
@@ -193,6 +201,10 @@ def wire_all_seams() -> None:
         assert_profile_env_retired()
         market_condition_resolver = PerInstanceMarketConditionResolver()
         TradeConditions.set_market_condition_context_resolver(market_condition_resolver)
+        # The live reader of CHAIN-profile gates (iv-v1) trained on the Alpha Vantage store. Registering
+        # it reads nothing and calls nothing; it is only ever BUILT for an expert whose setting names
+        # iv-v1 with option source alphavantage. Silent on purpose (no new INFO line for anyone else).
+        _register_live_chain_readers()
         logger.info(
             "Market-condition context resolver installed (per expert instance, setting "
             "market_condition_profile; no data is served for an expert whose setting is empty)"
