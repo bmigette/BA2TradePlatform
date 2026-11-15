@@ -389,6 +389,183 @@ def test_without_defer_new_manifests_mean_a_new_cell(env):
     assert _cell(env, *a).name != _cell(env, *a, cmd=recipe(manifests="ohlcv-v1=cccc,ta-structure-v1=dddd")).name
 
 
+# ------------------------------------------------------------------ abbreviations (review 2026-11-15, item 1)
+
+
+def _real_parser():
+    return S.ROM._launcher_module(LAUNCHER)._optimize_parser()
+
+
+#: (refused flag, a value for it or None for a switch, what the refusal says)
+_REFUSED = [("--seed-population", "b.json", "UNSEEDED"), ("--seed-genomes", "g.json", "UNSEEDED"),
+            ("--seed-check-only", None, "UNSEEDED"), ("--warm-start-from", "3", "UNSEEDED"),
+            ("--chain-seed-from", "x", "UNSEEDED"), ("--start", "2021-01-01", "cannot be given"),
+            ("--end", "2024-12-31", "cannot be given"), ("--generations", "5", "cannot be given"),
+            ("--name", "foo", "cannot be given"), ("--screen-preset", "xl", "--screen-preset"),
+            ("--print-universe", None, "--print-universe"), ("--strategy", "O_BULLCS", "O_STYLE style jobs")]
+
+
+def _abbreviations(flag):
+    return [flag[:n] for n in range(3, len(flag) + 1)]
+
+
+@pytest.mark.parametrize("flag,value,why", _REFUSED)
+def test_every_abbreviation_of_a_refused_flag_is_refused_before_training(env, capsys, flag, value, why):
+    parser = _real_parser()
+    resolved = 0
+    for abbr in _abbreviations(flag):
+        if abbr == "--seed":
+            continue                                                    # the RNG seed (exact match)
+        hits = [s for s in parser._option_string_actions if s.startswith(abbr)]
+        unique = abbr in parser._option_string_actions or len(hits) == 1
+        resolved += unique
+        for toks in ([abbr] if value is None else [abbr, value],
+                     [f"{abbr}={value if value is not None else '1'}"]):
+            with pytest.raises(SystemExit):
+                S.main(_argv(env, *PHASE_A, *toks))
+            err = capsys.readouterr().err
+            # a prefix argparse resolves is refused for ITS reason (a value given to a switch as such);
+            # an ambiguous prefix, which argparse refuses too, is refused as ambiguous
+            if not unique:
+                assert "ambiguous" in err, (toks, err)
+            elif value is None and "=" in toks[0]:
+                assert "takes no value" in err, (toks, err)
+            else:
+                assert why in err, (toks, err)
+    assert resolved >= 1
+    assert env.made == [] and env.fake.trained == [] and env.calls == []
+
+
+def test_the_real_parser_reads_those_abbreviations_as_the_refused_flags():
+    """The evidence that the refusals above are needed: the launcher accepts the abbreviations."""
+    p = _real_parser()
+    base = ["--expert", "DeterministicScorer", "--universe", "AAPL", "--start", "2020-01-01", "--end", "2020-12-31"]
+    assert p.parse_args(base + ["--seed-pop", "b.json"]).seed_population == "b.json"
+    assert p.parse_args(base + ["--nam", "foo"]).name == "foo"
+    assert p.parse_args(base + ["--gener", "5"]).generations == 5
+    assert p.parse_args(base + ["--warm-start", "3"]).warm_start_from == 3
+
+
+def test_valid_abbreviations_and_the_rng_seed_pass_and_are_spelled_out(env):
+    assert S.main(_argv(env, *PHASE_A, "--mutation-p", "0.2", "--seed=7", "--equity-c=9000")) == 0
+    c = dict(env.fake.trained)[env.fake.order[0]]
+    assert (_flag(c, "--mutation-prob"), _flag(c, "--seed"), _flag(c, "--equity-cap")) == ("0.2", "7", "9000")
+    assert not any(t.startswith(("--seed=", "--equity-cap=")) or t in ("--mutation-p", "--equity-c") for t in c)
+
+
+def test_an_unknown_optimize_option_is_refused_by_name(env, capsys):
+    with pytest.raises(SystemExit):
+        S.main(_argv(env, *PHASE_A, "--no-such-option", "1"))
+    assert "unknown" in capsys.readouterr().err and env.made == []
+
+
+# ------------------------------------------------------------------ data flags read like argparse (item 2)
+
+
+def test_an_override_of_the_panel_reaches_the_deferred_test_whatever_its_spelling(env):
+    L = S.ROM._launcher_module(LAUNCHER)
+    for override in (["--screener-panel", "/h/daily_panel/P2"], ["--screener-panel=/h/daily_panel/P2"],
+                     ["--screener-pan", "/h/daily_panel/P2"]):
+        env.fake = Fake()
+        assert S.main(_argv(env, *PHASE_A, *override)) == 0
+        for d in env.fake.data_args:
+            assert L._data_rebase_from_optimize_args(d)["screener_panel"] == "/h/daily_panel/P2"
+        c = dict(env.fake.trained)[env.fake.order[0]]
+        assert _flag(c, "--screener-panel") == "/h/daily_panel/P2"          # trained on the same panel
+
+
+def test_under_defer_the_panel_is_masked_in_every_spelling(env):
+    base = _cell(env, *PHASE_A).name
+    assert _cell(env, *PHASE_A, "--screener-panel=/e/daily_panel/ffff").name == base
+    assert _cell(env, *PHASE_A, "--screener-pan", "/e/daily_panel/ffff").name == base
+
+
+# ------------------------------------------------------------------ data identity across runs (item 3)
+
+
+def test_a_cell_records_its_data_identity_on_the_first_run(env):
+    assert S.main(_argv(env, *PHASE_A)) == 0
+    cell = env.fake.order[0][:-4]
+    with open(os.path.join(env.report, cell, "data_identity.json"), encoding="utf-8") as fh:
+        rec = json.load(fh)
+    assert rec["strict"]["universe_file_sha256"].startswith("sha256:")
+    assert rec["first"]["market_condition_manifest"] == "ohlcv-v1=aaaa,ta-structure-v1=bbbb"
+    assert _cells_json(env, cell)["data_identity"]["strict"] == rec["strict"]
+
+
+def test_a_dry_run_writes_no_identity_record(env):
+    assert S.main(_argv(env, *PHASE_A, "--dry-run")) == 0
+    assert not os.path.exists(env.report)
+
+
+def test_same_name_with_another_universe_file_is_refused_loudly(env, tmp_path):
+    """Under defer the universe file is masked in the name: a second cell with another universe gets
+    the SAME name, and without the record it would reuse the first cell's stored folds."""
+    u1, u2 = tmp_path / "u1.txt", tmp_path / "u2.txt"
+    u1.write_text("AAPL\nMSFT\n", encoding="utf-8")
+    u2.write_text("AAPL\nNVDA\n", encoding="utf-8")
+    assert S.main(_argv(env, *PHASE_A, cmd=recipe(ufile=str(u1)))) == 0
+    assert _cell(env, *PHASE_A, cmd=recipe(ufile=str(u2))).name == _cell(env, *PHASE_A, cmd=recipe(ufile=str(u1))).name
+    env.fake = Fake()
+    with pytest.raises(SystemExit, match="REFUSED: the data that defines this cell changed.*universe_file_sha256"):
+        S.main(_argv(env, *PHASE_A, cmd=recipe(ufile=str(u2))))
+    assert env.fake.trained == [] and env.fake.tested == []
+
+
+def test_phase_b_on_extended_data_warns_and_keeps_both_fingerprints(env, monkeypatch, capsys):
+    assert S.main(_argv(env, *PHASE_A)) == 0
+    cell = env.fake.order[0][:-4]
+    monkeypatch.setattr(S.ROM._launcher_module(LAUNCHER), "_OPTION_HOLDOUT_START", date(2027, 1, 1))
+    env.fake = Fake()
+    env.fake.completed = {f"{cell}-wf1", f"{cell}-wf2", f"{cell}-wf3"}
+    january = recipe(manifests="ohlcv-v1=cccc,ta-structure-v1=dddd", panel="/h/daily_panel/2027aaaa",
+                     store="/h/metric_store_2027")
+    capsys.readouterr()
+    assert S.main(_argv(env, "--wf-defer-last-test", cmd=january)) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "market_condition_manifest" in out and "screener_panel" in out
+    rec = _cells_json(env, cell)["data_identity"]
+    assert rec["first"]["market_condition_manifest"] == "ohlcv-v1=aaaa,ta-structure-v1=bbbb"
+    assert rec["latest"]["market_condition_manifest"] == "ohlcv-v1=cccc,ta-structure-v1=dddd"
+    assert rec["first"]["screener_panel"]["name"] == "03d21a4a2f176c69"
+    assert rec["latest"]["screener_panel"]["name"] == "2027aaaa" and len(rec["changes"]) == 1
+
+
+def test_the_matrix_walk_forward_has_the_same_guard(env, monkeypatch, tmp_path):
+    rom = importlib.util.module_from_spec(importlib.util.spec_from_file_location(
+        "rom_guard", _ROOT / "tools" / "run_options_matrix.py"))
+    importlib.util.spec_from_file_location("rom_guard", _ROOT / "tools" / "run_options_matrix.py").loader.exec_module(rom)
+    fake = Fake()
+    monkeypatch.setattr(rom, "_make_wf_runner", lambda args, selection: fake)
+    monkeypatch.setattr(rom, "_wf_selection", lambda args: dict(SEL))
+    u1, u2 = tmp_path / "u1.txt", tmp_path / "u2.txt"
+    u1.write_text("AAPL MSFT", encoding="utf-8")
+    u2.write_text("AAPL NVDA", encoding="utf-8")
+    argv = ["--strategies", "O_BULLCS", "--experts", "DeterministicScorer", "--estimates-source", "fmp",
+            "--launcher", LAUNCHER, "--walk-forward", "--wf-report-dir", env.report, "--wf-top-n", "2", *THRESH,
+            *PHASE_A]
+    assert rom.main(argv + ["--universe-file", str(u1)]) == 0
+    with pytest.raises(SystemExit, match="universe_sha256"):
+        rom.main(argv + ["--universe-file", str(u2)])
+
+
+# ------------------------------------------------------------------ merge dependency preflight (item 5)
+
+
+def test_a_style_missing_from_the_styles_file_is_refused_with_the_merge_order(env, tmp_path, capsys):
+    cmd = recipe()
+    cmd[cmd.index("--style") + 1] = "premium_stop"
+    with pytest.raises(SystemExit, match="premium_stop.*not defined.*feat/premium-mandatory-loss-exit"):
+        S.main(_argv(env, *PHASE_A, cmd=cmd))
+    assert env.made == [] and env.calls == []
+
+
+def test_a_missing_universe_file_is_refused_with_the_merge_order(env, tmp_path):
+    with pytest.raises(SystemExit, match="does not exist.*feat/premium-mandatory-loss-exit"):
+        S.main(_argv(env, *PHASE_A, cmd=recipe(ufile=str(tmp_path / "options_universe_nasdaq.txt"))))
+    assert env.made == []
+
+
 def test_the_ds_cell_carries_the_option_fixed_settings_and_nothing_forces_fmprating(env):
     spec = _cell(env, *PHASE_A)
     assert spec.expert == "DeterministicScorer" and _flag(spec.optimize_args, "--expert") == "DeterministicScorer"

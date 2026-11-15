@@ -110,23 +110,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _flag_given(tokens: List[str], flag: str) -> bool:
-    return any(t == flag or t.startswith(flag + "=") for t in tokens)
+    """``flag`` among CANONICAL optimize tokens (``canonical``: abbreviations and ``=`` resolved)."""
+    return flag in tokens
 
 
 def _value(tokens: List[str], flag: str) -> Optional[str]:
-    """The LAST value of ``flag`` (argparse semantics: a later override wins)."""
-    out = None
-    for i, t in enumerate(tokens):
-        if t == flag and i + 1 < len(tokens):
-            out = tokens[i + 1]
-        elif t.startswith(flag + "="):
-            out = t.split("=", 1)[1]
-    return out
+    """The LAST value of ``flag`` among CANONICAL tokens (argparse: a later override wins)."""
+    at = [i for i, t in enumerate(tokens[:-1]) if t == flag]
+    return tokens[at[-1] + 1] if at else None
+
+
+def canonical(ap, launcher: str, tokens: List[str], what: str) -> List[str]:
+    """``tokens`` as the launcher's REAL optimize parser reads them, spelled out (every abbreviation
+    resolved to its flag, ``--flag=value`` split): ``ba2test_launcher._canonical_optimize_tokens``.
+    Every check below and every fold command then sees exactly what argparse would act on, so no
+    abbreviation (``--seed-pop``, ``--nam``, ``--gener``) or ``=`` spelling slips past a refusal. An
+    ambiguous or unknown option is refused by name."""
+    try:
+        return ROM._launcher_module(launcher)._canonical_optimize_tokens(tokens)
+    except ValueError as e:
+        ap.error(f"--walk-forward: {what}: {e}")
 
 
 def resolve(argv: List[str]):
     """Parse and validate. Returns ``(args, cmd)``: ``cmd`` is the plain-equivalent command (recipe +
-    overrides). Every refusal exits with its reason."""
+    overrides), its optimize tokens in CANONICAL form. Every refusal exits with its reason."""
     extra, recipe = split_argv(argv)
     ap = build_parser()
     args, overrides = ap.parse_known_args(extra)
@@ -136,13 +144,16 @@ def resolve(argv: List[str]):
     if not args.walk_forward:
         ap.error("this driver runs walk-forward cells only (tools/option_style_job.sh enters it when "
                  "--walk-forward is among its extra args)")
+    k = recipe.index("optimize")
+    head = recipe[:k]
+    overrides = canonical(ap, head[-1], overrides, "the optimize overrides")
     window = [f for f in ("--start", "--end", "--generations") if _flag_given(overrides, f)]
     ROM._resolve_walk_forward(ap, args, window)
     if _flag_given(overrides, "--name"):
         ap.error("--walk-forward: --name cannot be given: the cell is named from the style job's own "
                  "name (optm-... -> optwf-...-d<digest>) and the chain names each fold's job")
-    cmd = recipe + overrides
-    body = cmd[cmd.index("optimize") + 1:]
+    body = canonical(ap, head[-1], recipe[k + 1:], "the style job's command") + overrides
+    cmd = head + ["optimize"] + body
     seeds = [f for f in SEED_FLAGS if _flag_given(body, f)]
     if seeds:
         ap.error(f"--walk-forward: {', '.join(seeds)} refused: {SEED_REFUSAL}")
@@ -164,6 +175,32 @@ def resolve(argv: List[str]):
     return args, cmd
 
 
+MERGE_HINT = ("the small-account styles (premium_stop, mid_share, burst10k, wheel50k_ndx, cheap10k), their "
+              "universe files and download_av_option_chains.py --require-complete live on "
+              "feat/premium-mandatory-loss-exit: merge it before this branch (or run from a checkout that has both)")
+
+
+def preflight(cmd: List[str]) -> None:
+    """Refuse, before anything trains, a style the --style-config file does not define and a missing
+    --style-config / --screener-universe-file, naming the merge dependency (the chain would otherwise
+    report a misleading 'AV store incomplete' skip, or the launcher would refuse at fold 1)."""
+    body = cmd[cmd.index("optimize") + 1:]
+    path, name = _value(body, "--style-config"), _value(body, "--style")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            styles = json.load(fh).get("styles") or {}
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        raise SystemExit(f"run_option_style_wf.py: --style-config {path}: cannot read the styles file "
+                         f"({type(e).__name__}: {e})")
+    if name not in styles:
+        raise SystemExit(f"run_option_style_wf.py: style {name!r} is not defined in {path} (it defines "
+                         f"{', '.join(sorted(styles))}); {MERGE_HINT}")
+    ufile = _value(body, "--screener-universe-file")
+    if ufile is not None and not os.path.isfile(ufile):
+        raise SystemExit(f"run_option_style_wf.py: --screener-universe-file {ufile} does not exist; "
+                         f"{MERGE_HINT}")
+
+
 def _style_sha(launcher: str, body: List[str]) -> str:
     """The content identity of the style the job builds (the launcher's own loader and hash)."""
     L = ROM._launcher_module(launcher)
@@ -180,6 +217,41 @@ def _file_sha(path: str) -> str:
             return "sha256:" + hashlib.sha256(fh.read()).hexdigest()
     except OSError as e:
         raise SystemExit(f"--walk-forward: --screener-universe-file {path}: {e}")
+
+
+def _panel_identity(panel: Optional[str]) -> Optional[dict]:
+    """What a daily panel IS (its manifest's fingerprint, criteria version and session range), or just
+    its directory name when no manifest can be read here (the launcher refuses such a panel itself)."""
+    if not panel:
+        return None
+    from ba2_providers.screener import live_sim as _ls
+    path = panel
+    if not os.path.isdir(path):
+        from ba2_common.config import CACHE_FOLDER
+        path = _ls.panel_dir_for(CACHE_FOLDER, panel)
+    man = _ls.read_manifest(path) or {}
+    return {"name": os.path.basename(os.path.normpath(panel)),
+            **{k: man.get(k) for k in ("panel_fingerprint", "criteria_version", "first_session",
+                                       "last_session")}}
+
+
+def style_data_identity(cmd: List[str]) -> tuple:
+    """(strict, evolving) data identity of a style cell (``run_options_matrix.guard_data_identity``).
+    Strict: the universe (file content and list), the market-condition profiles, the option store and
+    history source. Evolving (phase B extends them to 2026): the manifests, the daily panel, the store."""
+    body = cmd[cmd.index("optimize") + 1:]
+    ufile = _value(body, "--screener-universe-file")
+    store = _value(body, "--screener-store")
+    strict = {"universe_file_sha256": _file_sha(ufile) if ufile else None,
+              "universe_sha256": ROM.sha256_text(_value(body, "--universe")),
+              "market_condition_profile": _value(body, "--market-condition-profile") or "none",
+              "options_store": _value(body, "--options-store"),
+              "option_history_source": _value(body, "--option-history-source"),
+              "env:BACKTEST_OPTIONS_STORE": os.environ.get("BACKTEST_OPTIONS_STORE")}
+    evolving = {"market_condition_manifest": _value(body, "--market-condition-manifest"),
+                "screener_panel": _panel_identity(_value(body, "--screener-panel")),
+                "screener_store": os.path.basename(os.path.normpath(store)) if store else None}
+    return strict, evolving
 
 
 def identity_config(tokens: List[str]) -> dict:
@@ -279,6 +351,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     why = ROM.wf_holdout_refusal(args.wf_folds, args.wf_deferred, holdout)
     if why is not None:
         raise SystemExit(f"run_option_style_wf.py: --walk-forward: {why}")
+    preflight(cmd)
     selection = _wf_selection(args)
     spec = cell_spec(args, cmd, selection)
     print(f"option style walk-forward cell {spec.name} ({spec.expert} {spec.band}); reports under "
@@ -290,6 +363,10 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{args.wf_next_generations} (seeded folds, refit); option holdout from {holdout} "
           f"(launcher rail); unseeded (no external seed population)")
     print(f"Selection: top {args.wf_top_n} behaviour-distinct genomes per fold, {selection}")
+    strict, evolving = style_data_identity(cmd)
+    ROM.guard_data_identity(args.wf_report_dir, spec.name, strict, evolving, write=not args.dry_run,
+                            rename_hint="give the style job a new <name-suffix> for a different universe "
+                                        "or option source")
     if args.dry_run:
         ROM.print_wf_dry_run([spec], ROM._completed_names())
         return 0
@@ -301,7 +378,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                          f"{start}..{end} (tools/refresh_fred_cache.py --check-rate-window); nothing ran")
     runner = _make_wf_runner(args, selection)
     return ROM.run_wf_cells([spec], runner, args.wf_report_dir, _FAILED,
-                            "option style walk-forward driver")
+                            "option style walk-forward driver", verdict_lines=True)
 
 
 if __name__ == "__main__":

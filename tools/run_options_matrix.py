@@ -1111,6 +1111,10 @@ def _run_walk_forward(ap, args, launcher, experts, strategies, universe) -> int:
     print(f"Objective: fitness={args.fitness or 'per-job default'}, robust_fitness="
           f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
           " -- scores are NOT comparable across the robustness setting.")
+    strict, evolving = matrix_data_identity(args, universe)
+    for spec in specs:
+        guard_data_identity(args.wf_report_dir, spec.name, strict, evolving, write=not args.dry_run,
+                            rename_hint="use a new --name-suffix for a different universe or option source")
     if args.dry_run:
         print_wf_dry_run(specs, done)
         return 0
@@ -1142,18 +1146,117 @@ def print_wf_dry_run(specs, done) -> None:
     print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
 
 
-def run_wf_cells(specs, runner, report_dir, failed: list, label: str) -> int:
+def run_wf_cells(specs, runner, report_dir, failed: list, label: str, verdict_lines: bool = False) -> int:
     """Run the cells through ``wf_chain.run_cells`` (one cell's ERROR does not stop the others),
-    print each verdict and finish like a matrix (every ERROR reported, non-zero exit). Shared with
-    tools/run_option_style_wf.py."""
+    print each verdict and finish like a matrix (every ERROR reported, non-zero exit). Each cell's
+    data identity record (``guard_data_identity``) is copied into its ``cell.json``. With
+    ``verdict_lines`` a machine-readable ``VERDICT <verdict> <cell>`` line follows each cell (the
+    small-account chain records it). Shared with tools/run_option_style_wf.py."""
     WF, C = _wf_import()
     cells = C.run_cells(specs, lambda _spec: runner, report_dir)
     for c in cells:
+        _annotate_cell_report(report_dir, c["cell"])
         print(f"  {c['verdict']:7s} {c['cell']}" + (f"  refit={c['refit_job']}" if c["refit_job"] else "")
               + (f"  ({c['error']})" if c.get("error") else ""), flush=True)
+        if verdict_lines:
+            print(f"VERDICT {c['verdict']} {c['cell']}", flush=True)
         if c["verdict"] == "ERROR":
             note_job_exit(failed, c["cell"], 1, c["error"])
     return finish_matrix(failed, label)
+
+
+# ------------------------------------------------------------------------------------------------
+# DATA IDENTITY of a cell across runs (review 2026-11-15). Under --wf-defer-last-test the data VALUES
+# (manifests, universe list, and for style cells the universe file, panel and store) are masked in
+# the cell name so phase B finds phase A's jobs. Without a record, two cells differing only in their
+# universe would share a name (the second reusing the first's stored folds), and phase B could run on
+# changed data unnoticed. The record lives in <report dir>/<cell>/data_identity.json.
+# ------------------------------------------------------------------------------------------------
+
+DATA_IDENTITY_FILE = "data_identity.json"
+
+
+def guard_data_identity(report_dir: str, cell: str, strict: dict, evolving: dict, *, write: bool,
+                        rename_hint: str, log=print) -> dict:
+    """Compare this run's data identity with the cell's record; write the record on the first run.
+
+    ``strict``: inputs that define the experiment (universe content, market-condition profiles,
+    option store and history source): ANY difference from the first run is REFUSED (SystemExit),
+    naming each change. ``evolving``: inputs that legitimately move in phase B (manifests, panel,
+    store extended to 2026): a difference from the latest run is a WARNING naming it, and both the
+    first-run and the current values are kept (``first``, ``latest``, ``changes``). ``write=False``
+    (dry run) compares without writing. Returns the record."""
+    import datetime as _dt
+    path = os.path.join(report_dir, cell, DATA_IDENTITY_FILE)
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+    if not os.path.exists(path):
+        doc = {"schema": 1, "first_run": now, "strict": strict, "first": evolving, "latest": evolving,
+               "changes": []}
+        if write:
+            WF, _C = _wf_import()
+            WF.atomic_write_text(path, json.dumps(doc, indent=2, sort_keys=True))
+        return doc
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        stored_strict, latest = dict(doc["strict"]), dict(doc["latest"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SystemExit(f"--walk-forward {cell}: REFUSED: its data identity record {path} is unreadable "
+                         f"({type(e).__name__}: {e}); the cell's data cannot be verified. Restore the file, "
+                         f"or {rename_hint}")
+    diff = {k: (stored_strict.get(k), strict.get(k)) for k in sorted(set(stored_strict) | set(strict))
+            if stored_strict.get(k) != strict.get(k)}
+    if diff:
+        shown = "; ".join(f"{k}: {a!r} -> {b!r}" for k, (a, b) in diff.items())
+        raise SystemExit(f"--walk-forward {cell}: REFUSED: the data that defines this cell changed since its "
+                         f"first run ({doc.get('first_run')}): {shown}. Its name does not carry these values "
+                         f"(masked under --wf-defer-last-test), so running on would reuse another experiment's "
+                         f"folds; {rename_hint}")
+    changed = {k: (latest.get(k), evolving.get(k)) for k in sorted(set(latest) | set(evolving))
+               if latest.get(k) != evolving.get(k)}
+    if changed:
+        shown = "; ".join(f"{k}: {a!r} -> {b!r}" for k, (a, b) in changed.items())
+        log(f"WARNING [{cell}] data changed since the cell's last run: {shown}. Expected in phase B (the data "
+            f"extended to the new test year): the deferred test reads the new values, the trained folds keep "
+            f"the ones they ran on. Recorded in {path} (first-run values kept)."
+            + ("" if write else " Not written (dry run)."))
+        doc["changes"] = list(doc.get("changes") or []) + [
+            {"at": now, "changed": {k: list(v) for k, v in changed.items()}}]
+        doc["latest"] = evolving
+        if write:
+            WF, _C = _wf_import()
+            WF.atomic_write_text(path, json.dumps(doc, indent=2, sort_keys=True))
+    return doc
+
+
+def _annotate_cell_report(report_dir: str, cell: str) -> None:
+    """Copy the cell's data identity record (first-run and latest values) into its cell.json."""
+    ident = os.path.join(report_dir, cell, DATA_IDENTITY_FILE)
+    report = os.path.join(report_dir, cell, "cell.json")
+    if not (os.path.exists(ident) and os.path.exists(report)):
+        return
+    with open(ident, encoding="utf-8") as fh:
+        record = json.load(fh)
+    with open(report, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    doc["data_identity"] = record
+    WF, _C = _wf_import()
+    WF.atomic_write_text(report, json.dumps(doc, indent=2))
+
+
+def sha256_text(text: Optional[str]) -> Optional[str]:
+    return None if text is None else hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def matrix_data_identity(args, universe: str) -> tuple:
+    """(strict, evolving) data identity of an option-matrix cell (``guard_data_identity``)."""
+    strict = {"universe_sha256": sha256_text(universe),
+              "market_condition_profile": getattr(args, "market_condition_profile", None) or "none",
+              "options_store": getattr(args, "options_store", None),
+              "option_history_source": getattr(args, "option_history_source", None),
+              "env:BACKTEST_OPTIONS_STORE": os.environ.get("BACKTEST_OPTIONS_STORE")}
+    evolving = {"market_condition_manifest": getattr(args, "market_condition_manifest", None)}
+    return strict, evolving
 
 
 def main(argv=None) -> int:

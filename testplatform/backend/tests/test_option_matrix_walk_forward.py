@@ -337,3 +337,15 @@ def test_a_changed_drawdown_cap_rejudges_the_stored_fold_reports_without_rerunni
     with open(os.path.join(env.report, cell, "cell.json"), encoding="utf-8") as fh:
         doc = json.load(fh)
     assert doc["verdict"] == "FAIL" and doc["eliminated"]["before_fold"] == 3
+
+
+@pytest.mark.parametrize("flag", [["--star", "2021-01-01"], ["--sta=2021-01-01"], ["--gener", "10"],
+                                  ["--generation=10"], ["--en", "2024-12-31"], ["--end=2025-12-31"]])
+def test_an_abbreviated_job_window_or_budget_is_refused_too(env, flag, capsys):
+    """The matrix's own argparse resolves abbreviations (allow_abbrev): an abbreviation of --start/--end/
+    --generations is that flag and refused; an ambiguous one is refused by argparse. Nothing runs."""
+    with pytest.raises(SystemExit):
+        M.main(_argv(env, *PHASE_A, *flag))
+    err = capsys.readouterr().err
+    assert "cannot be given" in err or "ambiguous option" in err
+    assert env.fake.trained == [] and env.made == []
