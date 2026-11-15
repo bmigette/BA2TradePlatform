@@ -92,9 +92,24 @@ def live_estimates_source_from_settings() -> str:
 
 
 def _register_live_chain_readers() -> None:
-    """Register each live option source's chain reader with ba2_common (which may not import providers)."""
+    """Register each live option source's chain reader with ba2_common (which may not import providers).
+
+    An ImportError here must NOT abort startup (no iv gate may cost the platform its exits): it is
+    logged as ONE WARNING and the source is registered with a factory that serves a refusing reader
+    naming the import failure, so iv gates refuse with that reason and everything else runs."""
     from ba2_common.core.market_condition_iv_live import register_live_chain_reader
-    from ba2_providers.market_conditions.av_live_chain import make_reader
+
+    try:
+        from ba2_providers.market_conditions.av_live_chain import make_reader
+    except ImportError as e:
+        reason = (f"market-condition profile iv-v1: the live Alpha Vantage chain reader could not be "
+                  f"imported ({type(e).__name__}: {e}); its gates refuse every live entry")
+        logger.warning(reason)
+
+        def make_reader(profile, **_kw):
+            from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+
+            return LiveUnavailableMarketConditionReader(profile, reason)
 
     register_live_chain_reader("alphavantage", make_reader)
 

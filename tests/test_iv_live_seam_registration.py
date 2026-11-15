@@ -20,11 +20,13 @@ def test_the_registration_is_silent_and_registers_the_alphavantage_reader(caplog
     def no_network(*a, **k):
         raise AssertionError("the registration must not make a request")
     monkeypatch.setattr(requests, "get", no_network)
+    logged = []
+    for level in ("info", "warning", "error"):
+        monkeypatch.setattr(seam_wiring.logger, level, lambda msg, *a, _l=level, **k: logged.append((_l, msg)))
     clear_live_chain_readers()
     try:
-        with caplog.at_level(logging.DEBUG):
-            seam_wiring._register_live_chain_readers()
-        assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+        seam_wiring._register_live_chain_readers()
+        assert logged == []
         assert live_chain_reader_factory("alphavantage") is make_reader
         assert live_chain_reader_factory("thetadata") is None
     finally:
@@ -46,3 +48,80 @@ def test_an_expert_without_a_chain_profile_never_reaches_the_chain_seam(monkeypa
     pir = live.PerInstanceMarketConditionResolver()
     assert pir.resolver_for(7) is None
     assert asked == [] and pir._resolvers == {}
+
+
+def test_an_import_error_of_the_reader_does_not_abort_startup_and_iv_gates_refuse(caplog, monkeypatch):
+    import sys
+
+    from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
+    from ba2_trade_platform.core import seam_wiring
+
+    monkeypatch.setitem(sys.modules, "ba2_providers.market_conditions.av_live_chain", None)   # ImportError
+    warned = []
+    monkeypatch.setattr(seam_wiring.logger, "warning", lambda msg, *a, **k: warned.append(str(msg)))
+    clear_live_chain_readers()
+    try:
+        seam_wiring._register_live_chain_readers()
+        assert len(warned) == 1 and "could not be imported" in warned[0]
+        reader = live_chain_reader_factory("alphavantage")("iv-v1", cache_root=None, source_profile="x")
+        assert isinstance(reader, LiveUnavailableMarketConditionReader)
+        assert "could not be imported" in reader.reason
+    finally:
+        clear_live_chain_readers()
+
+
+class _FakeScheduler:
+    def __init__(self):
+        self.added, self.removed = [], []
+
+    def add_job(self, **kw):
+        self.added.append(kw["id"])
+        return object()
+
+    def remove_job(self, job_id):
+        self.removed.append(job_id)
+
+
+def _bare_job_manager():
+    from ba2_trade_platform.core.JobManager import JobManager
+
+    jm = JobManager.__new__(JobManager)
+    jm._scheduler = _FakeScheduler()
+    jm._scheduled_jobs = {}
+    return jm
+
+
+def test_no_prefetch_job_and_no_log_without_an_active_iv_gate(caplog, monkeypatch):
+    from ba2_trade_platform.modules.dataproviders.options import iv_chain_prefetch as ivp
+
+    monkeypatch.setattr(ivp, "has_active_iv_gates", lambda: False)
+    from ba2_trade_platform.core import JobManager as jm_mod
+
+    logged = []
+    for level in ("info", "warning", "error"):
+        monkeypatch.setattr(jm_mod.logger, level, lambda msg, *a, _l=level, **k: logged.append((_l, msg)))
+    jm = _bare_job_manager()
+    jm._schedule_iv_chain_prefetch_job()
+    assert jm._scheduler.added == [] and jm._scheduled_jobs == {}
+    assert logged == []
+
+
+def test_the_prefetch_job_is_scheduled_with_a_gate_and_removed_after_the_last_one(monkeypatch):
+    from ba2_trade_platform.core.JobManager import IV_CHAIN_PREFETCH_JOB_ID
+    from ba2_trade_platform.modules.dataproviders.options import iv_chain_prefetch as ivp
+
+    jm = _bare_job_manager()
+    monkeypatch.setattr(ivp, "has_active_iv_gates", lambda: True)
+    jm._schedule_iv_chain_prefetch_job()
+    assert jm._scheduler.added == [IV_CHAIN_PREFETCH_JOB_ID] and IV_CHAIN_PREFETCH_JOB_ID in jm._scheduled_jobs
+    monkeypatch.setattr(ivp, "has_active_iv_gates", lambda: False)
+    jm._schedule_iv_chain_prefetch_job()
+    assert jm._scheduler.removed == [IV_CHAIN_PREFETCH_JOB_ID] and jm._scheduled_jobs == {}
+
+
+def test_a_fresh_installation_has_no_active_iv_gate():
+    """The real check against the test DB (no iv-v1 setting row): the cheap pre-filter stops it."""
+    from ba2_trade_platform.modules.dataproviders.options import iv_chain_prefetch as ivp
+
+    assert ivp.has_active_iv_gates() is False
+    assert ivp.run_prefetch_once() == {"skipped": "no active iv-v1 gate"}

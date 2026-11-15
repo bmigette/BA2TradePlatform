@@ -61,6 +61,9 @@ FRED_PREOPEN_RETRY_DELAYS_MIN = (10, 10)
 # 429 window and every iv_rank gate stayed closed). 08:30 America/New_York, Mon-Fri; the job stops by
 # 09:20 ET and never runs inside the 09:25-09:45 collision window.
 IV_WARM_JOB_ID = "iv_history_preopen_warm_job"
+#: iv-v1 live gates: the pre-decision prefetch of the prior session's Alpha Vantage chains. Scheduled
+#: ONLY while an enabled expert has an active iv gate (see _schedule_iv_chain_prefetch_job).
+IV_CHAIN_PREFETCH_JOB_ID = "iv_chain_prefetch_job"
 IV_WARM_HOUR, IV_WARM_MINUTE = 8, 30
 
 # Scheduler id of the daily corporate-actions refresh of the Alpaca history cache (plan
@@ -701,6 +704,7 @@ class JobManager:
         self._schedule_iv_snapshot_job()
         self._schedule_fred_preopen_job()
         self._schedule_iv_warm_job()
+        self._schedule_iv_chain_prefetch_job()
         self._schedule_history_corporate_actions_job()
         self._schedule_warm_jobs()
 
@@ -917,6 +921,46 @@ class JobManager:
                         f"{IV_WARM_MINUTE:02d} America/New_York, Mon-Fri (deadline 09:20)")
         except Exception as e:
             logger.error(f"Error scheduling the pre-open ATM-IV warm job: {e}", exc_info=True)
+
+    def _schedule_iv_chain_prefetch_job(self):
+        """Schedule the iv-v1 chain prefetch (Mon-Fri 06:30 ET) ONLY while an enabled expert has an
+        ACTIVE iv-v1 gate trained on alphavantage. Without one nothing is scheduled and nothing is
+        logged -- every existing installation. Re-evaluated whenever the system jobs are rebuilt
+        (startup, refresh, an expert's schedule refresh); a job left behind after the last gate is
+        removed unschedules itself here, and the job re-checks before doing anything."""
+        try:
+            from ..modules.dataproviders.options import iv_chain_prefetch as ivp
+            active = ivp.has_active_iv_gates()
+        except Exception as e:  # noqa: BLE001 -- the check must never block the scheduler
+            logger.warning(f"iv-v1 chain prefetch: could not determine whether an iv gate is active ({e}); "
+                           f"not scheduled -- gates fetch on demand")
+            return
+        if not active:
+            if IV_CHAIN_PREFETCH_JOB_ID in self._scheduled_jobs:
+                try:
+                    self._scheduler.remove_job(IV_CHAIN_PREFETCH_JOB_ID)
+                except Exception:  # noqa: BLE001 -- already gone
+                    pass
+                self._scheduled_jobs.pop(IV_CHAIN_PREFETCH_JOB_ID, None)
+            return
+        try:
+            trigger = CronTrigger(hour=ivp.PREFETCH_HOUR, minute=ivp.PREFETCH_MINUTE,
+                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            job = self._scheduler.add_job(func=self._execute_iv_chain_prefetch, trigger=trigger,
+                                          id=IV_CHAIN_PREFETCH_JOB_ID, name="iv-v1 Chain Prefetch Job",
+                                          replace_existing=True, max_instances=1, coalesce=True)
+            self._scheduled_jobs[IV_CHAIN_PREFETCH_JOB_ID] = job
+            logger.info(f"iv-v1 chain prefetch scheduled for {ivp.PREFETCH_HOUR:02d}:{ivp.PREFETCH_MINUTE:02d} "
+                        f"America/New_York, Mon-Fri (deadline {ivp.DEADLINE_HOUR:02d}:{ivp.DEADLINE_MINUTE:02d})")
+        except Exception as e:
+            logger.error(f"Error scheduling the iv-v1 chain prefetch job: {e}", exc_info=True)
+
+    def _execute_iv_chain_prefetch(self):
+        try:
+            from ..modules.dataproviders.options import iv_chain_prefetch as ivp
+            ivp.run_prefetch_once()
+        except Exception as e:
+            logger.error(f"Error executing the iv-v1 chain prefetch: {e}", exc_info=True)
 
     def _iv_warm_catchup_if_due(self):
         """An app (re)started between 08:31 and 09:15 ET on a weekday missed the 08:30 cron: run the
