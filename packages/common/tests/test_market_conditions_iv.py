@@ -341,3 +341,68 @@ def test_a_thetadata_trained_iv_gate_is_refused_live_by_name():
     assert isinstance(r.reader, LiveUnavailableMarketConditionReader)
     assert "trained on option source 'thetadata'" in r.reader.reason
     assert r.live_unavailable_profiles() == (IV_PROFILE,)
+
+
+# --------------------------------------------------------------------------- review 2026-11-15
+def test_the_decision_scope_logs_one_summary_per_refusal_kind(monkeypatch, caplog):
+    import logging
+    from datetime import datetime, timezone
+
+    import ba2_common.core.TradeConditions as TC
+    from ba2_common.core import market_condition_live as live
+    from ba2_common.core.market_condition_iv_live import ChainLiveReader
+    from ba2_common.core.types import ExpertEventType
+
+    class _NoKey(ChainLiveReader):
+        option_source = "alphavantage"
+
+        def _evidence(self, symbol, session):
+            return self._refusal(symbol, session, "alpha_vantage_api_key is not set", "no_key")
+
+    reader = _NoKey(IV_PROFILE)
+    saved = TC.get_market_condition_context_resolver()
+    TC.set_market_condition_context_resolver(live.LiveMarketConditionResolver(IV_PROFILE, reader=reader))
+    monkeypatch.setattr(live, "_replay_now", lambda: datetime(2025, 11, 17, 15, 0, tzinfo=timezone.utc))
+    try:
+        with caplog.at_level(logging.WARNING):
+            with live.market_condition_decision_scope():
+                for sym in ("AAA", "BBB", "CCC"):
+                    for _ in range(2):           # a second leaf on the same symbol: no second read
+                        TC.create_condition(ExpertEventType.N_UNDERLYING_IV_RV_RATIO, object(), sym, None,
+                                            operator_str=">", value=1.0).evaluate()
+    finally:
+        TC.set_market_condition_context_resolver(saved)
+    assert reader.refused == 3
+    lines = [r.getMessage() for r in caplog.records if "refused this pass" in r.getMessage()]
+    assert len(lines) == 1 and "no_key: 3 symbol(s)" in lines[0] and "AAA" in lines[0]
+
+
+def test_an_old_option_source_spelling_is_read_under_its_current_name():
+    from ba2_common.core.market_condition_store import manifest_option_source
+
+    assert manifest_option_source({"option_source": "thetadata-eod-parquet-v1"}) == "thetadata"
+    assert manifest_option_source({"option_source": "alphavantage"}) == "alphavantage"
+    assert manifest_option_source({}) is None
+
+
+def test_a_programming_error_in_a_live_read_propagates_in_enforce_mode(monkeypatch):
+    """Enforce-mode convention: expected I/O / data faults become an unknown, a programming error
+    propagates (the entry pass isolates it per recommendation)."""
+    from ba2_common.core.market_condition_iv_live import ChainLiveReader
+
+    class _Bug(ChainLiveReader):
+        option_source = "alphavantage"
+
+        def _evidence(self, symbol, session):
+            raise TypeError("a bug")
+
+    class _Io(ChainLiveReader):
+        option_source = "alphavantage"
+
+        def _evidence(self, symbol, session):
+            raise OSError("disk")
+
+    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
+    with pytest.raises(TypeError):
+        _Bug(IV_PROFILE).observe("AAA", SESSION)
+    assert _Io(IV_PROFILE).observe("AAA", SESSION).by_field()[FIELD_IV_RV_RATIO].status == STATUS_NO_CONTEXT

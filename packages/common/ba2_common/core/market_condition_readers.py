@@ -32,6 +32,8 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
+from collections.abc import Mapping as _AbcMapping
+from types import MappingProxyType
 from typing import Any, Dict, Hashable, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -756,7 +758,17 @@ class CompositeMarketConditionReader:
         values: Dict[str, Observation] = {}
         versions: Dict[str, str] = {}
         any_row = False
+        lazy = []
         for reader in self.readers:
+            if getattr(reader, "live_chain", False):
+                # A CHAIN profile's live reader (iv-v1) is NOT asked here: asking would fetch an option
+                # chain for every market leaf of the expert, an OHLCV leaf included. Its fields are
+                # resolved only when a condition actually reads one (``_LazyChainRow``), straight from
+                # that reader -- which memoises a computed row and never a refusal, so a transient
+                # failure is retried on the next pass instead of living in this memo all day.
+                lazy.append(reader)
+                any_row = True
+                continue
             row = reader.observe(symbol, session)
             if row is None:
                 missing = Observation(None, STATUS_MISSING_SESSION,
@@ -770,13 +782,60 @@ class CompositeMarketConditionReader:
             for name, obs in row.by_field().items():
                 values[name] = obs
                 versions[name] = row.calc_versions[name]
-        merged = FeatureRow(values=values, calc_versions=versions) if any_row else None
+        if lazy:
+            merged = _LazyChainRow(values, versions, lazy, symbol, session)
+        else:
+            merged = FeatureRow(values=values, calc_versions=versions) if any_row else None
         with self._lock:
             self._memo[key] = merged
             self._memo.move_to_end(key)
             while len(self._memo) > self._memo_size:
                 self._memo.popitem(last=False)
         return merged
+
+
+class _LazyFields(_AbcMapping):
+    """The merged fields of a composite row whose CHAIN-profile fields resolve on first read."""
+
+    def __init__(self, eager: Dict[str, Observation], lazy: Sequence[Any], symbol: str, session: date):
+        self._eager = eager
+        self._owner = {spec.name: r for r in lazy for spec in PROFILES[r.profile].fields}
+        self._symbol, self._session = symbol, session
+        self._order = list(eager) + [n for n in self._owner if n not in eager]
+
+    def __getitem__(self, name: str) -> Observation:
+        if name in self._eager:
+            return self._eager[name]
+        reader = self._owner[name]                      # KeyError for a field no profile serves
+        row = reader.observe(self._symbol, self._session)
+        return row.by_field()[name]
+
+    def __iter__(self):
+        return iter(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+
+class _LazyChainRow:
+    """A composite's merged row when one of its profiles is a live CHAIN reader (see
+    ``CompositeMarketConditionReader.observe``). Duck-types ``FeatureRow`` (``by_field``,
+    ``calc_versions``); only ever built for a composite holding a chain reader, so every other
+    composite still returns the plain ``FeatureRow`` it always did."""
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, eager: Dict[str, Observation], versions: Dict[str, str], lazy: Sequence[Any],
+                 symbol: str, session: date):
+        self._fields = _LazyFields(dict(eager), lazy, symbol, session)
+        merged_versions = dict(versions)
+        for r in lazy:
+            for spec in PROFILES[r.profile].fields:
+                merged_versions.setdefault(spec.name, r.calc_version)
+        self.calc_versions = MappingProxyType(merged_versions)
+
+    def by_field(self) -> Mapping[str, Observation]:
+        return self._fields
 
 
 def capturing_reader_for(reader: Any, capture: Any, *, source_profile: str,

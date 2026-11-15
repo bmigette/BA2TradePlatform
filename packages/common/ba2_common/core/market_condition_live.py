@@ -1018,6 +1018,20 @@ def market_condition_decision_scope(*, expert_instance_id: Optional[Any] = None,
         yield state
     finally:
         _DECISION.reset(token)
+        _flush_chain_pass_summaries(resolver)
+
+
+def _flush_chain_pass_summaries(resolver: Any) -> None:
+    """End of a decision pass: each CHAIN reader (iv-v1 live) logs its one-per-reason refusal
+    summary. A resolver without a chain reader -- every other expert -- does nothing here."""
+    readers = getattr(resolver.reader, "readers", None) or (resolver.reader,)
+    for r in readers:
+        flush = getattr(r, "flush_pass_summary", None) if getattr(r, "live_chain", False) else None
+        if flush is not None:
+            try:
+                flush()
+            except Exception as e:  # noqa: BLE001 -- a log summary must never fail the pass
+                absorb_if_benign(e, OSError, ValueError)
 
 
 def run_in_decision_context(fn: Callable) -> Callable:

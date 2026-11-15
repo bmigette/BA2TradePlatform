@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
@@ -79,6 +80,7 @@ class IvEvidence:
     window_status: str = STATUS_VALID
     window_reason: str = ""
     failure: str = ""
+    session: Optional[date] = None
 
 
 def chain_bytes(chain: Any) -> bytes:
@@ -104,6 +106,48 @@ def chain_from_bytes(raw: bytes) -> Any:
     return ChainQuotes(e.copy(), c, k.copy(), b.copy(), a.copy())
 
 
+#: Capture keeps only the contracts the computation can read: the 7..130-day band is already all a
+#: chain holds; within it, strikes are trimmed to the narrowest band around each expiry's forward
+#: whose RECOMPUTED row is identical to the live one (else the full chain is kept). Exactness is
+#: checked, never assumed.
+_TRIM_BANDS = (0.15, 0.30, 0.5)
+
+
+def _trimmed_chain(ev: "IvEvidence") -> Any:
+    from ba2_common.core import implied_vol as iv
+
+    chain = ev.chain
+    if chain is None or not len(chain):
+        return chain
+    compute = CHAIN_COMPUTE_BY_PROFILE["iv-v1"]
+    session = _session_of(ev)
+    if session is None:
+        return chain
+    want = dict(ev.row.by_field())
+    forwards = {}
+    for e in chain.expiries():
+        lo, hi = chain.rows_for(e)
+        calls, puts = iv._side_quotes(chain, lo, hi)
+        forwards[e] = iv._forward_from(calls, puts)
+    for band in _TRIM_BANDS:
+        keep = np.zeros(len(chain), dtype=bool)
+        for e, F in forwards.items():
+            if F is None:
+                continue
+            lo, hi = chain.rows_for(e)
+            k = chain.strike[lo:hi]
+            keep[lo:hi] = (k >= F * (1 - band)) & (k <= F * (1 + band))
+        trimmed = chain.select(keep)
+        row = compute(session, trimmed, ev.window, ev.window_status, ev.window_reason)
+        if dict(row.by_field()) == want:
+            return trimmed
+    return chain
+
+
+def _session_of(ev: "IvEvidence") -> Optional[date]:
+    return getattr(ev, "session", None)
+
+
 def _uniform(profile: str, status: str, reason: str) -> FeatureRow:
     return FeatureRow.uniform(PROFILES[profile], status, reason)
 
@@ -123,7 +167,12 @@ class ChainLiveReader:
         self._memo: "OrderedDict[Hashable, IvEvidence]" = OrderedDict()
         self._memo_size = int(memo_size)
         self._lock = threading.Lock()
-        self._warned: set = set()
+        #: THIS decision pass (``market_condition_live.current_decision()`` -- one object per pass):
+        #: its refusals are memoised for the pass only (a second leaf on the same symbol costs
+        #: nothing) and summarised once per reason when the pass ends (``flush_pass_summary``).
+        self._pass_token: Any = None
+        self._pass_refusals: Dict[Hashable, IvEvidence] = {}
+        self._pass_reasons: "OrderedDict[str, list]" = OrderedDict()
         #: rows computed / refused (visibility for tests and diagnostics).
         self.computed = 0
         self.refused = 0
@@ -132,33 +181,82 @@ class ChainLiveReader:
     def _evidence(self, symbol: str, session: date) -> IvEvidence:
         raise NotImplementedError
 
-    def _refusal(self, symbol: str, session: date, reason: str) -> IvEvidence:
+    def _refusal(self, symbol: str, session: date, reason: str, kind: str = "error") -> IvEvidence:
+        """An unknown for every field of the profile, with ``reason``. Counted, and summarised per
+        ``kind`` (a stable category: ``no_key``, ``rate_limit``, ``http``, ``not_published``,
+        ``bad_chain``, ``cache``, ``error``) at the end of the pass -- one WARNING per kind, never
+        one per symbol per expert."""
         self.refused += 1
-        key = (symbol, session, reason)
-        if key not in self._warned:
-            self._warned.add(key)
-            from ba2_common.logger import logger
-
-            logger.warning(f"{self.profile} live ({self.option_source}) {symbol}@{session}: {reason} -- "
-                           f"every gate on its fields refuses this entry")
+        with self._lock:
+            self._pass_reasons.setdefault(kind, []).append((symbol, reason))
         return IvEvidence(row=_uniform(self.profile, STATUS_NO_CONTEXT, reason), failure=reason)
+
+    def flush_pass_summary(self) -> None:
+        """Log one WARNING per refusal kind of the pass just ended (counts and the first symbols)."""
+        with self._lock:
+            reasons, self._pass_reasons = self._pass_reasons, OrderedDict()
+        if not reasons:
+            return
+        from ba2_common.logger import logger
+
+        for kind, hits in reasons.items():
+            symbols = list(dict.fromkeys(sym for sym, _r in hits))
+            shown = ", ".join(symbols[:5]) + (f" and {len(symbols) - 5} more" if len(symbols) > 5 else "")
+            logger.warning(f"{self.profile} live ({self.option_source}): {kind}: {len(symbols)} symbol(s) "
+                           f"refused this pass ({shown}); e.g. {hits[0][1]} -- every gate on their fields "
+                           f"refused the entry")
+
+    def _current_pass(self) -> Any:
+        try:
+            from ba2_common.core.market_condition_live import current_decision
+        except ImportError:  # pragma: no cover -- ba2_common always ships it
+            return None
+        return current_decision()
+
+    def peek_evidence(self, symbol: str, session: date) -> Optional[IvEvidence]:
+        """The evidence already held for (symbol, session) -- a computed row or this pass's refusal --
+        WITHOUT fetching anything. The capture recorder uses it, so recording an OHLCV leaf never
+        triggers a chain fetch."""
+        key = (str(symbol).upper(), session)
+        with self._lock:
+            hit = self._memo.get(key)
+            if hit is None and self._pass_token is not None and self._pass_token is self._current_pass():
+                hit = self._pass_refusals.get(key)
+        return hit
 
     def observe_evidence(self, symbol: str, session: date) -> IvEvidence:
         key = (str(symbol).upper(), session)
+        token = self._current_pass()
         with self._lock:
             hit = self._memo.get(key)
             if hit is not None:
                 self._memo.move_to_end(key)
                 return hit
+            if token is not None and token is not self._pass_token:
+                self._pass_token, self._pass_refusals = token, {}
+            if token is not None and key in self._pass_refusals:
+                return self._pass_refusals[key]        # same pass: the second leaf costs nothing
         try:
             ev = self._evidence(key[0], session)
-        except Exception as e:  # noqa: BLE001 -- a live read failure is an unknown, never a pass or a crash
-            ev = self._refusal(key[0], session, f"{type(e).__name__}: {e}")
-        if not ev.failure:
-            self.computed += 1
+        except Exception as e:
+            # ENFORCE-MODE CONVENTION (failure_modes): the EXPECTED faults of a live read -- I/O and
+            # parse errors of the cached chain or the bar file, a value the data cannot satisfy --
+            # become an unknown (the gate refuses, countably). A programming error (TypeError,
+            # AttributeError, ...) PROPAGATES: the live entry pass evaluates each recommendation in
+            # its own try/except (TradeManager.process_expert_recommendations_after_analysis), so it
+            # fails THAT symbol's evaluation loudly without touching other symbols or experts.
+            from ba2_common.core.failure_modes import absorb_if_benign
+
+            absorb_if_benign(e, OSError, ValueError, KeyError, EOFError)
+            ev = self._refusal(key[0], session, f"{type(e).__name__}: {e}", "error")
         with self._lock:
-            # A FAILURE is not memoised: the next pass may find the chain published / the key set.
-            if not ev.failure:
+            if ev.failure:
+                # NEVER memoised beyond this pass: the next pass may find the chain published, the
+                # key set, the budget free.
+                if token is not None and token is self._pass_token:
+                    self._pass_refusals[key] = ev
+            else:
+                self.computed += 1
                 self._memo[key] = ev
                 while len(self._memo) > self._memo_size:
                     self._memo.popitem(last=False)
@@ -205,10 +303,17 @@ class CapturingChainReader:
             self._capture.note_failure(f"{self.profile} chain window {symbol}@{session} not recorded", exc)
         return ev.row
 
+    def flush_pass_summary(self) -> None:
+        self.inner.flush_pass_summary()
+
     def record(self, symbol: str, session: date, row: Any = None) -> None:
+        # The condition's recorder runs after EVERY valid market read, an OHLCV leaf's included: only
+        # evidence this reader already holds is recorded -- never a fetch on behalf of another field.
         try:
-            self._record(str(symbol).upper(), session, self.inner.observe_evidence(symbol, session))
-        except Exception as exc:  # noqa: BLE001
+            ev = self.inner.peek_evidence(symbol, session)
+            if ev is not None:
+                self._record(str(symbol).upper(), session, ev)
+        except Exception as exc:  # noqa: BLE001 -- recording is evidence, not a dependency
             self._capture.note_failure(f"{self.profile} chain window {symbol}@{session} not recorded", exc)
 
     def _record(self, symbol: str, session: date, ev: IvEvidence) -> None:
@@ -217,7 +322,7 @@ class CapturingChainReader:
         from ba2_common.core.replay.observe import sanitize_identity
         from ba2_common.core.replay.schemas import ReplayStatus
 
-        chain_raw = chain_bytes(ev.chain) if ev.chain is not None else None
+        chain_raw = chain_bytes(_trimmed_chain(ev)) if ev.chain is not None else None
         win_raw = normalized_window_bytes(*ev.window) if ev.window is not None else None
         chain_dg = _digest(b"mc-chain/v1\x00", chain_raw) if chain_raw is not None else None
         win_dg = _digest(b"mc-window/v1\x00", win_raw) if win_raw is not None else None
@@ -236,7 +341,10 @@ class CapturingChainReader:
             "statuses": {f: o.status for f, o in fields.items()},
             "reasons": {f: o.reason for f, o in fields.items()},
             "chain_digest": chain_dg,
-            "chain_b64": base64.b64encode(chain_raw).decode("ascii") if chain_raw is not None else None,
+            # zlib + base64 (the replay codec has no bytes type); the digest is over the RAW bytes.
+            "chain_encoding": "zlib",
+            "chain_b64": (base64.b64encode(zlib.compress(chain_raw, 6)).decode("ascii")
+                          if chain_raw is not None else None),
             "window_digest": win_dg,
             "window_f8_b64": base64.b64encode(win_raw).decode("ascii") if win_raw is not None else None,
             "window_status": ev.window_status, "window_reason": ev.window_reason,
@@ -311,6 +419,12 @@ class ReplayChainReader:
         chain = window = None
         if p.get("chain_b64") is not None:
             raw = base64.b64decode(p["chain_b64"])
+            if p.get("chain_encoding") == "zlib":
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error:
+                    raise ReplayMiss("market_condition_chain_digest", request_identity=ident,
+                                     detail="the retained chain does not decompress (corrupt evidence)") from None
             if _digest(b"mc-chain/v1\x00", raw) != p["chain_digest"]:
                 raise ReplayMiss("market_condition_chain_digest", request_identity=ident,
                                  detail="the retained chain does not hash to its recorded digest")
