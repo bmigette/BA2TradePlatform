@@ -7277,11 +7277,17 @@ def _data_rebase_from_optimize_args(tokens) -> dict:
             raise ValueError(f"{len(raw)} --market-condition-manifest digest(s) for profile(s) {profiles!r}")
         else:
             manifests = dict(zip(profiles, raw))
-    return {"static_universe": (None if screener or not universe
+    spec = {"static_universe": (None if screener or not universe
                                 else [s.strip().upper() for s in universe.split(",") if s.strip()]),
             "screener_store": value("--screener-store") if screener else None,
             "manifests": manifests,
             "exclude_symbols": _resolve_exclude_symbols_arg(value("--exclude-symbols"))}
+    # ``screener_panel``: the daily panel a live-simulation screen reads (``--screener-panel``, the option
+    # STYLE jobs). Present only when a screener command states one, so every other command's spec (the stock
+    # grid's) is unchanged.
+    if screener and value("--screener-panel"):
+        spec["screener_panel"] = value("--screener-panel")
+    return spec
 
 
 def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forward test") -> dict:
@@ -7296,7 +7302,10 @@ def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forw
       (``screener_opt.gate_only``, ``--screener-gate-store``: the option grids' per-bar price cap)
       is a STATIC run: its universe is the static ``--universe``, so it takes the current one, and
       its gate store is kept as stored (the option walk-forward cell name carries the gate-store
-      path, so a cell is only ever tested with the store it was trained with);
+      path, so a cell is only ever tested with the store it was trained with). A daily-panel
+      screen (``--screener-panel``, the option style jobs) reads the current command's panel
+      (``rerun_handler.with_screener_panel``: same criteria version, recorded as
+      ``_screener_panel_override``); without one the stored panel is kept;
     * exclusions: the stored list PLUS the current one, removed from the universe (an exclusion is
       never lifted by a rebase);
     * market-condition manifests: the current digest per profile, validated for coverage and window
@@ -7316,6 +7325,12 @@ def _rebase_run_data(backtest_block: dict, spec: dict, command: str = "walk-forw
     if screener:
         if spec.get("screener_store"):
             block["screener_opt"]["store"] = spec["screener_store"]
+        if spec.get("screener_panel"):
+            # The current command's daily panel (its criteria version must be the train job's; a
+            # store-only screen block is refused): the rerun tool's own re-pointing, so the panel
+            # path, fingerprint and checks are the ones every panel re-run uses.
+            from app.services.backtest.rerun_handler import with_screener_panel
+            block = with_screener_panel(block, spec["screener_panel"], row_id=command)
         universe = list(block.get("enabled_instruments") or [])
     else:
         if not spec.get("static_universe"):
