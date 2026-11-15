@@ -336,7 +336,7 @@ export default function WalkForwardDetail() {
       <div className={card}>
         <h2 className={h2}>
           Stitched out-of-sample (fold winners)
-          {rep.verdict && <span className={`ml-3 text-sm font-semibold ${rep.verdict === 'PASS' ? 'text-emerald-600' : rep.verdict === 'FAIL' ? 'text-red-600' : 'text-purple-600'}`}>verdict {rep.verdict}</span>}
+          {rep.verdict && <span className={`ml-3 text-sm font-semibold ${rep.verdict === 'PASS' ? 'text-emerald-600' : (rep.verdict === 'FAIL' || rep.verdict === 'ERROR') ? 'text-red-600' : 'text-purple-600'}`}>verdict {rep.verdict}</span>}
           {rep.winners_passed != null && <span className="ml-3 text-sm font-normal text-gray-500">{rep.winners_passed} fold winner(s) passed</span>}
         </h2>
         {rep.winner_stitch ? <StitchCards s={rep.winner_stitch} partial={!!rep.stitch_partial} /> : <p className="text-sm text-gray-500">No fold has been tested yet.</p>}
