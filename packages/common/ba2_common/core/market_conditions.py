@@ -1450,19 +1450,21 @@ def live_unavailable_reason(profile: str, option_source: Optional[str] = None) -
     return None
 
 
-#: CERTIFIED-EQUIVALENT live serving: profile -> trained option source -> the live SERVING kinds allowed
+#: CERTIFIED-EQUIVALENT live serving: profile -> trained option source -> the live SERVING sources allowed
 #: to serve its gates. ``alphavantage`` = the vendor's HISTORICAL_OPTIONS chain of the prior session;
-#: ``broker:<kind>`` = a quote-source account's snapshot captured between the prior session's close and
-#: the next open (``option_chain_quotes``). A pairing is listed only with evidence that it serves the SAME
-#: end-of-day quotes the gates were trained on (:data:`PAIRING_EVIDENCE`); everything else is refused.
+#: ``tastytrade`` = TastyTrade's market-data snapshot (real exchange quotes, app-level market-data
+#: credentials) captured between the prior session's close and the next open (``option_chain_quotes``).
+#: A pairing is listed only with evidence that it serves the SAME end-of-day quotes the gates were trained
+#: on (:data:`PAIRING_EVIDENCE`); everything else is refused. A broker feed is only ever eligible when its
+#: quotes are real OPRA quotes (an "indicative" feed is not: measured 2026-11-15 on Alpaca's).
 LIVE_SERVING_PAIRINGS: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    IV_PROFILE: {"alphavantage": ("alphavantage", "broker:tastytrade")},
+    IV_PROFILE: {"alphavantage": ("alphavantage", "tastytrade")},
 }
 
 #: (trained source, serving kind) -> the evidence the pairing rests on (also in the design note).
 PAIRING_EVIDENCE: Dict[Tuple[str, str], str] = {
     ("alphavantage", "alphavantage"): "same vendor, same endpoint as the store (live = store, tests pin it)",
-    ("alphavantage", "broker:tastytrade"): (
+    ("alphavantage", "tastytrade"): (
         "TastyTrade REST market data fetched Sunday 2026-11-15 for session 2026-11-13: 8 underlyings "
         "(MSFT KO AAPL JPM XOM NVDA ISRG EMN), 3,478 contracts, 100% identical bid/ask with the Alpha "
         "Vantage chain and identical iv-v1 fields (1 session; tools/certify_broker_iv_chain.py extends it)"),

@@ -13,7 +13,7 @@ from ba2_common.core.market_condition_iv_live import (
 from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
 from ba2_common.core.market_conditions import IV_PROFILE
 from ba2_common.core.option_chain_quotes import (
-    OptionChainQuote, OptionChainQuoteSnapshot, OptionChainQuotesUnsupported, session_close_and_next_open,
+    OptionChainQuote, OptionChainQuoteSnapshot, session_close_and_next_open,
     validate_prior_session_snapshot,
 )
 
@@ -23,13 +23,14 @@ from ba2_common.core.option_chain_quotes import (
     (None, None), ("", None), ("  ", None),
     ("alphavantage", LiveChainSource("alphavantage", "alphavantage")),
     ("AlphaVantage", LiveChainSource("AlphaVantage", "alphavantage")),
-    ("account:12", LiveChainSource("account:12", "broker", 12)),
+    ("tastytrade", LiveChainSource("tastytrade", "tastytrade")),
+    ("TastyTrade", LiveChainSource("TastyTrade", "tastytrade")),
 ])
 def test_the_setting_parses(raw, want):
     assert parse_live_chain_source(raw) == want
 
 
-@pytest.mark.parametrize("raw", ["account:", "account:x", "account:0", "thetadata", "broker"])
+@pytest.mark.parametrize("raw", ["account:3", "thetadata", "broker", "alpaca"])
 def test_a_malformed_setting_raises(raw):
     with pytest.raises(ValueError):
         parse_live_chain_source(raw)
@@ -38,16 +39,16 @@ def test_a_malformed_setting_raises(raw):
 # --------------------------------------------------------------------------- pairings
 def test_only_certified_pairings_serve_gates_trained_on_alphavantage():
     assert mc.pairing_unavailable_reason(IV_PROFILE, "alphavantage", "alphavantage") is None
-    assert mc.pairing_unavailable_reason(IV_PROFILE, "alphavantage", "broker:tastytrade") is None
-    assert "not certified" in mc.pairing_unavailable_reason(IV_PROFILE, "alphavantage", "broker:alpaca_opra")
-    assert "not certified" in mc.pairing_unavailable_reason(IV_PROFILE, "thetadata", "broker:tastytrade")
+    assert mc.pairing_unavailable_reason(IV_PROFILE, "alphavantage", "tastytrade") is None
+    assert "not certified" in mc.pairing_unavailable_reason(IV_PROFILE, "alphavantage", "alpaca")
+    assert "not certified" in mc.pairing_unavailable_reason(IV_PROFILE, "thetadata", "tastytrade")
     assert mc.pairing_unavailable_reason("ohlcv-v1", "x", "y") is None
-    for pair in (("alphavantage", "alphavantage"), ("alphavantage", "broker:tastytrade")):
+    for pair in (("alphavantage", "alphavantage"), ("alphavantage", "tastytrade")):
         assert pair in mc.PAIRING_EVIDENCE
 
 
 class _Reader(ChainLiveReader):
-    option_source = "broker"
+    option_source = "x"
 
     def __init__(self, profile, serving_kind, **kw):
         super().__init__(profile)
@@ -65,40 +66,40 @@ def registry():
     clear_live_chain_readers()
 
 
-def _reader_for(live_source, kind="broker:tastytrade", unavailable_reason=None, trained="alphavantage"):
+def _reader_for(live_source, kind="tastytrade", unavailable_reason=None, trained="alphavantage"):
     from ba2_common.core.market_condition_live import _chain_live_reader
 
-    register_live_chain_reader("broker", lambda p, **kw: _Reader(p, kind, **kw))
+    register_live_chain_reader("tastytrade", lambda p, **kw: _Reader(p, kind, **kw))
     register_live_chain_reader("alphavantage", lambda p, **kw: _Reader(p, "alphavantage", **kw))
     return _chain_live_reader(IV_PROFILE, trained, "root", "fmp", live_source, unavailable_reason)
 
 
 def test_the_chain_reader_follows_the_setting(registry):
-    r = _reader_for("account:7")
-    assert isinstance(r, _Reader) and r.kw["account_id"] == 7 and r.serving_kind == "broker:tastytrade"
+    r = _reader_for("tastytrade")
+    assert isinstance(r, _Reader) and r.serving_kind == "tastytrade" and set(r.kw) == {"cache_root", "source_profile"}
     r = _reader_for("alphavantage")
-    assert isinstance(r, _Reader) and "account_id" not in r.kw
+    assert isinstance(r, _Reader) and r.serving_kind == "alphavantage"
     for raw, why in ((None, "is not set"), ("nope", "malformed")):
         r = _reader_for(raw)
         assert isinstance(r, LiveUnavailableMarketConditionReader) and why in r.reason
         assert "iv_live_chain_source" in r.reason
-    r = _reader_for("account:7", kind="broker:alpaca_opra")
+    r = _reader_for("tastytrade", kind="indicative")
     assert isinstance(r, LiveUnavailableMarketConditionReader) and "not certified" in r.reason
-    r = _reader_for("account:7", unavailable_reason="expert instance 3: set screener_symbol_universe")
+    r = _reader_for("tastytrade", unavailable_reason="expert instance 3: set screener_symbol_universe")
     assert isinstance(r, LiveUnavailableMarketConditionReader) and "screener_symbol_universe" in r.reason
-    # the universe bound only matters to a broker source
+    # the universe bound only matters to a captured source
     assert isinstance(_reader_for("alphavantage", unavailable_reason="x"), _Reader)
-    r = _reader_for("account:7", trained="thetadata")
+    r = _reader_for("tastytrade", trained="thetadata")
     assert isinstance(r, LiveUnavailableMarketConditionReader)
 
 
-def test_an_account_that_cannot_serve_quotes_refuses_with_its_reason(registry):
+def test_a_source_that_cannot_serve_refuses_with_its_reason(registry):
     from ba2_common.core.market_condition_live import _chain_live_reader
 
-    register_live_chain_reader("broker", lambda p, **kw: LiveUnavailableMarketConditionReader(
-        p, "IBKRAccount does not provide option chain quotes"))
-    r = _chain_live_reader(IV_PROFILE, "alphavantage", "root", "fmp", "account:3")
-    assert isinstance(r, LiveUnavailableMarketConditionReader) and "IBKRAccount" in r.reason
+    register_live_chain_reader("tastytrade", lambda p, **kw: LiveUnavailableMarketConditionReader(
+        p, "TastyTrade market-data credentials are not set (tastytrade_market_client_secret ...)"))
+    r = _chain_live_reader(IV_PROFILE, "alphavantage", "root", "fmp", "tastytrade")
+    assert isinstance(r, LiveUnavailableMarketConditionReader) and "tastytrade_market_client_secret" in r.reason
 
 
 # --------------------------------------------------------------------------- bounded universes
@@ -121,24 +122,13 @@ def test_bounded_universes():
     assert bounded_iv_universe(_Expert([]))[0] is None
 
 
-# --------------------------------------------------------------------------- account default
-def test_the_account_default_is_unsupported():
-    from ba2_common.core.interfaces.AccountInterface import AccountInterface
-
-    assert AccountInterface.supports_option_chain_quote_snapshot is False
-    with pytest.raises(OptionChainQuotesUnsupported, match="does not provide option chain quotes"):
-        AccountInterface.get_option_chain_quote_snapshot(type("Fake", (), {})(), "MSFT",
-                                                         expiry_min=date(2026, 1, 1), expiry_max=date(2026, 2, 1),
-                                                         strike_band=0.2)
-
-
 # --------------------------------------------------------------------------- validity rule edges
 def _snap(session, updated, n=12, summary=None, spot=100.0):
     exp = session + timedelta(days=30)
     quotes = tuple(OptionChainQuote(f"X{exp:%y%m%d}{cp}{int(k * 1000):08d}", exp, "call" if cp == "C" else "put",
                                     k, 1.0, 1.1, summary or session, updated)
                    for k in (98.0, 99.0, 100.0, 101.0, 102.0, 103.0) for cp in ("C", "P"))[:n]
-    return OptionChainQuoteSnapshot("X", "tastytrade", updated, spot, session, quotes, len(quotes), 1)
+    return OptionChainQuoteSnapshot("X", "tastytrade", updated, spot, session, quotes, len(quotes))
 
 
 def test_an_early_close_session_is_measured_from_its_own_close():

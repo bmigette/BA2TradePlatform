@@ -1090,13 +1090,13 @@ def _chain_live_reader(profile: str, option_source: Optional[str], cache_root: O
                        unavailable_reason: Optional[str] = None) -> Any:
     """The live reader of a CHAIN profile for gates trained on ``option_source``, served by the
     configured LIVE IV CHAIN SOURCE (app setting ``iv_live_chain_source``: ``alphavantage`` or
-    ``account:<id>``), or a :class:`LiveUnavailableMarketConditionReader` naming why not: the trained
-    source is unknown, the setting is unset or malformed, no reader is wired, the account cannot serve
-    quotes, the pairing (trained -> serving kind) is not certified, or ``unavailable_reason`` (the
-    expert's universe is unbounded for a broker source)."""
+    ``tastytrade``), or a :class:`LiveUnavailableMarketConditionReader` naming why not: the trained source
+    is unknown, the setting is unset or malformed, no reader is wired, the source cannot serve (blank
+    credentials), the pairing (trained -> serving source) is not certified, or ``unavailable_reason`` (the
+    expert's universe is unbounded for a captured source)."""
     from ba2_common.core.market_conditions import live_unavailable_reason, pairing_unavailable_reason
     from ba2_common.core.market_condition_iv_live import (
-        LIVE_CHAIN_SOURCE_SETTING, SOURCE_BROKER, configured_live_chain_source_value, live_chain_reader_factory,
+        LIVE_CHAIN_SOURCE_SETTING, configured_live_chain_source_value, live_chain_reader_factory,
         parse_live_chain_source,
     )
     from ba2_common.core.market_condition_readers import LiveUnavailableMarketConditionReader
@@ -1116,9 +1116,8 @@ def _chain_live_reader(profile: str, option_source: Optional[str], cache_root: O
     if choice is None:
         return unavailable(f"market-condition profile {profile!r}: app setting {LIVE_CHAIN_SOURCE_SETTING} is not "
                            f"set -- choose where live reads the prior session's option chain ('alphavantage' or "
-                           f"a quote-source account, Settings > Data providers); its gates refuse every live "
-                           f"entry")
-    if unavailable_reason and choice.source == SOURCE_BROKER:
+                           f"'tastytrade', Settings > Data providers); its gates refuse every live entry")
+    if unavailable_reason and choice.captured:
         return unavailable(f"market-condition profile {profile!r}: {unavailable_reason}; its gates refuse every "
                            f"live entry")
     factory = live_chain_reader_factory(choice.source)
@@ -1126,8 +1125,7 @@ def _chain_live_reader(profile: str, option_source: Optional[str], cache_root: O
         return unavailable(f"market-condition profile {profile!r}: no live reader is wired for live IV chain "
                            f"source {choice.source!r} in this process (ba2_trade_platform seam_wiring registers "
                            f"it); its gates refuse every live entry")
-    extra = {"account_id": choice.account_id} if choice.source == SOURCE_BROKER else {}
-    reader = factory(profile, cache_root=cache_root, source_profile=source_profile, **extra)
+    reader = factory(profile, cache_root=cache_root, source_profile=source_profile)
     if getattr(reader, "live_unavailable", False):
         return reader
     kind = getattr(reader, "serving_kind", "") or getattr(reader, "option_source", "")
@@ -1438,16 +1436,16 @@ class PerInstanceMarketConditionResolver:
         return configured_live_chain_source_value()
 
     def universe_unbounded_reason(self, expert_instance_id: Any, live_source: Optional[str]) -> Optional[str]:
-        """For a BROKER live source only: why the expert's universe is not bounded (a screener with an
-        empty ``screener_symbol_universe``, an analysis-time selection), else None."""
+        """For a CAPTURED live source only (``tastytrade``): why the expert's universe is not bounded (a
+        screener with an empty ``screener_symbol_universe``, an analysis-time selection), else None."""
         from ba2_common.core.instance_resolver import get_instance_resolver
-        from ba2_common.core.market_condition_iv_live import SOURCE_BROKER, bounded_iv_universe, parse_live_chain_source
+        from ba2_common.core.market_condition_iv_live import bounded_iv_universe, parse_live_chain_source
 
         try:
             choice = parse_live_chain_source(live_source)
         except ValueError:
             return None                    # the reader refuses with the malformed-setting reason
-        if choice is None or choice.source != SOURCE_BROKER:
+        if choice is None or not choice.captured:
             return None
         try:
             expert = get_instance_resolver().get_expert_instance(int(expert_instance_id))

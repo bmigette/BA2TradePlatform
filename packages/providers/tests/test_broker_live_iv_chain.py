@@ -28,7 +28,7 @@ import pytest
 
 from ba2_common.core.market_conditions import CHAIN_COMPUTE_BY_PROFILE, IV_PROFILE, STATUS_NO_CONTEXT, STATUS_VALID
 from ba2_common.core.option_chain_quotes import (
-    FETCH_STRIKE_BAND, OptionChainQuotesFetchError, OptionChainQuotesUnsupported, fetch_expiry_window,
+    FETCH_STRIKE_BAND, OptionChainQuotesFetchError, OptionChainSourceUnavailable, fetch_expiry_window,
     validate_prior_session_snapshot,
 )
 from ba2_providers.market_conditions.av_live_chain import AlphaVantageLiveChainReader, chain_quotes, read_cached
@@ -42,7 +42,7 @@ FIX = Path(__file__).parent / "fixtures" / "broker_iv"
 S = date(2026, 11, 13)
 SYMS = ("MSFT", "NVDA", "EMN")
 FETCHED = datetime(2026, 11, 15, 11, 51, tzinfo=timezone.utc)
-KIND = "broker:tastytrade"
+KIND = "tastytrade"
 
 
 def _fx(sym):
@@ -86,7 +86,7 @@ def _get_json(fx, calls=None):
 def _snapshot(sym, band=FETCH_STRIKE_BAND, calls=None):
     lo, hi = fetch_expiry_window(S)
     return fetch_chain_quote_snapshot(_get_json(_fx(sym), calls), sym, expiry_min=lo, expiry_max=hi,
-                                      strike_band=band, account_id=7, now=lambda: FETCHED)
+                                      strike_band=band, now=lambda: FETCHED)
 
 
 def _av_row(root, sym, band=None):
@@ -100,11 +100,11 @@ def _av_row(root, sym, band=None):
 
 
 def _reader(root):
-    return BrokerLiveChainReader(IV_PROFILE, account_id=7, serving_kind=KIND, cache_root=str(root))
+    return BrokerLiveChainReader(IV_PROFILE, source=KIND, cache_root=str(root))
 
 
 def _capture(root, symbols, snapshot_fn, **kw):
-    return capture_chains(symbols, S, snapshot_fn=snapshot_fn, account_id=7, serving_kind=KIND,
+    return capture_chains(symbols, S, snapshot_fn=snapshot_fn, source=KIND,
                           cache_root=str(root), pause_s=0, stop=threading.Event(), **kw)
 
 
@@ -135,13 +135,13 @@ def test_the_cached_chain_carries_the_snapshot_facts(root):
     _capture(root, ["MSFT"], lambda s: _snapshot(s))
     from ba2_providers.market_conditions.av_live_chain import chain_path
 
-    facts = read_snapshot_facts(chain_path(str(root), "MSFT", S, broker_chain_dir(7)))
-    assert facts["account_id"] == 7 and facts["serving_kind"] == KIND
+    facts = read_snapshot_facts(chain_path(str(root), "MSFT", S, broker_chain_dir(KIND)))
+    assert facts["source_kind"] == "tastytrade" and facts["serving_kind"] == KIND
     assert facts["summary_dates"] == {S.isoformat(): 894}
     assert facts["updated_at_min"].startswith("2026-11-14T00:59") and facts["updated_at_max"].startswith("2026-11-14T00:59")
     assert facts["near_money_of_session"] == facts["near_money"] > 0
-    man = capture_manifest(str(root), 7, S)
-    assert man["symbols"]["MSFT"]["status"] == "captured" and man["serving_kind"] == KIND
+    man = capture_manifest(str(root), KIND, S)
+    assert man["symbols"]["MSFT"]["status"] == "captured" and man["source"] == KIND
 
 
 # --------------------------------------------------------------------------- the data validity rule
@@ -179,15 +179,15 @@ def test_an_invalid_snapshot_is_refused_never_cached_and_the_gate_says_why(root,
     assert "snapshot not the prior-session close" in verdict.reason
     rep = _capture(root, ["MSFT"], lambda s: snap)
     assert rep["captured"] == 0 and "MSFT" in rep["refused"]
-    assert read_cached(str(root), "MSFT", S, broker_chain_dir(7)) is None
-    entry = capture_manifest(str(root), 7, S)["symbols"]["MSFT"]
+    assert read_cached(str(root), "MSFT", S, broker_chain_dir(KIND)) is None
+    entry = capture_manifest(str(root), KIND, S)["symbols"]["MSFT"]
     assert entry["status"] == "refused" and entry["kind"] == kind and "summary_dates" in entry["facts"]
     row = _reader(root).observe("MSFT", S)
     assert all(o.status == STATUS_NO_CONTEXT and "snapshot not the prior-session close" in o.reason
                for o in row.values.values())
     # retried later in the window: a valid snapshot is then captured and served
     _capture(root, ["MSFT"], lambda s: _snapshot(s))
-    assert read_cached(str(root), "MSFT", S, broker_chain_dir(7)) is not None
+    assert read_cached(str(root), "MSFT", S, broker_chain_dir(KIND)) is not None
 
 
 def test_a_few_stale_far_contracts_are_dropped_like_missing_quotes_not_refused(root):
@@ -229,17 +229,18 @@ def test_one_failing_symbol_never_stops_the_run(root):
         return _snapshot(sym)
     rep = _capture(root, ["MSFT", "NVDA", "EMN"], snap)
     assert rep["captured"] == 2 and set(rep["failed"]) == {"NVDA"}
-    assert capture_manifest(str(root), 7, S)["symbols"]["NVDA"]["status"] == "failed"
+    assert capture_manifest(str(root), KIND, S)["symbols"]["NVDA"]["status"] == "failed"
 
 
-def test_an_unsupported_account_stops_the_run_with_its_reason(root):
+def test_rejected_credentials_stop_the_run_with_their_reason(root):
     def snap(sym):
-        raise OptionChainQuotesUnsupported("Alpaca option quotes require the OPRA feed")
+        raise OptionChainSourceUnavailable("TastyTrade rejected the market-data credentials (HTTP 401)")
     rep = _capture(root, ["MSFT", "NVDA"], snap)
     assert rep["unsupported"] and rep["captured"] == 0
-    man = capture_manifest(str(root), 7, S)["symbols"]
+    man = capture_manifest(str(root), KIND, S)["symbols"]
     assert {v["status"] for v in man.values()} == {"unsupported"}
-    assert "OPRA" in _reader(root).observe("NVDA", S).values["underlying_iv_rv_ratio_30_20"].reason
+    reason = _reader(root).observe("NVDA", S).values["underlying_iv_rv_ratio_30_20"].reason
+    assert "rejected the market-data credentials" in reason
 
 
 def test_the_stop_flag_stops_the_run(root):
@@ -248,7 +249,7 @@ def test_the_stop_flag_stops_the_run(root):
     def snap(sym):
         stop.set()
         return _snapshot(sym)
-    rep = capture_chains(["EMN", "MSFT", "NVDA"], S, snapshot_fn=snap, account_id=7, serving_kind=KIND,
+    rep = capture_chains(["EMN", "MSFT", "NVDA"], S, snapshot_fn=snap, source=KIND,
                          cache_root=str(root), pause_s=0, stop=stop)
     assert rep["stopped"] and rep["captured"] == 1 and rep["remaining"] == ["MSFT", "NVDA"]
 
@@ -286,8 +287,64 @@ def test_capture_records_the_serving_source_and_facts_and_replay_recomputes(root
                                            timing_policy="prior_session_v1")
     row = reader.observe("EMN", S)
     (p,) = [o["payload"] for o in cap.observations]
-    assert p["serving_kind"] == KIND and p["option_source"] == "broker" and p["chain_served_digest"]
-    assert p["source_facts"]["account_id"] == 7 and p["source_facts"]["summary_dates"] == {S.isoformat(): 24}
+    assert p["serving_kind"] == KIND and p["option_source"] == KIND and p["chain_served_digest"]
+    assert p["source_facts"]["source_kind"] == KIND and p["source_facts"]["summary_dates"] == {S.isoformat(): 24}
     assert p["source_facts"]["updated_at_min"] and p["source_facts"]["updated_at_max"]
-    replay = ReplayChainReader.from_payloads(json.loads(json.dumps([p])), profile=IV_PROFILE, option_source="broker")
+    replay = ReplayChainReader.from_payloads(json.loads(json.dumps([p])), profile=IV_PROFILE, option_source=KIND)
     assert dict(replay.observe("EMN", S).by_field()) == dict(row.by_field())
+
+
+# --------------------------------------------------------------------------- the market-data client
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body, self.text = status, body, json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+class _Http:
+    def __init__(self, token_status=200):
+        self.token_status, self.calls = token_status, []
+        self.headers = {}
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append(("POST", url))
+        return _Resp(self.token_status, {"access_token": "ACCESS-XYZ", "expires_in": 900})
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        self.calls.append(("GET", url))
+        assert headers["Authorization"] == "Bearer ACCESS-XYZ"
+        return _Resp(200, {"data": {"items": []}})
+
+
+SECRET, REFRESH = "CLIENT-SECRET-123", "REFRESH-TOKEN-456"
+
+
+def test_the_market_data_client_calls_only_market_data_paths_and_hides_its_credentials():
+    from ba2_providers.options.tastytrade_quotes import TastyTradeMarketDataClient
+
+    http = _Http()
+    c = TastyTradeMarketDataClient(SECRET, REFRESH, http=http)
+    assert SECRET not in repr(c) and REFRESH not in repr(c)
+    assert c.get_json("/market-data/by-type", {"equity": ["MSFT"]}) == {"items": []}
+    c.get_json("/option-chains/MSFT/nested")
+    assert [m for m, _u in http.calls] == ["POST", "GET", "GET"]          # one token, reused
+    for path in ("/accounts/5WX/orders", "/customers/me", "/accounts", "/sessions"):
+        with pytest.raises(PermissionError):
+            c.get_json(path)
+    assert len(http.calls) == 3                                           # refused before any request
+
+
+def test_blank_or_rejected_credentials_make_the_source_unavailable_without_leaking():
+    from ba2_providers.options.tastytrade_quotes import TastyTradeMarketDataClient
+
+    for secret, refresh in (("", ""), (SECRET, ""), (None, None)):
+        c = TastyTradeMarketDataClient(secret, refresh, http=_Http())
+        assert not c.configured
+        with pytest.raises(OptionChainSourceUnavailable, match="tastytrade_market_client_secret"):
+            c.get_json("/market-data/by-type", {})
+    c = TastyTradeMarketDataClient(SECRET, REFRESH, http=_Http(token_status=401))
+    with pytest.raises(OptionChainSourceUnavailable) as e:
+        c.get_json("/market-data/by-type", {})
+    assert "HTTP 401" in str(e.value) and SECRET not in str(e.value) and REFRESH not in str(e.value)

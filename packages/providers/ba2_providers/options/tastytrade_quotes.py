@@ -12,9 +12,13 @@ docs/plans/2026-11-15-option-iv-conditions.md section 6.6):
   limit) contracts per call: ``bid``, ``ask``, ``summary-date``, ``updated-at``, ``last``, ``volume``.
   (``prev-close-date`` is NOT usable: it reads 1970-01-01 or an old date on many contracts.)
 
-Pure over a ``get_json(path, params) -> data`` callable, so the account class
-(``TastyTradeAccount.get_option_chain_quote_snapshot``, through its own session) and the operator tools
-share one mapping, and the tests run on recorded payloads.
+Pure over a ``get_json(path, params) -> data`` callable; :class:`TastyTradeMarketDataClient` is the live
+one: app-level MARKET-DATA credentials (OAuth client secret + refresh token, app settings
+``tastytrade_market_client_secret`` / ``tastytrade_market_refresh_token``), independent of any account
+definition. It exchanges the refresh token for a 15-minute access token (TastyTrade does not rotate
+refresh tokens: nothing is ever written back), and it can ONLY call the market-data paths above -- any
+other path is refused before a request is made (no order, account or position endpoint can be reached).
+The credentials never appear in a message, a log or a repr.
 """
 from __future__ import annotations
 
@@ -24,12 +28,107 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ba2_common.core.option_chain_quotes import (
     FETCH_STRIKE_BAND, OptionChainQuote, OptionChainQuoteSnapshot, OptionChainQuotesFetchError,
+    OptionChainSourceUnavailable,
 )
 
-__all__ = ["fetch_chain_quote_snapshot", "parse_quote_item", "occ_from_tt_symbol", "BATCH", "SOURCE_KIND"]
+__all__ = ["fetch_chain_quote_snapshot", "parse_quote_item", "occ_from_tt_symbol", "BATCH", "SOURCE_KIND",
+           "TastyTradeMarketDataClient", "API_URL", "ALLOWED_PATH_PREFIXES"]
 
 SOURCE_KIND = "tastytrade"
 BATCH = 100
+API_URL = "https://api.tastyworks.com"          # production only: the sandbox's quotes are fake
+API_VERSION = "20251101"
+#: The ONLY paths the market-data client may call.
+ALLOWED_PATH_PREFIXES = ("/option-chains/", "/market-data/by-type")
+HTTP_TIMEOUT_S = 20.0
+
+
+class TastyTradeMarketDataClient:
+    """Market-data-only TastyTrade client over app-level OAuth credentials (see the module docstring).
+
+    ``get_json(path, params)`` returns the response's ``data`` object. Raises
+    ``OptionChainSourceUnavailable`` when the credentials are blank or rejected (HTTP 401/403 on the token
+    exchange), ``OptionChainQuotesFetchError`` on any other failure; a path outside
+    ``ALLOWED_PATH_PREFIXES`` raises ``PermissionError`` before any request."""
+
+    def __init__(self, client_secret: Optional[str], refresh_token: Optional[str], *, http: Any = None,
+                 clock: Callable[[], float] = None):
+        import time as _time
+
+        self.__secret = (client_secret or "").strip()
+        self.__refresh = (refresh_token or "").strip()
+        self._http = http
+        self._clock = clock or _time.monotonic
+        self._token: Optional[str] = None
+        self._expires = 0.0
+        self.requests = 0
+
+    def __repr__(self) -> str:                 # never the credentials
+        return "TastyTradeMarketDataClient(<credentials hidden>)"
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.__secret and self.__refresh)
+
+    def _session(self):
+        if self._http is None:
+            import requests
+
+            self._http = requests.Session()
+            self._http.headers.update({"Accept": "application/json", "Content-Type": "application/json",
+                                       "Accept-Version": API_VERSION, "User-Agent": "ba2-market-data"})
+        return self._http
+
+    def _redact(self, text: str) -> str:
+        for s in (self.__secret, self.__refresh, self._token):
+            if s:
+                text = text.replace(s, "***")
+        return text
+
+    def _access_token(self) -> str:
+        if self._token and self._clock() < self._expires - 60:
+            return self._token
+        if not self.configured:
+            raise OptionChainSourceUnavailable(
+                "TastyTrade market-data credentials are not set (app settings tastytrade_market_client_secret "
+                "and tastytrade_market_refresh_token)")
+        try:
+            r = self._session().post(API_URL + "/oauth/token", json={
+                "grant_type": "refresh_token", "client_secret": self.__secret, "refresh_token": self.__refresh},
+                timeout=HTTP_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 -- transport errors of any HTTP library, redacted
+            raise OptionChainQuotesFetchError(f"TastyTrade token exchange failed: {self._redact(type(e).__name__ + ': ' + str(e))[:200]}") from None
+        self.requests += 1
+        if r.status_code in (400, 401, 403):
+            raise OptionChainSourceUnavailable(
+                f"TastyTrade rejected the market-data credentials (HTTP {r.status_code} on the token exchange); "
+                f"check tastytrade_market_client_secret / tastytrade_market_refresh_token")
+        if r.status_code // 100 != 2:
+            raise OptionChainQuotesFetchError(f"TastyTrade token exchange failed: HTTP {r.status_code}")
+        body = r.json()
+        self._token = str(body["access_token"])
+        self._expires = self._clock() + float(body.get("expires_in", 900))
+        return self._token
+
+    def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        if not str(path).startswith(ALLOWED_PATH_PREFIXES):
+            raise PermissionError(f"the TastyTrade market-data client may not call {path!r}")
+        token = self._access_token()
+        try:
+            r = self._session().get(API_URL + path, params=params, timeout=HTTP_TIMEOUT_S,
+                                    headers={"Authorization": f"Bearer {token}"})
+        except Exception as e:  # noqa: BLE001 -- transport errors, redacted
+            raise OptionChainQuotesFetchError(f"TastyTrade {path}: {self._redact(type(e).__name__ + ': ' + str(e))[:200]}") from None
+        self.requests += 1
+        if r.status_code == 401:
+            self._token = None                 # expired early: one fresh token next call
+            raise OptionChainQuotesFetchError(f"TastyTrade {path}: HTTP 401 (access token expired; retried next attempt)")
+        if r.status_code // 100 != 2:
+            raise OptionChainQuotesFetchError(f"TastyTrade {path}: HTTP {r.status_code}: {self._redact(r.text)[:160]}")
+        try:
+            return r.json()["data"]
+        except (ValueError, KeyError) as e:
+            raise OptionChainQuotesFetchError(f"TastyTrade {path}: response has no data ({type(e).__name__})") from None
 
 
 def occ_from_tt_symbol(symbol: str) -> str:
@@ -112,7 +211,7 @@ def _wanted_contracts(chain: Dict[str, Any], underlying: str, spot: float, expir
 
 def fetch_chain_quote_snapshot(get_json: Callable[[str, Optional[Dict[str, Any]]], Any], underlying: str, *,
                                expiry_min: date, expiry_max: date, strike_band: float = FETCH_STRIKE_BAND,
-                               account_id: Optional[int] = None, pause: Callable[[], None] = lambda: None,
+                               pause: Callable[[], None] = lambda: None,
                                now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                                ) -> OptionChainQuoteSnapshot:
     """The latest quote of every standard contract of ``underlying`` with an expiry in the window and a
@@ -130,7 +229,7 @@ def fetch_chain_quote_snapshot(get_json: Callable[[str, Optional[Dict[str, Any]]
         raise OptionChainQuotesFetchError(f"TastyTrade chain/underlying response for {sym} unreadable: {e}") from e
     fetched = now()
     if spot is None or spot <= 0:
-        return OptionChainQuoteSnapshot(sym, SOURCE_KIND, fetched, None, spot_day, (), 0, account_id,
+        return OptionChainQuoteSnapshot(sym, SOURCE_KIND, fetched, None, spot_day, (), 0,
                                         strike_band, expiry_min, expiry_max, requests)
     wanted = _wanted_contracts(chain, sym, spot, expiry_min, expiry_max, strike_band)
     names = sorted(wanted)
@@ -149,4 +248,4 @@ def fetch_chain_quote_snapshot(get_json: Callable[[str, Optional[Dict[str, Any]]
         except (KeyError, TypeError, ValueError) as e:
             raise OptionChainQuotesFetchError(f"TastyTrade market-data response for {sym} unreadable: {e}") from e
     return OptionChainQuoteSnapshot(sym, SOURCE_KIND, fetched, spot, spot_day, tuple(quotes), len(names),
-                                    account_id, strike_band, expiry_min, expiry_max, requests)
+                                    strike_band, expiry_min, expiry_max, requests)

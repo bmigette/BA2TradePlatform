@@ -12,7 +12,8 @@ when. A snapshot is therefore accepted for session S only on POSITIVE EVIDENCE i
 (:func:`validate_prior_session_snapshot`); anything else is refused, never cached, never computed on.
 
 Pure: no broker, no I/O. The account classes produce :class:`OptionChainQuoteSnapshot`
-(``AccountInterface.get_option_chain_quote_snapshot``); the capture job validates and caches it.
+(``ba2_providers.options.tastytrade_quotes``, app-level market-data credentials); the capture job
+validates and caches it.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-__all__ = ["OptionChainQuote", "OptionChainQuoteSnapshot", "OptionChainQuotesUnsupported",
+__all__ = ["OptionChainQuote", "OptionChainQuoteSnapshot", "OptionChainSourceUnavailable",
            "OptionChainQuotesFetchError", "SnapshotVerdict", "validate_prior_session_snapshot",
            "FETCH_STRIKE_BAND", "NEAR_MONEY_BAND", "MIN_NEAR_MONEY_CONTRACTS", "MIN_ON_SESSION_SHARE",
            "fetch_expiry_window", "session_close_and_next_open"]
@@ -39,9 +40,9 @@ MIN_NEAR_MONEY_CONTRACTS = 4
 MIN_ON_SESSION_SHARE = 0.90
 
 
-class OptionChainQuotesUnsupported(RuntimeError):
-    """This account cannot serve real option chain quotes (no implementation, no entitlement). The
-    message says why; it is the refusal reason the iv gates report."""
+class OptionChainSourceUnavailable(RuntimeError):
+    """The source cannot serve at all (credentials blank or rejected). The message says why (never the
+    credentials themselves); a capture run stops on it and every symbol records the reason."""
 
 
 class OptionChainQuotesFetchError(RuntimeError):
@@ -74,7 +75,6 @@ class OptionChainQuoteSnapshot:
     spot_summary_date: Optional[date]
     quotes: Tuple[OptionChainQuote, ...]
     requested: int = 0                         # contracts asked for (a missing one has no data at all)
-    account_id: Optional[int] = None
     strike_band: float = FETCH_STRIKE_BAND
     expiry_min: Optional[date] = None
     expiry_max: Optional[date] = None
@@ -144,7 +144,7 @@ def validate_prior_session_snapshot(snap: OptionChainQuoteSnapshot, session: dat
     null_quotes = sum(1 for q in quotes if not (_finite(q.bid) and _finite(q.ask)))
     zero_bids = sum(1 for q in quotes if _finite(q.bid) and float(q.bid) == 0.0)
     facts: Dict[str, Any] = {
-        "session": session.isoformat(), "source_kind": snap.source_kind, "account_id": snap.account_id,
+        "session": session.isoformat(), "source_kind": snap.source_kind,
         "fetched_at": _iso(snap.fetched_at), "contracts": len(quotes), "requested": snap.requested,
         "summary_dates": dict(sorted(sd.items())),
         "updated_at_min": _iso(min(ups)) if ups else None, "updated_at_max": _iso(max(ups)) if ups else None,
