@@ -1,8 +1,10 @@
 # Option implied-volatility entry conditions: profile `iv-v1`
 
 Date: 2026-11-15
-Status: built on `feat/option-vol-conditions` for backtest and GA use. **Live refuses these gates.** See
-"Live source" below for the decision that is still open.
+Status: built on `feat/option-vol-conditions` for backtest, GA and LIVE. Owner decisions
+(2026-11-15): the option reruns read the **Alpha Vantage** option store, and live reads the same
+vendor's prior-session chain. A gate trained on the ThetaData store stays backtest-only; live and
+the deploy importer refuse it.
 Parent design: [2026-09-15-option-market-condition-genes-design.md](2026-09-15-option-market-condition-genes-design.md).
 `iv-v1` is a third profile in the same store, registry, gene scheme and seams.
 
@@ -136,49 +138,154 @@ build.
   `--iv-quality-accept`; the matrix driver forwards them only when they are set. Accepted symbols
   are recorded on the run (`iv_quality_accepted`).
 
-## 6. Live source: NOT available. Live refuses (open decision)
+## 6. Sources and the live reader
 
-Live would need the prior session's end-of-day chain with bid and ask. What the platform can read
-today:
+### 6.1 Option sources
 
-- **Alpaca**: the live chain (`AlpacaAccount.get_option_chain`) is the current intraday snapshot. The
-  historical API has bars and trades, but no quotes. The existing live IV-rank series
-  (`atm_iv_history.py`) inverts bar closes for exactly this reason.
-- **TastyTrade / dxfeed**: historical candles only, with no bid or ask.
-- **IBKR**: untested; no live account.
-- **ThetaData**: the same vendor and endpoint as the backtest store (`option_history_eod`,
-  `expiration="*"`), so it would be an identical source. But nothing live uses it.
+| `option_source` | Store (read-only) | Live |
+|---|---|---|
+| `alphavantage` | `<CACHE>/AlphaVantageOptionsProvider/` (`tools/download_av_option_chains.py`): the ThetaData partition layout plus not-yet-compacted `_days/` and a `_ledger.jsonl` | **served**: `HISTORICAL_OPTIONS&date=<prior session>` |
+| `thetadata` | `<CACHE>/ThetaDataOptionsProvider/` | refused, by name |
 
-The live resolver therefore serves `iv-v1` with `LiveUnavailableMarketConditionReader`:
+The source is always named explicitly: `--option-source` is required for chain profiles. It is
+recorded in the manifest (`option_source`, named like the backtest `options_store`) and on iv jobs
+as the expert setting `market_condition_option_source`. That setting is optional, undeclared and
+absent everywhere else.
 
-- Every observation is `no_context`, with the reason.
-- An ERROR is logged once per process, plus one per decision pass naming the expert.
-- The expert's other profiles keep their readers.
-- The deploy importer refuses a payload with an `iv-v1` leaf, because the strategy could never enter
-  live. A genome whose iv genes all decoded to off imports with `iv-v1` DROPPED from its profile
-  setting. Nothing reads it, so no decision changes, and live does not report a missing source for
-  a profile that is never read.
+- The launcher refuses an option job whose options store differs from the manifest's source.
+- The backtest seam refuses a setting that contradicts the pinned manifest.
+- Live serves only `alphavantage`.
+- IV always comes from our function on bid/ask; AV's `implied_volatility` and greeks columns are
+  never read.
 
-The options for the owner:
+**AV `bar_date` is the quote's own session**, checked the same way as ThetaData: the parity forward
+for D-1, D and D+1 around gap days tracks the D close in every case. The days checked: AMZN
+2022-02-04 and 2022-04-29 (as-traded x20), ADBE 2024-06-14 and 2024-03-15, DIS 2022-11-09, ABNB
+2023-05-10, AMD 2024-10-30, GOOGL 2023-02-08. Example: ADBE 2024-06-14, forward 525.35 against a close
+of 525.31 on D and 458.74 on D-1.
 
-1. **Build a live ThetaData EOD adapter.** It would be a pre-analysis step that fetches the prior
-   session's chain for the gated universe, through the same `chains()` interface
-   (`option_chain_source.py`), and builds that session's rows. This gives exact parity. The cost is a
-   live dependency on the ThetaData subscription and key (`AppSetting('thetadata_api_key')`).
-   ThetaData allows one session per key, so a live process would invalidate concurrent backfill
-   sessions; the backfills would need a second key, or to be scheduled around the live fetch.
-2. **Capture the Alpaca chain after the close each day** (latest quotes at about 16:05 ET) and
-   certify it against ThetaData EOD before use. This is a different source: it needs a certification
-   study, and history starts only from the first capture.
-3. **Keep `iv-v1` backtest-only** for now, and use it to learn whether the gates pay before paying
-   for a live source.
+**AV against ThetaData, same symbol-sessions.** 12 symbols (AA, AAL, ABNB, ABT, AFL, AMD, AMZN, BAC,
+C, DIS, EBAY, GOOGL), 2023-2024, 6,024 symbol-sessions:
+
+- **Chains:** present in both on 100% of the sessions.
+- **IV30:** defined in both on 100%. Identical to 1e-12 on 95.9% of sessions; differs by more than
+  0.01 vol on 0.23%; maximum difference 0.020.
+- **IV60:** defined in both on 93.6%, only in AV on 0.03%, in neither on 6.4%. Identical on 97.9%.
+- **Differences, AV minus ThetaData:** the median and the 5th and 95th percentiles of the
+  difference are exactly 0 for IV30, IV60, IV/RV and the term slope. A relative difference above 5%
+  occurs on 0.13% (IV30), 0.04% (IV60), 0.13% (IV/RV) and 0.18% (term slope) of sessions.
+- **Gate flips:**
+  - IV/RV above 1.0 / 1.2 / 1.4: 0.03% / 0.07% / 0.03% of sessions.
+  - Term slope above 0.95 / 1.0 / 1.05: 0.39% / 0.21% / 0.04%.
+- **AV quote quality** (5 symbols, H1 2024, 380k quote rows; ThetaData in parentheses): zero or
+  missing bid 16.07% (16.01%), missing ask 0.00%, crossed 0 (0), two-sided 83.9% (84.0%). Bid and
+  ask identical to the previous session on 3.21% of contracts (3.25%).
+
+The two vendors carry essentially the same end-of-day NBBO. The AV quotes are not broken, stale or
+crossed beyond what ThetaData shows.
+
+### 6.2 Live reader (`ba2_providers/market_conditions/av_live_chain.py`)
+
+**Same function, same inputs.** For the decision's prior session, live fetches AV's chain through
+the downloader's own `fetch_chain_payload`. It maps the chain with the store's `map_chain` and
+filters it with the store reader's `chain_quotes_from_frame`. The realized-vol leg reads the window
+the ohlcv-v1 live reader reads (FMP or Alpaca daily cache, `assemble_window`), and the row comes from
+`compute_iv_v1`. `packages/providers/tests/test_av_live_iv_certification.py` pins the live rows
+against the rows of a store built by the real downloader code from the same raw rows. **Tolerance:
+none (exact equality)**, because both sides run the same code on the same numbers.
+
+**On demand.** The reader is built only for an expert whose setting names `iv-v1` with source
+`alphavantage`, and the deploy importer drops `iv-v1` from a setting no leaf reads. A chain is
+fetched only when a market leaf of that expert is evaluated for the symbol. Every fetched chain is
+cached on disk at `<CACHE>/market_conditions_live/alphavantage/<SYM>/<session>.parquet`, so repeat
+passes, restarts and other experts make no further call. Rows are also memoised per reader.
+
+**Rate budget.** Calls go through the shared `_av_rate_budget.json`
+(owner `iv_live:<pid>`, 10/min of the key's 75), waiting at most 20 s for a slot.
+
+**Failure policy.** Every failure produces the profile's fields at `no_context` with the reason, one
+WARNING per (symbol, session, reason), and is never memoised or cached, so the next pass retries.
+The gate never passes and the evaluator counts the unknown. There is no fallback source and no
+approximation.
+
+| Failure | Reason recorded |
+|---|---|
+| no key | `alpha_vantage_api_key is not set ...`. Only an active gate ever asks for the key, so a blank key breaks nothing else. |
+| AV throttle or premium notice | `rate limit (Alpha Vantage): ...` |
+| no budget slot within 20 s | `rate limit: no slot in the shared Alpha Vantage budget ...` |
+| HTTP or transport error | `Alpha Vantage request failed: ...`, with the key redacted |
+| empty chain (not published yet, or no listed options) | `Alpha Vantage serves no chain ... yet` |
+| chain for another date, or no usable contract | named as such |
+| chain exists but cannot define the value | the calculator's `insufficient_history`, exactly as in the backtest |
+
+**Refused sources.** For a `thetadata`-trained gate, or a gate with no recorded source, live serves a
+`LiveUnavailableMarketConditionReader` naming the cause, with one ERROR per decision pass. The deploy
+importer refuses such leaves and accepts leaves trained on `alphavantage`.
+
+**Capture and replay.** Capture records each served row's values, statuses and reasons together with
+its evidence: the normalized chain arrays and the 128x5 window bytes, each with a digest
+(schema `market_condition_chain_window/v1`). `ReplayChainReader` re-verifies both digests,
+recomputes the row with the shared function, and refuses (`ReplayMiss`) evidence that is missing,
+tampered with, or recomputes differently. A recorded refusal replays as the same refusal.
+
+**Seam.** `ba2_common` may not import providers, so `ba2_trade_platform/core/seam_wiring.py`
+registers the AV reader factory. The registration reads nothing, calls nothing and logs nothing.
+
+### 6.3 Availability before the decision (evidence)
+
+**The download ledgers.** The running download recorded 194 fetches of a prior session's chain that
+returned rows, made the next trading morning before 10:00 ET. The earliest was at 00:02 ET and the
+latest at 09:55 ET; for example, AA's 2026-11-09 chain (742 rows) was fetched at 2026-11-10 04:56 ET.
+The 18 empty results in that window were all symbols with no listed options.
+
+**Live calls** on Sunday 2026-11-15 at 04:07 ET (three calls through the shared budget):
+
+| Request | Rows | Row dates | Two-sided quotes |
+|---|---|---|---|
+| MSFT, latest (no date) | 4,072 | 2026-11-13 | 3,743 |
+| MSFT, date=2026-11-13 | 4,072 | 2026-11-13 | 3,743 |
+| KO, date=2026-11-13 | 1,208 | 2026-11-13 | 1,009 |
+
+So the prior session's chain is available well before a 10:00 ET decision. Not verified: whether AV
+revises a chain after it first appears. The store keeps one fetch per day, so this could not be
+compared.
+
+### 6.4 Operator steps for live iv gates
+
+1. Set `alpha_vantage_api_key` in the live app's settings. **Live iv gates need an ongoing Alpha
+   Vantage subscription whose plan includes `HISTORICAL_OPTIONS`.** The live fetch shares that key's
+   75 calls/minute with the option download through `_av_rate_budget.json`.
+2. Train on the AV store: `--options-store alphavantage --option-history-source alphavantage` and an
+   iv manifest built with `--option-source alphavantage`.
+3. Deploy as usual. The payload carries `market_condition_profile` and
+   `market_condition_option_source = alphavantage`, and the importer accepts the iv leaves.
+4. Watch the log for `iv-v1 live (alphavantage)` WARNINGs and the per-pass ERROR of a refused source.
+
+### 6.5 Backward compatibility
+
+For anything that does not use `iv-v1`, decisions, settings, stored configs, manifests, digests and
+INFO-and-above logs are unchanged:
+
+- **No new declared or mandatory setting and no migration.** `market_condition_option_source` is
+  written only onto iv jobs, and absent means "no chain profile".
+- **The per-instance resolver** reads the source setting, and adds it to its cache key, only for
+  experts that name a chain profile (`test_an_ohlcv_expert_never_reads_or_keys_on_an_option_source`).
+- **The live host registration** is silent and inert (`tests/test_iv_live_seam_registration.py`).
+  An expert without a chain profile never reaches the chain seam.
+- **OHLCV manifests** never carry `option_source`, and an ohlcv-v1 job's expert settings never carry
+  the new key (`test_an_iv_job_records_its_option_source_and_an_ohlcv_job_does_not`).
+- **The ohlcv-v1 and ta-structure-v1 live readers** are untouched. The all-off and profile-none
+  goldens and every existing market-condition test pass.
+
+For a running prod instance (8081) with no iv gate, pulling this code changes nothing: one silent
+dictionary registration at startup and no new reads, calls or log lines.
 
 ## 7. Building the store
 
 ```text
-python tools/warm_market_conditions.py plan --profile iv-v1 --universe-file <U.txt> \
-    --start 2020-01-02 --end 2025-12-31 --ohlcv-history-source <fmp|alpaca> \
-    [--option-root <CACHE>/ThetaDataOptionsProvider] --out iv_plan.json
+python tools/warm_market_conditions.py plan --profile iv-v1 --option-source alphavantage \
+    --universe-file <U.txt> --start 2020-01-02 --end 2025-12-31 --ohlcv-history-source <fmp|alpaca> \
+    [--option-root <CACHE>/AlphaVantageOptionsProvider] --out iv_plan.json
 python tools/warm_market_conditions.py build --plan iv_plan.json --cache-only --concurrency 1 \
     --ohlcv-history-source <fmp|alpaca> --print-digest [--allow-exclusions]
 python tools/warm_market_conditions.py verify --manifest <digest> --ohlcv-history-source <...>
@@ -195,11 +302,14 @@ python tools/warm_market_conditions.py prepare-host --manifest <digest> --ohlcv-
   rebuild reuses a row only when both its bars and its quotes are unchanged.
 - **Coverage records.** Sessions with bars but no chain rows are recorded in coverage as
   `option_chain_missing`.
-- **Manifest.** The manifest records `option_source = thetadata-eod-parquet-v1`. This is an optional
-  key, so OHLCV manifests are byte-identical.
-- **Not retained.** The chain itself is not retained in the store: the parquet tree is the evidence.
-  `retained_window` does not serve chain-profile rows, and there is no live capture or replay of
-  `iv-v1` windows.
+- **Manifest.** The manifest records `option_source` (`alphavantage` or `thetadata`). This is an
+  optional key, so OHLCV manifests are byte-identical.
+- **AV store.** The build also reads not-yet-compacted staged days; a staged day replaces that day's
+  partition rows, exactly as compaction does. `fetched_through` comes from the download ledger, and a
+  torn last line is ignored.
+- **Not retained.** The store does not retain the chain itself: the parquet tree is the evidence, so
+  `retained_window` does not serve chain-profile rows. Live decisions are captured with their chain
+  evidence (section 6.2).
 
 **Smoke measurement** (5 real large caps over 2024, FMP bars, real ThetaData tree, one builder):
 
@@ -223,8 +333,8 @@ python tools/run_options_matrix.py ... --market-condition-profile ohlcv-v1,iv-v1
 ```
 
 Each profile needs its own manifest. On an option job, the launcher refuses an iv manifest whose
-`option_source` is not the job's options store: `thetadata-eod-parquet-v1` requires
-`options_store=thetadata`. Equity jobs trade no chain and are not held to a store. The profiles combine through the existing composite reader.
+`option_source` is not the job's options store: an `alphavantage` manifest requires
+`--options-store alphavantage`, and a `thetadata` one requires `thetadata`. Equity jobs trade no chain and are not held to a store. The profiles combine through the existing composite reader.
 Genes appear in registry order (ohlcv-v1, then ta-structure-v1, then iv-v1), whatever order the flag
 lists them in. Profile `none` and the two existing profiles emit exactly what they did before.
 
