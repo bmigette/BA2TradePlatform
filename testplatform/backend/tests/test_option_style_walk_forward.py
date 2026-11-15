@@ -635,10 +635,15 @@ def _run_script(tmp_path, script_text, args, extra_env=None, name="job.sh"):
 
 
 def _original(path):
-    """The script as imported verbatim from feat/premium-mandatory-loss-exit (commit 5b6f2f17)."""
+    """The script as imported verbatim from feat/premium-mandatory-loss-exit (commit 5b6f2f17). A missing
+    reference FAILS the byte-identity tests (only a machine without bash skips them): a skipped identity
+    test would look like a passed one."""
+    if _git_bash() is None:
+        pytest.skip("no bash")
     r = subprocess.run(["git", "-C", str(_ROOT), "show", f"5b6f2f17:{path}"], capture_output=True, text=True)
-    if r.returncode != 0:
-        pytest.skip("the import commit is not in this clone")
+    assert r.returncode == 0, (f"the reference commit 5b6f2f17 (the verbatim import of {path}) is not in this "
+                               f"clone, so plain-mode byte identity cannot be checked: fetch it (a shallow CI "
+                               f"clone needs more depth). git said: {r.stderr.strip()}")
     return r.stdout
 
 
@@ -683,59 +688,136 @@ def test_the_recipe_copy_matches_the_style_job_script(tmp_path):
     assert [t for t in got if t.startswith("--")] == [t for t in mine if t.startswith("--")]
 
 
+_FAKE_JOB = r"""#!/usr/bin/env bash
+# a stand-in option_style_job.sh: records its argv; in walk-forward mode prints the driver's VERDICT line, and
+# refuses the dry run of the style named in $REFUSE_STYLE the way the driver's preflight does
+for a in "$@"; do printf "%s\n" "$a"; done >> "$REC"; printf "%s\n" "----" >> "$REC"
+case " $* " in
+  *" --dry-run "*) if [ "$1" = "${REFUSE_STYLE:-}" ]; then
+                     echo "run_option_style_wf.py: style '$1' is not defined in x.json; merge feat/premium-mandatory-loss-exit" >&2
+                     exit 1
+                   fi ;;
+  *" --walk-forward "*) echo "VERDICT PENDING optwf-$1-$2-dabc" ;;
+esac
+exit 0
+"""
+
+
 def _chain_env(tmp_path, **kw):
     """A fake REPO whose tools/option_style_job.sh records its argv; GRID_DIR a scratch dir."""
     repo = tmp_path / "repo"
-    (repo / "tools").mkdir(parents=True)
-    (repo / "tools" / "option_style_job.sh").write_text(
-        'for a in "$@"; do printf "%s\\n" "$a"; done >> "$REC"; printf "%s\\n" "----" >> "$REC"\n',
-        encoding="utf-8", newline="\n")
+    (repo / "tools").mkdir(parents=True, exist_ok=True)
+    (repo / "tools" / "option_style_job.sh").write_text(_FAKE_JOB, encoding="utf-8", newline="\n")
     grid = tmp_path / "grid"
     grid.mkdir(exist_ok=True)
     return {"REPO": _posix(repo), "GRID_DIR": _posix(grid), **kw}
 
 
-def _run_chain(tmp_path, text, env_extra, name):
+def _run_chain(tmp_path, text, env_extra, name, av_rc=0):
     bash = _git_bash()
     if bash is None:
         pytest.skip("no bash")
     script = tmp_path / name
     script.write_text(text, encoding="utf-8", newline="\n")
     fake = tmp_path / "fakepy"
-    fake.write_text(_FAKE_PY, encoding="utf-8", newline="\n")
+    fake.write_text(_FAKE_PY.replace("*/download_av_option_chains.py|tools/download_av_option_chains.py) exit 0",
+                                     f"*/download_av_option_chains.py|tools/download_av_option_chains.py) exit {av_rc}"),
+                    encoding="utf-8", newline="\n")
     rec = tmp_path / f"{name}.rec"
-    env = dict(os.environ, PY=_posix(fake), BA2_HOME=_posix(tmp_path / "home"), REC=_posix(rec),
-               **env_extra)
+    env = dict(os.environ, PY=_posix(fake), BA2_HOME=_posix(tmp_path / "home"), REC=_posix(rec), **env_extra)
+    env.setdefault("WF_ARGS", "")
     out = subprocess.run([bash, _posix(script)], env=env, capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     runs, cur = [], []
-    for line in rec.read_text(encoding="utf-8").splitlines():
+    for line in (rec.read_text(encoding="utf-8").splitlines() if rec.exists() else []):
         if line == "----":
             runs.append(cur)
             cur = []
         else:
             cur.append(line)
-    return runs
+    return runs, out.stdout
 
 
-def test_the_plain_small_account_chain_emits_byte_identical_jobs(tmp_path):
-    env = _chain_env(tmp_path)
-    old = _run_chain(tmp_path, _original("tools/grid_option_small_accounts.sh"), env, "old_chain.sh")
-    new = _run_chain(tmp_path, (_ROOT / "tools" / "grid_option_small_accounts.sh").read_text(encoding="utf-8"),
-                     env, "new_chain.sh")
+def _status(tmp_path, wf):
+    import re
+    path = tmp_path / "grid" / ("s3chain_small-wf.status" if wf else "s3chain_small.status")
+    return [re.sub(r" \d{4}-\d\d-\d\dT\S+$", " <date>", ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+
+
+CHAIN = _ROOT / "tools" / "grid_option_small_accounts.sh"
+WF_CHAIN_ARGS = "--walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 --wf-top-n 3 --wf-report-dir /r"
+
+
+def test_the_plain_small_account_chain_emits_byte_identical_jobs_and_status(tmp_path):
+    old, _ = _run_chain(tmp_path, _original("tools/grid_option_small_accounts.sh"), _chain_env(tmp_path), "old.sh")
+    old_status = _status(tmp_path, False)
+    (tmp_path / "grid" / "s3chain_small.status").unlink()
+    new, out = _run_chain(tmp_path, CHAIN.read_text(encoding="utf-8"), _chain_env(tmp_path), "new.sh")
     assert new == old and len(new) == 7
+    assert _status(tmp_path, False) == old_status
+    assert "PLAIN mode" in out and "WF_ARGS is empty" in out
+
+
+def test_the_plain_chains_av_skip_line_is_unchanged(tmp_path):
+    _run_chain(tmp_path, _original("tools/grid_option_small_accounts.sh"), _chain_env(tmp_path), "old.sh", av_rc=3)
+    old_status = _status(tmp_path, False)
+    (tmp_path / "grid" / "s3chain_small.status").unlink()
+    _run_chain(tmp_path, CHAIN.read_text(encoding="utf-8"), _chain_env(tmp_path), "new.sh", av_rc=3)
+    assert _status(tmp_path, False) == old_status
 
 
 def test_the_small_account_chain_in_walk_forward_mode(tmp_path):
-    wf = "--walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 --wf-top-n 3 --wf-report-dir /r"
-    env = _chain_env(tmp_path, WF_ARGS=wf)
-    runs = _run_chain(tmp_path, (_ROOT / "tools" / "grid_option_small_accounts.sh").read_text(encoding="utf-8"),
-                      env, "wf_chain.sh")
-    # jobs 6 and 7 (fixed screens) are not launched in walk-forward mode; the status file says why
-    assert [r[:2] for r in runs] == [["long10k", "s3L10"], ["premium_stop", "s3P20"], ["mid_share", "s3A20"],
-                                     ["long", "s3C20"], ["burst10k", "s3B10"]]
-    for r in runs:
-        assert r[2] == "none" and r[-len(wf.split()):] == wf.split()
-    status = (tmp_path / "grid" / "s3chain_small-wf.status").read_text(encoding="utf-8")
-    assert "jobN50 SKIPPED" in status and "--screen-preset" in status and "jobW10 SKIPPED" in status
+    runs, out = _run_chain(tmp_path, CHAIN.read_text(encoding="utf-8"), _chain_env(tmp_path, WF_ARGS=WF_CHAIN_ARGS),
+                           "wf.sh")
+    assert "WALK-FORWARD mode" in out and "WF_ARGS is set" in out
+    jobs = [["long10k", "s3L10"], ["premium_stop", "s3P20"], ["mid_share", "s3A20"], ["long", "s3C20"],
+            ["burst10k", "s3B10"]]
+    # first every job's dry-run preflight, then the five cells; jobs 6 and 7 (fixed screens) are not launched
+    assert [r[:2] for r in runs] == jobs + jobs
+    for r in runs[:5]:
+        assert r[2] == "none" and r[-1] == "--dry-run" and r[-1 - len(WF_CHAIN_ARGS.split()):-1] == WF_CHAIN_ARGS.split()
+    for r in runs[5:]:
+        assert r[2] == "none" and r[-len(WF_CHAIN_ARGS.split()):] == WF_CHAIN_ARGS.split()
+    status = _status(tmp_path, True)
+    assert "jobL10 exit 0 verdict PENDING <date>" in status and len([s for s in status if "verdict PENDING" in s]) == 5
+    assert any("jobN50 SKIPPED" in s and "--screen-preset" in s for s in status)
+    assert any("jobW10 SKIPPED" in s for s in status)
     assert not (tmp_path / "grid" / "s3chain_small.status").exists()          # the plain chain's file untouched
+
+
+def test_a_preflight_refusal_is_recorded_with_the_drivers_reason_and_skips_only_that_job(tmp_path):
+    runs, _ = _run_chain(tmp_path, CHAIN.read_text(encoding="utf-8"),
+                         _chain_env(tmp_path, WF_ARGS=WF_CHAIN_ARGS, REFUSE_STYLE="premium_stop"), "wf.sh")
+    launched = [r[:2] for r in runs if "--dry-run" not in r]
+    assert ["premium_stop", "s3P20"] not in launched and len(launched) == 4
+    status = _status(tmp_path, True)
+    refused = [s for s in status if s.startswith("jobP20 REFUSED by the walk-forward preflight (exit 1)")]
+    assert refused and "is not defined" in refused[0] and "feat/premium-mandatory-loss-exit" in refused[0]
+
+
+def test_a_failing_av_check_is_not_reported_as_an_incomplete_store_in_walk_forward_mode(tmp_path):
+    _run_chain(tmp_path, CHAIN.read_text(encoding="utf-8"), _chain_env(tmp_path, WF_ARGS=WF_CHAIN_ARGS), "wf.sh",
+               av_rc=2)
+    status = _status(tmp_path, True)
+    assert any("the AV completeness check itself FAILED (exit 2" in s and "--require-complete" in s for s in status)
+    assert not any("AV store incomplete" in s for s in status)
+
+
+def test_the_job_script_skips_its_fixed_rate_check_in_walk_forward_mode(tmp_path):
+    """The driver checks the cell's real rate window (through 2026 in phase B); the script's fixed
+    2020-2025 check stays for plain jobs only."""
+    calls = tmp_path / "fred.calls"
+    fake = _FAKE_PY.replace("tools/refresh_fred_cache.py|", "tools/refresh_fred_cache.py) echo \"$@\" >> \"$FRED\"; exit 0 ;;\n  ")
+    bash = _git_bash()
+    if bash is None:
+        pytest.skip("no bash")
+    (tmp_path / "fakepy").write_text(fake, encoding="utf-8", newline="\n")
+    script = tmp_path / "j.sh"
+    script.write_text(_job_script(), encoding="utf-8", newline="\n")
+    for args in (["long10k", "s3L10", "/g/b.json"], ["long10k", "s3L10", "none", "--walk-forward"]):
+        env = dict(os.environ, REPO=_posix(_ROOT), PY=_posix(tmp_path / "fakepy"), BA2_HOME=_posix(tmp_path / "h"),
+                   REC=_posix(tmp_path / "rec"), FRED=_posix(calls))
+        assert subprocess.run([bash, _posix(script), *args], env=env, capture_output=True, text=True,
+                              timeout=120).returncode == 0
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "tools/refresh_fred_cache.py --check-rate-window 2020-01-02 2025-12-31"]          # the plain job only

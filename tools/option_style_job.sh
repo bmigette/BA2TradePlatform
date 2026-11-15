@@ -65,6 +65,8 @@
 # Without --walk-forward the job is exactly the plain one above (same command, byte for byte).
 set -u
 STYLE="$1"; SUFFIX="$2"; BUNDLE="$3"; shift 3
+WF=0                                   # --walk-forward among the extra args: a walk-forward cell (see above)
+for a in "$@"; do [ "$a" = "--walk-forward" ] && { WF=1; break; }; done
 REPO="${REPO:-/home/debian/ba2-grid/repo}"
 cd "$REPO" || exit 1
 PY="${PY:-/opt/ba2worker/ba2-venvs/test/bin/python}"
@@ -86,7 +88,8 @@ esac
 export BACKTEST_OPTIONS_STORE=$OPTION_HISTORY_SOURCE BT_MAX_TASKS_PER_CHILD=32 PYTHONUNBUFFERED=1
 export BA2_MAX_REMOTE_SLOTS="${BA2_MAX_REMOTE_SLOTS:-24}"
 export PYTHONPATH=$REPO/packages/common:$REPO/packages/providers:$REPO/packages/experts:$REPO/testplatform/backend:$REPO/testplatform
-$PY tools/refresh_fred_cache.py --check-rate-window 2020-01-02 2025-12-31 || exit 1
+# (a walk-forward cell checks the rate window itself, over its real span: through 2026 in phase B)
+[ "$WF" = 1 ] || $PY tools/refresh_fred_cache.py --check-rate-window 2020-01-02 2025-12-31 || exit 1
 CACHE=$BA2_HOME/common/cache
 UFILE="${UFILE:-$REPO/tools/options_universe_stage2.txt}"
 WORKER="${WORKER:-remote227}"
@@ -100,14 +103,11 @@ UNIVERSE=$(tr -d '\r' < "$UFILE" | sed 's/#.*//; s/[[:space:]]//g' | grep -v '^$
 # the seed bundle is dropped only when it is the word none (a real bundle reaches the driver, which refuses it).
 SEED=(--seed-population "$BUNDLE")
 WFRUN=()
-for a in "$@"; do
-  if [ "$a" = "--walk-forward" ]; then
-    WFRUN=($PY tools/run_option_style_wf.py "$@" --)
-    [ "$BUNDLE" = none ] && SEED=()
-    set --
-    break
-  fi
-done
+if [ "$WF" = 1 ]; then
+  WFRUN=($PY tools/run_option_style_wf.py "$@" --)
+  [ "$BUNDLE" = none ] && SEED=()
+  set --
+fi
 exec ${WFRUN[@]+"${WFRUN[@]}"} $PY testplatform/ba2test_launcher.py optimize --expert DeterministicScorer \
   --universe "$UNIVERSE" --strategy O_STYLE \
   --style-config $REPO/tools/option_styles.stage2.json --style "$STYLE" \

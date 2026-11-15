@@ -93,8 +93,12 @@
 # runs every job as a walk-forward CELL (option_style_job.sh --walk-forward): the seed bundle of every job is the
 # word none (walk-forward folds are UNSEEDED: no stage-1 seeds, no bundle files needed), WF_ARGS (no spaces inside
 # a value) go after each job's own flags, and the logs and the status file carry -wf (s3L10-wf_run.log,
-# s3chain_small-wf.status), so a plain chain's files are never overwritten. Jobs 6 and 7 are NOT launched in this
-# mode: a fixed screen (--screen-preset) cannot be walk-forward-tested yet (run_option_style_wf.py says why).
+# s3chain_small-wf.status), so a plain chain's files are never overwritten. Each job first runs its own --dry-run as a
+# PREFLIGHT (a style or universe file missing from this checkout, a refused flag, the holdout rail, a changed data
+# identity): a refusal is recorded with the driver's reason and that job is skipped. The status line of a job records
+# its cell VERDICT (PASS / FAIL / PENDING / ERROR). Jobs 6 and 7 are NOT launched in this mode: a fixed screen
+# (--screen-preset) cannot be walk-forward-tested yet (run_option_style_wf.py says why). The chain prints which mode it
+# runs in at start: an exported WF_ARGS left in the environment turns the plain chain into walk-forward.
 # Phase B (January 2027, after _OPTION_HOLDOUT_START moved): the same WF_ARGS without --wf-data-end, with
 # AV_END=2026-12-31 so the Alpha Vantage completeness check covers the 2026 test year, and the 2026 panel and
 # manifests in the job environment (SCREENER_PANEL, MC_OHLCV, MC_TA, SCREENER_STORE).
@@ -114,8 +118,11 @@ if [ -n "$WF_ARGS" ]; then
     esac
 fi
 AV_END="${AV_END:-2025-12-31}"                        # last day the AV completeness check requires
-# bundle <file>: the job's seed bundle under $GRID_DIR, or the word none for a walk-forward cell (unseeded)
-bundle() { if [ -n "$WF_ARGS" ]; then echo none; else echo "$B/$1"; fi; }
+if [ -n "$WF_ARGS" ]; then
+    echo "grid_option_small_accounts.sh: WALK-FORWARD mode, because WF_ARGS is set ($WF_ARGS): jobs 1-5 run as unseeded walk-forward cells after a dry-run preflight each, jobs 6-7 are skipped; status in $GRID_DIR/s3chain_small-wf.status"
+else
+    echo "grid_option_small_accounts.sh: PLAIN mode, because WF_ARGS is empty or unset: seven seeded optimize jobs; status in $GRID_DIR/s3chain_small.status"
+fi
 
 # av_complete <universe file> <tag>: exit 0 when the AV store holds every session of 2020-01-02..2025-12-31 for every
 # listed name (read-only, no network), with the job script's own host defaults; the log names what is owed.
@@ -127,31 +134,71 @@ av_complete() {
         --start 2020-01-02 --end "$AV_END" --require-complete --db "$home/test/dl_forecasting.db") > "$2_avcheck.log" 2>&1
 }
 
-STAGE2="$REPO/tools/options_universe_stage2.txt"
-if av_complete "$STAGE2" s3stage2; then
+# run_job <tag> <log> <bundle file> <style> <suffix> [optimize args]: one chain job.
+#   plain:         bash $JOB <style> <suffix> $B/<bundle file> [args] > <log>_run.log; status "job<tag> exit N <date>"
+#   walk-forward:  only after its preflight passed (wf_preflight); bundle none, WF_ARGS last, <log>-wf_run.log; the
+#                  status line records the exit AND the cell VERDICT (PASS/FAIL/PENDING/ERROR) the driver printed
+run_job() {
+    local tag=$1 log=$2 bfile=$3
+    shift 3
+    if [ -z "$WF_ARGS" ]; then
+        bash "$JOB" "$1" "$2" "$B/$bfile" "${@:3}" > "${log}_run.log" 2>&1
+        echo "job$tag exit $? $(date -Is)" >> s3chain_small.status
+        return
+    fi
+    case "$WF_PREFLIGHT_OK" in *" $tag "*) ;; *) return ;; esac
+    bash "$JOB" "$1" "$2" none "${@:3}" $WF_ARGS > "${log}-wf_run.log" 2>&1
+    local rc=$?
+    local verdict
+    verdict=$(grep -E '^VERDICT ' "${log}-wf_run.log" | tail -1 | cut -d' ' -f2)
+    echo "job$tag exit $rc verdict ${verdict:-NONE (the job stopped before its cell ran: see ${log}-wf_run.log)} $(date -Is)" >> s3chain_small-wf.status
+}
+
+# wf_preflight <same arguments as run_job>: walk-forward mode only. The job's own dry run (style and universe file
+# present, flags, holdout rail, data identity; it writes nothing). A refusal is recorded with the driver's reason and
+# the job is not launched; a pass puts its tag in WF_PREFLIGHT_OK.
+WF_PREFLIGHT_OK=" "
+wf_preflight() {
+    local tag=$1 log=$2
+    shift 3
+    bash "$JOB" "$1" "$2" none "${@:3}" $WF_ARGS --dry-run > "${log}-wf_preflight.log" 2>&1 && {
+        WF_PREFLIGHT_OK="$WF_PREFLIGHT_OK$tag "
+        return 0
+    }
+    local rc=$?
+    echo "job$tag REFUSED by the walk-forward preflight (exit $rc): $(grep -E 'error:|REFUSED|refused|run_option_style_wf.py:' "${log}-wf_preflight.log" | tail -1) (see ${log}-wf_preflight.log) $(date -Is)" >> s3chain_small-wf.status
+    return 1
+}
+
+# jobs 1-5 (the stage-2 universe), each as "<function> <tag> <log> <bundle file> <style> <suffix> [optimize args]".
+stage2_jobs() {
     # 1. $10k: long calls / call spreads / convex / LEAPS. Redo of job L10 (opt 44).
-    bash "$JOB" long10k s3L10 "$(bundle bundle_jobL10.json)" --fitness option_long_dd40_50 --estimates-source fmp \
-        --initial-capital 10000 --equity-cap 10000 $WF_ARGS > s3L10${WFT}_run.log 2>&1
-    echo "jobL10 exit $? $(date -Is)" >> s3chain_small${WFT}.status
-
+    "$1" L10 s3L10 bundle_jobL10.json long10k s3L10 --fitness option_long_dd40_50 --estimates-source fmp \
+        --initial-capital 10000 --equity-cap 10000
     # 2. $20k: premium with the wheel first (WHEEL > CSP > BULLPS > JL > RS > CC > PP > IC), style premium_stop.
-    bash "$JOB" premium_stop s3P20 "$(bundle bundle_jobPstop.json)" --estimates-source fmp $WF_ARGS > s3P20${WFT}_run.log 2>&1
-    echo "jobP20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
-
+    "$1" P20 s3P20 bundle_jobPstop.json premium_stop s3P20 --estimates-source fmp
     # 3. $20k: mid-term mix (STRG/STRD > BULLCS > BF > LC), style mid_share.
-    bash "$JOB" mid_share s3A20 "$(bundle bundle_jobAshare.json)" --estimates-source fmp $WF_ARGS > s3A20${WFT}_run.log 2>&1
-    echo "jobA20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
-
+    "$1" A20 s3A20 bundle_jobAshare.json mid_share s3A20 --estimates-source fmp
     # 4. $20k: long-dated (CBS > LEAP > PMCC > CONVEX). Redo of job C (opt 43).
-    bash "$JOB" long s3C20 "$(bundle bundle_jobC.json)" --fitness option_long --estimates-source fmp $WF_ARGS > s3C20${WFT}_run.log 2>&1
-    echo "jobC20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
-
+    "$1" C20 s3C20 bundle_jobC.json long s3C20 --fitness option_long --estimates-source fmp
     # 5. $10k: momentum burst (LC > BULLCS, short-dated, exits always on), style burst10k. Same account flags as job 1.
-    bash "$JOB" burst10k s3B10 "$(bundle bundle_jobBurst.json)" --fitness option_long_dd40_50 --estimates-source fmp \
-        --initial-capital 10000 --equity-cap 10000 $WF_ARGS > s3B10${WFT}_run.log 2>&1
-    echo "jobB10 exit $? $(date -Is)" >> s3chain_small${WFT}.status
+    "$1" B10 s3B10 bundle_jobBurst.json burst10k s3B10 --fitness option_long_dd40_50 --estimates-source fmp \
+        --initial-capital 10000 --equity-cap 10000
+}
+
+STAGE2="$REPO/tools/options_universe_stage2.txt"
+[ -n "$WF_ARGS" ] && stage2_jobs wf_preflight
+if av_complete "$STAGE2" s3stage2; then
+    stage2_jobs run_job
 else
-    echo "jobs L10 P20 A20 C20 B10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $? (see s3stage2_avcheck.log) $(date -Is)" >> s3chain_small${WFT}.status
+    rc=$?
+    if [ -z "$WF_ARGS" ]; then
+        echo "jobs L10 P20 A20 C20 B10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $rc (see s3stage2_avcheck.log) $(date -Is)" >> s3chain_small.status
+    elif [ "$rc" = 3 ]; then
+        echo "jobs L10 P20 A20 C20 B10 SKIPPED: AV store incomplete for options_universe_stage2.txt through $AV_END (check exit 3, see s3stage2_avcheck.log) $(date -Is)" >> s3chain_small-wf.status
+    else
+        echo "jobs L10 P20 A20 C20 B10 SKIPPED: the AV completeness check itself FAILED (exit $rc, see s3stage2_avcheck.log; exit 2 = a checkout without download_av_option_chains.py --require-complete: merge feat/premium-mandatory-loss-exit first) -- not a verdict on the store $(date -Is)" >> s3chain_small-wf.status
+    fi
 fi
 
 # 6. $50k: the wheel family (WHEEL > CSP, covered calls only after an assignment) on the 30 largest NASDAQ-listed
