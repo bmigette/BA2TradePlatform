@@ -14,6 +14,7 @@ from .backtest import Backtest, RobustnessRun
 from .strategy import Strategy
 from .strategy_optimization import (StrategyOptimization, StrategyOptimizationPopulation,
                                     StrategyOptimizationRunner, BacktestWriter)
+from .walk_forward_run import WalkForwardRun
 
 __all__ = [
     "Base", "engine", "SessionLocal", "get_db",
@@ -33,4 +34,5 @@ __all__ = [
     "StrategyOptimizationPopulation",
     "StrategyOptimizationRunner",
     "BacktestWriter",
+    "WalkForwardRun",
 ]

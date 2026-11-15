@@ -81,6 +81,11 @@ class RealRunner:
         self._launcher = None
         self._opt: Dict[str, tuple] = {}       # train name -> (opt_id, expert)
         self._exclusive: set = set()           # prefixes whose driver lock this process holds
+        # Who drives the chain, recorded on its walk_forward_runs row (wf_store): the grid / CLI by
+        # default; the UI's driver (tools/run_wf_run.py) sets source "ui" and its task's token.
+        self.wf_source = "cli"
+        self.wf_token: Optional[str] = None
+        self.wf_task_id: Optional[str] = None
 
     # -- lazy bootstrap: dry-run and unit tests never touch the backend
     def _tool(self):
@@ -106,6 +111,15 @@ class RealRunner:
                     self._exclusive.discard(prefix)
         except RESUME.ResumeRefused as e:
             raise WF.WalkForwardError(str(e)) from e
+
+    def wf_store(self, spec, report_dir: str):
+        """The DB writer of this chain's ``walk_forward_runs`` row (app.services.wf_store), used by
+        ``wf_chain.run_cell`` in addition to the report files, so the UI shows the run. A write that
+        fails raises: the cell then fails loudly, it never runs on without its row."""
+        self._tool()                           # init_db(): the table exists (migration 034)
+        from app.services import wf_store as S
+        return S.RunStore(spec.name, source=self.wf_source, token=self.wf_token,
+                          task_id=self.wf_task_id, report_dir=report_dir)
 
     def _owns(self, train_name: str) -> bool:
         return any(train_name.startswith(p + "-wf") for p in self._exclusive)

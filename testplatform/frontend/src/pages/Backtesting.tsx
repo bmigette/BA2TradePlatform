@@ -74,7 +74,7 @@ import RobustnessDialog from '../components/RobustnessDialog';
 import RobustnessResults from '../components/RobustnessResults';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions, getYearlyBreakdown, updateBacktest, runOptimizationIndividual } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions, getYearlyBreakdown, updateBacktest, runOptimizationIndividual, listOptimizationJobs, getOptimization } from '../lib/btApi';
 import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite, FitnessMetricOption, FitnessOptions, YearlyBreakdownRow } from '../lib/btApi';
 import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
@@ -1980,6 +1980,29 @@ const Backtesting: React.FC = () => {
       setError('Failed to load backtest details');
     }
   };
+
+  // Deep links from other pages (the Walk-forward run view): ?backtest=<id> opens that backtest,
+  // ?optimization=<id> opens that optimization job on the Opt History tab. Read once on mount.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const btId = Number(q.get('backtest'));
+    const optId = Number(q.get('optimization'));
+    // State is only set from the async callbacks (never synchronously in the effect body).
+    if (Number.isInteger(btId) && btId > 0) {
+      void Promise.resolve().then(() => viewBacktest(btId));
+    } else if (Number.isInteger(optId) && optId > 0) {
+      listOptimizationJobs()
+        .then(jobs => {
+          setBacktestCardTab('optjobs');
+          const job = jobs.find(j => j.id === optId);
+          if (!job) { setError(`Optimization ${optId} not found`); return; }
+          setSelectedOptJob({ job });
+          return getOptimization(optId).then(detail =>
+            setSelectedOptJob(cur => (cur && cur.job.id === optId ? { job, detail } : cur)));
+        })
+        .catch(err => setError(`Failed to open optimization ${optId}: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }, []);
 
   // Re-run a saved daily-expert backtest IN PLACE: re-execute its original config against the
   // CURRENT data/code and overwrite the same row. Confirm first (it replaces the stored results),

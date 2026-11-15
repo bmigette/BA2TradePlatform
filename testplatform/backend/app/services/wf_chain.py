@@ -122,6 +122,7 @@ class CellSpec:
     exclusive_return: bool = False      # fold return must be ABOVE the threshold
     defer_last_test: bool = False       # train the last fold now, test it when the data exists
     run_all_folds: bool = False         # no early elimination: every fold runs even if the cell cannot pass
+    refit: bool = True                  # a PASSING cell trains the refit job (False: verdict only)
 
 
 @dataclass
@@ -307,16 +308,47 @@ def run_cell(spec: CellSpec, runner: Any, report_dir: str,
 
     The whole chain runs under the runner's driver lock for the cell (``<report_dir>/<cell>/.lock``,
     when the runner has one): a second driver on the same cell is refused, a killed driver's lock
-    is taken over."""
+    is taken over.
+
+    DB row: when the runner offers ``wf_store(spec, report_dir)`` (the real runner does), the chain
+    ALSO writes its ``walk_forward_runs`` row as it advances (app.services.wf_store), after the
+    files each time. The files and their resume semantics are unchanged. One row per (cell, report
+    directory). A failed DB write of a grid / CLI chain is retried, then logged once as an ERROR and
+    the chain carries on without its row (the files are the source of truth; the importer repairs
+    the row); for a UI run it raises. An exception of the chain is recorded on the row, then
+    re-raised unchanged (a failure to record it is logged, never raised in its place)."""
     lock = getattr(runner, "exclusive", None)
+    make_store = getattr(runner, "wf_store", None)
+    store = make_store(spec, report_dir) if callable(make_store) else None
     with (lock(spec.name, lock_path(report_dir, spec.name)) if callable(lock) else nullcontext()):
-        return _run_cell(spec, runner, report_dir, log)
+        if store is None:
+            return _run_cell(spec, runner, report_dir, log)
+        try:
+            return _run_cell(spec, runner, report_dir, log, store)
+        except BaseException as e:
+            # Recording the failure must never mask or replace it: a KeyboardInterrupt stays a
+            # KeyboardInterrupt (run_cells must not carry on with the grid after Ctrl-C).
+            try:
+                store.fail(e)
+            except Exception as fe:  # noqa: BLE001 -- logged; the chain's own exception is re-raised
+                logger.error("[%s] could not record the chain's %s on its walk_forward_runs row "
+                             "(%s: %s)", spec.name, type(e).__name__, type(fe).__name__, fe)
+            raise
+
+
+class _NoStore:
+    """Stands in for the DB row writer when the runner has none (test fakes, dry runs)."""
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
 
 
 def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
-              log: Callable[[str], None]) -> CellResult:
+              log: Callable[[str], None], store: Any = None) -> CellResult:
+    store = store if store is not None else _NoStore()
     plan, folds = make_cell_plan(spec)
     deferred = deferred_fold(folds, spec.data_end, spec.defer_last_test)
+    store.begin(spec, folds, deferred)
     genomes: List[WF.GenomeFold] = []
     ran: List[WF.Fold] = []
     eliminated: Optional[Dict[str, Any]] = None
@@ -326,21 +358,27 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
             eliminated = {"before_fold": f.index, "reason": why}
             log(f"[{spec.name}] cell can no longer pass ({why}) -- fold {f.index} onward not run")
             break
+        store.fold_started(f)
         if f is deferred:
             WF.train_fold(plan, runner, f, log)
             log(f"[{spec.name}] fold {f.index}: trained; its test {f.test_start}..{f.test_end} "
                 f"waits for data past {spec.data_end}")
+            store.fold_deferred(f)
             break
         name = WF.train_job_name(spec.name, f.index)
-        stored = (_load_fold(report_dir, plan, f, _identities(runner, plan, f))
-                  if runner.train_completed(name) else None)
+        completed = runner.train_completed(name)
+        ids = _identities(runner, plan, f) if completed else None
+        stored = _load_fold(report_dir, plan, f, ids) if completed else None
         if stored is not None:
             log(f"[{spec.name}] fold {f.index}: completed -- reusing its stored report")
             genomes.extend(stored)
+            store.fold_done(f, stored, ids[-1] if ids else None, reused=True)
         else:
             got = WF.run_fold(plan, runner, f, log)
-            _save_fold(report_dir, plan, f, got, _identities(runner, plan, f))
+            ids = _identities(runner, plan, f)
+            _save_fold(report_dir, plan, f, got, ids)
             genomes.extend(got)
+            store.fold_done(f, got, ids[-1] if ids else None)
         ran.append(f)
     res = WF.aggregate(spec.name, ran, len(folds), spec.top_n, genomes, spec.thresholds,
                        spec.selection, require_test_years=plan.require_test_years,
@@ -361,6 +399,8 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
                           "seeded_from": _lineage(runner, spec, job, WF.train_job_name(
                               spec.name, prev.index) if prev else None)}
         log(f"[{spec.name}] cell PENDING -- fold {deferred.index} trained, test deferred")
+    elif passed and not spec.refit:
+        log(f"[{spec.name}] cell PASSED -- refit not requested (refit off)")
     elif passed:
         refit_job = refit_job_name(spec.name)
         cmd = refit_command(spec, folds)
@@ -368,6 +408,7 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
             log(f"[{spec.name}] refit {refit_job} already completed -- skipping")
         else:
             log(f"[{spec.name}] cell PASSED -- refit {refit_job}")
+            store.refit_started(refit_job)
             runner.run_train(cmd, refit_job)
             if not runner.train_completed(refit_job):
                 raise WalkForwardError(f"refit job {refit_job!r} did not reach status 'completed'")
@@ -399,6 +440,7 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
         "winner_stitch": asdict(res.winner_stitch) if res.winner_stitch else None,
     }
     WF.atomic_write_text(os.path.join(cell_dir, "cell.json"), json.dumps(report, indent=2))
+    store.finish(report, res)
     return CellResult(spec.name, report["verdict"], refit_job, res, report)
 
 

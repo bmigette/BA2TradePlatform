@@ -161,12 +161,24 @@ def validate_folds(folds: Sequence[Fold], embargo_days: int = 0) -> None:
 
 def check_user_optimize_args(args: Sequence[str]) -> None:
     """The wrapped optimize args must not carry the window, the job name, or a flag that imports
-    state from another job / queues the job: see ``FORBIDDEN_OPTIMIZE_FLAGS``."""
+    state from another job / queues the job: see ``FORBIDDEN_OPTIMIZE_FLAGS``.
+
+    ABBREVIATIONS. ``ba2-test optimize`` parses with argparse's default ``allow_abbrev=True``, so
+    ``--warm-start-f 7`` or ``--subm`` IS that flag (measured against the real parser,
+    tests/test_wf_ui_review.py). A token is therefore refused when its option part (before ``=``) is
+    a PREFIX of a forbidden flag: argparse would either resolve it to that flag or refuse it as
+    ambiguous, and no other optimize flag is itself such a prefix (pinned by the same test), so
+    nothing valid is refused."""
     for a in args:
+        if not a.startswith("--") or a == "--":
+            continue
+        opt = a.split("=", 1)[0]
         for flag, why in FORBIDDEN_OPTIMIZE_FLAGS.items():
-            if a == flag or a.startswith(flag + "="):
+            if len(opt) > 2 and flag.startswith(opt):
                 raise WalkForwardError(
-                    f"optimize args must not contain {flag} ({why}); got {a!r}")
+                    f"optimize args must not contain {flag} ({why}); got {a!r}"
+                    + ("" if opt == flag else f" (argparse reads {opt!r} as an abbreviation of "
+                                              f"{flag})"))
 
 
 def optimize_arg_value(args: Sequence[str], flag: str) -> Optional[str]:
@@ -526,8 +538,10 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
               require_test_years: Sequence[int] = (), exclusive_return: bool = False,
               rebase_test_data: bool = False) -> Plan:
     """Validate everything BEFORE any run: a refusal here costs nothing."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or ""):
-        raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-'")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or "") or re.fullmatch(r"\.+", prefix):
+        # (only dots: '.' / '..' would make <report_dir>/<prefix> the report dir or its parent)
+        raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-' "
+                               f"(not only dots)")
     if top_n < 1:
         raise WalkForwardError(f"--top-n must be >= 1, got {top_n}")
     if test_parallel < 1:

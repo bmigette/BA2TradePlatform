@@ -12,6 +12,9 @@ import Settings from './pages/Settings';
 import SavedData from './pages/SavedData';
 import Tools from './pages/Tools';
 import CacheManagement from './pages/CacheManagement';
+import WalkForward from './pages/WalkForward';
+import WalkForwardNew from './pages/WalkForwardNew';
+import WalkForwardDetail from './pages/WalkForwardDetail';
 
 function App() {
   return (
@@ -27,6 +30,9 @@ function App() {
           <Route path="models" element={<Models />} />
           <Route path="models/:id" element={<ModelDetails />} />
           <Route path="backtesting" element={<Backtesting />} />
+          <Route path="walk-forward" element={<WalkForward />} />
+          <Route path="walk-forward/new" element={<WalkForwardNew />} />
+          <Route path="walk-forward/:id" element={<WalkForwardDetail />} />
           <Route path="tools" element={<Tools />} />
           <Route path="saved-data" element={<SavedData />} />
           <Route path="cache" element={<CacheManagement />} />
