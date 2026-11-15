@@ -85,12 +85,37 @@
 #            bundle_jobCheap.json --estimates-source fmp --initial-capital 10000 --equity-cap 10000 --seed-check-only
 #      and its `--print-universe` dry run (same arguments) shows how many listed names the $10..$50 screen can ever select.
 # Every job continues after a failed one (the exit codes are appended to $GRID_DIR/s3chain_small.status).
+#
+# WALK-FORWARD (owner 2026-11-15; docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md, "Option style cells"):
+#   WF_ARGS="--walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 --wf-top-n 3 --wf-report-dir <dir>
+#            --pass-min-oos-return 0 --pass-max-dd-mult 2.5 --pass-max-oos-dd 35 --pass-min-folds 2"
+#       bash tools/grid_option_small_accounts.sh                (one environment assignment, one line or quoted)
+# runs every job as a walk-forward CELL (option_style_job.sh --walk-forward): the seed bundle of every job is the
+# word none (walk-forward folds are UNSEEDED: no stage-1 seeds, no bundle files needed), WF_ARGS (no spaces inside
+# a value) go after each job's own flags, and the logs and the status file carry -wf (s3L10-wf_run.log,
+# s3chain_small-wf.status), so a plain chain's files are never overwritten. Jobs 6 and 7 are NOT launched in this
+# mode: a fixed screen (--screen-preset) cannot be walk-forward-tested yet (run_option_style_wf.py says why).
+# Phase B (January 2027, after _OPTION_HOLDOUT_START moved): the same WF_ARGS without --wf-data-end, with
+# AV_END=2026-12-31 so the Alpha Vantage completeness check covers the 2026 test year, and the 2026 panel and
+# manifests in the job environment (SCREENER_PANEL, MC_OHLCV, MC_TA, SCREENER_STORE).
+# Without WF_ARGS the chain is exactly the plain one (same commands, byte for byte).
 REPO="${REPO:-/home/debian/ba2-grid/repo}"
 GRID_DIR="${GRID_DIR:-/home/debian/ba2-grid}"
 JOB="$REPO/tools/option_style_job.sh"
 cd "$GRID_DIR" || exit 1
 B="$GRID_DIR"
 export OPTION_HISTORY_SOURCE=alphavantage            # owner 2026-11-12: every job of this chain reads the AV store
+WF_ARGS="${WF_ARGS:-}"                                # empty: the plain chain; else every job is a walk-forward cell
+WFT=""
+if [ -n "$WF_ARGS" ]; then
+    case " $WF_ARGS " in
+        *" --walk-forward "*) WFT=-wf ;;
+        *) echo "WF_ARGS must contain --walk-forward, got: $WF_ARGS" >&2; exit 2 ;;
+    esac
+fi
+AV_END="${AV_END:-2025-12-31}"                        # last day the AV completeness check requires
+# bundle <file>: the job's seed bundle under $GRID_DIR, or the word none for a walk-forward cell (unseeded)
+bundle() { if [ -n "$WF_ARGS" ]; then echo none; else echo "$B/$1"; fi; }
 
 # av_complete <universe file> <tag>: exit 0 when the AV store holds every session of 2020-01-02..2025-12-31 for every
 # listed name (read-only, no network), with the job script's own host defaults; the log names what is owed.
@@ -99,34 +124,34 @@ av_complete() {
     (cd "$REPO" && BA2_HOME="$home" \
         PYTHONPATH="$REPO/packages/common:$REPO/packages/providers:$REPO/packages/experts:$REPO/testplatform/backend:$REPO/testplatform" \
         "${PY:-/opt/ba2worker/ba2-venvs/test/bin/python}" tools/download_av_option_chains.py --symbols-file "$1" \
-        --start 2020-01-02 --end 2025-12-31 --require-complete --db "$home/test/dl_forecasting.db") > "$2_avcheck.log" 2>&1
+        --start 2020-01-02 --end "$AV_END" --require-complete --db "$home/test/dl_forecasting.db") > "$2_avcheck.log" 2>&1
 }
 
 STAGE2="$REPO/tools/options_universe_stage2.txt"
 if av_complete "$STAGE2" s3stage2; then
     # 1. $10k: long calls / call spreads / convex / LEAPS. Redo of job L10 (opt 44).
-    bash "$JOB" long10k s3L10 "$B/bundle_jobL10.json" --fitness option_long_dd40_50 --estimates-source fmp \
-        --initial-capital 10000 --equity-cap 10000 > s3L10_run.log 2>&1
-    echo "jobL10 exit $? $(date -Is)" >> s3chain_small.status
+    bash "$JOB" long10k s3L10 "$(bundle bundle_jobL10.json)" --fitness option_long_dd40_50 --estimates-source fmp \
+        --initial-capital 10000 --equity-cap 10000 $WF_ARGS > s3L10${WFT}_run.log 2>&1
+    echo "jobL10 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 
     # 2. $20k: premium with the wheel first (WHEEL > CSP > BULLPS > JL > RS > CC > PP > IC), style premium_stop.
-    bash "$JOB" premium_stop s3P20 "$B/bundle_jobPstop.json" --estimates-source fmp > s3P20_run.log 2>&1
-    echo "jobP20 exit $? $(date -Is)" >> s3chain_small.status
+    bash "$JOB" premium_stop s3P20 "$(bundle bundle_jobPstop.json)" --estimates-source fmp $WF_ARGS > s3P20${WFT}_run.log 2>&1
+    echo "jobP20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 
     # 3. $20k: mid-term mix (STRG/STRD > BULLCS > BF > LC), style mid_share.
-    bash "$JOB" mid_share s3A20 "$B/bundle_jobAshare.json" --estimates-source fmp > s3A20_run.log 2>&1
-    echo "jobA20 exit $? $(date -Is)" >> s3chain_small.status
+    bash "$JOB" mid_share s3A20 "$(bundle bundle_jobAshare.json)" --estimates-source fmp $WF_ARGS > s3A20${WFT}_run.log 2>&1
+    echo "jobA20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 
     # 4. $20k: long-dated (CBS > LEAP > PMCC > CONVEX). Redo of job C (opt 43).
-    bash "$JOB" long s3C20 "$B/bundle_jobC.json" --fitness option_long --estimates-source fmp > s3C20_run.log 2>&1
-    echo "jobC20 exit $? $(date -Is)" >> s3chain_small.status
+    bash "$JOB" long s3C20 "$(bundle bundle_jobC.json)" --fitness option_long --estimates-source fmp $WF_ARGS > s3C20${WFT}_run.log 2>&1
+    echo "jobC20 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 
     # 5. $10k: momentum burst (LC > BULLCS, short-dated, exits always on), style burst10k. Same account flags as job 1.
-    bash "$JOB" burst10k s3B10 "$B/bundle_jobBurst.json" --fitness option_long_dd40_50 --estimates-source fmp \
-        --initial-capital 10000 --equity-cap 10000 > s3B10_run.log 2>&1
-    echo "jobB10 exit $? $(date -Is)" >> s3chain_small.status
+    bash "$JOB" burst10k s3B10 "$(bundle bundle_jobBurst.json)" --fitness option_long_dd40_50 --estimates-source fmp \
+        --initial-capital 10000 --equity-cap 10000 $WF_ARGS > s3B10${WFT}_run.log 2>&1
+    echo "jobB10 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 else
-    echo "jobs L10 P20 A20 C20 B10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $? (see s3stage2_avcheck.log) $(date -Is)" >> s3chain_small.status
+    echo "jobs L10 P20 A20 C20 B10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $? (see s3stage2_avcheck.log) $(date -Is)" >> s3chain_small${WFT}.status
 fi
 
 # 6. $50k: the wheel family (WHEEL > CSP, covered calls only after an assignment) on the 30 largest NASDAQ-listed
@@ -134,12 +159,14 @@ fi
 #    market cap at each scan, no screener genes) and restricted to tools/options_universe_nasdaq.txt; default fitness.
 #    GUARD: the AV store must hold the whole list, the ten names downloaded separately included (checklist 3).
 NDX="$REPO/tools/options_universe_nasdaq.txt"
-if av_complete "$NDX" s3N50; then
+if [ -n "$WF_ARGS" ]; then
+    echo "jobN50 SKIPPED in walk-forward mode: a fixed screen (--screen-preset ndx30) cannot be walk-forward-tested yet (tools/run_option_style_wf.py) $(date -Is)" >> s3chain_small${WFT}.status
+elif av_complete "$NDX" s3N50; then
     UFILE="$NDX" SCREEN="--screen-preset ndx30" bash "$JOB" wheel50k_ndx s3N50 "$B/bundle_jobNdx.json" \
         --estimates-source fmp --initial-capital 50000 --equity-cap 50000 > s3N50_run.log 2>&1
-    echo "jobN50 exit $? $(date -Is)" >> s3chain_small.status
+    echo "jobN50 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 else
-    echo "jobN50 SKIPPED: AV store incomplete for options_universe_nasdaq.txt, check exit $? (see s3N50_avcheck.log) $(date -Is)" >> s3chain_small.status
+    echo "jobN50 SKIPPED: AV store incomplete for options_universe_nasdaq.txt, check exit $? (see s3N50_avcheck.log) $(date -Is)" >> s3chain_small${WFT}.status
 fi
 
 # 7. $10k: the wheel family on CHEAP large caps (WHEEL > CSP > BULLPS > LC), style cheap10k (owner 2026-11-13). A $10k
@@ -147,10 +174,12 @@ fi
 #    weekly scan, the 50 largest of the stage-2 names priced $10..$50 on that scan's price (point in time, as-traded
 #    basis: the panel's split factor), so one contract reserves at most about $5,000. Default fitness (the premium
 #    family's soft30, as jobs 2 and 6). Same universe as jobs 1-5, re-checked here because job 6 ran in between.
-if av_complete "$STAGE2" s3W10; then
+if [ -n "$WF_ARGS" ]; then
+    echo "jobW10 SKIPPED in walk-forward mode: a fixed screen (--screen-preset cheap50) cannot be walk-forward-tested yet (tools/run_option_style_wf.py) $(date -Is)" >> s3chain_small${WFT}.status
+elif av_complete "$STAGE2" s3W10; then
     SCREEN="--screen-preset cheap50" bash "$JOB" cheap10k s3W10 "$B/bundle_jobCheap.json" \
         --estimates-source fmp --initial-capital 10000 --equity-cap 10000 > s3W10_run.log 2>&1
-    echo "jobW10 exit $? $(date -Is)" >> s3chain_small.status
+    echo "jobW10 exit $? $(date -Is)" >> s3chain_small${WFT}.status
 else
-    echo "jobW10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $? (see s3W10_avcheck.log) $(date -Is)" >> s3chain_small.status
+    echo "jobW10 SKIPPED: AV store incomplete for options_universe_stage2.txt, check exit $? (see s3W10_avcheck.log) $(date -Is)" >> s3chain_small${WFT}.status
 fi

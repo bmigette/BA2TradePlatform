@@ -1112,32 +1112,48 @@ def _run_walk_forward(ap, args, launcher, experts, strategies, universe) -> int:
           f"{'ON (launcher default)' if args.robust_fitness else 'OFF (--no-robust-fitness)'}"
           " -- scores are NOT comparable across the robustness setting.")
     if args.dry_run:
-        for spec in specs:
-            plan, folds = C.make_cell_plan(spec)
-            print(f"\n=== cell {spec.name} ({spec.expert} {spec.strategy} / {spec.band}) ===")
-            for f in folds:
-                job = WF.train_job_name(spec.name, f.index)
-                print(f"  {'DONE' if job in done else 'TODO'}  {job}")
-            print(WF.render_dry_run(plan))
-            later = C.deferred_fold(folds, spec.data_end, spec.defer_last_test)
-            if later is not None:
-                print(f"  fold {later.index}: TEST DEFERRED -- the data ends {spec.data_end}; this run "
-                      f"only TRAINS {WF.train_job_name(spec.name, later.index)}. Rerun the same "
-                      f"command without --wf-data-end to test it, decide the cell and refit.")
-                continue
-            print("  refit (only if the cell passes): " + " ".join(C.refit_command(spec, folds)))
-        print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
+        print_wf_dry_run(specs, done)
         return 0
     if args.screener_gate_store and not Path(args.screener_gate_store).exists():
         ap.error(f"Screener gate store does not exist: {args.screener_gate_store}")
     runner = _make_wf_runner(args, selection)
-    cells = C.run_cells(specs, lambda _spec: runner, args.wf_report_dir)
+    return run_wf_cells(specs, runner, args.wf_report_dir, _FAILED_JOBS,
+                        "options matrix driver (walk-forward)")
+
+
+def print_wf_dry_run(specs, done) -> None:
+    """Each cell's chain (DONE/TODO per fold job, the engine's own dry-run text, the deferred fold or
+    the refit command); runs nothing. Shared with tools/run_option_style_wf.py."""
+    WF, C = _wf_import()
+    for spec in specs:
+        plan, folds = C.make_cell_plan(spec)
+        print(f"\n=== cell {spec.name} ({spec.expert} {spec.strategy} / {spec.band}) ===")
+        for f in folds:
+            job = WF.train_job_name(spec.name, f.index)
+            print(f"  {'DONE' if job in done else 'TODO'}  {job}")
+        print(WF.render_dry_run(plan))
+        later = C.deferred_fold(folds, spec.data_end, spec.defer_last_test)
+        if later is not None:
+            print(f"  fold {later.index}: TEST DEFERRED -- the data ends {spec.data_end}; this run "
+                  f"only TRAINS {WF.train_job_name(spec.name, later.index)}. Rerun the same "
+                  f"command without --wf-data-end to test it, decide the cell and refit.")
+            continue
+        print("  refit (only if the cell passes): " + " ".join(C.refit_command(spec, folds)))
+    print("Dry-run only: cache coverage and vendor compatibility have NOT been validated.")
+
+
+def run_wf_cells(specs, runner, report_dir, failed: list, label: str) -> int:
+    """Run the cells through ``wf_chain.run_cells`` (one cell's ERROR does not stop the others),
+    print each verdict and finish like a matrix (every ERROR reported, non-zero exit). Shared with
+    tools/run_option_style_wf.py."""
+    WF, C = _wf_import()
+    cells = C.run_cells(specs, lambda _spec: runner, report_dir)
     for c in cells:
         print(f"  {c['verdict']:7s} {c['cell']}" + (f"  refit={c['refit_job']}" if c["refit_job"] else "")
               + (f"  ({c['error']})" if c.get("error") else ""), flush=True)
         if c["verdict"] == "ERROR":
-            note_job_exit(_FAILED_JOBS, c["cell"], 1, c["error"])
-    return finish_matrix(_FAILED_JOBS, "options matrix driver (walk-forward)")
+            note_job_exit(failed, c["cell"], 1, c["error"])
+    return finish_matrix(failed, label)
 
 
 def main(argv=None) -> int:

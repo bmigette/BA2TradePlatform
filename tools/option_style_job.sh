@@ -50,6 +50,19 @@
 #
 # Run it detached: a systemd transient unit (systemd-run --unit <name> -p MemoryMax=... ) or nohup + setsid, as
 # tools/grid_goal2027.sh does for its `start`. Tools/grid_option_small_accounts.sh chains seven of these.
+#
+# WALK-FORWARD (--walk-forward among the extra args; docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md,
+# "Option style cells"): the SAME recipe runs as a walk-forward CELL optwf-...-d<digest> through
+# tools/run_option_style_wf.py (wf1/wf2/wf3 train 2020..2023/2024/2025, tested 2024/2025/2026, refit if it passes),
+# on the stock grid's engine. The seed bundle must then be the word none: walk-forward folds are UNSEEDED (owner
+# 2026-11-15; fold 1 is a cold start, each fold seeds only the next). Any other bundle is handed on and refused there
+# with the reason. The walk-forward flags (--wf-*, --pass-*, --dry-run) and the optimize overrides share the extra
+# args, e.g. phase A:
+#   bash tools/option_style_job.sh long10k s3L10 none --fitness option_long_dd40_50 --estimates-source fmp \
+#       --initial-capital 10000 --equity-cap 10000 --walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 \
+#       --wf-top-n 3 --wf-report-dir $BA2_HOME/reports/option_style_wf \
+#       --pass-min-oos-return 0 --pass-max-dd-mult 2.5 --pass-max-oos-dd 35 --pass-min-folds 2
+# Without --walk-forward the job is exactly the plain one above (same command, byte for byte).
 set -u
 STYLE="$1"; SUFFIX="$2"; BUNDLE="$3"; shift 3
 REPO="${REPO:-/home/debian/ba2-grid/repo}"
@@ -83,7 +96,19 @@ SCREENER_STORE="${SCREENER_STORE:-metric_store_alpaca_20261022}"
 SCREENER_PANEL="${SCREENER_PANEL:-03d21a4a2f176c69}"
 SCREEN="${SCREEN:---screener-cap-band large}"
 UNIVERSE=$(tr -d '\r' < "$UFILE" | sed 's/#.*//; s/[[:space:]]//g' | grep -v '^$' | paste -sd, -)
-exec $PY testplatform/ba2test_launcher.py optimize --expert DeterministicScorer \
+# Walk-forward: the driver goes in front of the very command below, the extra args move in front of its '--', and
+# the seed bundle is dropped only when it is the word none (a real bundle reaches the driver, which refuses it).
+SEED=(--seed-population "$BUNDLE")
+WFRUN=()
+for a in "$@"; do
+  if [ "$a" = "--walk-forward" ]; then
+    WFRUN=($PY tools/run_option_style_wf.py "$@" --)
+    [ "$BUNDLE" = none ] && SEED=()
+    set --
+    break
+  fi
+done
+exec ${WFRUN[@]+"${WFRUN[@]}"} $PY testplatform/ba2test_launcher.py optimize --expert DeterministicScorer \
   --universe "$UNIVERSE" --strategy O_STYLE \
   --style-config $REPO/tools/option_styles.stage2.json --style "$STYLE" \
   --start 2020-01-02 --end 2025-12-31 --interval 1d \
@@ -99,4 +124,4 @@ exec $PY testplatform/ba2test_launcher.py optimize --expert DeterministicScorer 
   --screener --screener-store $CACHE/screener/$SCREENER_STORE \
   --screener-panel $CACHE/screener/daily_panel/$SCREENER_PANEL $SCREEN \
   --screener-universe-file "$UFILE" --screener-cadence-days 7 \
-  --seed-population "$BUNDLE" "$@"
+  ${SEED[@]+"${SEED[@]}"} "$@"
