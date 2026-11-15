@@ -290,6 +290,7 @@ class JobManager:
             self._running = True
             
         logger.info("Starting JobManager...")
+        _iv_prefetch_stop(False)            # a restart re-arms a prefetch a previous stop() halted
         
         # Start control thread for asynchronous operations
         self._start_control_thread()
@@ -314,6 +315,7 @@ class JobManager:
         _th.Thread(target=self._ensure_dgs3mo, args=(True,), name="dgs3mo-startup", daemon=True).start()
         self._report_iv_rank_readiness()
         self._iv_warm_catchup_if_due()
+        self._iv_chain_prefetch_catchup_if_due()
 
         logger.info("JobManager started successfully")
         
@@ -324,6 +326,10 @@ class JobManager:
             return
 
         logger.info("Stopping JobManager...")
+
+        # A running iv-v1 chain prefetch stops at its next check (per symbol, budget wait, request), so
+        # it cannot hold the scheduler's shutdown -- and a restart at 07:00 -- until its 09:45 deadline.
+        _iv_prefetch_stop(True)
 
         # Stop the watchdog first so it cannot re-arm jobs during shutdown.
         self._stop_account_refresh_watchdog()
@@ -413,6 +419,9 @@ class JobManager:
                 logger.debug(f"Re-scheduling jobs for expert {expert_instance_id}")
                 self._schedule_expert_analysis(expert_instance_id)
                 logger.debug(f"_scheduled_jobs after re-scheduling: {list(self._scheduled_jobs.keys())}")
+                # This expert may have gained or lost the last active iv-v1 gate (added, enabled,
+                # disabled, ruleset/profile changed): (un)schedule the chain prefetch accordingly.
+                self._schedule_iv_chain_prefetch_job()
             else:
                 # Stop all live experts before full refresh
                 self._stop_all_live_experts()
@@ -925,9 +934,11 @@ class JobManager:
     def _schedule_iv_chain_prefetch_job(self):
         """Schedule the iv-v1 chain prefetch (Mon-Fri 06:30 ET) ONLY while an enabled expert has an
         ACTIVE iv-v1 gate trained on alphavantage. Without one nothing is scheduled and nothing is
-        logged -- every existing installation. Re-evaluated whenever the system jobs are rebuilt
-        (startup, refresh, an expert's schedule refresh); a job left behind after the last gate is
-        removed unschedules itself here, and the job re-checks before doing anything."""
+        logged -- every existing installation. Re-evaluated at startup, on a full refresh AND on a
+        single expert's schedule refresh (an expert added, enabled, disabled, or its ruleset/profile
+        changed); when the last gate goes, the job is unscheduled here, and the job itself re-checks
+        before doing anything. Started inside the prefetch window (after 06:30, before the deadline),
+        it also runs once right away (``_iv_chain_prefetch_catchup_if_due``)."""
         try:
             from ..modules.dataproviders.options import iv_chain_prefetch as ivp
             active = ivp.has_active_iv_gates()
@@ -954,6 +965,19 @@ class JobManager:
                         f"America/New_York, Mon-Fri (deadline {ivp.DEADLINE_HOUR:02d}:{ivp.DEADLINE_MINUTE:02d})")
         except Exception as e:
             logger.error(f"Error scheduling the iv-v1 chain prefetch job: {e}", exc_info=True)
+
+    def _iv_chain_prefetch_catchup_if_due(self):
+        """An app (re)started between 06:30 and the 09:45 deadline on a weekday missed the cron: run the
+        prefetch once now, on its own thread (stoppable: ``av_live_chain.request_stop``)."""
+        try:
+            from ..modules.dataproviders.options import iv_chain_prefetch as ivp
+            if IV_CHAIN_PREFETCH_JOB_ID in self._scheduled_jobs and ivp.in_prefetch_window():
+                import threading as _th
+                logger.info("iv-v1 chain prefetch: app started inside the prefetch window; running it now")
+                _th.Thread(target=self._execute_iv_chain_prefetch, name="iv-chain-prefetch-catchup",
+                           daemon=True).start()
+        except Exception as e:  # noqa: BLE001 -- a catch-up must never block the start
+            logger.error(f"Error starting the iv-v1 chain prefetch catch-up: {e}", exc_info=True)
 
     def _execute_iv_chain_prefetch(self):
         try:
@@ -2433,6 +2457,16 @@ def initialize_job_manager():
     job_manager = get_job_manager()
     if not job_manager._running:
         job_manager.start()
+
+
+def _iv_prefetch_stop(stop: bool) -> None:
+    """Set (or clear) the iv-v1 chain prefetch's stop flag; silent and free when the module was never
+    imported (no installation without an iv gate imports it for this)."""
+    import sys as _sys
+
+    mod = _sys.modules.get("ba2_providers.market_conditions.av_live_chain")
+    if mod is not None:
+        (mod.request_stop if stop else mod.clear_stop)()
 
 
 def shutdown_job_manager():

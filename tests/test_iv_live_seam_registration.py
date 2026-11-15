@@ -125,3 +125,73 @@ def test_a_fresh_installation_has_no_active_iv_gate():
 
     assert ivp.has_active_iv_gates() is False
     assert ivp.run_prefetch_once() == {"skipped": "no active iv-v1 gate"}
+
+
+# --------------------------------------------------------------------------- re-review 2026-11-15
+def test_job_manager_stop_sets_the_prefetch_stop_flag_and_start_clears_it(monkeypatch):
+    """Item 1: stop()/shutdown() halt a running prefetch at its next check; a restart re-arms it."""
+    from ba2_providers.market_conditions import av_live_chain as avl
+    from ba2_trade_platform.core import JobManager as jm_mod
+
+    avl.clear_stop()
+    jm_mod._iv_prefetch_stop(True)
+    assert avl._STOP.is_set()
+    jm_mod._iv_prefetch_stop(False)
+    assert not avl._STOP.is_set()
+    jm = _bare_job_manager()
+    jm._running = True
+    jm._lock = __import__("threading").Lock()
+    for name in ("_stop_account_refresh_watchdog", "_stop_all_live_experts", "_stop_control_thread"):
+        monkeypatch.setattr(jm, name, lambda: None)
+    jm._scheduler.remove_all_jobs = lambda: None
+    jm.stop()
+    assert avl._STOP.is_set()
+    avl.clear_stop()
+
+
+def test_a_restart_inside_the_window_runs_the_prefetch_once(monkeypatch):
+    """Item 2: catch-up after a restart past 06:30 and before the deadline."""
+    import threading
+
+    from ba2_trade_platform.core.JobManager import IV_CHAIN_PREFETCH_JOB_ID
+    from ba2_trade_platform.modules.dataproviders.options import iv_chain_prefetch as ivp
+
+    ran = threading.Event()
+    jm = _bare_job_manager()
+    monkeypatch.setattr(jm, "_execute_iv_chain_prefetch", ran.set)
+    monkeypatch.setattr(ivp, "in_prefetch_window", lambda now=None: False)
+    jm._scheduled_jobs[IV_CHAIN_PREFETCH_JOB_ID] = object()
+    jm._iv_chain_prefetch_catchup_if_due()
+    assert not ran.wait(0.2)
+    monkeypatch.setattr(ivp, "in_prefetch_window", lambda now=None: True)
+    jm._iv_chain_prefetch_catchup_if_due()
+    assert ran.wait(2.0)
+    ran.clear()
+    jm._scheduled_jobs.clear()                    # no active gate -> no job -> no catch-up
+    jm._iv_chain_prefetch_catchup_if_due()
+    assert not ran.wait(0.2)
+
+
+def test_the_prefetch_window(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from ba2_trade_platform.modules.dataproviders.options import iv_chain_prefetch as ivp
+
+    ny = ZoneInfo("America/New_York")
+    assert ivp.in_prefetch_window(datetime(2025, 11, 17, 7, 0, tzinfo=ny))          # Monday 07:00
+    assert not ivp.in_prefetch_window(datetime(2025, 11, 17, 6, 0, tzinfo=ny))
+    assert not ivp.in_prefetch_window(datetime(2025, 11, 17, 9, 50, tzinfo=ny))
+    assert not ivp.in_prefetch_window(datetime(2025, 11, 16, 7, 0, tzinfo=ny))      # Sunday
+
+
+def test_a_single_expert_refresh_reschedules_the_prefetch(monkeypatch):
+    """Item 2: adding/enabling/disabling one expert (the single-expert refresh branch) re-evaluates
+    the prefetch job."""
+    import inspect
+
+    from ba2_trade_platform.core.JobManager import JobManager
+
+    src = inspect.getsource(JobManager._refresh_expert_schedules_sync)
+    single = src[:src.index("            else:\n                # Stop all live experts before full refresh")]
+    assert "self._schedule_iv_chain_prefetch_job()" in single

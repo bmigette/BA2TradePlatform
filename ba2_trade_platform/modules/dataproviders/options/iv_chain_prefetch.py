@@ -101,10 +101,12 @@ def prior_session(now: datetime = None) -> date:
     return decision_data_session(live_decision_label(now or datetime.now(timezone.utc)))
 
 
-def candidate_symbols(cache_root: str = None) -> Tuple[List[str], List[int]]:
-    """``(symbols, instances whose universe is only known at analysis time)``."""
+def candidate_symbols(cache_root: str = None, reference: date = None) -> Tuple[List[str], List[int]]:
+    """``(symbols, instances whose universe is only known at analysis time)``. For the latter, the
+    symbols with a cached chain for one of the last ``RECENT_SESSIONS`` sessions (by the file's
+    session date) -- what those experts actually evaluated lately."""
     from ba2_common.core.market_condition_live import UNIVERSE_SENTINELS
-    from ba2_providers.market_conditions.av_live_chain import LIVE_CHAIN_DIR
+    from ba2_providers.market_conditions.av_live_chain import recent_symbols
 
     symbols: set = set()
     dynamic: List[int] = []
@@ -117,13 +119,18 @@ def candidate_symbols(cache_root: str = None) -> Tuple[List[str], List[int]]:
         if cache_root is None:
             from ba2_common.core import native_cache
             cache_root = native_cache.CACHE_FOLDER
-        root = os.path.join(cache_root, LIVE_CHAIN_DIR)
-        if os.path.isdir(root):
-            for sym in os.listdir(root):
-                files = sorted(f for f in os.listdir(os.path.join(root, sym)) if f.endswith(".parquet"))
-                if files[-RECENT_SESSIONS:]:
-                    symbols.add(sym.upper())
+        symbols.update(recent_symbols(cache_root, RECENT_SESSIONS, reference))
     return sorted(symbols), dynamic
+
+
+def in_prefetch_window(now: datetime = None) -> bool:
+    """A weekday between the cron time (06:30 ET) and the deadline (09:45 ET)."""
+    from zoneinfo import ZoneInfo
+
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    start = local.replace(hour=PREFETCH_HOUR, minute=PREFETCH_MINUTE, second=0, microsecond=0)
+    end = local.replace(hour=DEADLINE_HOUR, minute=DEADLINE_MINUTE, second=0, microsecond=0)
+    return local.weekday() < 5 and start <= local < end
 
 
 def run_prefetch_once(now: datetime = None) -> Dict[str, Any]:
@@ -139,15 +146,17 @@ def run_prefetch_once(now: datetime = None) -> Dict[str, Any]:
     local = now.astimezone(ny)
     deadline_local = local.replace(hour=DEADLINE_HOUR, minute=DEADLINE_MINUTE, second=0, microsecond=0)
     remaining_s = max(0.0, (deadline_local - local).total_seconds())
-    symbols, dynamic = candidate_symbols()
-    report = prefetch_chains(symbols, prior_session(now), deadline=time.monotonic() + remaining_s,
-                             log=logger.info)
+    session = prior_session(now)
+    symbols, dynamic = candidate_symbols(reference=session)
+    report = prefetch_chains(symbols, session, deadline=time.monotonic() + remaining_s, log=logger.info)
     report["dynamic_instances"] = dynamic
     if report["failed"]:
         shown = ", ".join(f"{s} ({r.split(':', 1)[0]})" for s, r in list(report["failed"].items())[:8])
         logger.warning(f"iv-v1 chain prefetch: {len(report['failed'])} symbol(s) not fetched ({shown}); "
                        f"they are tried again on demand at the decision")
     if dynamic:
-        logger.info(f"iv-v1 chain prefetch: expert instance(s) {dynamic} pick their universe at analysis time; "
-                    f"their recently evaluated symbols were prefetched, the rest is fetched on demand")
+        logger.info(f"iv-v1 chain prefetch: expert instance(s) {dynamic} pick their universe at analysis time "
+                    f"(a screener run at the decision); their symbols of the last {RECENT_SESSIONS} sessions were "
+                    f"prefetched, any NEW name is fetched on demand at up to 10/min and beyond that refused for "
+                    f"the pass ('chain not prefetched; rate budget exhausted')")
     return report
