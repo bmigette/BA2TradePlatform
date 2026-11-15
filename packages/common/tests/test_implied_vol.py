@@ -169,9 +169,12 @@ def test_total_variance_interpolation():
 def test_total_variance_needs_both_sides():
     assert iv.interp_total_variance([(20, 0.3)], 30, 7, 75) == (None, None)
     assert iv.interp_total_variance([(45, 0.3), (50, 0.3)], 30, 7, 75) == (None, None)
-    # an expiry exactly at the target counts on the LOW side
+    # an expiry exactly ON the target is the constant-maturity value by itself, with or without
+    # a high side (review 2026-11-15)
     v, br = iv.interp_total_variance([(30, 0.25), (40, 0.4)], 30, 7, 75)
-    assert br == (30, 40) and v == pytest.approx(0.25, abs=1e-15)
+    assert br == (30, 30) and v == 0.25
+    v, br = iv.interp_total_variance([(30, 0.25)], 30, 7, 75)
+    assert br == (30, 30) and v == 0.25
 
 
 def test_interpolated_total_variance_lies_between_the_endpoints():
@@ -337,3 +340,51 @@ def test_atm_iv_equals_the_study_maths_on_a_noisy_chain():
     want = _study_atm(rows, pt.forward, T)
     assert want is not None
     assert pt.atm_iv == pytest.approx(want, abs=1e-12)
+
+
+# ------------------------------------------------------------------------- review 2026-11-15
+def test_a_zero_bid_quote_never_sets_the_forward():
+    """A zero bid is a one-sided market: its "mid" is half the ask, not a price. Here the only
+    strike where both sides meet has a zero-bid put; the forward must come from the others."""
+    strikes = [95.0, 100.0, 105.0]
+    F, T = 100.0, 30 / 365.0
+    exp = SESSION + timedelta(days=30)
+    rows = []
+    for K in strikes:
+        for c in (True, False):
+            p = iv.black76_price(F, K, T, 0.3, c)
+            rows.append((exp, c, K, p - 0.01, p + 0.01))
+    good = iv.ChainQuotes.from_columns(*zip(*rows))
+    f_good = iv.expiry_point(good, SESSION, exp).forward
+    poisoned = [(e, c, K, (0.0 if (K == 100.0 and not c) else b), a) for e, c, K, b, a in rows]
+    pt = iv.expiry_point(iv.ChainQuotes.from_columns(*zip(*poisoned)), SESSION, exp)
+    assert pt.forward is not None and pt.forward == pytest.approx(F, abs=0.05)
+    assert f_good == pytest.approx(F, abs=1e-6)
+
+
+def test_an_expiry_on_the_target_day_alone_defines_iv30():
+    ch = _chain(SESSION, (9, 30), 100.0, lambda d, K: 0.27, lambda d: [95.0, 100.0, 105.0], spread=0.0002)
+    term = iv.atm_iv_term(ch, SESSION)
+    assert term.iv30_bracket == (30, 30)
+    assert term.iv30 == pytest.approx(0.27, abs=1e-4)
+    assert term.iv60 is None
+
+
+def test_the_documented_discount_bias_of_d_equals_one():
+    """D = 1 is a deliberate choice (module docstring): pinned so the documented bias stays true."""
+    for dte, want in ((30, 0.2987), (60, 0.2974)):
+        T = dte / 365.0
+        D = math.exp(-0.053 * T)
+        price = D * iv.black76_price(100.0, 100.0, T, 0.30, True)
+        assert iv.implied_vol_black76(100.0, 100.0, T, price, True) == pytest.approx(want, abs=1e-4)
+    T = 30 / 365.0
+    near_zero = math.exp(-0.0005 * T) * iv.black76_price(100.0, 100.0, T, 0.30, True)
+    assert iv.implied_vol_black76(100.0, 100.0, T, near_zero, True) == pytest.approx(0.30, abs=2e-5)
+
+
+def test_conflicting_duplicates_are_counted():
+    exp = SESSION + timedelta(days=30)
+    ch = iv.ChainQuotes.from_columns([exp, exp, exp], [True, True, False], [100.0, 100.0, 100.0],
+                                     [1.0, 2.0, 1.0], [1.1, 2.1, 1.1])
+    assert ch.conflicts_dropped == 2 and len(ch) == 1
+    assert iv.ChainQuotes.from_columns([exp], [True], [100.0], [1.0], [1.1]).conflicts_dropped == 0

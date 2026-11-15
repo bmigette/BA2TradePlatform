@@ -13,8 +13,8 @@ METHOD (``IV_CALC_VERSION``), every step fixed:
 
 1. Candidate expiries: ``dte = expiry - session`` in calendar days, ``DTE_MIN..DTE_MAX`` (7..130).
 2. Forward per expiry (put-call parity, AS-TRADED basis, undiscounted): over strikes where both
-   the call and the put carry a forward-usable quote (finite, ``ask > 0``, ``bid >= 0``,
-   ``ask >= bid``), ``K*`` = the strike minimising ``|C_mid - P_mid|`` (ties: the LOWEST strike)
+   the call and the put carry a forward-usable quote (finite, ``bid > 0``, ``ask >= bid`` -- a
+   zero bid is a one-sided market, not a mid; the study admitted ``bid >= 0``), ``K*`` = the strike minimising ``|C_mid - P_mid|`` (ties: the LOWEST strike)
    and ``F = K* + C_mid - P_mid``. ``mid = (bid + ask) / 2``. No forward -> the expiry is unusable.
 3. Forward outliers: the median of the candidate expiries' forwards; an expiry whose forward is
    more than 10% from it is excluded (an adjusted root on another basis, a broken print).
@@ -32,7 +32,19 @@ METHOD (``IV_CALC_VERSION``), every step fixed:
    because only ``k0``/``k1`` can ever be read.
 6. Constant maturity, total variance linear in calendar days: IV30 between the NEAREST usable
    expiry with dte in ``[7, 30]`` and the nearest in ``(30, 75]``; IV60 between ``[21, 60]`` and
-   ``(60, 130]``. Both sides are required: never extrapolated, never a flat single expiry.
+   ``(60, 130]``. Both sides are required -- never extrapolated, never a flat single expiry --
+   EXCEPT an expiry exactly ON the target day, which is the constant-maturity value itself.
+
+DISCOUNTING IS IGNORED (D = 1), DELIBERATELY. Equity option quotes embed a discount factor
+``D = exp(-r T)``; pricing them undiscounted biases the IV slightly LOW when rates are high: a
+true 0.30 recovers 0.2987 at 30 days and 0.2974 at 60 days with r = 5.3% (2023-24), and ~0.3000 at
+r = 0.05% (2020-21) -- under 0.5% of the level, against gate steps of ~5-8% of it. Estimating D
+per expiry from the put-call-parity SLOPE across strikes was measured on real ThetaData chains
+(AAPL/MSFT/JPM/XOM/KO/AMD, March 2021/2023/2024, 20-75 day expiries, strikes within 10% of F):
+D error p10..p90 about -0.02..+0.04 and an implied rate whose median had the WRONG sign in 2023-24
+(-8% / -12% against ~5.2%), i.e. far noisier than the bias it would remove (American early
+exercise and dividends distort parity across strikes). There is no rate source in this pure
+module, so D = 1 stays; see docs/plans/2026-11-15-option-iv-conditions.md.
 
 Determinism: the chain is normalised (sorted, exact duplicates collapsed, conflicting duplicates
 dropped) at construction, so neither the answer nor ``digest()`` depends on row order. Every
@@ -129,6 +141,9 @@ class ChainQuotes:
     bid: np.ndarray
     ask: np.ndarray
     _index: Dict[int, Tuple[int, int]] = field(default=None, repr=False)  # type: ignore[assignment]
+    #: rows dropped because their (expiry, type, strike) carried CONFLICTING quotes (a quality signal
+    #: the store build reports; set at construction).
+    conflicts_dropped: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         e = np.asarray(self.expiry_days, dtype=np.int64)
@@ -155,7 +170,9 @@ class ChainQuotes:
                 group = np.cumsum(~same_key)                 # group id per (e, c, k)
                 bad_groups = np.unique(group[same_key & ~same_quote])
                 if len(bad_groups):
-                    keep &= ~np.isin(group, bad_groups)
+                    conflicting = np.isin(group, bad_groups)
+                    object.__setattr__(self, "conflicts_dropped", int(conflicting.sum()))
+                    keep &= ~conflicting
                 e, c, k, b, a = e[keep], c[keep], k[keep], b[keep], a[keep]
         for name, arr in (("expiry_days", e), ("is_call", c), ("strike", k), ("bid", b), ("ask", a)):
             arr.setflags(write=False)
@@ -296,7 +313,7 @@ def _side_quotes(chain: ChainQuotes, lo: int, hi: int) -> Tuple[Dict[float, Tupl
 def _forward_from(calls: Dict[float, Tuple[float, float]], puts: Dict[float, Tuple[float, float]]) -> Optional[float]:
     def usable(q):
         b, a = q
-        return math.isfinite(b) and math.isfinite(a) and a > 0 and b >= 0 and a >= b
+        return math.isfinite(b) and math.isfinite(a) and b > 0 and a >= b
     both = sorted(k for k in calls if k in puts and usable(calls[k]) and usable(puts[k]))
     if not both:
         return None
@@ -378,12 +395,18 @@ def _expiry_point(chain: ChainQuotes, sday: int, eday: int, *, with_iv: bool,
 def interp_total_variance(points: Sequence[Tuple[int, float]], target: int, lo_min: int,
                           hi_max: int) -> Tuple[Optional[float], Optional[Tuple[int, int]]]:
     """Total variance linear in days between the nearest point with dte in ``[lo_min, target]``
-    and the nearest in ``(target, hi_max]``. ``points``: (dte, iv) with a usable iv."""
+    and the nearest in ``(target, hi_max]``. ``points``: (dte, iv) with a usable iv. A point EXACTLY
+    on ``target`` is the answer by itself (bracket ``(target, target)``), with or without a high
+    side."""
     lo = [p for p in points if lo_min <= p[0] <= target and p[1] is not None]
     hi = [p for p in points if target < p[0] <= hi_max and p[1] is not None]
-    if not lo or not hi:
+    if not lo:
         return None, None
     t1, v1 = max(lo, key=lambda p: p[0])
+    if t1 == target:
+        return float(v1), (target, target)
+    if not hi:
+        return None, None
     t2, v2 = min(hi, key=lambda p: p[0])
     w1, w2 = v1 * v1 * t1, v2 * v2 * t2
     w = w1 + (w2 - w1) * (target - t1) / (t2 - t1)
@@ -441,6 +464,8 @@ def atm_iv_term(chain: ChainQuotes, session: date) -> IvTerm:
         t1 = next(((e - sday, atm(e)) for e in lo_side if atm(e) is not None), None)
         if t1 is None:
             return None, f"no expiry with a usable ATM implied volatility in {lo_min}..{target} days", None
+        if t1[0] == target:
+            return float(t1[1]), "", (target, target)
         t2 = next(((e - sday, atm(e)) for e in hi_side if atm(e) is not None), None)
         if t2 is None:
             return None, f"no expiry with a usable ATM implied volatility in {target + 1}..{hi_max} days", None
