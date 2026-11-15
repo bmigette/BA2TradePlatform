@@ -4729,13 +4729,16 @@ class MarketConditionCompare(CompareCondition):
         session = ctx.prior_session
         try:
             values = ctx.reader.observe(self.instrument_name, session)
+            if values is None:
+                return self._unknown(_MC_STATUS_MISSING_SESSION,
+                                     f"no feature row for {self.instrument_name} at {session}")
+            by_field = values.by_field()
+            # INSIDE the guard: a composite row resolves a live chain profile's field LAZILY (the
+            # read happens here, not in observe), and its failure must meet the same exit-pass
+            # contract as a failing observe -- unknown on a live exit pass, raised otherwise.
+            obs = by_field.get(self.FIELD)
         except Exception as e:
             return self._unknown_on_exit_pass(e)   # re-raises unless on a live exit pass
-        if values is None:
-            return self._unknown(_MC_STATUS_MISSING_SESSION,
-                                 f"no feature row for {self.instrument_name} at {session}")
-        by_field = values.by_field()
-        obs = by_field.get(self.FIELD)
         if obs is None:
             try:
                 raise LookupError(
