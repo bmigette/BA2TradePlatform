@@ -6,6 +6,7 @@ import {
   Brain,
   Library,
   TrendingUp,
+  GitBranch,
   Wrench,
   Archive,
   HardDrive,
@@ -21,6 +22,7 @@ const Sidebar: React.FC = () => {
     { path: '/training', label: 'Training', icon: Brain },
     { path: '/models', label: 'Models', icon: Library },
     { path: '/backtesting', label: 'Backtesting', icon: TrendingUp },
+    { path: '/walk-forward', label: 'Walk-forward', icon: GitBranch },
     { path: '/tools', label: 'Tools', icon: Wrench },
     { path: '/saved-data', label: 'Saved Data', icon: Archive },
     { path: '/cache', label: 'Cache', icon: HardDrive },
@@ -34,7 +36,8 @@ const Sidebar: React.FC = () => {
         <nav className="space-y-2">
           {navItems.map((item) => {
             const Icon = item.icon;
-            const isActive = location.pathname === item.path;
+            const isActive = location.pathname === item.path
+              || (item.path !== '/' && location.pathname.startsWith(item.path + '/'));
 
             return (
               <Link
