@@ -473,12 +473,84 @@ job); every other option of the driver (profile, store, gates, market conditions
 rides on every fold. Reports: `<--wf-report-dir>/<cell>/{fold<k>.json,cell.json,report.md}` and the
 grid `summary.{json,md}`. Resume, stop and refusals follow the runbook above (the runner is the same).
 
+### Option style cells (built 2026-11-15; nothing launched yet)
+
+The stage-2 style jobs and the small-accounts chain do not go through `run_options_matrix.py`: each
+job is `tools/option_style_job.sh` (`--strategy O_STYLE --style ...`, DeterministicScorer, the screener
+on the daily panel restricted to the stage-2 list, both market-condition profiles, SPY gates). That
+script stays the one place the recipe is written; `--walk-forward` among its extra args turns the job
+into a cell. It then execs `tools/run_option_style_wf.py` in front of the very command the plain job
+runs; the driver splits the extra args into the walk-forward flags above (same names, same defaults,
+same required verdict inputs) and optimize overrides (after the recipe, as in the plain job), and runs
+the cell on the same engine (`wf_chain` + `RealRunner`: resume with `--resume-interrupted`, stored
+fold reports, early elimination, deferral, refit). Without `--walk-forward` the job is byte-identical
+(tested against the imported script through a recording fake interpreter).
+
+- **Unseeded (owner 2026-11-15).** The seed bundle argument must be the word `none`. A real bundle,
+  `--seed-genomes`, `--seed-check-only`, `--warm-start-from` or `--chain-seed-from` is refused with the
+  reason (a stage-1 bundle was chosen on 2020-2025 and has seen the 2024 and 2025 test years). Fold 1
+  is a cold start, each fold seeds only the next. The engine itself now also refuses the three seed
+  file flags in any walk-forward optimize args (`walk_forward.FORBIDDEN_OPTIMIZE_FLAGS`).
+- **Names.** The plain `optm-DeterministicScorer-O_STYLE-<style>-<suffix>[-optalphavantage]` with the
+  `optwf-` prefix and `-d<digest>`; never a plain job's row. The digest hashes the style's CONTENT
+  (`spec_sha256`) and the universe file's content rather than their paths; `--worker`, `--parallel`
+  and `--labels` are not part of it. Under `--wf-defer-last-test` the manifests, universe, screener
+  store, daily panel, universe file and locations are masked.
+- **Phase B reads the new panel.** The deferred test of a daily-panel screen now takes the current
+  command's `--screener-panel` (`_rebase_run_data` via `rerun_handler.with_screener_panel`, same
+  criteria version), as it already took the store and the manifests. The universe RESTRICTION stays
+  the one the train job recorded; the refit uses the current file.
+- **Refused as well:** `--start/--end/--generations/--name` overrides, `--print-universe`, a
+  non-O_STYLE command, and `--screen-preset` (small-account jobs 6 and 7): a fixed screen has no
+  screener genes, and the out-of-sample re-run's test-window universe recompute
+  (`rerun_handler.recompute_static_universe`) refuses a run without screener gene ranges, so the cell
+  would ERROR after training fold 1. The chain skips those two jobs in walk-forward mode with that
+  reason in its status file. The holdout rail and the DGS3MO check (`refresh_fred_cache.py
+  --check-rate-window` over the cell's span) are checked before anything trains.
+- **Out-of-sample path:** `tests/test_option_style_wf_oos_rerun_genes.py` pins a launcher-built
+  `long10k` with both profiles and the SPY gates (every member gene, `optsel`, market-condition and
+  SPY genes, screener genes) through `select` -> `_persist_top_backtests(window=)`.
+
+**Launch a stage 2 style cell** (on the grid host, in the job script's environment; dry run first by
+adding `--dry-run`). Phase A:
+
+```bash
+bash tools/option_style_job.sh long s2C none --fitness option_long --estimates-source fmp \
+  --walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 \
+  --wf-top-n 3 --wf-report-dir $BA2_HOME/reports/option_style_wf \
+  --pass-min-oos-return 0 --pass-max-dd-mult 2.5 --pass-max-oos-dd 35 --pass-min-folds 2
+```
+
+Phase B (January 2027, after `_OPTION_HOLDOUT_START` has moved as a reviewed change and the 2026 data
+exists): the same command without `--wf-data-end 2025-12-31`, with the 2026 panel, store and manifests
+in the environment (`SCREENER_PANEL`, `SCREENER_STORE`, `MC_OHLCV`, `MC_TA`); keep
+`--wf-defer-last-test`. The job script's own DGS3MO check still covers 2020-2025 only; the driver
+checks the 2026 window itself.
+
+**Launch the small-accounts chain as cells** (jobs 1-5; every job reads the Alpha Vantage store, so the
+names carry `-optalphavantage`). Phase A:
+
+```bash
+WF_ARGS="--walk-forward --wf-defer-last-test --wf-data-end 2025-12-31 --wf-top-n 3 --wf-report-dir /home/debian/ba2-grid/option_style_wf --pass-min-oos-return 0 --pass-max-dd-mult 2.5 --pass-max-oos-dd 35 --pass-min-folds 2" \
+  bash tools/grid_option_small_accounts.sh
+```
+
+Logs `s3L10-wf_run.log` ..., status `s3chain_small-wf.status`; no seed bundles are needed. Phase B: the
+same `WF_ARGS` without `--wf-data-end 2025-12-31`, plus `AV_END=2026-12-31` (the AV completeness check)
+and the 2026 data in the job environment as above. A single small-account cell is
+`OPTION_HISTORY_SOURCE=alphavantage bash tools/option_style_job.sh long10k s3L10 none --fitness
+option_long_dd40_50 --estimates-source fmp --initial-capital 10000 --equity-cap 10000 <the walk-forward
+flags>`.
+
+**Cost.** Per cell, phase A: three train jobs (wf1 up to 30 generations on 4 years, wf2 and wf3 up to 15
+on 5 and 6 years; population 200, patience 5) and up to 2 x `--wf-top-n` single out-of-sample re-runs
+(1 year each, LOCAL on the master, one at a time, behind the `--wf-min-free-gb` floor of 20 GB on
+Linux). In trial-years, before early stopping, that is about 1.6x the plain 30-generation 2020-2025
+job; phase B adds `--wf-top-n` re-runs and, for a passing cell, a 15-generation refit on 7 years
+(about 2.2x in total). The chain's five cells are 15 train jobs and up to 30 re-runs in phase A.
+
 **Not covered.**
-- The small-accounts chain (`tools/grid_option_small_accounts.sh`, unmerged) does not go through
-  `run_options_matrix.py`: each job is `tools/option_style_job.sh`, which execs the launcher with
-  `--strategy O_STYLE --style ... --seed-population <bundle>`. The option driver has no O_STYLE /
-  style-config / seed-bundle support, and `--seed-population` is refused together with
-  `--chain-seed-from` (so a seeded style job cannot be chained), and stage-1 seeds chosen on
-  2020-2025 have seen the 2024 and 2025 test years (look-ahead for folds 1-2). Walk-forward for those
-  jobs needs its own decision: unseeded folds, or seeds restricted to each fold's train window.
-- Nothing was launched: no real optimization, no real out-of-sample re-run, no remote worker.
+- Small-account jobs 6 and 7 (fixed screens, see above).
+- Nothing was launched: no real optimization, no real out-of-sample re-run, no remote worker. The
+  style path was exercised with fake runners, a recording fake interpreter for the shell scripts, and
+  the real launcher's re-run path with the backtest engine call replaced.
