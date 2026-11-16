@@ -1,7 +1,7 @@
 """Read-only O_STYLE view: one card per member of a composed option expert, in priority order."""
 from nicegui import ui
 
-from ...core.style_view import load_style_summary
+from ...core.style_view import load_ruleset_style_views, load_style_summary
 from ...logger import logger
 
 _GROUP_LABELS = [("signal", "Signal gates"), ("iv", "IV gates"), ("market", "Market gates"),
@@ -53,26 +53,7 @@ def _render_member(member):
             _render_exit(exit_rule)
 
 
-def content(instance_id: int):
-    """Render /style/<instance_id>. (No awaits, so page CSS cannot be dropped.)"""
-    try:
-        summary = load_style_summary(instance_id)
-    except Exception as e:
-        logger.error(f'Style view for expert {instance_id} failed: {e}', exc_info=True)
-        ui.label(f'Could not load expert {instance_id}: {e}').classes('text-negative')
-        return
-    if summary is None:
-        ui.label(f'Expert instance {instance_id} does not exist or is not a style expert '
-                 f'(no entry rule carries a member tag).').classes('text-h6')
-        return
-    h = summary['header']
-    with ui.row().classes('items-center gap-4'):
-        ui.label(f"Expert #{h['id']}: {h['alias'] or h['expert']}").classes('text-h5')
-        ui.badge('enabled' if h['enabled'] else 'disabled',
-                 color='positive' if h['enabled'] else 'negative')
-    ui.label(f"Account: {h['account']}   |   Virtual equity: {h['virtual_equity_pct']:g}%   |   "
-             f"{len(summary['members'])} members, first match wins in the order shown"
-             ).classes('text-sm opacity-80')
+def _render_summary(summary):
     for member in summary['members']:
         _render_member(member)
     with ui.card().classes('w-full'):
@@ -87,3 +68,63 @@ def content(instance_id: int):
             for exit_rule in summary['orphan_exits']:
                 ui.label(f"tag {exit_rule['tag']}").classes('text-xs opacity-70')
                 _render_exit(exit_rule)
+
+
+def _nothing_to_show(text):
+    with ui.card().classes('w-full'):
+        ui.label('Nothing to show').classes('text-h6')
+        ui.label(text).classes('text-body1')
+        ui.link('Back to settings', '/settings')
+
+
+def ruleset_content(ruleset_id: int):
+    """Render /style/ruleset/<ruleset_id>: the option structures of an entry ruleset."""
+    try:
+        data = load_ruleset_style_views(ruleset_id)
+    except Exception as e:
+        logger.error(f'Structure view for ruleset {ruleset_id} failed: {e}', exc_info=True)
+        ui.label(f'Could not load ruleset {ruleset_id}: {e}').classes('text-negative')
+        return
+    if data is None:
+        _nothing_to_show(f'Ruleset {ruleset_id} does not exist or opens no option structure under a '
+                         f'member tag. This page lists the structures of the entry ruleset of a '
+                         f'composed option expert.')
+        return
+    ui.label(f"Entry ruleset #{data['ruleset']['id']}: {data['ruleset']['name']}").classes('text-h5')
+    n = len(data['views'][0]['summary']['members'])
+    ui.label(f'{n} members, first match wins in the order shown').classes('text-sm opacity-80')
+    for view in data['views']:
+        with ui.card().classes('w-full'):
+            if view['exit_ruleset'] is None:
+                ui.label('No open-positions ruleset is paired with this entry ruleset by an expert: '
+                         'entries only, no exits to show.').classes('text-sm text-warning')
+            else:
+                ui.label(f"Exits from open-positions ruleset #{view['exit_ruleset']['id']}: "
+                         f"{view['exit_ruleset']['name']}").classes('text-subtitle2')
+            if view['experts']:
+                _chips([f"#{e['id']} {e['alias'] or e['expert']}"
+                        + ('' if e['enabled'] else ' (disabled)') for e in view['experts']], 'primary')
+        _render_summary(view['summary'])
+
+
+def content(instance_id: int):
+    """Render /style/<instance_id>. (No awaits, so page CSS cannot be dropped.)"""
+    try:
+        summary = load_style_summary(instance_id)
+    except Exception as e:
+        logger.error(f'Style view for expert {instance_id} failed: {e}', exc_info=True)
+        ui.label(f'Could not load expert {instance_id}: {e}').classes('text-negative')
+        return
+    if summary is None:
+        _nothing_to_show(f'Expert instance {instance_id} does not exist or is not a style expert '
+                         f'(no entry rule carries a member tag).')
+        return
+    h = summary['header']
+    with ui.row().classes('items-center gap-4'):
+        ui.label(f"Expert #{h['id']}: {h['alias'] or h['expert']}").classes('text-h5')
+        ui.badge('enabled' if h['enabled'] else 'disabled',
+                 color='positive' if h['enabled'] else 'negative')
+    ui.label(f"Account: {h['account']}   |   Virtual equity: {h['virtual_equity_pct']:g}%   |   "
+             f"{len(summary['members'])} members, first match wins in the order shown"
+             ).classes('text-sm opacity-80')
+    _render_summary(summary)

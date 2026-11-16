@@ -191,6 +191,63 @@ def _rule_dicts(ruleset_id: Optional[int]) -> List[Dict[str, Any]]:
             for r in ruleset_event_actions(ruleset_id)]
 
 
+def actions_have_style_member(actions: Optional[Dict[str, Any]]) -> bool:
+    """True when a rule's actions open a structure under a member tag."""
+    return _entry_action(actions or {})[0] is not None
+
+
+def has_style_members(enter_market_ruleset_id: Optional[int]) -> bool:
+    """True when an entry rule of this ruleset carries a member tag, i.e. its structure view has
+    cards to show."""
+    return any(actions_have_style_member(rule["actions"])
+               for rule in _rule_dicts(enter_market_ruleset_id))
+
+
+def load_ruleset_style_views(ruleset_id: int) -> Optional[Dict[str, Any]]:
+    """Structure view of an ENTRY ruleset: its members, with the exits of the open-positions
+    ruleset each expert pairs it with. None when the ruleset is missing or has no member tag.
+
+    The exits live in another ruleset and only an expert instance links the two, so there is one
+    view per DISTINCT open-positions ruleset among the experts using this entry ruleset (the
+    experts sharing it are listed). With no expert using it, one entries-only view is returned
+    (``exit_ruleset`` None).
+    """
+    from sqlmodel import select
+    from .db import get_db
+    from .models import ExpertInstance, Ruleset
+    session = get_db()
+    try:
+        ruleset = session.get(Ruleset, ruleset_id)
+        if ruleset is None:
+            return None
+        name = ruleset.name
+        users = list(session.scalars(select(ExpertInstance)
+                                     .where(ExpertInstance.enter_market_ruleset_id == ruleset_id)
+                                     .order_by(ExpertInstance.id)))
+        experts_by_exit: Dict[Optional[int], List[Dict[str, Any]]] = {}
+        for inst in users:
+            experts_by_exit.setdefault(inst.open_positions_ruleset_id, []).append(
+                {"id": inst.id, "alias": inst.alias, "expert": inst.expert, "enabled": inst.enabled})
+        exit_names = {}
+        for rid in experts_by_exit:
+            if rid is not None:
+                r = session.get(Ruleset, rid)
+                exit_names[rid] = r.name if r is not None else "(not found)"
+    finally:
+        session.close()
+    enter_rules = _rule_dicts(ruleset_id)
+    if not any(actions_have_style_member(r["actions"]) for r in enter_rules):
+        return None
+    if not experts_by_exit:
+        experts_by_exit = {None: []}
+    views = []
+    for rid, experts in experts_by_exit.items():
+        summary = build_style_summary(enter_rules, _rule_dicts(rid) if rid is not None else [], {})
+        views.append({"exit_ruleset": None if rid is None else {"id": rid, "name": exit_names[rid]},
+                      "experts": experts, "summary": summary})
+    return {"ruleset": {"id": ruleset_id, "name": name}, "views": views}
+
+
 def load_style_summary(instance_id: int) -> Optional[Dict[str, Any]]:
     """Summary for a stored ExpertInstance; None when missing or not a style expert."""
     from .db import get_instance
