@@ -319,6 +319,12 @@ def _live_session_day(now) -> object:
     return ts.tz_convert("America/New_York").date()
 
 
+def _replaying() -> bool:
+    """An offline REPLAY is active: every clock read consumes a recorded one, so none may be added."""
+    context = current_capture()
+    return context is not None and context.is_replay
+
+
 def _capturing() -> bool:
     """A LIVE capture is active (not a replay, where nothing may be recorded and no clock read consumed)."""
     context = current_capture()
@@ -351,8 +357,12 @@ def _record_memoised_ohlcv(providers, symbol: str, need_from, now, frame) -> Non
 
 
 def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
-                lookback_days: int = OHLCV_LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
+                lookback_days: int = OHLCV_LOOKBACK_DAYS,
+                _now: Optional[datetime] = None) -> Optional[pd.DataFrame]:
     """Daily OHLCV ascending by date, sliced to <= as_of (causal).
+
+    ``_now`` (internal, ``fetch_index_closes`` only): the clock read the caller ALREADY made for this
+    request, so a live call reads the clock once, as it always did. None reads it here.
 
     ONE provider fetch per symbol per run (plan §4): the payload is cached on the
     symbol alone and each bar gets its own local slice. Keying the cache by as_of
@@ -370,7 +380,7 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     # unreproducible by construction (see ba2_common.core.replay.observe). Passing
     # None (never as_of) keeps the semantics exactly as they were: the window ends
     # at "now" even in a backtest, because bars advance forward into it.
-    now = replay_now(None)
+    now = replay_now(None) if _now is None else _now
     need_from = ((as_of or now) - timedelta(days=lookback_days)).replace(tzinfo=None)
     key = _ohlcv_key(symbol, lookback_days)
     entry = _OHLCV_COVERAGE.get(key)
@@ -611,22 +621,36 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
     key = (index_symbol, str(as_of) if as_of is not None else "live", OHLCV_LOOKBACK_DAYS)
     view_key = _ohlcv_key(index_symbol, OHLCV_LOOKBACK_DAYS)
     hit = _INDEX_CLOSES_MEMO.get(key)
+    live_now = None     # the ONE clock read a live call makes, handed on to fetch_ohlcv on a miss
     if hit is not None:
         fingerprint, closes = hit
         current = _OHLCV_VIEWS.get(view_key)
-        if (current is not None and current.fingerprint == fingerprint
-                and _index_frame_serves(providers, view_key, as_of)):
+        fresh = (current is not None and current.fingerprint == fingerprint
+                 and _index_frame_serves(providers, view_key, as_of))
+        if fresh and as_of is None and not _replaying():
+            # LIVE FRESHNESS, the per-symbol frames' rule (``fetch_ohlcv``'s ``stale_live``). The key is
+            # the constant "live" and the SPY frame is only refreshed inside ``fetch_ohlcv``, which only a
+            # miss reaches -- so without this a long-running app scored the macro trend on the SPY
+            # closes of its FIRST analysis until a restart. A frame fetched on an earlier New York
+            # session day misses; ``fetch_ohlcv`` then refetches it (once per day) and the memo refills.
+            # The clock read: off capture it records nothing; under capture it is the read this hit
+            # always made (recorded below), and on a miss it is handed to ``fetch_ohlcv`` instead of a
+            # second read. A REPLAY reads no clock here (its memo starts empty per analysis), so a
+            # replayed analysis consumes exactly the clock reads it did before.
+            live_now = replay_now(None)
+            fresh = _OHLCV_LIVE_DAY.get(view_key) == _live_session_day(live_now)
+        if fresh:
             _INDEX_CLOSES_MEMO.move_to_end(key)
             if as_of is None and _capturing():
                 # The memo spares the slice, not the READ: this analysis still read the index frame (and the
                 # clock for its window), so record both exactly where ``fetch_ohlcv`` would have.
-                now = replay_now(None)
+                now = live_now if live_now is not None else replay_now(None)
                 need_from = (now - timedelta(days=OHLCV_LOOKBACK_DAYS)).replace(tzinfo=None)
                 _record_memoised_ohlcv(providers, index_symbol, need_from, now,
                                        _OHLCV_COVERAGE[view_key].df)   # view and frame are cached together
             return closes
         del _INDEX_CLOSES_MEMO[key]
-    df = fetch_ohlcv(providers, index_symbol, as_of)
+    df = fetch_ohlcv(providers, index_symbol, as_of, _now=live_now)
     if df is None or "Close" not in df.columns:
         return None
     closes = df["Close"]
