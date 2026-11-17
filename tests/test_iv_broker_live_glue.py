@@ -5,7 +5,7 @@
   make the gates refuse naming the settings;
 * the ONE scheduler entry is parameterised by the source (AV prefetch cron / capture every 30 min); no
   gate -> nothing scheduled, nothing logged; an unset source with a gate logs one ERROR;
-* the capture window: after 20:15 ET on the session's date until 10 min before the next open;
+* the capture window: after 20:15 ET on the session's date until 02:45 ET on the next session's date (the broker rolls at 03:00);
 * SCREENER COVERAGE: the capture takes the union of the bounded universes; a screener pick that was
   captured evaluates, a pick that was not refuses explicitly (counted in the pass summary);
 * the operator tools read credentials read-only from the DB they are pointed at (app settings or
@@ -133,8 +133,11 @@ def test_the_schedule_follows_the_source(monkeypatch):
     (datetime(2026, 11, 13, 20, 0), None),                        # before the first attempt
     (datetime(2026, 11, 13, 20, 20), S),
     (datetime(2026, 11, 14, 12, 0), S),                           # Saturday
-    (datetime(2026, 11, 16, 9, 19), S),                           # Monday, before 09:20
-    (datetime(2026, 11, 16, 9, 21), None),                        # too close to the open
+    (datetime(2026, 11, 16, 2, 44), S),                           # Monday, before the 02:45 cut-off
+    (datetime(2026, 11, 16, 2, 45), None),                        # the broker rolls at 03:00 ET
+    (datetime(2026, 11, 16, 9, 19), None),                        # rolled hours before the open
+    (datetime(2026, 11, 17, 2, 30), date(2026, 11, 16)),          # weeknight: still Monday's snapshot
+    (datetime(2026, 11, 17, 3, 5), None),
     (datetime(2026, 11, 16, 12, 0), None),                        # Monday session running
     (datetime(2026, 11, 16, 21, 0), date(2026, 11, 16)),
 ])

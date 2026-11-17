@@ -4,9 +4,10 @@ parameterised by the LIVE IV CHAIN SOURCE (app setting ``iv_live_chain_source``)
 * ``alphavantage`` -> the PREFETCH below (06:30-09:45 ET of the decision day; on-demand stays possible);
 * ``tastytrade`` (TastyTrade market data with the app-level market-data credentials
   ``tastytrade_market_client_secret`` / ``tastytrade_market_refresh_token``; no account definition, no
-  order or account endpoint) -> the BROKER CAPTURE: between the prior session's close and the next open
-  only (a broker snapshot is the prior-session chain only then, and cannot be backfilled). Attempts every 30 minutes from ``CAPTURE_START`` (20:15 ET on the session's
-  date) to ``CAPTURE_END_BEFORE_OPEN`` before the next open (09:20 ET), plus a catch-up at app start
+  order or account endpoint) -> the BROKER CAPTURE: between the end of the prior session's extended
+  quoting and the broker's overnight roll only (a broker snapshot is the prior-session chain only then,
+  and cannot be backfilled). Attempts every 30 minutes from ``CAPTURE_START`` (20:15 ET on the session's
+  date) to ``CAPTURE_END`` (02:45 ET on the NEXT SESSION's date), plus a catch-up at app start
   inside that window; every attempt is validated on the data (``option_chain_quotes``), so an early or
   late attempt can only refuse, never store a wrong chain. The captured set is exactly the union of the
   BOUNDED universes of the iv-gated experts (fixed instruments / ``screener_symbol_universe``); an expert
@@ -45,9 +46,13 @@ from ba2_trade_platform.logger import logger
 IV_PROFILE = "iv-v1"
 OPTION_SOURCE = "alphavantage"
 #: Broker capture window (America/New_York): first attempt on the session's date, last attempt before the
-#: next open. Conservative until the brokers' weekday snapshot behaviour is observed (tools/probe_broker_iv_snapshot.py).
+#: broker's overnight roll on the next session's date. Observed with tools/probe_broker_iv_snapshot.py on
+#: TastyTrade, Mon 2026-11-16 -> Tue 2026-11-17 (MSFT, KO, EMN): quotes keep updating until 20:00 ET
+#: (extended hours), are then static, and at 08:00:00 UTC (03:00 ET) every contract is re-filed under the
+#: new session -- hours before the 09:30 open. Over a weekend the Friday snapshot is still served on Sunday.
+#: 02:45 ET is before the roll whether it is anchored on 03:00 ET or on 08:00 UTC (summer time included).
 CAPTURE_START_HOUR, CAPTURE_START_MINUTE = 20, 15
-CAPTURE_END_BEFORE_OPEN_MINUTES = 10
+CAPTURE_END_HOUR, CAPTURE_END_MINUTE = 2, 45
 #: Attempts at these minutes of every hour (inside the window only).
 CAPTURE_CRON_MINUTES = "15,45"
 #: Prefetch window: start (cron) and the deadline after which the remainder is left on demand.
@@ -280,7 +285,9 @@ def capture_target(now: datetime = None):
         return None
     _close, next_open = session_close_and_next_open(day)
     start = datetime(day.year, day.month, day.day, CAPTURE_START_HOUR, CAPTURE_START_MINUTE, tzinfo=ny)
-    end = next_open - timedelta(minutes=CAPTURE_END_BEFORE_OPEN_MINUTES)
+    nxt = next_open.astimezone(ny).date()
+    end = datetime(nxt.year, nxt.month, nxt.day, CAPTURE_END_HOUR, CAPTURE_END_MINUTE,
+                   tzinfo=ny).astimezone(timezone.utc)
     if start.astimezone(timezone.utc) <= now < end:
         return day, start.astimezone(timezone.utc), end
     return None
@@ -319,8 +326,8 @@ def schedule_spec():
                      f"({next(iter(unbounded.values()))})")
     return {"source": choice.source, "cron": {"minute": CAPTURE_CRON_MINUTES},
             "describe": f"{choice.source} chain capture every 30 min from {CAPTURE_START_HOUR:02d}:"
-                        f"{CAPTURE_START_MINUTE:02d} America/New_York until {CAPTURE_END_BEFORE_OPEN_MINUTES} min "
-                        f"before the next open"}
+                        f"{CAPTURE_START_MINUTE:02d} America/New_York until {CAPTURE_END_HOUR:02d}:"
+                        f"{CAPTURE_END_MINUTE:02d} on the next session's date (before the broker's roll)"}
 
 
 def in_window(now: datetime = None) -> bool:

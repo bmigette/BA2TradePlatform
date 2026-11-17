@@ -439,12 +439,19 @@ the next attempt. The cached chain carries the facts (summary-date counts, min/m
 near-money counts, source) in its parquet metadata, and the capture evidence records them with the
 serving source and the served-chain digest.
 
-**Capture window** (`iv_chain_prefetch`, constants documented here; conservative until the weekday
-behaviour is observed with `tools/probe_broker_iv_snapshot.py`): the ONE scheduler entry (parameterised
-by the source) fires at :15 and :45 of every hour; an attempt runs only from **20:15 ET** on S's date
-(`updated-at` values ran until ~20:00 ET) until **10 minutes before the next open** (09:20 ET), and once
-at app start inside that window. Every attempt is validated on the data, so an early or late attempt can
-only refuse, never store a wrong chain. The decision pass never fetches for this source.
+**Capture window** (`iv_chain_prefetch`, constants documented here): the ONE scheduler entry
+(parameterised by the source) fires at :15 and :45 of every hour; an attempt runs only from **20:15 ET**
+on S's date until **02:45 ET on the next session's date**, and once at app start inside that window.
+Every attempt is validated on the data, so an early or late attempt can only refuse, never store a wrong
+chain. The decision pass never fetches for this source.
+
+Observed with `tools/probe_broker_iv_snapshot.py` on TastyTrade, Mon 2026-11-16 to Tue 2026-11-17 (MSFT,
+KO, EMN; `reports/iv_broker_probe.jsonl`): `updated-at` values run until ~20:00 ET (extended hours) and
+are then static; the probes at 16:30, 17:30, 20:00 and 00:30 ET were VALID; at **03:00 ET (08:00:00
+UTC)** every contract is re-filed under the new session (`snapshot_after_session` from then on), hours
+before the open. Over a weekend the Friday snapshot was still served on Sunday 07:47 ET. A missed night
+cannot be backfilled: an app that starts after 02:45 ET has no chain for that decision day and the gate
+refuses. 02:45 ET is before the roll whether the broker anchors it on 03:00 ET or on 08:00 UTC.
 
 **What is captured.** Exactly the union of the BOUNDED universes of the enabled experts with an active
 iv gate: fixed instruments, or a screener's `screener_symbol_universe`. An expert with an unbounded
