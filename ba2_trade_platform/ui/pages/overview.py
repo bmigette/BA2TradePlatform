@@ -229,6 +229,7 @@ class OverviewTab:
         """Check for quantity mismatches between broker positions and transactions asynchronously."""
         from ...core.models import Transaction
         from ...core.types import TransactionStatus
+        from ..utils.quantity_mismatch import find_quantity_mismatches
 
         try:
             session = get_db()
@@ -247,15 +248,6 @@ class OverviewTab:
                         # Get positions from broker (run in thread to avoid blocking event loop)
                         positions = await asyncio.to_thread(provider_obj.get_positions)
                         
-                        # Create a map of symbol -> broker quantity
-                        broker_positions = {}
-                        for pos in positions:
-                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
-                            symbol = pos_dict.get('symbol')
-                            qty = pos_dict.get('qty', 0)
-                            if symbol and qty:
-                                broker_positions[symbol] = float(qty)
-                        
                         # Get all open transactions for this account
                         # First, get all trading orders for this account to find their transaction IDs
                         orders_stmt = select(TradingOrder).where(
@@ -263,10 +255,10 @@ class OverviewTab:
                             TradingOrder.transaction_id.isnot(None)
                         )
                         account_orders = session.exec(orders_stmt).all()
-                        
+
                         # Get unique transaction IDs
                         transaction_ids = list(set(o.transaction_id for o in account_orders if o.transaction_id))
-                        
+
                         # Get transactions
                         if transaction_ids:
                             txn_stmt = select(Transaction).where(
@@ -274,34 +266,12 @@ class OverviewTab:
                                 Transaction.status == TransactionStatus.OPENED
                             )
                             transactions = session.exec(txn_stmt).all()
-                            
-                            # Calculate total quantity per symbol from transactions
-                            transaction_quantities = {}
-                            for txn in transactions:
-                                if txn.symbol and txn.quantity:
-                                    if txn.symbol not in transaction_quantities:
-                                        transaction_quantities[txn.symbol] = 0
-                                    transaction_quantities[txn.symbol] += float(txn.quantity)
-                            
-                            # Compare broker positions with transaction quantities
-                            for symbol, broker_qty in broker_positions.items():
-                                txn_qty = transaction_quantities.get(symbol, 0)
-                                
-                                # Check if broker quantity is less than transaction quantity (potential issue)
-                                if abs(broker_qty) < abs(txn_qty) - 0.01:  # 0.01 tolerance for float comparison
-                                    # Get all transactions for this symbol
-                                    symbol_txns = [t for t in transactions if t.symbol == symbol]
-                                    
-                                    mismatches.append({
-                                        'account': acc.name,
-                                        'account_id': acc.id,
-                                        'symbol': symbol,
-                                        'broker_qty': broker_qty,
-                                        'transaction_qty': txn_qty,
-                                        'difference': txn_qty - broker_qty,
-                                        'transactions': symbol_txns
-                                    })
-                    
+
+                            # Shares against shares: an option transaction is filed under its
+                            # underlying's ticker in CONTRACTS and is never added to the share count.
+                            for found in find_quantity_mismatches(positions, transactions):
+                                mismatches.append({'account': acc.name, 'account_id': acc.id, **found})
+
                     except Exception as e:
                         logger.error(f"Error checking quantity mismatch for account {acc.name}: {e}", exc_info=True)
                 
