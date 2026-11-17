@@ -25,7 +25,7 @@ import inspect
 import itertools
 from collections import OrderedDict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,9 @@ _TTL_SECONDS = 900
 _OHLCV_CACHE = TTLCache(_TTL_SECONDS)
 # OHLCV needs range-aware caching (a payload is only reusable if it COVERS the
 # requested window), which TTLCache's key/value shape cannot express -- so the
-# frames live here as {key: (covered_from, df)} instead.
+# frames live here as {key: _CachedFrame} instead. See ``_covers`` for what
+# "covers" means; the frame outlives a backtest run (GA workers are long-lived),
+# so coverage is checked at BOTH ends and against the frame's history source.
 _OHLCV_COVERAGE: dict = {}
 # LIVE ONLY (as_of None): key -> the New York session date on which the cached frame was fetched.
 # A live frame is "history up to the last final session"; ``need_from`` only moves FORWARD with the
@@ -214,6 +216,75 @@ def _ohlcv_key(symbol: str, lookback_days: int) -> str:
     return f"ohlcv|{symbol}|{lookback_days}"
 
 
+class _CachedFrame(NamedTuple):
+    """One cached daily frame and what it is a frame OF.
+
+    ``covered_from``   the start of the window it was fetched for (the lookback anchor);
+    ``served_through`` the latest stamp the provider that served it DECLARED it serves
+                       (``served_through()``), or None when the provider declares no clamp;
+    ``source``         the history source it came from (``history_source()``, else the provider
+                       class name);
+    ``df``             the frame itself.
+    """
+    covered_from: Any
+    served_through: Optional[pd.Timestamp]
+    source: str
+    df: pd.DataFrame
+
+
+def _utc_naive(value: Any) -> pd.Timestamp:
+    """``value`` as a naive UTC Timestamp: naive values are read as UTC, as the backtest provider
+    reads its own bounds (``price_source._to_utc``)."""
+    ts = pd.Timestamp(value)
+    return ts.tz_convert("UTC").tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def _series_origin(ohlcv: Any) -> Tuple[str, Optional[pd.Timestamp]]:
+    """``(history source, served-through end)`` of the series ``ohlcv`` hands out.
+
+    A BACKTEST provider (``MemoizedOHLCVProvider``) serves each run's series clamped to that run's
+    window and declares both: the window end (``served_through``) and the history source
+    (``history_source``: fmp and alpaca histories are different caches). A provider that declares no
+    clamp -- every live provider -- serves through whatever end it is asked for, so its frame has no
+    end of its own (None) and its source is its class.
+    """
+    source_of = getattr(ohlcv, "history_source", None)
+    source = str(source_of()) if source_of is not None else type(ohlcv).__name__
+    served_of = getattr(ohlcv, "served_through", None)
+    return source, (_utc_naive(served_of()) if served_of is not None else None)
+
+
+def _covers(entry: Optional[_CachedFrame], *, source: str, need_from: Any,
+            need_end: Optional[datetime], served_now: Optional[pd.Timestamp]) -> bool:
+    """True when the cached frame holds EVERY bar the current provider would hand this decision.
+
+    THE START: the frame's window starts no later than this decision's lookback.
+
+    THE END (a backtest decision; ``need_end`` is its knowable daily end). The frame was served by
+    a provider clamped at ``entry.served_through``; the decision needs every bar stamped up to
+    ``need_end``, but never more than the CURRENT provider itself serves (``served_now``) -- so the
+    requirement is ``min(need_end, served_now) <= entry.served_through``. The comparison is against
+    the END THE PROVIDER DECLARED, not the frame's last bar: a symbol whose history genuinely stops
+    early (delisted, or no later bars in the cache) has a short frame from the very provider that
+    is asked again, and must not be refetched on every decision. Within a run the provider is the
+    same object, so one fetch per symbol per run stays the norm; a later run whose window reaches
+    past the frame's end refetches the moment one of its decisions needs a bar the frame cannot
+    hold. A frame from an unclamped provider (``served_through`` None) has no end to fall short of.
+
+    THE SOURCE: a frame read from one history source is never served for another.
+    """
+    if entry is None or entry.source != source:
+        return False
+    if entry.covered_from is not None and need_from < entry.covered_from:
+        return False
+    if need_end is None or entry.served_through is None:
+        return True
+    needed = _utc_naive(need_end)
+    if served_now is not None and served_now < needed:
+        needed = served_now
+    return needed <= entry.served_through
+
+
 def _slice_to_as_of(df: pd.DataFrame, as_of: Optional[datetime],
                     view: Optional[OhlcvView] = None) -> Optional[pd.DataFrame]:
     """Causal slice: keep rows dated <= as_of, matching the frame's tz-awareness.
@@ -302,12 +373,24 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
     now = replay_now(None)
     need_from = ((as_of or now) - timedelta(days=lookback_days)).replace(tzinfo=None)
     key = _ohlcv_key(symbol, lookback_days)
-    covered_from, df = _OHLCV_COVERAGE.get(key, (None, None))
+    entry = _OHLCV_COVERAGE.get(key)
+    df = entry.df if entry is not None else None
     live_day = _live_session_day(now) if as_of is None else None
     stale_live = as_of is None and df is not None and _OHLCV_LIVE_DAY.get(key) != live_day
-    if df is None or stale_live or (covered_from is not None and need_from < covered_from):
+    # Slice to what is KNOWABLE at the decision, not to the decision's own stamp: on an intraday
+    # backtest clock the decision session's daily bar is not finished at 09:30 (live holds only
+    # the prior session's). The cutoff comes from the clock owner via the OHLCV provider; it is
+    # ``as_of`` itself live and on a daily clock. It is also the END the cached frame must reach.
+    cutoff = knowable_daily_end(providers, as_of)
+    ohlcv = providers.ohlcv()
+    source, served_now = _series_origin(ohlcv)
+    if stale_live or not _covers(entry, source=source, need_from=need_from,
+                                 need_end=cutoff, served_now=served_now):
+        if df is not None and not stale_live:
+            logger.debug("DeterministicScorer: cached %s frame does not cover the decision at %s "
+                         "(source %s, served through %s); refetching", symbol, as_of, source,
+                         served_now)
         try:
-            ohlcv = providers.ohlcv()
             # This reader caches the whole series for the run and slices it per decision through
             # ``knowable_daily_end`` below, so on a backtest provider it asks for the UNSLICED series
             # explicitly (every other daily read is clamped to the knowable history by default).
@@ -324,7 +407,9 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
             return None
         if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
             return None
-        _OHLCV_COVERAGE[key] = (need_from, df)
+        # ``served_now`` is what the provider DECLARED (its run window end), never this frame's last
+        # bar: see ``_covers`` for why a short history must not read as "not covered".
+        _OHLCV_COVERAGE[key] = _CachedFrame(need_from, served_now, source, df)
         if as_of is None:
             _OHLCV_LIVE_DAY[key] = live_day
         else:
@@ -337,11 +422,7 @@ def fetch_ohlcv(providers, symbol: str, as_of: Optional[datetime],
         _record_memoised_ohlcv(providers, symbol, need_from, now, df)
     if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
         return None
-    # Slice to what is KNOWABLE at the decision, not to the decision's own stamp: on an intraday
-    # backtest clock the decision session's daily bar is not finished at 09:30 (live holds only
-    # the prior session's). The cutoff comes from the clock owner via the OHLCV provider; it is
-    # ``as_of`` itself live and on a daily clock.
-    out = _slice_to_as_of(df, knowable_daily_end(providers, as_of), _OHLCV_VIEWS.get(key))
+    out = _slice_to_as_of(df, cutoff, _OHLCV_VIEWS.get(key))
     if out is None or out.empty:
         return None
     return out.reset_index(drop=True)
@@ -498,6 +579,25 @@ def fetch_price_targets(api_key: str, symbol: str) -> list:
         return []
 
 
+def _index_frame_serves(providers, view_key: str, as_of: Optional[datetime]) -> bool:
+    """Whether the cached index frame behind an ``_INDEX_CLOSES_MEMO`` hit would ALSO be served to
+    this decision by ``fetch_ohlcv``. The memo is keyed on the decision, not on the provider, so a
+    hit from another run (other history source, or a window that ended earlier) must fall through
+    to the fetch, which refetches.
+
+    A backtest decision gets the full ``_covers`` test. A LIVE hit checks the source only: the start
+    and the session day need the wall clock, and reading it here would add a clock read to every
+    captured analysis the replay tapes do not hold.
+    """
+    entry = _OHLCV_COVERAGE.get(view_key)
+    source, served_now = _series_origin(providers.ohlcv())
+    if as_of is None:
+        return entry is not None and entry.source == source
+    need_from = (as_of - timedelta(days=OHLCV_LOOKBACK_DAYS)).replace(tzinfo=None)
+    return _covers(entry, source=source, need_from=need_from,
+                   need_end=knowable_daily_end(providers, as_of), served_now=served_now)
+
+
 def fetch_index_closes(providers, as_of: Optional[datetime],
                        index_symbol: str = INDEX_SYMBOL) -> Optional[pd.Series]:
     """Index (SPY) close series for the macro trend input.
@@ -514,7 +614,8 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
     if hit is not None:
         fingerprint, closes = hit
         current = _OHLCV_VIEWS.get(view_key)
-        if current is not None and current.fingerprint == fingerprint:
+        if (current is not None and current.fingerprint == fingerprint
+                and _index_frame_serves(providers, view_key, as_of)):
             _INDEX_CLOSES_MEMO.move_to_end(key)
             if as_of is None and _capturing():
                 # The memo spares the slice, not the READ: this analysis still read the index frame (and the
@@ -522,7 +623,7 @@ def fetch_index_closes(providers, as_of: Optional[datetime],
                 now = replay_now(None)
                 need_from = (now - timedelta(days=OHLCV_LOOKBACK_DAYS)).replace(tzinfo=None)
                 _record_memoised_ohlcv(providers, index_symbol, need_from, now,
-                                       _OHLCV_COVERAGE[view_key][1])   # view and frame are cached together
+                                       _OHLCV_COVERAGE[view_key].df)   # view and frame are cached together
             return closes
         del _INDEX_CLOSES_MEMO[key]
     df = fetch_ohlcv(providers, index_symbol, as_of)

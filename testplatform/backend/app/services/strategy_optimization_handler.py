@@ -552,6 +552,8 @@ def _worker_release_memory() -> Dict[str, Any]:
                         f"incomplete, NOT a measurement of an empty cache")
     _ps.clear_worker_bar_cache()
     _ps.clear_ohlcv_memo()
+    # DeterministicScorer's own process-wide copy of the daily frames (+ views, indicator memo).
+    _ps.clear_expert_frame_caches()
     # The NAMES are load-bearing and were wrong until 2026-09-14: neither `clear_worker_option_
     # caches` nor `clear_worker_5m_cache` has ever existed, so the lookup below fell through and
     # the option reader's caches (the biggest single holding a worker has at the 2020 option

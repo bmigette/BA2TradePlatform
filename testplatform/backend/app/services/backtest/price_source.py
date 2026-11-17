@@ -1563,12 +1563,41 @@ def evict_memo_if_working_set_changed(sig: Any) -> bool:
     global _MEMO_WORKING_SET_SIG
     if sig == _MEMO_WORKING_SET_SIG:
         return False
-    if _FULL_SERIES_MEMO:
+    cleared_readers = clear_expert_frame_caches()
+    if _FULL_SERIES_MEMO or cleared_readers:
         _FULL_SERIES_MEMO.clear()
         import gc
         gc.collect()
     _MEMO_WORKING_SET_SIG = sig
     return True
+
+
+#: Expert modules that keep their OWN process-wide copy of provider frames (beyond this module's
+#: memo), with the function that drops it. Only a module this process already imported is cleared:
+#: one that was never loaded holds nothing.
+_EXPERT_FRAME_CACHES = (("ba2_experts.DeterministicScorer.data", "reset_caches"),)
+
+
+def clear_expert_frame_caches() -> bool:
+    """Drop the expert-side frame caches (``_EXPERT_FRAME_CACHES``) alongside the OHLCV memo.
+
+    BOUNDS MEMORY AND STALENESS, NOT CORRECTNESS. DeterministicScorer keeps every symbol's daily
+    frame (plus parsed views and an indicator-series memo) for the life of the process, and GA
+    workers outlive a job. Whether a cached frame may answer a decision is decided by the reader
+    itself (``DeterministicScorer.data._covers``: start, END and history source), so a frame left
+    over from an earlier job is refetched rather than served; clearing here only stops one job's
+    frames from staying resident through the next. Returns True when a loaded module was cleared.
+    A named function that is GONE raises: a silently skipped clear is how a leak survives."""
+    import sys
+
+    cleared = False
+    for module_name, fn_name in _EXPERT_FRAME_CACHES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        getattr(module, fn_name)()
+        cleared = True
+    return cleared
 
 
 def _history_cache_dirname_of(provider: Any) -> str:
@@ -1641,6 +1670,21 @@ class MemoizedOHLCVProvider:
         both; a provider that is never bound (the regime benchmark reader, tests, standalone
         tools) behaves exactly as before."""
         self._ps = price_source
+
+    def served_through(self) -> datetime:
+        """The latest stamp this provider will EVER serve: the run's window end (naive UTC, the way
+        ``_load`` clamps to it). A reader that keeps a frame beyond one run (DeterministicScorer's
+        process-wide cache; GA workers outlive a job) compares a later decision against THIS, not
+        against the frame's last bar -- a frame fetched under a window ending E1 holds nothing after
+        E1 even when the provider of a later run has bars there, while a symbol whose history merely
+        stops early is complete as it is."""
+        return _to_utc(self._be).replace(tzinfo=None)
+
+    def history_source(self) -> str:
+        """The history source the series comes from: the inner provider's native-cache folder, the
+        same name ``_FULL_SERIES_MEMO`` keys on (fmp and alpaca histories are different caches, and
+        one worker process can run jobs on both)."""
+        return _history_cache_dirname_of(self)
 
     def knowable_daily_end(self, as_of: Any) -> Any:
         """The hook a CACHING reader (DeterministicScorer) uses to slice its own copy of the daily
