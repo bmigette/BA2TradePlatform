@@ -541,3 +541,101 @@ def test_the_imported_db_report_carries_restarts_and_the_set_score(tmp_path):
     assert report["folds"][0]["train_job"] == "cell-wf1-r2"
     assert [x["won"] for x in report["folds"][0]["restarts"]] == [False, True]
     assert report["folds"][0]["set"]["n"] == 2
+
+
+# ------------------------------------------------------------------ review fixes (2026-11-17)
+
+
+@pytest.mark.parametrize("args", [["--seed", "7"], ["--seed=7"], ["--see", "7"], ["--se=7"],
+                                  ["--expert", "X", "--seed"]])
+def test_restarts_refuse_a_user_seed_in_any_spelling_argparse_would_read(args):
+    with pytest.raises(WF.WalkForwardError, match="--seed"):
+        WF.make_plan("cell", FOLDS, ["--expert", "X", *args], "ba2-test", 2, TH, test_parallel=1,
+                     skip_train=False, only_fold=None, embargo_days=0, selection=SEL, restarts=2)
+
+
+@pytest.mark.parametrize("args", [["--seed-genomes", "s.json"], ["--seed-population=b"],
+                                  ["--search-sizing-mode"], ["--screener"], ["--strategy", "S2"],
+                                  ["--slippage", "0.1"], ["--seed-check-only"]])
+def test_flags_that_merely_start_like_seed_are_not_a_user_seed(args):
+    assert not WF.user_sets_seed(args)
+    WF.make_plan("cell", FOLDS, ["--expert", "X", *args], "ba2-test", 2, TH, test_parallel=1,
+                 skip_train=False, only_fold=None, embargo_days=0, selection=SEL, restarts=2)
+
+
+def test_without_restarts_a_user_seed_is_still_accepted():
+    _plan_args = dict(test_parallel=1, skip_train=False, only_fold=None, embargo_days=0, selection=SEL)
+    WF.make_plan("cell", FOLDS, ["--expert", "X", "--see", "7"], "ba2-test", 2, TH, **_plan_args)
+
+
+@pytest.mark.parametrize("trades", [None, float("nan")])
+def test_set_statistics_refuse_a_missing_trade_count(trades):
+    g = _genome(1, 1, 10.0)
+    g.oos_trades = trades
+    with pytest.raises(WF.MissingMetric, match="trades"):
+        WF.fold_set_stats(FOLDS[0], [_genome(1, 2, 5.0), g])
+
+
+class _SiblingFails(SearchRunner):
+    """Restart 1 is completed; restart 2's training fails (or ends without completing)."""
+
+    def __init__(self, mode, **kw):
+        super().__init__(restarts=2, completed={"cell-wf1"}, **kw)
+        self.mode = mode
+
+    def run_train(self, cmd, name):
+        if name == "cell-wf1-r2":
+            self.events.append(("train", name))
+            if self.mode == "raises":
+                raise WF.WalkForwardError(f"training job {name!r} exited with code 1")
+            return                                   # 'finished' but never completed
+        super().run_train(cmd, name)
+
+
+@pytest.mark.parametrize("mode,match", [("raises", "cell-wf1-r2.*exited"),
+                                        ("incomplete", "cell-wf1-r2.*did not reach")])
+def test_a_failed_sibling_restart_stops_the_fold_without_choosing_a_winner(tmp_path, mode, match):
+    r = _SiblingFails(mode, fitness={"cell-wf1": 50.0})
+    with pytest.raises(WF.WalkForwardError, match=match):
+        C.run_cell(_spec(chain_seed=False, restarts=2), r, str(tmp_path), log=lambda *_: None)
+    assert not any(e[0] == "oos" for e in r.events) and r.fitness_reads == []
+    assert not (tmp_path / "cell" / "fold1.json").exists()
+
+
+def test_search_records_refuse_a_restart_that_is_not_completed():
+    r = SearchRunner(restarts=2, completed={"cell-wf1"})
+    with pytest.raises(WF.WalkForwardError, match="cell-wf1-r2.*not completed"):
+        WF.search_records(_plan(restarts=2), r, FOLDS[0])
+    assert r.fitness_reads == []
+
+
+def _fake_launcher():
+    from types import SimpleNamespace
+    return SimpleNamespace(_resolve_estimates_source=lambda *a: None,
+                           _assert_option_window_excludes_holdout=lambda *a: None,
+                           _refuse_reused_estimates_source_name=lambda *a: None)
+
+
+def test_ui_preflight_lists_every_restart_of_every_fold_and_of_the_refit():
+    from app.services import wf_runs as R
+    args = ["--expert", "FMPRating", "--universe", "AAPL", "--strategy", "S2"]
+    out = R.preflight(_spec(optimize_args=args, chain_seed=False, restarts=2), _fake_launcher())
+    f1 = out["folds"][0]
+    assert f1["train_job"] == "cell-wf1" and "--seed" not in f1["command"]        # existing keys unchanged
+    assert [x["job"] for x in f1["restarts"]] == ["cell-wf1", "cell-wf1-r2"]
+    assert f1["restarts"][0]["command"] == f1["command"]
+    r2 = f1["restarts"][1]["command"]
+    assert r2[r2.index("--seed") + 1] == str(WF.restart_seed("cell-wf1-r2")) and r2[-1] == "cell-wf1-r2"
+    refit = out["refit"]
+    assert refit["job"] == "cell-refit" and [x["job"] for x in refit["restarts"]] == ["cell-refit", "cell-refit-r2"]
+    rr = refit["restarts"][1]["command"]
+    assert rr[rr.index("--seed") + 1] == str(WF.restart_seed("cell-refit-r2"))
+    assert out["jobs"] == ["cell-wf1", "cell-wf1-r2", "cell-wf2", "cell-wf2-r2", "cell-wf3", "cell-wf3-r2",
+                           "cell-refit", "cell-refit-r2"]
+
+
+def test_ui_preflight_without_restarts_has_no_restarts_key():
+    from app.services import wf_runs as R
+    args = ["--expert", "FMPRating", "--universe", "AAPL", "--strategy", "S2"]
+    out = R.preflight(_spec(optimize_args=args), _fake_launcher())
+    assert all("restarts" not in f for f in out["folds"]) and "restarts" not in out["refit"]

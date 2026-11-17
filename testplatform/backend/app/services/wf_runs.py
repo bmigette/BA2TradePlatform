@@ -190,17 +190,29 @@ def preflight(spec: C.CellSpec, L: Any = None) -> Dict[str, Any]:
         jobs += [C.refit_restart_name(spec.name, j) for j in range(1, spec.restarts + 1)]
     for job in jobs:
         _launcher_refusal(L._refuse_reused_estimates_source_name, job, source, "walk-forward")
+    # With restarts, every search's job and command (restart 1 = the keys above it); absent otherwise.
+    def fold_restarts(f):
+        return ({"restarts": [{"job": n, "command": [str(t) for t in plan.command_for(f, j)]}
+                              for j, n in enumerate(plan.restart_names(f), start=1)]}
+                if spec.restarts > 1 else {})
+
+    refit_restarts = ({"restarts": [{"job": C.refit_restart_name(spec.name, j),
+                                     "command": [str(t) for t in C.refit_command(spec, folds, j)]}
+                                    for j in range(1, spec.restarts + 1)]}
+                      if spec.restarts > 1 else {})
     return {
         "folds": [{**S.fold_window(f),
                    "generations": plan.fold_extra_args[f.index][1],
                    "deferred": f is deferred,
                    "train_job": WF.train_job_name(spec.name, f.index),
-                   "command": [str(t) for t in plan.command_for(f)]} for f in folds],
+                   "command": [str(t) for t in plan.command_for(f)],
+                   **fold_restarts(f)} for f in folds],
         "refit": None if not spec.refit or deferred is not None else {
             "job": C.refit_job_name(spec.name),
             "train_start": C.refit_window(folds)[0].isoformat(),
             "train_end": C.refit_window(folds)[1].isoformat(),
-            "command": [str(t) for t in C.refit_command(spec, folds)]},
+            "command": [str(t) for t in C.refit_command(spec, folds)],
+            **refit_restarts},
         "deferred_fold": deferred.index if deferred else None,
         "jobs": jobs,
     }

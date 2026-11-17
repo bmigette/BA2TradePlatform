@@ -191,6 +191,20 @@ def check_user_optimize_args(args: Sequence[str]) -> None:
                                               f"{flag})"))
 
 
+def user_sets_seed(args: Sequence[str]) -> bool:
+    """Whether the optimize args set the GA ``--seed`` in any spelling argparse reads as it: the flag
+    with or without a value or ``=``, or an abbreviation (``--see 7``, ``--se=7``). Same prefix rule as
+    ``check_user_optimize_args``: no other optimize flag is a prefix of ``--seed`` (pinned against the
+    real parser in tests/test_wf_ui_review.py), so ``--seed-genomes`` / ``--search-*`` are not one."""
+    for a in args:
+        if not a.startswith("--") or a == "--":
+            continue
+        opt = a.split("=", 1)[0]
+        if len(opt) > 2 and "--seed".startswith(opt):
+            return True
+    return False
+
+
 def optimize_arg_value(args: Sequence[str], flag: str) -> Optional[str]:
     """The value of ``flag`` in an optimize arg list (``--flag V`` or ``--flag=V``), or None."""
     for i, a in enumerate(args):
@@ -483,7 +497,8 @@ def fold_set_stats(fold: Fold, genomes: Sequence[GenomeFold]) -> Dict[str, Any]:
             "oos_return_min": min(rets), "oos_return_max": max(rets),
             "share_positive": sum(1 for r in rets if r > 0) / len(rets),
             "oos_max_dd_median": statistics.median(dds), "oos_max_dd_worst": max(dds),
-            "oos_trades_median": statistics.median([g.oos_trades for g in genomes]),
+            "oos_trades_median": statistics.median(
+                [_need(g.oos_trades, f"fold {fold.index} rank {g.rank} OOS trades") for g in genomes]),
             "window_years": fold.test_years, "full_year": full, "annual_return": annual}
 
 
@@ -670,9 +685,10 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     if restarts > 1 and seed_chain:
         raise WalkForwardError(f"--wf-restarts {restarts} needs --wf-no-chain-seed: with chain "
                                f"seeding, which restart of a fold seeds the next one is undefined")
-    if restarts > 1 and optimize_arg_value(optimize_args, "--seed") is not None:
-        raise WalkForwardError(f"--wf-restarts {restarts}: the optimize args set --seed; the engine "
-                               f"gives every restart its own GA seed (restart_seed)")
+    if restarts > 1 and user_sets_seed(optimize_args):
+        raise WalkForwardError(f"--wf-restarts {restarts}: the optimize args set --seed (or an "
+                               f"abbreviation of it); the engine gives every restart its own GA "
+                               f"seed (restart_seed), a user seed would be overridden for some")
     if verdict_mode not in VERDICT_MODES:
         raise WalkForwardError(f"--wf-verdict {verdict_mode!r}: one of {', '.join(VERDICT_MODES)}")
     if verdict_mode == "set-score":
@@ -795,6 +811,11 @@ def search_records(plan: Plan, runner: Any, f: Fold) -> List[Dict[str, Any]]:
     read = _best_fitness_reader(plan, runner)
     ident = getattr(runner, "train_identity", None)
     names = plan.restart_names(f)
+    # A winner is chosen among ALL restarts or not at all: a failed / running sibling stops the fold.
+    for n in names:
+        if not runner.train_completed(n):
+            raise WalkForwardError(f"fold {f.index}: restart job {n!r} is not completed; no search is "
+                                   f"chosen until every restart of the fold has completed")
     fits = [read(n) for n in names]
     won = choose_search(fits)
     gens = optimize_arg_value(plan.fold_extra_args.get(f.index, []), "--generations")

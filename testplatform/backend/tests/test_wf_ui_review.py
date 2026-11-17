@@ -232,3 +232,13 @@ def test_a_pending_chain_never_reports_an_overall_pass(tmp_path, wfdb):
     rep = S.build_report(name="x", windows=[], genomes=[], states={},
                          cell={"verdict": "PENDING"}, walk_forward={"overall_passed": True})
     assert rep["overall_passed"] is None
+
+
+def test_no_optimize_flag_but_seed_itself_is_a_prefix_of_seed(optimize_parser):
+    """``user_sets_seed`` (restarts refuse a user GA seed) reads any prefix of --seed as --seed: that
+    is only safe while no other optimize flag is such a prefix (--seed-genomes etc. are longer)."""
+    flags = {s for a in optimize_parser._actions for s in a.option_strings if s.startswith("--")}
+    assert [f for f in flags if "--seed".startswith(f)] == ["--seed"]
+    assert not any(WF.user_sets_seed([f, "x"]) for f in flags if f != "--seed")
+    for abbr in ("--see", "--seed"):                       # what the real parser does with them
+        assert _accepts(optimize_parser, BASE + [abbr, "7"]) is None or abbr == "--seed"
