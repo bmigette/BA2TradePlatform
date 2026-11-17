@@ -69,12 +69,23 @@ def spec_to_json(spec: Any) -> Dict[str, Any]:
         "expert": spec.expert,
         "strategy": spec.strategy,
         "band": spec.band,
+        # chain_seed / restarts / verdict_mode + min_oos_score / min_train_years: only when they
+        # differ from the original chain, so a default spec's stored JSON is unchanged
+        **spec.non_default_settings(),
     }
+
+
+#: The redesign settings a stored spec may carry. ABSENT = the original chain's value: every row
+#: written before these settings existed was run under exactly those (not a fallback default).
+_ORIGINAL_CHAIN = {"chain_seed": True, "restarts": 1, "verdict_mode": "winner", "min_oos_score": None,
+                   "min_train_years": None}
 
 
 def spec_from_json(d: Dict[str, Any], launcher: Any) -> Any:
     """The ``CellSpec`` of a stored spec. Every key is required (no defaults): a row whose spec lacks
-    one (an imported row has no optimize args) cannot be run, and says which key is missing."""
+    one (an imported row has no optimize args) cannot be run, and says which key is missing. The
+    redesign settings (``_ORIGINAL_CHAIN``) are stored only when not the original chain's, so their
+    absence means that chain."""
     from app.services import wf_chain as C
     if d.get("optimize_args") is None:
         raise WalkForwardError("this run has no stored optimize args (imported from a report "
@@ -96,7 +107,14 @@ def spec_from_json(d: Dict[str, Any], launcher: Any) -> Any:
             expert=d["expert"], strategy=d["strategy"], band=d["band"],
             floor=date.fromisoformat(d["floor"]) if d["floor"] else None,
             exclusive_return=bool(d["exclusive_return"]), defer_last_test=bool(d["defer_last_test"]),
-            run_all_folds=bool(d["run_all_folds"]), refit=bool(d["refit"]))
+            run_all_folds=bool(d["run_all_folds"]), refit=bool(d["refit"]),
+            chain_seed=bool(d["chain_seed"]) if "chain_seed" in d else _ORIGINAL_CHAIN["chain_seed"],
+            restarts=int(d["restarts"]) if "restarts" in d else _ORIGINAL_CHAIN["restarts"],
+            verdict_mode=(str(d["verdict_mode"]) if "verdict_mode" in d
+                          else _ORIGINAL_CHAIN["verdict_mode"]),
+            min_oos_score=(None if d.get("min_oos_score") is None else float(d["min_oos_score"])),
+            min_train_years=(None if d.get("min_train_years") is None
+                             else float(d["min_train_years"])))
     except KeyError as e:
         raise WalkForwardError(f"stored walk-forward spec lacks {e.args[0]!r}") from e
 
@@ -166,12 +184,14 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
             **{key: w.get(key) for key in ("index", "train_start", "train_end", "test_start",
                                             "test_end")},
             "state": states.get(k, "planned"),
-            "train_job": WF.train_job_name(name, k),
+            # the tested search's job: the winning restart's when the fold had restarts
+            "train_job": cf.get("job", WF.train_job_name(name, k)),
             "train_optimization_id": (ident or {}).get("id"),
             "generations": cf.get("generations", generations.get(k)),
             "seeded_from": cf.get("seeded_from", seeded_from.get(k)),
             "winner_passed": None if winner is None else bool(winner["passed"]),
             "ranks": ranks,
+            **{key: cf[key] for key in ("restarts", "set") if key in cf},
         })
     done = [k for k, s in states.items() if s == "done"]
     final = walk_forward is not None
@@ -205,7 +225,15 @@ def build_report(*, name: str, windows: Sequence[Dict[str, Any]], genomes: Seque
         "thresholds": c.get("thresholds") or thresholds,
         "selection": (walk_forward or {}).get("selection") or selection or {},
         "top_n": (walk_forward or {}).get("top_n", top_n),
+        # Redesign keys (restarts, chain seeding off, set-score verdict, dropped folds): present only
+        # when the cell report carries them, so a default chain's row report is unchanged.
+        **{key: c[key] for key in _REDESIGN_KEYS if key in c},
     }
+
+
+#: Cell-report keys of the 2026-11-17 redesign (wf_chain.CellSpec.non_default_settings + results).
+_REDESIGN_KEYS = ("chain_seed", "restarts", "verdict_mode", "min_oos_score", "min_train_years",
+                  "skipped_folds", "set_score")
 
 
 def summary_columns(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -364,8 +392,9 @@ class RunStore:
                         or key["test"] != [f.test_start.isoformat(), f.test_end.isoformat()]):
                     continue
                 self.genomes[f.index] = [asdict(WF.GenomeFold(**g)) for g in doc["genomes"]]
-                if key.get("train_jobs"):
-                    self.identities[f.index] = key["train_jobs"][-1]
+                ident = _tested_identity(doc)
+                if ident is not None:
+                    self.identities[f.index] = ident
                 self.states[f.index] = "done"
             except (OSError, ValueError, KeyError, TypeError) as e:
                 logger.warning("[%s] stored fold report %s not shown on the row (%s: %s); the chain "
@@ -378,7 +407,8 @@ class RunStore:
         self.spec_json = spec_to_json(spec)
         self.windows = [fold_window(f) for f in folds]
         self.states = {f.index: "planned" for f in folds}
-        self.generations = {f.index: (spec.first_generations if f.index == 1 else spec.next_generations)
+        self.generations = {f.index: (spec.first_generations if f.index == 1 or not spec.chain_seed
+                                      else spec.next_generations)
                             for f in folds}
         self._stored_folds(folds)
         drv = self._driver()
@@ -488,6 +518,19 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
         return json.load(fh)
 
 
+def _tested_identity(doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Identity of the job whose genomes a stored fold report holds: the last of its key's train jobs
+    (the fold's own job), or with restarts the winning search's: restarts run unchained, so the key
+    lists exactly this fold's restarts in order (wf_chain._identities)."""
+    key = doc["key"]
+    if not key.get("train_jobs"):
+        return None
+    won = [r for r in doc.get("restarts") or [] if r.get("won")]
+    if won:
+        return key["train_jobs"][int(won[0]["restart"]) - 1]
+    return key["train_jobs"][-1]
+
+
 def _fold_files(cell_dir: str) -> Dict[int, Dict[str, Any]]:
     out = {}
     for fn in os.listdir(cell_dir):
@@ -530,8 +573,9 @@ def report_from_files(name: str, cell_dir: Optional[str],
         windows[k] = {"index": k, "train_start": key["train"][0], "train_end": key["train"][1],
                       "test_start": key["test"][0], "test_end": key["test"][1]}
         genomes[k] = list(doc["genomes"])
-        if key.get("train_jobs"):
-            identities[k] = key["train_jobs"][-1]
+        ident = _tested_identity(doc)
+        if ident is not None:
+            identities[k] = ident
         states[k] = "done"
     for f in (wf or {}).get("folds", []):
         windows[int(f["index"])] = {"index": int(f["index"]), **{x: f[x] for x in (

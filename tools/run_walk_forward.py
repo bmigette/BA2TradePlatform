@@ -183,6 +183,25 @@ class RealRunner:
             raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
         return ((rows[0][0] or {}).get("seededFrom") or {}).get("name")
 
+    def train_best_fitness(self, name: str) -> float:
+        """The GA best fitness of the (single, completed) job of this name: how a fold's restarts are
+        ranked (training data only). A missing value raises, it is never defaulted."""
+        rows = self._opts_named(name)
+        if len(rows) != 1:
+            raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
+        if rows[0][1] != "completed":
+            raise WF.WalkForwardError(f"optimization {name!r} is {rows[0][1]!r}, not completed")
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
+        try:
+            fit = db.query(SO.best_fitness).filter(SO.id == rows[0][0]).scalar()
+        finally:
+            db.close()
+        if fit is None:
+            raise WF.MissingMetric(f"missing metric: {name!r} best_fitness = None")
+        return float(fit)
+
     def train_identity(self, name: str) -> dict:
         """Optimization id + completion time of the (single) job of this name: a stored fold report
         is only trusted while these still match (a retrained job gets a new id/time)."""

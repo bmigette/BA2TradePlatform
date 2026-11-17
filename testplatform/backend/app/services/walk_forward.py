@@ -23,13 +23,23 @@ import json
 import math
 import os
 import re
+import statistics
+import zlib
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from app.services.distinct_topn import annualise
+# The set-score verdict is scored like the consistent_annual_return fitness: the same constants and the
+# same consistency helper, imported so the two can never drift apart.
+from app.services.strategy_fitness import (_CAR_CONSISTENCY_FLOOR, _CAR_DD_FLOOR,  # noqa: F401
+                                           _CAR_DD_GUARD_MAX, _CAR_DD_REFERENCE,
+                                           _consistency_factor)
 
 OOS_LABELS = ("WalkForward", "OOS")     # + ``wf-fold-<k>`` per fold
+#: ``winner``: the rank-1 genome of each fold against ``Thresholds`` (the original rule). ``set-score``:
+#: every tested genome of every fold, scored like the CAR fitness (``set_score``) against a minimum.
+VERDICT_MODES = ("winner", "set-score")
 # The window and name are owned by the engine. The others import state from ANOTHER job (a
 # look-ahead door: that job may have seen the fold's test window) or break the one-name-one-row
 # resume rule; seeding comes only through ``initial_population_for_fold``.
@@ -198,6 +208,31 @@ def train_job_name(prefix: str, k: int) -> str:
     return f"{prefix}-wf{k}"
 
 
+def restart_job_name(prefix: str, k: int, j: int) -> str:
+    """Restart ``j`` of fold ``k``'s search: restart 1 IS the fold's train job (``<prefix>-wf<k>``),
+    restart j >= 2 is ``<prefix>-wf<k>-r<j>``."""
+    if j < 1:
+        raise WalkForwardError(f"restart index must be >= 1, got {j}")
+    return train_job_name(prefix, k) if j == 1 else f"{train_job_name(prefix, k)}-r{j}"
+
+
+def restart_seed(job_name: str) -> int:
+    """The GA ``--seed`` of a restart j >= 2: a function of its job name only, so a relaunch of the
+    same restart gets the same seed and two restarts get different random streams. Restart 1 passes
+    no ``--seed`` and keeps the launcher's default (42), exactly as a job without restarts."""
+    return zlib.crc32(job_name.encode("utf-8")) & 0x7FFFFFFF
+
+
+def choose_search(best_fitness: Sequence[Optional[float]]) -> int:
+    """The winning restart (1-based) of one fold: the highest training ``best_fitness``, the lowest
+    restart index on a tie. Training data only: nothing about the test window enters the choice."""
+    vals = [_need(v, f"restart {j} best_fitness") for j, v in enumerate(best_fitness, start=1)]
+    if not vals:
+        raise WalkForwardError("no restart to choose from")
+    best = max(vals)
+    return vals.index(best) + 1
+
+
 def oos_name_prefix(k: int) -> str:
     """``_persist_top_backtests`` appends ``<rank>-<optimization name>``: -> WF<k>-OOS-R<rank>-<job>."""
     return f"WF{k}-OOS-R"
@@ -240,18 +275,20 @@ def initial_population_for_fold(fold: Fold, prev: Optional[Fold] = None,
 
 def train_command(launcher: Any, user_args: Sequence[str], prefix: str, fold: Fold, *,
                   prev: Optional[Fold] = None, seed_chain: bool = False,
-                  extra_args: Sequence[str] = ()) -> List[str]:
+                  extra_args: Sequence[str] = (), restart: int = 1) -> List[str]:
     """``launcher`` is the ba2-test executable, or an argv prefix list (``[python, script.py]``).
     ``extra_args`` are this fold's own optimize args (e.g. its generation budget); the chain seed
-    is rendered as ``--chain-seed-from <previous fold's job>`` when ``seed_chain`` and ``prev``."""
+    is rendered as ``--chain-seed-from <previous fold's job>`` when ``seed_chain`` and ``prev``.
+    ``restart`` j >= 2 names the job ``<prefix>-wf<k>-r<j>`` and gives it its own ``--seed``."""
     seed = initial_population_for_fold(fold, prev if seed_chain else None, prefix)
     head = [launcher] if isinstance(launcher, str) else list(launcher)
     # Every job of a chain stores its final population (fold 1 has no seed but seeds fold 2).
     seed_args = (["--chain-seed-from", seed.source_job] if seed is not None
                  else ["--persist-final-population"] if seed_chain else [])
-    return [*head, "optimize", *user_args, *extra_args, *seed_args, "--start",
-            fold.train_start.isoformat(), "--end", fold.train_end.isoformat(), "--name",
-            train_job_name(prefix, fold.index)]
+    name = restart_job_name(prefix, fold.index, restart)
+    rng_args = ["--seed", str(restart_seed(name))] if restart > 1 else []
+    return [*head, "optimize", *user_args, *extra_args, *rng_args, *seed_args, "--start",
+            fold.train_start.isoformat(), "--end", fold.train_end.isoformat(), "--name", name]
 
 
 # --------------------------------------------------------------------------------- records
@@ -423,6 +460,55 @@ def stitch(items: Sequence[Tuple[Fold, GenomeFold]]) -> Stitch:
                   efficiency=efficiency(car, is_mean), years=years)
 
 
+def _full_calendar_year(f: Fold) -> bool:
+    return (f.test_start.year == f.test_end.year and (f.test_start.month, f.test_start.day) == (1, 1)
+            and (f.test_end.month, f.test_end.day) == (12, 31))
+
+
+def fold_set_stats(fold: Fold, genomes: Sequence[GenomeFold]) -> Dict[str, Any]:
+    """Out-of-sample statistics of EVERY genome tested on one fold (the set-score verdict). Drawdowns
+    are |max DD| (sign not trusted). ``annual_return`` is the median OOS return, annualised over the
+    test window unless the window is one whole calendar year (then it is the return itself)."""
+    if not genomes:
+        raise WalkForwardError(f"fold {fold.index}: no tested genome for the set statistics")
+    rets = [_need(g.oos_return, f"fold {fold.index} rank {g.rank} OOS return") for g in genomes]
+    dds = [abs(_need(g.oos_max_dd, f"fold {fold.index} rank {g.rank} OOS max DD")) for g in genomes]
+    med = statistics.median(rets)
+    full = _full_calendar_year(fold)
+    annual = med if full else annualise(med, fold.test_years)
+    if annual is None:
+        raise MissingMetric(f"missing metric: fold {fold.index} annualised median OOS return")
+    return {"fold": fold.index, "test": [fold.test_start.isoformat(), fold.test_end.isoformat()],
+            "n": len(genomes), "oos_return_median": med, "oos_return_mean": statistics.fmean(rets),
+            "oos_return_min": min(rets), "oos_return_max": max(rets),
+            "share_positive": sum(1 for r in rets if r > 0) / len(rets),
+            "oos_max_dd_median": statistics.median(dds), "oos_max_dd_worst": max(dds),
+            "oos_trades_median": statistics.median([g.oos_trades for g in genomes]),
+            "window_years": fold.test_years, "full_year": full, "annual_return": annual}
+
+
+def set_score(fold_stats: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The cell's out-of-sample score, shaped like ``strategy_fitness._consistent_annual_return``:
+    ``base x dd_guard x consistency`` over the annual series of the folds' MEDIAN OOS returns.
+
+    * base: the mean of that series;
+    * consistency: ``_consistency_factor`` (clamp(worst / mean, 0.25, 1.0); 1.0 for a single fold or a
+      mean <= 0), so a losing year drives it to the 0.25 floor instead of blocking the cell;
+    * dd_guard: min(20 / max(worst fold-median |max DD|, 1), 2.0);
+    * a base <= 0 is the score unfactored (a factor < 1 would improve a loss).
+    The fitness's trade gate and year gate are not part of it."""
+    if not fold_stats:
+        raise WalkForwardError("no fold to score")
+    annual = [float(s["annual_return"]) for s in fold_stats]
+    base = sum(annual) / len(annual)
+    worst_dd = max(float(s["oos_max_dd_median"]) for s in fold_stats)
+    dd_guard = min(_CAR_DD_REFERENCE / max(worst_dd, _CAR_DD_FLOOR), _CAR_DD_GUARD_MAX)
+    consistency = _consistency_factor(annual)
+    return {"annual_returns": annual, "base": base, "worst_fold_median_dd": worst_dd,
+            "dd_guard": dd_guard, "consistency": consistency, "factored": base > 0,
+            "score": base * dd_guard * consistency if base > 0 else base}
+
+
 @dataclass
 class WalkForwardResult:
     prefix: str
@@ -441,6 +527,9 @@ class WalkForwardResult:
     require_test_years: Tuple[int, ...] = ()    # --pass-require-fold
     required_failed: List[int] = field(default_factory=list)   # required years whose winner failed
     exclusive_return: bool = False      # the return threshold was strict (>)
+    verdict_mode: str = "winner"        # VERDICT_MODES
+    min_oos_score: Optional[float] = None   # set-score: the score must be ABOVE this
+    set_score: Optional[Dict[str, Any]] = None  # set-score: per-fold stats, factors, score
 
     def fold_winner(self, k: int) -> GenomeFold:
         return next(g for g in self.genomes if g.fold == k and g.rank == 1)
@@ -449,8 +538,12 @@ class WalkForwardResult:
 def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int,
               genomes: Sequence[GenomeFold], th: Thresholds,
               selection: Optional[Dict[str, Any]] = None,
-              require_test_years: Sequence[int] = (), exclusive_return: bool = False
+              require_test_years: Sequence[int] = (), exclusive_return: bool = False,
+              verdict_mode: str = "winner", min_oos_score: Optional[float] = None
               ) -> WalkForwardResult:
+    """``verdict_mode`` ``set-score``: ``overall_passed`` is ``set_score > min_oos_score`` over every
+    tested genome of the folds run; the rank-1 rule (``winners_passed``, ``required_failed``) is still
+    computed and reported, but it does not decide."""
     by_fold = {f.index: f for f in folds}
     notes: List[str] = []
     ranks = sorted({g.rank for g in genomes})
@@ -471,13 +564,26 @@ def aggregate(prefix: str, folds: Sequence[Fold], planned_folds: int, top_n: int
                              if not any(f.test_start.year == y and g.passed for f, g in winners))
     if not complete:
         notes.append(f"PARTIAL RUN: {len(folds)} of {planned_folds} folds; no overall verdict")
+    overall = ((passed >= th.min_folds) and not required_failed) if complete else None
+    scored: Optional[Dict[str, Any]] = None
+    if verdict_mode == "set-score":
+        if min_oos_score is None:
+            raise WalkForwardError("--wf-verdict set-score needs --pass-min-oos-score")
+        stats = [fold_set_stats(f, [g for g in genomes if g.fold == f.index]) for f in folds]
+        scored = {**set_score(stats), "folds": stats, "min_oos_score": min_oos_score,
+                  "complete": complete}
+        overall = (scored["score"] > min_oos_score) if complete else None
+        scored["passed"] = overall
+    elif verdict_mode != "winner":
+        raise WalkForwardError(f"--wf-verdict {verdict_mode!r}: one of {', '.join(VERDICT_MODES)}")
     return WalkForwardResult(
         prefix=prefix, thresholds=th, top_n=top_n, folds=list(folds), planned_folds=planned_folds,
         genomes=list(genomes), rank_stitches=rank_stitches, winner_stitch=winner_stitch,
         winners_passed=passed, selection=dict(selection or {}), complete=complete,
-        overall_passed=((passed >= th.min_folds) and not required_failed) if complete else None,
+        overall_passed=overall,
         notes=notes, require_test_years=tuple(sorted(set(require_test_years))),
-        required_failed=required_failed if complete else [], exclusive_return=exclusive_return)
+        required_failed=required_failed if complete else [], exclusive_return=exclusive_return,
+        verdict_mode=verdict_mode, min_oos_score=min_oos_score, set_score=scored)
 
 
 # --------------------------------------------------------------------------------- runner
@@ -491,6 +597,8 @@ class Runner(Protocol):
     def select(self, train_name: str, top_n: int) -> List[IsPick]: ...
     def run_oos(self, train_name: str, fold: Fold, picks: Sequence[IsPick], name_prefix: str,
                 labels: Sequence[str], parallel: int) -> Dict[int, OosMetrics]: ...
+    # Optional, REQUIRED by a plan with restarts > 1: the completed job's GA best fitness.
+    # def train_best_fitness(self, name: str) -> float: ...
 
 
 @dataclass
@@ -511,15 +619,21 @@ class Plan:
     require_test_years: Tuple[int, ...] = ()   # --pass-require-fold: these folds must pass
     exclusive_return: bool = False      # --pass-min-oos-return-exclusive: return must be ABOVE the threshold
     rebase_test_data: bool = False      # out-of-sample tests read the CURRENT command's data (two-phase)
+    restarts: int = 1                   # independent searches per fold; the best training fitness wins
+    verdict_mode: str = "winner"        # VERDICT_MODES
+    min_oos_score: Optional[float] = None   # set-score: the cell's score must be ABOVE this
 
     def previous_fold(self, fold: Fold) -> Optional[Fold]:
         before = [f for f in self.folds if f.index < fold.index]
         return before[-1] if before else None
 
-    def command_for(self, fold: Fold) -> List[str]:
+    def command_for(self, fold: Fold, restart: int = 1) -> List[str]:
         return train_command(self.launcher, self.optimize_args, self.prefix, fold,
                              prev=self.previous_fold(fold), seed_chain=self.seed_chain,
-                             extra_args=self.fold_extra_args.get(fold.index, ()))
+                             extra_args=self.fold_extra_args.get(fold.index, ()), restart=restart)
+
+    def restart_names(self, fold: Fold) -> List[str]:
+        return [restart_job_name(self.prefix, fold.index, j) for j in range(1, self.restarts + 1)]
 
     def selected_folds(self) -> List[Fold]:
         if self.only_fold is None:
@@ -536,8 +650,12 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
               only_fold: Optional[int], embargo_days: int, selection: Dict[str, Any],
               seed_chain: bool = False, fold_extra_args: Optional[Dict[int, List[str]]] = None,
               require_test_years: Sequence[int] = (), exclusive_return: bool = False,
-              rebase_test_data: bool = False) -> Plan:
-    """Validate everything BEFORE any run: a refusal here costs nothing."""
+              rebase_test_data: bool = False, restarts: int = 1, verdict_mode: str = "winner",
+              min_oos_score: Optional[float] = None) -> Plan:
+    """Validate everything BEFORE any run: a refusal here costs nothing.
+
+    RESTARTS x CHAIN SEEDING is refused: which restart of fold k would seed fold k+1 is a choice the
+    chain does not make (``--wf-restarts`` > 1 needs ``--wf-no-chain-seed``)."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", prefix or "") or re.fullmatch(r"\.+", prefix):
         # (only dots: '.' / '..' would make <report_dir>/<prefix> the report dir or its parent)
         raise WalkForwardError(f"--prefix {prefix!r}: use letters, digits, '_', '.', '-' "
@@ -547,6 +665,24 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     if test_parallel < 1:
         raise WalkForwardError(f"--test-parallel must be >= 1, got {test_parallel}")
     check_user_optimize_args(optimize_args)
+    if isinstance(restarts, bool) or not isinstance(restarts, int) or restarts < 1:
+        raise WalkForwardError(f"--wf-restarts must be an integer >= 1, got {restarts!r}")
+    if restarts > 1 and seed_chain:
+        raise WalkForwardError(f"--wf-restarts {restarts} needs --wf-no-chain-seed: with chain "
+                               f"seeding, which restart of a fold seeds the next one is undefined")
+    if restarts > 1 and optimize_arg_value(optimize_args, "--seed") is not None:
+        raise WalkForwardError(f"--wf-restarts {restarts}: the optimize args set --seed; the engine "
+                               f"gives every restart its own GA seed (restart_seed)")
+    if verdict_mode not in VERDICT_MODES:
+        raise WalkForwardError(f"--wf-verdict {verdict_mode!r}: one of {', '.join(VERDICT_MODES)}")
+    if verdict_mode == "set-score":
+        if (min_oos_score is None or isinstance(min_oos_score, bool)
+                or not isinstance(min_oos_score, (int, float)) or not math.isfinite(min_oos_score)):
+            raise WalkForwardError(f"--wf-verdict set-score needs a finite --pass-min-oos-score "
+                                   f"(no default), got {min_oos_score!r}")
+    elif min_oos_score is not None:
+        raise WalkForwardError("--pass-min-oos-score is the set-score verdict's minimum; it needs "
+                               "--wf-verdict set-score")
     validate_folds(folds, embargo_days)
     thresholds.validate(len(folds))
     have = sorted({f.test_start.year for f in folds})
@@ -557,7 +693,8 @@ def make_plan(prefix: str, folds: Sequence[Fold], optimize_args: Sequence[str], 
     plan = Plan(prefix, list(folds), list(optimize_args), launcher, top_n, thresholds,
                 test_parallel, skip_train, only_fold, embargo_days, dict(selection),
                 seed_chain, {k: list(v) for k, v in (fold_extra_args or {}).items()},
-                tuple(sorted(set(require_test_years))), exclusive_return, rebase_test_data)
+                tuple(sorted(set(require_test_years))), exclusive_return, rebase_test_data,
+                restarts, verdict_mode, None if min_oos_score is None else float(min_oos_score))
     plan.selected_folds()          # refuses an unknown --only-fold
     return plan
 
@@ -572,6 +709,13 @@ def render_dry_run(plan: Plan) -> str:
              + f", >= {th.min_folds} fold winner(s) must pass"
              + (f", and the {', '.join(map(str, plan.require_test_years))} fold(s) MUST pass"
                 if plan.require_test_years else "")]
+    if plan.verdict_mode == "set-score":
+        lines.append(f"verdict: SET SCORE (every tested genome; base x dd_guard x consistency over the "
+                     f"folds' median OOS returns) must be > {plan.min_oos_score:g}; the thresholds "
+                     f"above only label the genome rows")
+    if plan.restarts > 1:
+        lines.append(f"restarts: {plan.restarts} independent searches per fold; the best training "
+                     f"fitness is selected and tested")
     for f in plan.selected_folds():
         name = train_job_name(plan.prefix, f.index)
         lines.append(f"\nfold {f.index}: train {f.train_start}..{f.train_end} "
@@ -579,9 +723,15 @@ def render_dry_run(plan: Plan) -> str:
                      f"({f.test_years:.2f}y)")
         if plan.skip_train:
             lines.append("  train: SKIPPED (--skip-train; the job must already be completed)")
-        else:
+        elif plan.restarts == 1:
             lines.append(f"  train job: {name}  (skipped when already completed)")
             lines.append("  train cmd: " + " ".join(plan.command_for(f)))
+        else:
+            for j, rname in enumerate(plan.restart_names(f), start=1):
+                lines.append(f"  train job (restart {j}): {rname}  (skipped when already completed)")
+                lines.append("  train cmd: " + " ".join(plan.command_for(f, j)))
+        if plan.restarts > 1:
+            name = "<winning search>"
         lines.append(f"  select: top {plan.top_n} behaviour-distinct genomes "
                      f"(tools/persist_distinct_topn.py selection; {plan.selection})")
         lines.append(f"  test: re-run each once on {f.test_start}..{f.test_end} as "
@@ -593,11 +743,13 @@ def render_dry_run(plan: Plan) -> str:
 def check_seed_lineage(plan: Plan, runner: Any, f: Fold, name: str) -> None:
     """A chained job must RECORD the seed it was planned with (``seededFrom`` on its row, read back
     by the runner's optional ``seed_lineage``): a seed that was silently not applied would make the
-    whole chain a set of cold starts that look seeded. Skipped for runners without the reader."""
+    whole chain a set of cold starts that look seeded. An UNCHAINED plan expects no seed: a job of
+    its name that recorded one is not the job this plan launched. Skipped for runners without the
+    reader."""
     read = getattr(runner, "seed_lineage", None)
-    if not plan.seed_chain or not callable(read):
+    if not callable(read):
         return
-    prev = plan.previous_fold(f)
+    prev = plan.previous_fold(f) if plan.seed_chain else None
     want = train_job_name(plan.prefix, prev.index) if prev else None
     got = read(name)
     if got != want:
@@ -605,17 +757,15 @@ def check_seed_lineage(plan: Plan, runner: Any, f: Fold, name: str) -> None:
             f"fold {f.index}: {name!r} recorded seed source {got!r}, expected {want!r}")
 
 
-def train_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print) -> str:
-    """Train ONE fold (or skip when completed) and check its recorded seed. Returns the job name.
-    Also the whole of a DEFERRED fold's work (wf_chain: train now, test when the data exists)."""
-    name = train_job_name(plan.prefix, f.index)
+def _train_one(plan: Plan, runner: Runner, f: Fold, restart: int, name: str,
+               log: Callable[[str], None]) -> None:
     if plan.skip_train:
         if not runner.train_completed(name):
             raise WalkForwardError(f"--skip-train: training job {name!r} is not completed")
     elif runner.train_completed(name):
         log(f"fold {f.index}: training job {name} already completed -- skipping the train run")
     else:
-        cmd = plan.command_for(f)           # asserts no look-ahead for a chained seed
+        cmd = plan.command_for(f, restart)  # asserts no look-ahead for a chained seed
         prev = plan.previous_fold(f)
         if plan.seed_chain and prev is not None:
             src = train_job_name(plan.prefix, prev.index)
@@ -623,17 +773,60 @@ def train_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] =
                 raise WalkForwardError(
                     f"fold {f.index}: seed source {src!r} is not completed (chain seeding needs "
                     f"fold {prev.index} first)")
-        log(f"fold {f.index}: training {name} on {f.train_start}..{f.train_end}")
+        log(f"fold {f.index}: training {name} on {f.train_start}..{f.train_end}"
+            + (f" (restart {restart} of {plan.restarts})" if plan.restarts > 1 else ""))
         runner.run_train(cmd, name)
         if not runner.train_completed(name):
             raise WalkForwardError(f"training job {name!r} did not reach status 'completed'")
     check_seed_lineage(plan, runner, f, name)
-    return name
+
+
+def _best_fitness_reader(plan: Plan, runner: Any) -> Callable[[str], Any]:
+    read = getattr(runner, "train_best_fitness", None)
+    if not callable(read):
+        raise WalkForwardError(f"--wf-restarts {plan.restarts}: the runner cannot read a training "
+                               f"job's best fitness (train_best_fitness), so no restart can be chosen")
+    return read
+
+
+def search_records(plan: Plan, runner: Any, f: Fold) -> List[Dict[str, Any]]:
+    """One record per restart of a TRAINED fold: restart, job, optimization id (when the runner can
+    say), best training fitness, generation budget, and which one ``won`` (``choose_search``)."""
+    read = _best_fitness_reader(plan, runner)
+    ident = getattr(runner, "train_identity", None)
+    names = plan.restart_names(f)
+    fits = [read(n) for n in names]
+    won = choose_search(fits)
+    gens = optimize_arg_value(plan.fold_extra_args.get(f.index, []), "--generations")
+    return [{"restart": j, "job": n,
+             "optimization_id": (ident(n) or {}).get("id") if callable(ident) else None,
+             "best_fitness": float(fit), "generations": gens, "won": j == won}
+            for j, (n, fit) in enumerate(zip(names, fits), start=1)]
+
+
+def train_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print) -> str:
+    """Train ONE fold (or skip when completed) and check its recorded seed. Returns the job name:
+    with restarts every restart is trained (one after the other, each resumable like a train job)
+    and the name is the WINNER's (highest training best fitness, ``choose_search``). Also the whole
+    of a DEFERRED fold's work (wf_chain: train now, test when the data exists)."""
+    if plan.restarts > 1:
+        _best_fitness_reader(plan, runner)          # refuse before any training, not after
+    names = plan.restart_names(f)
+    for j, name in enumerate(names, start=1):
+        _train_one(plan, runner, f, j, name, log)
+    if plan.restarts == 1:
+        return names[0]
+    recs = search_records(plan, runner, f)
+    win = next(r for r in recs if r["won"])
+    log(f"fold {f.index}: search {win['job']} wins on training fitness ("
+        + ", ".join(f"{r['job']}={r['best_fitness']:.4f}" for r in recs) + ")")
+    return win["job"]
 
 
 def run_fold(plan: Plan, runner: Runner, f: Fold, log: Callable[[str], None] = print
              ) -> List[GenomeFold]:
-    """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold."""
+    """Train (or skip when completed), select, re-run out of sample and evaluate ONE fold. With
+    restarts only the winning search is selected and tested."""
     name = train_fold(plan, runner, f, log)
     picks = runner.select(name, plan.top_n)
     if not picks:
@@ -666,7 +859,8 @@ def run_walk_forward(plan: Plan, runner: Runner, log: Callable[[str], None] = pr
         genomes.extend(run_fold(plan, runner, f, log))
     return aggregate(plan.prefix, folds, len(plan.folds), plan.top_n, genomes, plan.thresholds,
                      plan.selection, require_test_years=plan.require_test_years,
-                     exclusive_return=plan.exclusive_return)
+                     exclusive_return=plan.exclusive_return, verdict_mode=plan.verdict_mode,
+                     min_oos_score=plan.min_oos_score)
 
 
 # --------------------------------------------------------------------------------- report
@@ -681,6 +875,14 @@ def _eff(v: Optional[float]) -> str:
 
 
 def result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
+    out = _result_to_json(res)
+    if res.verdict_mode != "winner":     # a winner-rule report keeps exactly its old keys
+        out.update({"verdict_mode": res.verdict_mode, "min_oos_score": res.min_oos_score,
+                    "set_score": res.set_score})
+    return out
+
+
+def _result_to_json(res: WalkForwardResult) -> Dict[str, Any]:
     return {
         "prefix": res.prefix,
         # the optional cap appears only when set, so a report made without it reads as before
@@ -708,9 +910,14 @@ def render_markdown(res: WalkForwardResult) -> str:
     th = res.thresholds
     verdict = ("INCOMPLETE (partial run)" if res.overall_passed is None
                else "PASS" if res.overall_passed else "FAIL")
-    out = [f"# Walk-forward report: {res.prefix}", "",
-           f"**Overall verdict: {verdict}** -- {res.winners_passed} of {len(res.folds)} fold "
-           f"winner(s) passed (need {th.min_folds}).", "",
+    ss = res.set_score
+    head = (f"**Overall verdict: {verdict}** -- {res.winners_passed} of {len(res.folds)} fold "
+            f"winner(s) passed (need {th.min_folds}).") if ss is None else (
+            f"**Overall verdict ({res.verdict_mode}): {verdict}** -- set score {ss['score']:.2f} "
+            f"(must be > {res.min_oos_score:g}); for information {res.winners_passed} of "
+            f"{len(res.folds)} fold winner(s) pass the per-genome thresholds below.")
+    out = [f"# Walk-forward report: {res.prefix}", "", head, "",
+           *(_set_score_lines(ss) if ss is not None else []),
            "## Thresholds used", "",
            f"- `--pass-min-oos-return{'-exclusive' if res.exclusive_return else ''}` {th.min_oos_return:g}% (per-fold TOTAL OOS return over that "
            f"fold's test window, NOT annualised; window lengths are in each fold heading)",
@@ -751,6 +958,30 @@ def render_markdown(res: WalkForwardResult) -> str:
                "worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not "
                "read); IS CAR = mean of the folds' IS CARs.")
     return "\n".join(out) + "\n"
+
+
+def _set_score_lines(ss: Dict[str, Any]) -> List[str]:
+    """The set-score section of report.md: per-fold statistics over every tested genome, then the
+    annual series and the three factors."""
+    out = ["## Set score (every tested genome)", "",
+           "| fold | test | n | median OOS | mean | min | max | share > 0 | median |maxDD| | "
+           "worst |maxDD| | median trades | annual |",
+           "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for s in ss["folds"]:
+        out.append(f"| {s['fold']} | {s['test'][0]}..{s['test'][1]} | {s['n']} | "
+                   f"{_f(s['oos_return_median'])} | {_f(s['oos_return_mean'])} | "
+                   f"{_f(s['oos_return_min'])} | {_f(s['oos_return_max'])} | "
+                   f"{s['share_positive'] * 100:.0f}% | {_f(s['oos_max_dd_median'])} | "
+                   f"{_f(s['oos_max_dd_worst'])} | {s['oos_trades_median']:g} | "
+                   f"{_f(s['annual_return'])}{'' if s['full_year'] else ' (annualised)'} |")
+    out += ["", f"- annual series (fold median OOS returns): "
+                + ", ".join(_f(a) for a in ss["annual_returns"]),
+            f"- base (mean) {ss['base']:.2f} x dd_guard {ss['dd_guard']:.3f} (worst fold-median "
+            f"|maxDD| {ss['worst_fold_median_dd']:.2f}%) x consistency {ss['consistency']:.3f} = "
+            f"**{ss['score']:.2f}**" + ("" if ss["factored"] else " (base <= 0: unfactored)"),
+            "- shaped like the consistent_annual_return fitness (same constants); its trade and "
+            "year gates are not applied", ""]
+    return out
 
 
 def _stitch_table(rows: Dict[str, Stitch]) -> str:

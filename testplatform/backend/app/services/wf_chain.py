@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.services import walk_forward as WF
@@ -38,8 +39,50 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------- folds
 
 
+def _add_years(d: date, n: int) -> date:
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:                   # 29 February -> 28 February
+        return d.replace(year=d.year + n, day=28)
+
+
+def calendar_years(start: date, end: date) -> float:
+    """Length of the INCLUSIVE window ``start..end`` in years: whole calendar years counted exactly
+    (2022-01-01..2023-12-31 is 2.0), the remainder in days / 365.25. 0.0 for an empty window."""
+    stop = end + timedelta(days=1)
+    if stop <= start:
+        return 0.0
+    n = stop.year - start.year
+    while n > 0 and _add_years(start, n) > stop:
+        n -= 1
+    return n + (stop - _add_years(start, n)).days / 365.25
+
+
+def short_train_folds(train_start: date, test_years: Sequence[int], floor: Optional[date],
+                      min_train_years: Optional[float]) -> List[Dict[str, Any]]:
+    """The test years whose fold would train on fewer than ``min_train_years`` (``--wf-min-train-years``)
+    years: the anchored train window runs from the later of ``train_start`` and ``floor`` to the day
+    before the test year. None = no minimum (nothing is dropped)."""
+    if min_train_years is None:
+        return []
+    if not isinstance(min_train_years, (int, float)) or not math.isfinite(min_train_years) \
+            or min_train_years <= 0:
+        raise WalkForwardError(f"--wf-min-train-years must be a number > 0, got {min_train_years!r}")
+    start = max(train_start, floor) if floor else train_start
+    out = []
+    for y in test_years:
+        end = date(y - 1, 12, 31)
+        yrs = calendar_years(start, end)
+        if yrs < min_train_years:
+            out.append({"test_year": int(y), "train": [start.isoformat(), end.isoformat()],
+                        "train_years": round(yrs, 4),
+                        "reason": f"trains {yrs:.2f} year(s) < --wf-min-train-years {min_train_years:g}"})
+    return out
+
+
 def build_cell_folds(train_start: date, test_years: Sequence[int], data_end: Optional[date],
-                     floor: Optional[date] = None, defer_last_test: bool = False) -> List[WF.Fold]:
+                     floor: Optional[date] = None, defer_last_test: bool = False,
+                     min_train_years: Optional[float] = None) -> List[WF.Fold]:
     """The cell's anchored folds. ``floor`` is the expert's data floor (FMPRating 2022-01-01): the
     train start of EVERY fold and of the refit is the later of ``train_start`` and ``floor``.
     ``data_end`` (``--wf-data-end``) shortens the LAST test window; it must leave that window
@@ -51,9 +94,17 @@ def build_cell_folds(train_start: date, test_years: Sequence[int], data_end: Opt
     trained now and tested once the data exists (``deferred_fold``); its windows are never clamped,
     so the January run with the full data rebuilds the very same jobs. A data end INSIDE the last
     test year is refused under the flag: a partly clamped test and refit would carry the same job
-    names as the full ones."""
+    names as the full ones.
+
+    ``min_train_years`` (``--wf-min-train-years``): a test year whose fold would train on fewer years
+    is DROPPED (``short_train_folds``; the caller logs and reports it) and the remaining folds are
+    numbered 1..n, exactly the folds of the reduced year list. A cell left with no fold is refused."""
     start = max(train_start, floor) if floor else train_start
-    years = list(test_years)
+    short = {s["test_year"] for s in short_train_folds(train_start, test_years, floor, min_train_years)}
+    years = [y for y in test_years if y not in short]
+    if short and not years:
+        raise WalkForwardError(f"--wf-min-train-years {min_train_years:g} drops every test year "
+                               f"({', '.join(map(str, sorted(short)))}): the cell has no fold left")
     test_end = None
     if data_end is not None and years:
         last_start, last_end = date(years[-1], 1, 1), date(years[-1], 12, 31)
@@ -123,6 +174,27 @@ class CellSpec:
     defer_last_test: bool = False       # train the last fold now, test it when the data exists
     run_all_folds: bool = False         # no early elimination: every fold runs even if the cell cannot pass
     refit: bool = True                  # a PASSING cell trains the refit job (False: verdict only)
+    # Redesign 2026-11-17. Defaults = the original chain (names, commands and reports unchanged).
+    chain_seed: bool = True             # False: every fold and the refit start cold on first_generations
+    restarts: int = 1                   # independent searches per fold / refit; best training fitness wins
+    verdict_mode: str = "winner"        # "set-score": every tested genome, scored like the CAR fitness
+    min_oos_score: Optional[float] = None   # set-score: the score must be ABOVE this (no default)
+    min_train_years: Optional[float] = None  # drop folds training on fewer years (None: keep all)
+
+    def non_default_settings(self) -> Dict[str, Any]:
+        """The redesign settings that differ from the original chain, for the reports (only these
+        keys are added, so a default cell's files stay as they were)."""
+        out: Dict[str, Any] = {}
+        if not self.chain_seed:
+            out["chain_seed"] = False
+        if self.restarts != 1:
+            out["restarts"] = self.restarts
+        if self.verdict_mode != "winner":
+            out["verdict_mode"] = self.verdict_mode
+            out["min_oos_score"] = self.min_oos_score
+        if self.min_train_years is not None:
+            out["min_train_years"] = self.min_train_years
+        return out
 
 
 @dataclass
@@ -135,20 +207,29 @@ class CellResult:
 
 
 def _fold_extra_args(spec: CellSpec, folds: Sequence[WF.Fold]) -> Dict[int, List[str]]:
+    """Generation budget per fold: ``first_generations`` for a cold start (fold 1, or every fold
+    without chain seeding), ``next_generations`` for a seeded one."""
     return {f.index: ["--generations",
-                      str(spec.first_generations if f.index == 1 else spec.next_generations)]
+                      str(spec.first_generations if f.index == 1 or not spec.chain_seed
+                          else spec.next_generations)]
             for f in folds}
 
 
+def cell_folds(spec: CellSpec) -> List[WF.Fold]:
+    return build_cell_folds(spec.train_start, spec.test_years, spec.data_end, spec.floor,
+                            spec.defer_last_test, spec.min_train_years)
+
+
 def make_cell_plan(spec: CellSpec) -> Tuple[WF.Plan, List[WF.Fold]]:
-    folds = build_cell_folds(spec.train_start, spec.test_years, spec.data_end, spec.floor,
-                             spec.defer_last_test)
+    folds = cell_folds(spec)
     plan = WF.make_plan(
         spec.name, folds, spec.optimize_args, spec.launcher, spec.top_n, spec.thresholds,
         test_parallel=spec.test_parallel, skip_train=False, only_fold=None, embargo_days=0,
-        selection=spec.selection, seed_chain=True, fold_extra_args=_fold_extra_args(spec, folds),
+        selection=spec.selection, seed_chain=spec.chain_seed,
+        fold_extra_args=_fold_extra_args(spec, folds),
         require_test_years=spec.require_test_years, exclusive_return=spec.exclusive_return,
-        rebase_test_data=spec.defer_last_test)
+        rebase_test_data=spec.defer_last_test, restarts=spec.restarts,
+        verdict_mode=spec.verdict_mode, min_oos_score=spec.min_oos_score)
     return plan, folds
 
 
@@ -156,19 +237,36 @@ def refit_job_name(prefix: str) -> str:
     return f"{prefix}-refit"
 
 
-def refit_command(spec: CellSpec, folds: Sequence[WF.Fold]) -> List[str]:
-    """The refit's optimize command: whole window, ``next_generations``, seeded from the last fold.
-    NO LOOK-AHEAD, asserted: the seed's train window ends before the refit window ends (the refit
-    is allowed to see everything, there is no test year left to protect)."""
+def refit_restart_name(prefix: str, j: int) -> str:
+    """Refit restart ``j``: restart 1 is ``<prefix>-refit``, j >= 2 ``<prefix>-refit-r<j>``."""
+    if j < 1:
+        raise WalkForwardError(f"restart index must be >= 1, got {j}")
+    return refit_job_name(prefix) if j == 1 else f"{refit_job_name(prefix)}-r{j}"
+
+
+def refit_source(spec: CellSpec, folds: Sequence[WF.Fold]) -> Optional[str]:
+    """The job the refit is seeded from: the last fold's, or None without chain seeding."""
+    return WF.train_job_name(spec.name, folds[-1].index) if spec.chain_seed else None
+
+
+def refit_command(spec: CellSpec, folds: Sequence[WF.Fold], restart: int = 1) -> List[str]:
+    """The refit's optimize command: whole window, ``next_generations``, seeded from the last fold
+    (without chain seeding: unseeded on ``first_generations``, like every fold). Restart j >= 2 is
+    ``<prefix>-refit-r<j>`` with its own GA ``--seed``. NO LOOK-AHEAD, asserted: the seed's train
+    window ends before the refit window ends (the refit is allowed to see everything, there is no
+    test year left to protect)."""
     start, end = refit_window(folds)
     last = folds[-1]
     if last.train_end >= end:
         raise WalkForwardError(f"refit seed {last.train_end} is not before the refit end {end}")
     head = [spec.launcher] if isinstance(spec.launcher, str) else list(spec.launcher)
-    return [*head, "optimize", *spec.optimize_args, "--generations", str(spec.next_generations),
-            "--chain-seed-from", WF.train_job_name(spec.name, last.index),
-            "--start", start.isoformat(), "--end", end.isoformat(), "--name",
-            refit_job_name(spec.name)]
+    name = refit_restart_name(spec.name, restart)
+    src = refit_source(spec, folds)
+    gens = spec.next_generations if spec.chain_seed else spec.first_generations
+    return [*head, "optimize", *spec.optimize_args, "--generations", str(gens),
+            *(["--seed", str(WF.restart_seed(name))] if restart > 1 else []),
+            *(["--chain-seed-from", src] if src is not None else []),
+            "--start", start.isoformat(), "--end", end.isoformat(), "--name", name]
 
 
 # --------------------------------------------------------------------------------- fold store
@@ -180,16 +278,21 @@ def _fold_path(report_dir: str, name: str, k: int) -> str:
 
 def _identities(runner: Any, plan: WF.Plan, f: WF.Fold) -> Optional[List[Any]]:
     """Identity (optimization id + completion time) of this fold's train job AND every earlier one:
-    fold k is seeded from fold k-1, so retraining any of them makes fold k's report stale. None for
+    fold k is seeded from fold k-1, so retraining any of them makes fold k's report stale. Without
+    chain seeding, the identities of this fold's restarts only (no other fold enters it). None for
     a runner that cannot say (then the key carries no identity)."""
     read = getattr(runner, "train_identity", None)
     if not callable(read):
         return None
-    return [read(WF.train_job_name(plan.prefix, k.index)) for k in plan.folds if k.index <= f.index]
+    if not plan.seed_chain:
+        return [read(n) for n in plan.restart_names(f)]
+    return [read(n) for k in plan.folds if k.index <= f.index for n in plan.restart_names(k)]
 
 
 def _fold_key(plan: WF.Plan, f: WF.Fold, identities: Optional[List[Any]] = None) -> Dict[str, Any]:
-    """What a stored fold report must agree with to be trusted (anything else re-evaluates)."""
+    """What a stored fold report must agree with to be trusted (anything else re-evaluates). The
+    chain-seed and restart settings enter only when they differ from the original chain, so a
+    default fold's stored key is unchanged."""
     th = plan.thresholds
     return {"train_jobs": identities,"train": [f.train_start.isoformat(), f.train_end.isoformat()],
             "test": [f.test_start.isoformat(), f.test_end.isoformat()],
@@ -197,13 +300,18 @@ def _fold_key(plan: WF.Plan, f: WF.Fold, identities: Optional[List[Any]] = None)
             "exclusive_return": plan.exclusive_return,
             "thresholds": {"min_oos_return": th.min_oos_return, "max_dd_mult": th.max_dd_mult,
                            "min_folds": th.min_folds,
-                           **({"max_oos_dd": th.max_oos_dd} if th.max_oos_dd is not None else {})}}
+                           **({"max_oos_dd": th.max_oos_dd} if th.max_oos_dd is not None else {})},
+            **({"chain_seed": False} if not plan.seed_chain else {}),
+            **({"restarts": plan.restarts} if plan.restarts != 1 else {})}
 
 
 def _save_fold(report_dir: str, plan: WF.Plan, f: WF.Fold, genomes: List[WF.GenomeFold],
-               identities: Optional[List[Any]] = None) -> None:
-    WF.atomic_write_text(_fold_path(report_dir, plan.prefix, f.index), json.dumps(
-        {"key": _fold_key(plan, f, identities), "genomes": [asdict(g) for g in genomes]}, indent=2))
+               identities: Optional[List[Any]] = None,
+               searches: Optional[List[Dict[str, Any]]] = None) -> None:
+    doc: Dict[str, Any] = {"key": _fold_key(plan, f, identities), "genomes": [asdict(g) for g in genomes]}
+    if searches is not None:
+        doc["restarts"] = searches       # a record only: the key decides whether the file is trusted
+    WF.atomic_write_text(_fold_path(report_dir, plan.prefix, f.index), json.dumps(doc, indent=2))
 
 
 def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold,
@@ -234,7 +342,7 @@ def _load_fold(report_dir: str, plan: WF.Plan, f: WF.Fold,
                            "metrics are kept and fold %d is re-judged under %s",
                            plan.prefix, path, doc["key"].get("thresholds"), f.index,
                            want["thresholds"])
-            _save_fold(report_dir, plan, f, genomes, identities)
+            _save_fold(report_dir, plan, f, genomes, identities, doc.get("restarts"))
             return genomes
         return [WF.GenomeFold(**g) for g in doc["genomes"]]
     except OSError as e:
@@ -256,11 +364,24 @@ def _lineage(runner: Any, spec: CellSpec, job: str, planned: Optional[str]) -> O
     return read(job) if callable(read) else planned
 
 
+def _planned_seed(plan: WF.Plan, f: WF.Fold) -> Optional[str]:
+    prev = plan.previous_fold(f) if plan.seed_chain else None
+    return WF.train_job_name(plan.prefix, prev.index) if prev else None
+
+
 def _fold_summary(spec: CellSpec, runner: Any, plan: WF.Plan, f: WF.Fold,
-                  winner: WF.GenomeFold) -> Dict[str, Any]:
-    job = WF.train_job_name(spec.name, f.index)
-    prev = plan.previous_fold(f)
-    planned = WF.train_job_name(spec.name, prev.index) if prev else None
+                  winner: WF.GenomeFold, searches: Optional[List[Dict[str, Any]]] = None,
+                  set_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """``searches`` (restarts > 1): every restart's record; ``job`` is then the winning search's.
+    ``set_stats`` (set-score verdict): the fold's statistics over every tested genome."""
+    job = (next(s["job"] for s in searches if s["won"]) if searches
+           else WF.train_job_name(spec.name, f.index))
+    planned = _planned_seed(plan, f)
+    extra: Dict[str, Any] = {}
+    if searches:
+        extra["restarts"] = searches
+    if set_stats is not None:
+        extra["set"] = set_stats
     return {"fold": f.index, "job": job,
             "train": [f.train_start.isoformat(), f.train_end.isoformat()],
             "test": [f.test_start.isoformat(), f.test_end.isoformat()],
@@ -271,7 +392,7 @@ def _fold_summary(spec: CellSpec, runner: Any, plan: WF.Plan, f: WF.Fold,
                     "trades": winner.oos_trades, "backtest_id": winner.oos_backtest_id},
             "efficiency": winner.efficiency, "passed": winner.passed,
             "fail_reasons": winner.fail_reasons,
-            "seeded_from": _lineage(runner, spec, job, planned)}
+            "seeded_from": _lineage(runner, spec, job, planned), **extra}
 
 
 def cannot_pass(plan: WF.Plan, folds: Sequence[WF.Fold], genomes: Sequence[WF.GenomeFold]
@@ -347,13 +468,23 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
               log: Callable[[str], None], store: Any = None) -> CellResult:
     store = store if store is not None else _NoStore()
     plan, folds = make_cell_plan(spec)
+    skipped = short_train_folds(spec.train_start, spec.test_years, spec.floor, spec.min_train_years)
+    for s in skipped:
+        msg = (f"[{spec.name}] test year {s['test_year']} dropped: its fold would train "
+               f"{s['train'][0]}..{s['train'][1]} ({s['train_years']:.2f} years), less than "
+               f"--wf-min-train-years {spec.min_train_years:g}")
+        logger.warning(msg)
+        log(msg)
     deferred = deferred_fold(folds, spec.data_end, spec.defer_last_test)
     store.begin(spec, folds, deferred)
     genomes: List[WF.GenomeFold] = []
     ran: List[WF.Fold] = []
+    searches: Dict[int, Optional[List[Dict[str, Any]]]] = {}
     eliminated: Optional[Dict[str, Any]] = None
+    set_mode = spec.verdict_mode == "set-score"
     for f in folds:
-        why = None if spec.run_all_folds else cannot_pass(plan, folds, genomes)
+        # The set-score verdict needs every fold: no early elimination.
+        why = None if (spec.run_all_folds or set_mode) else cannot_pass(plan, folds, genomes)
         if why is not None:
             eliminated = {"before_fold": f.index, "reason": why}
             log(f"[{spec.name}] cell can no longer pass ({why}) -- fold {f.index} onward not run")
@@ -361,28 +492,34 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
         store.fold_started(f)
         if f is deferred:
             WF.train_fold(plan, runner, f, log)
+            searches[f.index] = WF.search_records(plan, runner, f) if plan.restarts > 1 else None
             log(f"[{spec.name}] fold {f.index}: trained; its test {f.test_start}..{f.test_end} "
                 f"waits for data past {spec.data_end}")
             store.fold_deferred(f)
             break
-        name = WF.train_job_name(spec.name, f.index)
-        completed = runner.train_completed(name)
+        completed = all(runner.train_completed(n) for n in plan.restart_names(f))
         ids = _identities(runner, plan, f) if completed else None
         stored = _load_fold(report_dir, plan, f, ids) if completed else None
+        recs = WF.search_records(plan, runner, f) if completed and plan.restarts > 1 else None
+        if stored is not None and recs is not None and not _same_winner(report_dir, plan, f, recs):
+            stored = None
         if stored is not None:
             log(f"[{spec.name}] fold {f.index}: completed -- reusing its stored report")
             genomes.extend(stored)
-            store.fold_done(f, stored, ids[-1] if ids else None, reused=True)
+            store.fold_done(f, stored, _winner_identity(runner, ids, recs), reused=True)
         else:
             got = WF.run_fold(plan, runner, f, log)
             ids = _identities(runner, plan, f)
-            _save_fold(report_dir, plan, f, got, ids)
+            recs = WF.search_records(plan, runner, f) if plan.restarts > 1 else None
+            _save_fold(report_dir, plan, f, got, ids, recs)
             genomes.extend(got)
-            store.fold_done(f, got, ids[-1] if ids else None)
+            store.fold_done(f, got, _winner_identity(runner, ids, recs))
+        searches[f.index] = recs
         ran.append(f)
     res = WF.aggregate(spec.name, ran, len(folds), spec.top_n, genomes, spec.thresholds,
                        spec.selection, require_test_years=plan.require_test_years,
-                       exclusive_return=plan.exclusive_return)
+                       exclusive_return=plan.exclusive_return, verdict_mode=plan.verdict_mode,
+                       min_oos_score=plan.min_oos_score)
     cell_dir = os.path.join(report_dir, spec.name)
     WF.write_report(res, cell_dir)
     pending = deferred is not None and eliminated is None
@@ -391,41 +528,28 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
     refit_block: Optional[Dict[str, Any]] = None
     deferred_block: Optional[Dict[str, Any]] = None
     if pending:
-        job = WF.train_job_name(spec.name, deferred.index)
-        prev = plan.previous_fold(deferred)
+        recs = searches.get(deferred.index)
+        job = (next(r["job"] for r in recs if r["won"]) if recs
+               else WF.train_job_name(spec.name, deferred.index))
         deferred_block = {"fold": deferred.index, "job": job,
                           "train": [deferred.train_start.isoformat(), deferred.train_end.isoformat()],
                           "test": [deferred.test_start.isoformat(), deferred.test_end.isoformat()],
-                          "seeded_from": _lineage(runner, spec, job, WF.train_job_name(
-                              spec.name, prev.index) if prev else None)}
+                          "seeded_from": _lineage(runner, spec, job, _planned_seed(plan, deferred)),
+                          **({"restarts": recs} if recs else {})}
         log(f"[{spec.name}] cell PENDING -- fold {deferred.index} trained, test deferred")
     elif passed and not spec.refit:
         log(f"[{spec.name}] cell PASSED -- refit not requested (refit off)")
     elif passed:
-        refit_job = refit_job_name(spec.name)
-        cmd = refit_command(spec, folds)
-        if runner.train_completed(refit_job):
-            log(f"[{spec.name}] refit {refit_job} already completed -- skipping")
-        else:
-            log(f"[{spec.name}] cell PASSED -- refit {refit_job}")
-            store.refit_started(refit_job)
-            runner.run_train(cmd, refit_job)
-            if not runner.train_completed(refit_job):
-                raise WalkForwardError(f"refit job {refit_job!r} did not reach status 'completed'")
-        start, end = refit_window(folds)
-        src = WF.train_job_name(spec.name, folds[-1].index)
-        read = getattr(runner, "seed_lineage", None)
-        if callable(read) and read(refit_job) != src:
-            raise WalkForwardError(f"refit {refit_job!r} recorded seed source "
-                                   f"{read(refit_job)!r}, expected {src!r}")
-        refit_block = {"job": refit_job, "train": [start.isoformat(), end.isoformat()],
-                       "seeded_from": _lineage(runner, spec, refit_job, src)}
+        refit_job, refit_block = _run_refit(spec, plan, runner, folds, store, log)
     else:
-        log(f"[{spec.name}] cell FAILED -- no refit "
-            f"({res.winners_passed}/{len(ran)} folds passed"
+        log(f"[{spec.name}] cell FAILED -- no refit ("
+            + (f"set score {res.set_score['score']:.2f} not above {spec.min_oos_score:g}; "
+               if set_mode and res.set_score else "")
+            + f"{res.winners_passed}/{len(ran)} folds passed"
             + (f"; required {res.required_failed} failed" if res.required_failed else "")
             + (f"; eliminated before fold {eliminated['before_fold']}" if eliminated else "") + ")")
     winners = {g.fold: g for g in res.genomes if g.rank == 1}
+    set_folds = {s["fold"]: s for s in (res.set_score or {}).get("folds", [])}
     report = {
         "cell": spec.name, "expert": spec.expert, "strategy": spec.strategy, "band": spec.band,
         "verdict": "PENDING" if pending else "PASS" if passed else "FAIL",
@@ -436,12 +560,83 @@ def _run_cell(spec: CellSpec, runner: Any, report_dir: str,
                        "exclusive_return": spec.exclusive_return,
                        "require_test_years": list(res.require_test_years)},
         "data_end": spec.data_end.isoformat() if spec.data_end else None,
-        "folds": [_fold_summary(spec, runner, plan, f, winners[f.index]) for f in ran],
+        "folds": [_fold_summary(spec, runner, plan, f, winners[f.index], searches.get(f.index),
+                                set_folds.get(f.index)) for f in ran],
         "winner_stitch": asdict(res.winner_stitch) if res.winner_stitch else None,
+        # Redesign settings and results: present only when not the original chain's.
+        **spec.non_default_settings(),
+        **({"skipped_folds": skipped} if spec.min_train_years is not None else {}),
+        **({"set_score": res.set_score} if set_mode else {}),
     }
     WF.atomic_write_text(os.path.join(cell_dir, "cell.json"), json.dumps(report, indent=2))
     store.finish(report, res)
     return CellResult(spec.name, report["verdict"], refit_job, res, report)
+
+
+def _winner_identity(runner: Any, ids: Optional[List[Any]],
+                     recs: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """The identity of the job whose genomes were tested: the fold's train job (last of ``ids``), or
+    with restarts the winning search's."""
+    if not recs:
+        return ids[-1] if ids else None
+    read = getattr(runner, "train_identity", None)
+    return read(next(r["job"] for r in recs if r["won"])) if callable(read) else None
+
+
+def _same_winner(report_dir: str, plan: WF.Plan, f: WF.Fold, recs: List[Dict[str, Any]]) -> bool:
+    """A stored restart fold is reused only if it tested the search that wins now (a runner without
+    train identities cannot otherwise tell that a restart was retrained)."""
+    with open(_fold_path(report_dir, plan.prefix, f.index), encoding="utf-8") as fh:
+        stored = json.load(fh).get("restarts") or []
+    was = [r["job"] for r in stored if r.get("won")]
+    now = [r["job"] for r in recs if r["won"]]
+    if was != now:
+        logger.warning("[%s] stored report of fold %d tested %s, but the winning search is now %s; "
+                       "re-evaluating fold %d", plan.prefix, f.index, was or "no recorded search",
+                       now, f.index)
+        return False
+    return True
+
+
+def _run_refit(spec: CellSpec, plan: WF.Plan, runner: Any, folds: Sequence[WF.Fold], store: Any,
+               log: Callable[[str], None]) -> Tuple[str, Dict[str, Any]]:
+    """Train the refit (every restart; skipped when completed) and check each recorded seed against
+    the plan (``refit_source``: the last fold, or None without chain seeding). With restarts the
+    refit job is the one with the best training fitness."""
+    names = [refit_restart_name(spec.name, j) for j in range(1, spec.restarts + 1)]
+    src = refit_source(spec, folds)
+    read = getattr(runner, "seed_lineage", None)
+    for j, job in enumerate(names, start=1):
+        cmd = refit_command(spec, folds, j)
+        if runner.train_completed(job):
+            log(f"[{spec.name}] refit {job} already completed -- skipping")
+        else:
+            log(f"[{spec.name}] cell PASSED -- refit {job}")
+            store.refit_started(job)
+            runner.run_train(cmd, job)
+            if not runner.train_completed(job):
+                raise WalkForwardError(f"refit job {job!r} did not reach status 'completed'")
+        if callable(read) and read(job) != src:
+            raise WalkForwardError(f"refit {job!r} recorded seed source {read(job)!r}, expected {src!r}")
+    start, end = refit_window(folds)
+    recs: Optional[List[Dict[str, Any]]] = None
+    refit_job = names[0]
+    if spec.restarts > 1:
+        fit = WF._best_fitness_reader(plan, runner)
+        ident = getattr(runner, "train_identity", None)
+        fits = [fit(n) for n in names]
+        won = WF.choose_search(fits)
+        gens = spec.next_generations if spec.chain_seed else spec.first_generations
+        recs = [{"restart": j, "job": n,
+                 "optimization_id": (ident(n) or {}).get("id") if callable(ident) else None,
+                 "best_fitness": float(x), "generations": str(gens), "won": j == won}
+                for j, (n, x) in enumerate(zip(names, fits), start=1)]
+        refit_job = names[won - 1]
+        log(f"[{spec.name}] refit {refit_job} wins on training fitness")
+    block = {"job": refit_job, "train": [start.isoformat(), end.isoformat()],
+             "seeded_from": _lineage(runner, spec, refit_job, src),
+             **({"restarts": recs} if recs else {})}
+    return refit_job, block
 
 
 # --------------------------------------------------------------------------------- the grid
@@ -452,12 +647,16 @@ def _f(v: Any, suffix: str = "%") -> str:
 
 
 def render_summary(cells: Sequence[Dict[str, Any]]) -> str:
+    """One row per cell, one column per fold (at least 3: a grid of 3-fold cells renders as it always
+    did). Cells judged by the set score get a second table with the score and its factors."""
+    n = max([3] + [len(c.get("folds", [])) for c in cells])
     out = ["# goal2027 walk-forward summary", "",
            "Per fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).",
-           "", "| cell | verdict | fold 1 | fold 2 | fold 3 | refit |", "|---|---|---|---|---|---|"]
+           "", "| cell | verdict | " + " | ".join(f"fold {k}" for k in range(1, n + 1)) + " | refit |",
+           "|---|---|" + "---|" * n + "---|"]
     for c in cells:
         cols = []
-        for k in range(3):
+        for k in range(n):
             fo = c.get("folds", [])
             if k < len(fo):
                 x = fo[k]
@@ -470,6 +669,20 @@ def render_summary(cells: Sequence[Dict[str, Any]]) -> str:
                 or (c.get("eliminated") and f"eliminated before fold {c['eliminated']['before_fold']}")
                 or "-")
         out.append(f"| {c['cell']} | {c['verdict']} | " + " | ".join(cols) + f" | {note} |")
+    scored = [c for c in cells if c.get("set_score")]
+    if scored:
+        out += ["", "## Set score (every tested genome per fold)", "",
+                "Score = mean of the folds' median OOS returns (annualised for a partial year) x "
+                "dd_guard x consistency, as the consistent_annual_return fitness; PASS = above the "
+                "minimum. Per fold: median OOS return / share of genomes > 0.", "",
+                "| cell | verdict | set score | min | base | dd_guard | consistency | folds |",
+                "|---|---|---:|---:|---:|---:|---:|---|"]
+        for c in scored:
+            s = c["set_score"]
+            per = ", ".join(f"{_f(x['oos_return_median'])} / {x['share_positive'] * 100:.0f}%"
+                            for x in s["folds"])
+            out.append(f"| {c['cell']} | {c['verdict']} | {s['score']:.2f} | {s['min_oos_score']:g} | "
+                       f"{s['base']:.2f} | {s['dd_guard']:.3f} | {s['consistency']:.3f} | {per} |")
     return "\n".join(out) + "\n"
 
 
