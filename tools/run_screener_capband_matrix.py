@@ -57,9 +57,16 @@ fold now and tests it when the same command later runs without --wf-data-end (ce
 docs/plans/2026-11-02-goal2027-two-phase-walk-forward.md). A cell that can no longer pass stops early
 as FAIL unless --wf-run-all-folds. Out-of-sample re-runs are local, ~14 GB each. Reports: per cell
 <--wf-report-dir>/<cell>/{cell,report}.json + report.md, grid-wide <--wf-report-dir>/summary.{json,md}.
+
+Redesign 2026-11-17 (each changes the cell name only when given): --wf-no-chain-seed (every fold and
+the refit start cold on --wf-first-generations), --wf-restarts K (K searches per fold and refit, the
+best training fitness is tested; needs --wf-no-chain-seed), --wf-verdict set-score with
+--pass-min-oos-score X (every tested genome, scored like the CAR fitness; no early elimination),
+--wf-min-train-years Y (folds training on fewer years are dropped, the rest numbered 1..n).
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -966,14 +973,43 @@ def main() -> int:
                     help="Fold winners that must pass for the cell to pass (REQUIRED).")
     ap.add_argument("--pass-require-fold", type=int, action="append", default=[], metavar="YEAR",
                     help="A test year whose fold winner MUST pass (repeatable; the cell fails "
-                         "otherwise even when --pass-min-folds is met).")
+                         "otherwise even when --pass-min-folds is met). Under --wf-verdict set-score "
+                         "it is reported, not judged (the year must still be in the plan).")
+    # Redesign 2026-11-17. Each enters the cell name ONLY when not the default, so cells launched
+    # without these flags keep their names and completed jobs.
+    ap.add_argument("--wf-no-chain-seed", action="store_true",
+                    help="Do not seed fold k+1 (or the refit) from fold k's final population: every "
+                         "fold and the refit start cold on --wf-first-generations.")
+    ap.add_argument("--wf-restarts", type=int, default=None, metavar="K",
+                    help="K >= 1 independent searches per fold and per refit (default 1): restart 1 is "
+                         "<cell>-wf<k>, restart j <cell>-wf<k>-r<j> with its own GA --seed. All run (one "
+                         "at a time, each resumable); the best TRAINING fitness is selected and tested "
+                         "(ties: the lowest restart). K > 1 needs --wf-no-chain-seed.")
+    ap.add_argument("--wf-verdict", choices=["winner", "set-score"], default=None,
+                    help="winner (default): the rank-1 genome of each fold against the --pass-* rule. "
+                         "set-score: every tested genome of every fold; score = mean of the folds' median "
+                         "OOS returns (annualised for a partial year) x dd_guard x consistency, as the "
+                         "consistent_annual_return fitness; PASS iff score > --pass-min-oos-score. Every "
+                         "fold runs (no early elimination). --pass-min-oos-return / --pass-max-dd-mult / "
+                         "--pass-max-oos-dd / --pass-min-folds stay REQUIRED: they label each genome row "
+                         "and the rank-1 tally, which is reported but does not decide.")
+    ap.add_argument("--pass-min-oos-score", type=float, default=None, metavar="X",
+                    help="--wf-verdict set-score only (REQUIRED there, refused otherwise): the cell "
+                         "passes when its set score is strictly above X.")
+    ap.add_argument("--wf-min-train-years", type=float, default=None, metavar="Y",
+                    help="Drop a fold whose training window (from the expert's floor) is shorter than Y "
+                         "calendar years (logged; 'skipped_folds' in the cell report). The remaining "
+                         "folds are numbered 1..n as for the reduced year list. A cell with no fold left "
+                         "is refused. Default: keep every fold.")
     args = ap.parse_args()
 
     # Walk-forward flags: required with --walk-forward, refused without it.
     _wf_opt = ("wf_train_start", "wf_test_years", "wf_data_end", "wf_first_generations",
                "wf_next_generations", "wf_top_n", "wf_report_dir", "wf_test_parallel",
-               "wf_min_free_gb", "pass_min_oos_return", "pass_max_dd_mult", "pass_min_folds")
+               "wf_min_free_gb", "pass_min_oos_return", "pass_max_dd_mult", "pass_min_folds",
+               "wf_restarts", "wf_verdict", "pass_min_oos_score", "wf_min_train_years")
     if not args.walk_forward:
+        _stray_new = ["--wf-no-chain-seed"] if args.wf_no_chain_seed else []
         _stray = [("--" + k.replace("_", "-")) for k in _wf_opt if getattr(args, k) is not None]
         _stray += ["--wf-force-memory"] if args.wf_force_memory else []
         _stray += ["--wf-defer-last-test"] if args.wf_defer_last_test else []
@@ -982,6 +1018,7 @@ def main() -> int:
         _stray += ["--pass-require-fold"] if args.pass_require_fold else []
         _stray += ["--pass-max-oos-dd"] if args.pass_max_oos_dd is not None else []
         _stray += ["--wf-name-pass-max-dd-mult"] if args.wf_name_pass_max_dd_mult is not None else []
+        _stray += _stray_new
         if _stray:
             ap.error(f"{', '.join(_stray)} need --walk-forward")
     else:
@@ -999,6 +1036,23 @@ def main() -> int:
         args.wf_next_generations = args.wf_next_generations or 15
         args.wf_test_parallel = args.wf_test_parallel or 1
         args.wf_min_free_gb = 20.0 if args.wf_min_free_gb is None else args.wf_min_free_gb
+        # Redesign defaults = the original chain (they then add nothing to the cell names).
+        args.wf_restarts = 1 if args.wf_restarts is None else args.wf_restarts
+        args.wf_verdict = args.wf_verdict or "winner"
+        if args.wf_restarts < 1:
+            ap.error(f"--wf-restarts must be >= 1, got {args.wf_restarts}")
+        if args.wf_restarts > 1 and not args.wf_no_chain_seed:
+            ap.error(f"--wf-restarts {args.wf_restarts} needs --wf-no-chain-seed (with chain seeding, "
+                     f"which restart of a fold would seed the next one is undefined)")
+        if args.wf_verdict == "set-score" and args.pass_min_oos_score is None:
+            ap.error("--wf-verdict set-score requires --pass-min-oos-score (no default)")
+        if args.wf_verdict != "set-score" and args.pass_min_oos_score is not None:
+            ap.error("--pass-min-oos-score needs --wf-verdict set-score (it is that verdict's minimum)")
+        if args.pass_min_oos_score is not None and not math.isfinite(args.pass_min_oos_score):
+            ap.error(f"--pass-min-oos-score must be finite, got {args.pass_min_oos_score}")
+        if args.wf_min_train_years is not None and not (math.isfinite(args.wf_min_train_years)
+                                                        and args.wf_min_train_years > 0):
+            ap.error(f"--wf-min-train-years must be > 0, got {args.wf_min_train_years}")
         try:
             args.wf_train_start_d = date.fromisoformat(args.wf_train_start)
             args.wf_data_end_d = date.fromisoformat(args.wf_data_end) if args.wf_data_end else None
@@ -1194,12 +1248,19 @@ def main() -> int:
             WF, WFC = _wf_import()
             _floor = _EXPERT_MIN_START.get(expert)
             try:
+                _floor_d = date.fromisoformat(_floor) if _floor else None
                 wf_folds = WFC.build_cell_folds(args.wf_train_start_d, args.wf_years_l,
-                                                args.wf_data_end_d,
-                                                date.fromisoformat(_floor) if _floor else None,
-                                                args.wf_defer_last_test)
+                                                args.wf_data_end_d, _floor_d,
+                                                args.wf_defer_last_test, args.wf_min_train_years)
+                _short = WFC.short_train_folds(args.wf_train_start_d, args.wf_years_l, _floor_d,
+                                               args.wf_min_train_years)
             except WF.WalkForwardError as e:
                 raise SystemExit(f"--walk-forward: {e}")
+            if _short:
+                print(f"[{i}/{len(jobs)}] NOTE {expert}: test year(s) "
+                      f"{', '.join(str(s['test_year']) for s in _short)} dropped (training shorter than "
+                      f"--wf-min-train-years {args.wf_min_train_years:g}); folds run: "
+                      f"{', '.join(str(f.test_start.year) for f in wf_folds)}", flush=True)
             job_start = wf_folds[0].train_start.isoformat()
             job_end = WFC.refit_window(wf_folds)[1].isoformat()
         _ref_start = args.wf_train_start if args.walk_forward else args.start
@@ -1372,7 +1433,13 @@ def main() -> int:
                 else args.wf_name_pass_max_dd_mult),
             str(args.pass_min_folds),
             ",".join(map(str, sorted(set(args.pass_require_fold)))) or "-",
-            "exclusive" if args.pass_min_oos_return_exclusive else "inclusive"])
+            "exclusive" if args.pass_min_oos_return_exclusive else "inclusive",
+            # redesign settings: tokens ONLY when not the default, so existing cells keep their names
+            *(["no-chain-seed"] if args.wf_no_chain_seed else []),
+            *([f"restarts={args.wf_restarts}"] if args.wf_restarts != 1 else []),
+            *([f"verdict=set-score>{args.pass_min_oos_score}"] if args.wf_verdict == "set-score" else []),
+            *([f"min-train-years={args.wf_min_train_years}"]
+              if args.wf_min_train_years is not None else [])])
         if mc_tokens or excl_tokens or fr_tokens or dt_tokens or unc_tokens or sz_tokens or mp_tokens or ds_tokens or dp_tokens or er_tokens or spy_tokens or pb_tokens or rs_tokens or wf_tokens:
             ident = (mask_data_tokens(cmd) if args.walk_forward and args.wf_defer_last_test
                      else cmd)
@@ -1392,7 +1459,10 @@ def main() -> int:
                 test_parallel=args.wf_test_parallel, selection=_wf_selection_defaults(),
                 expert=expert, strategy=strat, band=band,
                 floor=date.fromisoformat(_EXPERT_MIN_START[expert])
-                if expert in _EXPERT_MIN_START else None))
+                if expert in _EXPERT_MIN_START else None,
+                chain_seed=not args.wf_no_chain_seed, restarts=args.wf_restarts,
+                verdict_mode=args.wf_verdict, min_oos_score=args.pass_min_oos_score,
+                min_train_years=args.wf_min_train_years))
             try:
                 WFC.make_cell_plan(wf_specs[-1])      # refuse a bad spec before anything runs
             except WF.WalkForwardError as e:
@@ -1441,7 +1511,9 @@ def _run_walk_forward_cells(args, specs, WF, WFC) -> int:
                       f"TRAINS {WF.train_job_name(spec.name, later.index)}. Rerun the same command without "
                       f"--wf-data-end to test it, decide the cell and refit.")
                 continue
-            print("  refit (only if the cell passes): " + " ".join(WFC.refit_command(spec, folds)))
+            for j in range(1, spec.restarts + 1):
+                print(f"  refit{'' if spec.restarts == 1 else f' (restart {j})'} (only if the cell passes): "
+                      + " ".join(WFC.refit_command(spec, folds, j)))
         return 0
     runner = _make_wf_runner(args)
     cells = WFC.run_cells(specs, lambda _spec: runner, args.wf_report_dir)

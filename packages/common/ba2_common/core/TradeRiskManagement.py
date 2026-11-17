@@ -1413,13 +1413,16 @@ class TradeRiskManagement:
         # and quantity is the min of them, so the position scales by exactly the factor either way
         # rather than by its square. 1.0 (the default, and the value in an unstressed bar) leaves
         # the arithmetic bit-for-bit unchanged.
-        risk_scale = self._regime_scale(expert, 'regime_risk_scale')
+        # ONE function (per_instrument_cap.regime_scaled_cap) for this and the account's
+        # pre-submit validation, so the account never refuses an order this sized.
+        from ba2_common.core.per_instrument_cap import regime_scaled_cap
+        cap = regime_scaled_cap(expert, max_equity_per_instrument)
+        risk_scale = cap.regime_scale
         if risk_scale != 1.0:
-            scaled_cap = max_equity_per_instrument * risk_scale
             self.logger.info(
                 f"Regime overlay: stressed market -> regime_risk_scale={risk_scale:g}, "
-                f"max per instrument ${max_equity_per_instrument:.2f} -> ${scaled_cap:.2f}")
-            max_equity_per_instrument = scaled_cap
+                f"max per instrument ${max_equity_per_instrument:.2f} -> ${cap.value:.2f}")
+            max_equity_per_instrument = cap.value
 
         # The knobs only THIS method reads, into the run record. The regime scale is recorded
         # ALWAYS -- 1.0 is the answer "the market was not stressed", and leaving it out would

@@ -1778,9 +1778,6 @@ class ExpertSettingsTab:
             
             self.experts_table.add_slot('body-cell-actions', """
                 <q-td :props="props">
-                    <q-btn v-if="props.row.expert === 'DeterministicScorer'" :href="'/style/' + props.row.id" target="_blank" icon="view_list" flat dense color='purple'>
-                        <q-tooltip>Style view (read-only option members)</q-tooltip>
-                    </q-btn>
                     <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'>
                         <q-tooltip>Edit Expert</q-tooltip>
                     </q-btn>
@@ -5873,6 +5870,7 @@ class TradeSettingsTab:
 
                     self.rulesets_table.add_slot('body-cell-actions', """
                         <q-td :props="props">
+                            <q-btn v-if="props.row.is_style" :href="'/style/ruleset/' + props.row.id" target="_blank" icon="view_list" flat dense color='purple' title="Structure view (option structures of this entry ruleset, read-only)"/>
                             <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
                             <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Ruleset"/>
                             <q-btn @click="$parent.$emit('duplicate', props)" icon="content_copy" flat dense color='orange' title="Duplicate Ruleset"/>
@@ -5938,6 +5936,7 @@ class TradeSettingsTab:
             from sqlmodel import select
             from sqlalchemy.orm import selectinload
             
+            from ...core.style_view import actions_have_style_member
             # Use selectinload to eagerly load the event_actions relationship
             statement = select(Ruleset).options(selectinload(Ruleset.event_actions))
             rulesets = list(session.scalars(statement))
@@ -5951,6 +5950,10 @@ class TradeSettingsTab:
                     'description': ruleset.description[:47] + '...' if ruleset.description and len(ruleset.description) > 50 else ruleset.description,
                     'subtype': ruleset.subtype.value if ruleset.subtype else 'Not set',
                     'rules_count': len(ruleset.event_actions) if ruleset.event_actions else 0,
+                    # Structure view button: only on an entry ruleset that opens option structures
+                    # under member tags (a composed option expert's ruleset).
+                    'is_style': any(actions_have_style_member(ea.actions)
+                                    for ea in (ruleset.event_actions or [])),
                     'actions': 'actions'
                 }
                 rows.append(row)

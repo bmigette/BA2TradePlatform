@@ -103,3 +103,101 @@ def test_unknown_leaf_shape_is_shown_not_dropped():
     rule = dict(ENTER[0], triggers={"cond_0": {"weird": 1}})
     s = build_style_summary([rule], [])
     assert s["members"][0]["entries"][0]["unreadable"] == ["cond_0: {'weird': 1}"]
+
+
+def test_has_style_members_tells_a_style_expert_from_a_plain_one(monkeypatch):
+    """The settings table offers the Style view button only when this is True: a stock expert's
+    button used to open a page with nothing on it."""
+    from ba2_trade_platform.core import style_view
+    plain = [{"name": "buy", "continue_processing": False, "triggers": {},
+              "actions": {"a0": {"action_type": "buy"}}}]
+    rulesets = {1: ENTER, 2: plain, None: []}
+    monkeypatch.setattr(style_view, "_rule_dicts", lambda rid: rulesets[rid])
+    assert style_view.has_style_members(1) is True
+    assert style_view.has_style_members(2) is False
+    assert style_view.has_style_members(None) is False
+
+
+def _store_ruleset(name, rules):
+    from ba2_trade_platform.core.db import add_instance, get_db
+    from ba2_trade_platform.core.models import EventAction, Ruleset, RulesetEventActionLink
+    from ba2_trade_platform.core.types import ExpertEventRuleType
+    rid = add_instance(Ruleset(name=name))
+    for i, rule in enumerate(rules):
+        eid = add_instance(EventAction(type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                                       name=rule["name"], triggers=rule["triggers"],
+                                       actions=rule["actions"],
+                                       continue_processing=rule["continue_processing"]))
+        with get_db() as session:      # the link table has no id column, add_instance needs one
+            session.add(RulesetEventActionLink(ruleset_id=rid, eventaction_id=eid, order_index=i))
+            session.commit()
+    return rid
+
+
+def test_ruleset_view_pairs_the_entry_ruleset_with_each_experts_exit_ruleset():
+    """The Rulesets tab opens the view by ENTRY ruleset; the exits come from the open-positions
+    ruleset of every expert that uses it, one view per distinct exit ruleset."""
+    from ba2_trade_platform.core.style_view import load_ruleset_style_views
+    from tests.factories import create_account_definition, create_expert_instance
+    enter = _store_ruleset("style-enter", ENTER)
+    exits = _store_ruleset("style-open", OPEN)
+    acct = create_account_definition()
+    a = create_expert_instance(acct.id, expert="DeterministicScorer", alias="opt-a",
+                               enter_market_ruleset_id=enter, open_positions_ruleset_id=exits)
+    b = create_expert_instance(acct.id, expert="DeterministicScorer", alias="opt-b",
+                               enter_market_ruleset_id=enter, open_positions_ruleset_id=exits)
+    data = load_ruleset_style_views(enter)
+    assert data["ruleset"] == {"id": enter, "name": "style-enter"}
+    assert len(data["views"]) == 1
+    view = data["views"][0]
+    assert view["exit_ruleset"] == {"id": exits, "name": "style-open"}
+    assert [e["id"] for e in view["experts"]] == [a.id, b.id]
+    assert [m["structure"] for m in view["summary"]["members"]] == ["O_STRD", "O_LC"]
+    assert any(m["exits"] for m in view["summary"]["members"])
+
+
+def test_ruleset_view_without_an_expert_shows_entries_only_and_plain_rulesets_show_nothing():
+    from ba2_trade_platform.core.style_view import load_ruleset_style_views
+    enter = _store_ruleset("style-enter-unused", ENTER)
+    data = load_ruleset_style_views(enter)
+    assert [v["exit_ruleset"] for v in data["views"]] == [None]
+    assert data["views"][0]["experts"] == []
+    assert len(data["views"][0]["summary"]["members"]) == 2
+    plain = _store_ruleset("plain", [{"name": "buy", "continue_processing": False, "triggers": {},
+                                      "actions": {"a0": {"action_type": "buy"}}}])
+    assert load_ruleset_style_views(plain) is None
+    assert load_ruleset_style_views(999999) is None
+
+
+def test_ruleset_page_draws_members_exits_and_the_experts_using_it():
+    from nicegui.client import Client
+    from nicegui.page import page as nicegui_page
+    from ba2_trade_platform.ui.pages import style_view as page
+    from tests.factories import create_account_definition, create_expert_instance
+    enter = _store_ruleset("style-enter", ENTER)
+    exits = _store_ruleset("style-open", OPEN)
+    acct = create_account_definition()
+    inst = create_expert_instance(acct.id, expert="DeterministicScorer", alias="opt-a",
+                                  enter_market_ruleset_id=enter, open_positions_ruleset_id=exits)
+    plain = _store_ruleset("plain", [{"name": "buy", "continue_processing": False, "triggers": {},
+                                      "actions": {"a0": {"action_type": "buy"}}}])
+    client = Client(nicegui_page('/test-style-ruleset'), request=None)
+    try:
+        with client:
+            page.ruleset_content(enter)
+            texts = [d.text for d in client.layout.descendants() if getattr(d, 'text', None)]
+        joined = " | ".join(texts)
+        assert f"Entry ruleset #{enter}: style-enter" in joined
+        assert "O_STRD" in joined and "O_LC" in joined
+        assert f"Exits from open-positions ruleset #{exits}: style-open" in joined
+        assert f"#{inst.id} opt-a" in joined
+    finally:
+        Client.instances.pop(client.id, None)
+    client = Client(nicegui_page('/test-style-ruleset-plain'), request=None)
+    try:
+        with client:
+            page.ruleset_content(plain)
+            texts = [d.text for d in client.layout.descendants() if getattr(d, 'text', None)]
+        assert "Nothing to show" in texts
+    finally:
+        Client.instances.pop(client.id, None)

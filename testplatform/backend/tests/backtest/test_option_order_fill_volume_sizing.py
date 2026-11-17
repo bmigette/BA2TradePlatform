@@ -183,7 +183,10 @@ def test_stage1_turns_it_on_and_the_matrix_forwards_it_as_an_identity_token():
     import run_options_matrix as M
     src = (repo / "tools" / "run_options_matrix.py").read_text(encoding="utf-8")
     assert 'cmd += ["--option-size-within-fill-volume"]' in src
-    assert '"--no-robust-fitness", "--option-size-within-fill-volume"' in src
+    # a BOOLEAN identity token (feat/option-vol-conditions moved the literal into _BOOLEAN_FLAGS)
+    assert "--option-size-within-fill-volume" in M._BOOLEAN_FLAGS
+    assert M._identity_config(["--option-size-within-fill-volume", "--seed", "7"]) == {
+        "--option-size-within-fill-volume": True, "--seed": "7"}
 
 
 # ------------------------------------------------------------------ C1: the ACTION sees the cut

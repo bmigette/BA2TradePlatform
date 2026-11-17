@@ -1269,10 +1269,17 @@ class AccountInterface(ReadOnlyAccountInterface):
 
     def _validate_single_position_size(self, trading_order: TradingOrder, transaction, expert_instance,
                                        current_price: float, max_position_pct: float,
-                                       virtual_equity: float) -> List[str]:
+                                       virtual_equity: float, expert=None) -> List[str]:
         """
         Validate that position size doesn't exceed expert's per-instrument limit.
-        
+
+        THE CAP IS THE RISK MANAGER'S CAP. ``per_instrument_cap`` is the one function both the
+        classic RM's sizing and this check compute it with, regime overlay included: in a stressed
+        bar ``regime_risk_scale`` shrinks or grows the cap the RM funded the order against, and an
+        unscaled cap here refused every order the RM sized above it (2026-11-17: 44-46 refusals in
+        one 4-year backtest at scale 1.5). ``expert`` is the resolved expert whose overlay settings
+        apply; None (a caller with no expert) means no overlay -- the unscaled cap.
+
         Args:
             trading_order: The order to validate
             transaction: The transaction associated with the order
@@ -1280,13 +1287,19 @@ class AccountInterface(ReadOnlyAccountInterface):
             current_price: Current market price
             max_position_pct: Maximum position percentage setting
             virtual_equity: Expert's virtual equity
-            
+            expert: The resolved expert (its regime overlay settings scale the cap)
+
         Returns:
             List[str]: List of error messages (empty if valid)
         """
+        from ba2_common.core.per_instrument_cap import per_instrument_cap
+
         errors = []
-        max_position_value = virtual_equity * (max_position_pct / 100.0)
-        
+        cap = per_instrument_cap(expert, virtual_equity, max_position_pct)
+        max_position_value = cap.value
+        regime_note = (f", x regime_risk_scale {cap.regime_scale:g} (stressed market)"
+                       if cap.regime_scale != 1.0 else "")
+
         # SIZE THE EXISTING HOLDING OFF WHAT WE MEASURED, AND NOTHING ELSE.
         #
         # This was ``abs(transaction.quantity or 0)`` -- the quantity the transaction
@@ -1329,7 +1342,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 errors.append(
                     f"Adding {trading_order.quantity} shares would bring total position to ${new_total_value:.2f}, "
                     f"exceeding expert's max allowed ${max_position_value:.2f} "
-                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}{regime_note}). "
                     f"Current position: {current_position_qty} shares (${current_position_value:.2f}). "
                     f"Can add up to {max_additional_qty} more shares."
                 )
@@ -1345,7 +1358,7 @@ class AccountInterface(ReadOnlyAccountInterface):
             if position_value > max_position_value:
                 errors.append(
                     f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
-                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}{regime_note}). "
                     f"Reduce quantity to {int(max_position_value / current_price)} or less."
                 )
                 logger.error(
@@ -1657,10 +1670,11 @@ class AccountInterface(ReadOnlyAccountInterface):
                 )
                 return errors
 
-            # Validate position size limits
+            # Validate position size limits -- against the cap the risk manager sized with
+            # (regime overlay included: ``expert`` carries its settings).
             position_size_errors = self._validate_single_position_size(
                 trading_order, transaction, expert_instance,
-                current_price, max_position_pct, virtual_equity
+                current_price, max_position_pct, virtual_equity, expert=expert
             )
             errors.extend(position_size_errors)
 

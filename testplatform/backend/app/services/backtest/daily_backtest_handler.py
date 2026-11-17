@@ -1276,6 +1276,12 @@ def run_daily_backtest(
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
             results = build_results(account, config)
+            # Funded entries the account refused at submit (cancelled, as live). Only when there
+            # were any, so a run without a refusal keeps exactly the results it had.
+            from app.services.backtest.daily_engine import refused_entries_result
+            refused_record = refused_entries_result(engine)
+            if refused_record is not None:
+                results["refused_entries"] = refused_record
             if ps.is_intraday:
                 # What the intraday-clock rule dropped, so a REDUCED universe / lost decision is
                 # visible in the persisted result (intraday runs only; absent on a daily clock).

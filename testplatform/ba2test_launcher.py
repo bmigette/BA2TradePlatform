@@ -11751,6 +11751,10 @@ def _test_window_static_universe(bt_block: dict, parameter_ranges, opt_id, name_
     and exclusions). A symbol without cached bars is excluded from the screen and NAMED here and on the
     row (``screener_universe_recompute_note``) -- one uncached name does not void the test.
 
+    A FIXED screen (``--screen-preset``: no screener genes, ``screener_opt.declared_ranges == {}``) is recomputed
+    the same way from its stored preset criteria with no gene ranges (``rerun_handler.is_fixed_screen``); it
+    used to refuse ("stores no screener gene ranges"), which ERRORed the cell after fold 1 had trained.
+
     Untouched: a non-screener block, and a block from before the superset rule (its legacy list is kept,
     as every re-run of such a row does)."""
     from ba2_providers.screener import universe_superset as _us

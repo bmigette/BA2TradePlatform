@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from ba2_common.core.db import get_instance, add_instance
+from ba2_common.core.per_instrument_cap import regime_scaled_cap
 from ba2_common.core.models import (
     ExpertInstance, TradingOrder, Transaction,
 )
@@ -94,7 +95,10 @@ class PennyTradeManager:
             "max_virtual_equity_per_instrument_percent", log_warning=False
         )
         virtual_balance = self.expert.get_virtual_balance()
-        max_per_instrument = virtual_balance * max_per_instrument_pct / 100.0
+        # Regime overlay included, through the ONE function the account's pre-submit validation
+        # uses (per_instrument_cap.regime_scaled_cap); 1.0 leaves this number bit-for-bit as before.
+        max_per_instrument = regime_scaled_cap(
+            self.expert, virtual_balance * max_per_instrument_pct / 100.0).value
 
         result: Dict[str, dict] = {}
         for c in candidates:
@@ -160,7 +164,9 @@ class PennyTradeManager:
             "max_virtual_equity_per_instrument_percent", log_warning=False
         )
         virtual_balance = self.expert.get_virtual_balance()
-        max_per_instrument = virtual_balance * max_per_pct / 100.0
+        # Same cap as the allocation above and the account's validation (regime overlay included).
+        max_per_instrument = regime_scaled_cap(
+            self.expert, virtual_balance * max_per_pct / 100.0).value
         max_instrument_qty = int(max_per_instrument / current_price)
         clamped_qty = min(clamped_qty, max_instrument_qty)
         if clamped_qty <= 0:

@@ -393,6 +393,145 @@ def row_or_none(model_class, row_id):
         return None
 
 
+def fail_waiting_transaction(transaction_id, reason: str, *, log: Any = None) -> bool:
+    """Mark a WAITING transaction FAILED. THE single give-up transition.
+
+    WHY IT IS SHARED. Every way of giving up on an entry leaves the same expensive debris: the
+    Transaction that ``submit_order`` created in WAITING before anything went wrong. The enter_market
+    SAFETY CHECK refuses any symbol+expert that already has an OPENED or WAITING transaction, and
+    nothing sweeps a stranded WAITING -- so one lost entry retires that symbol for that expert
+    permanently. Measured on PROD (CVS 2026-08-10, WSC 2026-08-24, both unsent) and on dev (SHOP/UNH
+    2026-09-14, NVDA/AVGO 2026-09-21, all four SENT and then cancelled by the broker).
+
+    Only a WAITING transaction is failed. An OPENED one has filled orders behind it and a real
+    position at the broker; the dead order was an add-on, not the position. Store-agnostic (the
+    backtest's in-memory trade store and SQLite alike), so live and the backtest share it.
+    """
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.types import TransactionStatus
+
+    log = log if log is not None else logger
+    if not transaction_id:
+        return False
+    txn = row_or_none(Transaction, transaction_id)
+    if not txn or txn.status != TransactionStatus.WAITING:
+        return False
+    txn.status = TransactionStatus.FAILED
+    update_instance(txn)
+    log.warning(
+        f"Transaction {txn.id} ({txn.symbol}) marked FAILED — {reason}; leaving it "
+        f"WAITING would block every future entry for this symbol+expert"
+    )
+    return True
+
+
+def cancel_waiting_trigger_dependents(order_id: int, *, log: Any = None) -> int:
+    """Cancel every WAITING_TRIGGER order chained on ``order_id``.
+
+    Those legs wait on a parent status that will now never arrive, so leaving them behind only moves
+    the leak. WAITING_TRIGGER is an unsent status -- the row exists only in this database -- so this
+    can never hide a live broker order. Read through ``trade_store.orders_where`` (the exact SQLite
+    query live, the in-memory store in a backtest).
+    """
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.trade_store import orders_where
+
+    log = log if log is not None else logger
+    dependent_ids = [d.id for d in orders_where(depends_on_order=order_id,
+                                                statuses=[OrderStatus.WAITING_TRIGGER])]
+    cancelled = 0
+    for dep_id in dependent_ids:
+        dep = row_or_none(TradingOrder, dep_id)
+        if dep and dep.status == OrderStatus.WAITING_TRIGGER:
+            dep.status = OrderStatus.CANCELED
+            update_instance(dep)
+            cancelled += 1
+            log.info(f"Cancelled protective leg {dep_id} of dead entry {order_id}")
+    return cancelled
+
+
+def fail_unsent_entry(order: TradingOrder, reason: str, *, log: Any = None) -> bool:
+    """Cancel an entry that never reached the broker, and release everything behind it.
+
+    THE ONE ENDING OF A REFUSED ENTRY, live and in a backtest. Live, ``TradeManager`` calls it for
+    the wash-trade lock expiry and for a failed submit in the funded-entry loop; the backtest engine
+    calls it when ``submit_order`` refuses a funded entry (``daily_engine._size_and_submit*``). Until
+    2026-11-17 the backtest only logged the refusal and left the order PENDING: in the in-memory
+    trade store the refused order (the stored object itself) kept its sized quantity and was FILLED
+    later; on SQLite the stored row stayed at quantity 0 and was "filled" as a zero-share trade whose
+    transaction then sat in CLOSING forever. Live cancelled it. Three runtimes, three answers.
+
+    Debris released: the entry row, its WAITING_TRIGGER protective legs, and the Transaction that
+    ``submit_order`` may have created in WAITING before anything went wrong (the transaction is the
+    expensive one: the enter_market SAFETY CHECK refuses any symbol+expert with a WAITING transaction
+    and nothing sweeps one -- CVS 2026-08-10 and WSC 2026-08-24 on PROD).
+
+    SAFETY -- WHY THIS CAN NEVER CANCEL A LIVE ORDER. Writing CANCELED onto an order that is actually
+    working at the broker would be far worse than the leak it fixes: the position opens and the
+    platform cannot see it. So the compensation is refused unless the in-memory object AND the stored
+    row BOTH agree that
+
+      * the order carries no ``broker_order_id`` (brokers hand one back on acceptance), and
+      * its status is one of ``OrderStatus.get_unsent_statuses()`` -- PENDING, WAITING_TRIGGER,
+        WASHTRADE_LOCKED -- i.e. states that exist only in this database.
+
+    Anything the broker has touched (NEW/ACCEPTED/FILLED/...) or that the submit path has already
+    marked ERROR falls outside that set and is left strictly alone.
+
+    Returns True when it compensated, False when it refused or had nothing to do.
+    """
+    from ba2_common.core.db import update_instance
+
+    log = log if log is not None else logger
+    order_id = getattr(order, 'id', None)
+    if not order_id:
+        log.error(f"Cannot compensate an unsaved entry order ({reason})")
+        return False
+
+    on_disk = row_or_none(TradingOrder, order_id)
+    if on_disk is None:
+        log.warning(f"Order {order_id} no longer exists — nothing to compensate ({reason})")
+        return False
+
+    unsent = OrderStatus.get_unsent_statuses()
+    for view, where in ((order, "in memory"), (on_disk, "on disk")):
+        broker_id = getattr(view, 'broker_order_id', None)
+        if broker_id:
+            log.error(
+                f"REFUSING to compensate order {order_id} ({order.symbol}): it carries "
+                f"broker id {broker_id} ({where}), so it REACHED the broker — cancelling it "
+                f"in the database would hide a live order. Reason was: {reason}")
+            return False
+        if view.status not in unsent:
+            log.error(
+                f"REFUSING to compensate order {order_id} ({order.symbol}): status is "
+                f"{view.status} ({where}), which is not an unsent status — it may be working "
+                f"at the broker. Reason was: {reason}")
+            return False
+
+    log.warning(
+        f"Order {order_id} ({order.symbol} {order.side.value} {order.quantity}) never "
+        f"reached the broker — cancelling: {reason}"
+    )
+    order.status = OrderStatus.CANCELED
+    update_instance(order)
+
+    cancel_waiting_trigger_dependents(order_id, log=log)
+
+    # The transaction id is read from the IN-MEMORY object first: submit_order creates the
+    # Transaction and stamps trading_order.transaction_id, then persists it with a SEPARATE
+    # update_instance. When that update is what failed, the row on disk has no transaction_id at
+    # all while a WAITING transaction very much exists -- and that orphan is precisely what would
+    # keep blocking the symbol.
+    transaction_id = getattr(order, 'transaction_id', None) or on_disk.transaction_id
+    fail_waiting_transaction(
+        transaction_id,
+        f"its entry order {order_id} never reached the broker",
+        log=log,
+    )
+    return True
+
+
 def persist_funded_entry(order: TradingOrder, quantity: float, stop_price: Optional[float] = None) -> None:
     """Write the risk manager's decision onto the entry row BEFORE the broker is called.
 

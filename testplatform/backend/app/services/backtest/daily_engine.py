@@ -512,6 +512,16 @@ def _recommendation_to_expert_recommendation(
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
+def refused_entries_result(engine: Any) -> Optional[Dict[str, Any]]:
+    """``results["refused_entries"]`` for a finished run: every funded entry the account refused at
+    submit (cancelled, as live), or None when there were none -- so a run without a refusal keeps
+    exactly the results it had."""
+    refused = engine.refused_entries
+    if not refused:
+        return None
+    return {"count": len(refused), "first": refused[:20]}
+
+
 class DailyBacktestEngine:
     """Daily multi-asset simulator driving the real ba2trade order path.
 
@@ -623,6 +633,9 @@ class DailyBacktestEngine:
         self.intraday_counters: Dict[str, int] = {"undecidable_symbol_days": 0,
                                                   "manage_skipped_no_price_symbol_ticks": 0,
                                                   "entry_skipped_no_price_symbol_ticks": 0}
+        # Every funded entry the account refused at submit, cancelled through the shared live
+        # compensation (``_fail_refused_entry``). Published as results["refused_entries"].
+        self.refused_entries: List[Dict[str, Any]] = []
         # Analysis passes per expert: {"passes": n, "failed": m, "first_error": str|None}. A pass is
         # one ``analyze_as_of`` call (per symbol for a classic expert, per bar for a basket / bypass
         # expert); "failed" = it raised and the loop swallowed it. Published in
@@ -2401,6 +2414,9 @@ class DailyBacktestEngine:
 
         for order in updated_orders:
             if order.quantity and order.quantity > 0:
+                # The try decides "refused or not, and why"; the compensation runs ONCE, after it
+                # (see _size_and_submit_candidates).
+                refused: Optional[str] = None
                 try:
                     # Effective protective stop: shared TIGHTER-WINS reconciliation of the RULESET
                     # entry-bracket SL (on the transaction) vs the RM SAFEGUARD (order.stop_price,
@@ -2426,9 +2442,17 @@ class DailyBacktestEngine:
                         stamp_safeguard_anchor(
                             order, (txn.stop_loss if txn else None), safeguard, sl_price,
                             lambda: self.account.get_instrument_current_price(order.symbol))
+                    else:
+                        refused = f"the sized order {order.id} submit returned nothing"
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
+                    refused = f"submit raised for order {order.id}: {e}"
+                if refused is not None:
+                    # The RM pass sized a PERSISTED order: refused, it must not stay PENDING and
+                    # fillable (same ending as the candidate path and as live). Outside the try: a
+                    # compensation that raises stops the run instead of being read as a refusal.
+                    self._fail_refused_entry(order, refused, as_of_dt)
 
     def _size_and_submit_candidates(self, expert_id: int, candidates: List[Any],
                                     as_of: datetime) -> bool:
@@ -2461,6 +2485,13 @@ class DailyBacktestEngine:
             if entry is None or not (cand.quantity and cand.quantity > 0):
                 continue
             _cand, evaluator, symbol, _rec = entry
+            # Per iteration, BEFORE the try: the compensation below acts on `order`, and a name left
+            # bound by the previous symbol would cancel the wrong entry (same rule as the live loop).
+            # The try decides only "refused or not, and why"; the compensation runs ONCE, after it,
+            # so a compensation that itself raises propagates (a run that cannot cancel a refused
+            # order must stop) instead of being caught here and attempted a second time.
+            order = None
+            refused: Optional[str] = None
             try:
                 # Persist the real order + transaction + TP/SL bracket (execute is byte-identical to
                 # the old flow; we just call it ONLY for funded symbols now).
@@ -2487,20 +2518,59 @@ class DailyBacktestEngine:
                     order, (txn.stop_loss if txn else None), safeguard, sl_price,
                     lambda: self.account.get_instrument_current_price(order.symbol))
                 submitted = self.account.submit_order(order, sl_price=sl_price)
-                created_any = True
                 # Additive metadata: the stop the size was keyed off (the RM safeguard), written
                 # once as the transaction's max-loss stop. Same shared helper as the live funded
                 # loop; it never raises.
                 if submitted:
+                    created_any = True
                     record_max_loss_stop(order, safeguard)
                     stamp_safeguard_anchor(          # the transaction may only exist since the submit
                         order, (txn.stop_loss if txn else None), safeguard, sl_price,
                         lambda: self.account.get_instrument_current_price(order.symbol))
+                else:
+                    refused = f"the funded entry submit for {symbol} returned nothing"
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                continue
+                refused = f"submit raised for {symbol}: {e}"
+            # `order` is None when execute() itself failed: nothing persisted, nothing to cancel.
+            if refused is not None and order is not None:
+                self._fail_refused_entry(order, refused, as_of)
         return created_any
+
+    def _fail_refused_entry(self, order: Any, reason: str, as_of: Optional[datetime]) -> None:
+        """End a funded entry the account refused (or that never reached the simulated broker)
+        exactly as live does: ``trade_cycle.fail_unsent_entry``, the body of live
+        ``TradeManager._fail_unsent_entry`` -- the order is CANCELED (never left PENDING, so the fill
+        engine can never fill it), its WAITING_TRIGGER legs cancelled, a WAITING transaction FAILED.
+
+        Before 2026-11-17 the engine only logged the refusal. The order stayed PENDING: in the
+        in-memory trade store it was the stored object, carried its sized quantity and was FILLED on
+        the next bar; on SQLite the stored row was still at quantity 0 and was "filled" as a
+        zero-share trade whose transaction then sat in CLOSING forever. Loud on purpose: the engine
+        log (``_log`` reaches a pool worker, where logging is disabled) and the shared helper's own
+        warning both name the order."""
+        from ba2_common.core.trade_cycle import fail_unsent_entry
+
+        when = f" @ {as_of:%Y-%m-%d %H:%M}" if as_of is not None else ""
+        compensated = fail_unsent_entry(order, reason)
+        line = (f"REFUSED entry {order.symbol} (order {getattr(order, 'id', None)}, qty "
+                f"{order.quantity}){when} "
+                + ("CANCELLED, as live" if compensated
+                   else "could NOT be cancelled (see the preceding error)")
+                + f": {reason}")
+        self._log(line if compensated else f"!! {line}")
+        # Published in results["refused_entries"] (run_daily_backtest; absent when there were
+        # none). A GA pool child drops every stdlib log line (_worker_init), so the FIRST refusal of
+        # a run also goes to the worker's own log file; the rest are counted in the results.
+        if not self.refused_entries:
+            from app.services.backtest.price_source import _worker_log
+            _worker_log(f"[daily_engine] {line} (further refusals of this run are counted in "
+                        f"results['refused_entries'])")
+        self.refused_entries.append({
+            "symbol": order.symbol, "order_id": getattr(order, "id", None),
+            "quantity": order.quantity, "at": as_of.isoformat() if as_of is not None else None,
+            "cancelled": bool(compensated), "reason": reason})
 
     # -- helpers ------------------------------------------------------------
     def _provider_bundle(self) -> Any:

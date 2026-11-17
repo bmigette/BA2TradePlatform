@@ -81,6 +81,11 @@ class RealRunner:
         self._launcher = None
         self._opt: Dict[str, tuple] = {}       # train name -> (opt_id, expert)
         self._exclusive: set = set()           # prefixes whose driver lock this process holds
+        # Who drives the chain, recorded on its walk_forward_runs row (wf_store): the grid / CLI by
+        # default; the UI's driver (tools/run_wf_run.py) sets source "ui" and its task's token.
+        self.wf_source = "cli"
+        self.wf_token: Optional[str] = None
+        self.wf_task_id: Optional[str] = None
 
     # -- lazy bootstrap: dry-run and unit tests never touch the backend
     def _tool(self):
@@ -106,6 +111,15 @@ class RealRunner:
                     self._exclusive.discard(prefix)
         except RESUME.ResumeRefused as e:
             raise WF.WalkForwardError(str(e)) from e
+
+    def wf_store(self, spec, report_dir: str):
+        """The DB writer of this chain's ``walk_forward_runs`` row (app.services.wf_store), used by
+        ``wf_chain.run_cell`` in addition to the report files, so the UI shows the run. A write that
+        fails raises: the cell then fails loudly, it never runs on without its row."""
+        self._tool()                           # init_db(): the table exists (migration 034)
+        from app.services import wf_store as S
+        return S.RunStore(spec.name, source=self.wf_source, token=self.wf_token,
+                          task_id=self.wf_task_id, report_dir=report_dir)
 
     def _owns(self, train_name: str) -> bool:
         return any(train_name.startswith(p + "-wf") for p in self._exclusive)
@@ -168,6 +182,25 @@ class RealRunner:
         if len(rows) != 1:
             raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
         return ((rows[0][0] or {}).get("seededFrom") or {}).get("name")
+
+    def train_best_fitness(self, name: str) -> float:
+        """The GA best fitness of the (single, completed) job of this name: how a fold's restarts are
+        ranked (training data only). A missing value raises, it is never defaulted."""
+        rows = self._opts_named(name)
+        if len(rows) != 1:
+            raise WF.WalkForwardError(f"{len(rows)} optimizations are named {name!r}")
+        if rows[0][1] != "completed":
+            raise WF.WalkForwardError(f"optimization {name!r} is {rows[0][1]!r}, not completed")
+        from app.models.database import SessionLocal
+        from app.models.strategy_optimization import StrategyOptimization as SO
+        db = SessionLocal()
+        try:
+            fit = db.query(SO.best_fitness).filter(SO.id == rows[0][0]).scalar()
+        finally:
+            db.close()
+        if fit is None:
+            raise WF.MissingMetric(f"missing metric: {name!r} best_fitness = None")
+        return float(fit)
 
     def train_identity(self, name: str) -> dict:
         """Optimization id + completion time of the (single) job of this name: a stored fold report

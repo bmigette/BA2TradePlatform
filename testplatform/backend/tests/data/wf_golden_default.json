@@ -1,0 +1,3069 @@
+{
+ "deferred": {
+  "files": {
+   "cell/cell.json": "{\n  \"cell\": \"cell\",\n  \"expert\": \"FMPRating\",\n  \"strategy\": \"S2\",\n  \"band\": \"large\",\n  \"verdict\": \"PASS\",\n  \"refit_job\": \"cell-refit\",\n  \"refit\": {\n    \"job\": \"cell-refit\",\n    \"train\": [\n      \"2020-01-01\",\n      \"2026-12-31\"\n    ],\n    \"seeded_from\": \"cell-wf3\"\n  },\n  \"deferred\": null,\n  \"eliminated\": null,\n  \"required_failed\": [],\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2,\n    \"max_oos_dd\": null,\n    \"top_n\": 2,\n    \"exclusive_return\": false,\n    \"require_test_years\": [\n      2026\n    ]\n  },\n  \"data_end\": null,\n  \"folds\": [\n    {\n      \"fold\": 1,\n      \"job\": \"cell-wf1\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2023-12-31\"\n      ],\n      \"test\": [\n        \"2024-01-01\",\n        \"2024-12-31\"\n      ],\n      \"generations\": \"30\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.00350894030015,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": null\n    },\n    {\n      \"fold\": 2,\n      \"job\": \"cell-wf2\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2024-12-31\"\n      ],\n      \"test\": [\n        \"2025-01-01\",\n        \"2025-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf1\"\n    },\n    {\n      \"fold\": 3,\n      \"job\": \"cell-wf3\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2025-12-31\"\n      ],\n      \"test\": [\n        \"2026-01-01\",\n        \"2026-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf2\"\n    }\n  ],\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 15.762500000000014,\n    \"oos_car\": 5.012890232979439,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.20051560931917756,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/fold1.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2023-12-31\"\n    ],\n    \"test\": [\n      \"2024-01-01\",\n      \"2024-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold2.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2024-12-31\"\n    ],\n    \"test\": [\n      \"2025-01-01\",\n      \"2025-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold3.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2025-12-31\"\n    ],\n    \"test\": [\n      \"2026-01-01\",\n      \"2026-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/report.json": "{\n  \"prefix\": \"cell\",\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2\n  },\n  \"top_n\": 2,\n  \"selection\": {\n    \"min_trade_rows\": 30,\n    \"min_return_rel_pct\": 5.0,\n    \"min_dd_pts\": 2.0,\n    \"min_trades_rel_pct\": 5.0\n  },\n  \"complete\": true,\n  \"overall_passed\": true,\n  \"winners_passed\": 3,\n  \"exclusive_return\": false,\n  \"require_test_years\": [\n    2026\n  ],\n  \"required_failed\": [],\n  \"notes\": [],\n  \"folds\": [\n    {\n      \"index\": 1,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2023-12-31\",\n      \"test_start\": \"2024-01-01\",\n      \"test_end\": \"2024-12-31\"\n    },\n    {\n      \"index\": 2,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2024-12-31\",\n      \"test_start\": \"2025-01-01\",\n      \"test_end\": \"2025-12-31\"\n    },\n    {\n      \"index\": 3,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2025-12-31\",\n      \"test_start\": \"2026-01-01\",\n      \"test_end\": \"2026-12-31\"\n    }\n  ],\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ],\n  \"rank_stitches\": {\n    \"1\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 15.762500000000014,\n      \"oos_car\": 5.012890232979439,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 25.0,\n      \"efficiency\": 0.20051560931917756,\n      \"years\": 2.9924709103353866\n    },\n    \"2\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 15.762500000000014,\n      \"oos_car\": 5.012890232979439,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 15.0,\n      \"efficiency\": 0.33419268219862924,\n      \"years\": 2.9924709103353866\n    }\n  },\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 15.762500000000014,\n    \"oos_car\": 5.012890232979439,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.20051560931917756,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/report.md": "# Walk-forward report: cell\n\n**Overall verdict: PASS** -- 3 of 3 fold winner(s) passed (need 2).\n\n## Thresholds used\n\n- `--pass-min-oos-return` 0% (per-fold TOTAL OOS return over that fold's test window, NOT annualised; window lengths are in each fold heading)\n- `--pass-max-dd-mult` 1.5 (OOS |max DD| <= mult x IS |max DD|)\n- `--pass-min-folds` 2 (fold winners that must pass)\n- a genome with zero OOS trades FAILS\n- `--pass-require-fold` 2026 (these test years' fold winners must pass)\n- top-n 2; selection knobs used: min_trade_rows=30, min_return_rel_pct=5.0, min_dd_pts=2.0, min_trades_rel_pct=5.0\n\nReturns and drawdowns in percent. CAR = annualised total return over the window. Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).\n\n## Fold 1: train 2020-01-01..2023-12-31 (4.00y), test 2024-01-01..2024-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 2: train 2020-01-01..2024-12-31 (5.00y), test 2025-01-01..2025-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 3: train 2020-01-01..2025-12-31 (6.00y), test 2026-01-01..2026-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Stitched out-of-sample, rank-1 per fold (deploying each fold's winner)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 / fold winners | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 25.00% | 0.20 |\n\n## Stitched out-of-sample per rank (rank r of every fold)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 25.00% | 0.20 |\n| rank 2 | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 15.00% | 0.33 |\n\nStitch: fold OOS returns compounded; CAR over the summed test years; worst DD = worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not read); IS CAR = mean of the folds' IS CARs.\n",
+   "summary.json": "{\n  \"cells\": [\n    {\n      \"cell\": \"cell\",\n      \"expert\": \"FMPRating\",\n      \"strategy\": \"S2\",\n      \"band\": \"large\",\n      \"verdict\": \"PENDING\",\n      \"refit_job\": null,\n      \"refit\": null,\n      \"deferred\": {\n        \"fold\": 3,\n        \"job\": \"cell-wf3\",\n        \"train\": [\n          \"2020-01-01\",\n          \"2025-12-31\"\n        ],\n        \"test\": [\n          \"2026-01-01\",\n          \"2026-12-31\"\n        ],\n        \"seeded_from\": \"cell-wf2\"\n      },\n      \"eliminated\": null,\n      \"required_failed\": [],\n      \"thresholds\": {\n        \"min_oos_return\": 0.0,\n        \"max_dd_mult\": 1.5,\n        \"min_folds\": 2,\n        \"max_oos_dd\": null,\n        \"top_n\": 2,\n        \"exclusive_return\": false,\n        \"require_test_years\": [\n          2026\n        ]\n      },\n      \"data_end\": \"2025-12-31\",\n      \"folds\": [\n        {\n          \"fold\": 1,\n          \"job\": \"cell-wf1\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2023-12-31\"\n          ],\n          \"test\": [\n            \"2024-01-01\",\n            \"2024-12-31\"\n          ],\n          \"generations\": \"30\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.00350894030015,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.200140357612006,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": null\n        },\n        {\n          \"fold\": 2,\n          \"job\": \"cell-wf2\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2024-12-31\"\n          ],\n          \"test\": [\n            \"2025-01-01\",\n            \"2025-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.017594081163668,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.2007037632465467,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": \"cell-wf1\"\n        }\n      ],\n      \"winner_stitch\": {\n        \"folds\": [\n          1,\n          2\n        ],\n        \"total_return\": 10.250000000000004,\n        \"oos_car\": 5.010541613985642,\n        \"worst_fold_dd\": -10.0,\n        \"trades\": 20,\n        \"is_car_mean\": 25.0,\n        \"efficiency\": 0.20042166455942567,\n        \"years\": 1.995893223819302\n      }\n    }\n  ]\n}",
+   "summary.md": "# goal2027 walk-forward summary\n\nPer fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).\n\n| cell | verdict | fold 1 | fold 2 | fold 3 | refit |\n|---|---|---|---|---|---|\n| cell | PENDING | P 25.0% / 5.0% / -10.0% | P 25.0% / 5.0% / -10.0% | - | fold 3 test deferred |\n"
+  },
+  "import": {
+   "band": "large",
+   "error_message": null,
+   "expert": "FMPRating",
+   "folds_done": 3,
+   "planned_folds": 3,
+   "report": {
+    "complete": true,
+    "data_end": null,
+    "deferred": null,
+    "eliminated": null,
+    "final": true,
+    "folds": [
+     {
+      "generations": "30",
+      "index": 1,
+      "ranks": [
+       {
+        "efficiency": 0.200140357612006,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.33356726268667664,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": null,
+      "state": "done",
+      "test_end": "2024-12-31",
+      "test_start": "2024-01-01",
+      "train_end": "2023-12-31",
+      "train_job": "cell-wf1",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 2,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf1",
+      "state": "done",
+      "test_end": "2025-12-31",
+      "test_start": "2025-01-01",
+      "train_end": "2024-12-31",
+      "train_job": "cell-wf2",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 3,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf2",
+      "state": "done",
+      "test_end": "2026-12-31",
+      "test_start": "2026-01-01",
+      "train_end": "2025-12-31",
+      "train_job": "cell-wf3",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     }
+    ],
+    "name": "cell",
+    "notes": [],
+    "overall_passed": true,
+    "planned_folds_known": true,
+    "rank_stitches": {
+     "1": {
+      "efficiency": 0.20051560931917756,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 25.0,
+      "oos_car": 5.012890232979439,
+      "total_return": 15.762500000000014,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     },
+     "2": {
+      "efficiency": 0.33419268219862924,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 15.0,
+      "oos_car": 5.012890232979439,
+      "total_return": 15.762500000000014,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     }
+    },
+    "refit": {
+     "job": "cell-refit",
+     "seeded_from": "cell-wf3",
+     "train": [
+      "2020-01-01",
+      "2026-12-31"
+     ]
+    },
+    "refit_job": "cell-refit",
+    "refit_running": null,
+    "required_failed": [],
+    "schema": 1,
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "stitch_partial": false,
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "verdict": "PASS",
+    "winner_stitch": {
+     "efficiency": 0.20051560931917756,
+     "folds": [
+      1,
+      2,
+      3
+     ],
+     "is_car_mean": 25.0,
+     "oos_car": 5.012890232979439,
+     "total_return": 15.762500000000014,
+     "trades": 30,
+     "worst_fold_dd": -10.0,
+     "years": 2.9924709103353866
+    },
+    "winners_passed": 3
+   },
+   "report_dir": "<DIR>",
+   "spec": {
+    "data_end": null,
+    "exclusive_return": false,
+    "first_generations": "30",
+    "imported": true,
+    "name": "cell",
+    "next_generations": "15",
+    "optimize_args": null,
+    "require_test_years": [
+     2026
+    ],
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "test_years": [
+     2024,
+     2025,
+     2026
+    ],
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "train_start": "2020-01-01"
+   },
+   "status": "pass",
+   "stitch_partial": false,
+   "stitched_return": 15.762500000000014,
+   "stitched_trades": 30,
+   "strategy": "S2",
+   "worst_oos_dd": -10.0
+  },
+  "phase2": {
+   "tested": [
+    [
+     "cell-wf3",
+     3,
+     "WF3-OOS-R",
+     [
+      "WalkForward",
+      "wf-fold-3",
+      "OOS"
+     ],
+     1,
+     [
+      1,
+      2
+     ]
+    ]
+   ],
+   "trained": [
+    [
+     "cell-refit",
+     [
+      "ba2-test",
+      "optimize",
+      "--expert",
+      "FMPRating",
+      "--strategy",
+      "S2",
+      "--population",
+      "200",
+      "--generations",
+      "15",
+      "--chain-seed-from",
+      "cell-wf3",
+      "--start",
+      "2020-01-01",
+      "--end",
+      "2026-12-31",
+      "--name",
+      "cell-refit"
+     ]
+    ]
+   ],
+   "verdict": "PASS"
+  },
+  "refit_job": null,
+  "tested": [
+   [
+    "cell-wf1",
+    1,
+    "WF1-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-1",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf2",
+    2,
+    "WF2-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-2",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ]
+  ],
+  "trained": [
+   [
+    "cell-wf1",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "cell-wf1"
+    ]
+   ],
+   [
+    "cell-wf2",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "cell-wf2"
+    ]
+   ],
+   [
+    "cell-wf3",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf2",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "cell-wf3"
+    ]
+   ]
+  ],
+  "verdict": "PENDING"
+ },
+ "eliminated": {
+  "files": {
+   "cell/cell.json": "{\n  \"cell\": \"cell\",\n  \"expert\": \"FMPRating\",\n  \"strategy\": \"S2\",\n  \"band\": \"large\",\n  \"verdict\": \"FAIL\",\n  \"refit_job\": null,\n  \"refit\": null,\n  \"deferred\": null,\n  \"eliminated\": {\n    \"before_fold\": 3,\n    \"reason\": \"0 fold(s) passed with 1 left, 2 needed\"\n  },\n  \"required_failed\": [],\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2,\n    \"max_oos_dd\": null,\n    \"top_n\": 2,\n    \"exclusive_return\": false,\n    \"require_test_years\": [\n      2026\n    ]\n  },\n  \"data_end\": null,\n  \"folds\": [\n    {\n      \"fold\": 1,\n      \"job\": \"cell-wf1\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2023-12-31\"\n      ],\n      \"test\": [\n        \"2024-01-01\",\n        \"2024-12-31\"\n      ],\n      \"generations\": \"30\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": -5.0,\n        \"car\": -5.003337518746687,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": -0.20013350074986747,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ],\n      \"seeded_from\": null\n    },\n    {\n      \"fold\": 2,\n      \"job\": \"cell-wf2\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2024-12-31\"\n      ],\n      \"test\": [\n        \"2025-01-01\",\n        \"2025-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": -5.0,\n        \"car\": -5.0167322590243035,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ],\n      \"seeded_from\": \"cell-wf1\"\n    }\n  ],\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2\n    ],\n    \"total_return\": -9.750000000000004,\n    \"oos_car\": -5.0100259379230465,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 20,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": -0.20040103751692187,\n    \"years\": 1.995893223819302\n  }\n}",
+   "cell/fold1.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2023-12-31\"\n    ],\n    \"test\": [\n      \"2024-01-01\",\n      \"2024-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.003337518746687,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20013350074986747,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.003337518746687,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.33355583458311244,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ]\n}",
+   "cell/fold2.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2024-12-31\"\n    ],\n    \"test\": [\n      \"2025-01-01\",\n      \"2025-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ]\n}",
+   "cell/report.json": "{\n  \"prefix\": \"cell\",\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2\n  },\n  \"top_n\": 2,\n  \"selection\": {\n    \"min_trade_rows\": 30,\n    \"min_return_rel_pct\": 5.0,\n    \"min_dd_pts\": 2.0,\n    \"min_trades_rel_pct\": 5.0\n  },\n  \"complete\": false,\n  \"overall_passed\": null,\n  \"winners_passed\": 0,\n  \"exclusive_return\": false,\n  \"require_test_years\": [\n    2026\n  ],\n  \"required_failed\": [],\n  \"notes\": [\n    \"PARTIAL RUN: 2 of 3 folds; no overall verdict\"\n  ],\n  \"folds\": [\n    {\n      \"index\": 1,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2023-12-31\",\n      \"test_start\": \"2024-01-01\",\n      \"test_end\": \"2024-12-31\"\n    },\n    {\n      \"index\": 2,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2024-12-31\",\n      \"test_start\": \"2025-01-01\",\n      \"test_end\": \"2025-12-31\"\n    }\n  ],\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.003337518746687,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20013350074986747,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.003337518746687,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.33355583458311244,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ],\n  \"rank_stitches\": {\n    \"1\": {\n      \"folds\": [\n        1,\n        2\n      ],\n      \"total_return\": -9.750000000000004,\n      \"oos_car\": -5.0100259379230465,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 20,\n      \"is_car_mean\": 25.0,\n      \"efficiency\": -0.20040103751692187,\n      \"years\": 1.995893223819302\n    },\n    \"2\": {\n      \"folds\": [\n        1,\n        2\n      ],\n      \"total_return\": -9.750000000000004,\n      \"oos_car\": -5.0100259379230465,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 20,\n      \"is_car_mean\": 15.0,\n      \"efficiency\": -0.33400172919486976,\n      \"years\": 1.995893223819302\n    }\n  },\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2\n    ],\n    \"total_return\": -9.750000000000004,\n    \"oos_car\": -5.0100259379230465,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 20,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": -0.20040103751692187,\n    \"years\": 1.995893223819302\n  }\n}",
+   "cell/report.md": "# Walk-forward report: cell\n\n**Overall verdict: INCOMPLETE (partial run)** -- 0 of 2 fold winner(s) passed (need 2).\n\n## Thresholds used\n\n- `--pass-min-oos-return` 0% (per-fold TOTAL OOS return over that fold's test window, NOT annualised; window lengths are in each fold heading)\n- `--pass-max-dd-mult` 1.5 (OOS |max DD| <= mult x IS |max DD|)\n- `--pass-min-folds` 2 (fold winners that must pass)\n- a genome with zero OOS trades FAILS\n- `--pass-require-fold` 2026 (these test years' fold winners must pass)\n- top-n 2; selection knobs used: min_trade_rows=30, min_return_rel_pct=5.0, min_dd_pts=2.0, min_trades_rel_pct=5.0\n\n> PARTIAL RUN: 2 of 3 folds; no overall verdict\n\nReturns and drawdowns in percent. CAR = annualised total return over the window. Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).\n\n## Fold 1: train 2020-01-01..2023-12-31 (4.00y), test 2024-01-01..2024-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | -5.00% | -5.00% | -10.00% | 10 | -0.20 | FAIL: OOS return -5.00% < 0% |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | -5.00% | -5.00% | -10.00% | 10 | -0.33 | FAIL: OOS return -5.00% < 0% |\n\n## Fold 2: train 2020-01-01..2024-12-31 (5.00y), test 2025-01-01..2025-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.20 | FAIL: OOS return -5.00% < 0% |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.33 | FAIL: OOS return -5.00% < 0% |\n\n## Stitched out-of-sample, rank-1 per fold (deploying each fold's winner)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 / fold winners | 1,2 | -9.75% | -5.01% | -10.00% | 20 | 25.00% | -0.20 |\n\n## Stitched out-of-sample per rank (rank r of every fold)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 | 1,2 | -9.75% | -5.01% | -10.00% | 20 | 25.00% | -0.20 |\n| rank 2 | 1,2 | -9.75% | -5.01% | -10.00% | 20 | 15.00% | -0.33 |\n\nStitch: fold OOS returns compounded; CAR over the summed test years; worst DD = worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not read); IS CAR = mean of the folds' IS CARs.\n",
+   "summary.json": "{\n  \"cells\": [\n    {\n      \"cell\": \"cell\",\n      \"expert\": \"FMPRating\",\n      \"strategy\": \"S2\",\n      \"band\": \"large\",\n      \"verdict\": \"FAIL\",\n      \"refit_job\": null,\n      \"refit\": null,\n      \"deferred\": null,\n      \"eliminated\": {\n        \"before_fold\": 3,\n        \"reason\": \"0 fold(s) passed with 1 left, 2 needed\"\n      },\n      \"required_failed\": [],\n      \"thresholds\": {\n        \"min_oos_return\": 0.0,\n        \"max_dd_mult\": 1.5,\n        \"min_folds\": 2,\n        \"max_oos_dd\": null,\n        \"top_n\": 2,\n        \"exclusive_return\": false,\n        \"require_test_years\": [\n          2026\n        ]\n      },\n      \"data_end\": null,\n      \"folds\": [\n        {\n          \"fold\": 1,\n          \"job\": \"cell-wf1\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2023-12-31\"\n          ],\n          \"test\": [\n            \"2024-01-01\",\n            \"2024-12-31\"\n          ],\n          \"generations\": \"30\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": -5.0,\n            \"car\": -5.003337518746687,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": -0.20013350074986747,\n          \"passed\": false,\n          \"fail_reasons\": [\n            \"OOS return -5.00% < 0%\"\n          ],\n          \"seeded_from\": null\n        },\n        {\n          \"fold\": 2,\n          \"job\": \"cell-wf2\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2024-12-31\"\n          ],\n          \"test\": [\n            \"2025-01-01\",\n            \"2025-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": -5.0,\n            \"car\": -5.0167322590243035,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": -0.20066929036097214,\n          \"passed\": false,\n          \"fail_reasons\": [\n            \"OOS return -5.00% < 0%\"\n          ],\n          \"seeded_from\": \"cell-wf1\"\n        }\n      ],\n      \"winner_stitch\": {\n        \"folds\": [\n          1,\n          2\n        ],\n        \"total_return\": -9.750000000000004,\n        \"oos_car\": -5.0100259379230465,\n        \"worst_fold_dd\": -10.0,\n        \"trades\": 20,\n        \"is_car_mean\": 25.0,\n        \"efficiency\": -0.20040103751692187,\n        \"years\": 1.995893223819302\n      }\n    }\n  ]\n}",
+   "summary.md": "# goal2027 walk-forward summary\n\nPer fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).\n\n| cell | verdict | fold 1 | fold 2 | fold 3 | refit |\n|---|---|---|---|---|---|\n| cell | FAIL | F 25.0% / -5.0% / -10.0% | F 25.0% / -5.0% / -10.0% | - | eliminated before fold 3 |\n"
+  },
+  "import": {
+   "band": "large",
+   "error_message": null,
+   "expert": "FMPRating",
+   "folds_done": 2,
+   "planned_folds": 3,
+   "report": {
+    "complete": false,
+    "data_end": null,
+    "deferred": null,
+    "eliminated": {
+     "before_fold": 3,
+     "reason": "0 fold(s) passed with 1 left, 2 needed"
+    },
+    "final": true,
+    "folds": [
+     {
+      "generations": "30",
+      "index": 1,
+      "ranks": [
+       {
+        "efficiency": -0.20013350074986747,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 1,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.003337518746687,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 1
+       },
+       {
+        "efficiency": -0.33355583458311244,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 1,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.003337518746687,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 2
+       }
+      ],
+      "seeded_from": null,
+      "state": "done",
+      "test_end": "2024-12-31",
+      "test_start": "2024-01-01",
+      "train_end": "2023-12-31",
+      "train_job": "cell-wf1",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": false
+     },
+     {
+      "generations": "15",
+      "index": 2,
+      "ranks": [
+       {
+        "efficiency": -0.20066929036097214,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 2,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 1
+       },
+       {
+        "efficiency": -0.3344488172682869,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 2,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf1",
+      "state": "done",
+      "test_end": "2025-12-31",
+      "test_start": "2025-01-01",
+      "train_end": "2024-12-31",
+      "train_job": "cell-wf2",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": false
+     },
+     {
+      "generations": null,
+      "index": 3,
+      "ranks": [],
+      "seeded_from": null,
+      "state": "eliminated",
+      "test_end": null,
+      "test_start": null,
+      "train_end": null,
+      "train_job": "cell-wf3",
+      "train_optimization_id": null,
+      "train_start": null,
+      "winner_passed": null
+     }
+    ],
+    "name": "cell",
+    "notes": [
+     "PARTIAL RUN: 2 of 3 folds; no overall verdict"
+    ],
+    "overall_passed": null,
+    "planned_folds_known": true,
+    "rank_stitches": {
+     "1": {
+      "efficiency": -0.20040103751692187,
+      "folds": [
+       1,
+       2
+      ],
+      "is_car_mean": 25.0,
+      "oos_car": -5.0100259379230465,
+      "total_return": -9.750000000000004,
+      "trades": 20,
+      "worst_fold_dd": -10.0,
+      "years": 1.995893223819302
+     },
+     "2": {
+      "efficiency": -0.33400172919486976,
+      "folds": [
+       1,
+       2
+      ],
+      "is_car_mean": 15.0,
+      "oos_car": -5.0100259379230465,
+      "total_return": -9.750000000000004,
+      "trades": 20,
+      "worst_fold_dd": -10.0,
+      "years": 1.995893223819302
+     }
+    },
+    "refit": null,
+    "refit_job": null,
+    "refit_running": null,
+    "required_failed": [],
+    "schema": 1,
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "stitch_partial": false,
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "verdict": "FAIL",
+    "winner_stitch": {
+     "efficiency": -0.20040103751692187,
+     "folds": [
+      1,
+      2
+     ],
+     "is_car_mean": 25.0,
+     "oos_car": -5.0100259379230465,
+     "total_return": -9.750000000000004,
+     "trades": 20,
+     "worst_fold_dd": -10.0,
+     "years": 1.995893223819302
+    },
+    "winners_passed": 0
+   },
+   "report_dir": "<DIR>",
+   "spec": {
+    "data_end": null,
+    "exclusive_return": false,
+    "first_generations": "30",
+    "imported": true,
+    "name": "cell",
+    "next_generations": "15",
+    "optimize_args": null,
+    "require_test_years": [
+     2026
+    ],
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "test_years": [
+     2024,
+     2025
+    ],
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "train_start": "2020-01-01"
+   },
+   "status": "fail",
+   "stitch_partial": false,
+   "stitched_return": -9.750000000000004,
+   "stitched_trades": 20,
+   "strategy": "S2",
+   "worst_oos_dd": -10.0
+  },
+  "refit_job": null,
+  "tested": [
+   [
+    "cell-wf1",
+    1,
+    "WF1-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-1",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf2",
+    2,
+    "WF2-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-2",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ]
+  ],
+  "trained": [
+   [
+    "cell-wf1",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "cell-wf1"
+    ]
+   ],
+   [
+    "cell-wf2",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "cell-wf2"
+    ]
+   ]
+  ],
+  "verdict": "FAIL"
+ },
+ "fail_required": {
+  "files": {
+   "cell/cell.json": "{\n  \"cell\": \"cell\",\n  \"expert\": \"FMPRating\",\n  \"strategy\": \"S2\",\n  \"band\": \"large\",\n  \"verdict\": \"FAIL\",\n  \"refit_job\": null,\n  \"refit\": null,\n  \"deferred\": null,\n  \"eliminated\": null,\n  \"required_failed\": [\n    2026\n  ],\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2,\n    \"max_oos_dd\": null,\n    \"top_n\": 2,\n    \"exclusive_return\": false,\n    \"require_test_years\": [\n      2026\n    ]\n  },\n  \"data_end\": null,\n  \"folds\": [\n    {\n      \"fold\": 1,\n      \"job\": \"cell-wf1\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2023-12-31\"\n      ],\n      \"test\": [\n        \"2024-01-01\",\n        \"2024-12-31\"\n      ],\n      \"generations\": \"30\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.00350894030015,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": null\n    },\n    {\n      \"fold\": 2,\n      \"job\": \"cell-wf2\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2024-12-31\"\n      ],\n      \"test\": [\n        \"2025-01-01\",\n        \"2025-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf1\"\n    },\n    {\n      \"fold\": 3,\n      \"job\": \"cell-wf3\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2025-12-31\"\n      ],\n      \"test\": [\n        \"2026-01-01\",\n        \"2026-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": -5.0,\n        \"car\": -5.0167322590243035,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ],\n      \"seeded_from\": \"cell-wf2\"\n    }\n  ],\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 4.7374999999999945,\n    \"oos_car\": 1.5588076957051777,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.06235230782820711,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/fold1.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2023-12-31\"\n    ],\n    \"test\": [\n      \"2024-01-01\",\n      \"2024-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold2.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2024-12-31\"\n    ],\n    \"test\": [\n      \"2025-01-01\",\n      \"2025-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold3.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2025-12-31\"\n    ],\n    \"test\": [\n      \"2026-01-01\",\n      \"2026-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ]\n}",
+   "cell/report.json": "{\n  \"prefix\": \"cell\",\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2\n  },\n  \"top_n\": 2,\n  \"selection\": {\n    \"min_trade_rows\": 30,\n    \"min_return_rel_pct\": 5.0,\n    \"min_dd_pts\": 2.0,\n    \"min_trades_rel_pct\": 5.0\n  },\n  \"complete\": true,\n  \"overall_passed\": false,\n  \"winners_passed\": 2,\n  \"exclusive_return\": false,\n  \"require_test_years\": [\n    2026\n  ],\n  \"required_failed\": [\n    2026\n  ],\n  \"notes\": [],\n  \"folds\": [\n    {\n      \"index\": 1,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2023-12-31\",\n      \"test_start\": \"2024-01-01\",\n      \"test_end\": \"2024-12-31\"\n    },\n    {\n      \"index\": 2,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2024-12-31\",\n      \"test_start\": \"2025-01-01\",\n      \"test_end\": \"2025-12-31\"\n    },\n    {\n      \"index\": 3,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2025-12-31\",\n      \"test_start\": \"2026-01-01\",\n      \"test_end\": \"2026-12-31\"\n    }\n  ],\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ],\n  \"rank_stitches\": {\n    \"1\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 4.7374999999999945,\n      \"oos_car\": 1.5588076957051777,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 25.0,\n      \"efficiency\": 0.06235230782820711,\n      \"years\": 2.9924709103353866\n    },\n    \"2\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 4.7374999999999945,\n      \"oos_car\": 1.5588076957051777,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 15.0,\n      \"efficiency\": 0.10392051304701184,\n      \"years\": 2.9924709103353866\n    }\n  },\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 4.7374999999999945,\n    \"oos_car\": 1.5588076957051777,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.06235230782820711,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/report.md": "# Walk-forward report: cell\n\n**Overall verdict: FAIL** -- 2 of 3 fold winner(s) passed (need 2).\n\n## Thresholds used\n\n- `--pass-min-oos-return` 0% (per-fold TOTAL OOS return over that fold's test window, NOT annualised; window lengths are in each fold heading)\n- `--pass-max-dd-mult` 1.5 (OOS |max DD| <= mult x IS |max DD|)\n- `--pass-min-folds` 2 (fold winners that must pass)\n- a genome with zero OOS trades FAILS\n- `--pass-require-fold` 2026 (these test years' fold winners must pass)\n- top-n 2; selection knobs used: min_trade_rows=30, min_return_rel_pct=5.0, min_dd_pts=2.0, min_trades_rel_pct=5.0\n\nReturns and drawdowns in percent. CAR = annualised total return over the window. Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).\n\n## Fold 1: train 2020-01-01..2023-12-31 (4.00y), test 2024-01-01..2024-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 2: train 2020-01-01..2024-12-31 (5.00y), test 2025-01-01..2025-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 3: train 2020-01-01..2025-12-31 (6.00y), test 2026-01-01..2026-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.20 | FAIL: OOS return -5.00% < 0% |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.33 | FAIL: OOS return -5.00% < 0% |\n\n## Stitched out-of-sample, rank-1 per fold (deploying each fold's winner)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 / fold winners | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 25.00% | 0.06 |\n\n## Stitched out-of-sample per rank (rank r of every fold)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 25.00% | 0.06 |\n| rank 2 | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 15.00% | 0.10 |\n\nStitch: fold OOS returns compounded; CAR over the summed test years; worst DD = worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not read); IS CAR = mean of the folds' IS CARs.\n",
+   "summary.json": "{\n  \"cells\": [\n    {\n      \"cell\": \"cell\",\n      \"expert\": \"FMPRating\",\n      \"strategy\": \"S2\",\n      \"band\": \"large\",\n      \"verdict\": \"FAIL\",\n      \"refit_job\": null,\n      \"refit\": null,\n      \"deferred\": null,\n      \"eliminated\": null,\n      \"required_failed\": [\n        2026\n      ],\n      \"thresholds\": {\n        \"min_oos_return\": 0.0,\n        \"max_dd_mult\": 1.5,\n        \"min_folds\": 2,\n        \"max_oos_dd\": null,\n        \"top_n\": 2,\n        \"exclusive_return\": false,\n        \"require_test_years\": [\n          2026\n        ]\n      },\n      \"data_end\": null,\n      \"folds\": [\n        {\n          \"fold\": 1,\n          \"job\": \"cell-wf1\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2023-12-31\"\n          ],\n          \"test\": [\n            \"2024-01-01\",\n            \"2024-12-31\"\n          ],\n          \"generations\": \"30\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.00350894030015,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.200140357612006,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": null\n        },\n        {\n          \"fold\": 2,\n          \"job\": \"cell-wf2\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2024-12-31\"\n          ],\n          \"test\": [\n            \"2025-01-01\",\n            \"2025-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.017594081163668,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.2007037632465467,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": \"cell-wf1\"\n        },\n        {\n          \"fold\": 3,\n          \"job\": \"cell-wf3\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2025-12-31\"\n          ],\n          \"test\": [\n            \"2026-01-01\",\n            \"2026-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": -5.0,\n            \"car\": -5.0167322590243035,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": -0.20066929036097214,\n          \"passed\": false,\n          \"fail_reasons\": [\n            \"OOS return -5.00% < 0%\"\n          ],\n          \"seeded_from\": \"cell-wf2\"\n        }\n      ],\n      \"winner_stitch\": {\n        \"folds\": [\n          1,\n          2,\n          3\n        ],\n        \"total_return\": 4.7374999999999945,\n        \"oos_car\": 1.5588076957051777,\n        \"worst_fold_dd\": -10.0,\n        \"trades\": 30,\n        \"is_car_mean\": 25.0,\n        \"efficiency\": 0.06235230782820711,\n        \"years\": 2.9924709103353866\n      }\n    }\n  ]\n}",
+   "summary.md": "# goal2027 walk-forward summary\n\nPer fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).\n\n| cell | verdict | fold 1 | fold 2 | fold 3 | refit |\n|---|---|---|---|---|---|\n| cell | FAIL | P 25.0% / 5.0% / -10.0% | P 25.0% / 5.0% / -10.0% | F 25.0% / -5.0% / -10.0% | - |\n"
+  },
+  "import": {
+   "band": "large",
+   "error_message": null,
+   "expert": "FMPRating",
+   "folds_done": 3,
+   "planned_folds": 3,
+   "report": {
+    "complete": true,
+    "data_end": null,
+    "deferred": null,
+    "eliminated": null,
+    "final": true,
+    "folds": [
+     {
+      "generations": "30",
+      "index": 1,
+      "ranks": [
+       {
+        "efficiency": 0.200140357612006,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.33356726268667664,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": null,
+      "state": "done",
+      "test_end": "2024-12-31",
+      "test_start": "2024-01-01",
+      "train_end": "2023-12-31",
+      "train_job": "cell-wf1",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 2,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf1",
+      "state": "done",
+      "test_end": "2025-12-31",
+      "test_start": "2025-01-01",
+      "train_end": "2024-12-31",
+      "train_job": "cell-wf2",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 3,
+      "ranks": [
+       {
+        "efficiency": -0.20066929036097214,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 3,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 1
+       },
+       {
+        "efficiency": -0.3344488172682869,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 3,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf2",
+      "state": "done",
+      "test_end": "2026-12-31",
+      "test_start": "2026-01-01",
+      "train_end": "2025-12-31",
+      "train_job": "cell-wf3",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": false
+     }
+    ],
+    "name": "cell",
+    "notes": [],
+    "overall_passed": false,
+    "planned_folds_known": true,
+    "rank_stitches": {
+     "1": {
+      "efficiency": 0.06235230782820711,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 25.0,
+      "oos_car": 1.5588076957051777,
+      "total_return": 4.7374999999999945,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     },
+     "2": {
+      "efficiency": 0.10392051304701184,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 15.0,
+      "oos_car": 1.5588076957051777,
+      "total_return": 4.7374999999999945,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     }
+    },
+    "refit": null,
+    "refit_job": null,
+    "refit_running": null,
+    "required_failed": [
+     2026
+    ],
+    "schema": 1,
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "stitch_partial": false,
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "verdict": "FAIL",
+    "winner_stitch": {
+     "efficiency": 0.06235230782820711,
+     "folds": [
+      1,
+      2,
+      3
+     ],
+     "is_car_mean": 25.0,
+     "oos_car": 1.5588076957051777,
+     "total_return": 4.7374999999999945,
+     "trades": 30,
+     "worst_fold_dd": -10.0,
+     "years": 2.9924709103353866
+    },
+    "winners_passed": 2
+   },
+   "report_dir": "<DIR>",
+   "spec": {
+    "data_end": null,
+    "exclusive_return": false,
+    "first_generations": "30",
+    "imported": true,
+    "name": "cell",
+    "next_generations": "15",
+    "optimize_args": null,
+    "require_test_years": [
+     2026
+    ],
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "test_years": [
+     2024,
+     2025,
+     2026
+    ],
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "train_start": "2020-01-01"
+   },
+   "status": "fail",
+   "stitch_partial": false,
+   "stitched_return": 4.7374999999999945,
+   "stitched_trades": 30,
+   "strategy": "S2",
+   "worst_oos_dd": -10.0
+  },
+  "refit_job": null,
+  "tested": [
+   [
+    "cell-wf1",
+    1,
+    "WF1-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-1",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf2",
+    2,
+    "WF2-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-2",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf3",
+    3,
+    "WF3-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-3",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ]
+  ],
+  "trained": [
+   [
+    "cell-wf1",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "cell-wf1"
+    ]
+   ],
+   [
+    "cell-wf2",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "cell-wf2"
+    ]
+   ],
+   [
+    "cell-wf3",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf2",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "cell-wf3"
+    ]
+   ]
+  ],
+  "verdict": "FAIL"
+ },
+ "floor": {
+  "files": {
+   "cell/cell.json": "{\n  \"cell\": \"cell\",\n  \"expert\": \"FMPRating\",\n  \"strategy\": \"S2\",\n  \"band\": \"large\",\n  \"verdict\": \"PASS\",\n  \"refit_job\": \"cell-refit\",\n  \"refit\": {\n    \"job\": \"cell-refit\",\n    \"train\": [\n      \"2022-01-01\",\n      \"2026-12-31\"\n    ],\n    \"seeded_from\": \"cell-wf3\"\n  },\n  \"deferred\": null,\n  \"eliminated\": null,\n  \"required_failed\": [],\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2,\n    \"max_oos_dd\": null,\n    \"top_n\": 2,\n    \"exclusive_return\": false,\n    \"require_test_years\": [\n      2026\n    ]\n  },\n  \"data_end\": null,\n  \"folds\": [\n    {\n      \"fold\": 1,\n      \"job\": \"cell-wf1\",\n      \"train\": [\n        \"2022-01-01\",\n        \"2023-12-31\"\n      ],\n      \"test\": [\n        \"2024-01-01\",\n        \"2024-12-31\"\n      ],\n      \"generations\": \"30\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.00350894030015,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": null\n    },\n    {\n      \"fold\": 2,\n      \"job\": \"cell-wf2\",\n      \"train\": [\n        \"2022-01-01\",\n        \"2024-12-31\"\n      ],\n      \"test\": [\n        \"2025-01-01\",\n        \"2025-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": -5.0,\n        \"car\": -5.0167322590243035,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ],\n      \"seeded_from\": \"cell-wf1\"\n    },\n    {\n      \"fold\": 3,\n      \"job\": \"cell-wf3\",\n      \"train\": [\n        \"2022-01-01\",\n        \"2025-12-31\"\n      ],\n      \"test\": [\n        \"2026-01-01\",\n        \"2026-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf2\"\n    }\n  ],\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 4.7374999999999945,\n    \"oos_car\": 1.5588076957051777,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.06235230782820711,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/fold1.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2022-01-01\",\n      \"2023-12-31\"\n    ],\n    \"test\": [\n      \"2024-01-01\",\n      \"2024-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold2.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2022-01-01\",\n      \"2024-12-31\"\n    ],\n    \"test\": [\n      \"2025-01-01\",\n      \"2025-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    }\n  ]\n}",
+   "cell/fold3.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2022-01-01\",\n      \"2025-12-31\"\n    ],\n    \"test\": [\n      \"2026-01-01\",\n      \"2026-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/report.json": "{\n  \"prefix\": \"cell\",\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2\n  },\n  \"top_n\": 2,\n  \"selection\": {\n    \"min_trade_rows\": 30,\n    \"min_return_rel_pct\": 5.0,\n    \"min_dd_pts\": 2.0,\n    \"min_trades_rel_pct\": 5.0\n  },\n  \"complete\": true,\n  \"overall_passed\": true,\n  \"winners_passed\": 2,\n  \"exclusive_return\": false,\n  \"require_test_years\": [\n    2026\n  ],\n  \"required_failed\": [],\n  \"notes\": [],\n  \"folds\": [\n    {\n      \"index\": 1,\n      \"train_start\": \"2022-01-01\",\n      \"train_end\": \"2023-12-31\",\n      \"test_start\": \"2024-01-01\",\n      \"test_end\": \"2024-12-31\"\n    },\n    {\n      \"index\": 2,\n      \"train_start\": \"2022-01-01\",\n      \"train_end\": \"2024-12-31\",\n      \"test_start\": \"2025-01-01\",\n      \"test_end\": \"2025-12-31\"\n    },\n    {\n      \"index\": 3,\n      \"train_start\": \"2022-01-01\",\n      \"train_end\": \"2025-12-31\",\n      \"test_start\": \"2026-01-01\",\n      \"test_end\": \"2026-12-31\"\n    }\n  ],\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.20066929036097214,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": -5.0,\n      \"oos_car\": -5.0167322590243035,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": -0.3344488172682869,\n      \"passed\": false,\n      \"fail_reasons\": [\n        \"OOS return -5.00% < 0%\"\n      ]\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ],\n  \"rank_stitches\": {\n    \"1\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 4.7374999999999945,\n      \"oos_car\": 1.5588076957051777,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 25.0,\n      \"efficiency\": 0.06235230782820711,\n      \"years\": 2.9924709103353866\n    },\n    \"2\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 4.7374999999999945,\n      \"oos_car\": 1.5588076957051777,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 15.0,\n      \"efficiency\": 0.10392051304701184,\n      \"years\": 2.9924709103353866\n    }\n  },\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 4.7374999999999945,\n    \"oos_car\": 1.5588076957051777,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.06235230782820711,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/report.md": "# Walk-forward report: cell\n\n**Overall verdict: PASS** -- 2 of 3 fold winner(s) passed (need 2).\n\n## Thresholds used\n\n- `--pass-min-oos-return` 0% (per-fold TOTAL OOS return over that fold's test window, NOT annualised; window lengths are in each fold heading)\n- `--pass-max-dd-mult` 1.5 (OOS |max DD| <= mult x IS |max DD|)\n- `--pass-min-folds` 2 (fold winners that must pass)\n- a genome with zero OOS trades FAILS\n- `--pass-require-fold` 2026 (these test years' fold winners must pass)\n- top-n 2; selection knobs used: min_trade_rows=30, min_return_rel_pct=5.0, min_dd_pts=2.0, min_trades_rel_pct=5.0\n\nReturns and drawdowns in percent. CAR = annualised total return over the window. Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).\n\n## Fold 1: train 2022-01-01..2023-12-31 (2.00y), test 2024-01-01..2024-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 2: train 2022-01-01..2024-12-31 (3.00y), test 2025-01-01..2025-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.20 | FAIL: OOS return -5.00% < 0% |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | -5.00% | -5.02% | -10.00% | 10 | -0.33 | FAIL: OOS return -5.00% < 0% |\n\n## Fold 3: train 2022-01-01..2025-12-31 (4.00y), test 2026-01-01..2026-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Stitched out-of-sample, rank-1 per fold (deploying each fold's winner)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 / fold winners | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 25.00% | 0.06 |\n\n## Stitched out-of-sample per rank (rank r of every fold)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 25.00% | 0.06 |\n| rank 2 | 1,2,3 | 4.74% | 1.56% | -10.00% | 30 | 15.00% | 0.10 |\n\nStitch: fold OOS returns compounded; CAR over the summed test years; worst DD = worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not read); IS CAR = mean of the folds' IS CARs.\n",
+   "summary.json": "{\n  \"cells\": [\n    {\n      \"cell\": \"cell\",\n      \"expert\": \"FMPRating\",\n      \"strategy\": \"S2\",\n      \"band\": \"large\",\n      \"verdict\": \"PASS\",\n      \"refit_job\": \"cell-refit\",\n      \"refit\": {\n        \"job\": \"cell-refit\",\n        \"train\": [\n          \"2022-01-01\",\n          \"2026-12-31\"\n        ],\n        \"seeded_from\": \"cell-wf3\"\n      },\n      \"deferred\": null,\n      \"eliminated\": null,\n      \"required_failed\": [],\n      \"thresholds\": {\n        \"min_oos_return\": 0.0,\n        \"max_dd_mult\": 1.5,\n        \"min_folds\": 2,\n        \"max_oos_dd\": null,\n        \"top_n\": 2,\n        \"exclusive_return\": false,\n        \"require_test_years\": [\n          2026\n        ]\n      },\n      \"data_end\": null,\n      \"folds\": [\n        {\n          \"fold\": 1,\n          \"job\": \"cell-wf1\",\n          \"train\": [\n            \"2022-01-01\",\n            \"2023-12-31\"\n          ],\n          \"test\": [\n            \"2024-01-01\",\n            \"2024-12-31\"\n          ],\n          \"generations\": \"30\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.00350894030015,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.200140357612006,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": null\n        },\n        {\n          \"fold\": 2,\n          \"job\": \"cell-wf2\",\n          \"train\": [\n            \"2022-01-01\",\n            \"2024-12-31\"\n          ],\n          \"test\": [\n            \"2025-01-01\",\n            \"2025-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": -5.0,\n            \"car\": -5.0167322590243035,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": -0.20066929036097214,\n          \"passed\": false,\n          \"fail_reasons\": [\n            \"OOS return -5.00% < 0%\"\n          ],\n          \"seeded_from\": \"cell-wf1\"\n        },\n        {\n          \"fold\": 3,\n          \"job\": \"cell-wf3\",\n          \"train\": [\n            \"2022-01-01\",\n            \"2025-12-31\"\n          ],\n          \"test\": [\n            \"2026-01-01\",\n            \"2026-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.017594081163668,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.2007037632465467,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": \"cell-wf2\"\n        }\n      ],\n      \"winner_stitch\": {\n        \"folds\": [\n          1,\n          2,\n          3\n        ],\n        \"total_return\": 4.7374999999999945,\n        \"oos_car\": 1.5588076957051777,\n        \"worst_fold_dd\": -10.0,\n        \"trades\": 30,\n        \"is_car_mean\": 25.0,\n        \"efficiency\": 0.06235230782820711,\n        \"years\": 2.9924709103353866\n      }\n    }\n  ]\n}",
+   "summary.md": "# goal2027 walk-forward summary\n\nPer fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).\n\n| cell | verdict | fold 1 | fold 2 | fold 3 | refit |\n|---|---|---|---|---|---|\n| cell | PASS | P 25.0% / 5.0% / -10.0% | F 25.0% / -5.0% / -10.0% | P 25.0% / 5.0% / -10.0% | cell-refit |\n"
+  },
+  "import": {
+   "band": "large",
+   "error_message": null,
+   "expert": "FMPRating",
+   "folds_done": 3,
+   "planned_folds": 3,
+   "report": {
+    "complete": true,
+    "data_end": null,
+    "deferred": null,
+    "eliminated": null,
+    "final": true,
+    "folds": [
+     {
+      "generations": "30",
+      "index": 1,
+      "ranks": [
+       {
+        "efficiency": 0.200140357612006,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.33356726268667664,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": null,
+      "state": "done",
+      "test_end": "2024-12-31",
+      "test_start": "2024-01-01",
+      "train_end": "2023-12-31",
+      "train_job": "cell-wf1",
+      "train_optimization_id": 8,
+      "train_start": "2022-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 2,
+      "ranks": [
+       {
+        "efficiency": -0.20066929036097214,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 2,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 1
+       },
+       {
+        "efficiency": -0.3344488172682869,
+        "fail_reasons": [
+         "OOS return -5.00% < 0%"
+        ],
+        "fold": 2,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": -5.0167322590243035,
+        "oos_max_dd": -10.0,
+        "oos_return": -5.0,
+        "oos_trades": 10,
+        "passed": false,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf1",
+      "state": "done",
+      "test_end": "2025-12-31",
+      "test_start": "2025-01-01",
+      "train_end": "2024-12-31",
+      "train_job": "cell-wf2",
+      "train_optimization_id": 8,
+      "train_start": "2022-01-01",
+      "winner_passed": false
+     },
+     {
+      "generations": "15",
+      "index": 3,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf2",
+      "state": "done",
+      "test_end": "2026-12-31",
+      "test_start": "2026-01-01",
+      "train_end": "2025-12-31",
+      "train_job": "cell-wf3",
+      "train_optimization_id": 8,
+      "train_start": "2022-01-01",
+      "winner_passed": true
+     }
+    ],
+    "name": "cell",
+    "notes": [],
+    "overall_passed": true,
+    "planned_folds_known": true,
+    "rank_stitches": {
+     "1": {
+      "efficiency": 0.06235230782820711,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 25.0,
+      "oos_car": 1.5588076957051777,
+      "total_return": 4.7374999999999945,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     },
+     "2": {
+      "efficiency": 0.10392051304701184,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 15.0,
+      "oos_car": 1.5588076957051777,
+      "total_return": 4.7374999999999945,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     }
+    },
+    "refit": {
+     "job": "cell-refit",
+     "seeded_from": "cell-wf3",
+     "train": [
+      "2022-01-01",
+      "2026-12-31"
+     ]
+    },
+    "refit_job": "cell-refit",
+    "refit_running": null,
+    "required_failed": [],
+    "schema": 1,
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "stitch_partial": false,
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "verdict": "PASS",
+    "winner_stitch": {
+     "efficiency": 0.06235230782820711,
+     "folds": [
+      1,
+      2,
+      3
+     ],
+     "is_car_mean": 25.0,
+     "oos_car": 1.5588076957051777,
+     "total_return": 4.7374999999999945,
+     "trades": 30,
+     "worst_fold_dd": -10.0,
+     "years": 2.9924709103353866
+    },
+    "winners_passed": 2
+   },
+   "report_dir": "<DIR>",
+   "spec": {
+    "data_end": null,
+    "exclusive_return": false,
+    "first_generations": "30",
+    "imported": true,
+    "name": "cell",
+    "next_generations": "15",
+    "optimize_args": null,
+    "require_test_years": [
+     2026
+    ],
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "test_years": [
+     2024,
+     2025,
+     2026
+    ],
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "train_start": "2022-01-01"
+   },
+   "status": "pass",
+   "stitch_partial": false,
+   "stitched_return": 4.7374999999999945,
+   "stitched_trades": 30,
+   "strategy": "S2",
+   "worst_oos_dd": -10.0
+  },
+  "refit_job": "cell-refit",
+  "tested": [
+   [
+    "cell-wf1",
+    1,
+    "WF1-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-1",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf2",
+    2,
+    "WF2-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-2",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf3",
+    3,
+    "WF3-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-3",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ]
+  ],
+  "trained": [
+   [
+    "cell-wf1",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "cell-wf1"
+    ]
+   ],
+   [
+    "cell-wf2",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf1",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "cell-wf2"
+    ]
+   ],
+   [
+    "cell-wf3",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf2",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "cell-wf3"
+    ]
+   ],
+   [
+    "cell-refit",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf3",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2026-12-31",
+     "--name",
+     "cell-refit"
+    ]
+   ]
+  ],
+  "verdict": "PASS"
+ },
+ "matrix_ds": {
+  "rc": 0,
+  "tested": [
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf1",
+    1
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf2",
+    2
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf3",
+    3
+   ]
+  ],
+  "trained": [
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf1",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf1"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf2",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf2"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf3",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf2",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf3"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-refit",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-wf3",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2026-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d32563377de97-refit"
+    ]
+   ]
+  ]
+ },
+ "matrix_ds_years": {
+  "rc": 0,
+  "tested": [
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf1",
+    1
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf2",
+    2
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf3",
+    3
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf4",
+    4
+   ]
+  ],
+  "trained": [
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf1",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2021-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf1"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf2",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2022-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf2"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf3",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf2",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf3"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf4",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf3",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf4"
+    ]
+   ],
+   [
+    "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf5",
+    [
+     "optimize",
+     "--expert",
+     "DeterministicScorer",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S1",
+     "--strategy",
+     "S1",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf4",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "scr-mid-DeterministicScorer-S1-goal2027-timegene-sup1-lds2-hsalpaca-d50a126d842f0-wf5"
+    ]
+   ]
+  ]
+ },
+ "matrix_fr_defer": {
+  "rc": 0,
+  "tested": [
+   [
+    "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf1",
+    1
+   ],
+   [
+    "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf2",
+    2
+   ]
+  ],
+  "trained": [
+   [
+    "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf1",
+    [
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S2",
+     "--strategy",
+     "S2",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf1"
+    ]
+   ],
+   [
+    "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf2",
+    [
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S2",
+     "--strategy",
+     "S2",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf1",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf2"
+    ]
+   ],
+   [
+    "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf3",
+    [
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--universe",
+     "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX",
+     "--screener",
+     "--screener-store",
+     "C:/golden/metric_store",
+     "--screener-cap-band",
+     "mid",
+     "--fitness",
+     "calmar_ratio",
+     "--interval",
+     "5min",
+     "--ohlcv-history-source",
+     "alpaca",
+     "--estimates-source",
+     "fmp",
+     "--population",
+     "200",
+     "--screener-cadence-days",
+     "7",
+     "--run-schedule",
+     "weekly",
+     "--parallel",
+     "4",
+     "--early-stop",
+     "5",
+     "--early-stop-min-rel",
+     "0.01",
+     "--profit-cap-pct",
+     "2000.0",
+     "--profit-share-cap-pct",
+     "25.0",
+     "--labels",
+     "goal2027,S2",
+     "--strategy",
+     "S2",
+     "--decision-times",
+     "09:35,09:40,09:45,10:00,12:00,15:30,15:45",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf2",
+     "--start",
+     "2022-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "scr-mid-FMPRating-S2-goal2027-from2022-timegene-sup1-lds2-hsalpaca-dbc21ecf8b134-wf3"
+    ]
+   ]
+  ]
+ },
+ "pass": {
+  "files": {
+   "cell/cell.json": "{\n  \"cell\": \"cell\",\n  \"expert\": \"FMPRating\",\n  \"strategy\": \"S2\",\n  \"band\": \"large\",\n  \"verdict\": \"PASS\",\n  \"refit_job\": \"cell-refit\",\n  \"refit\": {\n    \"job\": \"cell-refit\",\n    \"train\": [\n      \"2020-01-01\",\n      \"2026-12-31\"\n    ],\n    \"seeded_from\": \"cell-wf3\"\n  },\n  \"deferred\": null,\n  \"eliminated\": null,\n  \"required_failed\": [],\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2,\n    \"max_oos_dd\": null,\n    \"top_n\": 2,\n    \"exclusive_return\": false,\n    \"require_test_years\": [\n      2026\n    ]\n  },\n  \"data_end\": null,\n  \"folds\": [\n    {\n      \"fold\": 1,\n      \"job\": \"cell-wf1\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2023-12-31\"\n      ],\n      \"test\": [\n        \"2024-01-01\",\n        \"2024-12-31\"\n      ],\n      \"generations\": \"30\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.00350894030015,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": null\n    },\n    {\n      \"fold\": 2,\n      \"job\": \"cell-wf2\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2024-12-31\"\n      ],\n      \"test\": [\n        \"2025-01-01\",\n        \"2025-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf1\"\n    },\n    {\n      \"fold\": 3,\n      \"job\": \"cell-wf3\",\n      \"train\": [\n        \"2020-01-01\",\n        \"2025-12-31\"\n      ],\n      \"test\": [\n        \"2026-01-01\",\n        \"2026-12-31\"\n      ],\n      \"generations\": \"15\",\n      \"is\": {\n        \"fitness\": 1.0,\n        \"return\": 100.0,\n        \"car\": 25.0,\n        \"max_dd\": -20.0,\n        \"trades\": 50\n      },\n      \"oos\": {\n        \"return\": 5.0,\n        \"car\": 5.017594081163668,\n        \"max_dd\": -10.0,\n        \"trades\": 10,\n        \"backtest_id\": 1\n      },\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": [],\n      \"seeded_from\": \"cell-wf2\"\n    }\n  ],\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 15.762500000000014,\n    \"oos_car\": 5.012890232979439,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.20051560931917756,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/fold1.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2023-12-31\"\n    ],\n    \"test\": [\n      \"2024-01-01\",\n      \"2024-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold2.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2024-12-31\"\n    ],\n    \"test\": [\n      \"2025-01-01\",\n      \"2025-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/fold3.json": "{\n  \"key\": {\n    \"train_jobs\": [\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      },\n      {\n        \"id\": 8,\n        \"completed_at\": \"2026-10-25T10:00:00\"\n      }\n    ],\n    \"train\": [\n      \"2020-01-01\",\n      \"2025-12-31\"\n    ],\n    \"test\": [\n      \"2026-01-01\",\n      \"2026-12-31\"\n    ],\n    \"top_n\": 2,\n    \"selection\": {\n      \"min_trade_rows\": 30,\n      \"min_return_rel_pct\": 5.0,\n      \"min_dd_pts\": 2.0,\n      \"min_trades_rel_pct\": 5.0\n    },\n    \"exclusive_return\": false,\n    \"thresholds\": {\n      \"min_oos_return\": 0.0,\n      \"max_dd_mult\": 1.5,\n      \"min_folds\": 2\n    }\n  },\n  \"genomes\": [\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ]\n}",
+   "cell/report.json": "{\n  \"prefix\": \"cell\",\n  \"thresholds\": {\n    \"min_oos_return\": 0.0,\n    \"max_dd_mult\": 1.5,\n    \"min_folds\": 2\n  },\n  \"top_n\": 2,\n  \"selection\": {\n    \"min_trade_rows\": 30,\n    \"min_return_rel_pct\": 5.0,\n    \"min_dd_pts\": 2.0,\n    \"min_trades_rel_pct\": 5.0\n  },\n  \"complete\": true,\n  \"overall_passed\": true,\n  \"winners_passed\": 3,\n  \"exclusive_return\": false,\n  \"require_test_years\": [\n    2026\n  ],\n  \"required_failed\": [],\n  \"notes\": [],\n  \"folds\": [\n    {\n      \"index\": 1,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2023-12-31\",\n      \"test_start\": \"2024-01-01\",\n      \"test_end\": \"2024-12-31\"\n    },\n    {\n      \"index\": 2,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2024-12-31\",\n      \"test_start\": \"2025-01-01\",\n      \"test_end\": \"2025-12-31\"\n    },\n    {\n      \"index\": 3,\n      \"train_start\": \"2020-01-01\",\n      \"train_end\": \"2025-12-31\",\n      \"test_start\": \"2026-01-01\",\n      \"test_end\": \"2026-12-31\"\n    }\n  ],\n  \"genomes\": [\n    {\n      \"fold\": 1,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.200140357612006,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 1,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.00350894030015,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.33356726268667664,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 2,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 1,\n      \"is_fitness\": 1.0,\n      \"is_return\": 100.0,\n      \"is_car\": 25.0,\n      \"is_max_dd\": -20.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.2007037632465467,\n      \"passed\": true,\n      \"fail_reasons\": []\n    },\n    {\n      \"fold\": 3,\n      \"rank\": 2,\n      \"is_fitness\": 1.0,\n      \"is_return\": 60.0,\n      \"is_car\": 15.0,\n      \"is_max_dd\": -12.0,\n      \"is_trades\": 50,\n      \"oos_return\": 5.0,\n      \"oos_car\": 5.017594081163668,\n      \"oos_max_dd\": -10.0,\n      \"oos_trades\": 10,\n      \"oos_backtest_id\": 1,\n      \"efficiency\": 0.3345062720775778,\n      \"passed\": true,\n      \"fail_reasons\": []\n    }\n  ],\n  \"rank_stitches\": {\n    \"1\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 15.762500000000014,\n      \"oos_car\": 5.012890232979439,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 25.0,\n      \"efficiency\": 0.20051560931917756,\n      \"years\": 2.9924709103353866\n    },\n    \"2\": {\n      \"folds\": [\n        1,\n        2,\n        3\n      ],\n      \"total_return\": 15.762500000000014,\n      \"oos_car\": 5.012890232979439,\n      \"worst_fold_dd\": -10.0,\n      \"trades\": 30,\n      \"is_car_mean\": 15.0,\n      \"efficiency\": 0.33419268219862924,\n      \"years\": 2.9924709103353866\n    }\n  },\n  \"winner_stitch\": {\n    \"folds\": [\n      1,\n      2,\n      3\n    ],\n    \"total_return\": 15.762500000000014,\n    \"oos_car\": 5.012890232979439,\n    \"worst_fold_dd\": -10.0,\n    \"trades\": 30,\n    \"is_car_mean\": 25.0,\n    \"efficiency\": 0.20051560931917756,\n    \"years\": 2.9924709103353866\n  }\n}",
+   "cell/report.md": "# Walk-forward report: cell\n\n**Overall verdict: PASS** -- 3 of 3 fold winner(s) passed (need 2).\n\n## Thresholds used\n\n- `--pass-min-oos-return` 0% (per-fold TOTAL OOS return over that fold's test window, NOT annualised; window lengths are in each fold heading)\n- `--pass-max-dd-mult` 1.5 (OOS |max DD| <= mult x IS |max DD|)\n- `--pass-min-folds` 2 (fold winners that must pass)\n- a genome with zero OOS trades FAILS\n- `--pass-require-fold` 2026 (these test years' fold winners must pass)\n- top-n 2; selection knobs used: min_trade_rows=30, min_return_rel_pct=5.0, min_dd_pts=2.0, min_trades_rel_pct=5.0\n\nReturns and drawdowns in percent. CAR = annualised total return over the window. Efficiency = OOS CAR / IS CAR (n/a when IS CAR <= 0).\n\n## Fold 1: train 2020-01-01..2023-12-31 (4.00y), test 2024-01-01..2024-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.00% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 2: train 2020-01-01..2024-12-31 (5.00y), test 2025-01-01..2025-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Fold 3: train 2020-01-01..2025-12-31 (6.00y), test 2026-01-01..2026-12-31 (1.00y)\n\n| rank | IS fitness | IS return | IS CAR | IS maxDD | IS trades | OOS return | OOS CAR | OOS maxDD | OOS trades | eff | verdict |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| 1 | 1.0000 | 100.00% | 25.00% | -20.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.20 | PASS |\n| 2 | 1.0000 | 60.00% | 15.00% | -12.00% | 50 | 5.00% | 5.02% | -10.00% | 10 | 0.33 | PASS |\n\n## Stitched out-of-sample, rank-1 per fold (deploying each fold's winner)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 / fold winners | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 25.00% | 0.20 |\n\n## Stitched out-of-sample per rank (rank r of every fold)\n\n| genome | folds | OOS return | OOS CAR | worst single-fold DD | trades | IS CAR (mean) | eff |\n|---|---|---:|---:|---:|---:|---:|---:|\n| rank 1 | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 25.00% | 0.20 |\n| rank 2 | 1,2,3 | 15.76% | 5.01% | -10.00% | 30 | 15.00% | 0.33 |\n\nStitch: fold OOS returns compounded; CAR over the summed test years; worst DD = worst single-fold drawdown (NOT a chained drawdown: fold equity curves are not read); IS CAR = mean of the folds' IS CARs.\n",
+   "summary.json": "{\n  \"cells\": [\n    {\n      \"cell\": \"cell\",\n      \"expert\": \"FMPRating\",\n      \"strategy\": \"S2\",\n      \"band\": \"large\",\n      \"verdict\": \"PASS\",\n      \"refit_job\": \"cell-refit\",\n      \"refit\": {\n        \"job\": \"cell-refit\",\n        \"train\": [\n          \"2020-01-01\",\n          \"2026-12-31\"\n        ],\n        \"seeded_from\": \"cell-wf3\"\n      },\n      \"deferred\": null,\n      \"eliminated\": null,\n      \"required_failed\": [],\n      \"thresholds\": {\n        \"min_oos_return\": 0.0,\n        \"max_dd_mult\": 1.5,\n        \"min_folds\": 2,\n        \"max_oos_dd\": null,\n        \"top_n\": 2,\n        \"exclusive_return\": false,\n        \"require_test_years\": [\n          2026\n        ]\n      },\n      \"data_end\": null,\n      \"folds\": [\n        {\n          \"fold\": 1,\n          \"job\": \"cell-wf1\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2023-12-31\"\n          ],\n          \"test\": [\n            \"2024-01-01\",\n            \"2024-12-31\"\n          ],\n          \"generations\": \"30\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.00350894030015,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.200140357612006,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": null\n        },\n        {\n          \"fold\": 2,\n          \"job\": \"cell-wf2\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2024-12-31\"\n          ],\n          \"test\": [\n            \"2025-01-01\",\n            \"2025-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.017594081163668,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.2007037632465467,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": \"cell-wf1\"\n        },\n        {\n          \"fold\": 3,\n          \"job\": \"cell-wf3\",\n          \"train\": [\n            \"2020-01-01\",\n            \"2025-12-31\"\n          ],\n          \"test\": [\n            \"2026-01-01\",\n            \"2026-12-31\"\n          ],\n          \"generations\": \"15\",\n          \"is\": {\n            \"fitness\": 1.0,\n            \"return\": 100.0,\n            \"car\": 25.0,\n            \"max_dd\": -20.0,\n            \"trades\": 50\n          },\n          \"oos\": {\n            \"return\": 5.0,\n            \"car\": 5.017594081163668,\n            \"max_dd\": -10.0,\n            \"trades\": 10,\n            \"backtest_id\": 1\n          },\n          \"efficiency\": 0.2007037632465467,\n          \"passed\": true,\n          \"fail_reasons\": [],\n          \"seeded_from\": \"cell-wf2\"\n        }\n      ],\n      \"winner_stitch\": {\n        \"folds\": [\n          1,\n          2,\n          3\n        ],\n        \"total_return\": 15.762500000000014,\n        \"oos_car\": 5.012890232979439,\n        \"worst_fold_dd\": -10.0,\n        \"trades\": 30,\n        \"is_car_mean\": 25.0,\n        \"efficiency\": 0.20051560931917756,\n        \"years\": 2.9924709103353866\n      }\n    }\n  ]\n}",
+   "summary.md": "# goal2027 walk-forward summary\n\nPer fold: IS CAR / OOS total return / OOS maxDD of the rank-1 genome (P = fold passed).\n\n| cell | verdict | fold 1 | fold 2 | fold 3 | refit |\n|---|---|---|---|---|---|\n| cell | PASS | P 25.0% / 5.0% / -10.0% | P 25.0% / 5.0% / -10.0% | P 25.0% / 5.0% / -10.0% | cell-refit |\n"
+  },
+  "import": {
+   "band": "large",
+   "error_message": null,
+   "expert": "FMPRating",
+   "folds_done": 3,
+   "planned_folds": 3,
+   "report": {
+    "complete": true,
+    "data_end": null,
+    "deferred": null,
+    "eliminated": null,
+    "final": true,
+    "folds": [
+     {
+      "generations": "30",
+      "index": 1,
+      "ranks": [
+       {
+        "efficiency": 0.200140357612006,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.33356726268667664,
+        "fail_reasons": [],
+        "fold": 1,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.00350894030015,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": null,
+      "state": "done",
+      "test_end": "2024-12-31",
+      "test_start": "2024-01-01",
+      "train_end": "2023-12-31",
+      "train_job": "cell-wf1",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 2,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 2,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf1",
+      "state": "done",
+      "test_end": "2025-12-31",
+      "test_start": "2025-01-01",
+      "train_end": "2024-12-31",
+      "train_job": "cell-wf2",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     },
+     {
+      "generations": "15",
+      "index": 3,
+      "ranks": [
+       {
+        "efficiency": 0.2007037632465467,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 25.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -20.0,
+        "is_return": 100.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 1
+       },
+       {
+        "efficiency": 0.3345062720775778,
+        "fail_reasons": [],
+        "fold": 3,
+        "is_car": 15.0,
+        "is_fitness": 1.0,
+        "is_max_dd": -12.0,
+        "is_return": 60.0,
+        "is_trades": 50,
+        "oos_backtest_id": 1,
+        "oos_car": 5.017594081163668,
+        "oos_max_dd": -10.0,
+        "oos_return": 5.0,
+        "oos_trades": 10,
+        "passed": true,
+        "rank": 2
+       }
+      ],
+      "seeded_from": "cell-wf2",
+      "state": "done",
+      "test_end": "2026-12-31",
+      "test_start": "2026-01-01",
+      "train_end": "2025-12-31",
+      "train_job": "cell-wf3",
+      "train_optimization_id": 8,
+      "train_start": "2020-01-01",
+      "winner_passed": true
+     }
+    ],
+    "name": "cell",
+    "notes": [],
+    "overall_passed": true,
+    "planned_folds_known": true,
+    "rank_stitches": {
+     "1": {
+      "efficiency": 0.20051560931917756,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 25.0,
+      "oos_car": 5.012890232979439,
+      "total_return": 15.762500000000014,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     },
+     "2": {
+      "efficiency": 0.33419268219862924,
+      "folds": [
+       1,
+       2,
+       3
+      ],
+      "is_car_mean": 15.0,
+      "oos_car": 5.012890232979439,
+      "total_return": 15.762500000000014,
+      "trades": 30,
+      "worst_fold_dd": -10.0,
+      "years": 2.9924709103353866
+     }
+    },
+    "refit": {
+     "job": "cell-refit",
+     "seeded_from": "cell-wf3",
+     "train": [
+      "2020-01-01",
+      "2026-12-31"
+     ]
+    },
+    "refit_job": "cell-refit",
+    "refit_running": null,
+    "required_failed": [],
+    "schema": 1,
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "stitch_partial": false,
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "verdict": "PASS",
+    "winner_stitch": {
+     "efficiency": 0.20051560931917756,
+     "folds": [
+      1,
+      2,
+      3
+     ],
+     "is_car_mean": 25.0,
+     "oos_car": 5.012890232979439,
+     "total_return": 15.762500000000014,
+     "trades": 30,
+     "worst_fold_dd": -10.0,
+     "years": 2.9924709103353866
+    },
+    "winners_passed": 3
+   },
+   "report_dir": "<DIR>",
+   "spec": {
+    "data_end": null,
+    "exclusive_return": false,
+    "first_generations": "30",
+    "imported": true,
+    "name": "cell",
+    "next_generations": "15",
+    "optimize_args": null,
+    "require_test_years": [
+     2026
+    ],
+    "selection": {
+     "min_dd_pts": 2.0,
+     "min_return_rel_pct": 5.0,
+     "min_trade_rows": 30,
+     "min_trades_rel_pct": 5.0
+    },
+    "test_years": [
+     2024,
+     2025,
+     2026
+    ],
+    "thresholds": {
+     "exclusive_return": false,
+     "max_dd_mult": 1.5,
+     "max_oos_dd": null,
+     "min_folds": 2,
+     "min_oos_return": 0.0,
+     "require_test_years": [
+      2026
+     ],
+     "top_n": 2
+    },
+    "top_n": 2,
+    "train_start": "2020-01-01"
+   },
+   "status": "pass",
+   "stitch_partial": false,
+   "stitched_return": 15.762500000000014,
+   "stitched_trades": 30,
+   "strategy": "S2",
+   "worst_oos_dd": -10.0
+  },
+  "refit_job": "cell-refit",
+  "tested": [
+   [
+    "cell-wf1",
+    1,
+    "WF1-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-1",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf2",
+    2,
+    "WF2-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-2",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "cell-wf3",
+    3,
+    "WF3-OOS-R",
+    [
+     "WalkForward",
+     "wf-fold-3",
+     "OOS"
+    ],
+    1,
+    [
+     1,
+     2
+    ]
+   ]
+  ],
+  "trained": [
+   [
+    "cell-wf1",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "30",
+     "--persist-final-population",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2023-12-31",
+     "--name",
+     "cell-wf1"
+    ]
+   ],
+   [
+    "cell-wf2",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf1",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2024-12-31",
+     "--name",
+     "cell-wf2"
+    ]
+   ],
+   [
+    "cell-wf3",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf2",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2025-12-31",
+     "--name",
+     "cell-wf3"
+    ]
+   ],
+   [
+    "cell-refit",
+    [
+     "ba2-test",
+     "optimize",
+     "--expert",
+     "FMPRating",
+     "--strategy",
+     "S2",
+     "--population",
+     "200",
+     "--generations",
+     "15",
+     "--chain-seed-from",
+     "cell-wf3",
+     "--start",
+     "2020-01-01",
+     "--end",
+     "2026-12-31",
+     "--name",
+     "cell-refit"
+    ]
+   ]
+  ],
+  "verdict": "PASS"
+ },
+ "plan_default": {
+  "commands": [
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "30",
+    "--persist-final-population",
+    "--start",
+    "2020-01-01",
+    "--end",
+    "2023-12-31",
+    "--name",
+    "cell-wf1"
+   ],
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "15",
+    "--chain-seed-from",
+    "cell-wf1",
+    "--start",
+    "2020-01-01",
+    "--end",
+    "2024-12-31",
+    "--name",
+    "cell-wf2"
+   ],
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "15",
+    "--chain-seed-from",
+    "cell-wf2",
+    "--start",
+    "2020-01-01",
+    "--end",
+    "2025-12-31",
+    "--name",
+    "cell-wf3"
+   ]
+  ],
+  "dry_run": "walk-forward plan 'cell': 3 fold(s), top-n 2, embargo 0d, test-parallel 1\nthresholds: OOS return >= 0% per fold, OOS |maxDD| <= 1.5 x IS |maxDD|, >= 2 fold winner(s) must pass, and the 2026 fold(s) MUST pass\n\nfold 1: train 2020-01-01..2023-12-31 (4.00y), test 2024-01-01..2024-12-31 (1.00y)\n  train job: cell-wf1  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 30 --persist-final-population --start 2020-01-01 --end 2023-12-31 --name cell-wf1\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2024-01-01..2024-12-31 as WF1-OOS-R<rank>-cell-wf1  labels=['WalkForward', 'wf-fold-1', 'OOS']\n\nfold 2: train 2020-01-01..2024-12-31 (5.00y), test 2025-01-01..2025-12-31 (1.00y)\n  train job: cell-wf2  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 15 --chain-seed-from cell-wf1 --start 2020-01-01 --end 2024-12-31 --name cell-wf2\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2025-01-01..2025-12-31 as WF2-OOS-R<rank>-cell-wf2  labels=['WalkForward', 'wf-fold-2', 'OOS']\n\nfold 3: train 2020-01-01..2025-12-31 (6.00y), test 2026-01-01..2026-12-31 (1.00y)\n  train job: cell-wf3  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 15 --chain-seed-from cell-wf2 --start 2020-01-01 --end 2025-12-31 --name cell-wf3\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2026-01-01..2026-12-31 as WF3-OOS-R<rank>-cell-wf3  labels=['WalkForward', 'wf-fold-3', 'OOS']\n\n--dry-run: nothing was run.",
+  "refit": [
+   "ba2-test",
+   "optimize",
+   "--expert",
+   "FMPRating",
+   "--strategy",
+   "S2",
+   "--population",
+   "200",
+   "--generations",
+   "15",
+   "--chain-seed-from",
+   "cell-wf3",
+   "--start",
+   "2020-01-01",
+   "--end",
+   "2026-12-31",
+   "--name",
+   "cell-refit"
+  ],
+  "spec_json": {
+   "band": "large",
+   "data_end": null,
+   "defer_last_test": false,
+   "exclusive_return": false,
+   "expert": "FMPRating",
+   "first_generations": 30,
+   "floor": null,
+   "next_generations": 15,
+   "optimize_args": [
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200"
+   ],
+   "refit": true,
+   "require_test_years": [
+    2026
+   ],
+   "run_all_folds": false,
+   "selection": {
+    "min_dd_pts": 2.0,
+    "min_return_rel_pct": 5.0,
+    "min_trade_rows": 30,
+    "min_trades_rel_pct": 5.0
+   },
+   "strategy": "S2",
+   "test_parallel": 1,
+   "test_years": [
+    2024,
+    2025,
+    2026
+   ],
+   "thresholds": {
+    "max_dd_mult": 1.5,
+    "max_oos_dd": null,
+    "min_folds": 2,
+    "min_oos_return": 0.0
+   },
+   "top_n": 2,
+   "train_start": "2020-01-01"
+  }
+ },
+ "plan_floor_defer": {
+  "commands": [
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "30",
+    "--persist-final-population",
+    "--start",
+    "2022-01-01",
+    "--end",
+    "2023-12-31",
+    "--name",
+    "cell-wf1"
+   ],
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "15",
+    "--chain-seed-from",
+    "cell-wf1",
+    "--start",
+    "2022-01-01",
+    "--end",
+    "2024-12-31",
+    "--name",
+    "cell-wf2"
+   ],
+   [
+    "ba2-test",
+    "optimize",
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200",
+    "--generations",
+    "15",
+    "--chain-seed-from",
+    "cell-wf2",
+    "--start",
+    "2022-01-01",
+    "--end",
+    "2025-12-31",
+    "--name",
+    "cell-wf3"
+   ]
+  ],
+  "dry_run": "walk-forward plan 'cell': 3 fold(s), top-n 2, embargo 0d, test-parallel 1\nthresholds: OOS return >= 0% per fold, OOS |maxDD| <= 1.5 x IS |maxDD|, >= 2 fold winner(s) must pass, and the 2026 fold(s) MUST pass\n\nfold 1: train 2022-01-01..2023-12-31 (2.00y), test 2024-01-01..2024-12-31 (1.00y)\n  train job: cell-wf1  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 30 --persist-final-population --start 2022-01-01 --end 2023-12-31 --name cell-wf1\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2024-01-01..2024-12-31 as WF1-OOS-R<rank>-cell-wf1  labels=['WalkForward', 'wf-fold-1', 'OOS']\n\nfold 2: train 2022-01-01..2024-12-31 (3.00y), test 2025-01-01..2025-12-31 (1.00y)\n  train job: cell-wf2  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 15 --chain-seed-from cell-wf1 --start 2022-01-01 --end 2024-12-31 --name cell-wf2\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2025-01-01..2025-12-31 as WF2-OOS-R<rank>-cell-wf2  labels=['WalkForward', 'wf-fold-2', 'OOS']\n\nfold 3: train 2022-01-01..2025-12-31 (4.00y), test 2026-01-01..2026-12-31 (1.00y)\n  train job: cell-wf3  (skipped when already completed)\n  train cmd: ba2-test optimize --expert FMPRating --strategy S2 --population 200 --generations 15 --chain-seed-from cell-wf2 --start 2022-01-01 --end 2025-12-31 --name cell-wf3\n  select: top 2 behaviour-distinct genomes (tools/persist_distinct_topn.py selection; {'min_trade_rows': 30, 'min_return_rel_pct': 5.0, 'min_dd_pts': 2.0, 'min_trades_rel_pct': 5.0})\n  test: re-run each once on 2026-01-01..2026-12-31 as WF3-OOS-R<rank>-cell-wf3  labels=['WalkForward', 'wf-fold-3', 'OOS']\n\n--dry-run: nothing was run.",
+  "refit": [
+   "ba2-test",
+   "optimize",
+   "--expert",
+   "FMPRating",
+   "--strategy",
+   "S2",
+   "--population",
+   "200",
+   "--generations",
+   "15",
+   "--chain-seed-from",
+   "cell-wf3",
+   "--start",
+   "2022-01-01",
+   "--end",
+   "2026-12-31",
+   "--name",
+   "cell-refit"
+  ],
+  "spec_json": {
+   "band": "large",
+   "data_end": "2025-12-31",
+   "defer_last_test": true,
+   "exclusive_return": false,
+   "expert": "FMPRating",
+   "first_generations": 30,
+   "floor": "2022-01-01",
+   "next_generations": 15,
+   "optimize_args": [
+    "--expert",
+    "FMPRating",
+    "--strategy",
+    "S2",
+    "--population",
+    "200"
+   ],
+   "refit": true,
+   "require_test_years": [
+    2026
+   ],
+   "run_all_folds": false,
+   "selection": {
+    "min_dd_pts": 2.0,
+    "min_return_rel_pct": 5.0,
+    "min_trade_rows": 30,
+    "min_trades_rel_pct": 5.0
+   },
+   "strategy": "S2",
+   "test_parallel": 1,
+   "test_years": [
+    2024,
+    2025,
+    2026
+   ],
+   "thresholds": {
+    "max_dd_mult": 1.5,
+    "max_oos_dd": null,
+    "min_folds": 2,
+    "min_oos_return": 0.0
+   },
+   "top_n": 2,
+   "train_start": "2020-01-01"
+  }
+ }
+}

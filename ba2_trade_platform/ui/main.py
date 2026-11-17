@@ -83,6 +83,12 @@ def market_analysis_detail_page(analysis_id: int) -> None:
     with layout_render(f'Market Analysis Detail'):
         market_analysis_detail.content(analysis_id)
 
+@ui.page('/style/ruleset/{ruleset_id}')
+def style_ruleset_view_page(ruleset_id: int) -> None:
+    logger.debug(f"[ROUTE] /style/ruleset/{ruleset_id} - Loading structure view")
+    with layout_render(f'Structure View - Ruleset {ruleset_id}'):
+        style_view.ruleset_content(ruleset_id)
+
 @ui.page('/style/{instance_id}')
 def style_view_page(instance_id: int) -> None:
     logger.debug(f"[ROUTE] /style/{instance_id} - Loading O_STYLE view")

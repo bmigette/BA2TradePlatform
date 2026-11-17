@@ -95,6 +95,23 @@ POPULATION="${POPULATION:-300}"
 WF_FIRST_GENERATIONS="${WF_FIRST_GENERATIONS:-30}"
 WF_NEXT_GENERATIONS="${WF_NEXT_GENERATIONS:-20}"
 WF_TOP_N="${WF_TOP_N:-3}"
+# Walk-forward plan and verdict. Unset = the grid as launched (2024-2026, 2 fold winners, 2026 required,
+# rank-1 verdict, chain seeding, one search per fold). PASS_REQUIRE_FOLD: comma list, or "none".
+WF_TEST_YEARS="${WF_TEST_YEARS:-2024,2025,2026}"
+PASS_MIN_FOLDS="${PASS_MIN_FOLDS:-2}"
+PASS_REQUIRE_FOLD="${PASS_REQUIRE_FOLD:-2026}"
+# Redesign 2026-11-17 (each adds a driver flag, and a cell-name token, only when not the default):
+#   WF_RESTARTS=K (searches per fold, best training fitness tested; K > 1 needs WF_CHAIN_SEED=0),
+#   WF_CHAIN_SEED=0 (every fold cold on WF_FIRST_GENERATIONS), WF_VERDICT=set-score + PASS_MIN_OOS_SCORE
+#   (every tested genome scored like the CAR fitness), WF_MIN_TRAIN_YEARS=Y (drop folds training < Y years).
+WF_RESTARTS="${WF_RESTARTS:-1}"
+WF_CHAIN_SEED="${WF_CHAIN_SEED:-1}"
+WF_VERDICT="${WF_VERDICT:-winner}"
+PASS_MIN_OOS_SCORE="${PASS_MIN_OOS_SCORE:-}"
+WF_MIN_TRAIN_YEARS="${WF_MIN_TRAIN_YEARS:-}"
+# Out-of-sample tests run at once per fold (--wf-test-parallel). 1 = one at a time, as launched; ~30
+# tests per fold at 1 take ~1.5 h. A positive integer.
+WF_TEST_PARALLEL="${WF_TEST_PARALLEL:-1}"
 EARLY_STOP="${EARLY_STOP:-5}"
 EARLY_STOP_MIN_REL="${EARLY_STOP_MIN_REL:-0.01}"
 SUFFIX_BASE="${SUFFIX_BASE:--goal2027}"
@@ -235,6 +252,7 @@ preflight() {
   case "${ESTIMATES_SOURCE:-}" in fmp|alphavantage) ;; *) echo "FATAL: ESTIMATES_SOURCE must be fmp or alphavantage" >&2; exit 2 ;; esac
   for s in $STEPS; do case " $ALL_STEPS " in *" $s "*) ;; *) echo "FATAL: unknown step $s (known: $ALL_STEPS)" >&2; exit 2 ;; esac; done
   ds_weight_args >/dev/null || exit 2
+  wf_plan_args || exit 2
   check_checkout || exit 1
   check_home || exit 1
   check_venv || exit 1
@@ -289,6 +307,39 @@ ds_weight_args() {
   esac
 }
 
+# The walk-forward settings as driver flags: --pass-require-fold ones into WF_REQ, the redesign ones
+# into WF_ARGS (empty when unset). Validates every variable (returns 2 with the reason): a typo must
+# refuse the grid, never run it on a default.
+wf_plan_args() {
+  WF_REQ=(); WF_ARGS=()
+  local y
+  case "$WF_TEST_YEARS" in ''|*[!0-9,]*) echo "FATAL: WF_TEST_YEARS must be a comma list of years, got '$WF_TEST_YEARS'" >&2; return 2 ;; esac
+  case "$PASS_MIN_FOLDS" in ''|*[!0-9]*|0) echo "FATAL: PASS_MIN_FOLDS must be an integer >= 1, got '$PASS_MIN_FOLDS'" >&2; return 2 ;; esac
+  case "$PASS_REQUIRE_FOLD" in
+    none) ;;
+    *) for y in ${PASS_REQUIRE_FOLD//,/ }; do
+         case "$y" in [12][0-9][0-9][0-9]) WF_REQ+=(--pass-require-fold "$y") ;;
+           *) echo "FATAL: PASS_REQUIRE_FOLD must be a comma list of years or 'none', got '$PASS_REQUIRE_FOLD'" >&2; return 2 ;; esac
+       done ;;
+  esac
+  case "$WF_RESTARTS" in ''|*[!0-9]*|0) echo "FATAL: WF_RESTARTS must be an integer >= 1, got '$WF_RESTARTS'" >&2; return 2 ;; esac
+  case "$WF_CHAIN_SEED" in
+    1) [ "$WF_RESTARTS" = 1 ] || { echo "FATAL: WF_RESTARTS=$WF_RESTARTS needs WF_CHAIN_SEED=0" >&2; return 2; } ;;
+    0) WF_ARGS+=(--wf-no-chain-seed) ;;
+    *) echo "FATAL: WF_CHAIN_SEED must be 1 (seed fold k+1 from fold k) or 0, got '$WF_CHAIN_SEED'" >&2; return 2 ;;
+  esac
+  [ "$WF_RESTARTS" = 1 ] || WF_ARGS+=(--wf-restarts "$WF_RESTARTS")
+  case "$WF_VERDICT" in
+    winner) [ -z "$PASS_MIN_OOS_SCORE" ] || { echo "FATAL: PASS_MIN_OOS_SCORE needs WF_VERDICT=set-score" >&2; return 2; } ;;
+    set-score) [ -n "$PASS_MIN_OOS_SCORE" ] || { echo "FATAL: WF_VERDICT=set-score requires PASS_MIN_OOS_SCORE (no default)" >&2; return 2; }
+               WF_ARGS+=(--wf-verdict set-score --pass-min-oos-score "$PASS_MIN_OOS_SCORE") ;;
+    *) echo "FATAL: WF_VERDICT must be winner or set-score, got '$WF_VERDICT'" >&2; return 2 ;;
+  esac
+  [ -z "$WF_MIN_TRAIN_YEARS" ] || WF_ARGS+=(--wf-min-train-years "$WF_MIN_TRAIN_YEARS")
+  case "$WF_TEST_PARALLEL" in ''|*[!0-9]*|0*) echo "FATAL: WF_TEST_PARALLEL must be an integer >= 1, got '$WF_TEST_PARALLEL'" >&2; return 2 ;; esac
+  return 0
+}
+
 # ------------------------------------------------------------------------------------------- one step
 run_step() {                      # $1 = step id; $2 = "dry" for --dry-run
   local step="$1" dry="${2:-}" kind="${1%%-*}" band="${1#*-}" late=""
@@ -301,19 +352,20 @@ run_step() {                      # $1 = step id; $2 = "dry" for --dry-run
   local end; end="$(data_end)"
   local dsw
   local sp st; sp="$(spread_for "$band")"; st="$(stress_for "$band")"
+  wf_plan_args || return 2
   local args=(--bands "$band" --skip-experts "$(skip_all_but "$expert")"
       --start "$TRAIN_START" --fitness "$FITNESS" --interval "$INTERVAL" --store "$STORE"
       --spread-bps "$sp" --stress-spread-bps "$st"
       --population "$POPULATION" --no-budget-overrides
       --early-stop "$EARLY_STOP" --early-stop-min-rel "$EARLY_STOP_MIN_REL"
       --robust-fitness --parallel "$PARALLEL"
-      --walk-forward --wf-defer-last-test --wf-train-start "$TRAIN_START" --wf-test-years 2024,2025,2026
+      --walk-forward --wf-defer-last-test --wf-train-start "$TRAIN_START" --wf-test-years "$WF_TEST_YEARS"
       --wf-first-generations "$WF_FIRST_GENERATIONS" --wf-next-generations "$WF_NEXT_GENERATIONS"
-      --wf-top-n "$WF_TOP_N" --wf-report-dir "$WF_REPORT_DIR" --wf-test-parallel 1
+      --wf-top-n "$WF_TOP_N" --wf-report-dir "$WF_REPORT_DIR" --wf-test-parallel "$WF_TEST_PARALLEL"
       --pass-min-oos-return 0 --pass-min-oos-return-exclusive
       --pass-max-dd-mult "$PASS_DD_MULT" --pass-max-oos-dd "$PASS_MAX_OOS_DD"
       --wf-name-pass-max-dd-mult 1.5
-      --pass-min-folds 2 --pass-require-fold 2026)
+      --pass-min-folds "$PASS_MIN_FOLDS" ${WF_REQ[@]+"${WF_REQ[@]}"} ${WF_ARGS[@]+"${WF_ARGS[@]}"})
   [ -n "$end" ] && args+=(--wf-data-end "$end")
   [ -n "$WORKERS" ] && args+=(--workers "$WORKERS")
   args+=(--estimates-source "$ESTIMATES_SOURCE")
@@ -377,6 +429,7 @@ cmd_run() {                        # $1 = "dry" for a dry run
   echo "=== checkout $REPO_ROOT ($(git rev-parse --short HEAD 2>/dev/null))  python $PY  BA2_HOME ${BA2_HOME:-(default)}"
   echo "=== workers: ${WORKERS:-local-only}  local parallel: $PARALLEL  remote slots: $BA2_MAX_REMOTE_SLOTS"
   echo "=== steps: $STEPS"
+  echo "=== walk-forward: test years $WF_TEST_YEARS, top-n $WF_TOP_N, generations $WF_FIRST_GENERATIONS/$WF_NEXT_GENERATIONS, restarts $WF_RESTARTS, chain seed $WF_CHAIN_SEED, verdict $WF_VERDICT${PASS_MIN_OOS_SCORE:+ > $PASS_MIN_OOS_SCORE}${WF_MIN_TRAIN_YEARS:+, min train years $WF_MIN_TRAIN_YEARS}, test parallel $WF_TEST_PARALLEL"
   echo "=== reports: $WF_REPORT_DIR"
   echo "=================================================================="
   local s failed=""
@@ -500,7 +553,7 @@ case "$CMD" in
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
       local_env=()
-      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS BA2_RESUME_ACROSS_CODE_CHANGE; do
+      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS BA2_RESUME_ACROSS_CODE_CHANGE                WF_TEST_YEARS PASS_MIN_FOLDS PASS_REQUIRE_FOLD WF_RESTARTS WF_CHAIN_SEED WF_VERDICT PASS_MIN_OOS_SCORE WF_MIN_TRAIN_YEARS WF_TEST_PARALLEL; do
         [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
       done
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1
