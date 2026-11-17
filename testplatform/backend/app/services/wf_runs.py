@@ -178,7 +178,7 @@ def preflight(spec: C.CellSpec, L: Any = None) -> Dict[str, Any]:
     _launcher_refusal(L._resolve_estimates_source, SimpleNamespace(estimates_source=source),
                       "walk-forward")
     deferred = C.deferred_fold(folds, spec.data_end, spec.defer_last_test)
-    jobs = [WF.train_job_name(spec.name, f.index) for f in folds]
+    jobs = [n for f in folds for n in plan.restart_names(f)]       # every restart's job (1: the fold's)
     if spec.strategy:
         for f in folds:
             _launcher_refusal(L._assert_option_window_excludes_holdout, [spec.strategy],
@@ -187,7 +187,7 @@ def preflight(spec: C.CellSpec, L: Any = None) -> Dict[str, Any]:
             _launcher_refusal(L._assert_option_window_excludes_holdout, [spec.strategy],
                               C.refit_window(folds)[1].isoformat())
     if spec.refit:
-        jobs.append(C.refit_job_name(spec.name))
+        jobs += [C.refit_restart_name(spec.name, j) for j in range(1, spec.restarts + 1)]
     for job in jobs:
         _launcher_refusal(L._refuse_reused_estimates_source_name, job, source, "walk-forward")
     return {

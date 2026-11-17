@@ -18,6 +18,13 @@ with data ending before the last test year, wf1/wf2 run whole and wf3 is only TR
 PENDING); the same command with the full data later finds every train job completed and only runs
 wf3's test, the verdict and the refit. A cell that can no longer pass stops early (FAIL, the
 ``eliminated`` block) unless ``run_all_folds``.
+
+Redesign 2026-11-17 (``CellSpec`` defaults = the chain above, files and names unchanged):
+``chain_seed=False`` starts every fold and the refit cold on ``first_generations``; ``restarts=K``
+trains K searches per fold and per refit (``<job>``, ``<job>-r2``, ...) and tests the one with the
+best training fitness (needs ``chain_seed=False``); ``verdict_mode="set-score"`` judges the cell on
+every tested genome (``walk_forward.set_score`` > ``min_oos_score``; every fold runs);
+``min_train_years`` drops folds whose training is shorter (``short_train_folds``).
 """
 from __future__ import annotations
 
