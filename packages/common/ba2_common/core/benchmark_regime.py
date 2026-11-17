@@ -16,8 +16,8 @@ ONE RULE, TWO CALLERS (backtest == live):
 * BACKTEST -> :class:`BenchmarkRegimeCalendar`, the same arithmetic precomputed once for a whole
            run; ``tests/test_benchmark_regime.py`` asserts it equals the pure function for EVERY day.
 
-The host publishes the regime once per bar through the process-global seam below (same rationale as
-``regime_overlay``: the value is market-wide, and each GA trial has its own process). The overlay's
+The host publishes the regime once per bar through the seam below (same storage as ``regime_overlay``:
+the backtest's own run scope, process-global in live; see ``market_state_scope``). The overlay's
 ``set_stressed`` / ``StressedCalendar`` are deliberately left untouched so overlay results cannot move.
 An unknown regime (too little history, no SPY data, nothing published) NEVER passes a gate, and says
 why -- the condition reads :func:`get_benchmark_regime_failure` and the ``*_reason`` fields.
@@ -29,6 +29,7 @@ from datetime import date, datetime
 from typing import Any, List, Optional, Sequence, Tuple
 
 from ba2_common.core import market_regime as mr
+from ba2_common.core.market_state_scope import current_run_state
 from ba2_common.core.regime_overlay import _as_date
 
 BENCHMARK_SYMBOL = "SPY"
@@ -218,6 +219,8 @@ class BenchmarkRegimeCalendar:
 
 # ---------------------------------------------------------------------------------------------
 # Per-bar publish/read seam. Default None = "nothing published" -> every gate fails closed.
+# Stored in the current backtest's run scope when one is open (``market_state_scope``: concurrent
+# backtest threads never read each other's bar), else process-global (live).
 # ---------------------------------------------------------------------------------------------
 _REGIME_NOW: Optional[BenchmarkRegime] = None
 _FAILURE_NOW: Optional[str] = None
@@ -226,27 +229,46 @@ _FAILURE_NOW: Optional[str] = None
 def set_benchmark_regime(regime: Optional[BenchmarkRegime]) -> None:
     """Publish this bar's regime (``None`` = nothing known)."""
     global _REGIME_NOW
+    run = current_run_state()
+    if run is not None:
+        run.benchmark_regime = regime
+        return
     _REGIME_NOW = regime
 
 
 def get_benchmark_regime() -> Optional[BenchmarkRegime]:
     """This bar's published regime, or None when nothing has been published."""
+    run = current_run_state()
+    if run is not None:
+        return run.benchmark_regime
     return _REGIME_NOW
 
 
 def set_benchmark_regime_failure(reason: Optional[str]) -> None:
     """Live: record why the regime could not be computed (fetch failure), so a gate can say why."""
     global _FAILURE_NOW
+    run = current_run_state()
+    if run is not None:
+        run.benchmark_failure = reason
+        return
     _FAILURE_NOW = reason
 
 
 def get_benchmark_regime_failure() -> Optional[str]:
+    run = current_run_state()
+    if run is not None:
+        return run.benchmark_failure
     return _FAILURE_NOW
 
 
 def reset_benchmark_regime() -> None:
     """Clear the regime AND the failure. Call between runs so one trial cannot inherit another's bar."""
     global _REGIME_NOW, _FAILURE_NOW
+    run = current_run_state()
+    if run is not None:
+        run.benchmark_regime = None
+        run.benchmark_failure = None
+        return
     _REGIME_NOW = None
     _FAILURE_NOW = None
 

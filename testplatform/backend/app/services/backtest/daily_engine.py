@@ -74,9 +74,10 @@ from ba2_common.core.types import (
 from ba2_common.core.OptionRiskManagement import (
     option_risk_manager_enabled, update_sleeve_breaker,
 )
-from ba2_common.core.benchmark_regime import reset_benchmark_regime, set_benchmark_regime
+from ba2_common.core.benchmark_regime import set_benchmark_regime
+from ba2_common.core.market_state_scope import run_market_state_scope
 from ba2_common.core.TradeConditions import reset_finished_measure_memo
-from ba2_common.core.regime_overlay import reset_stressed, set_stressed
+from ba2_common.core.regime_overlay import set_stressed
 from ba2_common.logger import logger
 
 from app.services.backtest.entry_gate_bt import EntryGateRecord
@@ -749,7 +750,18 @@ class DailyBacktestEngine:
         Task 4 returns a minimal results payload (equity_history + filled trades) so the
         loop is independently testable; Task 5's ``build_results`` consumes the SAME account
         (``get_balance_history``/``get_filled_trades``) to produce the final metrics blob.
+
+        The per-bar market regime (``set_stressed`` / ``set_benchmark_regime``) is published into
+        THIS run's own scope (``market_state_scope``), never the process-global: the serve master
+        runs backtests as threads of one process, and a shared seam let one run size, validate and
+        gate on another run's bar. Live (no scope) keeps the global. A fresh scope holds nothing
+        published, so no run can inherit a previous or concurrent run's last bar.
         """
+        with run_market_state_scope():
+            return self._run_in_scope()
+
+    def _run_in_scope(self) -> Dict[str, Any]:
+        """The bar loop of :meth:`run`, inside the run's market-state scope."""
         # Determinism: seed BEFORE any decision so a run is byte-reproducible.
         random.seed(self.seed)
         np.random.seed(self.seed & 0xFFFFFFFF)
@@ -775,10 +787,8 @@ class DailyBacktestEngine:
         self._check_regime_calendar()
         self._warn_benchmark_warmup()
         self._validate_schedules_once()
-        # Start from a clean regime even if a PREVIOUS trial in this worker died mid-loop and
-        # never reached its own reset.
-        reset_stressed()
-        reset_benchmark_regime()
+        # The regime starts clean by construction (a fresh run scope, see run()); the measure memo
+        # is cleared in case a PREVIOUS trial in this worker died mid-loop before its own reset.
         reset_finished_measure_memo()
 
         self._assert_daily_reads_are_clamped()
@@ -1086,11 +1096,8 @@ class DailyBacktestEngine:
                 _k = _bisect.bisect_right(analysis_idx, i)
                 i = analysis_idx[_k] if _k < len(analysis_idx) else n_days
 
-        # The published regime is PROCESS-global (one market, one regime) and the GA reuses a
-        # worker across individuals -- clear it so the next trial cannot inherit this run's last
-        # bar before its own first set_stressed.
-        reset_stressed()
-        reset_benchmark_regime()
+        # The published regime lives in this run's scope and ends with it (run()); the measure memo
+        # is process-wide and the GA reuses a worker across individuals -- clear it.
         reset_finished_measure_memo()
         # Task 13: the same ledger check once more at run end (open_at_end rows are priced from
         # the transactions, the final equity from the ledger).
