@@ -36,6 +36,8 @@ import bisect
 from datetime import date, datetime
 from typing import Any, List, Optional, Sequence, Tuple
 
+from ba2_common.core.market_state_scope import current_run_state
+
 # Neutral value for every scale. Inside the GA range, so `enabled=1, scale=1.0` must score
 # identically to `enabled=0` -- that equality doubles as a leak check (see the design doc).
 NEUTRAL_SCALE = 1.0
@@ -59,8 +61,10 @@ _DOWNTREND_SIBLING = {"regime_risk_scale": "downtrend_risk_scale",
 #   backtest -> the daily engine, at the top of each bar, from the SIMULATED clock
 #   live     -> TradeManager, on each refresh
 #
-# Process-global is sound precisely BECAUSE the value is global: one market, one regime, and each
-# GA trial runs in its own process. Default None = "not classified" = neutral, so anything that
+# WHERE IT IS STORED (``market_state_scope``): a backtest publishes into its OWN run scope, so
+# backtests running as threads of one process (the test platform's serve master) never read each
+# other's bar; outside any run scope -- live -- it is the process-global, shared by the publishing
+# thread and every reader thread. Default None = "not classified" = neutral, so anything that
 # forgets to publish degrades to today's behaviour rather than to a wrong multiplier.
 # ---------------------------------------------------------------------------------------------
 _STRESSED_NOW: Optional[bool] = None
@@ -69,17 +73,30 @@ _STRESSED_NOW: Optional[bool] = None
 def set_stressed(value: Optional[bool]) -> None:
     """Publish this bar's regime. ``None`` means unclassified (insufficient benchmark history)."""
     global _STRESSED_NOW
-    _STRESSED_NOW = None if value is None else bool(value)
+    value = None if value is None else bool(value)
+    run = current_run_state()
+    if run is not None:
+        run.stressed = value
+        return
+    _STRESSED_NOW = value
 
 
 def get_stressed() -> Optional[bool]:
-    """This bar's published regime, or None when nothing has been published."""
+    """This bar's published regime, or None when nothing has been published (in this run, inside a
+    run scope; process-wide outside one)."""
+    run = current_run_state()
+    if run is not None:
+        return run.stressed
     return _STRESSED_NOW
 
 
 def reset_stressed() -> None:
     """Clear the published regime. Call between runs so one trial cannot inherit another's bar."""
     global _STRESSED_NOW
+    run = current_run_state()
+    if run is not None:
+        run.stressed = None
+        return
     _STRESSED_NOW = None
 
 

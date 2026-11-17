@@ -536,7 +536,7 @@ def test_the_engine_bar_head_runs_the_rekey_pass():
     book -- so the ex-date's marks, quotes and exit rules all see the adjusted contract."""
     import inspect
     from app.services.backtest import daily_engine
-    src = inspect.getsource(daily_engine.DailyBacktestEngine.run)
+    src = inspect.getsource(daily_engine.DailyBacktestEngine._run_in_scope)  # the bar loop of run()
     clock = src.index("self.price.set_clock(as_of_dt)")
     rekey = src.index("apply_split_rekeys()")
     experts = src.index("for expert, expert_id, settings, ruleset_id in self.experts")
