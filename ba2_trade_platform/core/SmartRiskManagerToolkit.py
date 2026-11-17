@@ -2370,8 +2370,12 @@ class SmartRiskManagerToolkit:
             # Check position size limits and adjust if necessary
             settings = self.expert.settings
             max_position_pct = self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
-            max_position_value = virtual_equity * (max_position_pct / 100.0)
-            
+            # The cap the account's pre-submit validation enforces (regime overlay included):
+            # one function, so an order adjusted here is never refused at submit for the cap.
+            from ba2_common.core.per_instrument_cap import per_instrument_cap
+            max_position_value = per_instrument_cap(
+                self.expert, virtual_equity, max_position_pct).value
+
             original_quantity = quantity
             quantity_was_adjusted = False
             

@@ -760,6 +760,47 @@ def test_the_transaction_is_found_when_only_the_ROW_carries_its_id(file_db):
         assert s.get(Transaction, txn.id).status == TransactionStatus.FAILED
 
 
+def test_live_compensation_is_the_shared_function_the_backtest_calls(file_db):
+    """2026-11-17: the body of ``_fail_unsent_entry`` moved to ``trade_cycle.fail_unsent_entry`` so
+    the backtest engine ends a refused entry the SAME way (it used to leave it PENDING and fill it).
+    The live wrapper must delegate to that one function with its own logger, and the full live
+    ending -- entry CANCELED, WAITING_TRIGGER leg CANCELED, WAITING transaction FAILED -- is
+    unchanged (every other test in this block pins one rule of it)."""
+    from unittest.mock import patch
+
+    from ba2_common.core import trade_cycle
+    from ba2_trade_platform.core import TradeManager as tm_module
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+
+    assert tm_module.fail_unsent_entry is trade_cycle.fail_unsent_entry
+
+    acct = factories.create_account_definition(provider="MockAccount")
+    txn = factories.create_transaction(symbol="WSC", status=TransactionStatus.WAITING)
+    order = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=7.0, status=OrderStatus.PENDING,
+        transaction_id=txn.id)
+    leg = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=7.0, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_STOP, stop_price=90.0, status=OrderStatus.WAITING_TRIGGER,
+        transaction_id=txn.id, depends_on_order=order.id,
+        depends_order_status_trigger=OrderStatus.FILLED)
+
+    manager = get_trade_manager()
+    calls = []
+
+    def _spy(o, reason, *, log=None):
+        calls.append((o.id, reason, log))
+        return trade_cycle.fail_unsent_entry(o, reason, log=log)
+
+    with patch.object(tm_module, "fail_unsent_entry", _spy):
+        assert manager._fail_unsent_entry(order, "submit raised") is True
+    assert calls == [(order.id, "submit raised", manager.logger)]
+    with get_db() as s:
+        assert s.get(TradingOrder, order.id).status == OrderStatus.CANCELED
+        assert s.get(TradingOrder, leg.id).status == OrderStatus.CANCELED
+        assert s.get(Transaction, txn.id).status == TransactionStatus.FAILED
+
+
 def test_a_washtrade_expiry_still_cancels_order_legs_and_transaction(file_db):
     """The other caller of the extracted tail — behaviour must be unchanged."""
     from ba2_trade_platform.core.TradeManager import get_trade_manager

@@ -2261,12 +2261,19 @@ class IncreaseInstrumentShareAction(TradeAction):
                     message=message,
                     data={}
                 )
-            if self.target_percent > max_percent_per_instrument:
-                logger.warning(f"Target percent {self.target_percent}% exceeds max allowed {max_percent_per_instrument}%. Using max.")
-                self.target_percent = max_percent_per_instrument
-            
-            # Calculate target position value
-            target_value = virtual_equity * (self.target_percent / 100.0)
+            # THE per-instrument cap -- the one the classic RM sizes against and the account's
+            # pre-submit validation enforces (per_instrument_cap; regime overlay included). An
+            # increase sized past it would be refused at submit in a stressed bar at a scale < 1.
+            from ba2_common.core.per_instrument_cap import per_instrument_cap
+            cap = per_instrument_cap(expert, virtual_equity, max_percent_per_instrument)
+            max_allowed_percent = max_percent_per_instrument * cap.regime_scale
+            if self.target_percent > max_allowed_percent:
+                logger.warning(f"Target percent {self.target_percent}% exceeds max allowed {max_allowed_percent}%. Using max.")
+                self.target_percent = max_allowed_percent
+
+            # Calculate target position value (never above the cap itself: the percent above is
+            # the same ceiling, but its product can differ from the cap's in the last bit)
+            target_value = min(virtual_equity * (self.target_percent / 100.0), cap.value)
 
             # Get expert's own position (not broker total which includes other experts).
             # A FAILED read refuses: read as 0.0 it re-bought the full target on top of
