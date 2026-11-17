@@ -192,3 +192,37 @@ def test_the_index_closes_memo_is_not_served_across_sources():
     other = ds_data.fetch_index_closes(_run_provider(_OtherSourceInner(), *window), as_of,
                                        index_symbol=SYMBOL)
     assert other.iloc[-1] == pytest.approx(2.0 * first.iloc[-1])
+
+
+def test_a_later_run_ending_earlier_reuses_the_frame_without_look_ahead():
+    """The other direction: the cached frame (declared end 2023-12-31) reaches PAST a later run's own
+    window end (2021-12-31). Same process, same source: the frame is reused -- no refetch -- and every
+    decision is still cut at its knowable daily end, so no bar after the decision reaches the
+    indicators. Proven three ways per decision: the slice ends at the decision, the indicators read off
+    the memoised FULL-frame series equal the ones rebuilt from the slice alone, and both equal a fresh
+    process whose frame physically ends at 2021-12-31."""
+    inner = _Inner()
+    decisions = [datetime(2021, 3, 1), datetime(2021, 7, 1), datetime(2021, 12, 30)]
+    long_job = _run_provider(inner, datetime(2019, 1, 1), datetime(2023, 12, 31))
+    ds_data.fetch_ohlcv(long_job, SYMBOL, decisions[0])
+    fingerprint = ds_data.frame_view(SYMBOL).fingerprint
+    assert ds_data.frame_view(SYMBOL).frame["Date"].max() > pd.Timestamp("2023-01-01")
+
+    short_job = _run_provider(inner, datetime(2019, 1, 1), datetime(2021, 12, 31))
+    reused = {}
+    for d in decisions:
+        df = ds_data.fetch_ohlcv(short_job, SYMBOL, d)
+        assert pd.Timestamp(df["Date"].max()) <= pd.Timestamp(d), "a bar after the decision is visible"
+        assert ds_data.frame_view(SYMBOL).fingerprint == fingerprint, "the covering frame was refetched"
+        memoised = _score(df)
+        assert memoised == technical_score(df, {}, view=None), (
+            "the memoised full-frame indicators differ from the slice's own: look-ahead")
+        reused[d] = (df, memoised)
+    assert inner.calls == 1
+
+    ds_data.reset_caches()
+    ps_mod.clear_ohlcv_memo()
+    for d in decisions:
+        fresh_df = ds_data.fetch_ohlcv(short_job, SYMBOL, d)
+        pd.testing.assert_frame_equal(reused[d][0], fresh_df)
+        assert reused[d][1] == _score(fresh_df)

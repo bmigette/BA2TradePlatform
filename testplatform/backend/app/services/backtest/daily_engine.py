@@ -512,6 +512,16 @@ def _recommendation_to_expert_recommendation(
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
+def refused_entries_result(engine: Any) -> Optional[Dict[str, Any]]:
+    """``results["refused_entries"]`` for a finished run: every funded entry the account refused at
+    submit (cancelled, as live), or None when there were none -- so a run without a refusal keeps
+    exactly the results it had."""
+    refused = engine.refused_entries
+    if not refused:
+        return None
+    return {"count": len(refused), "first": refused[:20]}
+
+
 class DailyBacktestEngine:
     """Daily multi-asset simulator driving the real ba2trade order path.
 
@@ -2404,6 +2414,9 @@ class DailyBacktestEngine:
 
         for order in updated_orders:
             if order.quantity and order.quantity > 0:
+                # The try decides "refused or not, and why"; the compensation runs ONCE, after it
+                # (see _size_and_submit_candidates).
+                refused: Optional[str] = None
                 try:
                     # Effective protective stop: shared TIGHTER-WINS reconciliation of the RULESET
                     # entry-bracket SL (on the transaction) vs the RM SAFEGUARD (order.stop_price,
@@ -2430,15 +2443,16 @@ class DailyBacktestEngine:
                             order, (txn.stop_loss if txn else None), safeguard, sl_price,
                             lambda: self.account.get_instrument_current_price(order.symbol))
                     else:
-                        self._fail_refused_entry(
-                            order, f"the sized order {order.id} submit returned nothing", as_of_dt)
+                        refused = f"the sized order {order.id} submit returned nothing"
                 except Exception as e:  # noqa: BLE001
                     _reraise_option_basis_refusal(e)
                     self._log(f"submit_order failed for order {order.id}: {e}")
+                    refused = f"submit raised for order {order.id}: {e}"
+                if refused is not None:
                     # The RM pass sized a PERSISTED order: refused, it must not stay PENDING and
-                    # fillable (same ending as the candidate path and as live).
-                    self._fail_refused_entry(order, f"submit raised for order {order.id}: {e}",
-                                             as_of_dt)
+                    # fillable (same ending as the candidate path and as live). Outside the try: a
+                    # compensation that raises stops the run instead of being read as a refusal.
+                    self._fail_refused_entry(order, refused, as_of_dt)
 
     def _size_and_submit_candidates(self, expert_id: int, candidates: List[Any],
                                     as_of: datetime) -> bool:
@@ -2471,9 +2485,13 @@ class DailyBacktestEngine:
             if entry is None or not (cand.quantity and cand.quantity > 0):
                 continue
             _cand, evaluator, symbol, _rec = entry
-            # Per iteration, BEFORE the try: the handler compensates `order`, and a name left bound
-            # by the previous symbol would cancel the wrong entry (same rule as the live loop).
+            # Per iteration, BEFORE the try: the compensation below acts on `order`, and a name left
+            # bound by the previous symbol would cancel the wrong entry (same rule as the live loop).
+            # The try decides only "refused or not, and why"; the compensation runs ONCE, after it,
+            # so a compensation that itself raises propagates (a run that cannot cancel a refused
+            # order must stop) instead of being caught here and attempted a second time.
             order = None
+            refused: Optional[str] = None
             try:
                 # Persist the real order + transaction + TP/SL bracket (execute is byte-identical to
                 # the old flow; we just call it ONLY for funded symbols now).
@@ -2510,14 +2528,14 @@ class DailyBacktestEngine:
                         order, (txn.stop_loss if txn else None), safeguard, sl_price,
                         lambda: self.account.get_instrument_current_price(order.symbol))
                 else:
-                    self._fail_refused_entry(order, f"the funded entry submit for {symbol} "
-                                                    f"returned nothing", as_of)
+                    refused = f"the funded entry submit for {symbol} returned nothing"
             except Exception as e:  # noqa: BLE001
                 _reraise_option_basis_refusal(e)
                 self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                if order is not None:
-                    self._fail_refused_entry(order, f"submit raised for {symbol}: {e}", as_of)
-                continue
+                refused = f"submit raised for {symbol}: {e}"
+            # `order` is None when execute() itself failed: nothing persisted, nothing to cancel.
+            if refused is not None and order is not None:
+                self._fail_refused_entry(order, refused, as_of)
         return created_any
 
     def _fail_refused_entry(self, order: Any, reason: str, as_of: Optional[datetime]) -> None:

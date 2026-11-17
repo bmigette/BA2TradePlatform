@@ -89,10 +89,12 @@ def _store_mode(monkeypatch, inmem: str) -> None:
 
 
 def _run(*, run_id, inmem, settings, buy_on=None, regime_calendar=None, refuse_on=frozenset(),
-         probe=None, entry_sl_pct=-20.0):
+         probe=None, entry_sl_pct=-20.0, empty_submit_on=frozenset()):
     """Full ``engine.run()``. ``refuse_on``: decision dates on which the account's validation
     refuses every entry (a refusal at submit, whatever its cause). ``probe(account)`` runs inside
-    the run's DB context after the run. ``entry_sl_pct``: a ruleset entry stop (never reached on the
+    the run's DB context after the run. ``empty_submit_on``: decision dates on which the account's
+    ``submit_order`` returns None for an entry without doing anything (the other refusal shape).
+    ``entry_sl_pct``: a ruleset entry stop (never reached on the
     flat bars) -- with it the entry's Transaction exists BEFORE the submit, which is what makes the
     account's per-instrument check run on it (as on every real ruleset with an entry bracket); None
     runs the bare enter-long ruleset (the transaction is created by the submit itself).
@@ -100,7 +102,7 @@ def _run(*, run_id, inmem, settings, buy_on=None, regime_calendar=None, refuse_o
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
         backtest_trading_db, seed_account_definition, seed_expert_instance)
-    from app.services.backtest.daily_engine import DailyBacktestEngine
+    from app.services.backtest.daily_engine import DailyBacktestEngine, refused_entries_result
     from app.services.backtest.default_rulesets import seed_enter_long_ruleset, seed_ruleset_from_tree
     from app.services.backtest.price_source import AsOfPriceSource
     from app.services.backtest.seam_wiring import wire_backtest_seams
@@ -138,6 +140,17 @@ def _run(*, run_id, inmem, settings, buy_on=None, regime_calendar=None, refuse_o
                 return real_validate(order, is_closing_order=is_closing_order)
 
             account._validate_trading_order = _validate
+        if empty_submit_on:
+            real_submit = account.submit_order
+
+            def _submit(order, *a, **k):
+                if (order.depends_on_order is None and not k.get("is_closing_order")
+                        and ps.now().date() in empty_submit_on):
+                    refusals.append((ps.now().date(), order.symbol, order.quantity))
+                    return None
+                return real_submit(order, *a, **k)
+
+            account.submit_order = _submit
         resolver.register_account(account_id, account)
         expert = _StubExpert(expert_id, ps, buy_on=buy_on)
         expert.save_settings({
@@ -176,6 +189,7 @@ def _run(*, run_id, inmem, settings, buy_on=None, regime_calendar=None, refuse_o
             "transactions": sorted(t.status.value for t in trade_store.transactions_where()),
             "refusals": refusals,
             "refused_entries": [(r["symbol"], r["cancelled"]) for r in engine.refused_entries],
+            "results_record": refused_entries_result(engine),
         }
         if probe is not None:
             outcome["probe"] = probe(account, expert_id)
@@ -312,3 +326,47 @@ def test_both_trade_stores_produce_the_same_trades_after_a_refusal(monkeypatch):
     assert runs["1"]["orders"] == runs["0"]["orders"]
     assert runs["1"]["trades"] == runs["0"]["trades"]
     assert runs["1"]["equity"] == runs["0"]["equity"]
+
+
+# --------------------------------------------------------------------------- #
+# one refusal, one compensation, one record -- whatever shape the refusal takes
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("shape", ["raised", "returned-nothing"])
+def test_a_refusal_is_recorded_exactly_once_in_the_results(monkeypatch, shape):
+    _store_mode(monkeypatch, "1")
+    day = FLAT[0][0]
+    out = _run(run_id=670 + (0 if shape == "raised" else 1), inmem="1", settings=NOTIONAL,
+               buy_on={day}, **({"refuse_on": {day}} if shape == "raised" else {"empty_submit_on": {day}}))
+    assert len(out["refusals"]) == 1
+    assert out["refused_entries"] == [("AAPL", True)]
+    record = out["results_record"]
+    assert record["count"] == 1 and len(record["first"]) == 1, record
+    assert [s for (s, _q, _f, _t) in out["entries"]] == ["canceled"]
+
+
+@pytest.mark.parametrize("shape", ["raised", "returned-nothing"])
+def test_a_compensation_that_raises_stops_the_run_after_one_attempt(monkeypatch, shape):
+    """A run that cannot cancel a refused order must stop, loudly -- and the compensation runs ONCE:
+    it is decided outside the submit's try, so its own failure is never mistaken for a refusal."""
+    from ba2_common.core import trade_cycle
+
+    attempts = []
+
+    def _broken(order, reason, *, log=None):
+        attempts.append(order.id)
+        raise RuntimeError("the store refused the cancel")
+
+    monkeypatch.setattr(trade_cycle, "fail_unsent_entry", _broken)
+    _store_mode(monkeypatch, "1")
+    day = FLAT[0][0]
+    with pytest.raises(RuntimeError, match="the store refused the cancel"):
+        _run(run_id=680 + (0 if shape == "raised" else 1), inmem="1", settings=NOTIONAL,
+             buy_on={day}, **({"refuse_on": {day}} if shape == "raised" else {"empty_submit_on": {day}}))
+    assert len(attempts) == 1, f"the compensation ran {len(attempts)} times"
+
+
+def test_no_refusal_publishes_no_record(monkeypatch):
+    _store_mode(monkeypatch, "1")
+    out = _run(run_id=690, inmem="1", settings=NOTIONAL, buy_on={FLAT[0][0]})
+    assert out["results_record"] is None
