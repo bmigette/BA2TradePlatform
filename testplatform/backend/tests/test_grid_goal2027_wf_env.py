@@ -39,7 +39,7 @@ def test_unset_settings_launch_exactly_the_old_argv(tmp_path, key):
 
 def test_stating_the_defaults_explicitly_changes_nothing(tmp_path):
     env = {"WF_TEST_YEARS": "2024,2025,2026", "PASS_MIN_FOLDS": "2", "PASS_REQUIRE_FOLD": "2026",
-           "WF_RESTARTS": "1", "WF_CHAIN_SEED": "1", "WF_VERDICT": "winner"}
+           "WF_RESTARTS": "1", "WF_CHAIN_SEED": "1", "WF_VERDICT": "winner", "WF_TEST_PARALLEL": "1"}
     rc, argv, err = run_step(str(tmp_path), "ds-large", env)
     assert rc == 0, err
     assert argv == GOLDEN["A:ds-large"]
@@ -94,6 +94,9 @@ def test_required_folds_are_a_list_or_none(tmp_path):
     ({"PASS_REQUIRE_FOLD": "last"}, "PASS_REQUIRE_FOLD"),
     ({"PASS_MIN_FOLDS": "x"}, "PASS_MIN_FOLDS"),
     ({"WF_TEST_YEARS": "2024 2025"}, "WF_TEST_YEARS"),
+    ({"WF_TEST_PARALLEL": "0"}, "WF_TEST_PARALLEL"),
+    ({"WF_TEST_PARALLEL": "four"}, "WF_TEST_PARALLEL"),
+    ({"WF_TEST_PARALLEL": "-2"}, "WF_TEST_PARALLEL"),
 ])
 def test_a_bad_setting_refuses_the_step(tmp_path, env, match):
     rc, argv, err = run_step(str(tmp_path), "ds-large", env)
@@ -106,7 +109,23 @@ def test_the_settings_travel_to_the_systemd_unit():
     names = set(line.split("for v in", 1)[1].split(";")[0].split())
     assert {"WF_TEST_YEARS", "PASS_MIN_FOLDS", "PASS_REQUIRE_FOLD", "WF_RESTARTS", "WF_CHAIN_SEED",
             "WF_VERDICT", "PASS_MIN_OOS_SCORE", "WF_MIN_TRAIN_YEARS", "WF_TOP_N",
-            "WF_FIRST_GENERATIONS", "WF_NEXT_GENERATIONS"} <= names
+            "WF_FIRST_GENERATIONS", "WF_NEXT_GENERATIONS", "WF_TEST_PARALLEL"} <= names
+
+
+def test_the_out_of_sample_test_parallelism_reaches_the_driver(tmp_path):
+    """WF_TEST_PARALLEL (default 1 = the argv above) sets --wf-test-parallel and nothing else."""
+    rc, argv, err = run_step(str(tmp_path), "ds-large", {"WF_TEST_PARALLEL": "6"})
+    assert rc == 0, err
+    assert _all(argv, "--wf-test-parallel") == ["6"]
+    want = list(GOLDEN["A:ds-large"])
+    want[want.index("--wf-test-parallel") + 1] = "6"
+    assert argv == want
+
+
+def test_the_banner_shows_the_test_parallelism():
+    with open(SH, encoding="utf-8") as fh:
+        banner = next(ln for ln in fh.read().splitlines() if "=== walk-forward:" in ln)
+    assert "$WF_TEST_PARALLEL" in banner
 
 
 def test_preflight_validates_the_settings_before_launching():
