@@ -4685,8 +4685,17 @@ class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterf
                                 orders_match = False
                                 break
                             # The right price on the wrong SIZE is not "unchanged": an add or a
-                            # trim moves the position the leg has to cover.
-                            if (post_fill_qty is not None and order.parent_order_id is None
+                            # trim moves the position the leg has to cover. A leg of an OCO
+                            # container is sized by its container; a leg of an ENTRY's or
+                            # ADD's own complex order covers that order's shares only, so it
+                            # is measured too (a 5-share leg of an add to a 10-share position
+                            # with no stop of its own read as "already protected").
+                            sized_here = order.parent_order_id is None
+                            if not sized_here:
+                                leg_parent = session.get(TradingOrder, order.parent_order_id)
+                                sized_here = (leg_parent is not None and not
+                                              TransactionHelper.is_resting_protection(leg_parent))
+                            if (post_fill_qty is not None and sized_here
                                     and (order.quantity is None
                                          or abs(float(order.quantity) - post_fill_qty) > 1e-9)):
                                 logger.debug(f"Exit order {order.id} covers {order.quantity}, "
@@ -5342,6 +5351,30 @@ class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterf
 
         return True
 
+    @staticmethod
+    def _buys_in_flight_behind_legs(session: Session, protection: list,
+                                    entry_order: TradingOrder) -> dict:
+        """``{order id: order}`` of every entry-side order still working at the broker whose
+        OWN complex-order leg is among ``protection``.
+
+        That is an ADD sent as an OTO/bracket, or the first entry itself while it is only
+        PARTIALLY_FILLED (RAPP 2026-10-29: 34 of 35 filled when its leg was cancelled). A
+        leg's parent counts when it is on the entry side and is not itself protection (an OCO
+        container is the parent of its legs too, and is never an entry)."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        in_flight = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
+                     | {OrderStatus.PARTIALLY_FILLED})
+        buys = {}
+        for leg in protection:
+            if leg.parent_order_id is None:
+                continue
+            parent = session.get(TradingOrder, leg.parent_order_id)
+            if (parent is not None and parent.status in in_flight
+                    and parent.side == entry_order.side
+                    and not TransactionHelper.is_resting_protection(parent)):
+                buys[parent.id] = parent
+        return buys
+
     def _handle_filled_entry_exit(
         self,
         session: Session,
@@ -5393,8 +5426,17 @@ class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterf
 
         # 2. No TP and no SL -> just cancel whatever is live; no standing exit order.
         #    (A leftover placeholder SELL would wash-trade-block new BUYs on the symbol.)
+        # A leg of a buy that is still working is never cancelled here: at Alpaca that cancels
+        # the buy itself (see 2b).
+        buys_in_flight = self._buys_in_flight_behind_legs(session, live_broker_orders, entry_order)
         if spec is None:
             for order in live_broker_orders:
+                if order.parent_order_id in buys_in_flight:
+                    logger.warning(
+                        f"Keeping leg {order.id} of order {order.parent_order_id}, which is still "
+                        f"working, although transaction {transaction.id} has no TP/SL: "
+                        f"cancelling the leg would cancel that order")
+                    continue
                 try:
                     self.cancel_order(order.id)
                     logger.info(f"Cancelled broker exit order {order.id} — transaction has no TP/SL")
@@ -5411,6 +5453,37 @@ class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterf
                 f"Not placing a {order_type.value} exit for transaction {transaction.id}: the "
                 f"position is {order_quantity} once its working orders fill -- nothing to protect")
             return False
+
+        # 2b. An ADD is in flight as a complex order (the OTO/bracket of the wash-trade escape)
+        #     and its own leg is among the live protection. Cancelling that leg cancels the
+        #     unfilled add at Alpaca: dev 2026-11-16, SOLS order 2400 / VRT order 2405 -- buy
+        #     and leg cancelled 2 ms apart, the replacement then waited for ever for shares
+        #     that never came, and the old stop was gone too. Same rule as the unfilled FIRST
+        #     entry (_handle_unfilled_entry_exit, RAPP 2026-10-29): nothing is cancelled now.
+        #     The replacement waits for the add to FILL; TradeManager then cancels the add's
+        #     leg and the position's other protection and submits it
+        #     (_rechain_behind_entry_legs). If the add dies, the replacement is dropped and
+        #     the protection left in place here keeps working.
+        if buys_in_flight:
+            pending_add = buys_in_flight[max(buys_in_flight)]
+            from ...core.TradeManager import PROTECTION_AFTER_ADD_KEY
+            waiting_exit = self._build_exit_order(
+                transaction, entry_order, spec,
+                quantity=order_quantity,
+                depends_on=pending_add.id,
+                trigger_status=OrderStatus.FILLED,
+                comment_suffix=f" (after add {pending_add.id} fills)"
+            )
+            waiting_exit.data = {**(waiting_exit.data or {}), PROTECTION_AFTER_ADD_KEY: True}
+            session.add(waiting_exit)
+            session.commit()
+            logger.info(
+                f"Staged {order_type.value} exit order {waiting_exit.id} (WAITING_TRIGGER) for "
+                f"transaction {transaction.id}, {order_quantity:g} shares — add {pending_add.id} "
+                f"is in flight as a complex order, so protective order(s) "
+                f"{[o.id for o in live_broker_orders]} stay in place until it fills"
+            )
+            return True
 
         # 3. No live broker order — straight path, submit immediately
         if not live_broker_orders:

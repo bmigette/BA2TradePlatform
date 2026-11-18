@@ -213,6 +213,61 @@ need another expert's stop resting on the same symbol at the same moment. If you
 change this area again, submit a contended `BRACKET` against a resting
 protective `SELL_STOP` on a paper account and record what comes back.
 
+### 2026-11-18: a top-up's complex order was cancelled by OUR cancel of its leg
+
+Measured against Alpaca **paper account 3** (dev DB, FactorRanker expert 28), read-only
+`get_order_by_id`. On 2026-11-16 two top-up buys went out as `OTO` because the position's
+own resting `SELL_STOP` blocked them, and both ended cancelled, unfilled:
+
+| Order | Submitted (broker, UTC) | Cancelled (broker, UTC) |
+|---|---|---|
+| ord 2400 SOLS `BUY` 1, `OTO` | 15:11:33.435 | 15:11:33.545 |
+| ord 2401, its stop leg | 15:11:33.428 | 15:11:33.547 |
+| ord 2405 VRT `BUY` 5, `OTO` | 15:11:34.498 | 15:11:34.599 |
+| ord 2406, its stop leg | 15:11:34.486 | 15:11:34.601 |
+
+Our log shows the platform asking to cancel legs 2401 and 2406 right after each submit
+(`AlpacaAccount` step 4b -> `adjust_sl` -> `_handle_filled_entry_exit`, which cancelled
+every live protective order of the transaction). The parent and its leg carry cancel times
+2 ms apart: **cancelling the leg of an unfilled `OTO` cancels the parent**. The same was
+already known for an unfilled FIRST entry (2026-10-29, RAPP entry 1438, kept in
+`_handle_unfilled_entry_exit`); the top-up path did not have the rule.
+
+Consequences on dev: 16 of FactorRanker's 21 top-ups sent as complex orders ended cancelled.
+For SOLS and VRT the position's old stop was cancelled in the same call, and the replacement
+(sized for the position AFTER the buy) was deferred at every refresh, at `INFO`, because the
+shares it wanted never existed: no top-up and no stop.
+
+**What changed.**
+
+1. While a buy is in flight as a complex order (an add, or the first entry while it is only
+   `PARTIALLY_FILLED`), `_handle_filled_entry_exit` cancels nothing. The replacement is
+   staged on that buy's `FILLED` (`TradingOrder.data["protection_after_add"]`).
+2. When the buy fills, `TradeManager._rechain_behind_entry_legs` cancels its leg and the
+   position's other live protection (`_live_protection_behind`: never a leg of a buy that is
+   still working) and chains the replacement on their cancel. Its price is not re-based to
+   the add's fill. A cancel the broker refuses is asked again at every refresh.
+3. When the add dies, the replacement is dropped and the protection that was never
+   cancelled keeps working (`_settle_protection_after_dead_add` sets the transaction's
+   level back to it). When the replacement is dropped AFTER the add filled (the order it
+   waited on expired or fired), the transaction's level is placed again for what is held.
+4. `_fit_staged_protection_to_position`, for cancel-and-replace orders and those staged
+   behind an add: one larger than its transaction's position is shrunk to it; one whose
+   transaction holds nothing is cancelled and never sent. The deferral for "more shares
+   than exist" could not end otherwise. A leg that waits on a FILL is left alone:
+   FactorRanker's remainder leg is sized across every transaction of the symbol.
+
+**Not covered.** A replacement stop the broker REFUSES at submit is not placed again by this
+path (as in every cancel-and-replace flow); a stop refused as already breached is re-sent as
+a market order by `AccountInterface._handle_order_submit_error`, and the breached-stop pass
+covers the rest.
+
+**Open question on the 2026-09-22 section.** Those entries were also cancelled 92 ms and
+142 ms after submission, the delay our own leg cancel has here. They were `BRACKET` entries
+whose adopted legs (a limit and a stop) do not match the `OCO` target structure, so the same
+cancel may have been ours and not the broker's wash-trade check. Not re-measured: the logs
+of that day would show whether a leg cancel was sent.
+
 ---
 
 ## Current design
