@@ -7,6 +7,30 @@ Provides:
 - MockExpert: concrete MarketExpertInterface with canned analysis results
 - Factory-created DB records (account definitions, expert instances, etc.)
 """
+import atexit
+import logging
+import os
+import shutil
+import tempfile
+
+# --- Real-store isolation (must run BEFORE any ba2 module is imported) ----------------------------
+# ``ba2_common.config`` and ``ba2_trade_platform.config`` read DB_FILE / LOG_FOLDER from the environment
+# at IMPORT, and their defaults are the DEV instance's own database and log folder. A test that ran the
+# real ``wire_all_seams()`` therefore pointed the engine at the dev DB and wrote rows into it (three
+# ``acc-fmp`` accounts, found 2026-11-18), and every test's ERROR records landed in the dev error log.
+# Both now live in a folder made for this run and removed at exit. ``_refuse_real_db_files`` below is
+# the second line: an engine on any file outside a temporary folder fails the test that asked for it.
+TEST_HOME = tempfile.mkdtemp(prefix="ba2-root-tests-")
+os.environ["DB_FILE"] = os.path.join(TEST_HOME, "db.sqlite")
+os.environ["LOG_FOLDER"] = os.path.join(TEST_HOME, "logs")
+
+
+@atexit.register
+def _remove_test_home():
+    logging.shutdown()  # the rotating handlers hold the log files open (Windows will not delete them)
+    shutil.rmtree(TEST_HOME, ignore_errors=True)
+
+
 import pytest
 from unittest.mock import patch, MagicMock
 from sqlmodel import SQLModel, Session, create_engine
@@ -32,6 +56,38 @@ from ba2_trade_platform.core.types import (
 from ba2_trade_platform.core.interfaces.AccountInterface import AccountInterface
 from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+
+def _is_temporary_path(path: str) -> bool:
+    path = os.path.normcase(os.path.realpath(path))
+    for root in (tempfile.gettempdir(), TEST_HOME):
+        root = os.path.normcase(os.path.realpath(root))
+        try:
+            if os.path.commonpath([path, root]) == root:
+                return True
+        except ValueError:  # another drive
+            continue
+    return False
+
+
+def _refuse_real_db_files():
+    """Every engine of the package is built by ``ba2_common.core.db._build_engine``: wrap it so a test can
+    only open ``:memory:`` or a file under a temporary folder (``tmp_path``, the session folder above)."""
+    import ba2_common.core.db as _pkg_db
+
+    build = _pkg_db._build_engine
+
+    def _build_engine_for_tests(db_file):
+        if db_file != ":memory:" and not _is_temporary_path(db_file):
+            raise RuntimeError(
+                f"a test asked for a database engine on {db_file!r}, which is outside a temporary folder. "
+                f"Tests never open a real database: use tmp_path, or the in-memory test engine.")
+        return build(db_file)
+
+    _pkg_db._build_engine = _build_engine_for_tests
+
+
+_refuse_real_db_files()
 
 
 # ---------------------------------------------------------------------------

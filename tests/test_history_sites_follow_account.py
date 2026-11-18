@@ -7,8 +7,8 @@ import pytest
 
 from ba2_common.core import backtest_context as BC
 from ba2_trade_platform.core import account_history as AH
-from ba2_trade_platform.core.db import get_db
-from ba2_trade_platform.core.models import AccountSetting
+from ba2_trade_platform.core.db import add_instance, get_db
+from ba2_trade_platform.core.models import AccountSetting, AppSetting
 from tests.factories import create_account_definition, create_expert_instance
 
 KEY = "ohlcv_history_source"
@@ -189,10 +189,24 @@ def test_wire_all_seams_installs_both_resolvers():
 
 
 # ---- rule conditions (realised vol, relative volume, recent high) ---------------------------------
-def test_live_wiring_points_rule_conditions_at_the_accounts_history():
+def test_live_wiring_points_rule_conditions_at_the_accounts_history(test_engine):
+    """The REAL ``wire_all_seams()`` also points the engine at ``config.DB_FILE``. Until 2026-11-18 this test
+    then created its account THERE (the dev database: three ``acc-fmp`` accounts): the engine is put back on
+    the test database before any row is written, and every seam the wiring touched is restored."""
+    import ba2_common.core.db as pkg_db
     from ba2_common.core import TradeConditions as TC
-    from ba2_trade_platform.core.seam_wiring import wire_all_seams
-    wire_all_seams()
-    assert TC.get_account_history_provider_resolver() is AH.history_provider_for_account
-    f = account("fmp")
-    assert type(TC._history_ohlcv_provider(SimpleNamespace(id=f.id))).__name__ == "FMPOHLCVProvider"
+    from tests.test_seam_wiring import _isolated_seam_state
+
+    before = TC.get_account_history_provider_resolver()
+    try:
+        with _isolated_seam_state() as seam_wiring:
+            seam_wiring._wired = False
+            seam_wiring.wire_all_seams()
+            pkg_db._engine = test_engine
+            assert TC.get_account_history_provider_resolver() is AH.history_provider_for_account
+            # the FMP provider refuses to be built without a key; the dev database used to supply a real one
+            add_instance(AppSetting(key="FMP_API_KEY", value_str="k"))
+            f = account("fmp")
+            assert type(TC._history_ohlcv_provider(SimpleNamespace(id=f.id))).__name__ == "FMPOHLCVProvider"
+    finally:
+        TC.set_account_history_provider_resolver(before)
