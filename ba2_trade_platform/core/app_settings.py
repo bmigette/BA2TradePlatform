@@ -78,6 +78,11 @@ APP_SETTINGS_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "scheduled_session_guard_enabled": {
         "type": "bool", "required": False, "default": True,
         "description": "Skip scheduled passes outside the regular market session (session guard)"},
+    # Live capture for backtest replay (core.replay_capture): OFF by default. Read ONCE at startup
+    # (initialize_replay_capture), so a change needs an app restart.
+    "replay_capture_enabled": {
+        "type": "bool", "required": False, "default": False,
+        "description": "Record live expert inputs for replay in the backtest engine (needs a restart)"},
 }
 
 

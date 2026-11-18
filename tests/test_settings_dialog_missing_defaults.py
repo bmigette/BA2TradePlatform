@@ -1205,6 +1205,17 @@ def test_app_settings_session_guard_switch_shows_its_declared_default_and_saves_
     assert _app_rows() == [("scheduled_session_guard_enabled", "false")]
 
 
+def test_app_settings_replay_capture_switch_shows_off_by_default_and_saves_a_flip(fake_ui):
+    from ba2_trade_platform.core import replay_capture
+    t = _app_tab()
+    assert t.replay_capture_input.value is False                     # declared default OFF
+    t.save_settings()
+    assert _app_rows() == []                                          # no edit, nothing written
+    t.replay_capture_input.value = True
+    t.save_settings()
+    assert _app_rows() == [(replay_capture.CAPTURE_SETTING_KEY, "true")]   # the key capture_enabled() reads
+
+
 def test_runtime_readers_use_the_same_declaration(monkeypatch):
     """No row: WorkerQueue, JobManager and ModelFactory read the declared default -- the
     value the UI shows -- not literals of their own."""

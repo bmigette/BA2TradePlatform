@@ -880,6 +880,7 @@ class AppSettingsTab:
         'iv_live_chain_source': 'iv_chain_source_input',
         'tastytrade_market_client_secret': 'tt_market_secret_input',
         'tastytrade_market_refresh_token': 'tt_market_refresh_input',
+        'replay_capture_enabled': 'replay_capture_input',
     }
 
     def _shown_value(self, key: str):
@@ -1067,6 +1068,12 @@ class AppSettingsTab:
                      'weekend, after an early close or outside 09:30-16:00 New York is skipped '
                      'and logged. Turn OFF only if the guard misbehaves; takes effect on the next '
                      'fire.').classes('text-xs text-gray-500')
+            self.replay_capture_input = ui.switch(
+                'Record live trading inputs for backtest replay',
+                value=self._shown_value('replay_capture_enabled'))
+            ui.label('OFF (default). ON records what every expert reads at each live analysis, so the '
+                     'backtest engine can replay live trades. Read once at startup: restart the app '
+                     'after changing it.').classes('text-xs text-gray-500')
         
         # A NO-EDIT SAVE IS A NO-OP: what every control shows is recorded, and a control
         # that still shows it is not written (stored value or declared default alike).
