@@ -8,6 +8,13 @@ those shares, so an exit for the same quantity has nothing available:
 
 where 6ba609... was the broker id of FactorRanker's OWN stop (order 608). Releasing the leg must
 not, in turn, leave a partial reduce unprotected -- hence the re-protect assertions.
+
+A cancel is a REQUEST at a live broker. Dev, 2026-11-16 14:45:10 UTC: the stop was cancelled
+and the market sell sent 270 ms later, while Alpaca still held the shares for the stop -- 14
+rebalance sells refused (40310000, ``related_orders`` = our own stops), each position left open
+with its stop gone. The sell now WAITS (``WAITING_TRIGGER``) for the leg to reach ``CANCELED``;
+the platform's dependent-order pass submits it. The backtest account cancels at once, so there
+the sell is submitted in the same call, as before.
 """
 from __future__ import annotations
 
@@ -64,14 +71,26 @@ class _Account:
         return order
 
 
-def _mgr(monkeypatch, legs, account=None):
-    """A FactorPortfolioManager with DB access stubbed out."""
+def _mgr(monkeypatch, legs, account=None, after_cancel=OrderStatus.CANCELED):
+    """A FactorPortfolioManager with DB access stubbed out.
+
+    ``after_cancel`` is the status the account left on a leg it was asked to cancel:
+    ``CANCELED`` is the backtest account (the cancel is immediate), ``PENDING_CANCEL`` a live
+    broker (the cancel is only requested)."""
     mgr = P.FactorPortfolioManager.__new__(P.FactorPortfolioManager)
     mgr.expert_instance_id = 14
     mgr.account_id = 1
     mgr.account = account or _Account()
+    mgr.added = []
     monkeypatch.setattr(mgr, "_working_protective_legs", lambda txns: list(legs), raising=False)
-    monkeypatch.setattr(P, "add_instance", lambda o: setattr(o, "id", 1000) or 1000)
+    monkeypatch.setattr(mgr, "_status_after_cancel", lambda leg: after_cancel, raising=False)
+
+    def _add(o, **kw):
+        mgr.added.append(o)
+        o.id = 1000 + len(mgr.added)
+        return o.id
+
+    monkeypatch.setattr(P, "add_instance", _add)
     monkeypatch.setattr(P, "update_instance", lambda o: o)
     return mgr
 
@@ -108,11 +127,102 @@ def test_the_cancel_happens_before_the_sell_is_submitted(monkeypatch):
     assert events[0] == "cancel" and "submit" in events
 
 
-def test_released_leg_is_marked_canceled_in_the_db(monkeypatch):
+def test_a_leg_the_account_cancelled_at_once_reads_canceled(monkeypatch):
     leg = _Leg(608, 11.0)
     mgr = _mgr(monkeypatch, [leg])
     mgr._submit_sell("SPCX", 11, [_Txn(open_qty=11.0)])
     assert leg.status == OrderStatus.CANCELED
+
+
+def test_a_leg_never_sent_to_the_broker_is_cancelled_locally(monkeypatch):
+    """No broker id = nothing to ask the broker: the row is closed here and the sell goes now."""
+    leg = _Leg(608, 11.0, broker_order_id=None)
+    acct = _Account()
+    mgr = _mgr(monkeypatch, [leg], acct, after_cancel=OrderStatus.PENDING_CANCEL)
+    order = mgr._submit_sell("SPCX", 11, [_Txn(open_qty=11.0)])
+    assert leg.status == OrderStatus.CANCELED and acct.canceled == []
+    assert order.status != OrderStatus.WAITING_TRIGGER and len(acct.submitted) == 1
+
+
+# --------------------------------------------------------------- the 2026-11-16 race
+
+def test_the_exit_waits_until_the_broker_confirms_the_cancel(monkeypatch):
+    """A live cancel is a request. Nothing is sent: the sell is written WAITING_TRIGGER on the
+    leg reaching CANCELED, which is what the platform's dependent-order pass acts on."""
+    leg = _Leg(1861, qty=18.0, broker_order_id="fc0f-stop")
+    acct = _Account()
+    mgr = _mgr(monkeypatch, [leg], acct, after_cancel=OrderStatus.PENDING_CANCEL)
+
+    order = mgr._submit_sell("CAI", 18, [_Txn(tid=560, open_qty=18.0)])
+
+    assert acct.canceled == ["fc0f-stop"]
+    assert acct.submitted == [], "no sell may reach the broker while the stop holds the shares"
+    assert mgr.added == [order], "the waiting sell is persisted"
+    assert order.status == OrderStatus.WAITING_TRIGGER
+    assert order.depends_on_order == 1861
+    assert order.depends_order_status_trigger == OrderStatus.CANCELED
+    assert (order.side, order.order_type, order.quantity) == (
+        OrderDirection.SELL, OrderType.MARKET, 18)
+    assert order.transaction_id == 560
+    assert order.data["fixed_quantity"] is True
+    assert order.data[P.STAGED_EXIT_KEY] is True, "the platform sizes it at the broker on submit"
+
+
+def test_an_unconfirmed_cancel_is_not_written_canceled(monkeypatch):
+    """Writing CANCELED over PENDING_CANCEL is what let the sell fire early."""
+    leg = _Leg(1861, qty=18.0)
+    mgr = _mgr(monkeypatch, [leg], after_cancel=OrderStatus.PENDING_CANCEL)
+    mgr._submit_sell("CAI", 18, [_Txn(open_qty=18.0)])
+    assert leg.status == OrderStatus.PENDING_CANCEL
+
+
+def test_the_exit_waits_on_the_last_unconfirmed_leg(monkeypatch):
+    """Like ``close_transaction``: one dependency, the last cancel requested; the pass that
+    submits the sell also checks the broker has released the quantity."""
+    legs = [_Leg(701, 18.0, broker_order_id="a"), _Leg(702, 18.0, broker_order_id="b")]
+    mgr = _mgr(monkeypatch, legs, after_cancel=OrderStatus.PENDING_CANCEL)
+    order = mgr._submit_sell("CAI", 18, [_Txn(open_qty=18.0)])
+    assert order.depends_on_order == 702
+
+
+def test_a_cancel_the_broker_refused_keeps_the_leg_and_is_not_waited_on(monkeypatch):
+    """``AlpacaAccount.cancel_order`` returns False instead of raising. The leg is then still
+    protecting the position: it must not be written CANCELED, and a sell waiting on its
+    cancel would wait for ever -- the sell goes in at once, as for a cancel that raised."""
+    class _Refusing(_Account):
+        def cancel_order(self, broker_order_id):
+            return False
+
+    leg = _Leg(608, 11.0)
+    acct = _Refusing()
+    mgr = _mgr(monkeypatch, [leg], acct, after_cancel=OrderStatus.PENDING_CANCEL)
+    order = mgr._submit_sell("SPCX", 11, [_Txn(open_qty=11.0)])
+    assert leg.status == OrderStatus.NEW
+    assert order.status != OrderStatus.WAITING_TRIGGER and len(acct.submitted) == 1
+
+
+def test_a_waiting_partial_reduce_still_reprotects_the_remainder(monkeypatch):
+    """The resized stop hangs off the WAITING sell's fill: cancel confirmed -> sell -> stop."""
+    acct = _Account()
+    mgr = _mgr(monkeypatch, [_Leg(608, qty=11.0, stop_price=90.0)], acct,
+               after_cancel=OrderStatus.PENDING_CANCEL)
+
+    sell = mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
+
+    assert sell.status == OrderStatus.WAITING_TRIGGER
+    [(stop, _kw)] = acct.submitted
+    assert (stop.order_type, stop.quantity, stop.stop_price) == (OrderType.SELL_STOP, 7, 90.0)
+    assert stop.depends_on_order == sell.id
+    assert stop.depends_order_status_trigger == OrderStatus.FILLED
+
+
+def test_a_waiting_exit_over_several_transactions_is_not_sized_on_one(monkeypatch):
+    """The platform sizes a marked sell on ITS transaction's fills. A sell that spans several
+    transactions of the symbol would be cut to the first one's size, so it is not marked."""
+    mgr = _mgr(monkeypatch, [_Leg(608, 11.0)], after_cancel=OrderStatus.PENDING_CANCEL)
+    order = mgr._submit_sell("SPCX", 11, [_Txn(tid=1, open_qty=6.0), _Txn(tid=2, open_qty=5.0)])
+    assert order.status == OrderStatus.WAITING_TRIGGER
+    assert P.STAGED_EXIT_KEY not in order.data
 
 
 def test_no_protective_leg_means_no_cancel_and_a_normal_sell(monkeypatch):

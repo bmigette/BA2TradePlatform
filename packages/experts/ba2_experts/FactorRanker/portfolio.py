@@ -30,6 +30,12 @@ from ba2_common.logger import logger
 # computed ONCE when the account builds its snapshot instead of via a per-bar DB query.
 _OpenedTxn = namedtuple("_OpenedTxn", ["id", "open_price", "open_qty"])
 
+# ``TradingOrder.data`` key on a sell that waits (WAITING_TRIGGER) for the cancel of its own
+# transaction's protective leg. The live dependent-order pass reads it (TradeManager's
+# ``STAGED_EXIT_KEY``, pinned equal by tests/test_factorranker_staged_rebalance_sell.py): it
+# sizes the sell at the broker when it sends it, and puts the stop back if the sell is refused.
+STAGED_EXIT_KEY = "staged_exit_behind_protection_cancel"
+
 
 class ProtectiveStopError(RuntimeError):
     """An ADD refused by the per-symbol max-loss rule.
@@ -564,15 +570,45 @@ class FactorPortfolioManager:
                 f"transactions {txn_ids}: {e}", exc_info=True)
             return []
 
+    def _status_after_cancel(self, leg) -> OrderStatus:
+        """What the ACCOUNT wrote on a leg it was just asked to cancel.
+
+        The backtest account cancels at once (``CANCELED``); a live broker only takes the
+        request (``PENDING_CANCEL``) and its refresh confirms it later. An unreadable row
+        counts as not confirmed."""
+        try:
+            return get_instance(TradingOrder, leg.id).status
+        except Exception as e:  # noqa: BLE001 -- unknown is "not confirmed", never "cancelled"
+            logger.error(
+                f"FactorRanker[{self.expert_instance_id}]: could not re-read protective order "
+                f"{leg.id} after its cancel ({e}); treating the cancel as not confirmed",
+                exc_info=True)
+            return leg.status
+
     def _release_protective_legs(self, legs: list) -> list:
-        """Cancel resting protective legs so their reserved shares become sellable."""
+        """Cancel resting protective legs so their reserved shares become sellable.
+
+        Returns the legs whose cancel went through or was accepted; each carries the status
+        the account left on it. ``CANCELED`` means the shares are free now. Anything else
+        means the cancel is only REQUESTED: the broker still holds the shares for the leg
+        (``_submit_sell`` then waits for the confirmation instead of selling into it)."""
         released = []
         for leg in legs:
             try:
                 if leg.broker_order_id:
-                    self.account.cancel_order(leg.broker_order_id)
-                leg.status = OrderStatus.CANCELED
-                update_instance(leg)
+                    if self.account.cancel_order(leg.broker_order_id) is False:
+                        # Refused, not raised (AlpacaAccount). The leg is still working, so
+                        # it is NOT written CANCELED and nothing waits on it.
+                        logger.error(
+                            f"FactorRanker[{self.expert_instance_id}]: the broker refused the "
+                            f"cancel of protective order {leg.id} for {leg.symbol}; the leg "
+                            f"keeps protecting the position")
+                        continue
+                    leg.status = self._status_after_cancel(leg)
+                else:
+                    # Never sent: there is no broker to ask, the row is closed here.
+                    leg.status = OrderStatus.CANCELED
+                    update_instance(leg)
                 released.append(leg)
                 logger.info(
                     f"FactorRanker[{self.expert_instance_id}]: released protective "
@@ -615,7 +651,40 @@ class FactorPortfolioManager:
             comment="FactorRanker rebalance sell",
             data={"fixed_quantity": True},
         )
-        result = self.account.submit_order(order, is_closing_order=True)
+
+        # A CANCEL IS A REQUEST AT A LIVE BROKER.
+        #
+        # Dev, 2026-11-16 14:45:10 UTC: stop 1861 was cancelled at .591 and the sell sent at
+        # .863 -- Alpaca still held the shares for the stop and refused it (40310000,
+        # related_orders = our own stops). 14 sells that minute; each position stayed open with
+        # its stop gone. The leg was also written CANCELED here straight after the request,
+        # which hid that the cancel had not landed.
+        #
+        # So while any leg's cancel is unconfirmed the sell is NOT sent: it is written
+        # WAITING_TRIGGER on that leg reaching CANCELED, exactly like the deferred close of
+        # ``AccountInterface.submit_close_order_for_transaction``. The platform's
+        # dependent-order pass submits it once the broker has confirmed the cancel AND released
+        # the quantity. The backtest account cancels at once, so there (and for a name with no
+        # resting leg) the sell is submitted in this call, as it always was.
+        unconfirmed = [leg for leg in released if leg.status != OrderStatus.CANCELED]
+        if unconfirmed:
+            order.status = OrderStatus.WAITING_TRIGGER
+            order.depends_on_order = unconfirmed[-1].id
+            order.depends_order_status_trigger = OrderStatus.CANCELED
+            if len(transactions) == 1:
+                # The leg can still FILL before its cancel lands. Marked, the sell is sized at
+                # the broker when it is finally sent (this transaction's entry fills minus its
+                # exit fills), so it never sells what the stop already sold. Not marked when
+                # the sell spans several transactions: that sizing reads one transaction.
+                order.data = {**order.data, STAGED_EXIT_KEY: True}
+            order.id = add_instance(order, expunge_after_flush=True)
+            logger.info(
+                f"FactorRanker[{self.expert_instance_id}]: sell of {qty} {symbol} (order "
+                f"{order.id}) waits for the broker to confirm the cancel of protective order "
+                f"{unconfirmed[-1].id}")
+            result = order
+        else:
+            result = self.account.submit_order(order, is_closing_order=True)
         self._reprotect_remainder(symbol, qty, transactions, released, result)
         return result
 

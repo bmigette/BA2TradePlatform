@@ -6,7 +6,7 @@ expert settings, rulesets, and trading permissions.
 """
 
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import threading
 from ..logger import logger
@@ -262,6 +262,42 @@ def is_staged_full_close(order) -> bool:
     """A full-position MARKET close of a transaction, staged by ``close_transaction``."""
     return bool(order.order_type == OrderType.MARKET and order.transaction_id
                 and (order.comment or "").startswith(_FULL_CLOSE_COMMENT_PREFIX))
+
+
+# ``TradingOrder.data`` key a caller sets on a MARKET reduce of an OPENED transaction that it
+# staged behind the cancel of that transaction's own protective leg. Written by FactorRanker's
+# rebalance sell (``ba2_experts.FactorRanker.portfolio.STAGED_EXIT_KEY``, the same string:
+# tests/test_factorranker_staged_rebalance_sell.py pins the two equal).
+STAGED_EXIT_KEY = "staged_exit_behind_protection_cancel"
+
+
+# How long a marked staged exit may wait for its leg's cancel. A cancel confirms within one
+# account refresh. One the broker never completes is given up on by
+# ``AlpacaAccount._reconcile_pending_cancel_orders`` after a day: the leg gets its working
+# status back and the exit would wait for ever, until some LATER cancel of that leg fired a
+# decision days old. Six hours keeps a morning rebalance inside its own session.
+STAGED_EXIT_MAX_WAIT_HOURS = 6.0
+
+
+def staged_exit_waited_too_long(order, now=None) -> bool:
+    """A marked staged exit older than ``STAGED_EXIT_MAX_WAIT_HOURS`` (``created_at`` is UTC)."""
+    created = order.created_at
+    if not is_marked_staged_exit(order) or created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc)) - created > timedelta(
+        hours=STAGED_EXIT_MAX_WAIT_HOURS)
+
+
+def is_marked_staged_exit(order) -> bool:
+    """A MARKET reduce staged behind the cancel of its own transaction's protection.
+
+    Unlike a ``close_transaction`` close, its transaction stays OPENED. The dependent-order
+    pass sizes it at the broker exactly like a staged full close (the leg may fill before its
+    cancel lands) and re-places the stop when the broker refuses it."""
+    return bool(order.order_type == OrderType.MARKET and order.transaction_id
+                and (order.data or {}).get(STAGED_EXIT_KEY))
 
 
 def _measured_qty(value):
@@ -2025,6 +2061,78 @@ class TradeManager:
                 f"entry {parent_order_id}'s leg(s) {[leg.id for leg in legs]}, which hold the shares")
         return True
 
+    @staticmethod
+    def _account_of(order):
+        """The trading account of ``order``, or None when its provider cannot be resolved."""
+        from ..modules.accounts import get_account_class
+        from .models import AccountDefinition
+        account_def = get_instance(AccountDefinition, order.account_id)
+        account_class = get_account_class(account_def.provider)
+        return account_class(account_def.id) if account_class else None
+
+    def _reprotect_after_refused_exit(self, account, order) -> None:
+        """Put the stop back when a marked staged exit (``is_marked_staged_exit``) ended ERROR.
+
+        WHY. The exit was staged behind the cancel of its transaction's own protective leg,
+        so when it is finally submitted that leg is gone. If the broker then refuses the exit
+        the position is open with no stop, and nothing revisits it: the transaction is still
+        OPENED (``_retry_stuck_closes`` owns CLOSING only) and its owner does not look again
+        before its next rebalance -- a week for FactorRanker (dev 8080, 2026-11-16: 13
+        positions of experts 9 and 10 left that way).
+
+        THE RULE. An OPENED transaction that records a stop or a take-profit gets its exit
+        re-placed through ``account.adjust_tp_sl`` at the transaction's own levels (that path
+        sizes it on the position). Anything that prevents it -- no recorded level, no account,
+        a refusal -- is an ERROR naming the position UNPROTECTED and a FAILURE activity.
+        Called once, when the exit dies (refused, expired, cancelled with its leg, or failed
+        before it was sent); a dead order is not revisited. ``account`` None = the caller has
+        none: it is built here.
+        """
+        if not is_marked_staged_exit(order):
+            return
+        from .types import TransactionStatus, ActivityLogSeverity, ActivityLogType
+        from .db import log_activity
+
+        what = (f"staged exit order {order.id} ({order.symbol}, transaction "
+                f"{order.transaction_id}) was refused after protective order "
+                f"{order.depends_on_order} was cancelled for it")
+        try:
+            txn = get_instance(Transaction, order.transaction_id)
+            if txn.status != TransactionStatus.OPENED:
+                return
+            if is_protection_suspended(txn):
+                self.logger.info(
+                    f"[Account {order.account_id}] {what}: not re-protected -- its shares are "
+                    f"pledged to an open short call (protection suspended)")
+                return
+            if txn.stop_loss is None and txn.take_profit is None:
+                reason = "the transaction records no stop or take-profit to re-place"
+            elif account is None and (account := self._account_of(order)) is None:
+                reason = "the account could not be built"
+            else:
+                self.logger.warning(
+                    f"[Account {order.account_id}] {what}: the position has no stop. "
+                    f"Re-placing its exit at TP={txn.take_profit} SL={txn.stop_loss}.")
+                if account.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss,
+                                        source="refused_exit_reprotect"):
+                    return
+                reason = "the account did not place the replacement"
+        except Exception as e:  # noqa: BLE001 -- reported below; the pass must go on
+            self.logger.error(
+                f"[Account {order.account_id}] re-protecting after refused exit order "
+                f"{order.id} raised: {e}", exc_info=True)
+            reason = str(e)
+        msg = (f"{what}, and its stop could NOT be put back ({reason}): "
+               f"{order.symbol} transaction {order.transaction_id} is UNPROTECTED.")
+        self.logger.error(f"[Account {order.account_id}] {msg}")
+        try:
+            log_activity(ActivityLogSeverity.FAILURE, ActivityLogType.TP_SL_ADJUSTED, msg,
+                         data={"transaction_id": order.transaction_id, "symbol": order.symbol,
+                               "order_id": order.id},
+                         source_account_id=order.account_id)
+        except Exception as e:  # noqa: BLE001 -- the ERROR above already said it
+            self.logger.error(f"Could not record the unprotected-position activity: {e}")
+
     def _size_staged_full_close(self, account, close_order):
         """How many shares a staged full close may sell NOW, measured at the broker.
 
@@ -2138,6 +2246,7 @@ class TradeManager:
             # PHASE 1: Collect all orders to process WHILE session is open
             orders_to_submit = []  # List of (order, parent_order_id)
             status_updates = {}  # Map of order_id -> new_status
+            waiting_by_id = {}   # every row this pass read, to re-protect marked exits it ends
             # True if the SL-rebase or TP-floor-recheck blocks below wrote a Transaction field
             # (txn.stop_loss / txn.take_profit). Those updates live only in this Phase-1 session
             # and are otherwise silently lost on close: order.limit_price/stop_price mutations
@@ -2170,9 +2279,20 @@ class TradeManager:
                 self.logger.info(f"Checking {len(waiting_orders)} orders in WAITING_TRIGGER status")
                 
                 for dependent_order in waiting_orders:
+                    waiting_by_id[dependent_order.id] = dependent_order
                     try:
                         parent_order_id = dependent_order.depends_on_order
                         trigger_status = dependent_order.depends_order_status_trigger
+
+                        if staged_exit_waited_too_long(dependent_order):
+                            self.logger.error(
+                                f"Staged exit order {dependent_order.id} ({dependent_order.symbol}, "
+                                f"transaction {dependent_order.transaction_id}) has waited more than "
+                                f"{STAGED_EXIT_MAX_WAIT_HOURS:g} h for the cancel of order "
+                                f"{parent_order_id}: it is dropped, NOT sent -- the decision behind "
+                                f"it is stale.")
+                            status_updates[dependent_order.id] = OrderStatus.CANCELED
+                            continue
                         
                         # Get current parent order status
                         parent_order = session.get(TradingOrder, parent_order_id)
@@ -2467,6 +2587,12 @@ class TradeManager:
                     if transaction_field_updates:
                         self.logger.debug("Committed SL-rebase/TP-floor Transaction field updates")
                 # Session will close here
+
+            # A marked staged exit that this pass ended without sending it (expired, its leg
+            # ended other than CANCELED, an ERROR above) leaves a position whose stop was
+            # cancelled for it: put the stop back.
+            for order_id in status_updates:
+                self._reprotect_after_refused_exit(None, waiting_by_id[order_id])
             
             # PHASE 2: Process all order submissions OUTSIDE of session context
             submitted_count = 0
@@ -2478,6 +2604,7 @@ class TradeManager:
                         f"Dependent order {dependent_order.id} is being submitted by another "
                         f"thread; skipping it in this pass")
                     continue
+                account = None   # read by the except below when the failure came before it was built
                 try:
                     # Phase 1 read this row before the claim: another pass may have submitted,
                     # failed, deferred-and-rechained or cancelled it since. Act only if it is
@@ -2499,6 +2626,7 @@ class TradeManager:
                         self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        self._reprotect_after_refused_exit(account, dependent_order)
                         continue
                     
                     account_class = get_account_class(account_def.provider)
@@ -2506,6 +2634,7 @@ class TradeManager:
                         self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        self._reprotect_after_refused_exit(account, dependent_order)
                         continue
                     
                     account = account_class(account_def.id)
@@ -2514,6 +2643,7 @@ class TradeManager:
                         self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        self._reprotect_after_refused_exit(account, dependent_order)
                         continue
 
                     if self._rechain_behind_entry_legs(account, dependent_order, parent_order_id):
@@ -2522,7 +2652,7 @@ class TradeManager:
                     # A staged FULL close is sized NOW, from the broker's final word on the
                     # legs it waited on -- never from the quantity it was staged at (see
                     # _size_staged_full_close: NVDA transaction 468 sold 5 for 4).
-                    if is_staged_full_close(dependent_order):
+                    if is_staged_full_close(dependent_order) or is_marked_staged_exit(dependent_order):
                         verdict, close_qty, detail = self._size_staged_full_close(
                             account, dependent_order)
                         if verdict == "defer":
@@ -2630,6 +2760,7 @@ class TradeManager:
                             )
                             (fresh or dependent_order).status = OrderStatus.ERROR
                             update_instance(fresh or dependent_order)
+                        self._reprotect_after_refused_exit(account, dependent_order)
 
                 except Exception as submit_error:
                     self.logger.error(
@@ -2648,6 +2779,7 @@ class TradeManager:
                         update_instance(fresh)
                     except Exception as update_error:
                         self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
+                    self._reprotect_after_refused_exit(account, dependent_order)
                 finally:
                     _release_dependent_submit(dependent_order.id)
 
