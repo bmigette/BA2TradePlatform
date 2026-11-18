@@ -533,3 +533,22 @@ def test_a_replacement_for_a_position_that_is_gone_is_never_sent(monkeypatch):
 
     assert world.submits == [], "a stop went out for shares this transaction does not hold"
     assert get_instance(TradingOrder, stuck.id).status == OrderStatus.CANCELED
+
+
+def test_a_replacement_for_a_closed_transaction_is_never_sent_whatever_its_fills_say(monkeypatch):
+    """CELH order 1851, dev 2026-11-18: transaction 72 was CLOSED ("partial fill on canceled
+    order consumed position") with 29 of 52 sold on its rows. Sized on those fills, the stale
+    replacement read as 23 shares still held, was resized and went to the broker."""
+    definition = create_account_definition()
+    txn, _entry, old = _held_long(definition, stop_status=OrderStatus.CANCELED,
+                                  txn_status=TransactionStatus.CLOSED)
+    _order(definition, txn, 2, side=OrderDirection.SELL, quantity=10.0,
+           order_type=OrderType.SELL_LIMIT, status=OrderStatus.CANCELED, filled_qty=6.0,
+           open_price=110.0, broker_order_id="b-tp", comment="take profit, partly filled")
+    stuck = _stuck_replacement(definition, txn, old, qty=10.0)
+    world = _World(monkeypatch, definition, available=1_000.0)
+
+    world.sweep()
+
+    assert world.submits == [], "an order went out for a transaction that is CLOSED"
+    assert get_instance(TradingOrder, stuck.id).status == OrderStatus.CANCELED

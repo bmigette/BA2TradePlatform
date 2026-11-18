@@ -2138,6 +2138,9 @@ class TradeManager:
         SOLS order 2402: 11 wanted, 10 held). Worse, a stop whose transaction holds NOTHING
         passed the gate as soon as the ACCOUNT held enough of the symbol for someone else.
 
+        * its transaction is CLOSED          -> cancelled, never sent, whatever its fills
+          add up to (dev 2026-11-18, CELH order 1851: transaction 72 was closed with 29 of 52
+          sold on its rows; sized on those fills the stale replacement went out for 23);
         * nothing held and nothing in flight -> cancelled, never sent;
         * larger than the position            -> shrunk to it;
         * staged behind an add (``PROTECTION_AFTER_ADD_KEY``), nothing else in flight -> set
@@ -2154,7 +2157,7 @@ class TradeManager:
         """
         from ba2_common.core.TransactionHelper import TransactionHelper
         from ba2_common.core.trade_store import orders_where
-        from .types import AssetClass
+        from .types import AssetClass, TransactionStatus
         after_add = is_protection_after_add(order)
         if (not order.transaction_id or order.order_type == OrderType.MARKET
                 or getattr(order, "asset_class", AssetClass.EQUITY) != AssetClass.EQUITY
@@ -2181,8 +2184,16 @@ class TradeManager:
         in_flight = [o.id for o in txn_orders
                      if o.status in working and not TransactionHelper.is_resting_protection(o)]
         staged = float(order.quantity or 0.0)
-        if position <= 1e-9:
-            if in_flight:
+        closed = txn.status == TransactionStatus.CLOSED
+        if closed and position > 1e-9:
+            # Loud: the platform's books and its own order rows disagree. Shares may be
+            # stranded at the broker, and no order of a closed transaction will manage them.
+            self.logger.error(
+                f"Transaction {txn.id} ({order.symbol}) is CLOSED but its order rows leave "
+                f"{position:g} shares unsold: staged protective order {order.id} is NOT sent. "
+                f"Check the broker position: shares left there are managed by nothing.")
+        if closed or position <= 1e-9:
+            if in_flight and not closed:
                 return "kept"   # a close is working: the gate keeps this waiting on its outcome
             fresh = get_instance(TradingOrder, order.id)
             fresh.status = OrderStatus.CANCELED
