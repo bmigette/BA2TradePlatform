@@ -4102,7 +4102,7 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # field, what an unknown reads as, whether the leverage clause can be stated,
     # and -- new -- that there are always exactly three of them. The loop below has
     # no branch that can skip one.
-    figures = summary_figures(managed_value=total, valuation_mode=mode,
+    figures = summary_figures(managed_value=total,
                               account_value=payload['account_value'],
                               available_buying_power=buying_power)
     # TWO cards now, EQUAL HEIGHT, and they WRAP.

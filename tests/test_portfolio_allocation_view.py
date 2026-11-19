@@ -11,7 +11,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed,
 )
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
-    ACCOUNT_VALUE_TITLE, ACCOUNT_VALUE_UNAVAILABLE_DETAIL,
+    ACCOUNT_VALUE_TITLE, ACCOUNT_VALUE_UNAVAILABLE_DETAIL, MANAGED_VALUE_TITLE,
     ACCOUNT_VALUE_UNAVAILABLE_TEXT, account_value_card, account_value_from_snapshot,
     BUYING_POWER_TITLE, BUYING_POWER_UNAVAILABLE_DETAIL, FIGURE_UNKNOWN_TEXT,
     DEFAULT_MACHINE_LABEL_FAMILIES, GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT,
@@ -4739,7 +4739,7 @@ def test_the_card_the_notice_and_the_footer_still_share_one_verdict():
 def _figures(**kwargs):
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import summary_figures
 
-    defaults = {'managed_value': 4_853.48, 'valuation_mode': VALUATION_MODE_MARKET,
+    defaults = {'managed_value': 4_853.48,
                 'account_value': 2_511.90, 'available_buying_power': 170.31}
     defaults.update(kwargs)
     return summary_figures(**defaults)
@@ -4802,17 +4802,15 @@ def test_an_unreadable_ACCOUNT_VALUE_does_not_blank_the_other_two_either():
     assert buying_power.available is True and buying_power.text == '$170.31'
 
 
-def test_every_caption_survives_the_merge_including_the_parentheticals():
-    """They are DEFINITIONS, not decoration. "Managed value" alone does not say
-    whether it is what you paid or what it is worth, and this page carries a
-    Valuation selector two inches away."""
-    market = _figures(valuation_mode=VALUATION_MODE_MARKET)
-    cost = _figures(valuation_mode=VALUATION_MODE_COST)
+def test_the_three_captions_are_plain_names():
+    """Owner, 2026-11-19: "Managed value — cost basis (what you paid)" was not clear.
+    The card says "Managed value"; which valuation it is measured in is the Valuation
+    selector's to say, on the same page."""
+    figures = _figures()
 
-    assert market[0].title == 'Managed value — market value (qty x price)'
-    assert cost[0].title == 'Managed value — cost basis (what you paid)'
-    assert market[1].title == ACCOUNT_VALUE_TITLE == 'Account value'
-    assert market[2].title == BUYING_POWER_TITLE == 'Free buying power'
+    assert figures[0].title == MANAGED_VALUE_TITLE == 'Managed value'
+    assert figures[1].title == ACCOUNT_VALUE_TITLE == 'Account value'
+    assert figures[2].title == BUYING_POWER_TITLE == 'Free buying power'
 
 
 def test_the_leverage_LINE_survives_the_merge_and_stays_with_its_own_figure():

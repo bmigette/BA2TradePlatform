@@ -1094,9 +1094,10 @@ def test_content_draws_the_whole_page_for_a_manual_account(
     text = ' '.join(_texts(nicegui_client.layout))
     assert 'Portfolio Allocation' in text
     # MARKET is the default mode (W1): 10 shares at 800 is 8,000, not the 6,000
-    # they cost. The headline names the mode it used right next to the number.
+    # they cost. The caption is the plain name (owner, 2026-11-19); the Valuation
+    # selector says which mode.
     assert '$8,000.00' in text
-    assert 'market value (qty x price)' in text
+    assert 'Managed value' in text and 'market value (qty x price)' not in text
     assert '$6,000.00' not in text
     assert 'Managed labels' in text
 
@@ -7722,7 +7723,7 @@ def test_the_three_money_figures_share_ONE_card(nicegui_client, account_id):
     cards = _marked(root, page.MARKER_MONEY_CARD)
     assert len(cards) == 1
     texts = _texts(cards[0])
-    assert 'Managed value — market value (qty x price)' in texts
+    assert 'Managed value' in texts
     assert 'Account value' in texts
     assert 'Free buying power' in texts
 
@@ -7802,17 +7803,18 @@ def test_an_UNKNOWN_figure_is_painted_NEUTRAL_and_not_as_a_number(
     assert 'color' not in measured[0]._style
 
 
-def test_the_managed_value_caption_still_names_WHICH_valuation(nicegui_client,
-                                                               account_id):
-    """The parenthetical is a definition, not decoration -- the Valuation selector
-    sits two inches away and changes what the figure means."""
+def test_the_managed_value_caption_is_the_same_plain_name_in_cost_mode(nicegui_client,
+                                                                       account_id):
+    """Owner, 2026-11-19: the caption is "Managed value" and nothing more. The
+    Valuation selector on the page says which valuation the figure is measured in."""
     views = _views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']})
     with nicegui_client:
         page._render_labels(account_id, _payload(views, VALUATION_MODE_COST),
                             _noop_refresh)
 
-    assert 'Managed value — cost basis (what you paid)' in \
-        _texts(_money_card(nicegui_client.layout))
+    texts = _texts(_money_card(nicegui_client.layout))
+    assert 'Managed value' in texts
+    assert not any('what you paid' in t or 'cost basis' in t for t in texts)
 
 
 def test_the_leverage_line_still_sits_under_the_account_value(nicegui_client,

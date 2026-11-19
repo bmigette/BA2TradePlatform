@@ -3919,17 +3919,11 @@ def account_value_card(*, account_value: Optional[float],
 # structural rather than remembered.
 # ---------------------------------------------------------------------------
 
-#: The managed-value caption. The parenthetical is a DEFINITION, not decoration:
-#: this page carries a Valuation selector, so "managed value" alone does not say
-#: whether it is what you paid or what it is worth.
-MANAGED_VALUE_TITLE_FMT = 'Managed value — {mode}'
-
-#: The two readings the Valuation selector chooses between, in the words the
-#: caption states them in. Owned here rather than in the renderer: which of the two
-#: a mode means is a decision, and the page must not be able to answer it
-#: differently from the card.
-VALUATION_CAPTION_COST = 'cost basis (what you paid)'
-VALUATION_CAPTION_MARKET = 'market value (qty x price)'
+#: The managed-value caption: the plain name, in both valuation modes. It used to
+#: carry the mode ("Managed value — cost basis (what you paid)"); the owner found
+#: that unclear (2026-11-19). Which valuation the figure is measured in is the
+#: Valuation selector's to say, on the same page.
+MANAGED_VALUE_TITLE = 'Managed value'
 
 #: Why the managed value could not be measured. Not reachable from the page today
 #: -- ``managed_total_value`` sums what it can and an unpriced holding gets its own
@@ -3966,16 +3960,9 @@ class SummaryFigure:
     available: bool
 
 
-def valuation_caption(valuation_mode: str) -> str:
-    """The Valuation selector's mode, in the words the caption uses. Pure."""
-    return (VALUATION_CAPTION_COST if valuation_mode == VALUATION_MODE_COST
-            else VALUATION_CAPTION_MARKET)
-
-
-def managed_value_figure(managed_value: Optional[float], *,
-                         valuation_mode: str) -> SummaryFigure:
-    """The managed positions' worth, under the mode that measured it. Pure."""
-    title = MANAGED_VALUE_TITLE_FMT.format(mode=valuation_caption(valuation_mode))
+def managed_value_figure(managed_value: Optional[float]) -> SummaryFigure:
+    """The managed positions' worth. Pure."""
+    title = MANAGED_VALUE_TITLE
     if managed_value is None:
         return SummaryFigure(title=title, text=FIGURE_UNKNOWN_TEXT,
                              detail=MANAGED_VALUE_UNAVAILABLE_DETAIL,
@@ -4002,7 +3989,7 @@ def buying_power_figure(available_buying_power: Optional[float]) -> SummaryFigur
                          detail='', available=True)
 
 
-def summary_figures(*, managed_value: Optional[float], valuation_mode: str,
+def summary_figures(*, managed_value: Optional[float],
                     account_value: Optional[float],
                     available_buying_power: Optional[float]) -> List[SummaryFigure]:
     """The merged card's three lines, in reading order. Pure; never raises.
@@ -4019,7 +4006,7 @@ def summary_figures(*, managed_value: Optional[float], valuation_mode: str,
     card = account_value_card(account_value=account_value,
                               managed_value=float(managed_value or 0.0))
     return [
-        managed_value_figure(managed_value, valuation_mode=valuation_mode),
+        managed_value_figure(managed_value),
         SummaryFigure(title=card.title, text=card.text, detail=card.detail,
                       available=card.available),
         buying_power_figure(available_buying_power),
