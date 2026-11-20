@@ -28,7 +28,7 @@ from .models import ExpertInstance, Transaction, TradingOrder
 from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SELL_UNTRACKED, ACTION_SKIP,
     ACTION_UNACTIONABLE,
-    ALLOCATION_BASIS_POSITION,
+    ALLOCATION_BASIS_POSITION, ALLOCATION_MODE_REBALANCE_LABEL,
     FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
@@ -1973,7 +1973,9 @@ INELIGIBLE_ACCOUNT_BLOCK_FMT = (
     "account {account_id} is no longer eligible for portfolio allocation: {why}")
 OVER_BUDGET_BLOCK_FMT = (
     "the plan needs ${required:,.2f} of buying power against ${available:,.2f} "
-    "available now. Deselect buys or add funds, then review again.")
+    "available now{freed}. Deselect buys or add funds, then review again.")
+#: The ``freed`` clause of the line above, only when the plan sells something.
+OVER_BUDGET_FREED_FMT = " plus ${released:,.2f} freed by its own sells"
 
 
 def _submission_lock(account_id: int) -> threading.Lock:
@@ -2093,7 +2095,8 @@ def _working_orders_block(account_id: int, plan: AllocationPlan) -> Optional[str
     return None
 
 
-def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
+def _budget_block(account, plan: AllocationPlan,
+                  current: Dict[str, PositionState]) -> Optional[str]:
     """The documented-but-advisory budget check, made binding at submission.
 
     The engine deliberately lets the BROKER refuse buys as capacity runs out,
@@ -2102,11 +2105,30 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
     leave $1,000 of buys against $0, and the validator says so while Submit sends
     them anyway. Re-measured against buying power read NOW, not at solve time, so
     a plan that fitted an hour ago is judged on today's account.
+
+    THE BUDGET IS THE DRY RUN'S OWN: what the broker publishes PLUS what this plan's own sells
+    free (``AllocationPlan.total_buying_power``; sells are submitted before any buy). Measuring
+    against the published figure alone refused every sell-to-buy plan on an account with less
+    free buying power than its buys -- a rebalance inside a fully invested account, which the
+    dry run had just shown as fitting. ``bp_released`` is read per SUBMITTED sell row, so a
+    funding sell the user un-ticked funds nothing, and neither does one the engine marked
+    unroutable (its ``bp_released`` is 0).
+
+    ONLY A SELL THIS RUN WILL REALLY SEND counts: ``decide_symbol_action`` against ``current`` (the
+    positions the submission consumes) must route it to a close, an adjust or an untracked sell.
+    An UNACTIONABLE sell -- an equity holding whose transactions are option-classed -- is reported
+    and never sent, so its proceeds are not money. A sell dropped LATER (its protective order could
+    not be cancelled, ``_prepare_protected_rows``) is not knowable here; the broker then refuses
+    the buy it would have funded, which is the documented per-row outcome.
     """
     required = sum(row.bp_cost or 0.0 for row in plan.rows
                    if row.side == OrderDirection.BUY and row.delta_quantity)
     if required <= 0:
         return None
+    released = sum(row.bp_released for row in plan.rows
+                   if row.side == OrderDirection.SELL and row.delta_quantity
+                   and decide_symbol_action(row, (current or {}).get(row.symbol))
+                   in (ACTION_CLOSE, ACTION_ADJUST, ACTION_SELL_UNTRACKED))
     try:
         snapshot = account.get_account_snapshot()
     except Exception as e:  # noqa: BLE001 - an unreadable account is not a budget
@@ -2118,8 +2140,10 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
     available = getattr(snapshot, "buying_power", None)
     if available is None:
         return "the broker published no buying power, so the plan cannot be checked against it"
-    if required > float(available) + MONEY_EPSILON:
-        return OVER_BUDGET_BLOCK_FMT.format(required=required, available=float(available))
+    if required > float(available) + released + MONEY_EPSILON:
+        freed = OVER_BUDGET_FREED_FMT.format(released=released) if released > 0 else ""
+        return OVER_BUDGET_BLOCK_FMT.format(required=required, available=float(available),
+                                            freed=freed)
     return None
 
 
@@ -2433,7 +2457,7 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
     if reason is None:
         reason = _stale_plan_block(account, plan, current)
     if reason is None:
-        reason = _budget_block(account, plan)
+        reason = _budget_block(account, plan, current)
     if reason is not None:
         logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
                        f"nothing was submitted and no run was recorded")
@@ -2469,7 +2493,10 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
     run = record_allocation_run(
         account.id, mode, plan.to_dict(),
         scope_label=scope_label,
-        base_notional=base.base_notional,
+        # The money THIS run divided. A label-only run splits its label's own money
+        # (``plan.base_notional``), not the account's allocatable base.
+        base_notional=(plan.base_notional if mode == ALLOCATION_MODE_REBALANCE_LABEL
+                       else base.base_notional),
         available_buying_power=base.available_buying_power,
         allow_fractional=bool(plan.allow_fractional),
     )

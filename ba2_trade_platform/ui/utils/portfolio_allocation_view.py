@@ -1950,6 +1950,45 @@ def symbol_target_values(weights, *, label_target_pct: float,
             for symbol, weight in (weights or {}).items()}
 
 
+def label_local_target_values(weights, current_values, *, frozen=()) -> Dict[str, Optional[float]]:
+    """``{symbol: target money}`` when ONE label's own CURRENT money is re-split by its shares. Pure.
+
+    The LOCAL counterpart of ``symbol_target_values`` (which splits the label's PORTFOLIO-target
+    money): this is what "Rebalance label" aims at, and it mirrors the engine's
+    ``compute_label_rebalance`` rule for rule (a test checks it against the engine itself):
+
+    * the money is the sum of ``current_values`` over the symbols in ``weights`` -- pass the
+      ENABLED symbols' solved shares, so an excluded symbol is outside both;
+    * shares totalling under 100% are scaled to 100% (the label's money stays in the label);
+      over 100% they are used as typed (the run itself is refused there);
+    * a ``frozen`` symbol keeps its current value and the others share what is left, in
+      proportion to their shares (never below 0).
+
+    ``None`` for every symbol when no share is above 0%: the label run is refused there, so there
+    is no target to print. A label holding nothing has local targets of 0.0, which is true.
+    """
+    shares = {symbol: max(0.0, float(weight or 0.0)) for symbol, weight in (weights or {}).items()}
+    total = sum(shares.values())
+    if total <= 0:
+        return {symbol: None for symbol in shares}
+    # A symbol absent from ``current_values`` is one the label does not hold: its value IS zero.
+    known = current_values or {}
+    held = {symbol: (float(known[symbol]) if known.get(symbol) is not None else 0.0)
+            for symbol in shares}
+    money = max(0.0, sum(held.values()))
+    scale = 100.0 / total if total < 100.0 else 1.0
+    targets = {symbol: money * share * scale / 100.0 for symbol, share in shares.items()}
+    frozen_names = {(f or '').strip().upper() for f in (frozen or ())}
+    fixed = {symbol for symbol in shares if (symbol or '').strip().upper() in frozen_names}
+    if fixed:
+        unfrozen_total = sum(v for symbol, v in targets.items() if symbol not in fixed)
+        remaining = max(0.0, money - sum(held[symbol] for symbol in fixed))
+        rest = (remaining / unfrozen_total) if unfrozen_total > 0 else 0.0
+        targets = {symbol: (held[symbol] if symbol in fixed else value * rest)
+                   for symbol, value in targets.items()}
+    return targets
+
+
 # ---------------------------------------------------------------------------
 # "FILL 100%" -- the deliberate replacement for automatic recalculation
 #

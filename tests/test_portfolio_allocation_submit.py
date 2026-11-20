@@ -4598,6 +4598,63 @@ class TestAKnownUnfundablePlanIsRefused:
                                     make_base(), mode=ALLOCATION_MODE_REBALANCE)
         assert result["blocked"] is False
 
+    @staticmethod
+    def _sell_funds_buy(account_id, *, buy_value):
+        """Sell 5 MSFT (frees 2,000) and buy ``buy_value`` of AAPL, on an account with NO buying power."""
+        account = _gate_account(account_id, buying_power=0.0,
+                                holds=[FakePosition("MSFT", 5.0, 1800.0, 2000.0)])
+        account.prices = {"MSFT": 400.0, "AAPL": 100.0}
+        txn_id = make_open_transaction(account_id, "MSFT", 5.0)
+        sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+        sell.target_quantity, sell.bp_released = 0.0, 2000.0
+        buy = make_row("AAPL", OrderDirection.BUY, buy_value / 100.0, buy_value, buy_value, price=100.0)
+        buy.target_quantity = buy_value / 100.0
+        current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                         transaction_ids=[txn_id])}
+        return account, AllocationPlan(rows=[sell, buy]), current
+
+    def test_buys_funded_by_the_plans_own_sells_are_not_refused(self, activity):
+        """The dry run's budget is what the broker published PLUS what the plan's own sells free
+        (``AllocationPlan.total_buying_power``). The submission gate measured against the published
+        figure alone, so a rebalance inside a fully invested account -- sell one symbol, buy another
+        -- was shown as fitting and then refused. Sells go out first; their proceeds are the budget."""
+        account, plan, current = self._sell_funds_buy(323, buy_value=2_000.0)
+        result = svc.run_allocation(account, plan, current, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is False
+        # the buy went out (the MSFT close goes through the transaction path, not submit_order)
+        assert [symbol for symbol, *_rest in account.submitted] == ["AAPL"]
+
+    def test_buys_beyond_what_the_sells_free_are_still_refused(self, activity):
+        account, plan, current = self._sell_funds_buy(324, buy_value=2_500.0)
+        result = svc.run_allocation(account, plan, current, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+        assert "$2,500.00 of buying power" in result["blocked_reason"]
+        assert "$2,000.00 freed by its own sells" in result["blocked_reason"]
+        assert account.submitted == []
+
+    def test_a_sell_that_cannot_be_submitted_funds_nothing(self, activity):
+        """``bp_released`` is 0 on a reduction the engine knows it cannot route, and that is the
+        figure the gate reads -- never the sell's face value."""
+        account, plan, current = self._sell_funds_buy(325, buy_value=2_000.0)
+        plan.rows[0].bp_released = 0.0
+        result = svc.run_allocation(account, plan, current, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+
+    def test_a_sell_this_run_has_no_route_for_funds_nothing(self, activity):
+        """An equity holding whose only transactions are option-classed is UNACTIONABLE: the sell is
+        reported, never sent. Its proceeds are not money the buys may be measured against."""
+        account, plan, current = self._sell_funds_buy(326, buy_value=2_000.0)
+        state = current["MSFT"]
+        state.unactionable_transaction_ids, state.transaction_ids = list(state.transaction_ids), []
+        result = svc.run_allocation(account, plan, current, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+        assert "freed by its own sells" not in result["blocked_reason"]
+        assert account.submitted == []
+
 
 def test_submit_plan_reports_each_row_as_it_lands(monkeypatch):
     """The seam behind the dry run's live Result column: outcomes arrive DURING the

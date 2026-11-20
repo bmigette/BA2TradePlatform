@@ -89,6 +89,12 @@ fetched on click. The rebalance icon beside it, and the "Rebalance tester" butto
 under the label list (whole account), open the REBALANCE TESTER
 (``rebalance_tester_dialog.py``): would rebalancing to target every 1 / 3 / 6 / 12
 months have beaten holding. Read-only, same data path; it places no orders.
+The "Rebalance label" button among an expanded label's buttons is NOT read-only: it rebalances THAT LABEL ONLY
+(``ALLOCATION_MODE_REBALANCE_LABEL``, engine ``compute_label_rebalance``) through the
+same dry run and Submit as Review and Submit. The money is what the label's positions
+are worth now, re-split by its symbol shares; its portfolio target, the reserve and
+every other label are untouched. A label sharing a symbol with another managed label
+is refused (``label_rebalance_block``).
 
 Above the label list, the "REBALANCE DUE" reminder (``ui/utils/rebalance_reminder.py``,
 store ``core/allocator_rebalance_reminder.py``): due when the last completed REBALANCE
@@ -135,11 +141,12 @@ from ...core.models import ExpertInstance
 from ba2_common.core.symbol_facts import load_symbol_facts, save_symbol_facts
 from ba2_common.core.symbol_stats import load_symbol_stats
 from ...core.portfolio_allocation import (
-    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
+    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE, ALLOCATION_MODE_REBALANCE_LABEL,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
     compute_allocation,
     cash_dividends_by_symbol, compute_base_notional, compute_label_investment,
+    compute_label_rebalance, label_rebalance_block,
     current_value, format_unrealised_pnl, is_blocking_message, split_unrealised_pnl,
     unconsumed_income_notice, validate_symbol_weights,
 )
@@ -198,7 +205,7 @@ from ..utils.portfolio_allocation_view import (
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
     symbol_delta,
-    symbol_target_quantity,
+    symbol_target_quantity, label_local_target_values,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
@@ -458,10 +465,24 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     margin = svc.fetch_margin_info(account, symbols)
     base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
                                valuation_mode=valuation_mode)
-    if mode == ALLOCATION_MODE_INVEST_LABEL:
+    scope = None
+    if mode in (ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE_LABEL):
         scope = next((lt for lt in labels if lt.label == scope_label), None)
         if scope is None:
             raise ValueError(f"Label {scope_label!r} is no longer managed")
+    if mode == ALLOCATION_MODE_REBALANCE_LABEL:
+        # ONE label, on the money its own positions are worth now: no account base, no reserve, no
+        # other label. Re-checked on every solve (Refresh, Retry), like the freeze below.
+        block = label_rebalance_block(scope, labels, current)
+        if block is not None:
+            raise ValueError(block)
+        plan = compute_label_rebalance(
+            scope, current, margin,
+            available_buying_power=base.available_buying_power,
+            allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
+            valuation_mode=valuation_mode,
+            frozen_symbols=freeze_store.frozen_symbols(account_id))
+    elif mode == ALLOCATION_MODE_INVEST_LABEL:
         plan = compute_label_investment(
             scope, float(amount), current, margin,
             available_buying_power=base.available_buying_power,
@@ -680,6 +701,26 @@ MARKER_ACCOUNT_REBAL_TEST = 'pf-account-rebal-test'
 LABEL_REBAL_TEST_TOOLTIP = ('Rebalance tester: would rebalancing this label to its shares every 1, 3, 6 or 12 '
                             'months have beaten holding? A what-if; places no orders')
 ACCOUNT_REBAL_TEST_LABEL = 'Rebalance tester'
+#: Among an expanded label's controls: which money the symbol table's Target value / Target qty (and the change
+#: under them) are measured against. Display only; kept per label for the page's life (``local_change``).
+MARKER_CHANGE_SCOPE = 'pf-change-scope'
+CHANGE_SCOPE_GLOBAL = 'global'
+CHANGE_SCOPE_LOCAL = 'local'
+CHANGE_SCOPE_OPTIONS = {CHANGE_SCOPE_GLOBAL: 'Global', CHANGE_SCOPE_LOCAL: 'Local'}
+CHANGE_SCOPE_CAPTION = 'Change:'
+CHANGE_SCOPE_TOOLTIP = ('Which money Target value, Target qty and the change under them are measured against. '
+                        'Global: this label’s portfolio target — what Review and Submit would do. '
+                        'Local: the money this label holds now, split by its shares — what Rebalance label '
+                        'would do. Display only')
+#: Among an expanded label's own buttons: rebalance THIS label only -- real orders, through the same dry run as
+#: Review and Submit.
+MARKER_LABEL_RUN = 'pf-label-run'
+LABEL_RUN_BUTTON_LABEL = 'Rebalance label'
+LABEL_RUN_TOOLTIP = ('Rebalance this label only: the money held in it now is re-split by its symbol shares. '
+                     'Its portfolio target and the other labels are not touched. Opens the same order preview as '
+                     'Review and Submit; nothing is ordered until you press Submit there')
+LABEL_RUN_TITLE_FMT = "Rebalance label '{label}' only - dry run"
+LABEL_RUN_GONE_FMT = "Label '{label}' is no longer managed - refresh the page"
 ACCOUNT_REBAL_TEST_TOOLTIP = ('Would rebalancing the whole account (or one label) back to target every 1, 3, 6 or 12 '
                               'months have beaten holding? A what-if; places no orders')
 #: The orange count beside that icon: symbols in the label whose share is 0% or
@@ -897,6 +938,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'reserve_slider': None,
         'total_bar': None,      # the label-total fill bar's mutable elements
         'footer': None,         # the totals line under the list
+        # Labels whose symbol table shows the LOCAL change (``_apply_change_scope``). The page owns the
+        # set and hands the same one to every redraw; a caller that passes none gets a fresh, empty one.
+        'local_change': set(),
     }
 
 
@@ -960,6 +1004,47 @@ def _write_row_deltas(row: Dict[str, Any]) -> None:
     row['target_quantity'] = None if target_qty is None else round(target_qty, 4)
 
 
+def _apply_change_scope(live: Dict[str, Any], label: str) -> None:
+    """Point one label's Target value / Target qty, and the change under them, at GLOBAL or LOCAL money. In place.
+
+    GLOBAL is ``row['target_value_global']``: the label's portfolio-target money times the share, the figure the
+    row was built with and every recalculation refreshes. LOCAL is ``label_local_target_values``: the money the
+    label HOLDS now times the share, i.e. what "Rebalance label" solves. Only ``target_value`` is swapped;
+    ``_write_row_deltas`` then derives the quantity and both changes from it, as it does for every other writer.
+    """
+    table = live['tables'].get(label)
+    if table is None:
+        return
+    local = label in live['local_change']
+    values: Dict[str, Optional[float]] = {}
+    if local:
+        enabled = [row for row in table.rows if not row.get('excluded')]
+        solved = effective_symbol_weights(live['weights'].get(label) or {}, live['exclusions'])
+        values = label_local_target_values(
+            {row['symbol']: solved.get(row['symbol']) for row in enabled if row['symbol'] in solved},
+            {row['symbol']: row.get('current_value') for row in enabled},
+            frozen={row['symbol'] for row in enabled if row.get('frozen')})
+    for row in table.rows:
+        if row.get('excluded'):
+            continue
+        if local:
+            value = values.get(row['symbol'])
+            row['target_value'] = None if value is None else round(value, 2)
+        else:
+            row['target_value'] = row.get('target_value_global')
+        _write_row_deltas(row)
+    table.update()
+
+
+def _set_change_scope(live: Dict[str, Any], label: str, scope: Any) -> None:
+    """The toggle's handler: remember the label's choice (in the page-owned set) and redraw its figures."""
+    if scope == CHANGE_SCOPE_LOCAL:
+        live['local_change'].add(label)
+    else:
+        live['local_change'].discard(label)
+    _apply_change_scope(live, label)
+
+
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     """Rewrite one label's Share-of-label % and Target value cells. In place.
 
@@ -993,9 +1078,14 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
         row['eff_weight'] = protect_view.effective_weight_text(weights[symbol], row['eff_weight_pct'])
         value = values.get(symbol)
         row['target_value'] = None if value is None else round(value, 2)
+        # Kept beside it: what the Global / Local toggle switches BACK to.
+        row['target_value_global'] = row['target_value']
         # The live deltas, recomputed from the SAME two numbers the cells above were
         # just written from, so the figure and the change beside it cannot disagree.
         _write_row_deltas(row)
+    if label in live['local_change']:
+        # The label is showing its LOCAL change: the shares just moved, so its local targets did too.
+        _apply_change_scope(live, label)
     table.update()
     # The label's own share-of-100 bar, from the SAME map the cells were written
     # from -- so the picture and the column cannot disagree about the total.
@@ -3479,6 +3569,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # The deltas, stamped through the SAME writer the edit path uses, so the first
     # render and every later one agree about what a change looks like.
     for row in rows:
+        # What the Global / Local toggle switches BACK to (see ``_apply_change_scope``).
+        row['target_value_global'] = row['target_value']
         _write_row_deltas(row)
 
     columns = symbol_table_columns()
@@ -3493,6 +3585,9 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     table.add_slot('item', symbol_card_template())
     _phone_tables().register(table)
     live['tables'][view.label] = table
+    if view.label in live['local_change']:
+        # Left on Local before this redraw: the table comes back on the label's own money.
+        _apply_change_scope(live, view.label)
     # WHAT AN UNSET SHARE IS SHOWING. The default used to be the fair share, which
     # would have BOUGHT a newly added symbol; it is the symbol's actual share now,
     # so a symbol the account does not hold sits at 0% and will not be. That is
@@ -3723,6 +3818,26 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   ).props('outline dense') \
             .tooltip('Holdings, dividends and total return for the ticked '
                      'symbols, side by side.')
+        # WHICH MONEY the Target value / Target qty columns and their change are measured against. Display
+        # only: it re-points the table above and stores nothing.
+        with ui.row().classes('items-center gap-1 no-wrap'):
+            ui.label(CHANGE_SCOPE_CAPTION).classes('text-xs text-secondary-custom')
+            ui.toggle(CHANGE_SCOPE_OPTIONS,
+                      value=(CHANGE_SCOPE_LOCAL if view.label in live['local_change']
+                             else CHANGE_SCOPE_GLOBAL),
+                      on_change=lambda e, lbl=view.label: _set_change_scope(live, lbl, e.value)
+                      ).props('dense no-caps unelevated toggle-color=primary size=sm') \
+                .mark(MARKER_CHANGE_SCOPE).tooltip(CHANGE_SCOPE_TOOLTIP)
+        # Rebalance THIS label only: real orders, through the same dry run as Review and Submit. LAST of
+        # the harmless side, after the share buttons it acts on. Drawn only where the page gave a handler --
+        # the handler owns the click latch, the what-if interlock and the never-cleared dialog host that
+        # this body (cleared by every refresh) cannot provide.
+        on_label_run = (live or {}).get('on_label_run')
+        if on_label_run is not None:
+            ui.button(LABEL_RUN_BUTTON_LABEL, icon='fact_check',
+                      on_click=lambda lbl=view.label: on_label_run(lbl)
+                      ).props('outline dense color=primary').mark(MARKER_LABEL_RUN) \
+                .tooltip(LABEL_RUN_TOOLTIP)
         ui.space()
         ui.button('Remove selected from label', icon='delete', on_click=_remove_selected
                   ).props('outline color=negative dense')
@@ -4070,7 +4185,12 @@ def _render_protection_banner(payload: Dict[str, Any]) -> None:
                 ui.label(line).classes('text-sm')
 
 
-def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
+def _render_labels(account_id: int, payload: Dict[str, Any], refresh, *, on_label_run=None,
+                   local_change: Optional[set] = None) -> None:
+    """The label section. ``on_label_run(label)`` is the page's "rebalance this label only" handler; without
+    one its button is not drawn in the label's body (a caller with no dry-run flow behind it gets no dead control).
+    ``local_change`` is the page-owned set of labels whose table shows the LOCAL change (the Global / Local
+    toggle); it is mutated in place, so handing the same set to every redraw is what makes the choice survive one."""
     # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
     # because the order was whatever ``sort_order`` happened to be.
     # BEFORE the empty-label early return: an account with no labels can still be
@@ -4095,6 +4215,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                            protection=payload.get('protection'),
                            exclusions=payload.get('exclusions'),
                            frozen=payload.get('frozen'))
+    live['on_label_run'] = on_label_run
+    if local_change is not None:
+        live['local_change'] = local_change
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -4273,7 +4396,7 @@ def _market_gate_for(hours):
 async def _open_allocation_flow(account_id: int, valuation_mode: str,
                                 refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
                                 invest_amount: float = 0.0,
-                                on_progress=None) -> None:
+                                on_progress=None, scope_label: Optional[str] = None) -> None:
     """The Review-and-Submit button: the dry run, then Submit. NO target step any more.
 
     A REBALANCE goes STRAIGHT to the dry run. The three-step dialog it used to open
@@ -4285,6 +4408,10 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     An INVEST run still opens ``open_invest_scope`` first, and that is not a target
     editor: it spends a specific amount on a single label, so the run has to be told
     which label and how much, and neither is a stored target of anything.
+
+    A REBALANCE_LABEL run (the "Rebalance label" button of an expanded label, ``scope_label`` = it) is the
+    REBALANCE flow on ONE label: straight to the same dry run, solved on the money the label holds
+    now (``compute_label_rebalance``). It never writes a label's portfolio target or the reserve.
 
     Every blocking call is dispatched through ``asyncio.to_thread``: broker IO on the
     event loop freezes the app for every connected client.
@@ -4304,8 +4431,20 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     if not labels:
         ui.notify('No managed labels yet - use "Manage labels" first', type='warning')
         return
+    if mode == ALLOCATION_MODE_REBALANCE_LABEL:
+        # Refused HERE, with the reason, before a broker round trip is spent on a run that
+        # ``_solve_plan`` would refuse anyway (it checks again on every solve).
+        scope = next((lt for lt in labels if lt.label == scope_label), None)
+        if scope is None:
+            ui.notify(LABEL_RUN_GONE_FMT.format(label=scope_label), type='warning')
+            return
+        block = label_rebalance_block(scope, labels)
+        if block is not None:
+            ui.notify(block[:1].upper() + block[1:], type='warning', multi_line=True,
+                      close_button=True, classes='break-words')
+            return
 
-    state = {'mode': mode, 'scope_label': None, 'amount': float(invest_amount or 0.0),
+    state = {'mode': mode, 'scope_label': scope_label, 'amount': float(invest_amount or 0.0),
              'labels': labels, 'allow_fractional': allow_fractional,
              'unallocated_pct': unallocated_pct,
              'base': base, 'current': {}}
@@ -4333,13 +4472,20 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         percentage played no part, and its ``unallocated_pct`` is a hard 0 that
         would ZERO a reserve the user set on the rebalance side. Its symbol weights
         DID split the money, so they are still saved.
+
+        A REBALANCE_LABEL run is on the same side of that line: it splits one label's own
+        money, so no label percentage and no reserve played a part and neither is written.
+        Only ITS label's symbol weights are saved -- the other labels split nothing.
         """
         svc.remember_fractional_choice(account_id, bool(allow_fractional))
-        if mode != ALLOCATION_MODE_INVEST_LABEL:
+        full_rebalance = mode == ALLOCATION_MODE_REBALANCE
+        if full_rebalance:
             set_allocation_config(account_id, unallocated_pct=float(unallocated_pct))
+        if mode == ALLOCATION_MODE_REBALANCE_LABEL:
+            labels = [lt for lt in labels if lt.label == state['scope_label']]
         return save_allocation_targets(
             account_id, labels_for_persist(account_id, labels),
-            save_label_targets=(mode != ALLOCATION_MODE_INVEST_LABEL))
+            save_label_targets=full_rebalance)
 
     async def _save_choices(mode: str, labels, allow_fractional: bool,
                             unallocated_pct: float) -> None:
@@ -4430,9 +4576,13 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
 
         # HELD, because the dialog no longer closes on Submit: the run reports each
         # row's outcome back into this table while it is still on screen.
+        scoped = {}
+        if state['mode'] == ALLOCATION_MODE_REBALANCE_LABEL:
+            scoped = {'title': LABEL_RUN_TITLE_FMT.format(label=state['scope_label']),
+                      'scope_label': state['scope_label']}
         state['wizard'] = open_allocation_wizard(
             new_base, plan, market=_market_gate_for(hours),
-            on_refresh=_on_refresh, on_submit=_on_submit, on_validate=_on_validate)
+            on_refresh=_on_refresh, on_submit=_on_submit, on_validate=_on_validate, **scoped)
 
     async def _do_submit(selected_plan) -> None:
         # THE WORKER RECORDS, THE TIMER PAINTS -- the same split the Review bar uses,
@@ -4668,6 +4818,9 @@ async def content() -> None:
             # reload would be indistinguishable from the real page the next time it
             # was opened, which is the one way this feature could mislead.
             sim_state: Dict[str, Any] = {'on': False, 'base': None}
+            # Labels left on the LOCAL change view. Session-only like the what-if: a display choice, and
+            # one set for the page's life so a refresh does not flip every label back to Global.
+            local_change: set = set()
         except Exception as e:
             logger.error(f"Portfolio allocation: valuation mode unreadable for account "
                          f"{account_id}: {e}", exc_info=True)
@@ -4703,7 +4856,11 @@ async def content() -> None:
                 return
             body.clear()
             with body:
-                _render_labels(account_id, payload, _refresh)
+                # THROUGH ``_defer``: the button lives in ``body``, which this very function clears -- including on
+                # the refresh that ends a Submit -- so the dry run is started from the never-cleared dialog host.
+                _render_labels(account_id, payload, _refresh,
+                               on_label_run=lambda label: _defer(lambda: _review_scope(label)),
+                               local_change=local_change)
             await _draw_reminder()
             # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
             # render path and never joined: a slow provider must not hold the page,
@@ -4760,6 +4917,12 @@ async def content() -> None:
         async def _review() -> None:
             """The Review button: ONE dry run per press, however many times it is
             pressed. See ``ClickLatch``."""
+            await _review_scope(None)
+
+        async def _review_scope(scope_label: Optional[str]) -> None:
+            """``_review`` for the whole account (``None``) or for ONE label (its "Rebalance label" button).
+            ONE latch for both: a label run and a full run are two plans over the same positions, and two dry
+            runs open at once is the double-submit the latch exists to prevent."""
             # THE INTERLOCK, re-checked at press time and not only by disabling the
             # button. The dry run solves against the broker's REAL base -- it has to,
             # it is going to place real orders -- so reviewing while the page shows
@@ -4795,9 +4958,11 @@ async def content() -> None:
 
             painter = ui.timer(0.2, _paint)
             try:
+                scoped = ({} if scope_label is None
+                          else {'mode': ALLOCATION_MODE_REBALANCE_LABEL, 'scope_label': scope_label})
                 await review_latch.run(
                     lambda: _open_allocation_flow(account_id, mode_state['value'],
-                                                  _refresh, on_progress=_record))
+                                                  _refresh, on_progress=_record, **scoped))
             finally:
                 painter.deactivate()
 

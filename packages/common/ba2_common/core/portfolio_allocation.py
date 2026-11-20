@@ -54,7 +54,7 @@ exactly 100.0. Never hand-roll a split.
 
 import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime as DateTime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -96,6 +96,10 @@ __all__ = [
     "WARNING_INVEST_EXCEEDS_BP_FMT", "ADVISORY_MESSAGE_FRAGMENTS",
     # modes
     "ALLOCATION_MODE_REBALANCE", "ALLOCATION_MODE_INVEST_LABEL",
+    "ALLOCATION_MODE_REBALANCE_LABEL", "compute_label_rebalance", "label_rebalance_block",
+    "WARNING_LABEL_HOLDS_NOTHING_FMT", "WARNING_LABEL_SHARES_SCALED_FMT",
+    "LABEL_REBALANCE_SHARED_BLOCK_FMT", "LABEL_REBALANCE_NO_SHARE_BLOCK_FMT",
+    "LABEL_REBALANCE_SHORT_BLOCK_FMT", "LABEL_REBALANCE_NO_PRICE_BLOCK_FMT",
     "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
     # tolerances and grid
     "DEFAULT_FRACTIONAL_DECIMALS", "LABEL_TOTAL_TOLERANCE_PCT",
@@ -168,6 +172,8 @@ __all__ = [
 
 ALLOCATION_MODE_REBALANCE = "REBALANCE"
 ALLOCATION_MODE_INVEST_LABEL = "INVEST_LABEL"
+#: A rebalance of ONE label: its current money re-split by its symbol shares (``compute_label_rebalance``).
+ALLOCATION_MODE_REBALANCE_LABEL = "REBALANCE_LABEL"
 
 #: How "current value" is measured -- see ``current_value`` and decision 5a.
 #: PLAIN str, matching the ``portfolio_allocation_config.valuation_mode`` column.
@@ -494,6 +500,26 @@ WARNING_FROZEN_NO_PRICE_FMT = ("{symbol} is frozen and held but has no price - s
 WARNING_FROZEN_LABEL_ALL_FMT = ("every symbol of label '{label}' is frozen - nothing can be invested "
                                 "in it; unfreeze a symbol or pick another label")
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
+#: A label-only rebalance of a label with no position: there is no money to re-split.
+WARNING_LABEL_HOLDS_NOTHING_FMT = ("label '{label}' holds no position - a label-only rebalance has no "
+                                   "money to split; use Invest or the full Review and Submit")
+#: A label-only rebalance scaled symbol shares that total under 100% up to 100%, so the label's money stays in it.
+WARNING_LABEL_SHARES_SCALED_FMT = ("label '{label}' symbol shares total {total:.2f}% - scaled to 100% for this "
+                                   "label-only run, so all of the label's money stays in the label")
+LABEL_REBALANCE_NO_SHARE_BLOCK_FMT = (
+    "label '{label}' cannot be rebalanced alone: it has no symbol share above 0%, so there is nothing to "
+    "put its money on. Set the shares first, or close it with the full Review and Submit")
+LABEL_REBALANCE_SHORT_BLOCK_FMT = (
+    "label '{label}' cannot be rebalanced alone: {symbols} is held short, and a label-only run only "
+    "re-splits money the label holds. Use the full Review and Submit")
+LABEL_REBALANCE_NO_PRICE_BLOCK_FMT = (
+    "label '{label}' cannot be rebalanced alone right now: there is no price for {symbols}, so the label's "
+    "money cannot be split without buying or selling the other symbols against the account's cash. "
+    "Refresh and try again")
+#: Why a label cannot be rebalanced alone (``label_rebalance_block``). ``shared`` = "SYM (other label), ...".
+LABEL_REBALANCE_SHARED_BLOCK_FMT = (
+    "label '{label}' cannot be rebalanced alone: {shared} also belong to another managed label, so the "
+    "part of the position that is this label's money is not defined. Use the full Review and Submit")
 
 # Validation messages from ``validate_label_targets``. Pinned so the UI and the
 # tests agree on the exact text.
@@ -2855,6 +2881,134 @@ def compute_label_investment(label: LabelTarget, amount: float,
     plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
                                           allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
+    return plan
+
+
+def label_rebalance_block(label: LabelTarget, labels: List[LabelTarget],
+                          current: Optional[Dict[str, PositionState]] = None) -> Optional[str]:
+    """Why ``label`` may NOT be rebalanced alone, or ``None``. Pure.
+
+    A label-only run promises ONE thing: the label's money stays what it is and only its split
+    changes. Each refusal below is a case where that promise cannot be kept or the money cannot be
+    measured, so the run is refused with the reason instead of sized on a guess:
+
+    * every symbol share is 0%: there is nothing to put the label's money on (closing a whole
+      label is the full run's job, where the money has somewhere to go);
+    * a symbol also belongs to another managed label: it is ONE position serving two targets and
+      nothing stores which part is this label's money (matched case-insensitively; ``labels`` may
+      include ``label`` itself).
+
+    With ``current`` (the solve-time positions; ``None`` skips these two, e.g. before the broker
+    has been read):
+
+    * a member is SHORT: targets are long-only, so the engine would buy it back with money the
+      label does not hold;
+    * a member that is held, or has a share above 0%, has no usable price: it cannot trade, so its
+      money (cost mode) or its share (either mode) would be bought or sold on the OTHER members
+      against the account's cash.
+    """
+    if label is None:
+        return None
+    weights: Dict[str, float] = {}
+    for st in label.symbols:
+        weights[st.symbol] = weights.get(st.symbol, 0.0) + float(st.weight_pct or 0.0)
+    if weights and sum(max(0.0, w) for w in weights.values()) <= 0:
+        return LABEL_REBALANCE_NO_SHARE_BLOCK_FMT.format(label=label.label)
+    mine = {(symbol or "").strip().upper(): symbol for symbol in weights}
+    shared: Dict[str, List[str]] = {}
+    for other in labels or []:
+        if other.label == label.label:
+            continue
+        for st in other.symbols:
+            key = (st.symbol or "").strip().upper()
+            if key in mine and other.label not in shared.setdefault(mine[key], []):
+                shared[mine[key]].append(other.label)
+    if shared:
+        return LABEL_REBALANCE_SHARED_BLOCK_FMT.format(
+            label=label.label,
+            shared=", ".join(f"{sym} ({', '.join(sorted(others))})"
+                             for sym, others in sorted(shared.items())))
+    if current is None:
+        return None
+    short, unpriced = [], []
+    for symbol, weight in weights.items():
+        state = current.get(symbol)
+        quantity = float(state.quantity) if state is not None else 0.0
+        if quantity < 0:
+            short.append(symbol)
+        elif (quantity > 0 or weight > 0) and (
+                state is None or state.price is None or state.price <= 0):
+            unpriced.append(symbol)
+    if short:
+        return LABEL_REBALANCE_SHORT_BLOCK_FMT.format(label=label.label,
+                                                      symbols=", ".join(sorted(short)))
+    if unpriced:
+        return LABEL_REBALANCE_NO_PRICE_BLOCK_FMT.format(label=label.label,
+                                                         symbols=", ".join(sorted(unpriced)))
+    return None
+
+
+def compute_label_rebalance(label: LabelTarget, current: Dict[str, PositionState],
+                            margin: Dict[str, MarginInfo], *,
+                            available_buying_power: float, allow_fractional: bool,
+                            default_bp_factor: float, valuation_mode: str,
+                            frozen_symbols: Optional[Set[str]] = None) -> AllocationPlan:
+    """Solve a REBALANCE_LABEL run: re-split ONE label's CURRENT money by its symbol shares.
+
+    The money is what the label's positions are worth NOW in ``valuation_mode`` (``current_value``
+    summed over its distinct symbols) -- NOT ``label.target_pct`` of the account, which plays no
+    part. So the label's total does not move: what its over-weight symbols sell is what its
+    under-weight ones buy (give or take share rounding), and no other label is touched.
+
+    It IS ``compute_allocation`` on that money with the label at 100% and no cash reserve, so every
+    rule is the full run's own: a 0% symbol is closed, a frozen member keeps its position and the
+    others share what is left, rounding, minimum-order suppression, redistribution and buying-power
+    scaling (the sells' proceeds fund the buys). The returned plan's ``base_notional`` is the
+    label's money and ``labels`` holds the label as it was SOLVED: at 100% of that money.
+
+    ONE DIFFERENCE from the full run, and it is the point of the run: symbol shares totalling UNDER
+    100% are SCALED to 100% (proportions kept, ``WARNING_LABEL_SHARES_SCALED_FMT`` recorded). The
+    full run leaves the shortfall as cash, which here would sell part of the label out of the label.
+    Shares OVER 100% are left as typed, for ``validate_label_targets`` to refuse as it does today.
+
+    A label that holds nothing has no money to split: every row is a no-op and
+    ``WARNING_LABEL_HOLDS_NOTHING_FMT`` is recorded.
+
+    Raises:
+        TypeError: if ``valuation_mode`` is omitted (it has no default).
+        ValueError: on a ``None`` ``label``, an unknown ``valuation_mode``, a ``None``
+        ``available_buying_power`` (money inputs are never guessed), or any single-label reason
+        of ``label_rebalance_block`` (every share at 0%, a short member, a held or wanted member
+        with no price). The caller checks the SHARED-symbol reason, which needs the other labels.
+    """
+    if label is None:
+        raise ValueError("compute_label_rebalance: label is None")
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    current = current or {}
+    block = label_rebalance_block(label, [label], current)
+    if block is not None:
+        raise ValueError(block)
+    total_weight = sum(float(st.weight_pct or 0.0) for st in label.symbols)
+    solved = replace(label, target_pct=100.0)
+    scaled = 0.0 < total_weight < 100.0 - LABEL_TOTAL_TOLERANCE_PCT
+    if scaled:
+        solved = replace(solved, symbols=[
+            replace(st, weight_pct=float(st.weight_pct or 0.0) * 100.0 / total_weight)
+            for st in label.symbols])
+    label_money = sum(current_value(current.get(symbol), valuation_mode)
+                      for symbol in dict.fromkeys(st.symbol for st in label.symbols))
+    plan = compute_allocation(
+        max(0.0, label_money), available_buying_power, [solved],
+        current, margin, allow_fractional=allow_fractional, default_bp_factor=default_bp_factor,
+        valuation_mode=valuation_mode, unallocated_pct=0.0, frozen_symbols=frozen_symbols)
+    if scaled:
+        plan.warnings.append(WARNING_LABEL_SHARES_SCALED_FMT.format(label=label.label,
+                                                                    total=total_weight))
+    if label.symbols and label_money <= MONEY_EPSILON:
+        plan.warnings.append(WARNING_LABEL_HOLDS_NOTHING_FMT.format(label=label.label))
     return plan
 
 

@@ -387,6 +387,10 @@ RETRY_TOOLTIP = (
 #: and nothing called ``validate_label_targets`` before Submit. Two boxes at 100%
 #: each used to buy DOUBLE the base with no warning on screen.
 MARKER_TARGET_BLOCK = 'target-block'
+#: A label-only run (``scope_label``): the line above the tabs that says WHICH money is being split.
+MARKER_LABEL_RUN_NOTE = 'label-run-note'
+LABEL_RUN_NOTE_FMT = ("Label '{label}' only: ${money:,.2f} is held in it. That total is kept; only the split "
+                      "between its symbols changes. The other labels are not traded.")
 #: Prefixes the joined validator errors so the banner reads as one sentence
 #: rather than a bare semicolon-joined dump of ``ERROR_LABEL_*`` strings.
 TARGET_BLOCK_PREFIX = 'Submit is off until the targets are fixed: '
@@ -983,8 +987,12 @@ class AllocationWizard:
         on_submit: Callable[[AllocationPlan], None],
         on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
         title: str = 'Portfolio allocation - dry run',
+        scope_label: Optional[str] = None,
     ):
         self.base = base
+        #: The label of a label-only run (``compute_label_rebalance``), else None. Display only:
+        #: it adds the "which money" line; the plan itself already carries the scope.
+        self.scope_label = scope_label
         self.plan = plan
         self.market = market
         self.on_refresh = on_refresh
@@ -1689,6 +1697,12 @@ class AllocationWizard:
             return
         self._base_block_container.clear()
         with self._base_block_container:
+            if self.scope_label:
+                # Redrawn with the plan: ``base_notional`` of a label-only plan IS the label's money, and a
+                # Refresh re-prices it.
+                _label(LABEL_RUN_NOTE_FMT.format(label=self.scope_label,
+                                                 money=self.plan.base_notional),
+                       'text-sm').mark(MARKER_LABEL_RUN_NOTE)
             base_block = self._base_block()
             if base_block is not None:
                 with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
@@ -2455,6 +2469,7 @@ def open_allocation_wizard(
     on_submit: Callable[[AllocationPlan], None],
     on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
     title: str = 'Portfolio allocation - dry run',
+    scope_label: Optional[str] = None,
 ) -> AllocationWizard:
     """Open the dry-run dialog. Returns the wizard so the caller can keep a handle.
 
@@ -2477,7 +2492,7 @@ def open_allocation_wizard(
     """
     wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
                               on_submit=on_submit, on_validate=on_validate,
-                              title=title)
+                              title=title, scope_label=scope_label)
     wizard.open()
     return wizard
 
