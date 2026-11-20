@@ -36,6 +36,9 @@ UNAVAILABLE_NO_MULTIPLIER = "contract multiplier not recorded"
 UNAVAILABLE_INCOMPLETE = "executed structure incompletely recorded"
 UNAVAILABLE_NO_PRICES = "entry or exit premium not recorded"
 
+#: ``OptionPnlDisplay.source`` of a single contract priced at a broker position mark of exactly 0.
+SOURCE_ZERO_MARK = "single_leg_broker_zero_mark"
+
 
 @dataclass(frozen=True)
 class OptionPnlDisplay:
@@ -231,6 +234,48 @@ def option_transaction_pnl(
     )
 
 
+def _zero_mark_pnl(account: Any, transaction: Any, order: Any) -> Optional[OptionPnlDisplay]:
+    """P&L of ONE held contract the broker's own position book marks at exactly 0, else ``None``.
+
+    The single-leg seam declines a premium <= 0: on its quote path a 0 is how a feed reports an
+    ABSENT side, and nothing may be sold or stopped out on a number nobody quoted. A broker
+    POSITION mark is a different fact. It is the price the broker itself carries the holding at
+    (Alpaca: ``current_price`` 0, ``unrealized_pl`` = minus the whole premium), and a far
+    out-of-the-money contract near expiry with no bid really is carried at 0. Declining it
+    dropped the position from every open-P/L view as "no broker price", which overstated the
+    row by the entire premium paid (8082, 2026-11-20: two calls, about $2,170).
+
+    DISPLAY ONLY, and only in marks mode: the rules engine reads quotes and is not touched. The
+    figure is the seam's own formula (``TransactionHelper.calculate_option_pnl``) at a premium
+    of zero -- a long has lost what it paid, a short has kept what it was paid -- so a mark of
+    0.01 and a mark of 0 are one cent apart per share, not a different rule. A multi-leg
+    structure needs none of this: its seam already prices a leg at 0.
+    """
+    if not isinstance(account, QuoteCachingAccount):
+        return None
+    marks = object.__getattribute__(account, '_marks')
+    contract = getattr(order, "contract_symbol", None)
+    if marks is None or contract is None:
+        return None
+    mark = marks.get(contract)
+    if mark is None or mark != 0:
+        return None
+    open_price = getattr(transaction, "open_price", None)
+    quantity = getattr(transaction, "quantity", None)
+    multiplier = getattr(transaction, "multiplier", None) or getattr(order, "multiplier", None)
+    if not open_price or not quantity or not multiplier:
+        return None
+    basis = float(open_price) * abs(float(quantity)) * float(multiplier)
+    if basis <= 0:
+        return None
+
+    from ba2_common.core.types import OrderDirection
+
+    long = getattr(transaction, "side", None) == OrderDirection.BUY
+    return OptionPnlDisplay(amount=round(-basis if long else basis, 2),
+                            percent=-100.0 if long else 100.0, source=SOURCE_ZERO_MARK)
+
+
 def open_structure_pnl(
     account: Any,
     transaction: Any,
@@ -252,6 +297,9 @@ def open_structure_pnl(
     seam would see a DIFFERENT structure, second review N4), and reports a transaction whose
     entry has not executed as ``UNAVAILABLE_NO_FILLS``: it holds nothing yet.
     ``leg_set`` may be passed when the caller already built it (``opening_legs``).
+
+    A single contract the broker's position book marks at exactly 0 is priced at 0, not reported
+    as unquoted (``_zero_mark_pnl``).
     """
     if leg_set is None:
         from .option_positions import opening_legs
@@ -269,8 +317,13 @@ def open_structure_pnl(
         representative = leg_set.legs[0].order
     if representative is None:
         return _unavailable(UNAVAILABLE_INCOMPLETE)
-    return option_transaction_pnl(account, representative, opening_legs=leg_set.count,
-                                  single_leg=single_leg, multi_leg=multi_leg)
+    priced = option_transaction_pnl(account, representative, opening_legs=leg_set.count,
+                                    single_leg=single_leg, multi_leg=multi_leg)
+    if priced.reason == UNAVAILABLE_NO_QUOTE and not leg_set.is_multi_leg:
+        at_zero = _zero_mark_pnl(account, transaction, representative)
+        if at_zero is not None:
+            return at_zero
+    return priced
 
 
 def option_closed_pnl(transaction: Any) -> OptionPnlDisplay:

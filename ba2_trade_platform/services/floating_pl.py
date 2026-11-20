@@ -27,7 +27,8 @@ class PLRow:
     happened to come out at zero -- a flat account is ``pl=0.0``. Same contract for
     ``balance``.
 
-    ``unpriced`` names the symbols this row HOLDS but the broker did not quote.
+    ``unpriced`` names what this row HOLDS but the broker did not quote: a stock by its symbol,
+    an option by its CONTRACT (``unpriced_names``), never by the underlying.
     Those legs are missing from ``pl``, so ``pl`` is real but incomplete: the row
     is rendered with :data:`PARTIAL_SUFFIX` rather than silently understated,
     which is what dropping them did.
@@ -47,6 +48,20 @@ class PLRow:
     unpriced: Tuple[str, ...] = ()
     tradable: Optional[float] = None
     broker_bp: Optional[float] = None
+
+
+def unpriced_names(trans, orders) -> List[str]:
+    """What to call a transaction the row could not price. Pure.
+
+    An option transaction's ``symbol`` is its UNDERLYING, and "no broker price for TSM" reads as
+    a missing stock price when the stock is quoted and it is the contract that is not. So an
+    option is named by its contract(s) -- every distinct one its orders carry, in order, since a
+    structure is missing from the row as a whole -- and anything else by its own symbol.
+    """
+    contracts = list(dict.fromkeys(
+        contract for contract in (getattr(order, 'contract_symbol', None) for order in orders)
+        if contract))
+    return contracts or [trans.symbol]
 
 
 def combine_measurements(
@@ -334,6 +349,7 @@ class FloatingPLCalculator:
         option_quotes: Dict = {}
 
         for trans, display_name in trans_list:
+            orders = ()
             try:
                 orders = session.exec(
                     select(TradingOrder)
@@ -348,15 +364,17 @@ class FloatingPLCalculator:
             except Exception as e:
                 logger.error(f"Error calculating P/L for transaction {trans.id}: {e}",
                              exc_info=True)
-                if trans.symbol not in unpriced_by_name[display_name]:
-                    unpriced_by_name[display_name].append(trans.symbol)
+                for name in unpriced_names(trans, orders):
+                    if name not in unpriced_by_name[display_name]:
+                        unpriced_by_name[display_name].append(name)
                 continue
 
             if measured is None:
                 # HELD but not quoted. Not zero: the leg is missing, and the row
                 # says so instead of quietly understating the account.
-                if trans.symbol not in unpriced_by_name[display_name]:
-                    unpriced_by_name[display_name].append(trans.symbol)
+                for name in unpriced_names(trans, orders):
+                    if name not in unpriced_by_name[display_name]:
+                        unpriced_by_name[display_name].append(name)
                 continue
             pl_by_name[display_name] += measured
 

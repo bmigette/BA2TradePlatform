@@ -251,3 +251,124 @@ def test_marks_mode_quotes_at_the_mark_and_unknown_when_unlisted():
     q = wrapped.get_option_quote('XYZ_C95')
     assert (q.bid, q.ask, q.last) == (2.0, 2.0, 2.0)
     assert wrapped.get_option_quote('XYZ_C100') is None   # not held per the broker: unknown
+
+
+# ---- a broker mark of ZERO is a price, not a missing one (8082, 2026-11-20) -----------------
+# Alpaca reported two far out-of-the-money calls a week from expiry (no bid) at current_price 0,
+# unrealized_pl = minus the whole premium. The single-leg seam declines a premium <= 0, so both
+# were dropped from the Floating P/L card as "no broker price" and the row read ~$2,170 too high.
+from ba2_common.core.option_types import OptionQuote
+
+TSM_CALL = 'TSM261127C00485000'
+
+
+def _tsm_entry(side=OrderDirection.BUY):
+    return SimpleNamespace(
+        id=8, transaction_id=5, account_id=1, symbol='TSM', side=side,
+        status=OrderStatus.FILLED, quantity=1.0, filled_qty=1.0, open_price=6.95,
+        asset_class=AssetClass.OPTION, contract_symbol=TSM_CALL,
+        option_type='CALL', strike=485.0, expiry=_date(2026, 11, 27), multiplier=100,
+        position_intent='buy_to_open' if side == OrderDirection.BUY else 'sell_to_open',
+        option_strategy='long_call', underlying_symbol='TSM',
+        created_at=_datetime(2026, 10, 13, 13, 36), data=None, comment=None,
+    )
+
+
+def _tsm_txn(side=OrderDirection.BUY, multiplier=100):
+    return SimpleNamespace(id=5, symbol='TSM', side=side, quantity=1.0, open_price=6.95,
+                           multiplier=multiplier, asset_class=AssetClass.OPTION)
+
+
+@pytest.fixture
+def real_seam(monkeypatch):
+    """The rules engine's OWN single-leg seam, with only its transaction lookup answered here."""
+    import ba2_common.core.TradeConditions as conditions
+    held = {}
+    monkeypatch.setattr(conditions, '_get_transaction_for_order',
+                        lambda order: held.get(order.transaction_id))
+    return held
+
+
+def _marked(marks):
+    return quote_caching_account(_MarkAccount([]), {}, 1, marks)
+
+
+def test_a_long_call_the_broker_marks_at_zero_has_lost_its_whole_premium(real_seam):
+    txn = real_seam[5] = _tsm_txn()
+    result = open_structure_pnl(_marked({TSM_CALL: 0.0}), txn, [_tsm_entry()])
+
+    assert result.available
+    assert result.amount == pytest.approx(-695.0) and result.percent == pytest.approx(-100.0)
+
+
+def test_a_short_call_the_broker_marks_at_zero_has_kept_its_whole_premium(real_seam):
+    txn = real_seam[5] = _tsm_txn(side=OrderDirection.SELL)
+    result = open_structure_pnl(_marked({TSM_CALL: 0.0}), txn, [_tsm_entry(side=OrderDirection.SELL)])
+
+    assert result.amount == pytest.approx(695.0) and result.percent == pytest.approx(100.0)
+
+
+def test_the_zero_mark_figure_is_the_seams_own_formula_at_a_premium_of_zero(real_seam):
+    from ba2_common.core.TransactionHelper import TransactionHelper
+    for side in (OrderDirection.BUY, OrderDirection.SELL):
+        txn = real_seam[5] = _tsm_txn(side=side)
+        limit = TransactionHelper.calculate_option_pnl(txn, 1e-9, 100)
+        result = open_structure_pnl(_marked({TSM_CALL: 0.0}), txn, [_tsm_entry(side=side)])
+        assert result.amount == pytest.approx(limit['amount'], abs=0.01)
+        assert result.percent == pytest.approx(limit['percent'], abs=0.01)
+
+
+def test_a_positive_mark_is_still_priced_by_the_seam(real_seam):
+    txn = real_seam[5] = _tsm_txn()
+    result = open_structure_pnl(_marked({TSM_CALL: 0.24}), txn, [_tsm_entry()])
+    assert result.amount == pytest.approx(-671.0) and result.source == 'single_leg_premium'
+
+
+def test_a_contract_the_broker_does_not_list_is_still_unknown(real_seam):
+    txn = real_seam[5] = _tsm_txn()
+    result = open_structure_pnl(_marked({}), txn, [_tsm_entry()])
+    assert not result.available and result.reason == UNAVAILABLE_NO_QUOTE
+
+
+def test_a_zero_mark_without_a_contract_multiplier_is_still_unknown(real_seam):
+    txn = real_seam[5] = _tsm_txn(multiplier=None)
+    entry = _tsm_entry()
+    entry.multiplier = None
+    result = open_structure_pnl(_marked({TSM_CALL: 0.0}), txn, [entry])
+    assert not result.available
+
+
+def test_a_zero_bid_on_the_quote_path_is_still_unknown(real_seam):
+    """Only the broker's POSITION mark is trusted at zero. A live quote reports an absent side as
+    0 too, and that path is the rules engine's: it is deliberately left exactly as it was."""
+    class _Quoted(_MarkAccount):
+        def get_option_quote(self, contract_symbol):
+            return OptionQuote(symbol=contract_symbol, bid=0.0, ask=2.11, last=0.24)
+
+    txn = real_seam[5] = _tsm_txn()
+    result = open_structure_pnl(quote_caching_account(_Quoted([]), {}, 1), txn, [_tsm_entry()])
+    assert not result.available and result.reason == UNAVAILABLE_NO_QUOTE
+
+
+def test_the_floating_pl_card_counts_a_position_the_broker_marks_at_zero(real_seam):
+    from ba2_trade_platform.ui.components.FloatingPLPerAccountWidget import _FloatingPLWidgetBase
+    txn = real_seam[5] = _tsm_txn()
+    measured = _FloatingPLWidgetBase._option_transaction_pl(
+        txn, [_tsm_entry()], _MarkAccount([]), 1, {}, {TSM_CALL: 0.0})
+    assert measured == pytest.approx(-695.0)
+
+
+def test_an_unpriced_option_is_named_by_its_contract_not_its_underlying():
+    """'no broker price for TSM' read as a missing STOCK price; what is unpriced is the contract."""
+    from ba2_trade_platform.services.floating_pl import unpriced_names
+    assert unpriced_names(_tsm_txn(), [_tsm_entry()]) == [TSM_CALL]
+    wing = _tsm_entry()
+    wing.contract_symbol = 'TSM261127C00500000'
+    parent = _tsm_entry()
+    parent.contract_symbol = None
+    assert unpriced_names(_tsm_txn(), [parent, _tsm_entry(), wing, _tsm_entry()]) == \
+        [TSM_CALL, 'TSM261127C00500000']
+    # an equity transaction has no contract: its own symbol, as before
+    stock = SimpleNamespace(id=1, symbol='AAPL')
+    assert unpriced_names(stock, [SimpleNamespace(contract_symbol=None)]) == ['AAPL']
+    assert unpriced_names(stock, []) == ['AAPL']
