@@ -251,6 +251,10 @@ SKIP_STOPPED_TRADING = "symbol_stopped_trading"
 #: ``sma200_and_spy`` only: the symbol has no completed bar on SPY's last session (a halt or a data
 #: gap of at most MAX_STALE_DAYS), so the stock and the market regime cannot be read on one session.
 SKIP_NO_SESSION_BAR = "no_bar_on_decision_session"
+#: Under ``MIN_BARS`` completed bars in the lookback window although the history reaches back before
+#: it: the symbol missed sessions (thin trading, a long halt, or a hole in the data). Its indicators
+#: cannot be computed for this decision; SPY, read on the same decision, covers the whole window.
+SKIP_HISTORY_GAP = "history_gap"
 
 
 def _utc_now() -> datetime:
@@ -335,36 +339,37 @@ def _span(bars) -> str:
     return f"{bars.index[0].date()}..{bars.index[-1].date()} ({len(bars)} sessions)"
 
 
-def _check_recent_listing(frame, bars, session, name: str, spy_bars, older_history) -> None:
-    """Return quietly only when a short completed history (under ``MIN_BARS``, possibly empty on
-    the listing day itself) is a genuine recent listing, which the expert skips; raise
-    ``ValueError`` (the run aborts) otherwise.
+def _check_short_history(frame, bars, session, name: str, spy_bars, older_history) -> Optional[str]:
+    """Why a completed history under ``MIN_BARS`` (possibly empty on the listing day itself) is
+    short. Both answers are SKIPPED by the expert, under different reasons: ``None`` for a
+    genuine recent listing, or the words describing a GAP. Raises ``ValueError`` (the run aborts)
+    when the history is corrupt or the provider does not serve the window.
 
     A recent listing is a valid history whose EARLIEST ROW EVER lies inside the lookback
     window. A history reaching back to the window start but still short has a gap; so does one
     with ANY row before the window (``older_history()``: the long probe fetch), however late in
-    the window it resumes. "Inside" is only meaningful if the provider serves the whole window,
-    which a backtest does not when its warmup is shorter than the fetch window: every symbol
-    would then look newly listed and the run would skip them all. ``spy_bars()`` returns SPY's
-    completed bars; SPY always has history, so a short SPY, or one that also starts inside the
-    window, aborts."""
+    the window it resumes. A gap used to abort the run, and one thinly traded symbol on one
+    decision then killed a whole training job (VFS, goal2027 pb-large, 2026-11-21: 176 bars,
+    need 200), so it is skipped for the decision instead, like a symbol with no bar on SPY's
+    last session.
+
+    Neither answer means anything unless the provider serves the whole window, which a backtest
+    does not when its warmup is shorter than the fetch window: every symbol would then look
+    short and the run would skip them all. ``spy_bars()`` returns SPY's completed bars; SPY
+    always has history, so a short SPY, or one that also starts inside the window, aborts."""
     window_start = session - timedelta(days=LOOKBACK_DAYS)
     covered_by = window_start + timedelta(days=LISTING_SLACK_DAYS)
     earliest = pd.Timestamp(_session_stamps(frame, name).min()).date()
+    gap = None
     if earliest <= covered_by:
-        raise ValueError(
-            f"Insufficient history in {name}: {len(bars)} completed bars in the {LOOKBACK_DAYS}-day "
-            f"window, need {MIN_BARS}, although its history starts on {earliest}: a gap in the "
-            "data, not a new listing")
-    older = older_history()
-    if older is not None and len(older):
-        earliest_ever = pd.Timestamp(_session_stamps(older, name).min()).date()
-        if earliest_ever < window_start:
-            raise ValueError(
-                f"Insufficient history in {name}: {len(bars)} completed bars in the "
-                f"{LOOKBACK_DAYS}-day window, need {MIN_BARS}; it resumes on {earliest} but has "
-                f"rows from {earliest_ever}, before the window start {window_start}: a gap in the "
-                "data, not a new listing")
+        gap = f"its history starts on {earliest}"
+    else:
+        older = older_history()
+        if older is not None and len(older):
+            earliest_ever = pd.Timestamp(_session_stamps(older, name).min()).date()
+            if earliest_ever < window_start:
+                gap = (f"it resumes on {earliest} but has rows from {earliest_ever}, before the "
+                       f"window start {window_start}")
     try:
         close = bars["Close"].to_numpy(dtype=float)
     except (TypeError, ValueError) as exc:
@@ -383,6 +388,7 @@ def _check_recent_listing(frame, bars, session, name: str, spy_bars, older_histo
             f"{LOOKBACK_DAYS}-day window from {window_start}: the provider does not cover the "
             f"window (backtest warmup too short?), so {name} starting on {earliest} cannot be "
             "told apart from missing data")
+    return gap
 
 
 def _check_stopped_trading(name: str, last, session, spy_bars) -> None:
@@ -410,8 +416,9 @@ class PullbackReversion(MarketExpertInterface):
     position, never by itself opening a short.
 
     Skips (DeterministicScorer's fields, logged at WARNING since the backtest drops them):
-    ``insufficient_history`` for a recent listing, ``symbol_stopped_trading`` for a stale symbol
-    while SPY is current. Every other data problem aborts."""
+    ``insufficient_history`` for a recent listing, ``history_gap`` for a short history that is
+    not a listing, ``symbol_stopped_trading`` for a stale symbol while SPY is current,
+    ``no_bar_on_decision_session`` under the SPY gate. Every other data problem aborts."""
 
     BACKTEST_WARMUP_BARS = BACKTEST_WARMUP_BARS
     #: Daily histories every decision reads besides the symbol's own (the gap/listing/stale
@@ -554,7 +561,7 @@ class PullbackReversion(MarketExpertInterface):
             raise ValueError(f"No completed sessions for {symbol} in the {LOOKBACK_DAYS}-day window "
                              f"ending {session}, although it has rows from {raw_first}")
         if len(bars) < MIN_BARS:  # possibly empty: the listing day's own candle only
-            _check_recent_listing(frame, bars, session, symbol, spy, older_history)
+            gap = _check_short_history(frame, bars, session, symbol, spy, older_history)
             if close is None:
                 # Listing day: no completed session yet. The only rows are after the data
                 # session, i.e. today's candle, whose OPEN is known at the decision (its close
@@ -563,6 +570,13 @@ class PullbackReversion(MarketExpertInterface):
                 close = float(opens[np.argmin(stamps)])
                 if not (math.isfinite(close) and close > 0):
                     raise ValueError(f"Invalid listing-day open for {symbol}: {close!r}")
+            if gap is not None:
+                return self._skip(
+                    symbol, SKIP_HISTORY_GAP,
+                    f"Insufficient OHLCV history ({len(bars)} < {MIN_BARS}) for {symbol} in the "
+                    f"{LOOKBACK_DAYS}-day lookback ending {session}, although {gap}: missed "
+                    "sessions (thin trading, a halt or a hole in the data), not a new listing",
+                    close, raw_first, last, spy())
             return self._skip(
                 symbol, SKIP_INSUFFICIENT_HISTORY,
                 f"Insufficient OHLCV history ({len(bars)} < {MIN_BARS}): {symbol} listed on "

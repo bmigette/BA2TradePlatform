@@ -448,8 +448,7 @@ def _defect(kind):
     raise AssertionError(kind)
 
 
-@pytest.mark.parametrize("kind", ["missing", "empty", "gap", "nan", "duplicate", "no_close",
-                                  "no_date"])
+@pytest.mark.parametrize("kind", ["missing", "empty", "nan", "duplicate", "no_close", "no_date"])
 def test_bad_history_aborts_the_backtest(kind):
     # SPY is present and current: a skip would be possible, so an abort is the defect's own.
     frames = {"AAA": _defect(kind), "SPY": provider_frame(uptrend())}
@@ -457,10 +456,55 @@ def test_bad_history_aborts_the_backtest(kind):
         analyze(frames, settings_for())
 
 
-def test_a_gap_is_not_mistaken_for_a_new_listing():
+def test_a_gap_is_skipped_and_not_mistaken_for_a_new_listing(warnings):
+    """VFS, goal2027 pb-large (2026-11-21): 176 completed bars in the window, need 200, on a history
+    reaching back before it. One thinly traded symbol on one decision aborted a whole training
+    job. It is skipped for that decision under its OWN reason, logged once, and the run goes on."""
+    from app.services.backtest.daily_engine import _recommendation_to_expert_recommendation
+    from ba2_experts.PullbackReversion import SKIP_HISTORY_GAP, SKIP_INSUFFICIENT_HISTORY
+
     frames = {"AAA": _defect("gap"), "SPY": provider_frame(uptrend())}
-    with pytest.raises(FMPHistoryCacheMiss, match="a gap in the data, not a new listing"):
-        analyze(frames, settings_for())
+    rec, provider = analyze(frames, settings_for())
+    assert rec.skip is True and rec.skip_reason == SKIP_HISTORY_GAP == "history_gap"
+    assert rec.skip_reason != SKIP_INSUFFICIENT_HISTORY
+    assert rec.signal == OrderRecommendation.HOLD and rec.confidence == 0.0
+    assert rec.current_price == pytest.approx(long_dip()[-1])
+    assert "(150 < 200)" in rec.details and "not a new listing" in rec.details
+    assert [c[0] for c in provider.calls] == ["AAA", "SPY"]     # SPY is still the reference
+    assert len(warnings) == 1
+    for part in ("AAA", "history_gap", "..2024-06-14", "SPY sessions"):
+        assert part in warnings[0], part
+    assert _recommendation_to_expert_recommendation(
+        rec, expert_instance_id=1, symbol="AAA", as_of=AS_OF, allow_hold=True) is None
+
+
+def test_a_gap_is_skipped_in_the_manage_pass_too():
+    frames = {"AAA": _defect("gap"), "SPY": provider_frame(uptrend())}
+    rec, _ = analyze(frames, settings_for(), subtype=AnalysisUseCase.OPEN_POSITIONS)
+    assert rec.skip is True and rec.skip_reason == "history_gap"
+
+
+@pytest.mark.parametrize("spy, match", [
+    (provider_frame(uptrend()[-150:]), "benchmark always has history"),        # SPY short
+    (provider_frame(uptrend()[-250:]), "provider does not cover the window"),  # warmup short
+    (None, "Missing OHLCV history: SPY"),
+])
+def test_a_gap_is_only_skipped_against_a_sound_spy_reference(spy, match):
+    """Skipping is safe only while SPY, read on the same decision, covers the whole window: when
+    SPY is short too, the provider is not serving the window and EVERY symbol would be skipped,
+    which is a run that silently evaluates nothing. That still aborts."""
+    frames = {"AAA": _defect("gap")}
+    if spy is not None:
+        frames["SPY"] = spy
+    with pytest.raises(FMPHistoryCacheMiss, match=match):
+        analyze(frames, settings_for(), default_spy=False)
+
+
+def test_a_gap_with_corrupt_closes_aborts():
+    frame = _defect("gap")
+    frame.loc[60, "Close"] = float("nan")
+    with pytest.raises(FMPHistoryCacheMiss, match="Corrupt OHLCV history"):
+        analyze({"AAA": frame, "SPY": provider_frame(uptrend())}, settings_for())
 
 
 @pytest.mark.parametrize("bad", [{"direction": "sideways"}, {"rsi_period": 9},
@@ -619,18 +663,20 @@ def test_recent_listing_needs_a_sound_spy_reference(spy, match):
 
 
 @pytest.mark.parametrize("honour", [False, True])
-def test_gap_from_before_the_window_deep_into_it_aborts(honour):
+def test_gap_from_before_the_window_deep_into_it_is_a_gap_not_a_listing(honour):
     """History until 2023-03-31, nothing again until 2023-10-02: a provider honouring
     start_date only shows the part that resumes deep inside the window, which alone looks
-    like a listing. The long probe finds the older rows, so it is a gap and aborts."""
+    like a listing. The long probe finds the older rows, so it is skipped as a GAP."""
     old = provider_frame(_wiggle(80, 100, 300), end="2023-03-31")
     resumed = provider_frame(long_dip()[-185:])
     assert resumed["Date"].iloc[0].date() == date(2023, 10, 2)
     frames = {"AAA": pd.concat([old, resumed], ignore_index=True), "SPY": spy_full()}
     # Honouring start_date, only the probe can see it; serving everything, the fetch does.
     match = "before the window start" if honour else "history starts on 2022"
-    with pytest.raises(FMPHistoryCacheMiss, match=match):
-        analyze(frames, settings_for(), honour=honour)
+    rec, provider = analyze(frames, settings_for(), honour=honour)
+    assert rec.skip is True and rec.skip_reason == "history_gap"
+    assert match in rec.details
+    assert [c[0] for c in provider.calls] == (["AAA", "AAA", "SPY"] if honour else ["AAA", "SPY"])
 
 
 def test_recent_listing_with_corrupt_closes_aborts():
