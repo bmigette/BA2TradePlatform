@@ -4508,7 +4508,15 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                       f"and their targets were not saved — refresh the page",
                       type='warning')
 
-    async def _run_dry_run() -> None:
+    async def _run_dry_run(*, progress=None, before_open=None) -> bool:
+        """Solve and open the dry run. ``True`` when it opened; ``False`` when the solve
+        failed (already reported to the user).
+
+        ``progress`` replaces the flow's own ``on_progress`` sink for this one solve, and
+        ``before_open()`` runs once the plan is solved, right before the dialog is built:
+        the Retry uses both, to report into the dry run that is still open and to close it
+        at the moment its replacement exists.
+        """
         # Persist BEFORE solving. This is the Continue action, and Continue is what
         # "last" means: the numbers the user last chose to allocate with, whether or
         # not they then went through with the orders.
@@ -4516,7 +4524,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                             state['unallocated_pct'])
         try:
             new_base, plan, current, hours = await asyncio.to_thread(
-                _solve_plan, account_id, on_progress=on_progress,
+                _solve_plan, account_id, on_progress=progress or on_progress,
                 mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
                 allow_fractional=state['allow_fractional'],
@@ -4525,11 +4533,11 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         except PositionFetchFailed as e:
             logger.error(f"Portfolio allocation dry run: position fetch failed: {e}")
             ui.notify(f'Broker position fetch FAILED: {e}', type='negative')
-            return
+            return False
         except Exception as e:
             logger.error(f"Allocation dry run failed: {e}", exc_info=True)
             ui.notify(f'Dry run failed: {e}', type='negative')
-            return
+            return False
         state['base'] = new_base
         state['current'] = current
 
@@ -4580,9 +4588,12 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         if state['mode'] == ALLOCATION_MODE_REBALANCE_LABEL:
             scoped = {'title': LABEL_RUN_TITLE_FMT.format(label=state['scope_label']),
                       'scope_label': state['scope_label']}
+        if before_open is not None:
+            before_open()
         state['wizard'] = open_allocation_wizard(
             new_base, plan, market=_market_gate_for(hours),
             on_refresh=_on_refresh, on_submit=_on_submit, on_validate=_on_validate, **scoped)
+        return True
 
     async def _do_submit(selected_plan) -> None:
         # THE WORKER RECORDS, THE TIMER PAINTS -- the same split the Review bar uses,
@@ -4647,10 +4658,39 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             target and comes back in. ``symbols`` is carried for the log only: the
             new plan is the whole account's, and the user re-ticks in the dry run
             exactly as they would on any other run.
+
+            THE DRY RUN THAT WAS RETRIED STAYS OPEN until the fresh one is ready. The
+            re-solve previews every buy with the broker (one round trip each) and the
+            dialog used to be closed before it started: 28 seconds of a blank page on prod
+            (2026-11-23), reported as "it closed the popup". The worker thread only
+            RECORDS the preview count; a timer paints it into the open dialog, the same
+            split the Review bar uses.
             """
             logger.info(f"Allocation retry requested for {len(symbols)} failed "
                         f"row(s) on account {account_id}: {', '.join(symbols)}")
-            ui.timer(0.1, _run_dry_run, once=True)
+            sink = {'done': 0, 'total': 0}
+
+            def _record(done, total, symbol) -> None:
+                sink['done'], sink['total'] = done, total
+
+            async def _resolve() -> None:
+                painter = ui.timer(
+                    0.2, lambda: wizard.retry_progress(sink['done'], sink['total']))
+                try:
+                    opened = await _run_dry_run(progress=_record,
+                                                before_open=wizard.close_for_retry)
+                except Exception as e:
+                    # A stuck "Re-solving..." is the blank page again. Say it, and give
+                    # the Retry button back.
+                    logger.error(f"Allocation retry failed: {e}", exc_info=True)
+                    ui.notify(f'Retry failed: {e}', type='negative')
+                    opened = False
+                finally:
+                    painter.deactivate()
+                if not opened:
+                    wizard.retry_failed()
+
+            ui.timer(0.1, _resolve, once=True)
 
         # NO second dialog: the dry-run table is the result. The summary line, the
         # Retry button (only when something failed) and the per-row icons are all in it.

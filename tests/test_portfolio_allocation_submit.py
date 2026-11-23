@@ -744,6 +744,38 @@ def test_precheck_plan_re_solves_on_an_impact_that_frees_buying_power():
     assert result.rows[0].bp_cost == pytest.approx(0.0)
 
 
+def test_precheck_plan_drops_the_buy_the_broker_refuses_and_keeps_the_others():
+    """Prod, 2026-11-23: 27 of 58 previews came back "closing only" and all 27 buys were sent
+    anyway. A refused preview leaves a row with NO order (nothing to tick, nothing to submit), the
+    broker's sentence as its reason, and the refused money reported -- and the other buys intact."""
+    words = ("closing_only: IDVO is currently set to closing only.  Only closing trades may be "
+             "submitted at this time.")
+    account = FakeAccount()
+    account.impacts = {
+        "IDVO": OrderImpact(symbol="IDVO", change_in_buying_power=0.0, accepted=False,
+                            errors=[words]),
+        "AAPL": OrderImpact(symbol="AAPL", change_in_buying_power=-800.0),
+    }
+    plan = AllocationPlan(
+        rows=[make_row("IDVO", OrderDirection.BUY, 5, 190.0, 190.0),
+              make_row("AAPL", OrderDirection.BUY, 10, 1600.0, 1600.0)],
+        available_buying_power=10_000.0, required_buying_power=1790.0,
+        total_buy_value=1790.0,
+    )
+
+    result = svc.precheck_plan(account, plan, available_buying_power=10_000.0, margin={})
+
+    refused, kept = result.rows
+    assert refused.symbol == "IDVO" and refused.skipped is True and refused.side is None
+    assert refused.delta_quantity == 0.0 and refused.estimated_value == 0.0
+    assert refused.bp_cost == 0.0
+    assert words in refused.reasons
+    assert refused.unmet_notional == pytest.approx(5 * refused.price)
+    assert [r.symbol for r in result.buy_rows] == ["AAPL"], "the refused buy is not an order"
+    assert kept.side == OrderDirection.BUY and kept.delta_quantity == pytest.approx(10)
+    assert kept.bp_cost == pytest.approx(800.0)
+
+
 def test_precheck_plan_previews_a_buy_as_an_opening_order():
     account = FakeAccount()
     plan = AllocationPlan(

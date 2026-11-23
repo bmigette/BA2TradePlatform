@@ -266,6 +266,30 @@ class TastyTradeAccount(AccountInterface):
     #: by _describe_broker_error.
     _CLOSED_MARKET_PREVIEW_CODE = "tif_no_after_hours_opening_market_orders"
 
+    #: TastyTrade's refusal codes that are the broker's VERDICT on the order itself: it will not
+    #: take this order however it is priced or sized, and it answers a DRY RUN in exactly the
+    #: words it answers the submission in. A preview that raises one of them is therefore a
+    #: refusal (``OrderImpact.accepted=False``), not a preview that could not be made.
+    #:
+    #: ``closing_only`` -- "<SYM> is currently set to closing only. Only closing trades may be
+    #: submitted at this time." Prod, 2026-11-23: 27 of an allocation's 58 previews, returned as
+    #: "no precheck", so all 27 buys were sent and refused again.
+    #:
+    #: ONLY codes observed live, one by one. Any other reply stays "no precheck" and is logged
+    #: at ERROR: a code nobody has characterised may be transient, and a row dropped from a plan
+    #: on a guess is a buy the user never sees refused.
+    #:
+    #: Matched at the START of a line of the broker's message, which is where the SDK puts the
+    #: code ("{code}: {message}\n" per error, tastytrade/utils.py ``validate_response``).
+    _ORDER_REFUSAL_PREVIEW_CODES = ("closing_only",)
+
+    @classmethod
+    def _order_refusal_in(cls, described: str) -> bool:
+        """Whether the broker's message carries one of ``_ORDER_REFUSAL_PREVIEW_CODES``."""
+        return any(line.strip().startswith(f"{code}:")
+                   for line in described.splitlines()
+                   for code in cls._ORDER_REFUSAL_PREVIEW_CODES)
+
     @classmethod
     def _describe_broker_error(cls, exc: Exception, operation: str) -> str:
         """A human-actionable rendering of a broker exception, for logs and comments.
@@ -1452,7 +1476,9 @@ class TastyTradeAccount(AccountInterface):
         Returns:
             Optional[OrderImpact]: ``None`` when the preview call failed. ``None``
             means "no precheck", NOT "the order is free" -- a zero impact is never
-            fabricated.
+            fabricated. A reply that REFUSES the order itself
+            (``_ORDER_REFUSAL_PREVIEW_CODES``) is not a failed call: it comes back as an
+            impact with ``accepted=False`` and the broker's words in ``errors``.
         """
         if not self._check_authentication():
             return None
@@ -1477,6 +1503,22 @@ class TastyTradeAccount(AccountInterface):
                     f"order out of hours. Nothing was submitted; the row simply has no "
                     f"broker-measured buying power or margin requirement.")
                 return None
+            if self._order_refusal_in(described):
+                # THE BROKER'S ANSWER, not a failure to get one. Returned as None it read
+                # as "no precheck": the plan kept the buy, Submit sent it, and the broker
+                # refused it again in the same words. No traceback: nothing went wrong here.
+                logger.warning(
+                    f"[Account {self.id}] The broker refuses {trading_order.symbol} in the "
+                    f"dry run: {described} Nothing was submitted; the plan carries no order "
+                    f"for it.")
+                return OrderImpact(
+                    symbol=trading_order.symbol,
+                    # A refused order moves no buying power. Not a measurement: the
+                    # consumer zeroes a refused row before it reads any figure.
+                    change_in_buying_power=0.0,
+                    accepted=False,
+                    errors=[described],
+                )
             logger.error(
                 f"[Account {self.id}] Order preview failed for {trading_order.symbol}: "
                 f"{described}", exc_info=True)

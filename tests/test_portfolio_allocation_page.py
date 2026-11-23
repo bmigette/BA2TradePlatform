@@ -1490,6 +1490,99 @@ def test_submit_opens_NO_results_dialog_and_reports_into_the_dry_run_table(
     assert not hasattr(page, 'render_outcomes')
 
 
+def _retry_flow(monkeypatch, nicegui_client, account_id):
+    """Run a real submit against a fake wizard, then hand back what the Retry needs."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    notes = _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    events = []
+
+    class _Wizard:
+        finished = None
+
+        def set_row_outcome(self, outcome):
+            pass
+
+        def finish_submit(self, summary, **kwargs):
+            self.finished = (summary, kwargs)
+
+        def retry_progress(self, done, total):
+            events.append(('progress', done, total))
+
+        def close_for_retry(self):
+            events.append('closed')
+
+        def retry_failed(self):
+            events.append('retry_failed')
+
+    wizard, opened, pending = _Wizard(), {}, []
+
+    def _open_wizard(*a, **kw):
+        events.append('opened')
+        opened.update(kw, base=a[0], plan=a[1])
+        return wizard
+
+    monkeypatch.setattr(page, 'open_allocation_wizard', _open_wizard)
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _delay, callback, once=False: pending.append(callback)
+                        or type('T', (), {'deactivate': lambda self: None})())
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop(0))
+    del events[:], pending[:]
+    return wizard, events, pending, notes
+
+
+def test_retry_re_solves_with_the_dry_run_open_and_closes_it_only_to_open_the_fresh_one(
+        monkeypatch, nicegui_client, account_id):
+    """Prod, 2026-11-23: Retry closed the dry run FIRST and re-solved for 30 seconds behind a
+    blank page. The old dry run now stays until the fresh one is ready to take its place, and
+    the re-solve reports its broker previews to it."""
+    wizard, events, pending, _notes = _retry_flow(monkeypatch, nicegui_client, account_id)
+    seen = []
+    real_solve = page._solve_plan
+
+    def _solve(*a, **kw):
+        seen.append(kw.get('on_progress'))
+        solved = real_solve(*a, **kw)
+        kw['on_progress'](3, 7, 'AAPL')              # what precheck_plan reports per preview
+        assert events == [], "nothing may close or open while the plan is still being solved"
+        return solved
+
+    monkeypatch.setattr(page, '_solve_plan', _solve)
+
+    wizard.finished[1]['on_retry'](['AAPL'])
+    resolve = pending.pop(0)
+    _run_in_client(nicegui_client, resolve)
+
+    assert events == ['closed', 'opened']
+    assert callable(seen[0])
+    paint = pending.pop(0)                           # the painter the re-solve started
+    paint()
+    assert events[-1] == ('progress', 3, 7)
+
+
+def test_a_retry_whose_re_solve_fails_leaves_the_dry_run_open(monkeypatch, nicegui_client,
+                                                              account_id):
+    wizard, events, pending, notes = _retry_flow(monkeypatch, nicegui_client, account_id)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("broker unreachable")
+
+    monkeypatch.setattr(page, '_solve_plan', _boom)
+
+    wizard.finished[1]['on_retry'](['AAPL'])
+    _run_in_client(nicegui_client, pending.pop(0))
+
+    assert events == ['retry_failed'], "the dry run must not close on a solve that failed"
+    assert any('broker unreachable' in str(n) for n in notes)
+
+
 def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
                                                               nicegui_client,
                                                               account_id):

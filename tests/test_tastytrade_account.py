@@ -4780,16 +4780,20 @@ def _capture_all(monkeypatch):
     from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
 
     TT = sys.modules[TastyTradeAccount.__module__]
-    seen = {"info": [], "error": [], "traceback": []}
+    seen = {"info": [], "warning": [], "error": [], "traceback": []}
 
     def _info(msg, *a, **k):
         seen["info"].append(str(msg))
+
+    def _warning(msg, *a, **k):
+        seen["warning"].append(str(msg))
 
     def _error(msg, *a, **k):
         seen["error"].append(str(msg))
         seen["traceback"].append(bool(k.get("exc_info")))
 
     monkeypatch.setattr(TT.logger, "info", _info)
+    monkeypatch.setattr(TT.logger, "warning", _warning)
     monkeypatch.setattr(TT.logger, "error", _error)
     return seen
 
@@ -4837,3 +4841,65 @@ def test_a_real_preview_failure_is_still_a_loud_error(monkeypatch):
                                         is_closing_order=False) is None
     assert len(seen["error"]) == 1 and seen["traceback"] == [True]
     assert not seen["info"]
+
+
+#: The broker's own words, as the SDK renders them ("{code}: {message}\n").
+_CLOSING_ONLY_REPLY = ("closing_only: IDVO is currently set to closing only.  Only closing trades "
+                       "may be submitted at this time.\n")
+
+
+def _raise_closing_only(_coro):
+    from tastytrade.utils import TastytradeError
+
+    raise TastytradeError(_CLOSING_ONLY_REPLY)
+
+
+def test_a_closing_only_preview_is_the_brokers_refusal_not_a_missing_precheck(monkeypatch):
+    """Prod, 2026-11-23: the dry run of an allocation previewed 58 buys and the broker answered
+    "closing_only" for 27 of them. Each answer was returned as ``None`` -- "no precheck" -- so the
+    plan kept all 27 buys, Submit sent them, and the broker refused every one again in the same
+    words (27 failed rows, 27 ERROR orders, about $2,000 the plan showed as invested).
+
+    The broker saying "I will not take an opening order in this symbol" is its VERDICT on the
+    order, not a failure to price it: an ``OrderImpact`` with ``accepted=False`` and the broker's
+    sentence, which ``apply_order_impacts`` turns into a row that carries no order. Nothing was
+    sent by the dry run, and it must not read like a failed submission: one WARNING, no traceback.
+    """
+    seen = _capture_all(monkeypatch)
+    account = _preview_account(_raise_closing_only)
+
+    impact = account.preview_order_impact(SimpleNamespace(symbol="IDVO"), is_closing_order=False)
+
+    assert impact is not None, "a refusal returned as None is sent to the broker again on Submit"
+    assert impact.accepted is False
+    assert impact.symbol == "IDVO"
+    assert impact.errors == [_CLOSING_ONLY_REPLY.strip()], "the broker's own words, verbatim"
+    # A refused order costs nothing, and no figure is invented for it.
+    assert impact.change_in_buying_power == 0.0 and impact.bp_cost == 0.0
+    assert impact.margin_requirement is None and impact.estimated_fees is None
+    assert not seen["error"], "a refused DRY RUN at ERROR reads as a failed submission"
+    assert len(seen["warning"]) == 1, seen["warning"]
+    message = seen["warning"][0]
+    assert "IDVO" in message and "closing only" in message
+    assert "Nothing was submitted" in message
+
+
+@pytest.mark.parametrize("reply", [
+    # Another refusal code: nobody has characterised it, so it stays "no precheck" and LOUD.
+    "margin_check_failed: Account does not have enough buying power.\n",
+    # The words inside a sentence are not the broker's code: the code LEADS a line.
+    "Couldn't parse response: {'note': 'closing_only: maybe'}",
+])
+def test_only_the_characterised_refusal_code_is_a_refusal(monkeypatch, reply):
+    def _boom(_coro):
+        from tastytrade.utils import TastytradeError
+
+        raise TastytradeError(reply)
+
+    seen = _capture_all(monkeypatch)
+    account = _preview_account(_boom)
+
+    assert account.preview_order_impact(SimpleNamespace(symbol="IDVO"),
+                                        is_closing_order=False) is None
+    assert len(seen["error"]) == 1 and seen["traceback"] == [True]
+    assert not seen["warning"]

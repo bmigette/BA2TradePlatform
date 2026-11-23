@@ -313,6 +313,45 @@ def test_details_open_for_a_row_that_has_no_outcome_yet(nicegui_client):
 
 # -- retry in the dialog footer ----------------------------------------------------
 
+def _exit_button(client):
+    found = [el for el in client.layout.descendants()
+             if wiz.MARKER_EXIT_BUTTON in getattr(el, '_markers', [])]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_the_exit_button_says_cancel_only_while_there_is_something_to_cancel(nicegui_client):
+    """Prod, 2026-11-23: run 4 sent 69 orders and the owner reported "it didn't close and I
+    don't have a way to close". The way out was there: a borderless "Cancel" beside a greyed
+    Submit, which after a finished run reads as "cancel the orders".
+
+    Before Submit it is Cancel (it abandons the dry run). From the moment orders go out it is
+    Close -- closing recalls nothing -- and once the run is over it is the highlighted action."""
+    wizard = _open(nicegui_client)
+    button = _exit_button(nicegui_client)
+    assert button.text == wiz.EXIT_LABEL_CANCEL
+    assert 'flat' in button._props
+
+    with nicegui_client:
+        wizard.begin_submit(['AAPL'])
+    assert button.text == wiz.EXIT_LABEL_CLOSE
+
+    with nicegui_client:
+        wizard.finish_submit('Run 1: 1 sent.', run_id=1,
+                             outcomes=[_outcome('AAPL', svc.OUTCOME_SUBMITTED)])
+    assert button.text == wiz.EXIT_LABEL_CLOSE
+    assert 'flat' not in button._props and button._props.get('color') == 'primary'
+    assert button.enabled is True
+
+
+def test_a_run_refused_before_any_row_was_sent_still_ends_on_close(nicegui_client):
+    """``finish_submit`` without ``begin_submit`` (the gate re-check refuses the run)."""
+    wizard = _open(nicegui_client)
+    with nicegui_client:
+        wizard.finish_submit('Refused: the market is closed.')
+    assert _exit_button(nicegui_client).text == wiz.EXIT_LABEL_CLOSE
+
+
 def _retry_buttons(client):
     return [el for el in client.layout.descendants()
             if wiz.MARKER_OUTCOME_RETRY in getattr(el, '_markers', [])]
@@ -342,20 +381,85 @@ def test_no_retry_without_a_callback(nicegui_client):
     assert _retry_buttons(nicegui_client) == []
 
 
-def test_retry_closes_the_dialog_first_and_hands_back_the_failed_symbols(
-        nicegui_client):
-    wizard = _open(nicegui_client)
-    order = []
+def _retry_progress(client):
+    return [el for el in client.layout.descendants()
+            if wiz.MARKER_RETRY_PROGRESS in getattr(el, '_markers', [])]
+
+
+def _press_retry(client, wizard, order):
+    """Finish a run with one failed row and press the real Retry button."""
     wizard.dialog.close = lambda: order.append('closed')
-    with nicegui_client:
+    with client:
         wizard.finish_submit('Run 1', run_id=1,
                              on_retry=lambda symbols: order.append(list(symbols)),
                              outcomes=[_outcome('A', svc.OUTCOME_FAILED),
                                        _outcome('B', svc.OUTCOME_SUBMITTED)])
-        button = _retry_buttons(nicegui_client)[0]
-        next(l for l in button._event_listeners.values()
-             if l.type.split('.')[0] == 'click').handler(None)
-    assert order == ['closed', ['A']]
+        button = _retry_buttons(client)[0]
+        press = next(l for l in button._event_listeners.values()
+                     if l.type.split('.')[0] == 'click').handler
+        press(None)
+    return button, press
+
+
+def test_retry_keeps_the_dry_run_open_and_says_it_is_re_solving(nicegui_client):
+    """Prod, 2026-11-23: Retry closed the dry run and then re-solved for 30 seconds (one broker
+    round trip per buy) with NOTHING on screen. The owner reported it as "it closed the popup".
+
+    The dry run stays where it is, says what is happening, and hands back the failed symbols.
+    Refresh is off meanwhile: two solves over the same positions is two plans."""
+    wizard = _open(nicegui_client)
+    order = []
+    button, _press = _press_retry(nicegui_client, wizard, order)
+
+    assert order == [['A']], "the dialog must NOT close before the fresh dry run exists"
+    assert button.enabled is False
+    labels = _retry_progress(nicegui_client)
+    assert [el._text for el in labels] == [wiz.RETRY_SOLVING]
+    assert wizard._refresh_button.enabled is False
+
+
+def test_retry_progress_counts_the_broker_previews(nicegui_client):
+    wizard = _open(nicegui_client)
+    _press_retry(nicegui_client, wizard, [])
+    with nicegui_client:
+        wizard.retry_progress(0, 0)           # the bulk calls: nothing to count yet
+    assert _retry_progress(nicegui_client)[0]._text == wiz.RETRY_SOLVING
+    with nicegui_client:
+        wizard.retry_progress(12, 67)
+    assert _retry_progress(nicegui_client)[0]._text == \
+        wiz.RETRY_SOLVING_FMT.format(done=12, total=67)
+
+
+def test_retry_progress_before_retry_was_pressed_is_ignored(nicegui_client):
+    wizard = _open(nicegui_client)
+    with nicegui_client:
+        wizard.retry_progress(1, 2)
+    assert _retry_progress(nicegui_client) == []
+
+
+def test_the_old_dry_run_closes_when_the_fresh_one_is_about_to_open(nicegui_client):
+    wizard = _open(nicegui_client)
+    order = []
+    _press_retry(nicegui_client, wizard, order)
+    with nicegui_client:
+        wizard.close_for_retry()
+    assert order == [['A'], 'closed']
+
+
+def test_a_failed_re_solve_gives_the_retry_button_back(nicegui_client):
+    """The re-solve can fail (the position fetch, the broker). The dry run is still on screen
+    with its results, and the user can press Retry again -- never a spinner that never ends."""
+    wizard = _open(nicegui_client)
+    order = []
+    button, press = _press_retry(nicegui_client, wizard, order)
+    with nicegui_client:
+        wizard.retry_failed()
+    assert _retry_progress(nicegui_client) == []
+    assert button.enabled is True and wizard._refresh_button.enabled is True
+    with nicegui_client:
+        press(None)
+    assert order == [['A'], ['A']]
+    assert len(_retry_progress(nicegui_client)) == 1
 
 
 def test_a_second_finish_replaces_the_retry_button_rather_than_stacking(nicegui_client):
@@ -627,8 +731,11 @@ def test_retry_fires_once_however_often_it_is_tapped(nicegui_client):
                    if l.type.split('.')[0] == 'click')
     handler(None)
     handler(None)
-    assert calls == ['closed', ['A']]
+    # ONE re-solve and one progress line; the dialog is not closed by the tap (it closes when
+    # the fresh dry run is ready, ``close_for_retry``).
+    assert calls == [['A']]
     assert button.enabled is False
+    assert len(_retry_progress(nicegui_client)) == 1
 
 
 def test_tick_boxes_and_the_selection_toolbar_are_locked_once_a_run_starts(

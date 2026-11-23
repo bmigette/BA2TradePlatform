@@ -379,6 +379,19 @@ RETRY_TOOLTIP = (
     'Re-solve against the positions as they are now and open a fresh dry run. '
     'What filled is already out of the new plan; what failed is still in it. '
     'Nothing is re-sent without another Submit.')
+#: What the footer says WHILE the retry re-solves, beside the (disabled) Retry button. The
+#: re-solve previews every buy with the broker, one round trip each: 28 seconds for 67 buys on
+#: prod (2026-11-23), during which the dialog used to be gone and the page said nothing.
+MARKER_RETRY_PROGRESS = 'outcome-retry-progress'
+#: The dialog's ONE way out, and what it is called. "Cancel" is true only while there is a
+#: dry run to abandon. Once orders go out, closing recalls nothing, and a finished run whose
+#: only exit read "Cancel" (borderless, beside a greyed Submit) was reported from prod on
+#: 2026-11-23 as "it didn't close and I don't have a way to close".
+MARKER_EXIT_BUTTON = 'dry-run-exit'
+EXIT_LABEL_CANCEL = 'Cancel'
+EXIT_LABEL_CLOSE = 'Close'
+RETRY_SOLVING = 'Re-solving the plan...'
+RETRY_SOLVING_FMT = 'Re-solving the plan: {done} of {total} buys checked with the broker'
 
 #: Marker on the TARGET-TOTAL block: label percentages off 100%, or a label's
 #: symbol weights off 100% within it. Decision 3 -- "Submit is blocked otherwise"
@@ -1016,6 +1029,7 @@ class AllocationWizard:
         self._selection_container = None
         self._footer_container = None
         self._submit_button = None
+        self._exit_button = None
         self._submit_tooltip = None
         self._refresh_button = None
         #: The one-line verdict shown IN the dialog once a submit finishes. Hidden
@@ -1047,6 +1061,11 @@ class AllocationWizard:
         #: The container the "Retry the N that failed" button is drawn into, beside
         #: the summary line.
         self._retry_container = None
+        #: The retry IN FLIGHT: its progress row and label, and how to give the button back if
+        #: the re-solve fails. All ``None`` unless Retry has been pressed and not yet resolved.
+        self._retry_progress_row = None
+        self._retry_progress_label = None
+        self._retry_rearm = None
         #: Rows that were IN the submit and have not reported yet (spinner), and rows
         #: the run ended without reporting on (symbol -> STATUS_NOT_SENT /
         #: STATUS_UNKNOWN_CHECK_BROKER). Both survive a re-render of the rows.
@@ -1082,11 +1101,22 @@ class AllocationWizard:
                 element.set_enabled(flag)
         for box in getattr(self, '_tick_boxes', {}).values():
             box.set_enabled(False)
+        self._exit_reads_close()
         self._pending = (set(self._result_cells) if symbols is None else set(symbols))
         self._unresolved = {}
         getattr(self, '_outcomes', {}).clear()
         for symbol in self._pending:
             self._show_pending(symbol)
+
+    def _exit_reads_close(self, *, highlighted: bool = False) -> None:
+        """Orders are going out or have gone: the way out is "Close", never "Cancel".
+        ``highlighted`` once the run is over, when it is the one thing left to press."""
+        button = getattr(self, '_exit_button', None)
+        if button is None:
+            return
+        button.set_text(EXIT_LABEL_CLOSE)
+        if highlighted:
+            button.props(remove='flat', add='color=primary')
 
     def _show_pending(self, symbol: str) -> None:
         cell = self._result_cells.get(symbol)
@@ -1236,11 +1266,16 @@ class AllocationWizard:
         popup: the positions have moved -- what filled is now held, so the new plan
         does not ask for it again, while what failed is still off target and comes
         back in. Nothing is re-sent without another Submit.
+
+        THIS DIALOG STAYS OPEN while the re-solve runs (``_begin_retry``) and is closed by
+        the caller at the moment the fresh dry run is ready (``close_for_retry``): two
+        stacked dialogs describing two plans never happens, and neither does a blank page.
         """
         container = getattr(self, '_retry_container', None)
         if container is None:
             return
         container.clear()
+        self._retry_progress_row = self._retry_progress_label = self._retry_rearm = None
         retryable = retryable_outcomes(outcomes)
         if not retryable or on_retry is None:
             return
@@ -1255,14 +1290,65 @@ class AllocationWizard:
                     return
                 fired.append(True)
                 holder[0].set_enabled(False)
-                # Closed FIRST: the retry re-solves and opens a fresh dry run, and
-                # two stacked dialogs describing two different plans is exactly the
-                # confusion this feature exists to remove.
-                self.dialog.close()
+                # NOT closed here. It used to be, "first", and the re-solve that follows
+                # is one broker round trip per buy: prod, 2026-11-23, 28 seconds of a
+                # blank page that the owner reported as "it closed the popup".
+                self._begin_retry(container, holder[0], fired)
                 on_retry(symbols)
             holder.append(
                 ui.button(RETRY_FAILED_FMT.format(count=len(retryable)), on_click=_retry)
                 .props('outline').mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP))
+
+    def _begin_retry(self, container, button, fired) -> None:
+        """Retry was pressed: say so in the footer, and freeze what would re-solve under it.
+
+        Refresh and the fractional switch both re-solve THIS dialog's plan; a second solve
+        over the same positions while the retry's is running is two plans. Cancel stays
+        live, as it does during a submit.
+        """
+        with container:
+            with ui.row().classes('items-center gap-2 no-wrap') as row:
+                ui.spinner(size='sm')
+                self._retry_progress_label = ui.label(RETRY_SOLVING) \
+                    .classes('text-sm').mark(MARKER_RETRY_PROGRESS)
+        self._retry_progress_row = row
+        self._retry_rearm = (button, fired)
+        for element in (self._refresh_button, getattr(self, '_fractional_switch', None)):
+            if element is not None:
+                element.set_enabled(False)
+
+    def retry_progress(self, done: int, total: int) -> None:
+        """How far the retry's re-solve is: ``done`` of ``total`` buys previewed with the broker.
+
+        ``total == 0`` is the part that cannot be counted (the positions, quotes and margin
+        calls are one round trip each). Ignored unless a retry is in flight.
+        """
+        label = self._retry_progress_label
+        if label is None:
+            return
+        label.set_text(RETRY_SOLVING_FMT.format(done=int(done), total=int(total))
+                       if total else RETRY_SOLVING)
+
+    def close_for_retry(self) -> None:
+        """The fresh dry run is ready: this one gets out of its way, and only now."""
+        self.dialog.close()
+
+    def retry_failed(self) -> None:
+        """The retry's re-solve failed (the caller has said why). The results are still on
+        screen; take the progress line down and give the Retry button and Refresh back."""
+        if self._retry_progress_row is not None:
+            self._retry_progress_row.delete()
+        rearm = self._retry_rearm
+        self._retry_progress_row = self._retry_progress_label = self._retry_rearm = None
+        if rearm is not None:
+            button, fired = rearm
+            del fired[:]
+            button.set_enabled(True)
+        if self._refresh_button is not None:
+            self._refresh_button.set_enabled(True)
+        switch = getattr(self, '_fractional_switch', None)
+        if switch is not None:
+            switch.set_enabled(bool(self.base.supports_fractional))
 
     def finish_submit(self, summary: str, *, run_id: Optional[int] = None,
                       outcomes=None, on_retry=None, interrupted: bool = False) -> None:
@@ -1293,6 +1379,7 @@ class AllocationWizard:
         switch = getattr(self, '_fractional_switch', None)
         if switch is not None:
             switch.set_enabled(bool(self.base.supports_fractional))
+        self._exit_reads_close(highlighted=True)
         self._render_retry(outcomes, on_retry)
 
     def open(self):
@@ -1388,7 +1475,8 @@ class AllocationWizard:
                         ui.button(VALIDATE_BUTTON_LABEL, on_click=self._validate) \
                         .props('outline').mark(MARKER_VALIDATE_BUTTON)
                     self._validate_button.tooltip(VALIDATE_TOOLTIP)
-                ui.button('Cancel', on_click=dialog.close).props('flat')
+                self._exit_button = ui.button(EXIT_LABEL_CANCEL, on_click=dialog.close) \
+                    .props('flat').mark(MARKER_EXIT_BUTTON)
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary').classes(PRIMARY_ACTION_CLASS)
                 # Built ONCE and re-texted on refresh. ``Element.tooltip()`` creates
