@@ -151,6 +151,8 @@ def initialize_system():
     # init_db cannot import them), so register them with the shared metadata first: create_all
     # then builds them on any database. See core/allocator_protection_models.py.
     import ba2_trade_platform.core.allocator_protection_models  # noqa: F401
+    # Same for the stored page snapshots (Account Growth / allocator dividends / FMP dividend histories).
+    import ba2_trade_platform.core.growth_snapshot_models  # noqa: F401
     init_db()
 
     # Housekeeping, FIRST and alone. The activity-log purge is cheap; the conditional

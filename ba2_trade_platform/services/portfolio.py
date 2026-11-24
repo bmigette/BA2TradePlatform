@@ -7,6 +7,7 @@ The page calls these with their default arguments and keeps its old private name
 ``asyncio.to_thread``."""
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlmodel import select
@@ -22,6 +23,7 @@ from ..core.portfolio_allocation import (
 from ..core.portfolio_allocation_store import (
     get_allocation_config, get_managed_labels, get_previous_symbol_weights, get_symbol_comments, get_symbol_rows)
 from ..logger import logger
+from . import growth_snapshot
 from .load_timing import LoadBreakdown, rows_note
 from ..ui.utils.portfolio_allocation_view import (
     GateResult, ManagedLabel, account_value_from_snapshot, build_label_views, collect_managed_symbols,
@@ -358,9 +360,28 @@ def _view_payload(account_id: int, valuation_mode: str, base_override: Optional[
         if managed_real is not None:
             buying_power = base_notional - managed_real
 
+    # THE PAGE reads the STORED dividend rows when they are at most a day old (they only feed the display-only
+    # "w/ div" figure, and the broker read is the slowest step of the payload); the page's ``_refresh`` tops them
+    # up in the background when they are older than ``STORED_DIVIDENDS_FRESH_S``. The API path (``read_only`` /
+    # ``dividends_source``) never reads nor writes the stored copy.
+    page_path = not read_only and dividends_source is None
+    dividends_as_of = None
+    dividends_stale = False
     with timing.step("dividends") as entry:
-        dividends = account.get_dividends() if dividends_source is None else dividends_source()
-        entry.note = rows_note(dividends)
+        stored = _usable_stored_dividends(account_id) if page_path else None
+        if stored is not None:
+            dividends = stored.rows
+            age_s = stored.age_seconds()
+            dividends_as_of = stored.fetched_at
+            dividends_stale = age_s > STORED_DIVIDENDS_FRESH_S
+            entry.note = f"{rows_note(dividends)}, stored {int(age_s // 60)} min old"
+        else:
+            fetched_at = datetime.now(timezone.utc)
+            dividends = account.get_dividends() if dividends_source is None else dividends_source()
+            entry.note = rows_note(dividends)
+            if page_path:
+                dividends_stale = True          # there was no usable stored copy
+                _store_dividends(account_id, dividends, fetched_at)
     # Market mode values an unpriced managed holding at 0 inside ``compute_base_notional``, so the base above is a
     # LOWER BOUND whenever one exists (the page does not flag this; the API does).
     unpriced_managed = sorted(sym for sym in enabled_symbols
@@ -444,7 +465,96 @@ def _view_payload(account_id: int, valuation_mode: str, base_override: Optional[
         #: How many rows ``get_dividends`` returned. It returns ``[]`` on a failed fetch too, so 0 cannot tell
         #: "pays nothing" from "could not ask"; the API says so next to the figure.
         'dividend_payments': len(dividends or []),
+        #: When the dividend rows were fetched, for a STORED copy; None for a live read (and on the API path).
+        'dividends_as_of': dividends_as_of,
+        #: True when the page should top the stored copy up (``refresh_stored_dividends``): it is older than
+        #: ``STORED_DIVIDENDS_FRESH_S``, or there was none usable. Always False on the API path.
+        'dividends_stale': dividends_stale,
     }
+
+
+#: The page uses a stored dividend copy up to this old (``_view_payload``) ...
+STORED_DIVIDENDS_MAX_AGE_S = 24 * 3600
+#: ... and asks for a background top-up once it is older than this.
+STORED_DIVIDENDS_FRESH_S = 15 * 60
+_DIVIDEND_REFRESH_LOCKS: Dict[int, threading.Lock] = {}
+_DIVIDEND_REFRESH_GUARD = threading.Lock()
+
+
+def _usable_stored_dividends(account_id: int):
+    """The stored dividend rows when they are at most ``STORED_DIVIDENDS_MAX_AGE_S`` old, else None (the loader
+    logs an unreadable row)."""
+    stored = growth_snapshot.load_dividends(account_id)
+    if stored is None or stored.age_seconds() > STORED_DIVIDENDS_MAX_AGE_S:
+        return None
+    return stored
+
+
+def _store_dividends(account_id: int, rows, fetched_at) -> bool:
+    """Store the account's dividend rows; True when stored. NEVER replaces stored non-empty rows with an empty answer:
+    the lenient ``get_dividends`` returns ``[]`` on a failed fetch too. A failure is a WARNING, never an exception."""
+    try:
+        if not rows:
+            existing = growth_snapshot.load_dividends(account_id)
+            if existing is not None and existing.rows:
+                logger.warning(f"Dividends of account {account_id}: the broker returned none; keeping the "
+                               f"{len(existing.rows)} stored rows (a failed fetch returns none too)")
+                return False
+        growth_snapshot.save_dividends(account_id, rows, fetched_at)
+        return True
+    except Exception as e:  # noqa: BLE001 -- a stored copy must never cost the page
+        logger.warning(f"Could not store the dividends of account {account_id} ({type(e).__name__}: {e})")
+        return False
+
+
+def refresh_stored_dividends(account_id: int) -> None:
+    """The allocator page's background top-up (a daemon thread started by the page's ``_refresh``, never by a
+    loader): fetch ``get_dividends()`` in full and store it. One run per account at a time; never raises."""
+    from ..core.utils import get_account_instance_from_id
+
+    with _DIVIDEND_REFRESH_GUARD:
+        lock = _DIVIDEND_REFRESH_LOCKS.setdefault(int(account_id), threading.Lock())
+    if not lock.acquire(blocking=False):
+        return                              # a top-up of this account is already running
+    try:
+        try:
+            account = get_account_instance_from_id(account_id)
+            if account is None:
+                raise RuntimeError(f"Account {account_id} could not be instantiated")
+            fetched_at = datetime.now(timezone.utc)
+            rows = account.get_dividends()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Background dividends refresh of account {account_id} failed ({e}); "
+                           f"the stored copy stays in use")
+            return
+        _store_dividends(account_id, rows, fetched_at)
+    finally:
+        lock.release()
+
+
+_DIVIDEND_REFRESH_THREADS: set = set()
+
+
+def start_dividends_refresh(account_id: int) -> threading.Thread:
+    """Start ``refresh_stored_dividends(account_id)`` in a daemon thread (the PAGE's ``_refresh`` calls this; a loader
+    never does) and keep a handle, so ``join_dividends_refresh`` can wait for every such thread (tests: a daemon
+    thread doing DB work must not outlive its test)."""
+    thread = threading.Thread(target=refresh_stored_dividends, args=(account_id,),
+                              name='dividends-refresh', daemon=True)
+    with _DIVIDEND_REFRESH_GUARD:
+        _DIVIDEND_REFRESH_THREADS.difference_update({t for t in _DIVIDEND_REFRESH_THREADS if not t.is_alive()})
+        _DIVIDEND_REFRESH_THREADS.add(thread)      # registered BEFORE it starts: a join can never miss it
+    thread.start()
+    return thread
+
+
+def join_dividends_refresh(timeout: Optional[float] = None) -> None:
+    """Wait for every running ``start_dividends_refresh`` thread."""
+    with _DIVIDEND_REFRESH_GUARD:
+        threads = list(_DIVIDEND_REFRESH_THREADS)
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(timeout)
 
 
 def load_valuation_mode(account_id: int) -> str:

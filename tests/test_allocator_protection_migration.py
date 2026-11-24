@@ -169,7 +169,9 @@ def test_reminder_revision_chains_on_the_frozen_revision_and_is_the_single_head(
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert script.get_heads() == ["e3b7c5a91f20"]
+    # f4c2a8d61b39 (growth snapshots) chains onto e3b7c5a91f20; still exactly one head
+    assert len(script.get_heads()) == 1
+    assert script.get_revision("f4c2a8d61b39").down_revision == "e3b7c5a91f20"
     assert script.get_revision("e3b7c5a91f20").down_revision == "d5a1f93e2c70"
 
 

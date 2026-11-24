@@ -290,6 +290,23 @@ def patch_db_engine(test_engine):
         _pkg_db._engine = _saved
 
 
+@pytest.fixture(autouse=True)
+def join_stored_copy_refresh_threads(patch_db_engine):
+    """Two background daemon threads write stored copies to the DB: the dividend forecast's refresh of stale FMP
+    histories (``services.growth_snapshot``) and the allocator page's dividends top-up (``services.portfolio``).
+    Wait for them BEFORE the engine is restored: a daemon thread doing DB work past its test's teardown once raced
+    the fixture into a Windows access violation, and one that calls ``get_engine()`` in the gap between two tests
+    can install an engine without tables under the next test."""
+    yield
+    import sys
+    snapshots = sys.modules.get("ba2_trade_platform.services.growth_snapshot")
+    if snapshots is not None:
+        snapshots.join_dividend_history_refresh(timeout=30)
+    portfolio = sys.modules.get("ba2_trade_platform.services.portfolio")
+    if portfolio is not None:
+        portfolio.join_dividends_refresh(timeout=30)
+
+
 @pytest.fixture
 def db_session(test_engine):
     """Provide a fresh session per test with automatic cleanup."""

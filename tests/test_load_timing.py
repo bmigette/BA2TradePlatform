@@ -101,8 +101,11 @@ def test_a_growth_load_logs_every_dataset_the_prices_the_maths_and_the_draw(env,
     assert len(lines) == 1, perf_lines
     line = lines[0]
     assert "accounts=[1]" in line and "range=YTD" in line
-    for part in ("acct1 dividends", "acct1 trades", "acct1 positions", "acct1 balance", "prices", "compute", "draw"):
+    for part in ("snapshot", "acct1 dividends", "acct1 trades", "acct1 positions", "acct1 balance", "prices",
+                 "monthly realized", "value denominators", "scope inputs", "dividend forecast", "draw"):
         assert f"{part} " in line, (part, line)
+    assert "compute " not in line              # the maths is four named steps now
+    assert "snapshot " in line and "[none]" in line   # no stored snapshot: the load waited for the broker
     assert "[2 rows]" in line                 # the two filled trades the fake broker returned
     assert "[2 symbols, downloaded]" in line
 

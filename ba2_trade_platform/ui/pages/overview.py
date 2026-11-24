@@ -59,6 +59,7 @@ from ..components.account_scope import scope_transactions_to_account
 from ...services import stats as stats_service
 from ...services import growth as growth_service
 from ...services import price_history
+from ...services import growth_snapshot
 from ...services.load_timing import LoadBreakdown, rows_note, step as timed_step
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
@@ -5067,6 +5068,48 @@ def merge_refresh(prev, new, failed, accept_empty=frozenset()):
 #: balance_floor before anything has been requested (None means the default window).
 _UNFETCHED = object()
 
+#: The four datasets of an account's stored "growth" snapshot (services.growth_snapshot).
+GROWTH_DATASETS = ('dividends', 'trades', 'positions', 'balance')
+
+
+def balance_fingerprint(balance) -> str:
+    '''One digest over the SORTED full balance rows (every key). Not part of ``rows_fingerprint`` (the chip is for
+    changed rows); used by the first refresh after a snapshot paint, which redraws when the balance moved too.'''
+    import hashlib
+
+    def f(v):
+        return '' if v is None else str(v)
+    rows = sorted(repr(sorted((str(k), f(v)) for k, v in r.items())) for r in balance)
+    return hashlib.md5(repr(rows).encode('utf-8')).hexdigest()
+
+
+def _load_growth_snapshots(account_ids):
+    '''``{account_id: GrowthSnapshot}`` for the accounts in order, stopping at the first one that has none (the
+    page then fetches from the broker anyway). Blocking DB reads: called off the event loop.'''
+    out = {}
+    for aid in account_ids:
+        snap = growth_snapshot.load_growth_snapshot(aid)
+        if snap is None:
+            break
+        out[aid] = snap
+    return out
+
+
+def _save_growth_snapshots(rows_by_account, balance_floor, fetched_at) -> list:
+    '''Store each account's "growth" snapshot; returns the ids stored. A failure is a WARNING and never fails the
+    load (the next cold page load simply waits for the broker again). Blocking: called off the event loop.'''
+    saved = []
+    for aid, data in rows_by_account.items():
+        try:
+            growth_snapshot.save_growth_snapshot(
+                aid, dividends=data['dividends'], trades=data['trades'], positions=data['positions'],
+                balance=data['balance'], balance_floor=balance_floor, fetched_at=fetched_at)
+            saved.append(aid)
+        except Exception as e:  # noqa: BLE001 -- a stored copy must never cost the page
+            logger.warning(f"Could not store the growth snapshot of account {aid} ({type(e).__name__}: {e}); "
+                           f"the next cold page load will wait for the broker")
+    return saved
+
 
 _GROWTH_CSS_ONCE = CssOnce()
 
@@ -5160,6 +5203,9 @@ class AccountGrowthTab:
             self._broker_cache = {}
         self._refresh_warned = False
         self._bg_running = False
+        # Set by a load that painted from the stored snapshot: once the load lock is released, a background full
+        # refresh starts (see _start_refresh_after_snapshot).
+        self._refresh_after_snapshot = False
         # The load being timed (services.load_timing), None between loads; and how the last price read was
         # served ('cached' | 'downloaded' | 'download failed').
         self._load_timing = None
@@ -5441,19 +5487,48 @@ class AccountGrowthTab:
 
     def _provider_dividend_histories(self, symbols):
         """``{symbol: (history, date_kind)}`` from the FMP provider, for symbols that have one.
-        Per-symbol session cache (a failure is retried after ``PRICE_TTL_SECONDS``); the provider
-        has its own 24 h cache + global rate-limit gate; uncached symbols are fetched in a small
-        thread pool. No FMP key / any failure -> the symbol is simply absent (one warning)."""
+        Per-symbol session cache (a failure is retried after ``PRICE_TTL_SECONDS``). Behind it, the RAW
+        payloads are STORED (``services.growth_snapshot``, table ``symbol_dividend_history``) so a restart
+        does not refetch every held symbol: a stored payload is used whatever its age, only symbols with no
+        stored row are fetched now (small thread pool; the provider has its own 24 h memory cache + global
+        rate-limit gate) and stored -- an empty payload too, so a non-payer is not asked on every cold load.
+        Stored rows older than 24 h are refreshed AFTER this returns, in one background thread per process
+        (``self._dividend_history_refresh`` holds it). No FMP key / any failure -> the symbol is simply
+        absent (one warning) and the forecast falls back to the account's own history."""
         cache = self.__dict__.setdefault('_provider_div_cache', {})
         now = _clock()
         todo = [s for s in symbols if s not in cache or (cache[s][0] is None
                                                          and now - cache[s][1] > PRICE_TTL_SECONDS)]
+        stale = []
         if todo:
+            stored = growth_snapshot.load_dividend_histories(todo)
+            wall = datetime.now(timezone.utc)
+            fetch_now = []
+            for s in todo:
+                hit = stored.get(s.upper())
+                if hit is None:
+                    fetch_now.append(s)
+                    continue
+                payload, fetched_at = hit
+                try:
+                    hist, kind = parse_provider_history(payload)
+                except Exception as e:  # noqa: BLE001 -- an unreadable stored copy is refetched, not trusted
+                    logger.warning(f"Dividend forecast: stored history of {s} could not be parsed ({e}); "
+                                   f"asking FMP again")
+                    fetch_now.append(s)
+                    continue
+                cache[s] = (((hist, kind) if hist else None), now)
+                if (wall - fetched_at).total_seconds() > growth_snapshot.DIVIDEND_HISTORY_MAX_AGE_SECONDS:
+                    stale.append(s)
+            todo = fetch_now
+        api_key = None
+        if todo or stale:
             try:
                 from ...config import get_app_setting
                 api_key = get_app_setting('FMP_API_KEY')
             except Exception:
                 api_key = None
+        if todo:
             if not api_key:
                 for s in todo:
                     cache[s] = (None, now)
@@ -5461,19 +5536,35 @@ class AccountGrowthTab:
                 def one(sym):
                     try:
                         from ba2_providers.symbol_info import fetch_dividends
-                        hist, kind = parse_provider_history(fetch_dividends(api_key, sym))
-                        return sym, ((hist, kind) if hist else ()), None
+                        payload = fetch_dividends(api_key, sym)
+                        hist, kind = parse_provider_history(payload)
+                        return sym, ((hist, kind) if hist else ()), payload, None
                     except Exception as e:  # noqa: BLE001 -- a data source must not break the page
-                        return sym, None, e
+                        return sym, None, None, e
                 from concurrent.futures import ThreadPoolExecutor
                 warned = False
+                fetched = []
                 with ThreadPoolExecutor(max_workers=6) as pool:
-                    for sym, res, err in pool.map(one, todo):
+                    for sym, res, payload, err in pool.map(one, todo):
                         if err is not None and not warned:
                             warned = True
                             logger.warning(f"Dividend forecast: provider history unavailable ({err}); "
                                            f"falling back to the account's own history")
                         cache[sym] = ((res if res else None), now)
+                        if err is None:
+                            fetched.append((sym, payload))
+                stamp = datetime.now(timezone.utc)
+                for sym, payload in fetched:
+                    try:
+                        growth_snapshot.save_dividend_history(sym, payload, stamp)
+                    except Exception as e:  # noqa: BLE001 -- the forecast already has it; only the next cold load pays
+                        logger.warning(f"Dividend forecast: could not store the history of {sym} "
+                                       f"({type(e).__name__}: {e}); it will be fetched again after a restart")
+        if stale and api_key:
+            def refetch(sym, key=api_key):
+                from ba2_providers.symbol_info import fetch_dividends
+                return fetch_dividends(key, sym)
+            self._dividend_history_refresh = growth_snapshot.start_dividend_history_refresh(stale, refetch)
         return {s: cache[s][0] for s in symbols if s in cache and cache[s][0]}
 
     def _dividend_metadata(self, account_ids, held):
@@ -5725,12 +5816,17 @@ class AccountGrowthTab:
                 new_data_btn.set_visibility(False)
                 reload_page('Updating...')     # the cache already holds the new rows: no fetch
 
-            async def background_refresh():
+            async def background_refresh(after_snapshot=False):
                 # Under the load lock, so it never overlaps a load. Refetches IN FULL and
                 # stores the result; never redraws on its own (that would jump the scroll
                 # position and reset session-only selections) -- when ROWS changed it shows
                 # the "New data - tap to refresh" chip instead.
+                # EXCEPT the refresh that follows a paint from the STORED snapshot
+                # (``after_snapshot``): the user has only just opened the page, so when it
+                # succeeds and its rows OR balance differ from what is drawn, it redraws
+                # once, from the cache. Identical data: nothing visible but the stamp.
                 changed = False
+                redraw = False
                 try:
                     async with self._load_lock:
                         target, problem = self._resolve_target_accounts(selected_account_id)
@@ -5745,6 +5841,14 @@ class AccountGrowthTab:
                         finally:
                             self._load_timing.log()
                             self._load_timing = None
+                        if after_snapshot and not self._broker_cache.get('failed'):
+                            redraw = changed or (balance_fingerprint(self._broker_cache['balance'])
+                                                 != getattr(self, '_drawn_balance_fp', None))
+                            if not redraw:
+                                # what is drawn IS what the broker has now: the stamp says so
+                                # (a snapshot from yesterday must not keep reading as yesterday)
+                                self._drawn_wall = self._broker_cache.get('updated_wall')
+                                self._update_age_label()
                 except RuntimeError:
                     return
                 except Exception as e:
@@ -5752,6 +5856,9 @@ class AccountGrowthTab:
                     return
                 finally:
                     self._bg_running = False
+                if redraw:
+                    on_new_data()                              # draws from the cache: no fetch
+                    return
                 new_data_btn.set_visibility(bool(changed))     # also hides it when the cache
                 #                                               is back to exactly what is drawn
 
@@ -5818,6 +5925,22 @@ class AccountGrowthTab:
                 return      # overtaken while waiting for the lock; the newer click owns the page
             await self._load_growth_data_locked(loading_label, charts_container,
                                                 selected_account_id, gen)
+        # AFTER the lock is released: the background refresh takes the lock itself.
+        self._start_refresh_after_snapshot()
+
+    def _start_refresh_after_snapshot(self):
+        '''A load that painted from the stored snapshot (``_hydrate_from_snapshot``) did not wait for the broker:
+        start the background FULL refresh now, flagged so that it redraws once by itself when the broker's data
+        differs from what is drawn. A tab built without ``render()`` (tests) has no background refresh: nothing
+        starts, and the next load's normal TTL logic applies.'''
+        if not getattr(self, '_refresh_after_snapshot', False):
+            return
+        self._refresh_after_snapshot = False
+        bg = getattr(self, '_background_refresh', None)
+        if bg is None or self._bg_running or not self._cache_expired():
+            return
+        self._bg_running = True
+        asyncio.create_task(bg(after_snapshot=True))
 
     async def _load_growth_data_locked(self, loading_label, charts_container, selected_account_id, gen):
         # ONE "[PERF:page:load] AccountGrowth(...)" log line per load says where its time went: each broker
@@ -5843,9 +5966,17 @@ class AccountGrowthTab:
             if cache.get('key') != key:
                 cache.clear()
                 cache['key'] = key
+            # A page with no data yet paints from the STORED snapshot when every account has one
+            # (stale-while-revalidate): no broker wait before the first draw, and the full refresh
+            # runs in the background once this load has drawn (_start_refresh_after_snapshot).
+            hydrated = False
+            if 'dividends' not in cache:
+                hydrated = await self._hydrate_from_snapshot(target_accounts)
+                if hydrated:
+                    self._refresh_after_snapshot = True
             # TTL: past it everything is fetched again IN FULL (BROKER_DATA_TTL_SECONDS); within
             # it nothing is asked of the broker. A failed refresh keeps the old rows.
-            if 'dividends' not in cache or self._cache_expired():
+            if 'dividends' not in cache or (self._cache_expired() and not hydrated):
                 await self._refresh_cache(target_accounts)
             if gen != self._gen:
                 return      # stale: the raw data is cached above, nothing range-dependent is touched
@@ -5898,35 +6029,39 @@ class AccountGrowthTab:
             if gen != self._gen:
                 return
 
-            with timed_step(timing, 'compute'):
-                # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
-                try:
+            # The maths, one timed step each (a cold dividend forecast waits on FMP; the others are CPU).
+            # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
+            try:
+                with timed_step(timing, 'monthly realized'):
                     months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
                         self._compute_monthly_realized, all_filled_trades, all_dividends
                     )
+                with timed_step(timing, 'value denominators'):
                     monthly_global, monthly_label = await asyncio.to_thread(
                         self._compute_value_denominators, all_balance_history, all_positions,
                         historical_prices, all_filled_trades, all_dividends, months
                     )
-                except Exception as e:
-                    logger.warning(f"Could not compute monthly realized income: {e}")
-                    months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
-                    monthly_global, monthly_label = {}, {}
+            except Exception as e:
+                logger.warning(f"Could not compute monthly realized income: {e}")
+                months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
+                monthly_global, monthly_label = {}, {}
 
-                try:
+            try:
+                with timed_step(timing, 'scope inputs'):
                     scope_state = await asyncio.to_thread(
                         self._compute_scope_inputs, target_accounts, all_filled_trades,
                         all_dividends, positions_by_account)
-                except Exception as e:
-                    logger.warning(f"Could not compute the label scope inputs: {e}")
-                    scope_state = {}
-                try:
+            except Exception as e:
+                logger.warning(f"Could not compute the label scope inputs: {e}")
+                scope_state = {}
+            try:
+                with timed_step(timing, 'dividend forecast'):
                     forecast = await asyncio.to_thread(
                         self._compute_dividend_forecast, all_dividends, all_filled_trades,
                         qty_by_account_symbol)
-                except Exception as e:
-                    logger.warning(f"Could not compute the dividend forecast: {e}")
-                    forecast = {}
+            except Exception as e:
+                logger.warning(f"Could not compute the dividend forecast: {e}")
+                forecast = {}
 
             if gen != self._gen:
                 return  # a newer load (range changed meanwhile) owns the container
@@ -5977,6 +6112,7 @@ class AccountGrowthTab:
                 draw_charts()
                 first_draw[0] = None
                 self._drawn_fp = rows_fingerprint(all_dividends, all_filled_trades, all_positions)
+                self._drawn_balance_fp = balance_fingerprint(all_balance_history)
                 self._drawn_wall = cache.get('updated_wall')
                 self._hide_chip()
                 self._update_age_label()
@@ -6085,6 +6221,61 @@ class AccountGrowthTab:
                      activity_first=min(dates) if dates else None,
                      balance_first=min(bdates) if bdates else None)
 
+    async def _hydrate_from_snapshot(self, target_accounts):
+        '''Fill the EMPTY page cache from the stored "growth" snapshot of every target account, exactly as a
+        fetch would have (rows, instances, ``balance_floor``, no failures). ``updated_wall`` is the snapshot's
+        fetch time (local wall time) and ``fetched_at`` is placed that far back on the ``_clock()`` scale, so
+        the TTL sees the data's real age. True when filled; False (cache untouched) when any account has no
+        readable snapshot -- the load then waits for the broker as it always did.'''
+        ids = [a.id for a, _ in target_accounts]
+        with timed_step(self._load_timing, 'snapshot') as entry:
+            try:
+                snaps = await asyncio.to_thread(_load_growth_snapshots, ids)
+            except Exception as e:  # noqa: BLE001 -- the loaders never raise; this is the thread hop itself
+                logger.warning(f"Growth snapshot could not be read ({e}); fetching from the broker instead")
+                snaps = {}
+            missing = [aid for aid in ids if aid not in snaps]
+            if missing:
+                entry.note = 'none' if not snaps else f'none for account(s) {missing}'
+                return False
+            oldest = min(s.fetched_at for s in snaps.values())
+            age = max(0.0, (datetime.now(timezone.utc) - oldest).total_seconds())
+            self._store_accounts(
+                {aid: {'dividends': snaps[aid].dividends, 'trades': snaps[aid].trades,
+                       'positions': snaps[aid].positions, 'balance': snaps[aid].balance} for aid in ids},
+                {a.id: inst for a, inst in target_accounts})
+            cache = self._broker_cache
+            # The floor that reaches back LEAST: None (the default ~1y window) when any account was read that
+            # way, else the latest requested start. A longer range than that still fetches (the load's rule).
+            floors = [snaps[aid].balance_floor for aid in ids]
+            cache['balance_floor'] = None if any(f is None for f in floors) else max(floors)
+            cache['failed'] = set()
+            cache['updated_wall'] = oldest.astimezone().replace(tzinfo=None)
+            cache['fetched_at'] = _clock() - age
+            entry.note = f'{len(ids)} account(s), {age:.0f}s old'
+            return True
+
+    async def _save_snapshots(self, target_accounts, bad, fetched_at):
+        '''After a broker refresh: store the "growth" snapshot of every account whose four datasets were all good
+        (an account that kept previous rows for a bad dataset is NOT stored -- its snapshot would claim a fetch
+        that did not happen). Off the event loop; a failure is a WARNING, never a failed load.'''
+        cache = self._broker_cache
+        attempt = cache.get('balance_attempt')
+        if attempt is None:
+            return
+        good = [a.id for a, _ in target_accounts
+                if a.id in (cache.get('accounts') or {})
+                and not any((a.id, name) in bad for name in GROWTH_DATASETS)]
+        if not good:
+            return
+        rows = {aid: cache['accounts'][aid] for aid in good}
+        with timed_step(self._load_timing, 'snapshot save', f'{len(good)} account(s)'):
+            try:
+                # attempt[0]: the start the balance history was just fetched from (None = default window)
+                await asyncio.to_thread(_save_growth_snapshots, rows, attempt[0], fetched_at)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Could not store the growth snapshot ({type(e).__name__}: {e})")
+
     def _cache_expired(self):
         cache = self._broker_cache
         return 'dividends' in cache and _clock() - cache['fetched_at'] > BROKER_DATA_TTL_SECONDS
@@ -6112,6 +6303,7 @@ class AccountGrowthTab:
         prev_fp = (rows_fingerprint(cache['dividends'], cache['trades'], cache['positions'])
                    if prev else None)
         instances = {a.id: inst for a, inst in target_accounts}
+        fetched_wall = datetime.now(timezone.utc)       # the stored snapshot's fetch time
         new, failed = await self._fetch_accounts(
             target_accounts, only=('dividends', 'trades', 'positions'))
         manual = cache.pop('accept_empty', False)
@@ -6130,6 +6322,7 @@ class AccountGrowthTab:
         if not bad or prev is None:
             cache['updated_wall'] = datetime.now()
         self._announce_refresh(bad, prev is not None)
+        await self._save_snapshots(target_accounts, bad, fetched_wall)
         return changed
 
     async def _refresh_balance(self, target_accounts, req=None, accept_empty=frozenset()):
@@ -6197,8 +6390,11 @@ class AccountGrowthTab:
         if label is None or when is None:
             return
         failed = bool(self._broker_cache.get('failed'))
+        # Data drawn from a stored snapshot can be from an earlier day: then the date is shown too, so
+        # yesterday's 14:02 cannot read as today's.
+        stamp = when.strftime('%H:%M:%S') if when.date() == date.today() else when.strftime('%Y-%m-%d %H:%M')
         try:
-            label.set_text(f"Updated {when.strftime('%H:%M:%S')}"
+            label.set_text(f"Updated {stamp}"
                            + (' - refresh failed' if failed else ''))
             label.classes(replace='text-xs ' + ('text-orange-500' if failed else 'text-gray-500'))
         except RuntimeError:

@@ -4915,6 +4915,12 @@ async def content() -> None:
                                local_change=local_change)
             with timing.step('reminder'):
                 await _draw_reminder()
+            # Top up the STORED dividend rows the "w/ div" figures were drawn from (older than 15 minutes, or there
+            # were none usable), off the render path and never joined here, like the stats top-up below: the next
+            # refresh draws the new rows. A daemon thread running portfolio_svc.refresh_stored_dividends, started
+            # through the service so the tests can join it. The loader never starts it (see the stats note).
+            if payload.get('dividends_stale'):
+                portfolio_svc.start_dividends_refresh(account_id)
             # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
             # render path and never joined: a slow provider must not hold the page,
             # and a failed top-up costs a tooltip line rather than the table.
