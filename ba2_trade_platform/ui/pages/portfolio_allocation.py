@@ -158,6 +158,7 @@ from ...core.portfolio_allocation_store import (
 )
 from ...logger import logger
 from ...services import portfolio as portfolio_svc
+from ...services.load_timing import LoadBreakdown
 from ..account_filter_context import get_selected_account_id
 # The MODULE, deliberately: the panel is absent from ``ui/components/__init__.py``
 # (same convention as ``symbol_chart_data`` and ``echart_theme``) so importing it
@@ -4869,14 +4870,25 @@ async def content() -> None:
             return
 
         async def _refresh() -> None:
+            # ONE "[PERF:page:load] AllocatorPage(...)" log line per refresh: the wait for the payload thread,
+            # the table build, the reminder, the income panel (services.load_timing). The payload's own reads
+            # are on its "AllocatorPayload" line. Server time only.
+            timing = LoadBreakdown('AllocatorPage', f'account={account_id}')
+            try:
+                await _refresh_timed(timing)
+            finally:
+                timing.log()
+
+        async def _refresh_timed(timing) -> None:
             body.clear()
             income_host.clear()
             with body:
                 ui.spinner(size='lg').classes('self-center')
             try:
-                payload = await asyncio.to_thread(
-                    _load_view_payload, account_id, mode_state['value'],
-                    sim_state['base'] if sim_state['on'] else None)
+                with timing.step('payload'):
+                    payload = await asyncio.to_thread(
+                        _load_view_payload, account_id, mode_state['value'],
+                        sim_state['base'] if sim_state['on'] else None)
             except PositionFetchFailed as e:
                 logger.error(f"Portfolio allocation: position fetch failed: {e}")
                 body.clear()
@@ -4895,13 +4907,14 @@ async def content() -> None:
                         ui.label(f'Could not load allocation: {e}')
                 return
             body.clear()
-            with body:
+            with body, timing.step('render labels'):
                 # THROUGH ``_defer``: the button lives in ``body``, which this very function clears -- including on
                 # the refresh that ends a Submit -- so the dry run is started from the never-cleared dialog host.
                 _render_labels(account_id, payload, _refresh,
                                on_label_run=lambda label: _defer(lambda: _review_scope(label)),
                                local_change=local_change)
-            await _draw_reminder()
+            with timing.step('reminder'):
+                await _draw_reminder()
             # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
             # render path and never joined: a slow provider must not hold the page,
             # and a failed top-up costs a tooltip line rather than the table.
@@ -4910,8 +4923,9 @@ async def content() -> None:
                 threading.Thread(target=svc.refresh_symbol_stats, args=(managed,),
                                  name='symbol-stats-refresh', daemon=True).start()
                 try:
-                    events, open_total, working_note = await asyncio.to_thread(
-                        _load_income_panel, account_id)
+                    with timing.step('income panel'):
+                        events, open_total, working_note = await asyncio.to_thread(
+                            _load_income_panel, account_id)
                     load_error = None
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)

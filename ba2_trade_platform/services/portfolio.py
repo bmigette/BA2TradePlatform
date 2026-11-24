@@ -22,6 +22,7 @@ from ..core.portfolio_allocation import (
 from ..core.portfolio_allocation_store import (
     get_allocation_config, get_managed_labels, get_previous_symbol_weights, get_symbol_comments, get_symbol_rows)
 from ..logger import logger
+from .load_timing import LoadBreakdown, rows_note
 from ..ui.utils.portfolio_allocation_view import (
     GateResult, ManagedLabel, account_value_from_snapshot, build_label_views, collect_managed_symbols,
     evaluate_gate, positions_by_symbol)
@@ -176,6 +177,19 @@ def load_view_payload(account_id: int, valuation_mode: str,
         PositionFetchFailed: the broker position fetch failed (NOT a flat account).
         RuntimeError: the account could not be instantiated.
     """
+    # ONE "[PERF:page:load] AllocatorPayload(...)" log line per call says where its time went, a failed
+    # broker read included (services.load_timing).
+    timing = LoadBreakdown("AllocatorPayload", f"account={account_id}, read_only={read_only}")
+    try:
+        return _view_payload(account_id, valuation_mode, base_override, timing, read_only=read_only,
+                             account=account, config=config, dividends_source=dividends_source)
+    finally:
+        timing.log()
+
+
+def _view_payload(account_id: int, valuation_mode: str, base_override: Optional[float], timing, *,
+                  read_only: bool, account, config, dividends_source) -> Dict[str, Any]:
+    """The body of ``load_view_payload``; ``timing`` collects the duration of each read."""
     from ..core.utils import (get_account_instance_from_id, get_company_names,
                                get_symbols_by_label)
 
@@ -202,9 +216,12 @@ def load_view_payload(account_id: int, valuation_mode: str,
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
 
-    positions = positions_by_symbol(account.get_positions())
+    with timing.step("positions") as entry:
+        positions = positions_by_symbol(account.get_positions())
+        entry.note = f"{len(positions)} held"
 
-    protection = load_protection_payload(account, account_id, positions)
+    with timing.step("protection"):
+        protection = load_protection_payload(account, account_id, positions)
 
     prices: Dict[str, Optional[float]] = {}
     if symbols:
@@ -213,7 +230,8 @@ def load_view_payload(account_id: int, valuation_mode: str,
         # build_position_states, the label table prices here, and fixing only the first left
         # MAGY still reading 16.86 on the very screen the discrepancy was reported from.
         # Both are valuations and both must ask for the same thing.
-        fetched = account.get_instrument_current_price(symbols, price_type='mark')
+        with timing.step("prices", f"{len(symbols)} symbols"):
+            fetched = account.get_instrument_current_price(symbols, price_type='mark')
         if isinstance(fetched, dict):
             prices = dict(fetched)
         else:
@@ -234,10 +252,11 @@ def load_view_payload(account_id: int, valuation_mode: str,
     # survive a broker that will not answer: a failed fetch falls back to the last
     # stored answer rather than blanking facts that were true five minutes ago.
     # Never fatal -- the page's job is the label table, and the chips are on top.
-    if read_only:
-        facts = read_symbol_facts_strict(account_id, symbols)
-    else:
-        facts = refresh_symbol_facts(account, account_id, symbols)
+    with timing.step("symbol facts"):
+        if read_only:
+            facts = read_symbol_facts_strict(account_id, symbols)
+        else:
+            facts = refresh_symbol_facts(account, account_id, symbols)
     # READ ONLY. The yield and the 1Y/3Y return need several FMP calls per symbol,
     # far too slow for a render, so the page draws whatever is already cached (nothing
     # on a cold start) and the top-up runs from the PAGE's refresh handler instead.
@@ -246,7 +265,8 @@ def load_view_payload(account_id: int, valuation_mode: str,
     # the page tests, and a daemon thread doing DB work outlives the test that started
     # it -- which raced the fixture's teardown into a Windows access violation. A
     # loader that spawns background work is a loader that cannot be called safely.
-    stats = read_symbol_stats_strict(symbols) if read_only else load_symbol_stats(symbols)
+    with timing.step("symbol stats"):
+        stats = read_symbol_stats_strict(symbols) if read_only else load_symbol_stats(symbols)
 
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
@@ -277,7 +297,8 @@ def load_view_payload(account_id: int, valuation_mode: str,
         # ONE snapshot for both figures. A second ``get_account_snapshot()`` for
         # the account value would double the REST cost of every refresh -- and on
         # Alpaca that call is two endpoints, not one.
-        snapshot = account.get_account_snapshot()
+        with timing.step("snapshot"):
+            snapshot = account.get_account_snapshot()
         # Extracted FIRST, so a failure in the base arithmetic below costs the
         # reserve row (as it always has) and not the account-value card as well.
         account_value = account_value_from_snapshot(snapshot)
@@ -337,52 +358,56 @@ def load_view_payload(account_id: int, valuation_mode: str,
         if managed_real is not None:
             buying_power = base_notional - managed_real
 
-    dividends = account.get_dividends() if dividends_source is None else dividends_source()
+    with timing.step("dividends") as entry:
+        dividends = account.get_dividends() if dividends_source is None else dividends_source()
+        entry.note = rows_note(dividends)
     # Market mode values an unpriced managed holding at 0 inside ``compute_base_notional``, so the base above is a
     # LOWER BOUND whenever one exists (the page does not flag this; the API does).
     unpriced_managed = sorted(sym for sym in enabled_symbols
                               if sym in positions and valuation_mode == VALUATION_MODE_MARKET
                               and positions[sym].quantity and positions[sym].price is None)
+    with timing.step("label views"):
+        views = build_label_views(managed, symbols_by_label, positions, prices, comments,
+                                      valuation_mode=valuation_mode,
+                                      base_notional=base_notional,
+                                      symbol_weights=weights,
+                                      symbol_previous_weights=previous_weights,
+                                      # One indexed query over the managed set, not one per
+                                      # row: the ⓘ tooltip is the only consumer and it is
+                                      # not worth a lookup per cell.
+                                      company_names=get_company_names(symbols),
+                                      # The "w/ div" half of the P&L column: the
+                                      # broker's FULL dividend history, cash only.
+                                      #
+                                      # NOT the income ledger. get_dividends_by_symbol
+                                      # answers "what cash is waiting to be deployed"
+                                      # and is synced over a rolling
+                                      # INCOME_WINDOW_DAYS=30 window, so it held six
+                                      # weeks of a six-month position and reported a
+                                      # fifth of what the holding had paid
+                                      # (WHEEL_L1_HR, 2026-09-07: 46.98 against ~189).
+                                      # It stays the source for CONSUMPTION, which is
+                                      # the question it is right for.
+                                      #
+                                      # Cash only, via the same helper the growth
+                                      # charts use: a reinvested dividend is already
+                                      # in market value and cost basis, so counting it
+                                      # here would book the money twice.
+                                      #
+                                      # This one costs a REST call, unlike the ledger
+                                      # read it replaces. It is on the same background
+                                      # thread as the rest of this payload, and a
+                                      # broker that will not answer costs the "w/ div"
+                                      # figure, not the page: get_dividends returns []
+                                      # on failure and every row simply has no
+                                      # dividend-adjusted number.
+                                      dividends_by_symbol=cash_dividends_by_symbol(dividends),
+                                      unallocated_pct=unallocated_pct,
+                                      excluded=exclusions,
+                                      frozen=frozen,
+                                      freed_labels=exclusion_store.labels_with_weight_changes(account_id))
     return {
-        'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
-                                   valuation_mode=valuation_mode,
-                                   base_notional=base_notional,
-                                   symbol_weights=weights,
-                                   symbol_previous_weights=previous_weights,
-                                   # One indexed query over the managed set, not one per
-                                   # row: the ⓘ tooltip is the only consumer and it is
-                                   # not worth a lookup per cell.
-                                   company_names=get_company_names(symbols),
-                                   # The "w/ div" half of the P&L column: the
-                                   # broker's FULL dividend history, cash only.
-                                   #
-                                   # NOT the income ledger. get_dividends_by_symbol
-                                   # answers "what cash is waiting to be deployed"
-                                   # and is synced over a rolling
-                                   # INCOME_WINDOW_DAYS=30 window, so it held six
-                                   # weeks of a six-month position and reported a
-                                   # fifth of what the holding had paid
-                                   # (WHEEL_L1_HR, 2026-09-07: 46.98 against ~189).
-                                   # It stays the source for CONSUMPTION, which is
-                                   # the question it is right for.
-                                   #
-                                   # Cash only, via the same helper the growth
-                                   # charts use: a reinvested dividend is already
-                                   # in market value and cost basis, so counting it
-                                   # here would book the money twice.
-                                   #
-                                   # This one costs a REST call, unlike the ledger
-                                   # read it replaces. It is on the same background
-                                   # thread as the rest of this payload, and a
-                                   # broker that will not answer costs the "w/ div"
-                                   # figure, not the page: get_dividends returns []
-                                   # on failure and every row simply has no
-                                   # dividend-adjusted number.
-                                   dividends_by_symbol=cash_dividends_by_symbol(dividends),
-                                   unallocated_pct=unallocated_pct,
-                                   excluded=exclusions,
-                                   frozen=frozen,
-                                   freed_labels=exclusion_store.labels_with_weight_changes(account_id)),
+        'views': views,
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
         'base_notional': base_notional,
@@ -473,8 +498,14 @@ def load_income_panel(account_id: int):
     account = get_account_instance_from_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
-    svc.sync_income_events(account)
-    return read_income_panel(account_id)
+    timing = LoadBreakdown("AllocatorIncome", f"account={account_id}")
+    try:
+        with timing.step("income sync"):
+            svc.sync_income_events(account)
+        with timing.step("ledger read"):
+            return read_income_panel(account_id)
+    finally:
+        timing.log()
 
 
 # ---------------------------------------------------------------------------

@@ -8390,7 +8390,8 @@ def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
     from ba2_trade_platform.services import portfolio as portfolio_svc
 
     sources = {
-        "services/portfolio.py::load_view_payload": inspect.getsource(portfolio_svc.load_view_payload),
+        # the body of ``load_view_payload`` (which only wraps it in the load-timing report)
+        "services/portfolio.py::_view_payload": inspect.getsource(portfolio_svc._view_payload),
         "portfolio_allocation_service.py::build_position_states":
             inspect.getsource(svc.build_position_states),
     }

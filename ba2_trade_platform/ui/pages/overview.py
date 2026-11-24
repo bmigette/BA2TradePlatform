@@ -59,6 +59,7 @@ from ..components.account_scope import scope_transactions_to_account
 from ...services import stats as stats_service
 from ...services import growth as growth_service
 from ...services import price_history
+from ...services.load_timing import LoadBreakdown, rows_note, step as timed_step
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
 from ..components.refresh_button import refresh_button
@@ -5159,6 +5160,10 @@ class AccountGrowthTab:
             self._broker_cache = {}
         self._refresh_warned = False
         self._bg_running = False
+        # The load being timed (services.load_timing), None between loads; and how the last price read was
+        # served ('cached' | 'downloaded' | 'download failed').
+        self._load_timing = None
+        self._price_read = None
         self._earliest = None            # first balance / trade / dividend date
         self._raw_range_start = None
         self._balance_first = None
@@ -5733,7 +5738,13 @@ class AccountGrowthTab:
                             return
                         if not self._cache_expired():
                             return                 # another load refreshed it meanwhile
-                        changed = await self._refresh_cache(target)
+                        self._load_timing = LoadBreakdown(
+                            'AccountGrowthBackground', f'accounts={[a.id for a, _ in target]}')
+                        try:
+                            changed = await self._refresh_cache(target)
+                        finally:
+                            self._load_timing.log()
+                            self._load_timing = None
                 except RuntimeError:
                     return
                 except Exception as e:
@@ -5809,6 +5820,9 @@ class AccountGrowthTab:
                                                 selected_account_id, gen)
 
     async def _load_growth_data_locked(self, loading_label, charts_container, selected_account_id, gen):
+        # ONE "[PERF:page:load] AccountGrowth(...)" log line per load says where its time went: each broker
+        # dataset, the prices, the maths, each chart (services.load_timing). Server time only.
+        timing = self._load_timing = LoadBreakdown('AccountGrowth', f'range={self._range}')
         try:
             target_accounts, problem = self._resolve_target_accounts(selected_account_id)
             if problem:
@@ -5817,6 +5831,7 @@ class AccountGrowthTab:
                 return
 
             self._account_ids = [a.id for a, _ in target_accounts]
+            timing.detail = f'accounts={self._account_ids}, range={self._range}'
             self._single_account = selected_account_id if selected_account_id is not None else None
 
             # BROKER DATA IS FETCHED ONCE PER PAGE (per account selection). None of it depends
@@ -5877,38 +5892,41 @@ class AccountGrowthTab:
             # Historical prices: re-download only when a LONGER period than already held is
             # needed (or new symbols appeared); a shorter range is just filtered.
             position_symbols = sorted(set(pos.symbol for pos in all_positions))
-            historical_prices = await self._ensure_prices(position_symbols)
+            with timed_step(timing, 'prices') as price_step:
+                historical_prices = await self._ensure_prices(position_symbols)
+                price_step.note = f'{len(historical_prices)} symbols, {self._price_read}'
             if gen != self._gen:
                 return
 
-            # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
-            try:
-                months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
-                    self._compute_monthly_realized, all_filled_trades, all_dividends
-                )
-                monthly_global, monthly_label = await asyncio.to_thread(
-                    self._compute_value_denominators, all_balance_history, all_positions,
-                    historical_prices, all_filled_trades, all_dividends, months
-                )
-            except Exception as e:
-                logger.warning(f"Could not compute monthly realized income: {e}")
-                months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
-                monthly_global, monthly_label = {}, {}
+            with timed_step(timing, 'compute'):
+                # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
+                try:
+                    months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
+                        self._compute_monthly_realized, all_filled_trades, all_dividends
+                    )
+                    monthly_global, monthly_label = await asyncio.to_thread(
+                        self._compute_value_denominators, all_balance_history, all_positions,
+                        historical_prices, all_filled_trades, all_dividends, months
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not compute monthly realized income: {e}")
+                    months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
+                    monthly_global, monthly_label = {}, {}
 
-            try:
-                scope_state = await asyncio.to_thread(
-                    self._compute_scope_inputs, target_accounts, all_filled_trades,
-                    all_dividends, positions_by_account)
-            except Exception as e:
-                logger.warning(f"Could not compute the label scope inputs: {e}")
-                scope_state = {}
-            try:
-                forecast = await asyncio.to_thread(
-                    self._compute_dividend_forecast, all_dividends, all_filled_trades,
-                    qty_by_account_symbol)
-            except Exception as e:
-                logger.warning(f"Could not compute the dividend forecast: {e}")
-                forecast = {}
+                try:
+                    scope_state = await asyncio.to_thread(
+                        self._compute_scope_inputs, target_accounts, all_filled_trades,
+                        all_dividends, positions_by_account)
+                except Exception as e:
+                    logger.warning(f"Could not compute the label scope inputs: {e}")
+                    scope_state = {}
+                try:
+                    forecast = await asyncio.to_thread(
+                        self._compute_dividend_forecast, all_dividends, all_filled_trades,
+                        qty_by_account_symbol)
+                except Exception as e:
+                    logger.warning(f"Could not compute the dividend forecast: {e}")
+                    forecast = {}
 
             if gen != self._gen:
                 return  # a newer load (range changed meanwhile) owns the container
@@ -5921,7 +5939,10 @@ class AccountGrowthTab:
                     scope_holder = ui.column().classes('w-full')
                     chart_holder = ui.column().classes('w-full')
 
+                first_draw = [timing]       # the load's own draw is timed; a later scope redraw is not
+
                 def draw_charts():
+                    drawing = first_draw[0]
                     chart_holder.clear()
                     # The ONE place the range reaches the monthly bars: months before the
                     # range start drop out (the FIFO/dividend compute above stays on the
@@ -5931,13 +5952,20 @@ class AccountGrowthTab:
                                               self._range_start, date.today())
                     with chart_holder:
                         # New monthly histograms at the top
-                        self._render_monthly_realized_income_chart(shown_months, monthly_income, monthly_global)
-                        self._render_monthly_profit_by_label_chart(shown_months, monthly_by_label, income_labels, monthly_label)
-                        self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
-                        self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                        self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                        self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
-                        self._render_dividend_history_table(all_dividends)
+                        with timed_step(drawing, 'draw monthly income'):
+                            self._render_monthly_realized_income_chart(shown_months, monthly_income, monthly_global)
+                        with timed_step(drawing, 'draw monthly by label'):
+                            self._render_monthly_profit_by_label_chart(shown_months, monthly_by_label, income_labels, monthly_label)
+                        with timed_step(drawing, 'draw total growth'):
+                            self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
+                        with timed_step(drawing, 'draw growth by label'):
+                            self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        with timed_step(drawing, 'draw positions in label'):
+                            self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                        with timed_step(drawing, 'draw per position'):
+                            self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
+                        with timed_step(drawing, 'draw dividend table'):
+                            self._render_dividend_history_table(all_dividends)
 
                 def on_scope_change():
                     self._kick_refresh()
@@ -5947,6 +5975,7 @@ class AccountGrowthTab:
                 if scope_state:
                     self._render_scope_controls(scope_holder, scope_state, on_scope_change)
                 draw_charts()
+                first_draw[0] = None
                 self._drawn_fp = rows_fingerprint(all_dividends, all_filled_trades, all_positions)
                 self._drawn_wall = cache.get('updated_wall')
                 self._hide_chip()
@@ -5961,6 +5990,9 @@ class AccountGrowthTab:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
                 pass
+        finally:
+            timing.log()
+            self._load_timing = None
 
     def _resolve_target_accounts(self, selected_account_id):
         """``([(AccountDefinition, instance)], problem_message_or_None)``."""
@@ -5981,6 +6013,13 @@ class AccountGrowthTab:
             return [], 'No accounts available for growth data.'
         return target, None
 
+    async def _timed_read(self, account_id, dataset, read, **kwargs):
+        '''One broker read off the event loop, as a step of the load being timed (if any).'''
+        with timed_step(self._load_timing, f'acct{account_id} {dataset}') as entry:
+            rows = await asyncio.to_thread(read, **kwargs)
+            entry.note = rows_note(rows)
+            return rows
+
     async def _fetch_accounts(self, target_accounts, req=None, only=('dividends', 'trades', 'positions', 'balance')):
         '''``({account_id: {dataset: rows}}, failed)`` -- fetched IN FULL, never incrementally.
         ``failed`` holds ``(account_id, dataset)`` for fetches that raised (``get_positions``
@@ -5991,26 +6030,26 @@ class AccountGrowthTab:
             for name in only:
                 try:
                     if name == 'dividends':
-                        rows = await asyncio.to_thread(inst.get_dividends)
+                        rows = await self._timed_read(aid, name, inst.get_dividends)
                         for entry in rows:
                             entry['account_name'] = acc_def.name
                             entry['account_id'] = aid
                     elif name == 'trades':
-                        rows = await asyncio.to_thread(inst.get_filled_trades)
+                        rows = await self._timed_read(aid, name, inst.get_filled_trades)
                         for t in rows:
                             t['account_id'] = aid
                     elif name == 'positions':
-                        rows = await asyncio.to_thread(inst.get_positions)
+                        rows = await self._timed_read(aid, name, inst.get_positions)
                         if rows is None:
                             raise RuntimeError('get_positions returned None')
                     else:
                         if req is not None:
-                            rows = await asyncio.to_thread(
-                                inst.get_balance_history,
+                            rows = await self._timed_read(
+                                aid, name, inst.get_balance_history,
                                 start_date=datetime.combine(req, datetime.min.time()),
                                 end_date=datetime.now())
                         else:
-                            rows = await asyncio.to_thread(inst.get_balance_history)
+                            rows = await self._timed_read(aid, name, inst.get_balance_history)
                         for entry in rows:
                             entry['account_name'] = acc_def.name
                             entry['account_id'] = aid
@@ -6196,6 +6235,7 @@ class AccountGrowthTab:
         if (held and covered
                 and _clock() - held['fetched_at'] <= PRICE_TTL_SECONDS
                 and self._PRICE_RANKS.index(held['period']) >= self._PRICE_RANKS.index(need)):
+            self._price_read = 'cached'
             return held['data']
         data = {}
         ok = True
@@ -6206,6 +6246,7 @@ class AccountGrowthTab:
             except Exception as e:
                 logger.warning(f"Could not fetch historical prices: {e}")
                 ok = False
+        self._price_read = 'downloaded' if ok else 'download failed'
         if ok:
             # Only a download that returned something is remembered: a failed one is retried
             # on the next load instead of freezing empty charts until the page is reopened.
