@@ -898,7 +898,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
                     symbol_stats: Optional[Dict[str, Any]] = None,
                     protection: Optional[Dict[str, Any]] = None,
                     exclusions: Optional[Dict[str, Any]] = None,
-                    frozen: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    frozen: Optional[Dict[str, Any]] = None,
+                    dividends_as_of: Optional[datetime] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -923,6 +924,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'exclusions': {(k or '').strip().upper(): v for k, v in (exclusions or {}).items()},
         # {SYMBOL: AllocatorFrozen}: the operator's freezes (no orders, value fixed outside the maths).
         'frozen': {(k or '').strip().upper(): v for k, v in (frozen or {}).items()},
+        # When the "w/ div" figures come from the STORED dividend copy, its fetch time (the P&L header says so);
+        # None for a live read.
+        'dividends_as_of': dividends_as_of,
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -3169,9 +3173,20 @@ def _phone_tables() -> PhoneTableRegistry:
     return registry
 
 
-def symbol_table_columns() -> List[Dict[str, Any]]:
+def dividends_as_of_text(as_of: datetime, now: Optional[datetime] = None) -> str:
+    """When a STORED dividend copy was fetched, in local time: ``HH:MM`` today, ``YYYY-MM-DD HH:MM`` on an
+    earlier day (so yesterday's 18:02 cannot read as today's)."""
+    local = as_of.astimezone()
+    today = (now or datetime.now().astimezone()).astimezone().date()
+    return local.strftime('%H:%M') if local.date() == today else local.strftime('%Y-%m-%d %H:%M')
+
+
+def symbol_table_columns(dividends_as_of: Optional[datetime] = None) -> List[Dict[str, Any]]:
     """The symbol table's column definitions. ONE list, read by the table and by
-    the phone card spec check (``SYMBOL_CARD``)."""
+    the phone card spec check (``SYMBOL_CARD``).
+
+    ``dividends_as_of``: when the "w/ div" half of the P&L cells comes from the STORED dividend copy
+    (``services.portfolio``), its fetch time -- the P&L header then says so. None (a live read): plain "P&L"."""
     # The LABELS column is gone. Every row inside a label's own section repeated the
     # same value, and the section header already says which label this is; the one
     # case where the value differs -- a symbol carrying two managed labels -- is
@@ -3228,7 +3243,9 @@ def symbol_table_columns() -> List[Dict[str, Any]]:
         # STRING and not two numeric columns because half its values are not
         # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
         # those as 0.00 is the failure mode this platform has actually paid for.
-        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
+        {'name': 'pnl', 'field': 'pnl', 'align': 'right',
+         'label': 'P&L' if dividends_as_of is None
+         else f'P&L (w/ div as of {dividends_as_of_text(dividends_as_of)})'},
         {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
     ]
     return columns
@@ -3574,7 +3591,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         row['target_value_global'] = row['target_value']
         _write_row_deltas(row)
 
-    columns = symbol_table_columns()
+    columns = symbol_table_columns(dividends_as_of=live['dividends_as_of'])
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
@@ -4215,7 +4232,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh, *, on_labe
                            symbol_stats=payload.get('symbol_stats') or {},
                            protection=payload.get('protection'),
                            exclusions=payload.get('exclusions'),
-                           frozen=payload.get('frozen'))
+                           frozen=payload.get('frozen'),
+                           dividends_as_of=payload['dividends_as_of'])
     live['on_label_run'] = on_label_run
     if local_change is not None:
         live['local_change'] = local_change
@@ -4915,11 +4933,11 @@ async def content() -> None:
                                local_change=local_change)
             with timing.step('reminder'):
                 await _draw_reminder()
-            # Top up the STORED dividend rows the "w/ div" figures were drawn from (older than 15 minutes, or there
-            # were none usable), off the render path and never joined here, like the stats top-up below: the next
-            # refresh draws the new rows. A daemon thread running portfolio_svc.refresh_stored_dividends, started
+            # Top up the STORED dividend rows the "w/ div" figures were drawn from (when they are older than 15
+            # minutes; a live read is not topped up), off the render path and never joined here, like the stats
+            # top-up below: the next refresh draws the new rows. A daemon thread running portfolio_svc.refresh_stored_dividends, started
             # through the service so the tests can join it. The loader never starts it (see the stats note).
-            if payload.get('dividends_stale'):
+            if payload['dividends_stale']:
                 portfolio_svc.start_dividends_refresh(account_id)
             # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
             # render path and never joined: a slow provider must not hold the page,

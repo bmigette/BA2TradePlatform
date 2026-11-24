@@ -249,13 +249,34 @@ def _upsert(session, account_id: int, dataset: str, payload: Dict[str, Any], fet
     session.add(row)
 
 
+#: The datasets whose EMPTY answer cannot be told from a failed fetch (the lenient broker getters return ``[]`` on
+#: failure). Positions are not here: a flat account is real, and a failed position fetch is ``None``.
+EMPTY_MEANS_FAILED = ("dividends", "trades", "balance")
+
+
+def _stored_has_rows(payload: Any, key: str) -> bool:
+    """Whether a stored payload (of ANY schema version: a schema bump must not open the door) holds rows under
+    ``key``. Reads the raw JSON, no decoding: an encoded row list has one entry per row."""
+    return isinstance(payload, dict) and isinstance(payload.get(key), list) and bool(payload[key])
+
+
 def save_growth_snapshot(account_id: int, *, dividends, trades, positions, balance,
-                         balance_floor: Optional[date], fetched_at: datetime) -> None:
+                         balance_floor: Optional[date], fetched_at: datetime,
+                         confirmed_empty: Iterable[str] = ()) -> None:
     """Store the account's ``"growth"`` snapshot AND its ``"dividends"`` dataset (the same dividend rows), in one
-    transaction. Everything is encoded before anything is written: a refused value stores nothing."""
+    transaction. Everything is encoded before anything is written: a refused value stores nothing.
+
+    AN EMPTY ANSWER NEVER REPLACES STORED ROWS. For ``EMPTY_MEANS_FAILED``, a save whose list is empty while the
+    stored snapshot has rows for it is REFUSED (``ValueError`` naming the account and the datasets): the lenient
+    broker getters return ``[]`` on a failed fetch, and a page with no previous rows (a first load, a schema bump)
+    cannot tell. ``confirmed_empty`` names the datasets the caller KNOWS became empty (the tab's manual refresh after
+    an empty answer twice in a row). The ``"dividends"`` dataset row is never written with an empty list at all
+    (``save_dividends``' rule): it keeps its previous rows."""
     fetched_at = _check_utc(fetched_at)
     if balance_floor is not None and type(balance_floor) is not date:
         raise TypeError(f"cannot store 'balance_floor' of type {type(balance_floor).__name__}: a date or None")
+    confirmed = set(confirmed_empty)
+    lists = {"dividends": dividends, "trades": trades, "balance": balance}
     encoded_dividends = encode_rows(dividends)
     payload = {
         "dividends": encoded_dividends,
@@ -265,8 +286,16 @@ def save_growth_snapshot(account_id: int, *, dividends, trades, positions, balan
         "balance_floor": None if balance_floor is None else balance_floor.isoformat(),
     }
     with get_db() as session:
+        stored = session.get(AccountGrowthSnapshot, (int(account_id), DATASET_GROWTH))
+        stored_payload = stored.payload if stored is not None else None
+        emptied = [name for name in EMPTY_MEANS_FAILED
+                   if not lists[name] and name not in confirmed and _stored_has_rows(stored_payload, name)]
+        if emptied:
+            raise ValueError(f"refusing to replace the stored {', '.join(emptied)} of account {account_id} with an "
+                             f"empty answer (a failed broker fetch returns none too); the stored snapshot is kept")
         _upsert(session, account_id, DATASET_GROWTH, payload, fetched_at)
-        _upsert(session, account_id, DATASET_DIVIDENDS, {"rows": encoded_dividends}, fetched_at)
+        if encoded_dividends:
+            _upsert(session, account_id, DATASET_DIVIDENDS, {"rows": encoded_dividends}, fetched_at)
         session.commit()
 
 
@@ -310,13 +339,19 @@ def load_growth_snapshot(account_id: int) -> Optional[GrowthSnapshot]:
         return None
 
 
-def save_dividends(account_id: int, rows, fetched_at: datetime) -> None:
-    """Store the account's ``"dividends"`` dataset alone (the allocator's live fetch)."""
+def save_dividends(account_id: int, rows, fetched_at: datetime) -> bool:
+    """Store the account's ``"dividends"`` dataset alone (the allocator's fetches); True when written.
+
+    An EMPTY list is never written (returns False, nothing changes): the lenient ``get_dividends`` returns ``[]`` on
+    a failed fetch too, so it must neither replace stored rows nor be served as a fresh "pays nothing"."""
     fetched_at = _check_utc(fetched_at)
+    if not rows:
+        return False
     payload = {"rows": encode_rows(rows)}
     with get_db() as session:
         _upsert(session, account_id, DATASET_DIVIDENDS, payload, fetched_at)
         session.commit()
+    return True
 
 
 def load_dividends(account_id: int) -> Optional[StoredDividends]:
@@ -354,15 +389,36 @@ def load_dividend_histories(symbols: Iterable[str]) -> Dict[str, Tuple[Any, date
         return {}
 
 
-def save_dividend_history(symbol: str, payload: Any, fetched_at: datetime) -> None:
-    """Store one symbol's raw FMP payload (an empty one too: a non-payer is not asked again on every cold start).
-    FMP's error answer (``{"Error Message": ...}``) is refused with a ``ValueError``: it is not "pays nothing"."""
+def _check_history_shape(symbol: str, payload: Any) -> None:
+    """FMP's ``historical-price-full/stock_dividend`` reply is ``{"symbol": ..., "historical": [...]}``, ``{}`` for a
+    symbol that never paid, and some FMP endpoints answer a bare list. Anything else -- an error body served with
+    HTTP 200 (``{"Error Message": ...}``, ``{"message": ...}``), a string, ``None`` -- is not "pays nothing" and is
+    refused with a ``ValueError``."""
+    if isinstance(payload, list):
+        return
+    if isinstance(payload, dict) and (not payload or isinstance(payload.get("historical"), list)):
+        return
+    shown = repr(payload)
+    raise ValueError(f"FMP's dividend history of {symbol} has an unexpected shape "
+                     f"({shown[:120]}{'...' if len(shown) > 120 else ''}); not stored")
+
+
+def save_dividend_history(symbol: str, payload: Any, fetched_at: datetime) -> bool:
+    """Store one symbol's raw FMP payload; True when written. An empty history is stored too (a non-payer is not
+    asked again on every cold start), EXCEPT over a stored payload that parses to payments: that is kept (WARNING
+    naming the symbol, returns False), because an empty answer is also what a broken reply parses to. A payload of
+    any other shape than FMP's (``_check_history_shape``) raises ``ValueError``."""
+    from ..ui.utils.dividend_forecast import parse_provider_history
+
     fetched_at = _check_utc(fetched_at)
-    if isinstance(payload, dict) and "Error Message" in payload:
-        raise ValueError(f"FMP answered {symbol} with an error ({payload['Error Message']!r}); not stored")
     sym = str(symbol).upper()
+    _check_history_shape(sym, payload)
     with get_db() as session:
         row = session.get(SymbolDividendHistory, sym)
+        if row is not None and not parse_provider_history(payload)[0] and parse_provider_history(row.payload)[0]:
+            logger.warning(f"Dividend history of {sym}: FMP now answers no payments, the stored history has some; "
+                           f"keeping the stored history")
+            return False
         if row is None:
             row = SymbolDividendHistory(symbol=sym, fetched_at=fetched_at, payload=payload)
         else:
@@ -370,6 +426,7 @@ def save_dividend_history(symbol: str, payload: Any, fetched_at: datetime) -> No
             row.payload = payload
         session.add(row)
         session.commit()
+    return True
 
 
 _REFRESH_LOCK = threading.Lock()
@@ -405,7 +462,8 @@ def start_dividend_history_refresh(symbols: Iterable[str], fetch: Callable[[str]
 
 
 def join_dividend_history_refresh(timeout: Optional[float] = None) -> None:
-    """Wait for the running history refresh, if any (tests: no thread doing DB work outlives its test)."""
+    """TEST HOOK (``tests/conftest.py`` and the tests call it; production never does): wait for the running history
+    refresh, if any, so no thread doing DB work outlives its test."""
     with _REFRESH_LOCK:
         thread = _refresh_thread
     if thread is not None and thread.is_alive():

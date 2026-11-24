@@ -364,3 +364,47 @@ def test_the_timing_line_names_the_snapshot_and_the_four_compute_steps(page_env,
     for part in ('monthly realized', 'value denominators', 'scope inputs', 'dividend forecast'):
         assert f'{part} ' in line, (part, line)
     assert 'compute ' not in line
+
+
+# ---- an empty broker answer never replaces the stored snapshot ---------------------------------------------------------
+
+def test_a_failed_empty_answer_on_a_load_without_previous_rows_does_not_overwrite_the_snapshot(page_env, monkeypatch):
+    """Two accounts, one without a snapshot: the load waits for the broker with NO previous rows in the page, so
+    ``merge_refresh`` cannot call account 1's ``[]`` (a failed lenient fetch) bad. The store refuses it instead."""
+    warnings = []
+    monkeypatch.setattr(page_env.ov.logger, 'warning', lambda msg, *a, **k: warnings.append(str(msg)))
+    page_env.state.brokers = [PosBroker(aid=1), PosBroker(aid=2)]
+    page_env.state.selected = None
+    seeded = _seed(page_env.state.brokers[0], aid=1)
+    page_env.state.brokers[0].fail = {'dividends'}
+
+    async def go():
+        page_env.build()
+        await page_env.settle()
+    asyncio.run(go())
+    stored = gs.load_growth_snapshot(1)
+    assert len(stored.dividends) == 3 and stored.fetched_at == seeded['fetched_at']
+    assert len(gs.load_dividends(1).rows) == 3
+    assert gs.load_growth_snapshot(2) is not None                # the good account is stored
+    assert any('account 1' in w and 'dividends' in w for w in warnings), warnings
+
+
+def test_a_manual_refresh_after_an_empty_answer_twice_stores_the_now_empty_dataset(page_env):
+    """The existing way out ("empty twice in a row", accepted by the manual refresh) reaches the store too."""
+    broker = page_env.state.brokers[0]
+
+    async def go():
+        page = page_env.build()
+        await page_env.settle()                                  # no snapshot: blocking fetch, 3 dividends stored
+        broker.divs = []                                         # the history truly became empty
+        page_env.clock.t += 300
+        await page.timer.callback()                              # empty after rows: kept, not stored
+        after_auto = len(gs.load_growth_snapshot(1).dividends)
+        with page.client.content:
+            page.refresh(None)                                   # manual: empty seen twice -> accepted
+        await page_env.settle()
+        return after_auto
+    after_auto = asyncio.run(go())
+    assert after_auto == 3
+    assert gs.load_growth_snapshot(1).dividends == []
+    assert len(gs.load_dividends(1).rows) == 3                   # the dividends row is never written empty

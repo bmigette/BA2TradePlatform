@@ -174,9 +174,64 @@ def test_saving_the_growth_snapshot_also_writes_the_dividends_dataset():
 
 def test_a_second_save_replaces_the_first():
     _save(fetched_at=datetime(2026, 11, 24, 9, 0, tzinfo=UTC))
-    _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC), dividends=[])
+    _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC),
+          dividends=[{"symbol": "BBB", "amount": 1.0, "date": date(2026, 4, 1)}])
     snap = gs.load_growth_snapshot(1)
-    assert snap.fetched_at.hour == 10 and snap.dividends == []
+    assert snap.fetched_at.hour == 10 and [d["symbol"] for d in snap.dividends] == ["BBB"]
+    assert [d["symbol"] for d in gs.load_dividends(1).rows] == ["BBB"]
+
+
+# ---- an empty broker answer never replaces stored rows ----------------------------------------------------------------
+# The lenient broker getters return [] on a FAILED fetch, and the tab cannot always tell (no previous rows in the page).
+
+@pytest.mark.parametrize("dataset", ["dividends", "trades", "balance"])
+def test_an_empty_list_over_stored_rows_is_refused_and_the_snapshot_kept(dataset):
+    first = _save(fetched_at=datetime(2026, 11, 24, 9, 0, tzinfo=UTC))
+    with pytest.raises(ValueError) as err:
+        _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC), **{dataset: []})
+    assert dataset in str(err.value) and "account 1" in str(err.value)
+    snap = gs.load_growth_snapshot(1)
+    assert snap.fetched_at == first["fetched_at"] and getattr(snap, dataset) == first[dataset]
+    assert gs.load_dividends(1).rows == first["dividends"]
+
+
+@pytest.mark.parametrize("dataset", ["dividends", "trades", "balance"])
+def test_a_confirmed_empty_dataset_may_replace_stored_rows(dataset):
+    _save(fetched_at=datetime(2026, 11, 24, 9, 0, tzinfo=UTC))
+    _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC), confirmed_empty={dataset}, **{dataset: []})
+    snap = gs.load_growth_snapshot(1)
+    assert snap.fetched_at.hour == 10 and getattr(snap, dataset) == []
+
+
+def test_confirming_one_dataset_does_not_confirm_another():
+    _save()
+    with pytest.raises(ValueError, match="trades"):
+        _save(dividends=[], trades=[], confirmed_empty={"dividends"})
+
+
+def test_positions_may_become_empty_a_flat_account_is_real():
+    _save(fetched_at=datetime(2026, 11, 24, 9, 0, tzinfo=UTC))
+    _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC), positions=[])
+    assert gs.load_growth_snapshot(1).positions == []
+
+
+def test_an_empty_list_where_nothing_was_stored_is_saved():
+    _save(dividends=[], trades=[], balance=[])
+    snap = gs.load_growth_snapshot(1)
+    assert snap.dividends == [] and snap.trades == [] and snap.balance == []
+
+
+def test_the_dividends_row_is_never_written_empty():
+    _save(dividends=[])                                            # nothing stored before
+    assert gs.load_growth_snapshot(1) is not None and gs.load_dividends(1) is None
+
+
+def test_a_confirmed_empty_dividends_list_still_leaves_the_dividends_row_alone():
+    first = _save(fetched_at=datetime(2026, 11, 24, 9, 0, tzinfo=UTC))
+    _save(fetched_at=datetime(2026, 11, 24, 10, 0, tzinfo=UTC), dividends=[], confirmed_empty={"dividends"})
+    assert gs.load_growth_snapshot(1).dividends == []
+    stored = gs.load_dividends(1)
+    assert stored.rows == first["dividends"] and stored.fetched_at == first["fetched_at"]
 
 
 def test_snapshots_are_per_account():
@@ -249,10 +304,21 @@ def test_no_row_is_absent_without_a_warning(warnings_seen):
 def test_dividends_save_and_load():
     rows = [{"symbol": "O", "amount": 1.25, "date": datetime(2026, 1, 15), "drip_quantity": None, "id": "x1"}]
     at = datetime(2026, 11, 24, 8, 0, tzinfo=UTC)
-    gs.save_dividends(7, rows, at)
+    assert gs.save_dividends(7, rows, at) is True
     stored = gs.load_dividends(7)
     assert stored.rows == rows and stored.fetched_at == at
     assert gs.load_growth_snapshot(7) is None          # the dividends dataset alone is no growth snapshot
+
+
+def test_an_empty_dividends_list_is_never_written():
+    assert gs.save_dividends(7, [], datetime(2026, 11, 24, 8, 0, tzinfo=UTC)) is False
+    assert gs.load_dividends(7) is None
+    rows = [{"symbol": "O", "amount": 1.25, "date": date(2026, 1, 15)}]
+    at = datetime(2026, 11, 24, 8, 0, tzinfo=UTC)
+    gs.save_dividends(7, rows, at)
+    assert gs.save_dividends(7, [], datetime(2026, 11, 24, 9, 0, tzinfo=UTC)) is False
+    stored = gs.load_dividends(7)
+    assert stored.rows == rows and stored.fetched_at == at
 
 
 # ---- dividend histories ----------------------------------------------------------------------------------------------
@@ -272,10 +338,42 @@ def test_a_dividend_history_save_replaces_the_previous_payload():
     assert gs.load_dividend_histories(["AAA"])["AAA"][0] == {"historical": []}
 
 
-def test_an_fmp_error_payload_is_not_stored_as_a_non_payer():
-    with pytest.raises(ValueError, match="with an error .*Limit Reach"):
-        gs.save_dividend_history("AAA", {"Error Message": "Limit Reach"}, datetime(2026, 11, 2, tzinfo=UTC))
+@pytest.mark.parametrize("payload", [
+    [], [{"date": "2026-01-02", "dividend": 0.5}], {}, {"historical": []},
+    {"symbol": "AAA", "historical": [{"date": "2026-01-02", "dividend": 0.5}]},
+])
+def test_the_shapes_fmp_answers_with_are_stored(payload):
+    assert gs.save_dividend_history("AAA", payload, datetime(2026, 11, 2, tzinfo=UTC)) is True
+    assert gs.load_dividend_histories(["AAA"])["AAA"][0] == payload
+
+
+@pytest.mark.parametrize("payload", [
+    {"Error Message": "Limit Reach"}, {"message": "Upgrade your plan"}, "Limit Reach", None, 42,
+    {"symbol": "AAA"}, {"historical": "nope"}, {"historical": None},
+])
+def test_any_other_shape_is_refused_and_nothing_stored(payload):
+    with pytest.raises(ValueError, match="AAA"):
+        gs.save_dividend_history("AAA", payload, datetime(2026, 11, 2, tzinfo=UTC))
     assert gs.load_dividend_histories(["AAA"]) == {}
+
+
+def test_a_history_that_parses_to_payments_is_never_replaced_by_one_that_parses_to_none(warnings_seen):
+    paying = {"symbol": "AAA", "historical": [{"date": "2026-01-02", "dividend": 0.5, "paymentDate": "2026-01-20"}]}
+    at = datetime(2026, 11, 1, tzinfo=UTC)
+    gs.save_dividend_history("AAA", paying, at)
+    assert gs.save_dividend_history("AAA", {}, datetime(2026, 11, 2, tzinfo=UTC)) is False
+    assert gs.save_dividend_history("AAA", {"historical": [{"date": "x", "dividend": None}]},
+                                    datetime(2026, 11, 2, tzinfo=UTC)) is False
+    assert gs.load_dividend_histories(["AAA"])["AAA"] == (paying, at)
+    assert len([w for w in warnings_seen if "AAA" in w]) == 2, warnings_seen
+
+
+def test_a_paying_history_may_replace_another_paying_history():
+    gs.save_dividend_history("AAA", {"historical": [{"date": "2026-01-02", "dividend": 0.5}]},
+                             datetime(2026, 11, 1, tzinfo=UTC))
+    newer = {"historical": [{"date": "2026-04-02", "dividend": 0.6}]}
+    assert gs.save_dividend_history("AAA", newer, datetime(2026, 11, 2, tzinfo=UTC)) is True
+    assert gs.load_dividend_histories(["AAA"])["AAA"][0] == newer
 
 
 def test_the_history_refresh_runs_one_thread_at_a_time_and_stores_what_it_fetched(monkeypatch):

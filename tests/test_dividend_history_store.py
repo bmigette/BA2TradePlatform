@@ -93,12 +93,35 @@ def test_a_stale_row_is_used_at_once_and_refreshed_by_the_background_thread(fmp)
     tab = _tab()
     got = tab._provider_dividend_histories(['NEW', 'OLD'])
     assert got['OLD'][0][0][1] == 0.2                                       # the stored copy, not a wait for FMP
-    thread = tab._dividend_history_refresh
-    assert thread is not None and thread.daemon
-    thread.join(10)
+    gs.join_dividend_history_refresh(10)
     assert fmp.calls == ['OLD']                                             # only the stale one
     payload, fetched_at = gs.load_dividend_histories(['OLD'])['OLD']
     assert payload == _payload(0.25, 'OLD') and fetched_at > old
+
+
+def test_the_background_refresh_never_replaces_a_paying_history_with_an_empty_answer(fmp, monkeypatch):
+    warned = []
+    monkeypatch.setattr(gs.logger, 'warning', lambda msg, *a, **k: warned.append(str(msg)))
+    old = datetime.now(UTC) - timedelta(hours=30)
+    gs.save_dividend_history('OLD', _payload(0.2, 'OLD'), old)
+    fmp.answers['OLD'] = {}                                                 # what a broken reply parses to
+    _tab()._provider_dividend_histories(['OLD'])
+    gs.join_dividend_history_refresh(10)
+    assert fmp.calls == ['OLD']
+    assert gs.load_dividend_histories(['OLD'])['OLD'] == (_payload(0.2, 'OLD'), old)
+    assert any('OLD' in w for w in warned), warned
+
+
+def test_an_fmp_error_body_in_the_background_refresh_is_refused_and_logged(fmp, monkeypatch):
+    warned = []
+    monkeypatch.setattr(gs.logger, 'warning', lambda msg, *a, **k: warned.append(str(msg)))
+    old = datetime.now(UTC) - timedelta(hours=30)
+    gs.save_dividend_history('OLD', _payload(0.2, 'OLD'), old)
+    fmp.answers['OLD'] = {'Error Message': 'Limit Reach'}
+    _tab()._provider_dividend_histories(['OLD'])
+    gs.join_dividend_history_refresh(10)
+    assert gs.load_dividend_histories(['OLD'])['OLD'] == (_payload(0.2, 'OLD'), old)
+    assert any('OLD' in w and 'unexpected shape' in w for w in warned), warned
 
 
 def test_no_key_means_no_fetch_and_no_refresh_but_stored_rows_still_count(fmp):
@@ -107,7 +130,8 @@ def test_no_key_means_no_fetch_and_no_refresh_but_stored_rows_still_count(fmp):
     tab = _tab()
     got = tab._provider_dividend_histories(['OLD', 'MISSING'])
     assert set(got) == {'OLD'} and fmp.calls == []
-    assert getattr(tab, '_dividend_history_refresh', None) is None
+    gs.join_dividend_history_refresh(10)
+    assert fmp.calls == []                                                  # no background refresh either
 
 
 def test_a_provider_error_warns_once_stores_nothing_and_falls_back(fmp, monkeypatch):

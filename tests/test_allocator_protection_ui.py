@@ -173,7 +173,7 @@ def _render(nicegui_client, protection):
     from nicegui import ui
     payload = {'views': _views(), 'symbols_by_label': {}, 'valuation_mode': VALUATION_MODE_MARKET,
                'base_notional': 10_000.0, 'available_buying_power': 1_000.0, 'account_value': None,
-               'unallocated_pct': 0.0}
+               'unallocated_pct': 0.0, 'dividends_as_of': None, 'dividends_stale': False}
     if protection is not None:
         payload['protection'] = protection
     with nicegui_client:

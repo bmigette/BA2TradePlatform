@@ -144,7 +144,8 @@ def _table(nicegui_client):
                                 'valuation_mode': VALUATION_MODE_MARKET,
                                 'base_notional': 10_000.0,
                                 'available_buying_power': 1_000.0,
-                                'account_value': None, 'unallocated_pct': 0.0}, _noop)
+                                'account_value': None, 'unallocated_pct': 0.0,
+                                'dividends_as_of': None, 'dividends_stale': False}, _noop)
     return next(el for el in nicegui_client.layout.descendants()
                 if isinstance(el, ui.table))
 

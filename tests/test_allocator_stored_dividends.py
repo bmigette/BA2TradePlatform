@@ -67,7 +67,8 @@ def test_with_no_stored_copy_the_broker_is_asked_and_the_answer_stored(scenario,
     acct_id, account = scenario
     payload = svc.load_view_payload(acct_id, VALUATION_MODE_MARKET)
     assert account.dividend_calls == 1
-    assert payload["dividends_as_of"] is None and payload["dividends_stale"] is True
+    # a live read is fresh: no background top-up right behind it (no second get_dividends back to back)
+    assert payload["dividends_as_of"] is None and payload["dividends_stale"] is False
     stored = gs.load_dividends(acct_id)
     assert stored.rows == account.dividends
     assert (datetime.now(UTC) - stored.fetched_at).total_seconds() < 60
@@ -81,9 +82,20 @@ def test_a_stored_copy_older_than_24h_is_not_used(scenario):
     acct_id, account = scenario
     gs.save_dividends(acct_id, STORED, datetime.now(UTC) - timedelta(hours=25))
     payload = svc.load_view_payload(acct_id, VALUATION_MODE_MARKET)
-    assert account.dividend_calls == 1 and payload["dividends_as_of"] is None and payload["dividends_stale"] is True
+    assert account.dividend_calls == 1 and payload["dividends_as_of"] is None and payload["dividends_stale"] is False
     assert _o_dividend_cash(payload) == pytest.approx(40.0)          # the broker's rows
     assert gs.load_dividends(acct_id).rows == account.dividends     # and stored
+
+
+def test_an_empty_live_answer_is_not_stored_so_it_is_never_served_as_a_fresh_pays_nothing(scenario):
+    acct_id, account = scenario
+    account.dividends = []                                           # the lenient get_dividends' failure shape
+    payload = svc.load_view_payload(acct_id, VALUATION_MODE_MARKET)
+    assert payload["dividend_payments"] == 0 and payload["dividends_stale"] is False
+    assert gs.load_dividends(acct_id) is None
+    account.dividends = [{"symbol": "O", "amount": 40.0, "drip_quantity": None, "date": datetime(2026, 9, 1)}]
+    svc.load_view_payload(acct_id, VALUATION_MODE_MARKET)            # the next load asks the broker again
+    assert account.dividend_calls == 2
 
 
 def test_a_failed_live_fetch_never_overwrites_a_stored_non_empty_copy(scenario):
@@ -135,11 +147,11 @@ def test_refresh_stored_dividends_never_overwrites_non_empty_rows_with_an_empty_
     assert stored.rows == STORED and stored.fetched_at == old
 
 
-def test_refresh_stored_dividends_stores_an_empty_answer_when_nothing_was_stored(scenario):
+def test_refresh_stored_dividends_never_stores_an_empty_answer(scenario):
     acct_id, account = scenario
     account.dividends = []
     svc.refresh_stored_dividends(acct_id)
-    assert gs.load_dividends(acct_id).rows == []
+    assert gs.load_dividends(acct_id) is None
 
 
 def test_refresh_stored_dividends_logs_and_returns_when_the_broker_raises(scenario, monkeypatch):
@@ -161,8 +173,59 @@ def test_the_page_starts_the_top_up_thread_only_when_the_stored_copy_is_stale():
     src = (Path(__file__).resolve().parent.parent / "ba2_trade_platform" / "ui" / "pages"
            / "portfolio_allocation.py").read_text(encoding="utf-8")
     body = src[src.index("        async def _refresh_timed(timing) -> None:"):]
-    assert ("if payload.get('dividends_stale'):\n"
+    assert ("if payload['dividends_stale']:\n"
             "                portfolio_svc.start_dividends_refresh(account_id)") in body
+    assert "payload.get('dividends_stale')" not in src and "payload.get('dividends_as_of')" not in src
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_every_payload_carries_both_dividend_keys(scenario, read_only):
+    acct_id, account = scenario
+    kwargs = {"read_only": True, "dividends_source": lambda: list(account.dividends)} if read_only else {}
+    payload = svc.load_view_payload(acct_id, VALUATION_MODE_MARKET, **kwargs)
+    assert "dividends_as_of" in payload and "dividends_stale" in payload
+
+
+# ---- the stored copy's time is on the page: the P&L column header ------------------------------------------------------
+
+def test_the_as_of_text_is_the_time_today_and_the_date_and_time_on_an_earlier_day():
+    from ba2_trade_platform.ui.pages import portfolio_allocation as page
+    now = datetime(2026, 11, 24, 15, 0).astimezone()
+    today = datetime(2026, 11, 24, 9, 14).astimezone()
+    earlier = datetime(2026, 11, 23, 18, 2).astimezone()
+    assert page.dividends_as_of_text(today.astimezone(UTC), now=now) == "09:14"
+    assert page.dividends_as_of_text(earlier.astimezone(UTC), now=now) == "2026-11-23 18:02"
+
+
+def test_the_pnl_column_says_the_w_div_figures_come_from_the_stored_copy():
+    from ba2_trade_platform.ui.pages import portfolio_allocation as page
+    at = datetime.now(UTC).replace(second=0, microsecond=0)
+    label = {c["name"]: c["label"] for c in page.symbol_table_columns(dividends_as_of=at)}["pnl"]
+    assert label == f"P&L (w/ div as of {page.dividends_as_of_text(at)})"
+    assert {c["name"]: c["label"] for c in page.symbol_table_columns()}["pnl"] == "P&L"
+    assert {c["name"]: c["label"] for c in page.symbol_table_columns(dividends_as_of=None)}["pnl"] == "P&L"
+
+
+def test_the_rendered_page_shows_the_stored_copys_time_in_the_pnl_header(scenario):
+    from nicegui.client import Client
+    from nicegui.page import page as nicegui_page
+    from ba2_trade_platform.ui.pages import portfolio_allocation as page
+    acct_id, _ = scenario
+    at = datetime.now(UTC) - timedelta(minutes=20)
+    gs.save_dividends(acct_id, STORED, at)
+    payload = svc.load_view_payload(acct_id, VALUATION_MODE_MARKET)
+
+    async def noop():
+        pass
+    client = Client(nicegui_page("/test-stored-dividends-header"), request=None)
+    try:
+        with client:
+            page._render_labels(acct_id, payload, noop)
+        headers = {c["label"] for e in client.elements.values() if type(e).__name__ == "Table"
+                   for c in e._props["columns"] if c["name"] == "pnl"}
+    finally:
+        client.remove_elements(client.elements.values())
+    assert headers == {f"P&L (w/ div as of {page.dividends_as_of_text(at)})"}
 
 
 def test_the_top_up_thread_is_a_named_daemon_running_refresh_stored_dividends_and_can_be_joined(scenario):

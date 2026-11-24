@@ -266,7 +266,8 @@ def test_the_table_is_wired_to_the_freeze_handler_and_marks_frozen_rows(nicegui_
     frozen = _frozen()
     payload = {"views": views, "symbols_by_label": {}, "valuation_mode": VALUATION_MODE_MARKET,
                "base_notional": 10_000.0, "available_buying_power": 1_000.0, "account_value": None,
-               "unallocated_pct": 0.0, "exclusions": {}, "frozen": frozen}
+               "unallocated_pct": 0.0, "exclusions": {}, "frozen": frozen,
+               "dividends_as_of": None, "dividends_stale": False}
     with nicegui_client:
         page._render_labels(1, payload, _noop)
     table = next(el for el in nicegui_client.layout.descendants() if isinstance(el, ui.table))

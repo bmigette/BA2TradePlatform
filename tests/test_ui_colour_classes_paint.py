@@ -314,7 +314,7 @@ def _render_page_body(client, *, targets, reserve, buying_power=1_000.0):
     payload = {'views': views, 'symbols_by_label': symbols_by_label,
                'valuation_mode': VALUATION_MODE_MARKET, 'base_notional': 10_000.0,
                'available_buying_power': buying_power, 'account_value': 12_000.0,
-               'unallocated_pct': reserve}
+               'unallocated_pct': reserve, 'dividends_as_of': None, 'dividends_stale': False}
 
     async def _noop():
         pass

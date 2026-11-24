@@ -380,7 +380,8 @@ def _view_payload(account_id: int, valuation_mode: str, base_override: Optional[
             dividends = account.get_dividends() if dividends_source is None else dividends_source()
             entry.note = rows_note(dividends)
             if page_path:
-                dividends_stale = True          # there was no usable stored copy
+                # A live read is fresh: ``dividends_stale`` stays False (no second get_dividends right behind it).
+                # An EMPTY answer is not stored (``save_dividends``): it is also what a failed fetch returns.
                 _store_dividends(account_id, dividends, fetched_at)
     # Market mode values an unpriced managed holding at 0 inside ``compute_base_notional``, so the base above is a
     # LOWER BOUND whenever one exists (the page does not flag this; the API does).
@@ -467,8 +468,8 @@ def _view_payload(account_id: int, valuation_mode: str, base_override: Optional[
         'dividend_payments': len(dividends or []),
         #: When the dividend rows were fetched, for a STORED copy; None for a live read (and on the API path).
         'dividends_as_of': dividends_as_of,
-        #: True when the page should top the stored copy up (``refresh_stored_dividends``): it is older than
-        #: ``STORED_DIVIDENDS_FRESH_S``, or there was none usable. Always False on the API path.
+        #: True when the page should top the stored copy up (``refresh_stored_dividends``): a STORED copy was used
+        #: and it is older than ``STORED_DIVIDENDS_FRESH_S``. False after a live read, and always on the API path.
         'dividends_stale': dividends_stale,
     }
 
@@ -491,17 +492,15 @@ def _usable_stored_dividends(account_id: int):
 
 
 def _store_dividends(account_id: int, rows, fetched_at) -> bool:
-    """Store the account's dividend rows; True when stored. NEVER replaces stored non-empty rows with an empty answer:
-    the lenient ``get_dividends`` returns ``[]`` on a failed fetch too. A failure is a WARNING, never an exception."""
+    """Store the account's dividend rows; True when stored. An EMPTY answer is never stored (``save_dividends``' rule,
+    shared with the growth tab): the lenient ``get_dividends`` returns ``[]`` on a failed fetch too, so it neither
+    replaces stored rows nor is served later as a fresh "pays nothing". A failure is a WARNING, never an exception."""
     try:
-        if not rows:
-            existing = growth_snapshot.load_dividends(account_id)
-            if existing is not None and existing.rows:
-                logger.warning(f"Dividends of account {account_id}: the broker returned none; keeping the "
-                               f"{len(existing.rows)} stored rows (a failed fetch returns none too)")
-                return False
-        growth_snapshot.save_dividends(account_id, rows, fetched_at)
-        return True
+        stored = growth_snapshot.save_dividends(account_id, rows, fetched_at)
+        if not stored:
+            logger.warning(f"Dividends of account {account_id}: the broker returned none; nothing stored "
+                           f"(a failed fetch returns none too), any stored rows are kept")
+        return stored
     except Exception as e:  # noqa: BLE001 -- a stored copy must never cost the page
         logger.warning(f"Could not store the dividends of account {account_id} ({type(e).__name__}: {e})")
         return False
@@ -549,7 +548,8 @@ def start_dividends_refresh(account_id: int) -> threading.Thread:
 
 
 def join_dividends_refresh(timeout: Optional[float] = None) -> None:
-    """Wait for every running ``start_dividends_refresh`` thread."""
+    """TEST HOOK (``tests/conftest.py`` and the tests call it; production never does): wait for every running
+    ``start_dividends_refresh`` thread, so no thread doing DB work outlives its test."""
     with _DIVIDEND_REFRESH_GUARD:
         threads = list(_DIVIDEND_REFRESH_THREADS)
     for thread in threads:

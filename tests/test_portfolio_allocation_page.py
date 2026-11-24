@@ -1008,7 +1008,8 @@ def _payload(views, mode=VALUATION_MODE_COST, *, base_notional=None,
             'base_notional': base_notional,
             'available_buying_power': available_buying_power,
             'account_value': account_value,
-            'unallocated_pct': unallocated_pct}
+            'unallocated_pct': unallocated_pct,
+            'dividends_as_of': None, 'dividends_stale': False}
 
 
 def test_the_managed_value_headline_counts_a_two_label_symbol_once(nicegui_client):

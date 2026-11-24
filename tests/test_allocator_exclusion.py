@@ -436,7 +436,8 @@ def _render(client, exclusions, freed=None, weights=None):
     views = _views(excluded=exclusions, freed=freed, weights=weights)
     payload = {"views": views, "symbols_by_label": {}, "valuation_mode": VALUATION_MODE_MARKET,
                "base_notional": 10_000.0, "available_buying_power": 1_000.0, "account_value": None,
-               "unallocated_pct": 0.0, "exclusions": exclusions or {}}
+               "unallocated_pct": 0.0, "exclusions": exclusions or {},
+               "dividends_as_of": None, "dividends_stale": False}
     with client:
         page._render_labels(1, payload, _noop)
     return next(el for el in client.layout.descendants() if isinstance(el, ui.table))

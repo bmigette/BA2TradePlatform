@@ -5095,15 +5095,18 @@ def _load_growth_snapshots(account_ids):
     return out
 
 
-def _save_growth_snapshots(rows_by_account, balance_floor, fetched_at) -> list:
-    '''Store each account's "growth" snapshot; returns the ids stored. A failure is a WARNING and never fails the
+def _save_growth_snapshots(rows_by_account, balance_floor, fetched_at, confirmed_empty_by_account) -> list:
+    '''Store each account's "growth" snapshot; returns the ids stored. ``confirmed_empty_by_account``: ``{account_id:
+    {dataset}}`` the refresh ACCEPTED as truly empty (the manual refresh's "empty twice in a row"); without it the
+    store refuses an empty list over stored rows. A failure (a refusal included) is a WARNING and never fails the
     load (the next cold page load simply waits for the broker again). Blocking: called off the event loop.'''
     saved = []
     for aid, data in rows_by_account.items():
         try:
             growth_snapshot.save_growth_snapshot(
                 aid, dividends=data['dividends'], trades=data['trades'], positions=data['positions'],
-                balance=data['balance'], balance_floor=balance_floor, fetched_at=fetched_at)
+                balance=data['balance'], balance_floor=balance_floor, fetched_at=fetched_at,
+                confirmed_empty=confirmed_empty_by_account.get(aid, ()))
             saved.append(aid)
         except Exception as e:  # noqa: BLE001 -- a stored copy must never cost the page
             logger.warning(f"Could not store the growth snapshot of account {aid} ({type(e).__name__}: {e}); "
@@ -5493,7 +5496,7 @@ class AccountGrowthTab:
         stored row are fetched now (small thread pool; the provider has its own 24 h memory cache + global
         rate-limit gate) and stored -- an empty payload too, so a non-payer is not asked on every cold load.
         Stored rows older than 24 h are refreshed AFTER this returns, in one background thread per process
-        (``self._dividend_history_refresh`` holds it). No FMP key / any failure -> the symbol is simply
+        (``growth_snapshot.start_dividend_history_refresh``). No FMP key / any failure -> the symbol is simply
         absent (one warning) and the forecast falls back to the account's own history."""
         cache = self.__dict__.setdefault('_provider_div_cache', {})
         now = _clock()
@@ -5564,7 +5567,7 @@ class AccountGrowthTab:
             def refetch(sym, key=api_key):
                 from ba2_providers.symbol_info import fetch_dividends
                 return fetch_dividends(key, sym)
-            self._dividend_history_refresh = growth_snapshot.start_dividend_history_refresh(stale, refetch)
+            growth_snapshot.start_dividend_history_refresh(stale, refetch)
         return {s: cache[s][0] for s in symbols if s in cache and cache[s][0]}
 
     def _dividend_metadata(self, account_ids, held):
@@ -6255,10 +6258,12 @@ class AccountGrowthTab:
             entry.note = f'{len(ids)} account(s), {age:.0f}s old'
             return True
 
-    async def _save_snapshots(self, target_accounts, bad, fetched_at):
+    async def _save_snapshots(self, target_accounts, bad, fetched_at, accept_empty=frozenset()):
         '''After a broker refresh: store the "growth" snapshot of every account whose four datasets were all good
         (an account that kept previous rows for a bad dataset is NOT stored -- its snapshot would claim a fetch
-        that did not happen). Off the event loop; a failure is a WARNING, never a failed load.'''
+        that did not happen). ``accept_empty`` (``{(account_id, dataset)}``, the manual refresh's "empty twice in a
+        row") is passed on as the store's ``confirmed_empty``: only those may replace stored rows with nothing.
+        Off the event loop; a failure is a WARNING, never a failed load.'''
         cache = self._broker_cache
         attempt = cache.get('balance_attempt')
         if attempt is None:
@@ -6269,10 +6274,11 @@ class AccountGrowthTab:
         if not good:
             return
         rows = {aid: cache['accounts'][aid] for aid in good}
+        confirmed = {aid: {name for a, name in accept_empty if a == aid} for aid in good}
         with timed_step(self._load_timing, 'snapshot save', f'{len(good)} account(s)'):
             try:
                 # attempt[0]: the start the balance history was just fetched from (None = default window)
-                await asyncio.to_thread(_save_growth_snapshots, rows, attempt[0], fetched_at)
+                await asyncio.to_thread(_save_growth_snapshots, rows, attempt[0], fetched_at, confirmed)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Could not store the growth snapshot ({type(e).__name__}: {e})")
 
@@ -6322,7 +6328,7 @@ class AccountGrowthTab:
         if not bad or prev is None:
             cache['updated_wall'] = datetime.now()
         self._announce_refresh(bad, prev is not None)
-        await self._save_snapshots(target_accounts, bad, fetched_wall)
+        await self._save_snapshots(target_accounts, bad, fetched_wall, accept_empty)
         return changed
 
     async def _refresh_balance(self, target_accounts, req=None, accept_empty=frozenset()):
