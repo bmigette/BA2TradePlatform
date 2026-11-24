@@ -13,12 +13,34 @@ from tests.factories import (
 # knows whether any enabled factor will actually need it — see FactorRanker/__init__.py. The
 # instance itself is never touched here (fetch_close_prices is mocked below, so nothing calls
 # a method on it), so a bare stub avoids depending on a real FMP_API_KEY app setting.
-_OHLCV_MOD = "ba2_providers.ohlcv.FMPOHLCVProvider.FMPOHLCVProvider"
+#
+# It is served at the provider-RESOLVER seam (the dynamic ``dataproviders.get_provider`` the test
+# conftest wires into TradeConditions), never by patching ``FMPOHLCVProvider.__new__``: undoing a
+# patch of an inherited ``__new__`` deletes it, and CPython then leaves the class unable to take
+# constructor arguments ("object.__new__() takes exactly one argument") for every later test.
+_FETCH_CLOSES = "ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices"
 
 
 class _StubOHLCV:
     def __init__(self, *a, **k):
         pass
+
+
+def _resolve_stub_ohlcv_only(category, name, **_kw):
+    if category == "ohlcv":
+        return _StubOHLCV()
+    raise AssertionError(f"unexpected provider resolved in a FactorRanker unit test: {category}/{name}")
+
+
+def _stub_providers():
+    return patch("ba2_trade_platform.modules.dataproviders.get_provider", _resolve_stub_ohlcv_only)
+
+
+def _patch_closes(prices):
+    """``fetch_close_prices`` mocked WITH its real signature: ``_compute_factor`` threads kwargs only to
+    a fetcher that declares them, and a bare MagicMock (``**kwargs``) would also be handed the routed
+    fundamentals-details provider the real momentum fetch never asks for (91538cc7)."""
+    return patch(_FETCH_CLOSES, autospec=True, return_value=prices)
 
 
 def _ramp(start, end, n=260):
@@ -60,9 +82,9 @@ def test_run_analysis_ranks_and_rebalances():
 
     pm_instance = MagicMock()
     pm_instance.get_holdings.return_value = ({}, {})  # empty portfolio (first run)
-    with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices) as fetch_px, \
+    with _patch_closes(prices) as fetch_px, \
          patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance) as PM, \
-         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
+         _stub_providers():
         expert.run_analysis("EXPERT", ma)
 
     # Disabled factors must not be fetched — momentum (the only enabled factor here) is the
@@ -108,9 +130,9 @@ def test_run_analysis_action_reflects_holdings():
     pm_instance = MagicMock()
     # Currently hold A (stays in top-2) and C (ranked last, drops out of top-2).
     pm_instance.get_holdings.return_value = ({"A": 10.0, "C": 20.0}, {})
-    with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices), \
+    with _patch_closes(prices), \
          patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance), \
-         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
+         _stub_providers():
         expert.run_analysis("EXPERT", ma)
 
     actions = {row["symbol"]: row["action"] for row in ma.state["factor_ranker"]["ranking"]}
@@ -129,9 +151,9 @@ def test_run_analysis_skips_when_universe_empty():
     # OHLCV provider) before the skip decision, so patch fetch_close_prices to keep
     # the empty-universe path off the network. The subject under test is the SKIP
     # decision (empty universe -> no portfolio manager, status SKIPPED).
-    with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value={}), \
+    with _patch_closes({}), \
          patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager") as PM, \
-         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
+         _stub_providers():
         expert.run_analysis("EXPERT", ma)
 
     PM.assert_not_called()

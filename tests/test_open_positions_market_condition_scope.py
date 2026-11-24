@@ -1060,9 +1060,9 @@ def test_a_capture_reader_failure_in_the_exit_pass_leaves_the_exits_running(
 
     class _Store:
         health = CaptureHealth()
-
-        def current_session_id(self):
-            return "s1"
+        # A decision pass reads the OPEN session (the ``session_id`` property), never
+        # ``current_session_id()``: that one runs the rollover check on the pass thread (4558dc17).
+        session_id = "s1"
 
         def submit(self, record, objects=None, observations=()):
             submitted.append(record)

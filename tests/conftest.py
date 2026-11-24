@@ -48,6 +48,12 @@ from ba2_trade_platform.core.models import (
     PortfolioAllocationConfig, PortfolioAllocationLabel, PortfolioAllocationSymbol,
     PortfolioIncomeEvent, PortfolioAllocationRun,
 )
+# The in-tree live-only tables, registered before any ``create_all`` exactly as ``main.initialize_system`` and
+# ``alembic/env.py`` register them. The services import these modules lazily, so without this the FIRST test of a
+# run to reach one (after its schema was already created) failed with "no such table: allocator_exclusion"
+# (tests/test_portfolio_allocation_submit.py run alone), and passed whenever an earlier file had imported it.
+import ba2_trade_platform.core.allocator_protection_models  # noqa: E402,F401
+import ba2_trade_platform.core.growth_snapshot_models  # noqa: E402,F401
 from ba2_trade_platform.core.types import (
     OrderStatus, OrderDirection, OrderType, OrderOpenType,
     OrderRecommendation, RiskLevel, TimeHorizon, TransactionStatus,
@@ -258,15 +264,24 @@ _wire_package_seams_for_tests()
 def history_source_seams_unwired():
     """The per-account history-source seams (wire_all_seams step 4b) resolve an expert's ACCOUNT in the DB; most tests use stub
     experts / ``MockAccount`` rows that no real resolver can classify. Every test starts with them unwired (the pre-feature
-    behaviour); the tests of the feature wire them explicitly."""
+    behaviour); the tests of the feature wire them explicitly.
+
+    That includes the rule conditions' history seam (``TradeConditions.set_account_history_provider_resolver``,
+    152a33b6, wired by step 4): several tests run the REAL ``wire_all_seams()`` (boot smoke, seam wiring, phase-6
+    golden, market-condition live context) and restore only the seams they knew about, which left every later rule
+    condition resolving a ``MockAccount`` row through ``account_history`` ("unknown provider 'MockAccount'")."""
+    from ba2_common.core import TradeConditions as tc_module
     from ba2_common.core import TradeRiskManagement as rm_module
     from ba2_common.core import backtest_context as bc
-    before = (bc.get_live_history_resolver(), rm_module.get_indicator_provider_resolver())
+    before = (bc.get_live_history_resolver(), rm_module.get_indicator_provider_resolver(),
+              tc_module.get_account_history_provider_resolver())
     bc.set_live_history_resolver(None)
     rm_module.set_indicator_provider_resolver(None)
+    tc_module.set_account_history_provider_resolver(None)
     yield
     bc.set_live_history_resolver(before[0])
     rm_module.set_indicator_provider_resolver(before[1])
+    tc_module.set_account_history_provider_resolver(before[2])
 
 
 @pytest.fixture(autouse=True)
@@ -305,6 +320,14 @@ def join_stored_copy_refresh_threads(patch_db_engine):
     portfolio = sys.modules.get("ba2_trade_platform.services.portfolio")
     if portfolio is not None:
         portfolio.join_dividends_refresh(timeout=30)
+    # The same race, from the package's async ActivityLog writer (``ba2_common.core.db.log_activity`` queues, the
+    # "ActivityLogWorker" daemon writes): an entry queued at the end of a test (a close-order activity, say) was
+    # written in the gap, the worker's ``get_engine()`` found no engine and built one on the session's empty
+    # db.sqlite, and that engine replaced the in-memory test engine under the NEXT test ("no such table:
+    # accountdefinition" at that test's first insert; order-dependent, e.g. test_breached_stop_force_close.py
+    # alone). Drain and stop it here; the next ``log_activity`` starts a fresh worker.
+    import ba2_common.core.db as _pkg_db
+    _pkg_db._stop_activity_log_worker()
 
 
 @pytest.fixture

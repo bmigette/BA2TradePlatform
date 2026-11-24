@@ -121,6 +121,7 @@ def test_broker_next_date_is_the_fallback_when_there_is_no_pay_date():
 def _tab(provider=None, instances=None, monkeypatch=None):
     import ba2_trade_platform.ui.pages.overview as ov
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: {})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_forecast_today', staticmethod(lambda: TODAY))
     tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
     tab._broker_cache = {'instances': instances or {}}
     tab._provider_dividend_histories = (lambda syms: provider or {})
@@ -230,6 +231,7 @@ def test_provider_errors_fall_back_with_one_warning(monkeypatch):
     import ba2_trade_platform.config as cfg
     monkeypatch.setattr(cfg, 'get_app_setting', lambda k, d=None: 'KEY')
     monkeypatch.setattr(si, 'fetch_dividends', lambda key, sym: (_ for _ in ()).throw(RuntimeError('429')))
+    monkeypatch.setattr(ov.AccountGrowthTab, '_forecast_today', staticmethod(lambda: TODAY))
     tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
     tab._broker_cache = {'instances': {}}
     out = tab._compute_dividend_forecast(_account_rows('A') + _account_rows('B'), [],

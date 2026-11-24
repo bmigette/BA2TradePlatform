@@ -234,3 +234,31 @@ def test_the_top_up_thread_is_a_named_daemon_running_refresh_stored_dividends_an
     assert thread.daemon and thread.name == "dividends-refresh"
     svc.join_dividends_refresh(timeout=10)
     assert not thread.is_alive() and account.dividend_calls == 1
+
+
+def test_the_symbol_stats_top_up_is_started_through_the_tracked_starter():
+    """The page's other background DB writer. Started bare (``threading.Thread(...).start()``) it outlived its test
+    and, calling ``get_engine()`` between two tests, installed an engine without tables under the next one
+    ("no such table: accountdefinition" at that test's setup, about one full run in several)."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "ba2_trade_platform" / "ui" / "pages"
+           / "portfolio_allocation.py").read_text(encoding="utf-8")
+    body = src[src.index("        async def _refresh_timed(timing) -> None:"):]
+    assert ("portfolio_svc.start_tracked_refresh(svc.refresh_symbol_stats, managed, "
+            "name='symbol-stats-refresh')") in body
+    assert "threading.Thread(" not in src
+
+
+def test_a_tracked_refresh_is_a_named_daemon_the_join_waits_for():
+    import threading
+    release, done = threading.Event(), []
+
+    def work(tag):
+        release.wait(10)
+        done.append(tag)
+
+    thread = svc.start_tracked_refresh(work, "x", name="symbol-stats-refresh")
+    assert thread.daemon and thread.name == "symbol-stats-refresh" and thread.is_alive()
+    release.set()
+    svc.join_dividends_refresh(timeout=10)
+    assert not thread.is_alive() and done == ["x"]

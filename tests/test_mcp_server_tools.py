@@ -56,6 +56,11 @@ def _spy(http):
 
 
 # --- reads -------------------------------------------------------------------------------------------------------
+def test_capture_health_returns_the_api_body(wired):
+    body = tools.get_capture_health()
+    assert {"enabled", "session_id", "counters", "total_failures"} <= set(body)
+
+
 def test_reads_return_the_api_body_and_translate_names(wired):
     t = _txn()
     assert tools.get_platform_status()["status"] == "ok"

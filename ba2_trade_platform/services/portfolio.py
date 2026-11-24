@@ -538,8 +538,15 @@ def start_dividends_refresh(account_id: int) -> threading.Thread:
     """Start ``refresh_stored_dividends(account_id)`` in a daemon thread (the PAGE's ``_refresh`` calls this; a loader
     never does) and keep a handle, so ``join_dividends_refresh`` can wait for every such thread (tests: a daemon
     thread doing DB work must not outlive its test)."""
-    thread = threading.Thread(target=refresh_stored_dividends, args=(account_id,),
-                              name='dividends-refresh', daemon=True)
+    return start_tracked_refresh(refresh_stored_dividends, account_id, name='dividends-refresh')
+
+
+def start_tracked_refresh(target, *args, name: str) -> threading.Thread:
+    """Start ``target(*args)`` in a daemon thread and keep a handle for ``join_dividends_refresh``. Every
+    background DB writer the allocator PAGE starts goes through here (the dividends top-up, the symbol-stats
+    top-up): one started bare outlived its test and, calling ``get_engine()`` between two tests, installed an
+    engine without tables under the next one. Production behaviour is the bare thread's: never joined."""
+    thread = threading.Thread(target=target, args=args, name=name, daemon=True)
     with _DIVIDEND_REFRESH_GUARD:
         _DIVIDEND_REFRESH_THREADS.difference_update({t for t in _DIVIDEND_REFRESH_THREADS if not t.is_alive()})
         _DIVIDEND_REFRESH_THREADS.add(thread)      # registered BEFORE it starts: a join can never miss it
@@ -549,7 +556,8 @@ def start_dividends_refresh(account_id: int) -> threading.Thread:
 
 def join_dividends_refresh(timeout: Optional[float] = None) -> None:
     """TEST HOOK (``tests/conftest.py`` and the tests call it; production never does): wait for every running
-    ``start_dividends_refresh`` thread, so no thread doing DB work outlives its test."""
+    ``start_tracked_refresh`` thread (the dividends and the symbol-stats top-ups), so no thread doing DB work
+    outlives its test."""
     with _DIVIDEND_REFRESH_GUARD:
         threads = list(_DIVIDEND_REFRESH_THREADS)
     for thread in threads:

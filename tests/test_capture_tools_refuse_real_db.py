@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIVE_TOOL = os.path.join(REPO, "tools", "live_export_capture.py")
 BACKTEST_TOOL = os.path.join(REPO, "tools", "export_golden_capture.py")
@@ -17,8 +19,12 @@ BACKTEST_TOOL = os.path.join(REPO, "tools", "export_golden_capture.py")
 
 def _run(tool, tmp_path, *, home, ba2_home=None, db_file=None, database_url=None):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("BA2_HOME", "DB_FILE", "DATABASE_URL")}
+           if k not in ("BA2_HOME", "DB_FILE", "DATABASE_URL", "HOMEDRIVE", "HOMEPATH")}
+    # ``~`` is HOME on POSIX but USERPROFILE on Windows (Python ignores HOME there since 3.8): with HOME
+    # alone the tool's "~/Documents/ba2" was the REAL user profile on Windows, so it did not refuse the
+    # throwaway file and ran against it instead.
     env["HOME"] = str(home)
+    env["USERPROFILE"] = str(home)
     if ba2_home is not None:
         env["BA2_HOME"] = str(ba2_home)
     if db_file is not None:
@@ -51,7 +57,10 @@ def test_live_tool_refuses_a_symlink_to_the_default_trade_db(tmp_path):
     home = tmp_path / "home"
     real = _touch(home / "Documents" / "ba2" / "trade" / "db.sqlite")
     link = tmp_path / "link.sqlite"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as e:  # Windows without Developer Mode / SeCreateSymbolicLinkPrivilege: WinError 1314
+        pytest.skip(f"this OS refused to create a symlink ({e}); the symlink refusal cannot be exercised here")
     _assert_refused(_run(LIVE_TOOL, tmp_path, home=home, db_file=link), tmp_path)
 
 

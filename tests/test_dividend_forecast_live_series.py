@@ -89,6 +89,7 @@ def test_stepping_up_payers_use_the_latest_amount():
 def _tab(monkeypatch, provider, instances=None, positions=None, labels=None):
     import ba2_trade_platform.ui.pages.overview as ov
     monkeypatch.setattr(ov, 'get_labels_by_symbol', lambda syms: labels or {})
+    monkeypatch.setattr(ov.AccountGrowthTab, '_forecast_today', staticmethod(lambda: TODAY))
     tab = ov.AccountGrowthTab.__new__(ov.AccountGrowthTab)
     tab._broker_cache = {'instances': instances or {}, 'positions': positions or []}
     tab._provider_dividend_histories = lambda syms: provider

@@ -137,6 +137,13 @@ def get_platform_status() -> Dict[str, Any]:
     BA2_API_URL and the token work."""
 
 
+@api_tool("GET", "/capture-health")
+def get_capture_health() -> Dict[str, Any]:
+    """Replay-capture health of the live decision recorder: enabled, the open session_id, and the counters of
+    what it failed to record (counters, discards, discards_by_expert, total_failures). enabled=false means
+    capture is off, and the empty counters then mean "not recording", not "no failures"."""
+
+
 # ------------------------------------------------------------------ accounts
 @api_tool("GET", "/accounts")
 def list_accounts(limit: int = 50, offset: int = 0) -> Dict[str, Any]:

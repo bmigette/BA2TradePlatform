@@ -229,11 +229,39 @@ def real_needed(monkeypatch):
     monkeypatch.undo()          # drop the autouse "needed" stub for these tests
 
 
-def test_needed_is_false_with_no_experts_and_with_plain_rulesets(real_needed):
+class _OverlayExpert:
+    """The one thing ``_expert_has_downtrend_overlay`` reads off the live expert object."""
+
+    def __init__(self, downtrend_on):
+        self._on = downtrend_on
+
+    def get_setting_with_interface_default(self, key, log_warning=True):
+        return self._on if key == "downtrend_overlay_enabled" else None
+
+
+def _overlay(monkeypatch, downtrend_on):
+    """An enabled expert with no gated ruleset still needs the SPY regime when its down-trend
+    overlay is on (c11a5b22): the check builds the live expert, and the factory row's
+    ``MockExpert`` type is in no registry, so answer it at the instance-factory seam."""
+    from ba2_trade_platform.core import utils as core_utils
+
+    monkeypatch.setattr(core_utils, "get_expert_instance_from_id",
+                        lambda _id: _OverlayExpert(downtrend_on))
+
+
+def test_needed_is_false_with_no_experts_and_with_plain_rulesets(real_needed, monkeypatch):
     assert TradeManager()._benchmark_regime_needed() is False
+    _overlay(monkeypatch, downtrend_on=False)
     acct = create_account_definition(provider="AlpacaAccount")
     create_expert_instance(account_id=acct.id, enter_market_ruleset_id=_plain_ruleset())
     assert TradeManager()._benchmark_regime_needed() is False
+
+
+def test_needed_when_a_plain_ruleset_expert_has_the_downtrend_overlay_on(real_needed, monkeypatch):
+    _overlay(monkeypatch, downtrend_on=True)
+    acct = create_account_definition(provider="AlpacaAccount")
+    create_expert_instance(account_id=acct.id, enter_market_ruleset_id=_plain_ruleset())
+    assert TradeManager()._benchmark_regime_needed() is True
 
 
 @pytest.mark.parametrize("slot", ["enter_market_ruleset_id", "open_positions_ruleset_id"])

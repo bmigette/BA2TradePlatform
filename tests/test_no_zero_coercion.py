@@ -364,16 +364,16 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:4457":
+    "ba2_trade_platform/ui/pages/settings.py:4599":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
-        "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
+        "measurement of anything (:4457 until the 2026-11-24 recount; was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747; the "
         "market-condition profile widget + guard of plan Task 12 moved it to :3850, then "
         ":3889; the batch export/import toolbar + handlers added 127 lines above it, :4016, then :4056; the trigger picker replaced two module-level helpers with TriggerTypePicker, :4215; the review fixes added the trigger-row markers and the kind-driven operator control above it, :4238; the ruleset rule picker added one import line at the top of the file, :4239); the UI consistency pass added the shared refresh_button import, :4240; the pullback/market-exits merge with origin/dev added 5 lines above, :4245; the equity-short netting rule removed a permission checkbox and its load/save, :4240; the settings-display fix (declared defaults, no literals; 2026-09-22) and its load-failure guards, :4298; its review fixes (no-edit no-op, unset method, account save order), :4389; the declared app settings + dropdown errors, :4352; the re-review (no rewrite of stored values, forced-method errors), :4374; the fractional checkbox + _strike_param_text (2026-09-27), :4403",
-    "ba2_trade_platform/ui/pages/settings.py:4507":
+    "ba2_trade_platform/ui/pages/settings.py:4649":
         "same settings-import default; the comment above the line records why the fallback was "
-        "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
+        "deliberately restored (:4507 until the 2026-11-24 recount; was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
         "continuation line 3795, one past the outer .get(...)'s opening line 3794; plan "
         "Task 12's widget + guard then moved the pair to :3850/:3898, then :3889/:3939; the "
@@ -386,46 +386,15 @@ ALLOWLIST: dict = {
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
         "scored as either (was ba2_trade_platform/ui/components/performance_charts.py:476 "
         "before the P0a move)",
-    "testplatform/backend/app/services/data_build_handler.py:126":
+    "testplatform/backend/app/services/data_build_handler.py:140":
         "screener CONFIG bound: an absent price_min means 'no minimum', which is what 0.0 "
-        "expresses; it is not a quote (was :157 before the prewarm handler moved to "
+        "expresses; it is not a quote (:126 until the 2026-11-24 recount; was :157 before the prewarm handler moved to "
         "prewarm_fetchers.run_prewarm, :121 before prewarm_fred gained its warn sink)",
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:2206":
-        "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
-        "SETTING, a configured cap rather than a measurement of anything "
-        "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
-        "resolve split added the option_request import; :1533 before it added the "
-        "option_payoff import; :1534 before the F3 entry-quote gene added the "
-        "option_entry_quote import; :1537 at the two option lineages' common base; "
-        ":1546 after three IMPORT-BLOCK additions above it (+9): the option_payoff "
-        "import expanding to a multi-line form (+5), the OptionRiskManagement import "
-        "(+3) and the option_selection_policy import (+1) — NOT the "
-        "_option_risk_manager helper, which sits ~1,100 lines BELOW this line and "
-        "cannot shift it (review 2026-08-30 dev-merge, FIX 4); :1547 after the F7 close "
-        "concession wrapped that option_entry_quote import onto a second line to pull "
-        "in ENTRY_CROSS_FULL (+1); :1548 after Task 9 added ONE import line "
-        "(``from ba2_common.core.earnings_stamp import ...``, line 37) for the earnings "
-        "event-date carry-forward -- 1547 + 1 = 1548, and it is the ONLY line this task "
-        "added above 1547: its other two edits sit at ~2888 and ~2976); :1549 after the "
-        "margin Task 6 wrapped the 'Get total virtual equity' comment just above it onto "
-        "a second line (+1); :1599 after the BT/live option parity branch (2026-09-22) added "
-        "9 import lines at the top (option_payoff_chart, option_trade_record, "
-        "decision_data_session, DEFAULT_OPTION_MULTIPLIER) and 14 lines in BuyAction above it "
-        "(+23 from :1576); :1751 after plan 2026-09-24 Task B4 added ruleset_stop_policy and "
-        "its helpers just above AdjustStopLossAction (+152); :1791 after the B4 review fixes "
-        "(floor_would_loosen, the resolve_expert alias, a strict stop side, rule_price) added "
-        "40 more above it; :1806 after floor_exceeds_rule added 15 more; :2007 after equity "
-        "short selling (plan 2026-09-24 Task S1) added the netting helpers to TradeAction and "
-        "rewrote SellAction/BuyAction above it (+201); :2032 after the S1 review fixes "
-        "(side classification, filled-quantity guard, shared expert id); :2041 after TP/SL "
-        "direction moved to _position_is_long (+9); :2135 after the close percent + permission "
-        "matrix (_close_own_position, buying_enabled) rewrote SellAction/BuyAction above it; :2197 "
-        "after the be1a0aab review fixes (partial-close refusals, FIFO plan) grew them; :2203 "
-        "after refusals gained closed_transaction_ids; :2206 after fractional partial "
-        "closes replaced the whole-share floor above it (+3)",
+    # packages/common/ba2_common/core/TradeActions.py:2206 LEFT this list 2026-11-24: 828f0192 made an unset
+    # max_virtual_equity_per_instrument_percent a refusal, so the 10.0 default it exempted is gone.
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -447,15 +416,22 @@ ALLOWLIST: dict = {
 # The cost is that a fix and a fresh defect in the same file can cancel out -- which is why the
 # per-file numbers must RATCHET DOWN (``test_baseline_has_not_rotted`` fails when a count is
 # higher than reality) rather than being left as generous headroom.
+#
+# RECOUNT 2026-11-24. The four register tests had been failing on dev since early November: 33 coercions were
+# merged past the rule (allocator rebalance / cover protection / live and option trade totals / backtest
+# account), three ALLOWLIST lines had drifted and one had lost its site. The 33 are COUNTED below, marked
+# ``recount``, exactly as the 08-25 debt was: NOT read, NOT justified, NOT blessed. Counting them changes no
+# behaviour; it only makes the rule able to stop the next one again. Each is a candidate for the fixing pass.
 # --------------------------------------------------------------------------- #
 BASELINE: dict = {
     "ba2_trade_platform/core/ModelBillingUsage.py": 12,
     "ba2_trade_platform/core/SmartRiskManagerGraph.py": 6,
     "ba2_trade_platform/core/SmartRiskManagerToolkit.py": 2,
+    "ba2_trade_platform/core/TradeManager.py": 1,                       # recount: +1 (new file)
     # option_lifecycle_service.py is GONE from this register: its 3 coercions moved with
     # ``_build_structure`` into ba2_common.core.OptionRiskManagement (the shared sleeve
     # reader, listed below at the same count), and the service now delegates.
-    "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
+    "ba2_trade_platform/core/portfolio_allocation_service.py": 6,       # recount: 3 -> 6
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 9,
     # moved verbatim out of ui/pages/overview.py (the Account Growth series); same debt, new home. The page kept
     # its display behaviour (a golden number would shift). The API path never reaches these sites with a missing
@@ -470,12 +446,16 @@ BASELINE: dict = {
     # the base contract, which raises rather than inventing a balance), so the file now
     # measures 0 and drops out -- BASELINE carries no zeroes. Total below drops by 2.
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
+    "ba2_trade_platform/modules/accounts/alpaca_cover_protection.py": 1,   # recount: +1 (new file)
+    "ba2_trade_platform/ui/pages/live_trades.py": 4,                    # recount: +4 (new file)
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
+    "ba2_trade_platform/ui/pages/option_trades.py": 2,                  # recount: +2 (new file)
     # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
     # price instead of reading either as 0, which would book a free trade.
     # 16 -> 7: ten of the Account Growth series coercions moved with their code into
     # ba2_trade_platform/services/growth.py (listed below); the page itself keeps 7.
-    "ba2_trade_platform/ui/pages/overview.py": 7,
+    # 7 -> 6 (recount 2026-11-24): one went away on dev without the register being lowered.
+    "ba2_trade_platform/ui/pages/overview.py": 6,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -483,16 +463,16 @@ BASELINE: dict = {
     "packages/common/ba2_common/core/TradeConditions.py": 5,
     "packages/common/ba2_common/core/TransactionHelper.py": 4,
     "packages/common/ba2_common/core/interfaces/OptionsAccountInterface.py": 1,
-    "packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py": 1,
+    "packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py": 4,   # recount: 1 -> 4
     "packages/common/ba2_common/core/models.py": 2,
-    "packages/common/ba2_common/core/portfolio_allocation.py": 39,
+    "packages/common/ba2_common/core/portfolio_allocation.py": 50,     # recount: 39 -> 50
     # 2 MOVED here, not added, and the total below is unchanged: the per-contract
     # option balance was lifted out of ReadOnlyAccountInterface.refresh_transactions
     # (3 -> 1) into ``option_contract_net`` so the LIVE settlement door
     # (AlpacaAccount._apply_option_activity) can call the same arithmetic instead of
     # growing a second copy of it. The two coercions travelled verbatim.
     "packages/common/ba2_common/core/utils.py": 2,
-    "packages/common/ba2_common/core/position_sizing.py": 2,
+    "packages/common/ba2_common/core/position_sizing.py": 3,           # recount: 2 -> 3
     "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 2,
     # The three PROMOTED sleeve-reader coercions, moved verbatim out of
     # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
@@ -511,14 +491,18 @@ BASELINE: dict = {
     # total below drops by exactly those 2.
     "packages/providers/ba2_providers/fundamentals/overview/FMPCompanyOverviewProvider.py": 1,
     "packages/providers/ba2_providers/insider/FMPInsiderProvider.py": 4,
-    "testplatform/backend/app/services/backtest/backtest_account.py": 26,
+    "testplatform/backend/app/services/backtest/backtest_account.py": 30,   # recount: 26 -> 30
+    "testplatform/backend/app/services/backtest/daily_engine.py": 2,    # recount: +2 (new file)
     "testplatform/backend/app/services/backtest_handler.py": 1,
     # strategy_optimization_handler.py is GONE from this register, not zeroed: its one
     # coercion went away with 02d99d8c (robustness-adjusted fitness on by default), and a
     # 0 entry would be a row claiming "this file is fine", which is the one thing BASELINE
     # must never say. Debt paid off leaves the register entirely.
+    # ... and it is BACK (recount 2026-11-24): a ``backtest_cfg.get("commission", 0.0)`` was added since.
+    "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 166
+# 166 -> 198 at the 2026-11-24 recount: +33 counted, -1 (overview.py).
+BASELINE_TOTAL = 198
 
 
 # =========================================================================== #

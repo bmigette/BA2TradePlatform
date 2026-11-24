@@ -122,7 +122,6 @@ from ..utils.responsive import (
     check_card_columns, install_phone_listener, phone_grid_prop, phone_media,
 )
 import asyncio
-import threading
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -4944,8 +4943,9 @@ async def content() -> None:
             # and a failed top-up costs a tooltip line rather than the table.
             managed = [r.symbol for view in payload['views'] for r in view.rows]
             if managed:
-                threading.Thread(target=svc.refresh_symbol_stats, args=(managed,),
-                                 name='symbol-stats-refresh', daemon=True).start()
+                # Started through the service's tracked starter (like the dividends top-up) so the tests can
+                # join it; ``svc.refresh_symbol_stats`` is looked up here, at the call.
+                portfolio_svc.start_tracked_refresh(svc.refresh_symbol_stats, managed, name='symbol-stats-refresh')
                 try:
                     with timing.step('income panel'):
                         events, open_total, working_note = await asyncio.to_thread(

@@ -65,8 +65,9 @@ def test_weekly_monthly_quarterly_unchanged():
     assert forecast_dividends(quarterly, 10, TODAY)[0]['amount'] == 5.0
 
 
-def test_overview_derivation_ignores_a_payment_made_on_a_liquidation_shrunk_position():
+def test_overview_derivation_ignores_a_payment_made_on_a_liquidation_shrunk_position(monkeypatch):
     import ba2_trade_platform.ui.pages.overview as ov
+    monkeypatch.setattr(ov.AccountGrowthTab, '_forecast_today', staticmethod(lambda: TODAY))
     from datetime import timedelta
     ov_labels = ov.get_labels_by_symbol
     ov.get_labels_by_symbol = lambda syms: {}

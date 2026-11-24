@@ -19,12 +19,33 @@ from tests.factories import (
 
 # _gather() eagerly builds a real OHLCV provider before it knows whether any enabled factor
 # needs it; fetch_close_prices is mocked below so the instance is never actually used.
-_OHLCV_MOD = "ba2_providers.ohlcv.FMPOHLCVProvider.FMPOHLCVProvider"
+# The stub is served at the provider-RESOLVER seam (the dynamic ``dataproviders.get_provider``
+# the test conftest wires), never by patching ``FMPOHLCVProvider.__new__``: undoing a patch of an
+# inherited ``__new__`` deletes it, and CPython then leaves the class unable to take constructor
+# arguments ("object.__new__() takes exactly one argument") for every later test.
+_FETCH_CLOSES = "ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices"
 
 
 class _StubOHLCV:
     def __init__(self, *a, **k):
         pass
+
+
+def _resolve_stub_ohlcv_only(category, name, **_kw):
+    if category == "ohlcv":
+        return _StubOHLCV()
+    raise AssertionError(f"unexpected provider resolved in a FactorRanker test: {category}/{name}")
+
+
+def _stub_providers():
+    return patch("ba2_trade_platform.modules.dataproviders.get_provider", _resolve_stub_ohlcv_only)
+
+
+def _patch_closes(prices):
+    """``fetch_close_prices`` mocked WITH its real signature: ``_compute_factor`` threads kwargs only to
+    a fetcher that declares them, and a bare MagicMock (``**kwargs``) would also be handed the routed
+    fundamentals-details provider the real momentum fetch never asks for (91538cc7)."""
+    return patch(_FETCH_CLOSES, autospec=True, return_value=prices)
 
 
 def _ramp(end, n=260):
@@ -113,16 +134,16 @@ def test_two_rebalances_sell_dropped_buy_new():
 
     with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
          patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub), \
-         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
+         _stub_providers():
 
         ma1 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
-        with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=run1):
+        with _patch_closes(run1):
             expert.run_analysis("EXPERT", ma1)
         run1_orders = _orders_by_symbol(account.submitted)
         account.submitted.clear()
 
         ma2 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
-        with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=run2):
+        with _patch_closes(run2):
             expert.run_analysis("EXPERT", ma2)
         run2_orders = _orders_by_symbol(account.submitted)
 
@@ -192,8 +213,8 @@ def test_rerun_before_transaction_promoted_does_not_double_buy():
 
     with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
          patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub), \
-         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()), \
-         patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=run1):
+         _stub_providers(), \
+         _patch_closes(run1):
 
         ma1 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
         expert.run_analysis("EXPERT", ma1)

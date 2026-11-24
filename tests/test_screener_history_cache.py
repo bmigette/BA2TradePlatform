@@ -12,6 +12,7 @@ differed.
 These tests count HTTP calls, because the fix is only worth having if the count falls.
 """
 import types
+from datetime import date, timedelta
 
 import pytest
 
@@ -28,8 +29,11 @@ class _Response:
 
     def json(self):
         def bars(sym):
-            # Newest-first, as FMP returns them. Dates descend from 2026-09-08.
-            return [{"date": f"2026-{9 - (i // 28):02d}-{28 - (i % 28):02d}",
+            # Newest-first, as FMP returns them. Daily dates descend from TODAY: the
+            # screener's windows are anchored to now(), so fixed dates would fall out of
+            # the narrow (RVOL / price-drop) windows as the calendar moves on.
+            today = date.today()
+            return [{"date": (today - timedelta(days=i)).isoformat(),
                      "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.5,
                      "volume": 1000 + i}
                     for i in range(self._days)]
@@ -54,8 +58,9 @@ def screener(monkeypatch):
     # A fresh live cache per test, or the first test warms the rest of the file.
     monkeypatch.setattr(fmp_common, "_LIVE_BULK_CACHES", {})
 
-    scr = object.__new__(StockScreener)
-    scr._as_of = None
+    # The real constructor (live: as_of=None), so every per-screen attribute __init__ sets
+    # (e.g. the history-outcome stats ``_hist``) exists; the constructor does no IO.
+    scr = StockScreener({})
     return scr, calls
 
 

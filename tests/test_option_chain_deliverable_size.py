@@ -23,6 +23,7 @@ what the strategies expect — a %OTM/delta selection never wants an adjusted co
 the whole stack multiplier-aware is a much larger change, and until it exists a contract we
 cannot price at 100 must not be selectable.
 """
+import inspect
 from datetime import date
 from types import SimpleNamespace
 
@@ -81,7 +82,9 @@ def _chain(acct):
 
 
 def _capture_warnings(monkeypatch):
-    module_globals = AlpacaAccount.get_option_chain.__globals__
+    # Unwrapped: the replay option tap (475398b4) and ``alpaca_api_retry`` wrap the method, and the
+    # outermost wrapper's globals are ``ba2_common.core.replay.observe``'s, not AlpacaAccount's.
+    module_globals = inspect.unwrap(AlpacaAccount.get_option_chain).__globals__
     real = module_globals["logger"]
     messages = []
 
