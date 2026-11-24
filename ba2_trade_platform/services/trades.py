@@ -17,7 +17,8 @@ from ba2_common.core.utils import calculate_transaction_pnl
 from ..core.db import get_db, update_instance
 from ..core.models import AccountDefinition, ActivityLog, TradingOrder, Transaction
 from ..core.TransactionHelper import TransactionHelper
-from ..core.types import OrderDirection, OrderStatus, OrderType, TransactionStatus
+from ..core.types import (AssetClass, OrderDirection, OrderOpenType, OrderStatus, OrderType,
+                          TransactionStatus)
 from ..core.utils import (close_transaction_with_logging, get_account_instance_from_id,
                           get_account_instance_from_transaction)
 from ..logger import logger
@@ -363,6 +364,151 @@ def _clear_override_locks_locked(transaction_id: int) -> OverrideClear:
         logger.info(f"Cleared manual override on transaction {transaction_id} for {symbol}: "
                     f"tp={had_tp_lock}, sl={had_sl_lock}")
     return OverrideClear(symbol, cleared)
+
+
+@dataclass
+class QuantityReconciliation:
+    symbol: str
+    quantity_before: float               # what the transaction's filled orders netted to
+    quantity_after: float
+    side: Optional[OrderDirection]       # side of the recorded order; None when none was needed
+    order_id: Optional[int]              # the recorded order; None when the fills already said so
+    changed: bool                        # False when nothing at all was written
+
+
+#: Share difference below which the filled orders already net to the requested quantity (float dust).
+_RECONCILE_EPS = 1e-9
+#: ``refresh_transactions`` reads a net at or below this as a FLAT position and closes the transaction.
+_FLAT_EPS = 0.0001
+
+
+def _shares_text(quantity: float) -> str:
+    """A share count for a comment: up to 5 decimals (brokers trade fractions), no trailing zeros."""
+    return f"{quantity:.5f}".rstrip("0").rstrip(".")
+
+
+def reconcile_transaction_quantity(transaction_id: int, new_quantity: float) -> QuantityReconciliation:
+    """Set an OPENED equity transaction's quantity to ``new_quantity`` so that it STAYS there.
+
+    ``refresh_transactions`` re-derives every open transaction's quantity from its filled orders on every
+    cycle, so writing ``Transaction.quantity`` alone is undone by the next refresh (prod 2026-11-24, O on
+    TastyTrade: matched to the broker twice, rewritten twice). The correction is therefore recorded in the
+    ledger the refresh reads, as ONE order row for the difference:
+
+      * ``status = FILLED``, ``filled_qty = quantity``: the shares are gone (or there), nothing is working;
+      * ``open_type = EXTERNAL``, ``broker_order_id = None``: the platform placed no such order and there is
+        none at the broker to point at (the markers option assignments use, ``_record_assignment_equity_order``);
+      * ``open_price = None``: the price those shares traded at was never measured. Nothing is invented; a
+        row without a price is skipped by every cost and entry-price reading;
+      * ``depends_on_order = None``: a FILLED dependent order reads as a TP/SL close to the refresh;
+      * the side that moves the net: the exit side for fewer shares, the entry side for more.
+
+    The difference is taken from the ORDERS (by the refresh's own rule), not from the stored quantity, which
+    an earlier hand edit may have left different, and to 9 decimals: a partial close refuses a transaction
+    whose fills and quantity differ by more than 1e-9.
+
+    Refused: a quantity the refresh would read as flat (``_FLAT_EPS`` or less), since fills that balance
+    close the transaction at the last fill price and closing is ``close_transaction``'s job; an OVERSOLD
+    transaction (exits beyond its entry), which the refresh reports loudly and a buy row would silence;
+    an option transaction, whose quantity is contracts netted per contract. Under the transaction's lock.
+    """
+    try:
+        target = float(new_quantity)
+    except (TypeError, ValueError):
+        raise Invalid("Quantity must be a number greater than 0", {"quantity": new_quantity})
+    if not math.isfinite(target) or target <= _FLAT_EPS:
+        raise Invalid("Quantity must be greater than 0 (use Close to close a transaction)",
+                      {"quantity": new_quantity})
+    with transaction_write_lock(transaction_id, with_expert=False):
+        return _reconcile_transaction_quantity_locked(transaction_id, target)
+
+
+def _reconcile_transaction_quantity_locked(transaction_id: int, target: float) -> QuantityReconciliation:
+    with get_db() as session:
+        txn = session.get(Transaction, transaction_id)
+        if txn is None:
+            raise NotFound("Transaction not found", {"id": transaction_id})
+        if txn.status != TransactionStatus.OPENED:
+            raise Conflict(f"Transaction {transaction_id} is {txn.status.value}, not opened",
+                           {"id": transaction_id, "status": txn.status.value})
+        if txn.asset_class == AssetClass.OPTION:
+            raise Invalid("An option transaction's quantity is netted from its contracts and cannot be set",
+                          {"id": transaction_id})
+        orders = session.exec(select(TradingOrder).where(TradingOrder.transaction_id == transaction_id)
+                              .order_by(TradingOrder.id)).all()
+        if not orders:
+            raise Conflict(f"Transaction {transaction_id} has no orders, so no account to record against",
+                           {"id": transaction_id})
+
+        # The refresh's own netting (ReadOnlyAccountInterface.refresh_transactions), so the row written
+        # below is exactly what makes it compute ``target``.
+        executed = OrderStatus.get_executed_statuses()
+        combo_parents = {o.id for o in orders if o.asset_class == AssetClass.OPTION
+                         and not o.contract_symbol and o.parent_order_id is None}
+        bought = sold = 0.0
+        for order in orders:
+            if order.parent_order_id in combo_parents:
+                continue
+            has_fill = order.filled_qty is not None and order.filled_qty > 0
+            if order.status in executed or has_fill:
+                counted = order.filled_qty if has_fill else order.quantity
+                if not counted:
+                    continue
+                if order.side == OrderDirection.BUY:
+                    bought += float(counted)
+                elif order.side == OrderDirection.SELL:
+                    sold += float(counted)
+        long_side = txn.side != OrderDirection.SELL
+        net = (bought - sold) if long_side else (sold - bought)
+        if net <= _FLAT_EPS:
+            entered, exited = (bought, sold) if long_side else (sold, bought)
+            raise Conflict(
+                f"Transaction {transaction_id} ({txn.symbol}) has exits of {_shares_text(exited)} against "
+                f"an entry of {_shares_text(entered)}: it holds nothing of its own. Close it, or reduce "
+                f"the other {txn.symbol} transactions",
+                {"id": transaction_id, "bought": bought, "sold": sold})
+        difference = round(target - net, 9)
+        symbol, stored = txn.symbol, txn.quantity
+
+        side = order_id = None
+        if abs(difference) >= _RECONCILE_EPS:
+            entry_side = OrderDirection.BUY if long_side else OrderDirection.SELL
+            exit_side = OrderDirection.SELL if long_side else OrderDirection.BUY
+            side = entry_side if difference > 0 else exit_side
+            row = TradingOrder(
+                account_id=orders[0].account_id,
+                symbol=symbol,
+                quantity=abs(difference),
+                filled_qty=abs(difference),
+                side=side,
+                order_type=OrderType.MARKET,
+                status=OrderStatus.FILLED,
+                open_price=None,
+                transaction_id=transaction_id,
+                depends_on_order=None,
+                asset_class=AssetClass.EQUITY,
+                open_type=OrderOpenType.EXTERNAL,
+                broker_order_id=None,
+                comment=(f"Manual quantity reconciliation: {symbol} transaction {transaction_id} set to "
+                         f"{_shares_text(target)} shares (its fills said {_shares_text(net)}) - "
+                         f"synthetic fill, no broker order exists"),
+                data={"quantity_reconciliation": {"quantity_before": net, "quantity_after": target}},
+            )
+            session.add(row)
+        changed = side is not None or stored != target
+        if changed:
+            txn.quantity = target
+            session.add(txn)
+            session.commit()
+            if side is not None:
+                session.refresh(row)
+                order_id = row.id
+    if changed:
+        logger.warning(
+            f"Quantity of transaction {transaction_id} ({symbol}) reconciled by hand: fills said "
+            f"{_shares_text(net)}, stored {stored}, now {_shares_text(target)}"
+            + (f"; recorded as external {side.value} order {order_id}" if order_id else ""))
+    return QuantityReconciliation(symbol, net, target, side, order_id, changed)
 
 
 # ------------------------------------------------------------------------------------------------------

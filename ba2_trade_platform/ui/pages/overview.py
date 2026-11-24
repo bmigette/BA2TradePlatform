@@ -347,9 +347,9 @@ class OverviewTab:
                 # Summary
                 with ui.card().classes('alert-banner info p-4'):
                     ui.label(f'Account: {account}').classes('text-sm font-bold')
-                    ui.label(f'Broker Position: {broker_qty:+.2f}').classes('text-sm')
-                    ui.label(f'Transaction Total: {txn_qty:+.2f}').classes('text-sm')
-                    ui.label(f'Difference: {txn_qty - broker_qty:+.2f}').classes('text-sm text-[#ff6b6b] font-bold')
+                    ui.label(f'Broker Position: {broker_qty:+.5f}').classes('text-sm')
+                    ui.label(f'Transaction Total: {txn_qty:+.5f}').classes('text-sm')
+                    ui.label(f'Difference: {txn_qty - broker_qty:+.5f}').classes('text-sm text-[#ff6b6b] font-bold')
                 
                 ui.label('Open Transactions:').classes('text-subtitle2 mt-4')
                 
@@ -363,15 +363,16 @@ class OverviewTab:
                             ui.label(f'{txn.symbol}').classes('w-24')
                             ui.label(f'Opened: {txn.open_date.strftime("%Y-%m-%d") if txn.open_date else "N/A"}').classes('w-32')
                             
-                            # Editable quantity
+                            # Editable quantity. Five decimals: brokers trade fractional shares, and
+                            # two rounded a broker's 1.70106 to 1.70 when the field lost focus.
                             qty_input = ui.number(
                                 label='Quantity',
                                 value=txn.quantity,
-                                format='%.2f'
+                                format='%.5f'
                             ).classes('w-32')
                             transaction_inputs[txn.id] = qty_input
-                            
-                            ui.label(f'Original: {txn.quantity:+.2f}').classes('text-xs text-gray-500')
+
+                            ui.label(f'Original: {txn.quantity:+.5f}').classes('text-xs text-gray-500')
                 
                 # Action buttons
                 with ui.row().classes('w-full justify-between mt-4'):
@@ -415,28 +416,43 @@ class OverviewTab:
         ui.notify('Quantities distributed proportionally', type='info')
     
     def _apply_quantity_changes(self, transactions, transaction_inputs, dialog):
-        """Apply quantity changes to transactions."""
-        from ...core.db import update_instance
-        
+        """Apply the dialog's quantities so that they STAY applied.
+
+        Writing ``Transaction.quantity`` alone (what this did) is undone by the next account refresh,
+        which re-derives the quantity from the filled orders: the banner came straight back. The
+        service records the difference as an order row instead; see
+        ``services.trades.reconcile_transaction_quantity``. A refused quantity is reported and the
+        dialog stays open; the other transactions are still applied. A field the user did not edit
+        is left alone: it holds the quantity read when the dialog opened, and reconciling that
+        against the orders would book a row nobody asked for.
+        """
+        from ...services import trades as trades_service
+        from ...services.errors import ServiceError
+
         try:
             updated_count = 0
+            refused = False
             for txn in transactions:
                 if txn.id in transaction_inputs:
                     new_qty = transaction_inputs[txn.id].value
-                    if new_qty != txn.quantity:
-                        # Add abs() safety for manual edits
-                        if new_qty < 0:
-                            logger.error(
-                                f"NEGATIVE QUANTITY DETECTED in manual edit for transaction {txn.id}: {new_qty}",
-                                
-                            )
-                        txn.quantity = abs(float(new_qty))
-                        update_instance(txn)
+                    if new_qty == txn.quantity:
+                        continue
+                    try:
+                        result = trades_service.reconcile_transaction_quantity(txn.id, new_qty)
+                    except ServiceError as e:
+                        refused = True
+                        ui.notify(f'{txn.symbol} (transaction {txn.id}): {e.message}', type='negative')
+                        continue
+                    if result.changed:
                         updated_count += 1
-            
+
+            if refused and not updated_count:
+                return
             ui.notify(f'Updated {updated_count} transaction(s)', type='positive')
+            if refused:
+                return
             dialog.close()
-            
+
             # Refresh the page to show updated data
             async def reload_page():
                 await ui.navigate.reload()
@@ -5313,6 +5329,12 @@ class AccountGrowthTab:
                       ).props('outline dense no-caps').classes('ba2-ctl ba2-ctl-btn').tooltip('Select none')
         return select
 
+    @staticmethod
+    def _forecast_today():
+        """The day the dividend forecast counts from. Its own method so a test can pin it: the forecast tests
+        carry dated histories, and read against the real date they stop forecasting the months they assert."""
+        return date.today()
+
     def _compute_dividend_forecast(self, all_dividends, all_filled_trades, qty_by_account_symbol):
         """``{month: {'total': x, 'labels': {label: x}, 'sources': {source: x}}}`` for the next 2
         months; the per-symbol detail lands in ``self._forecast_detail``.
@@ -5341,7 +5363,7 @@ class AccountGrowthTab:
         def _ds(v):
             return v.strftime('%Y-%m-%d') if hasattr(v, 'strftime') else str(v)[:10]
 
-        today = date.today()
+        today = self._forecast_today()
         divs_by = defaultdict(list)
         for d in all_dividends or []:
             if d.get('symbol') and d.get('date'):

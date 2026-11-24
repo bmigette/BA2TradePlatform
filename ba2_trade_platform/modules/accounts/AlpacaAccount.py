@@ -3500,7 +3500,18 @@ class AlpacaAccount(CoverProtectionMixin, AccountInterface, OptionsAccountInterf
                         # we just skip and let Step 2 try to map by broker_order_id.
                         with Session(get_db().bind) as session:
                             candidate = session.get(TradingOrder, order_id)
-                            if candidate and candidate.account_id == self.id:
+                            if (candidate and candidate.account_id == self.id
+                                    and candidate.open_type == OrderOpenType.EXTERNAL
+                                    and not candidate.broker_order_id):
+                                # A row the platform recorded for something it did NOT place (an
+                                # option assignment, a manual quantity reconciliation) was never
+                                # submitted, so no broker order can be its own. This one only
+                                # shares the row id: SQLite reuses ids, and adopting it would
+                                # overwrite the recorded shares with an old order's status and fill.
+                                logger.debug(
+                                    f"Broker order {broker_order_id} carries client_order_id={order_id}, the id "
+                                    f"of an EXTERNAL row that was never submitted; not mapped")
+                            elif candidate and candidate.account_id == self.id:
                                 db_order = candidate
                                 # Backfill broker_order_id if missing
                                 if not db_order.broker_order_id:

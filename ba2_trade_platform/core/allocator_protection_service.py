@@ -2155,7 +2155,8 @@ def before_sale(account, symbol: str, quantity: Optional[float] = None) -> Optio
 def _sale_outcome(account_id: int, symbol: str, since: Optional[DateTime]) -> str:
     """What became of the platform's SELL of ``symbol`` made around ``since``: ``"filled"`` (any filled
     sale), ``"failed"`` (sales exist and none filled) or ``"none"``. The protective fills' own synthetic
-    sales are not counted."""
+    sales are not counted, nor is any EXTERNAL row: a sale the platform recorded but did not place (a
+    manual quantity reconciliation, shares called away)."""
     floor = (since - timedelta_seconds(300)) if since is not None else \
         _now() - timedelta_seconds(WORKING_ORDER_WINDOW_SECONDS)
     with get_db() as session:
@@ -2164,7 +2165,8 @@ def _sale_outcome(account_id: int, symbol: str, since: Optional[DateTime]) -> st
             TradingOrder.side == OrderDirection.SELL)).all()
     sales = [o for o in rows
              if (_naive(o.created_at) is None or _naive(o.created_at) >= floor)
-             and (o.data or {}).get("source") != "allocator_protection"]
+             and (o.data or {}).get("source") != "allocator_protection"
+             and o.open_type != OrderOpenType.EXTERNAL]
     if not sales:
         return "none"
     if any(o.status == OrderStatus.FILLED or (o.filled_qty is not None and float(o.filled_qty) > 0) for o in sales):
