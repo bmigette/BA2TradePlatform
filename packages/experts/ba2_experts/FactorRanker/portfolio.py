@@ -704,7 +704,10 @@ class FactorPortfolioManager:
         skipped, which is the common rebalance case (and exactly what order 630 was).
         """
         held = sum((t.open_qty or 0) for t in (transactions or []))
-        remaining = held - sold_qty
+        # No sell row = the account did not place it (``submit_order`` returned nothing): no
+        # share was sold, and the released leg was the position's only stop. It goes back over
+        # everything held -- also for a FULL exit, which is no exit until it trades.
+        remaining = held if sell_order is None else held - sold_qty
         if remaining <= 0 or not released:
             return
         # Prefer a stop price; a released TP-only leg has limit_price instead.
@@ -715,12 +718,27 @@ class FactorPortfolioManager:
                 f"FactorRanker[{self.expert_instance_id}]: released leg {source_leg.id} for "
                 f"{symbol} carried no usable price — {remaining} share(s) left UNPROTECTED")
             return
+        # THE LEG WAITS FOR THE REDUCE TO FILL.
+        #
+        # Dev 8080, every weekly rebalance 2026-10-12..2026-11-16 (experts 27 and 28, 24
+        # reduces): the leg was saved and that same object handed to ``submit_order``.
+        # ``add_instance`` detaches what it saves, so the submit raised ("not bound to a
+        # Session") and the remainder had no stop. Had it gone through, the leg would have
+        # reached the broker before the sell filled, and while the old stop's cancel was still
+        # only requested: no shares were free for it.
+        #
+        # So while the sell has not FILLED the leg is written WAITING_TRIGGER on it, like the
+        # staged sell above; the platform's dependent-order pass sends it. Nothing is sent
+        # here. With no sell row (``submit_order`` returned nothing) there is nothing to wait
+        # on, and with a sell that already filled nothing to wait for: the leg goes out now.
         try:
+            waits = sell_order is not None and sell_order.status != OrderStatus.FILLED
             replacement = TradingOrder(
                 account_id=self.account_id, symbol=symbol, quantity=remaining,
                 side=source_leg.side, order_type=source_leg.order_type,
                 stop_price=source_leg.stop_price, limit_price=source_leg.limit_price,
-                transaction_id=source_leg.transaction_id, status=OrderStatus.PENDING,
+                transaction_id=source_leg.transaction_id,
+                status=OrderStatus.WAITING_TRIGGER if waits else OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
                 # Depend on the reducing sell so the leg goes live only once the reduce has
                 # FILLED -- submitting it beforehand would reserve shares the sell still needs
@@ -735,7 +753,13 @@ class FactorPortfolioManager:
                     note=f"FactorRanker protective leg resized after partial reduce "
                          f"(replaces order {source_leg.id})"),
             )
-            add_instance(replacement)
+            replacement.id = add_instance(replacement, expunge_after_flush=True)
+            if waits:
+                logger.info(
+                    f"FactorRanker[{self.expert_instance_id}]: stop for the remaining "
+                    f"{remaining} {symbol} at {price} (order {replacement.id}, replaces released "
+                    f"order {source_leg.id}) waits for sell order {sell_order.id} to fill")
+                return
             self.account.submit_order(replacement)
             logger.info(
                 f"FactorRanker[{self.expert_instance_id}]: re-protected {symbol} x{remaining} at "

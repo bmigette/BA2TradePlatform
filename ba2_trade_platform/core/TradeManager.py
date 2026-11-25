@@ -2324,12 +2324,41 @@ class TradeManager:
         """
         if not is_marked_staged_exit(order):
             return
+        self._put_transaction_protection_back(
+            account, order,
+            f"staged exit order {order.id} ({order.symbol}, transaction "
+            f"{order.transaction_id}) was refused after protective order "
+            f"{order.depends_on_order} was cancelled for it")
+
+    def _reprotect_after_dead_reduce(self, order, parent_id, parent_status) -> None:
+        """Put the stop back when the REDUCING order a protective leg waited on died unsold.
+
+        A partial reduce cancels the position's stop, sells, and stages the stop for the
+        remainder behind the sell's FILL (FactorRanker's rebalance sell; a partial close).
+        When the sell ends without selling anything the leg can never fire and is cancelled
+        by the pass -- which left the whole position with no stop and one WARNING. The
+        transaction's own levels are re-placed instead, exactly as after a refused staged
+        exit. Only a protective leg that waits on a FILL: a cancel-and-replace leg (it waits
+        on a CANCELED) has its own sizing and retry.
+        """
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        if (not order.transaction_id or order.order_type == OrderType.MARKET
+                or _as_order_status(order.depends_order_status_trigger) != OrderStatus.FILLED
+                or not TransactionHelper.is_resting_protection(order)):
+            return
+        self._put_transaction_protection_back(
+            None, order,
+            f"protective order {order.id} ({order.symbol}, transaction {order.transaction_id}) "
+            f"waited on reducing order {parent_id}, which ended "
+            f"{getattr(parent_status, 'value', parent_status)} without selling")
+
+    def _put_transaction_protection_back(self, account, order, what: str) -> None:
+        """Re-place an OPENED transaction's exit at its own recorded levels, or say loudly that
+        it could not be done (the rule of ``_reprotect_after_refused_exit``). ``what`` names
+        the event for the log and the activity; ``account`` None = built here."""
         from .types import TransactionStatus, ActivityLogSeverity, ActivityLogType
         from .db import log_activity
 
-        what = (f"staged exit order {order.id} ({order.symbol}, transaction "
-                f"{order.transaction_id}) was refused after protective order "
-                f"{order.depends_on_order} was cancelled for it")
         try:
             txn = get_instance(Transaction, order.transaction_id)
             if txn.status != TransactionStatus.OPENED:
@@ -2481,6 +2510,7 @@ class TradeManager:
             orders_to_submit = []  # List of (order, parent_order_id)
             status_updates = {}  # Map of order_id -> new_status
             waiting_by_id = {}   # every row this pass read, to re-protect marked exits it ends
+            dead_reduces = {}    # protective order id -> (reducing parent id, its status): see below
             # True if the SL-rebase or TP-floor-recheck blocks below wrote a Transaction field
             # (txn.stop_loss / txn.take_profit). Those updates live only in this Phase-1 session
             # and are otherwise silently lost on close: order.limit_price/stop_price mutations
@@ -2545,8 +2575,26 @@ class TradeManager:
                         action = classify_waiting_trigger(current_status, trigger_status,
                                                           parent_order.filled_qty)
                         after_add = is_protection_after_add(dependent_order)
-                        if action == "submit" and current_status != trigger_status \
-                                and current_status != OrderStatus.FILLED and not after_add:
+                        # The parent OPENS the position (the dependent is its exit) unless it
+                        # is on the dependent's own side: then it REDUCES the position (a
+                        # partial close, FactorRanker's rebalance sell) and the dependent
+                        # protects what the reduce leaves.
+                        parent_is_entry = parent_order.side != dependent_order.side
+                        part_filled_then_dead = (action == "submit" and current_status != trigger_status
+                                                 and current_status != OrderStatus.FILLED and not after_add)
+                        if part_filled_then_dead and not parent_is_entry:
+                            # A reduce that sold only part: the shares it did NOT sell are still
+                            # held, on top of what the leg was staged for. (Sizing it at the
+                            # parent's filled quantity, as behind an entry, protects the shares
+                            # that LEFT.)
+                            unsold = float(parent_order.quantity) - float(parent_order.filled_qty)
+                            self.logger.warning(
+                                f"Reducing order {parent_order_id} ended {current_status} after filling "
+                                f"{parent_order.filled_qty} of {parent_order.quantity}; protective order "
+                                f"{dependent_order.id} is resized {dependent_order.quantity} -> "
+                                f"{float(dependent_order.quantity) + unsold:g} for the {unsold:g} it did not sell")
+                            dependent_order.quantity = float(dependent_order.quantity) + unsold
+                        elif part_filled_then_dead:
                             # Partial fill, then cancelled: protect what filled, not what was ordered.
                             self.logger.warning(
                                 f"Parent order {parent_order_id} ended {current_status} after filling "
@@ -2593,7 +2641,13 @@ class TradeManager:
                                 data_dict = dependent_order.data if isinstance(dependent_order.data, dict) else None
                                 # Protection staged behind an ADD is a level for the whole
                                 # position: the add's own fill price is no anchor for it.
-                                if fill_px and not after_add:
+                                #
+                                # Nor is the fill of a REDUCING order (same side as the
+                                # protection: a partial close, FactorRanker's rebalance sell).
+                                # The rule re-bases a level computed before the ENTRY filled;
+                                # applied to a trim it moved the stop by (trim price / anchor)
+                                # and rewrote the transaction's stop to match.
+                                if fill_px and not after_add and parent_is_entry:
                                     # -- reference anchor for the stop (recorded when the exit order was built)
                                     ref_val = None
                                     ref_raw = data_dict.get("tpsl_reference_price") if data_dict else None
@@ -2799,6 +2853,8 @@ class TradeManager:
                                 f"Syncing dependent order to CANCELED"
                             )
                             status_updates[dependent_order.id] = OrderStatus.CANCELED
+                            if not parent_is_entry:
+                                dead_reduces[dependent_order.id] = (parent_order_id, current_status)
                         else:
                             # action == "wait": parent still in flight (incl. PARTIALLY_FILLED) — keep waiting
                             self.logger.debug(
@@ -2832,6 +2888,8 @@ class TradeManager:
                 self._reprotect_after_refused_exit(None, waiting_by_id[order_id])
                 if new_status == OrderStatus.CANCELED:
                     self._settle_protection_after_dead_add(waiting_by_id[order_id])
+                if order_id in dead_reduces:
+                    self._reprotect_after_dead_reduce(waiting_by_id[order_id], *dead_reduces[order_id])
             
             # PHASE 2: Process all order submissions OUTSIDE of session context
             submitted_count = 0

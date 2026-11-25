@@ -95,6 +95,11 @@ def _mgr(monkeypatch, legs, account=None, after_cancel=OrderStatus.CANCELED):
     return mgr
 
 
+def _staged_stops(mgr):
+    """The protective legs the manager SAVED (a leg that waits is saved, not submitted)."""
+    return [o for o in mgr.added if o.order_type == OrderType.SELL_STOP]
+
+
 # --------------------------------------------------------------- the regression (order 630)
 
 def test_full_exit_cancels_the_protective_leg_before_selling(monkeypatch):
@@ -210,8 +215,10 @@ def test_a_waiting_partial_reduce_still_reprotects_the_remainder(monkeypatch):
     sell = mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
 
     assert sell.status == OrderStatus.WAITING_TRIGGER
-    [(stop, _kw)] = acct.submitted
+    assert acct.submitted == [], "nothing reaches the broker while the cancel is unconfirmed"
+    [stop] = _staged_stops(mgr)
     assert (stop.order_type, stop.quantity, stop.stop_price) == (OrderType.SELL_STOP, 7, 90.0)
+    assert stop.status == OrderStatus.WAITING_TRIGGER
     assert stop.depends_on_order == sell.id
     assert stop.depends_order_status_trigger == OrderStatus.FILLED
 
@@ -257,7 +264,7 @@ def test_partial_reduce_reprotects_the_remainder(monkeypatch):
 
     mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
 
-    protective = [o for o, _ in acct.submitted if o.order_type == OrderType.SELL_STOP]
+    protective = _staged_stops(mgr)
     assert len(protective) == 1, "the remaining 7 shares must get a stop back"
     assert protective[0].quantity == 7
     assert protective[0].stop_price == 90.0, "price is preserved, only the quantity shrinks"
@@ -270,9 +277,29 @@ def test_reprotection_waits_for_the_reduce_to_fill(monkeypatch):
     mgr = _mgr(monkeypatch, [_Leg(608, qty=11.0)], acct)
     mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
 
-    leg = [o for o, _ in acct.submitted if o.order_type == OrderType.SELL_STOP][0]
+    assert not [o for o, _ in acct.submitted if o.order_type == OrderType.SELL_STOP], \
+        "the leg was handed to the broker before the sell filled"
+    [leg] = _staged_stops(mgr)
+    assert leg.status == OrderStatus.WAITING_TRIGGER
     assert leg.depends_on_order == 999, "must hang off the reducing sell order"
     assert leg.depends_order_status_trigger == OrderStatus.FILLED
+
+
+def test_a_sell_that_already_filled_gets_its_stop_at_once(monkeypatch):
+    """Nothing is left to wait for: the leg is submitted in the same call."""
+    class _FillsAtOnce(_Account):
+        def submit_order(self, order, **kw):
+            order = super().submit_order(order, **kw)
+            if order.order_type == OrderType.MARKET:
+                order.status = OrderStatus.FILLED
+            return order
+
+    acct = _FillsAtOnce()
+    mgr = _mgr(monkeypatch, [_Leg(608, qty=11.0)], acct)
+    mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
+
+    [leg] = [o for o, _ in acct.submitted if o.order_type == OrderType.SELL_STOP]
+    assert leg.status == OrderStatus.PENDING and leg.quantity == 7
 
 
 def test_full_exit_does_not_reprotect(monkeypatch):
@@ -290,19 +317,16 @@ def test_reprotect_failure_is_loud_but_does_not_undo_the_reduce(monkeypatch):
     handler and does not propagate to the root, so caplog.text is empty even though the record
     is emitted -- checking caplog here would silently pass on a regression.
     """
-    class _HalfBad(_Account):
-        def submit_order(self, order, **kw):
-            self.submitted.append((order, kw))
-            if order.order_type == OrderType.SELL_STOP:
-                raise RuntimeError("broker down")
-            order.id = 999
-            return order
-
     errors: list = []
     monkeypatch.setattr(P.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
 
-    acct = _HalfBad()
+    acct = _Account()
     mgr = _mgr(monkeypatch, [_Leg(608, qty=11.0)], acct)
+
+    def _db_down(o, **kw):          # the leg is staged in the database, not sent
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(P, "add_instance", _db_down)
     order = mgr._submit_sell("SPCX", 4, [_Txn(open_qty=11.0)])
 
     assert order is not None, "the reduce itself must still stand"
@@ -341,3 +365,22 @@ def test_a_resized_leg_with_no_sell_to_chain_on_is_classed_as_protection(monkeyp
     assert replacement.depends_on_order is None
     assert TransactionHelper.is_resting_protection(replacement), replacement.comment
     assert "608" in replacement.comment, "the trace to the replaced leg is kept"
+
+
+def test_a_sell_the_account_did_not_place_leaves_the_whole_position_protected(monkeypatch):
+    """``submit_order`` returned nothing: no share was sold, and the only stop has just been
+    cancelled. The stop goes back over ALL 11 -- also when the sell was a full exit, which used to
+    return early ("nothing left to protect") and left the position with no stop at all."""
+    class _SellRefused(_Account):
+        def submit_order(self, order, **kw):
+            if order.order_type == OrderType.MARKET:
+                return None
+            return super().submit_order(order, **kw)
+
+    for sold in (4, 11):
+        acct = _SellRefused()
+        mgr = _mgr(monkeypatch, [_Leg(608, qty=11.0, stop_price=90.0)], acct)
+        assert mgr._submit_sell("SPCX", sold, [_Txn(open_qty=11.0)]) is None
+        [(leg, _kw)] = acct.submitted
+        assert (leg.order_type, leg.quantity, leg.stop_price) == (OrderType.SELL_STOP, 11.0, 90.0)
+        assert leg.depends_on_order is None
