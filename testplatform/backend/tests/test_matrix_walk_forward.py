@@ -554,3 +554,42 @@ def test_the_new_flags_need_walk_forward(env, monkeypatch, flag, capsys):
     with pytest.raises(SystemExit):
         M.main()
     assert "need --walk-forward" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ phase B: the daily screener panel
+
+
+def test_a_stated_panel_does_not_rename_a_deferring_cell(env, monkeypatch):
+    """Phase A trains on the newest panel of its machine (no flag). In January the deferred 2026 test
+    needs the REBUILT panel, stated with --screener-panel (``_rebase_run_data`` re-points a stored job
+    only at a panel the command names). Stating it must still find phase A's jobs."""
+    a = _cell_name(env, monkeypatch, "--wf-defer-last-test", "--wf-data-end", "2025-12-31")
+    jan = _cell_name(env, monkeypatch, "--wf-defer-last-test", "--screener-panel", "/c/daily_panel/P2027")
+    assert a == jan
+
+
+def test_the_stated_panel_reaches_every_daily_panel_job_and_its_deferred_test(env, monkeypatch):
+    seen = []
+
+    class Recording(Fake):
+        def run_oos(self, train_name, fold, picks, name_prefix, labels, parallel, data_args=None):
+            seen.append(list(data_args or []))
+            return super().run_oos(train_name, fold, picks, name_prefix, labels, parallel)
+
+    fake = Recording()
+    monkeypatch.setattr(M, "_make_wf_runner", lambda args: fake)
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--screener-panel", "/c/daily_panel/P2027",
+                                           experts=("DeterministicScorer",)))
+    assert M.main() == 0
+    assert fake.trained and all(_flag(cmd, "--screener-panel") == "/c/daily_panel/P2027"
+                                for _name, cmd in fake.trained)
+    assert seen and all(_flag(args, "--screener-panel") == "/c/daily_panel/P2027" for args in seen)
+
+
+def test_a_factorranker_job_never_carries_the_panel(env, monkeypatch):
+    """FactorRanker reads the weekly store, not the daily panel: its stored block names no panel, and a
+    deferred test handed one is refused ("has no daily-panel screener block")."""
+    monkeypatch.setattr(sys, "argv", _argv(env, "--wf-defer-last-test", "--screener-panel", "/c/daily_panel/P2027",
+                                           experts=("FactorRanker",)))
+    assert M.main() == 0
+    assert env.fake.trained and all("--screener-panel" not in cmd for _name, cmd in env.fake.trained)

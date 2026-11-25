@@ -17,7 +17,8 @@ WRAPPER_VARS = ("PHASE", "ESTIMATES_SOURCE", "MC_OHLCV", "MC_TA", "MC_SEN_OHLCV"
                 "EARLY_STOP", "EARLY_STOP_MIN_REL", "SUFFIX_BASE", "TRAIN_START", "FITNESS", "INTERVAL",
                 "DS_WEIGHTS", "G27_MARKET_EXIT", "G27_REGIME_SPLIT", "PASS_DD_MULT", "PASS_MAX_OOS_DD",
                 "WF_TEST_YEARS", "PASS_MIN_FOLDS", "PASS_REQUIRE_FOLD", "WF_RESTARTS", "WF_CHAIN_SEED",
-                "WF_VERDICT", "PASS_MIN_OOS_SCORE", "WF_MIN_TRAIN_YEARS", "PY", "VENV")
+                "WF_VERDICT", "PASS_MIN_OOS_SCORE", "WF_MIN_TRAIN_YEARS", "PY", "VENV",
+                "SCREENER_PANEL", "WF_TEST_PARALLEL")
 
 BASE_ENV = {"PHASE": "A", "ESTIMATES_SOURCE": "alphavantage", "MC_OHLCV": "mco", "MC_TA": "mct",
             "STORE": "/store", "WF_REPORT_DIR": "/reports", "PLAN_FILE": "/plan.json",

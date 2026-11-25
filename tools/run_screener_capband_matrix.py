@@ -350,13 +350,36 @@ def exploration_range_tokens(args, expert, strat) -> list:
 _DATA_FLAGS = ("--market-condition-manifest", "--exclude-symbols", "--screener-store", "--universe")
 
 
+#: The daily screener-criteria panel a job reads. Phase A states none (a launch stamps the newest panel
+#: of its machine on the job); January states the REBUILT one, because a stored job is re-pointed only
+#: at a panel the command names (``_rebase_run_data``) and phase A's panel does not reach the 2026 test
+#: window. The flag AND its value are left out of the name digest, so a command that states a panel
+#: still finds the jobs of the one that stated none.
+_PANEL_FLAG = "--screener-panel"
+
+
 def mask_data_tokens(cmd) -> list:
-    """``cmd`` with the value of every ``_DATA_FLAGS`` flag replaced by ``<data>`` (for the name digest)."""
-    out = list(cmd)
-    for k, tok in enumerate(out[:-1]):
-        if tok in _DATA_FLAGS:
-            out[k + 1] = "<data>"
+    """``cmd`` with the value of every ``_DATA_FLAGS`` flag replaced by ``<data>`` and ``--screener-panel
+    <dir>`` removed (for the name digest)."""
+    out, skip = [], False
+    for k, tok in enumerate(cmd):
+        if skip:
+            skip = False
+            continue
+        if tok == _PANEL_FLAG and k + 1 < len(cmd):
+            skip = True
+            continue
+        out.append("<data>" if k and cmd[k - 1] in _DATA_FLAGS else tok)
     return out
+
+
+def panel_tokens(panel, band, expert) -> list:
+    """``--screener-panel <dir>`` for a job whose screen reads the daily panel, else nothing: the senate
+    band has no screen, and FactorRanker (the bypass expert) reads the weekly store -- its stored block
+    names no panel, and a deferred test handed one is refused."""
+    if not panel or band == SENATE_BAND or expert == _RANKER:
+        return []
+    return [_PANEL_FLAG, panel]
 
 
 def read_universe_file(path) -> str:
@@ -781,6 +804,13 @@ def main() -> int:
                          "spread varies sharply by cap band). Default 0.0 (off).")
     ap.add_argument("--fitness", default="calmar_ratio")
     ap.add_argument("--store", default=_STORE)
+    ap.add_argument("--screener-panel", default=None,
+                    help="Daily screener-criteria panel directory (or its fingerprint) every daily-panel job "
+                         "reads; forwarded as `ba2-test optimize --screener-panel`. Unset: a launch takes the "
+                         "newest panel of its machine. REQUIRED in the January run of a two-phase year "
+                         "(--wf-defer-last-test without --wf-data-end): the deferred test of a job trained "
+                         "in phase A is re-pointed only at a panel this command names. Not part of a "
+                         "deferring cell's name.")
     ap.add_argument("--cadence-days", type=int, default=7)
     ap.add_argument("--include-no-data", action="store_true",
                     help="Also run EarningsDrift/Insider on the large band (default: skip — no data).")
@@ -1284,6 +1314,7 @@ def main() -> int:
             generations = budget.get("generations", generations)
         cmd = [exe, "optimize", "--expert", expert,
                *universe_tokens(band, args.store, senate_universe),
+               *panel_tokens(args.screener_panel, band, expert),
                # Per-expert floor, not the raw --start: see _EXPERT_MIN_START. An expert whose
                # signal data does not reach --start would otherwise burn the early years as dead
                # window and bucket empty calendar years into the consistency fitness.

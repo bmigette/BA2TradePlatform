@@ -133,3 +133,61 @@ def test_preflight_validates_the_settings_before_launching():
         src = fh.read()
     pre = src[src.index("preflight() {"):src.index("\n}\n", src.index("preflight() {"))]
     assert "wf_plan_args || exit 2" in pre
+
+
+# ------------------------------------------------------------------ phase B: the daily screener panel
+
+
+def _run_body(tmp_path, env, tail):
+    """(exit code, stdout lines, stderr) of the wrapper's functions followed by ``tail`` (nothing runs)."""
+    import subprocess
+
+    from tests import grid_wrapper_harness as H
+    with open(SH, encoding="utf-8") as fh:
+        source = fh.read()
+    path = os.path.join(str(tmp_path), "grid_body.sh")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("stubpy() { printf '%s\n' \"$@\"; }\nPY=stubpy\n"
+                 + source[:source.index('\ncase "$CMD" in')] + "\n" + tail + "\n")
+    base = {k: v for k, v in os.environ.items() if k not in H.WRAPPER_VARS}
+    r = subprocess.run([bash(), path], capture_output=True, text=True, env={**base, **H.BASE_ENV, **env})
+    return r.returncode, r.stdout.splitlines(), r.stderr
+
+
+def test_the_stated_panel_reaches_the_driver_and_nothing_else_changes(tmp_path):
+    rc, argv, err = run_step(str(tmp_path), "ds-large", {"PHASE": "B", "SCREENER_PANEL": "/c/daily_panel/P2027"})
+    assert rc == 0, err
+    i = argv.index("--screener-panel")
+    assert argv[i + 1] == "/c/daily_panel/P2027"
+    assert argv[:i] + argv[i + 2:] == GOLDEN["B:ds-large"]
+
+
+@pytest.mark.parametrize("env,rc", [
+    ({"PHASE": "B", "STEPS": "rank-large ds-large"}, 1),          # a daily-panel step and no panel stated
+    ({"PHASE": "B", "STEPS": "s9-fr-small"}, 1),
+    ({"PHASE": "B", "STEPS": "rank-large senate"}, 0),            # weekly store / no screen: no panel read
+    ({"PHASE": "B", "STEPS": "ds-large", "SCREENER_PANEL": "/c/daily_panel/P2027"}, 0),
+    ({"PHASE": "A", "STEPS": "ds-large"}, 0),                     # phase A trains on the newest panel
+])
+def test_phase_b_refuses_to_start_without_the_rebuilt_panel(tmp_path, env, rc):
+    """Phase A's jobs name phase A's panel, which does not reach the 2026 test window; a stored job is
+    re-pointed only at a panel the command names. Unstated, every classic cell would fail its deferred
+    test after the whole chain had run."""
+    got, out, err = _run_body(tmp_path, env, 'require_phase_b_panel; echo "rc=$?"')
+    assert out[-1] == f"rc={rc}", err
+    assert ("SCREENER_PANEL" in err) == (rc == 1)
+
+
+def test_every_setting_travels_to_the_systemd_unit_even_an_empty_worker_list(tmp_path):
+    """`start` on Linux hands the settings to a transient unit. Four of them were not on the list, so
+    the unit ran on the defaults; and WORKERS="" (local-only) was dropped as empty, so the unit took
+    the default worker list."""
+    env = {"WORKERS": "", "PARALLEL": "4", "G27_MARKET_EXIT": "exit,stop", "G27_REGIME_SPLIT": "entry",
+           "PASS_DD_MULT": "3", "PASS_MAX_OOS_DD": "40", "SCREENER_PANEL": "/c/daily_panel/P2027"}
+    rc, out, err = _run_body(tmp_path, env, 'unit_env_args; printf "%s\n" "${local_env[@]}"')
+    assert rc == 0, err
+    for want in ("--setenv=WORKERS=", "--setenv=PARALLEL=4", "--setenv=G27_MARKET_EXIT=exit,stop",
+                 "--setenv=G27_REGIME_SPLIT=entry", "--setenv=PASS_DD_MULT=3", "--setenv=PASS_MAX_OOS_DD=40",
+                 "--setenv=SCREENER_PANEL=/c/daily_panel/P2027", "--setenv=PHASE=A"):
+        assert want in out, (want, out)
+    assert not [ln for ln in out if ln.startswith("--setenv=MC_SEN_OHLCV=")]     # unset stays unset

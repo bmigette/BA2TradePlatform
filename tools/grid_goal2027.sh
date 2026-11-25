@@ -83,6 +83,11 @@ TRAIN_START="${TRAIN_START:-2020-01-01}"
 FITNESS="${FITNESS:-consistent_annual_return}"
 INTERVAL="${INTERVAL:-5min}"
 STORE="${STORE:-}"     # default: <ba2_common CACHE_FOLDER>/screener/metric_store (resolve_store)
+# The daily screener-criteria panel (a directory under <cache>/screener/daily_panel, or its fingerprint).
+# Unset in phase A: a launch stamps the newest panel of its machine on the job. REQUIRED in phase B for
+# every daily-panel step (require_phase_b_panel): the deferred 2026 test of a job trained in phase A is
+# re-pointed only at a panel this command names, and phase A's panel does not reach the 2026 window.
+SCREENER_PANEL="${SCREENER_PANEL:-}"
 PLAN_FILE="${PLAN_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/strategy_plan.json}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/excluded_symbols.txt}"
 SENATE_UNIVERSE_FILE="${SENATE_UNIVERSE_FILE:-${REPO_ROOT}/docs/strategy_research/atr_grid/senate_universe_2020_2025.txt}"
@@ -243,6 +248,38 @@ print(f"venv imports this checkout: {root}")
 EOF
 }
 
+# Phase B (January): every step whose screen reads the daily panel needs the REBUILT panel stated.
+# rank-* (FactorRanker: weekly store) and senate (no screen) read none.
+require_phase_b_panel() {
+  [ "${PHASE:-}" = "B" ] || return 0
+  [ -z "${SCREENER_PANEL:-}" ] || return 0
+  local s
+  for s in $STEPS; do
+    case "$s" in
+      rank-*|senate) ;;
+      *) echo "FATAL: PHASE=B needs SCREENER_PANEL for step $s: the daily screener-criteria panel rebuilt on" >&2
+         echo "       January's data (a directory under <cache>/screener/daily_panel, or its fingerprint)." >&2
+         echo "       Phase A's jobs name phase A's panel, which does not reach the 2026 test window, and a" >&2
+         echo "       stored job is re-pointed only at a panel the command names." >&2
+         return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# The settings `start` hands to its transient unit on Linux (local_env = systemd-run --setenv arguments).
+# WORKERS and PARALLEL always travel, empty included: WORKERS="" means "local only", and dropped as empty
+# the unit fell back to the default worker list. Every other setting travels when it is set.
+unit_env_args() {
+  local v
+  local_env=()
+  for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS BA2_RESUME_ACROSS_CODE_CHANGE WF_TEST_YEARS PASS_MIN_FOLDS PASS_REQUIRE_FOLD WF_RESTARTS WF_CHAIN_SEED WF_VERDICT PASS_MIN_OOS_SCORE WF_MIN_TRAIN_YEARS WF_TEST_PARALLEL G27_MARKET_EXIT G27_REGIME_SPLIT PASS_DD_MULT PASS_MAX_OOS_DD SCREENER_PANEL; do
+    case "$v" in WORKERS|PARALLEL) local_env+=("--setenv=$v=${!v}"); continue ;; esac
+    [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
+  done
+  return 0
+}
+
 # ------------------------------------------------------------------------------------------- preflight
 preflight() {
   local end="$1"
@@ -260,6 +297,7 @@ preflight() {
   [ -n "${MC_OHLCV:-}" ] && [ -n "${MC_TA:-}" ] || {
     echo "FATAL: MC_OHLCV and MC_TA (market-condition manifest digests covering the cap bands to the data end)" >&2
     echo "       are required; there is no default, since each phase has its own data." >&2; exit 1; }
+  require_phase_b_panel || exit 1
   for f in "$PLAN_FILE" "$EXCLUDE_FILE"; do [ -f "$f" ] || { echo "FATAL: missing $f" >&2; exit 1; }; done
   case " $STEPS " in *" senate "*)
     [ -f "$SENATE_UNIVERSE_FILE" ] || { echo "FATAL: missing Senate universe $SENATE_UNIVERSE_FILE" >&2; exit 1; } ;;
@@ -368,6 +406,7 @@ run_step() {                      # $1 = step id; $2 = "dry" for --dry-run
       --pass-min-folds "$PASS_MIN_FOLDS" ${WF_REQ[@]+"${WF_REQ[@]}"} ${WF_ARGS[@]+"${WF_ARGS[@]}"})
   [ -n "$end" ] && args+=(--wf-data-end "$end")
   [ -n "$WORKERS" ] && args+=(--workers "$WORKERS")
+  [ -n "$SCREENER_PANEL" ] && args+=(--screener-panel "$SCREENER_PANEL")
   args+=(--estimates-source "$ESTIMATES_SOURCE")
   local suffix="$SUFFIX_BASE"
   local mc_o="$MC_OHLCV" mc_t="$MC_TA"
@@ -552,10 +591,7 @@ case "$CMD" in
       # `journalctl -u`. The settings travel as --setenv; the FMP key does NOT (args and unit
       # properties are readable): `run` reads it from the master's own DB.
       sudo systemctl reset-failed "$UNIT" >/dev/null 2>&1
-      local_env=()
-      for v in PHASE ESTIMATES_SOURCE MC_OHLCV MC_TA MC_SEN_OHLCV MC_SEN_TA WORKERS PARALLEL BA2_MAX_REMOTE_SLOTS STEPS BA2_HOME                VENV PY STORE PLAN_FILE EXCLUDE_FILE SENATE_UNIVERSE_FILE WF_REPORT_DIR GRID_LOG POPULATION                WF_FIRST_GENERATIONS WF_NEXT_GENERATIONS WF_TOP_N EARLY_STOP EARLY_STOP_MIN_REL SUFFIX_BASE                TRAIN_START FITNESS INTERVAL FORBIDDEN_CHECKOUTS FORBIDDEN_HOMES DS_WEIGHTS BA2_RESUME_ACROSS_CODE_CHANGE                WF_TEST_YEARS PASS_MIN_FOLDS PASS_REQUIRE_FOLD WF_RESTARTS WF_CHAIN_SEED WF_VERDICT PASS_MIN_OOS_SCORE WF_MIN_TRAIN_YEARS WF_TEST_PARALLEL; do
-        [ -n "${!v:-}" ] && local_env+=("--setenv=$v=${!v}")
-      done
+      unit_env_args
       sudo systemd-run --unit="$UNIT" -p MemoryMax="$MEMORY_MAX" -p User="$(id -un)"           --working-directory="$REPO_ROOT" --setenv=GRID_SKIP_PREFLIGHT=1 --setenv=HOME="$HOME"           "${local_env[@]}" /bin/bash tools/grid_goal2027.sh run || exit 1
       echo "started unit $UNIT (MemoryMax $MEMORY_MAX); journalctl -u $UNIT; log: $REPO_ROOT/$GRID_LOG"
       exit 0
