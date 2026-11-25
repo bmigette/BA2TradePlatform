@@ -86,3 +86,33 @@ def test_fmprating_partial_row_reading_is_unchanged():
     assert G.grade_bucket_counts(row) is None
     both = dict(row, analystRatingsbuy=9, analystRatingsHold=1, analystRatingsSell=0, analystRatingsStrongSell=0)
     assert G.grade_bucket_counts(both)["buy"] == 9        # the pre-fix alias order: ...buy first
+
+
+# ---------------------------------------------------------------- same-day rows on the intraday clock
+
+# 2024-07-01 is a Monday session; FMP dates the monthly snapshot that day with no time of day.
+_JULY_ROWS = [
+    {"symbol": "AAPL", "date": "2024-07-01", "analystRatingsStrongBuy": 0, "analystRatingsBuy": 0,
+     "analystRatingsHold": 0, "analystRatingsSell": 30, "analystRatingsStrongSell": 10},
+    {"symbol": "AAPL", "date": "2024-06-01", "analystRatingsStrongBuy": 12, "analystRatingsBuy": 24,
+     "analystRatingsHold": 12, "analystRatingsSell": 1, "analystRatingsStrongSell": 0},
+]
+_DECISION_1000 = datetime(2024, 7, 1, 10, 0)
+
+
+def test_a_snapshot_dated_today_is_not_read_by_an_intraday_decision():
+    """A date-only row is public from the NEXT session (``knowability``; FMPRating gates its
+    grades rows the same way). At 10:00 on 2024-07-01 the July snapshot is not public yet."""
+    from ba2_common.core.knowability import intraday_decisions
+
+    with intraday_decisions(True):
+        out = A.revision_momentum([dict(r) for r in _JULY_ROWS], _DECISION_1000)
+        next_day = A.revision_momentum([dict(r) for r in _JULY_ROWS], datetime(2024, 7, 2, 10, 0))
+
+    assert out["n_rows"] == 1 and out["net_revision"] > 0, "read July's snapshot a session early"
+    assert next_day["n_rows"] == 2
+
+
+def test_the_daily_clock_still_reads_a_snapshot_dated_today():
+    out = A.revision_momentum([dict(r) for r in _JULY_ROWS], _DECISION_1000)
+    assert out["n_rows"] == 2

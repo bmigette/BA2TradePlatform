@@ -80,6 +80,11 @@ def revision_momentum(grades_rows: List[Dict[str, Any]], as_of: datetime,
         d = _as_utc(d)
         if d > as_of or d < cutoff:
             continue
+        # INTRADAY clock: a grades row carries a date and no time of day, so it is public from
+        # the NEXT session (ba2_common.core.knowability; FMPRating gates its rows the same way).
+        # Without this a 10:00 decision read the snapshot dated that same day.
+        if intraday_decision_clock() and not published_known(d, as_of):
+            continue
         counts = _bucket_counts(row)
         if counts is None:
             continue
