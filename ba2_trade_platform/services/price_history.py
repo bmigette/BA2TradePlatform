@@ -6,6 +6,7 @@ is no yfinance here and no silent fallback to another source: a symbol the sourc
 result (the caller reports it as unpriced), never a 0; if the source answers nothing at all it is
 ``PriceSourceUnreachable`` (503). The whole batch is bounded by ``PRICE_DEADLINE_S``."""
 import threading
+from contextlib import contextmanager
 import time
 from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Optional
@@ -19,6 +20,19 @@ PRICE_DEADLINE_S = 45.0
 MAX_CONCURRENT = 4
 WORKERS = 4
 _SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+
+@contextmanager
+def download_slot(timeout_s: float):
+    """Hold ONE of the ``MAX_CONCURRENT`` process-wide download slots for a provider call that is not a
+    ``fetch_closes`` (the Overview heatmap's split-calendar reads use the same FMP key): yields True once a slot is
+    held, False when none freed within ``timeout_s`` (the caller then makes no call)."""
+    held = _SLOTS.acquire(timeout=max(0.0, timeout_s))
+    try:
+        yield held
+    finally:
+        if held:
+            _SLOTS.release()
 
 #: yfinance-style ``period`` names the page's cache ranks by, as the number of calendar days each covers.
 _PERIOD_DAYS = {'6mo': 190, '1y': 370, '3y': 3 * 370}
@@ -102,7 +116,8 @@ class Closes(dict):
 
 def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
                  deadline_s: Optional[float] = None,
-                 errors: Optional[Dict[str, str]] = None) -> Closes:
+                 errors: Optional[Dict[str, str]] = None,
+                 end: Optional[datetime] = None) -> Closes:
     """``{symbol: {date: close}}`` from ``start`` through today, each account's symbols from that account's history
     source.
 
@@ -118,7 +133,11 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
 
     ``errors``: OPT-IN. A caller that must tell "the fetch FAILED" from "the source has nothing" passes a dict; every
     symbol whose provider call raised (before the deadline) is recorded in it as ``{symbol: "<Type>: <message>"}``,
-    credentials redacted. The returned ``Closes`` is identical either way, so a caller passing nothing sees no change."""
+    credentials redacted. The returned ``Closes`` is identical either way, so a caller passing nothing sees no change.
+
+    ``end``: OPT-IN, the last day to read (naive, like ``datetime.now()``). Omitted = now, a LATEST read that tops the
+    provider's daily cache up. A past ``end`` is a pinned read the provider serves from its cache without a vendor
+    call (the Overview heatmap needs finished sessions only; it re-reads LATEST what that misses)."""
     deadline = PRICE_DEADLINE_S if deadline_s is None else deadline_s
     jobs = [(aid, sym) for aid, syms in by_account.items() for sym in syms]
     out = Closes()
@@ -126,7 +145,7 @@ def fetch_closes(by_account: Dict[int, List[str]], start: date, *,
     if not jobs:
         return out
     providers = {aid: _provider(aid) for aid in by_account}     # a bad source setting is a ValueError (Unmeasurable)
-    now = datetime.now()
+    now = end or datetime.now()
     slots =sum(1 for _ in range(min(WORKERS, len(jobs))) if _SLOTS.acquire(blocking=False))
     if slots == 0:
         raise PriceSourceUnreachable("The price source is busy: every download slot is in use",

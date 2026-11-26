@@ -51,7 +51,7 @@ def _data():
 def _render(client, loader=None, **kw):
     async def run():
         with client:
-            tab = tab_mod.PositionHeatmapTab(loader=loader or (lambda aid, now, timing: _data()),
+            tab = tab_mod.PositionHeatmapTab(loader=loader or (lambda aid, now, timing, progress=None: _data()),
                                              now_fn=lambda: NOW, account_id_fn=lambda: None,
                                              storage_port=8080, **kw)
             await tab._task
@@ -101,13 +101,13 @@ def test_a_change_is_remembered_and_keeps_other_accounts_experts(nicegui_client,
 def test_the_caption_issue_list_and_quantity_differences_are_drawn(nicegui_client, storage):
     tab = _render(nicegui_client)
     assert '1 option position excluded' in tab._caption.text
-    assert 'opened through the platform' in tab._caption.text
+    assert 'held at the broker' in tab._caption.text
     assert any('MSFT: no market cap' in t for t in _texts(tab._issues_box))
     assert any('AAPL' in t and '10' in t and '12' in t for t in _texts(tab._mismatch_box))
 
 
 def test_a_failed_load_says_so_and_redacts_secrets(nicegui_client, storage):
-    def boom(aid, now, timing):
+    def boom(aid, now, timing, progress=None):
         raise ConnectionError('GET https://x/api?apikey=SECRET123 failed')
 
     tab = _render(nicegui_client, loader=boom)
@@ -129,7 +129,7 @@ def test_a_load_that_never_returns_ends_in_a_timeout_status(nicegui_client, stor
     monkeypatch.setattr(tab_mod, 'LOAD_DEADLINE_S', 0.2)
     release = threading.Event()
 
-    def hang(aid, now, timing):
+    def hang(aid, now, timing, progress=None):
         release.wait(1)          # asyncio.run waits for this worker at shutdown: keep it short
         return _data()
 
@@ -144,7 +144,7 @@ def test_a_load_that_never_returns_ends_in_a_timeout_status(nicegui_client, stor
 def test_reload_while_loading_says_so_and_the_button_is_disabled(nicegui_client, storage):
     release = threading.Event()
 
-    def slow(aid, now, timing):
+    def slow(aid, now, timing, progress=None):
         release.wait(5)
         return _data()
 
@@ -166,3 +166,26 @@ def test_reload_while_loading_says_so_and_the_button_is_disabled(nicegui_client,
     assert disabled_while_loading and same_task
     assert 'Already loading' in said
     assert tab._reload_btn.enabled
+
+
+def test_the_status_line_shows_the_loads_progress(nicegui_client, storage):
+    release = threading.Event()
+
+    def slow(aid, now, timing, progress=None):
+        progress('Reading history: 3 of 5 symbols')
+        release.wait(5)
+        return _data()
+
+    async def run():
+        with nicegui_client:
+            tab = tab_mod.PositionHeatmapTab(loader=slow, now_fn=lambda: NOW, account_id_fn=lambda: None,
+                                             storage_port=8080)
+            await asyncio.sleep(0.8)
+            shown = tab._status.text
+            release.set()
+            await tab._task
+        return tab, shown
+
+    tab, shown = asyncio.run(run())
+    assert 'Reading history: 3 of 5 symbols' in shown
+    assert tab._status.text == ''

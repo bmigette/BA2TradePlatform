@@ -6,8 +6,17 @@ plain inputs below; everything that decides a number, a colour, a size or a reme
 unit-tested (``tests/test_position_heatmap.py``). The tab (``ui.components.PositionHeatmapTab``) only draws the
 result.
 
-TILES ARE THE PLATFORM'S OPEN TRANSACTIONS (positions opened through the platform), not the broker's own book. Where
-the broker's quantity for a symbol differs from the platform's, the difference is listed (``quantity_mismatches``).
+THE BROKER'S POSITION IS WHAT IS HELD. The owner buys through the platform and directly at the broker, so the
+platform's transactions are not a complete book. Per account and symbol:
+  * all experts: the tile quantity is the BROKER's position (signed); every symbol the broker holds gets a tile; a
+    symbol open on the platform that the broker does not hold gets none and is listed;
+  * an expert filter: a named expert's quantity is its open platform transactions (only the platform can attribute a
+    share to an expert); "No expert" is the broker's quantity MINUS every named expert's transactions. When the
+    experts' records exceed the broker's position nothing is clamped: the experts keep their platform quantity, "No
+    expert" gets none, and the symbol is listed;
+  * an account whose broker positions could not be read falls back to the platform's transaction quantities, and
+    the caption says so for that account.
+The platform-vs-broker quantity differences are listed (``quantity_mismatches``) for information.
 
 Periods (NYSE calendar, ``ba2_common.core.market_calendar``), measured at ``now`` (a tz-aware moment; a bare date
 means "that day, after the close"):
@@ -32,6 +41,17 @@ add up to its open quantity, or its P/L is n/a.
 
 A split dated inside the period makes BOTH metrics n/a: the history is split-adjusted as of its fetch while broker
 prices and the platform's fills are as traded, and nothing here can prove the two are on one basis.
+
+WHOSE FILLS. "My P/L" is computed from the PLATFORM's fills only, for every account type, and only when the platform's
+records cover the broker's whole position for that symbol and account (within ``COVER_TOLERANCE``); otherwise it is
+n/a: "platform records cover X of the broker's Y shares". The broker's own trade history is deliberately not used:
+its depth and completeness differ per broker and cannot be verified here, and a missing execution would silently
+move the start quantity. With an expert filter "My P/L" uses that expert's platform fills, and "No expert" uses the
+platform's no-expert records only when they cover its whole remainder. Dividends and fees are not counted. When a
+symbol's split calendar could not be read, its "My P/L" for a period longer than one session is n/a.
+
+A transaction whose account cannot be resolved is never added to a symbol a broker holds (listed, not counted), and
+a dust position (under 1e-6 shares, or worth under one cent) gets no tile.
 
 Size mode: ``company`` -- the company's market cap (default, like a market heat map); ``exposure`` -- the
 position's market value. An unknown size is a small minimum tile with a neutral border, listed under the chart.
@@ -139,6 +159,10 @@ class MarketInputs:
     splits: Mapping[str, Sequence[date]] = field(default_factory=dict)
     splits_missing: Mapping[str, str] = field(default_factory=dict)
     broker_qty: Mapping[int, Mapping[str, float]] = field(default_factory=dict)
+    #: account -> why its broker positions could not be read (its tiles use the platform's quantities)
+    broker_failed: Mapping[int, str] = field(default_factory=dict)
+    #: account -> option rows in its broker positions (excluded, counted)
+    broker_option_rows: Mapping[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -182,6 +206,8 @@ class HeatmapView:
     options_excluded: int = 0
     #: (symbol, account, platform qty, broker qty) where they differ -- whole account, every expert
     quantity_mismatches: List[Tuple[str, int, float, float]] = field(default_factory=list)
+    #: per-account notes for the caption (a broker book that could not be read)
+    broker_notes: List[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -304,31 +330,69 @@ def _symbol_labels(labels: Mapping[str, Sequence[str]], symbol: str) -> Tuple[st
     return found or (UNLABELED,)
 
 
-def available_experts(lots: Iterable[Lot]) -> List[str]:
-    """Expert keys present in ``lots``, sorted, with :data:`NO_EXPERT` last."""
+#: Platform records "cover" a position when they match it within this fraction (fractional shares round).
+COVER_TOLERANCE = 1e-4
+#: A position under this many shares, or worth under this many dollars, is dust: no tile.
+DUST_QTY = 1e-6
+DUST_VALUE = 0.01
+
+
+def _signed_qty(lot: Lot) -> float:
+    return lot.quantity if lot.direction == "long" else -lot.quantity
+
+
+def _tol(target: float) -> float:
+    return max(_EPS, COVER_TOLERANCE * abs(target))
+
+
+def _named_quantities(lots: Iterable[Lot], account_id: int) -> Dict[str, float]:
+    """``{symbol: signed qty}`` of the NAMED experts' open equity transactions on ``account_id``."""
+    out: Dict[str, float] = {}
+    for l in lots:
+        if l.account_id == account_id and not l.is_option and l.expert != NO_EXPERT and _positive(l.quantity):
+            out[l.symbol] = out.get(l.symbol, 0.0) + _signed_qty(l)
+    return out
+
+
+def _has_no_expert_share(lots: Sequence[Lot], market: MarketInputs) -> bool:
+    for account_id, book in market.broker_qty.items():
+        named = _named_quantities(lots, account_id)
+        for symbol, qty in book.items():
+            q = _finite(qty)
+            if q is not None and abs(q - (named[symbol] if symbol in named else 0.0)) > _tol(q):
+                return True
+    return False
+
+
+def available_experts(lots: Iterable[Lot], market: Optional[MarketInputs] = None) -> List[str]:
+    """Expert keys to offer, sorted, with :data:`NO_EXPERT` last: the experts of ``lots``, plus "No expert" when a
+    broker position holds shares no named expert's transactions account for."""
+    lots = list(lots)
     keys = {l.expert for l in lots}
+    if market is not None and _has_no_expert_share(lots, market):
+        keys.add(NO_EXPERT)
     return sorted(k for k in keys if k != NO_EXPERT) + ([NO_EXPERT] if NO_EXPERT in keys else [])
 
 
-def available_labels(lots: Iterable[Lot], labels: Mapping[str, Sequence[str]]) -> List[str]:
-    """Labels of the symbols in ``lots``, sorted, with :data:`UNLABELED` last."""
-    keys = {lbl for l in lots for lbl in _symbol_labels(labels, l.symbol)}
+def available_labels(lots: Iterable[Lot], labels: Mapping[str, Sequence[str]],
+                     market: Optional[MarketInputs] = None) -> List[str]:
+    """Labels of the symbols in ``lots`` and in the broker positions, sorted, with :data:`UNLABELED` last."""
+    symbols = {l.symbol for l in lots}
+    if market is not None:
+        symbols |= {s for book in market.broker_qty.values() for s in book}
+    keys = {lbl for s in symbols for lbl in _symbol_labels(labels, s)}
     return sorted(k for k in keys if k != UNLABELED) + ([UNLABELED] if UNLABELED in keys else [])
 
 
-def _in_scope(lot: Lot, state: HeatmapState, labels: Mapping[str, Sequence[str]]) -> bool:
-    if state.experts and lot.expert not in state.experts:
-        return False
-    if state.labels and not set(_symbol_labels(labels, lot.symbol)) & set(state.labels):
-        return False
-    return True
+def _label_ok(symbol: str, state: HeatmapState, labels: Mapping[str, Sequence[str]]) -> bool:
+    return not state.labels or bool(set(_symbol_labels(labels, symbol)) & set(state.labels))
 
 
 # --------------------------------------------------------------------------------------------------------------
 # the maths
 # --------------------------------------------------------------------------------------------------------------
 
-def _signed(fill: Fill) -> float:
+def _signed(fill) -> float:
     return fill.qty if fill.side == "BUY" else -fill.qty
 
 
@@ -367,6 +431,38 @@ def _lot_pnl(lot: Lot, price: float, ref: Optional[float], start: date) -> Tuple
     return pnl, abs(start_value) + opening, None
 
 
+def _lots_pnl(lots: Sequence[Lot], price: float, ref: Optional[float], start: date):
+    total, denom = 0.0, 0.0
+    for l in lots:
+        amount, base, why = _lot_pnl(l, price, ref, start)
+        if why is not None:
+            return None, None, why
+        total += amount
+        denom += base
+    return total, denom, None
+
+
+@dataclass
+class _Part:
+    """One account's share of a symbol's tile. ``mode``: ``lots`` (these platform lots ARE the quantity) or ``cover``
+    (a broker quantity: the platform lots must cover ``qty`` for "My P/L")."""
+    account_id: Optional[int]
+    qty: float
+    mode: str
+    lots: Tuple[Lot, ...] = ()
+    experts: Tuple[str, ...] = ()
+    whose: str = "the broker's"
+
+
+def _part_pnl(symbol: str, part: _Part, market: MarketInputs, price: float, ref: Optional[float], start: date):
+    if part.mode == "lots":
+        return _lots_pnl(part.lots, price, ref, start)
+    mine = sum(_signed_qty(l) for l in part.lots)
+    if abs(mine - part.qty) > _tol(part.qty):
+        return None, None, f"platform records cover {abs(mine):g} of {part.whose} {abs(part.qty):g} shares"
+    return _lots_pnl(part.lots, price, ref, start)
+
+
 def _quantity_mismatches(lots: Sequence[Lot], broker_qty: Mapping[int, Mapping[str, float]]
                          ) -> List[Tuple[str, int, float, float]]:
     platform: Dict[Tuple[int, str], float] = {}
@@ -389,6 +485,89 @@ def _quantity_mismatches(lots: Sequence[Lot], broker_qty: Mapping[int, Mapping[s
     return sorted(out, key=lambda m: (m[0], m[1]))
 
 
+def _holdings(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState):
+    """``({symbol: [parts]}, issues, options excluded)`` for ``state`` -- see the module docstring for the rules."""
+    parts: Dict[str, List[_Part]] = {}
+    issues: List[Tuple[str, str]] = []
+    labels = market.labels
+
+    def expert_ok(name: str) -> bool:
+        return not state.experts or name in state.experts
+
+    equity, options = [], []
+    for l in lots:
+        if l.is_option:
+            options.append(l)
+        elif _positive(l.quantity) is None:
+            if expert_ok(l.expert) and _label_ok(l.symbol, state, labels):
+                issues.append((l.symbol, f"transaction {l.transaction_id} has no open quantity; not drawn"))
+        else:
+            equity.append(l)
+
+    for acct in sorted(market.broker_qty):
+        book = {s: q for s, q in ((s, _finite(q)) for s, q in market.broker_qty[acct].items()) if q is not None}
+        acct_lots = [l for l in equity if l.account_id == acct]
+        for sym in sorted(set(book) | {l.symbol for l in acct_lots}):
+            if not _label_ok(sym, state, labels):
+                continue
+            b = book[sym] if sym in book else 0.0
+            sym_lots = [l for l in acct_lots if l.symbol == sym]
+            named = [l for l in sym_lots if l.expert != NO_EXPERT]
+            unnamed = [l for l in sym_lots if l.expert == NO_EXPERT]
+            expert_q = sum(_signed_qty(l) for l in named)
+            held = abs(b) > _EPS
+            exceed = abs(expert_q) > _EPS and (not held or b * expert_q < 0 or abs(expert_q) > abs(b) + _tol(b))
+            exceed_why = f"experts' records exceed the broker's position (platform {expert_q:g}, broker {b:g})"
+            not_held_why = (f"open on the platform ({sum(_signed_qty(l) for l in sym_lots):g}), "
+                            f"not held at the broker (account {acct})")
+            remainder = b - expert_q
+            if not state.experts:
+                if not held:
+                    if sym_lots:
+                        issues.append((sym, not_held_why))
+                    continue
+                if exceed:
+                    issues.append((sym, exceed_why))
+                experts = tuple(sorted({l.expert for l in named}))
+                if not exceed and abs(remainder) > _tol(b):
+                    experts += (NO_EXPERT,)
+                parts.setdefault(sym, []).append(_Part(acct, b, "cover", tuple(sym_lots), experts))
+                continue
+            chosen = [l for l in named if l.expert in state.experts]
+            if exceed and (chosen or NO_EXPERT in state.experts):
+                issues.append((sym, exceed_why))
+            if chosen:
+                parts.setdefault(sym, []).append(_Part(acct, sum(_signed_qty(l) for l in chosen), "lots",
+                                                       tuple(chosen), tuple(sorted({l.expert for l in chosen}))))
+            if NO_EXPERT in state.experts and not exceed:
+                if abs(remainder) > _tol(b):
+                    parts.setdefault(sym, []).append(_Part(acct, remainder, "cover", tuple(unnamed), (NO_EXPERT,),
+                                                           "the No-expert"))
+                elif unnamed and not held:
+                    issues.append((sym, not_held_why))
+
+    # accounts whose broker book was not read (failed, or a transaction whose account is unknown): platform quantities
+    held_somewhere = {s for book in market.broker_qty.values() for s, q in book.items()
+                      if _finite(q) is not None and abs(_finite(q)) > _EPS}
+    for l in equity:
+        if l.account_id in market.broker_qty or not expert_ok(l.expert) or not _label_ok(l.symbol, state, labels):
+            continue
+        if l.account_id is None and l.symbol in held_somewhere:
+            issues.append((l.symbol, f"transaction {l.transaction_id} has no account: not counted"))
+            continue
+        parts.setdefault(l.symbol, []).append(_Part(l.account_id, _signed_qty(l), "lots", (l,), (l.expert,)))
+
+    if not state.experts:
+        with_rows = {a for a, n in market.broker_option_rows.items() if n and a in market.broker_qty}
+        excluded = sum(market.broker_option_rows[a] for a in with_rows)
+        excluded += len({l.transaction_id for l in options
+                         if l.account_id not in with_rows and _label_ok(l.symbol, state, labels)})
+    else:
+        excluded = len({l.transaction_id for l in options
+                        if l.expert in state.experts and _label_ok(l.symbol, state, labels)})
+    return parts, issues, excluded
+
+
 def build_view(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState, now: Moment) -> HeatmapView:
     """The tiles, the issues, the excluded-option count and the quantity differences for ``state`` at ``now``."""
     start = period_start(state.timeframe, now)
@@ -396,22 +575,18 @@ def build_view(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState, n
     view = HeatmapView(state=state, period_start=start, reference_session=ref_day, clamp=CLAMP_PCT[state.timeframe],
                        today_status=today_status(now)[0])
     view.quantity_mismatches = _quantity_mismatches(lots, market.broker_qty)
-    scoped = [l for l in lots if _in_scope(l, state, market.labels)]
-    view.options_excluded = len({l.transaction_id for l in scoped if l.is_option})
-
-    by_symbol: Dict[str, List[Lot]] = {}
-    issues: List[Tuple[str, str]] = []
-    for l in scoped:
-        if l.is_option:
-            continue
-        if _positive(l.quantity) is None:
-            issues.append((l.symbol, f"transaction {l.transaction_id} has no open quantity; not drawn"))
-            continue
-        by_symbol.setdefault(l.symbol, []).append(l)
+    view.broker_notes = [f"Account {a}: the broker's positions could not be read ({why}); its tiles use the "
+                         f"platform's transaction quantities." for a, why in sorted(market.broker_failed.items())]
+    parts, issues, view.options_excluded = _holdings(lots, market, state)
 
     today = _split_moment(now)[0]
-    for symbol in sorted(by_symbol):
-        tile, tile_issues = _tile(symbol, by_symbol[symbol], market, state, start, ref_day, today)
+    for symbol in sorted(parts):
+        gross = sum(abs(p.qty) for p in parts[symbol])
+        price = _positive(market.prices.get(symbol))
+        if gross < DUST_QTY or (price is not None and gross * price < DUST_VALUE):
+            issues.append((symbol, f"dust position ({gross:g} shares): not drawn"))
+            continue
+        tile, tile_issues = _tile(symbol, parts[symbol], market, state, start, ref_day, today)
         view.tiles.append(tile)
         issues.extend((symbol, why) for why in tile_issues)
 
@@ -420,11 +595,11 @@ def build_view(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState, n
     for t in view.tiles:
         if not t.size_known:
             t.size = floor
-    view.issues = sorted(issues, key=lambda i: i[0])
+    view.issues = sorted(dict.fromkeys(issues), key=lambda i: i[0])
     return view
 
 
-def _tile(symbol: str, lots: List[Lot], market: MarketInputs, state: HeatmapState, start: date,
+def _tile(symbol: str, parts: List[_Part], market: MarketInputs, state: HeatmapState, start: date,
           ref_day: date, today: date) -> Tuple[Tile, List[str]]:
     issues: List[str] = []
     price = _positive(market.prices.get(symbol))
@@ -441,19 +616,22 @@ def _tile(symbol: str, lots: List[Lot], market: MarketInputs, state: HeatmapStat
     split_issue = (f"split on {split_days[0].isoformat()} inside the period: history and broker prices may be on "
                    f"different bases" if split_days else None)
 
-    net = sum((l.quantity if l.direction == "long" else -l.quantity) for l in lots)
-    gross = sum(l.quantity for l in lots)
+    net = sum(p.qty for p in parts)
+    gross = sum(abs(p.qty) for p in parts)
     value = gross * price if price is not None else None
     change = (price / ref - 1.0) * 100.0 if price is not None and ref is not None and not split_issue else None
 
     pnl = pnl_pct = None
     pnl_issue = split_issue
-    if split_issue:
+    if not split_issue and symbol in market.splits_missing and state.timeframe != "today":
+        pnl_issue = (f"split calendar unavailable ({market.splits_missing[symbol]}): My P/L cannot rule out a split "
+                     f"in a period longer than one session")
+    if pnl_issue:
         pass
     elif price is not None:
         total, denom = 0.0, 0.0
-        for l in lots:
-            amount, base, why = _lot_pnl(l, price, ref, start)
+        for part in parts:
+            amount, base, why = _part_pnl(symbol, part, market, price, ref, start)
             if why is not None:
                 pnl_issue = ref_issue if why == _NO_REFERENCE else why
                 total = None
@@ -493,7 +671,8 @@ def _tile(symbol: str, lots: List[Lot], market: MarketInputs, state: HeatmapStat
             issues.append(price_issue)
         size = value if size_known else 0.0
 
-    experts = tuple(sorted({l.expert for l in lots}))
+    names = {e for p in parts for e in p.experts}
+    experts = tuple(sorted(n for n in names if n != NO_EXPERT)) + ((NO_EXPERT,) if NO_EXPERT in names else ())
     tile = Tile(symbol=symbol, quantity=net, current_price=price, reference_close=ref, market_value=value,
                 market_cap=mcap, price_change_pct=change, pnl_amount=pnl, pnl_pct=pnl_pct, color_pct=color_pct,
                 size=size, size_known=size_known, experts=experts, labels=_symbol_labels(market.labels, symbol))
@@ -712,12 +891,15 @@ def caption(view: HeatmapView) -> str:
             if s.size == "company" else "my position value, |quantity| x current price (My exposure)")
     metric = ("Price change - current price vs that close" if s.metric == "price"
               else "My P/L - my position's profit or loss since that close, counting buys and sells made since")
-    parts = ["Tiles: positions opened through the platform (its open transactions), not the broker's own book.",
+    parts = ["Tiles: what is held at the broker; expert split from the platform's records.",
              f"Size: {size}.",
              f"Colour: {metric}. Period: {TIMEFRAMES[s.timeframe]}, from the close of "
              f"{view.reference_session.isoformat()}. Red <= -{view.clamp:g}%, green >= +{view.clamp:g}%."]
+    if s.metric == "pnl":
+        parts.append("My P/L does not count dividends and fees.")
     if s.timeframe == "today":
         parts.append(_today_sentence(view))
+    parts.extend(view.broker_notes)
     if view.options_excluded:
         n = view.options_excluded
         parts.append(f"{n} option position{'s' if n != 1 else ''} excluded (option contracts have no daily "

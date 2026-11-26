@@ -55,6 +55,14 @@ class LoadBreakdown:
         finally:
             entry.seconds = self._clock() - began
 
+    def add(self, name: str, seconds: float, note: Optional[str] = None) -> Step:
+        """A step timed ELSEWHERE (it ran in its own thread, in parallel with the steps around it): reported with its
+        own wall time. ``untimed`` then never goes below zero, since parallel steps can add up to more than the load."""
+        entry = Step(name, note)
+        entry.seconds = seconds
+        self._steps.append(entry)
+        return entry
+
     def summary(self) -> str:
         total = self._clock() - self._start
         untimed = max(0.0, total - sum(s.seconds for s in self._steps))
@@ -78,6 +86,12 @@ def rows_note(rows) -> str:
         return f"{len(rows)} rows"
     except TypeError:
         return type(rows).__name__
+
+
+def add(breakdown: Optional[LoadBreakdown], name: str, seconds: float, note: Optional[str] = None) -> None:
+    """``breakdown.add(...)``, or nothing when the caller has no breakdown (``None``)."""
+    if breakdown is not None:
+        breakdown.add(name, seconds, note)
 
 
 @contextmanager

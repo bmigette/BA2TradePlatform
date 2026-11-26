@@ -30,6 +30,8 @@ from ..utils import position_heatmap as hm
 
 #: The whole load (the service bounds each broker / source itself; this is the backstop).
 LOAD_DEADLINE_S = 120.0
+#: How often the status line shows the load's progress.
+PROGRESS_POLL_S = 0.5
 
 
 def _port() -> Optional[int]:
@@ -58,9 +60,9 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _default_loader(account_id, now, timing):
+def _default_loader(account_id, now, timing, progress=None):
     from ...services.position_heatmap import load_heatmap_data
-    return load_heatmap_data(account_id, now, timing=timing)
+    return load_heatmap_data(account_id, now, timing=timing, progress=progress)
 
 
 def _default_account_id() -> Optional[int]:
@@ -73,7 +75,8 @@ def _why(e: BaseException) -> str:
 
 
 class PositionHeatmapTab:
-    """``loader(account_id, now, timing) -> services.position_heatmap.HeatmapData``; injectable (the demo)."""
+    """``loader(account_id, now, timing, progress) -> services.position_heatmap.HeatmapData``; injectable (the demo).
+    ``progress(text)`` is called from the worker thread with the step it is on."""
 
     CHART_HEIGHT = '560px'
 
@@ -159,8 +162,7 @@ class PositionHeatmapTab:
         timing = LoadBreakdown('Heatmap', f'account={self._account_id}')
         try:
             now = self._now_fn()
-            data = await asyncio.wait_for(asyncio.to_thread(self._loader, self._account_id, now, timing),
-                                          timeout=LOAD_DEADLINE_S)
+            data = await self._run_loader(now, timing)
             self._apply(data, now)
         except asyncio.TimeoutError:
             logger.error(f"Heatmap: the load did not finish within {LOAD_DEADLINE_S:.0f}s")
@@ -178,6 +180,31 @@ class PositionHeatmapTab:
             self._set_busy(False)
             timing.log()
 
+    async def _run_loader(self, now, timing):
+        """The loader in a worker thread, bounded by ``LOAD_DEADLINE_S``. While it runs, the step it reports through
+        ``progress`` (the worker only stores the text) is copied to the status line every ``PROGRESS_POLL_S``."""
+        progress_box = {'text': None}
+
+        def progress(text):
+            progress_box['text'] = text
+
+        loop = asyncio.get_running_loop()
+        ends = loop.time() + LOAD_DEADLINE_S
+        work = asyncio.ensure_future(asyncio.to_thread(self._loader, self._account_id, now, timing, progress))
+        shown = None
+        while True:
+            left = ends - loop.time()
+            if left <= 0:
+                work.cancel()                  # the worker thread finishes on its own; its result is dropped
+                raise asyncio.TimeoutError
+            done, _pending = await asyncio.wait({work}, timeout=min(PROGRESS_POLL_S, left))
+            if done:
+                return work.result()
+            text = progress_box['text']
+            if text and text != shown:
+                shown = text
+                self._set_status(text)
+
     def _clear_chart(self):
         try:
             self._chart_box.clear()
@@ -186,8 +213,8 @@ class PositionHeatmapTab:
 
     def _apply(self, data, now):
         self._data, self._now = data, now
-        self._experts = hm.available_experts(data.lots)
-        self._labels = hm.available_labels(data.lots, data.market.labels)
+        self._experts = hm.available_experts(data.lots, data.market)
+        self._labels = hm.available_labels(data.lots, data.market.labels, data.market)
         self._state = hm.resolve_state(self._stored, self._experts, self._labels)
         self._syncing = True
         try:

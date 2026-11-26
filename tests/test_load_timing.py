@@ -52,6 +52,21 @@ def test_a_step_that_raises_is_still_timed_and_says_so():
     assert b.summary() == "[PERF:page:load] AccountGrowth - 2000ms (positions 2000ms [FAILED: RuntimeError] | untimed 0ms)"
 
 
+def test_a_step_timed_in_another_thread_is_added_with_its_own_time():
+    """A step that ran in parallel (its own thread) reports its real wall time, not the time spent joining it."""
+    clock = Clock()
+    b = LoadBreakdown("Heatmap", clock=clock)
+    with b.step("history"):
+        clock.t += 3
+    b.add("market caps (parallel)", 1.5, "125 symbols")
+    assert b.summary() == ("[PERF:page:load] Heatmap - 3000ms "
+                           "(history 3000ms | market caps (parallel) 1500ms [125 symbols] | untimed 0ms)")
+
+
+def test_adding_to_no_breakdown_does_nothing():
+    load_timing.add(None, "market caps", 1.0, "ignored")
+
+
 def test_log_writes_the_summary_once_as_one_info_line(perf_lines):
     clock = Clock()
     b = LoadBreakdown("AccountGrowth", clock=clock)

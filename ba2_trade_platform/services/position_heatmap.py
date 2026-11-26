@@ -23,8 +23,15 @@ WHERE EACH NUMBER COMES FROM (the same sources the other Overview views use):
   * labels -- ``Instrument.labels`` (``core.utils.get_labels_by_symbol``), the portfolio allocator's labels.
 
 BOUNDS. Each account's broker work runs in its own thread under ``BROKER_DEADLINE_S`` (a hung IBKR Gateway or
-TastyTrade session marks that account "timed out"); the history reads share ``HISTORY_BUDGET_S``; market caps and
-splits each run under ``MARKET_DATA_DEADLINE_S``. The tab adds an overall bound on top.
+TastyTrade session marks that account "timed out"); the history reads share ``HISTORY_BUDGET_S``; the market caps
+run in their own thread WHILE the history is read; the split calendar is read AFTER it (the history refresh fills the
+same memo), at most ``price_history.MAX_CONCURRENT`` requests at a time ON THE HISTORY PATH'S SHARED download
+slots, and keeps every calendar that arrived within
+``MARKET_DATA_DEADLINE_S`` (only the rest are "not checked"). The tab adds an overall bound on top.
+
+TIMING. One ``[PERF:page:load] Heatmap(...)`` line per load: every step with its own wall time (the parallel market
+caps included) and counts -- symbols read / cache or memo hits / failed / timed out -- so one line explains a slow
+load. ``progress(text)`` reports the running step to the tab's status line.
 
 CACHES. Reference closes are kept per (history source, symbol) for ``CLOSES_TTL_S`` and never across a regular
 session close (the next session's reference close would be missing). Concurrent loads of the same scope (two browser
@@ -45,15 +52,17 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from sqlmodel import and_, or_, select
 
 from ba2_common.config import get_app_setting
-from ba2_common.core.market_calendar import nyse_regular_sessions
+from ba2_common.core.market_calendar import NY_TZ, nyse_regular_sessions
 
 from ..core.db import get_db
 from ..core.models import ExpertInstance, TradingOrder, Transaction
 from ..core.types import AssetClass, OrderDirection, OrderStatus, OrderType
-from ..core.utils import get_account_instance_from_id, get_labels_by_symbol, normalize_symbol
+from ..core.utils import get_account_instance_from_id, get_labels_by_symbol
 from ..logger import logger
-from ..ui.utils.position_heatmap import NO_EXPERT, Fill, Lot, MarketInputs, history_start, warm_calendar
+from ..ui.utils.position_heatmap import (NO_EXPERT, TIMEFRAMES, Fill, Lot, MarketInputs, reference_session,
+                                        warm_calendar)
 from . import price_history
+from .errors import PriceSourceUnreachable
 from ._positions_cache import read_positions, share_positions
 from .account_scope import account_transaction_ids
 from .accounts import broker_read
@@ -66,6 +75,11 @@ BROKER_DEADLINE_S = 15.0
 HISTORY_BUDGET_S = 45.0
 #: The market caps, and separately the split calendars.
 MARKET_DATA_DEADLINE_S = 20.0
+#: How long to wait before asking a BUSY history source again (every shared download slot in use).
+HISTORY_BUSY_RETRY_S = 1.0
+HISTORY_BUSY = "history busy, reload"
+#: A history read is not started with less time than this left in the budget.
+MIN_HISTORY_READ_S = 0.2
 #: How long a symbol's fetched closes are reused (and never across a regular session close).
 CLOSES_TTL_S = 4 * 3600.0
 #: Market caps change slowly; one day is fresh enough (one FMP call per 100 uncached symbols per day).
@@ -82,29 +96,13 @@ class HeatmapData:
     calls: Dict[str, int] = field(default_factory=dict)
 
 
-class _Deadline(Exception):
-    pass
-
-
-def _call_with_deadline(fn: Callable, timeout_s: float, name: str):
-    """``fn()`` in a daemon thread; ``_Deadline`` when it has not returned after ``timeout_s`` (it keeps running and
-    its result is dropped). Its exception is re-raised here."""
-    box: Dict[str, object] = {}
-
-    def run():
-        try:
-            box["value"] = fn()
-        except BaseException as e:  # noqa: BLE001 -- re-raised in the caller's thread
-            box["error"] = e
-
-    t = threading.Thread(target=run, daemon=True, name=name)
-    t.start()
-    t.join(max(0.0, timeout_s))
-    if t.is_alive():
-        raise _Deadline(f"{name} did not answer within {timeout_s:.0f}s")
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
+def _canonical(raw) -> str:
+    """ONE spelling per instrument, for every map this load builds: the repo's canonicaliser
+    (``ba2_providers.screener.symbol_universe.canonical_symbol``, ``BRK.B`` -> ``BRK-B``) -- the spelling of FMP and of
+    the Alpaca history store. Alpaca and IBKR (``ibkr_mapping.from_ib_symbol``) report a share class with a dot,
+    TastyTrade passes its own symbol through (a slash, ``BRK/B``): the slash is read as the dot first."""
+    from ba2_providers.screener.symbol_universe import canonical_symbol
+    return canonical_symbol(raw.replace("/", ".")) if isinstance(raw, str) else ""
 
 
 def _positive(value) -> Optional[float]:
@@ -169,7 +167,7 @@ def lots_from_rows(transactions: Sequence[Transaction], orders_of: Dict[int, Lis
             expert = NO_EXPERT
         else:                                 # an id with no ExpertInstance row is named, not folded into NO_EXPERT
             expert = expert_names[tx.expert_id] if tx.expert_id in expert_names else f"expert {tx.expert_id} (no instance row)"
-        lots.append(Lot(transaction_id=tx.id, symbol=normalize_symbol(tx.symbol) or tx.symbol, expert=expert,
+        lots.append(Lot(transaction_id=tx.id, symbol=_canonical(tx.symbol) or tx.symbol, expert=expert,
                         direction=direction, quantity=tx.quantity, fills=tuple(fills),
                         is_option=tx.asset_class == AssetClass.OPTION, account_id=account_of.get(tx.id)))
     return lots
@@ -218,7 +216,8 @@ def fetch_market_caps(symbols: Iterable[str], *, quote_fn: Optional[Callable] = 
 
     Only uncached symbols are requested, 100 per call. A row without a finite positive ``marketCap`` (an ETF often
     has none) is missing, never a 0; a failed call marks its chunk. Only real values are cached, so a missing one is
-    asked again on the next load. ``calls`` (when given) must carry ``fmp_quote_calls``."""
+    asked again on the next load. ``calls`` (when given) must carry ``fmp_quote_calls`` and
+    ``market_cap_cache_hits``."""
     from ba2_providers.fmp_common import FMP_LIVE_CACHE_MISS, fmp_live_cache_get, fmp_live_cache_put, redact
     from ..core.fmp_live_price import FMP_QUOTE_BATCH, fetch_fmp_quote_rows, to_fmp_symbol
 
@@ -229,6 +228,8 @@ def fetch_market_caps(symbols: Iterable[str], *, quote_fn: Optional[Callable] = 
         hit = fmp_live_cache_get(_CAP_KEY.format(to_fmp_symbol(s)), MARKET_CAP_TTL_S)
         if hit is not FMP_LIVE_CACHE_MISS:
             caps[s] = hit
+            if calls is not None:
+                calls["market_cap_cache_hits"] += 1
         else:
             to_ask.setdefault(to_fmp_symbol(s), []).append(s)
     if not to_ask:
@@ -265,28 +266,99 @@ def fetch_market_caps(symbols: Iterable[str], *, quote_fn: Optional[Callable] = 
     return caps, missing
 
 
-def fetch_split_days(symbols: Iterable[str], *, calls: Optional[Dict[str, int]] = None
+def fetch_split_days(symbols: Iterable[str], *, calls: Optional[Dict[str, int]] = None,
+                     deadline_s: float = None, workers: int = None,
+                     progress: Optional[Callable[[str], None]] = None
                      ) -> Tuple[Dict[str, List[date]], Dict[str, str]]:
-    """``({symbol: [split dates]}, {symbol: why unknown})`` from FMP's split calendar (``symbol_info.fetch_splits``,
-    1-day memo). Every dated split counts, its ratio known or not."""
+    """``({symbol: [split dates]}, {symbol: why unknown})`` from FMP's split calendar (``symbol_info.fetch_splits``:
+    one FMP request per symbol through ``fmp_http_get``, 1-day memo). Every dated split counts, its ratio known or not.
+
+    A symbol whose calendar is already in the memo (the FMP history provider's daily refresh puts it there) is a memo
+    hit. The rest are read by at most ``price_history.MAX_CONCURRENT`` threads, each request holding one of the
+    history path's shared download slots. PARTIAL on timeout: after ``deadline_s`` every
+    calendar that arrived is returned; only the symbols still unanswered are "did not answer". ``calls`` (when given)
+    must carry ``split_calendar_reads``, ``split_memo_hits`` and ``split_timed_out``."""
     from ba2_providers import symbol_info
-    from ba2_providers.fmp_common import redact
+    from ba2_providers.fmp_common import FMP_LIVE_CACHE_MISS, fmp_live_cache_get, redact
     from ..core.fmp_live_price import to_fmp_symbol
 
+    deadline_s = MARKET_DATA_DEADLINE_S if deadline_s is None else deadline_s
+    workers = price_history.MAX_CONCURRENT if workers is None else min(workers, price_history.MAX_CONCURRENT)
+    ends = time.monotonic() + deadline_s
+    stop = threading.Event()
     wanted = list(dict.fromkeys(symbols))
+    if not wanted:
+        return {}, {}
     api_key = get_app_setting("FMP_API_KEY")
     if not api_key:
         return {}, {s: "FMP_API_KEY is not configured" for s in wanted}
+    lock = threading.Lock()
     out: Dict[str, List[date]] = {}
     missing: Dict[str, str] = {}
-    for s in wanted:
+    done = threading.Event()
+    state = {"finished": 0}
+
+    def count(key):
         if calls is not None:
-            calls["split_calendar_reads"] += 1
+            with lock:
+                calls[key] += 1
+
+    def read(s):
         try:
-            out[s] = [e.date for e in symbol_info.parse_splits(symbol_info.fetch_splits(api_key, to_fmp_symbol(s)))]
+            got = [e.date for e in symbol_info.parse_splits(symbol_info.fetch_splits(api_key, to_fmp_symbol(s)))]
         except Exception as e:  # noqa: BLE001 -- deliberate: one symbol's calendar failing is that symbol's note
-            missing[s] = f"the FMP split calendar failed ({type(e).__name__}: {redact(str(e))})"
-    return out, missing
+            got, why = None, f"the FMP split calendar failed ({type(e).__name__}: {redact(str(e))})"
+        with lock:
+            if got is None:
+                missing[s] = why
+            else:
+                out[s] = got
+            state["finished"] += 1
+            finished = state["finished"]
+            if finished == len(wanted):
+                done.set()
+        if progress is not None:
+            progress(f"Checking splits: {finished} of {len(wanted)} symbols")
+
+    queue = []
+    for s in wanted:
+        # The memo key of ``symbol_info.fetch_splits`` (pinned by test_a_split_calendar_the_history_read_...): a hit
+        # is read straight away, the rest go to the pool.
+        if fmp_live_cache_get(f"{symbol_info._KEY_PREFIX}:stock_split:{to_fmp_symbol(s).upper()}",
+                              symbol_info.CACHE_TTL_SECONDS) is not FMP_LIVE_CACHE_MISS:
+            count("split_memo_hits")
+            read(s)
+        else:
+            queue.append(s)
+    pending = list(queue)
+    if queue:
+        def worker():
+            # Each request holds one of the history path's SHARED download slots (``price_history.download_slot``):
+            # the process-wide cap on calls against the FMP key is never exceeded, whoever else is downloading.
+            # After the deadline nothing new starts.
+            while not stop.is_set():
+                with price_history.download_slot(ends - time.monotonic()) as slot:
+                    if not slot or stop.is_set():
+                        return
+                    with lock:
+                        if not pending:
+                            return
+                        s = pending.pop(0)
+                    count("split_calendar_reads")
+                    read(s)
+
+        for i in range(min(workers, len(queue))):
+            threading.Thread(target=worker, daemon=True, name=f"heatmap-splits-{i}").start()
+        done.wait(max(0.0, deadline_s))
+        stop.set()
+    with lock:
+        late = [s for s in wanted if s not in out and s not in missing]
+        pending.clear()                        # nothing new starts after the deadline
+        for s in late:
+            missing[s] = f"the split calendar did not answer within {deadline_s:.0f}s"
+        if calls is not None:
+            calls["split_timed_out"] += len(late)
+        return dict(out), dict(missing)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -331,13 +403,75 @@ def _cached_closes(source: str, symbol: str, start: date, now: datetime) -> Opti
     return closes
 
 
-def _closes(symbols_by_account: Dict[int, List[str]], start: date, now: datetime, calls: Dict[str, int]
+def _read_history(account_id: int, symbols: List[str], start: date, end: Optional[datetime], budget_ends: float):
+    """``(closes, {symbol: why missing}, None)`` from ``fetch_closes``, or ``(None, None, reason)`` when the
+    account's source failed as a whole. A BUSY source (every shared download slot in use) is asked again every
+    ``HISTORY_BUSY_RETRY_S`` until ``budget_ends``; still busy then = ``HISTORY_BUSY``, not a failure."""
+    errors: Dict[str, str] = {}
+    while True:
+        try:
+            got = price_history.fetch_closes({account_id: symbols}, start, deadline_s=budget_ends - time.monotonic(),
+                                             errors=errors, end=end)
+            break
+        except PriceSourceUnreachable as e:
+            if not e.detail.get("busy"):
+                reason = price_history.redact_message(f"{type(e).__name__}: {e}")
+                logger.warning(f"Heatmap: daily history of account {account_id} unavailable: {reason}")
+                return None, None, reason
+            if budget_ends - time.monotonic() <= HISTORY_BUSY_RETRY_S:
+                logger.warning(f"Heatmap: daily history of account {account_id}: every download slot stayed busy")
+                return None, None, HISTORY_BUSY
+            time.sleep(HISTORY_BUSY_RETRY_S)
+        except Exception as e:  # noqa: BLE001 -- deliberate: this account's source down = its symbols n/a, with why
+            reason = price_history.redact_message(f"{type(e).__name__}: {e}")
+            logger.warning(f"Heatmap: daily history of account {account_id} unavailable: {reason}")
+            return None, None, reason
+    why: Dict[str, str] = {}
+    for s in symbols:
+        if s in got:
+            continue
+        if s in errors:
+            why[s] = errors[s]
+        elif s in (got.unfetched or []):
+            why[s] = "the history source did not answer in time"
+        else:
+            why[s] = "the history source has no daily closes for it"
+    return dict(got), why, None
+
+
+def _closes(symbols_by_account: Dict[int, List[str]], needed: Sequence[date], now: datetime, calls: Dict[str, int],
+            progress: Optional[Callable[[str], None]] = None
             ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, str]]:
-    """Per account (one source failing marks only its symbols), cache first, within ``HISTORY_BUDGET_S``."""
+    """The daily closes of the ``needed`` reference sessions, per account (one source failing marks only its
+    symbols), cache first, within ``HISTORY_BUDGET_S``.
+
+    FROM DISK FIRST. The first read is PINNED to the newest reference session (a past end date): the history provider
+    serves it from its own daily cache, with no vendor call. Only a symbol whose answer lacks one of the ``needed``
+    closes (its cache file ends before it, or there is none) is read again as a LATEST read, which tops the provider's
+    cache up exactly as before. A LATEST read of every symbol was what made the first load slow: a daily file older
+    than a day, or ANY file while a session is open or settling (once per 10 minutes per symbol), is re-fetched from
+    the vendor, with its split check, even though the heatmap never needs the forming bar.
+
+    Progress is reported per account (``price_history.fetch_closes`` reads one account's symbols in one call)."""
     out: Dict[str, Dict[str, float]] = {}
     missing: Dict[str, str] = {}
+    start = min(needed)
+    wanted_days = {d.isoformat() for d in needed}
+    newest = max(needed)
+    pinned_end = datetime(newest.year, newest.month, newest.day, 23, 59)      # naive, like price_history's now
     budget_ends = time.monotonic() + HISTORY_BUDGET_S
+    busy_seen = False
+    total = len({s for v in symbols_by_account.values() for s in v})
+
+    def report():
+        if progress is not None:
+            progress(f"Reading daily history: {len(out) + len(missing)} of {total} symbols")
+
+    def complete(closes) -> bool:
+        return closes is not None and wanted_days <= set(closes)
+
     for account_id in sorted(symbols_by_account):
+        report()
         symbols = [s for s in symbols_by_account[account_id] if s not in out]
         if not symbols:
             continue
@@ -353,35 +487,52 @@ def _closes(symbols_by_account: Dict[int, List[str]], start: date, now: datetime
             if hit is not None:
                 out[s] = hit
                 missing.pop(s, None)
+                calls["history_cache_hits"] += 1
             else:
                 todo.append(s)
         if not todo:
             continue
-        remaining = budget_ends - time.monotonic()
-        if remaining <= 1.0:
-            missing.update({s: "the history reads ran out of time" for s in todo})
+        if budget_ends - time.monotonic() <= MIN_HISTORY_READ_S:
+            out_of_time = HISTORY_BUSY if busy_seen else "the history reads ran out of time"
+            missing.update({s: out_of_time for s in todo})
             continue
         calls["history_symbols"] += len(todo)
-        errors: Dict[str, str] = {}
-        try:
-            got = price_history.fetch_closes({account_id: todo}, start, deadline_s=remaining, errors=errors)
-        except Exception as e:  # noqa: BLE001 -- deliberate: this account's source down = its symbols n/a, with why
-            reason = price_history.redact_message(f"{type(e).__name__}: {e}")
-            logger.warning(f"Heatmap: daily history of account {account_id} unavailable: {reason}")
-            missing.update({s: reason for s in todo})
+        got, why, failure = _read_history(account_id, todo, start, pinned_end, budget_ends)
+        if failure is not None:
+            busy_seen = busy_seen or failure == HISTORY_BUSY
+            missing.update({s: failure for s in todo})
             continue
+        short = [s for s in todo if not complete(got.get(s))]
+        if short and budget_ends - time.monotonic() > MIN_HISTORY_READ_S:
+            calls["history_topped_up"] += len(short)
+            latest, why_latest, failure = _read_history(account_id, short, start, None, budget_ends)
+            for s in short:
+                if failure is not None:
+                    why[s] = failure
+                elif s in latest:
+                    got[s] = latest[s]
+                    why.pop(s, None)
+                else:
+                    why[s] = why_latest[s]
+        elif short:
+            why.update({s: "the history reads ran out of time" for s in short if s not in got})
         for s in todo:
             if s in got:
                 out[s] = got[s]
-                missing.pop(s, None)
-                with _CLOSES_LOCK:
-                    _CLOSES[(source, s)] = (now, start, got[s])
-            elif s in errors:
-                missing[s] = errors[s]
-            elif s in (got.unfetched or []):
-                missing[s] = "the history source did not answer in time"
+                if complete(got[s]):
+                    missing.pop(s, None)
+                    with _CLOSES_LOCK:
+                        _CLOSES[(source, s)] = (now, start, got[s])
+                elif s in why:
+                    missing[s] = why[s]         # partial closes: the reason a reference close is missing
             else:
-                missing[s] = "the history source has no daily closes for it"
+                missing[s] = why[s]
+                if why[s] == "the history source did not answer in time":
+                    calls["history_timed_out"] += 1
+    calls["history_busy"] = len([s for s, why in missing.items() if why == HISTORY_BUSY])
+    calls["history_failed"] = (len([s for s in missing if s not in out]) - calls["history_timed_out"]
+                               - calls["history_busy"])
+    report()
     return out, missing
 
 
@@ -403,109 +554,170 @@ class _CountingAccount:
         return self._account.get_instrument_current_price(*args, **kwargs)
 
 
-def _broker_quantities(positions) -> Dict[str, float]:
-    """``{symbol: signed qty}`` of the EQUITY positions in a positions read (the platform's Position convention: a
-    short is negative). Option rows and unusable quantities are skipped."""
+def _broker_book(positions) -> Tuple[Dict[str, float], int, Dict[str, str]]:
+    """``({canonical symbol: signed qty} of the EQUITY rows, number of OPTION rows, {canonical: the broker's own
+    spelling})`` of a positions read (the platform's Position convention: a short is negative). Alpaca lists option
+    positions here (``asset_class`` ``us_option``); IBKR and TastyTrade return the equity book only. Unusable
+    quantities are skipped."""
     out: Dict[str, float] = {}
+    spelled: Dict[str, str] = {}
+    options = 0
     for pos in positions:
         row = pos if isinstance(pos, dict) else dict(pos)
-        symbol = normalize_symbol(row.get("symbol"))
-        qty = row.get("qty")
-        if not symbol or "option" in str(row.get("asset_class") or "").lower():
+        raw = row.get("symbol")
+        symbol = _canonical(raw)
+        if not symbol:
             continue
+        if "option" in str(row.get("asset_class") or "").lower():
+            options += 1
+            continue
+        qty = row.get("qty")
         if isinstance(qty, bool) or not isinstance(qty, (int, float)) or not math.isfinite(float(qty)):
             continue
         out[symbol] = out.get(symbol, 0.0) + float(qty)
-    return out
+        spelled.setdefault(symbol, str(raw).strip())
+    return out, options, spelled
 
 
-def _account_work(account_id: int, symbols: List[str], calls: Dict[str, int], lock: threading.Lock):
-    """``(prices, missing, broker_qty or None)`` for one account. ONE positions read; a failed or raised read falls
-    back to the price feed for every symbol (no second read)."""
+def _account_work(account_id: int, raw_symbols: List[str], calls: Dict[str, int], lock: threading.Lock) -> Dict:
+    """One account: ``{prices, missing, book (None = not read), option_rows, failure}``, all keyed by CANONICAL symbol.
+    ONE positions read and, for the platform symbols the broker does not hold, the account's price feed -- nothing
+    else at the broker. A failed or raised positions read falls back to the feed for every symbol (no second read)
+    and is reported as ``failure``. The broker and the feed are asked in THEIR spelling (the platform's stored one for
+    a symbol the broker does not hold); only the answers are canonicalised."""
     account = get_account_instance_from_id(account_id)
     if account is None:
-        return {}, {s: f"account {account_id} cannot be instantiated" for s in symbols}, None
+        why = f"account {account_id} cannot be instantiated"
+        return {"prices": {}, "missing": {_canonical(s): why for s in raw_symbols}, "book": None, "option_rows": 0,
+                "failure": why}
     with lock:
         calls["positions"] += 1
+    failure = None
     with share_positions():
         try:
             positions = broker_read(account_id, "the positions fetch", read_positions, account, account_id)
         except Exception as e:  # noqa: BLE001 -- deliberate: a failed read is priced from the feed, not refused
             logger.warning(f"Heatmap: account {account_id} positions read failed ({type(e).__name__}); "
                            f"pricing from the account price feed")
-            positions = None
+            positions, failure = None, f"the positions read failed ({type(e).__name__})"
     if positions is None:
-        logger.warning(f"Heatmap: account {account_id} returned no positions; pricing from the account price feed")
+        failure = failure or "the positions read returned nothing"
+        logger.warning(f"Heatmap: account {account_id}: {failure}; pricing from the account price feed")
     held = list(positions) if positions is not None else []
+    book, option_rows, spelled = _broker_book(held)
+    held_canonical = set(book)
+    wanted = sorted({s for s in raw_symbols if _canonical(s) not in held_canonical} | set(spelled.values()))
     missing: Dict[str, str] = {}
     try:
-        got = held_position_prices(_CountingAccount(account, calls, lock), account_id, symbols, held)
+        got = held_position_prices(_CountingAccount(account, calls, lock), account_id, wanted, held)
     except Exception as e:  # noqa: BLE001 -- deliberate: the feed failing leaves the broker-held prices standing
         logger.warning(f"Heatmap: account {account_id} price feed failed: {type(e).__name__}: {e}")
-        got = {s: p for s, p in broker_position_prices_from(held).items() if s in symbols}
-        missing.update({s: f"account {account_id}'s price feed failed ({type(e).__name__})"
-                        for s in symbols if s not in got})
-    prices = {s: p for s, p in ((s, _positive(got.get(s))) for s in symbols) if p is not None}
-    for s in symbols:
-        if s not in prices and s not in missing:
-            missing[s] = f"account {account_id} returned no usable price"
-    return prices, missing, (_broker_quantities(held) if positions is not None else None)
+        got = {s: p for s, p in broker_position_prices_from(held).items() if s in wanted}
+        missing.update({_canonical(s): f"account {account_id}'s price feed failed ({type(e).__name__})"
+                        for s in wanted if s not in got})
+    prices: Dict[str, float] = {}
+    for raw in wanted:
+        price = _positive(got.get(raw))
+        if price is not None:
+            prices.setdefault(_canonical(raw), price)
+    for raw in wanted:
+        c = _canonical(raw)
+        if c not in prices and c not in missing:
+            missing[c] = f"account {account_id} returned no usable price"
+    return {"prices": prices, "missing": missing, "book": book if positions is not None else None,
+            "option_rows": option_rows, "failure": failure}
 
 
-def _prices(lots: List[Lot], calls: Dict[str, int], timing
-            ) -> Tuple[Dict[str, float], Dict[str, str], Dict[int, List[str]], Dict[int, Dict[str, float]]]:
+@dataclass
+class _BrokerRead:
+    prices: Dict[str, float] = field(default_factory=dict)
+    missing: Dict[str, str] = field(default_factory=dict)
+    symbols_by_account: Dict[int, List[str]] = field(default_factory=dict)
+    broker_qty: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    broker_failed: Dict[int, str] = field(default_factory=dict)
+    option_rows: Dict[int, int] = field(default_factory=dict)
+
+
+def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int, set], calls: Dict[str, int],
+             timing) -> _BrokerRead:
+    """Every account in scope -- also one with no platform rows -- in parallel, each under ``BROKER_DEADLINE_S``: ONE
+    positions read (+ the feed for symbols the broker does not hold). Nothing else is asked of a broker."""
     by_account: Dict[int, set] = defaultdict(set)
     orphan: set = set()
+    for a in accounts:
+        by_account[a]
     for l in lots:
         if l.account_id is not None:
             by_account[l.account_id].add(l.symbol)
         else:
             orphan.add(l.symbol)
     lock = threading.Lock()
-    results: Dict[int, Tuple] = {}
+    results: Dict[int, Dict] = {}
     failures: Dict[int, BaseException] = {}
 
-    def run(aid, syms):
+    def run(aid, raw):
         try:
-            results[aid] = _account_work(aid, syms, calls, lock)
+            results[aid] = _account_work(aid, raw, calls, lock)
         except BaseException as e:  # noqa: BLE001 -- reported per account below
             failures[aid] = e
 
-    with _step(timing, "broker", f"{len(by_account)} accounts"):
-        threads = {aid: threading.Thread(target=run, args=(aid, sorted(syms)), daemon=True, name=f"heatmap-acct{aid}")
-                   for aid, syms in by_account.items()}
+    out = _BrokerRead()
+    with _step(timing, "broker") as entry:
+        threads = {aid: threading.Thread(target=run, args=(aid, sorted(raw_by_account.get(aid) or ())), daemon=True,
+                                         name=f"heatmap-acct{aid}") for aid in by_account}
         for t in threads.values():
             t.start()
         ends = time.monotonic() + BROKER_DEADLINE_S
         for t in threads.values():
             t.join(max(0.0, ends - time.monotonic()))
-    prices: Dict[str, float] = {}
-    missing: Dict[str, str] = {}
-    broker_qty: Dict[int, Dict[str, float]] = {}
+        late = sum(1 for t in threads.values() if t.is_alive())
+        with lock:
+            entry.note = (f"{len(by_account)} accounts: {calls['positions']} positions read, "
+                          f"{calls['feed_price_calls']} feed calls, {late} timed out")
     for aid in sorted(by_account):
         symbols = sorted(by_account[aid])
+        out.symbols_by_account[aid] = symbols
         if threads[aid].is_alive() or (aid not in results and aid not in failures):
-            missing.update({s: f"account {aid} timed out (no answer within {BROKER_DEADLINE_S:.0f}s)"
-                            for s in symbols if s not in prices})
+            why = f"account {aid} timed out (no answer within {BROKER_DEADLINE_S:.0f}s)"
+            out.broker_failed[aid] = why
+            out.missing.update({s: why for s in symbols if s not in out.prices})
             continue
         if aid in failures:
             e = failures[aid]
             logger.warning(f"Heatmap: account {aid} could not be priced: {type(e).__name__}: {e}")
-            missing.update({s: f"account {aid} could not be priced ({type(e).__name__})"
-                            for s in symbols if s not in prices})
+            why = f"account {aid} could not be read ({type(e).__name__})"
+            out.broker_failed[aid] = why
+            out.missing.update({s: why for s in symbols if s not in out.prices})
             continue
-        got, why, held = results[aid]
-        for s in symbols:
-            if s in got and s not in prices:
-                prices[s] = got[s]
-                missing.pop(s, None)
-            elif s not in prices and s in why:
-                missing[s] = why[s]
-        if held is not None:
-            broker_qty[aid] = held
-    for s in sorted(orphan - set(prices)):
-        missing.setdefault(s, "the transaction has no order and no expert, so its account is unknown")
-    return prices, missing, {a: sorted(v) for a, v in by_account.items()}, broker_qty
+        res = results[aid]
+        if res["book"] is None:
+            out.broker_failed[aid] = res["failure"]
+        else:
+            out.broker_qty[aid] = res["book"]
+            out.option_rows[aid] = res["option_rows"]
+            out.symbols_by_account[aid] = sorted(set(symbols) | set(res["book"]))
+        for s in out.symbols_by_account[aid]:
+            if s in res["prices"] and s not in out.prices:
+                out.prices[s] = res["prices"][s]
+                out.missing.pop(s, None)
+            elif s not in out.prices and s in res["missing"]:
+                out.missing[s] = res["missing"][s]
+    for s in sorted(orphan - set(out.prices)):
+        out.missing.setdefault(s, "the transaction has no order and no expert, so its account is unknown")
+    return out
+
+
+def _accounts_in_scope(account_id: Optional[int]) -> List[int]:
+    """The header's account, or (``None`` = All) every ``AccountDefinition`` -- the rule the app already uses for
+    "which accounts are live": the scheduled account refresh (``TradeManager.refresh_accounts``, every 5 minutes)
+    instantiates and refreshes every account definition, and the Overview's other "All" tabs read them all. There is
+    no enabled / active flag on an account. The accounts are read in parallel, so a dead one bounds the load at
+    ``BROKER_DEADLINE_S``; it does not add to it."""
+    if account_id is not None:
+        return [account_id]
+    from ..core.models import AccountDefinition
+    with get_db() as session:
+        return sorted(session.exec(select(AccountDefinition.id)).all())
 
 
 def _step(timing, name, note=None):
@@ -513,22 +725,51 @@ def _step(timing, name, note=None):
     return step(timing, name, note)
 
 
-def _bounded(fn: Callable, symbols: List[str], what: str, calls: Dict[str, int]):
-    if not symbols:
-        return {}, {}
-    try:
-        return _call_with_deadline(lambda: fn(symbols, calls=calls), MARKET_DATA_DEADLINE_S, f"heatmap {what}")
-    except _Deadline:
-        return {}, {s: f"the {what} did not answer within {MARKET_DATA_DEADLINE_S:.0f}s" for s in symbols}
-
-
 # --------------------------------------------------------------------------------------------------------------
 # the load
 # --------------------------------------------------------------------------------------------------------------
 
-def _load(account_id: Optional[int], now: datetime, timing) -> HeatmapData:
-    calls: Dict[str, int] = {"positions": 0, "feed_price_calls": 0, "history_symbols": 0, "fmp_quote_calls": 0,
-                             "split_calendar_reads": 0}
+def _market_caps_in_background(symbols: List[str], calls: Dict[str, int]):
+    """Start the market-cap read in its own thread (it runs while the history is read). Returns ``finish()``:
+    ``((caps, missing), wall seconds, note)``, waiting at most ``MARKET_DATA_DEADLINE_S`` from the start."""
+    box: Dict[str, object] = {}
+    began = time.monotonic()
+
+    def run():
+        try:
+            box["value"] = fetch_market_caps(symbols, calls=calls)
+        except Exception as e:  # noqa: BLE001 -- deliberate: no market caps = small bordered tiles, with why
+            box["error"] = e
+        box["seconds"] = time.monotonic() - began
+
+    t = threading.Thread(target=run, daemon=True, name="heatmap-market-caps")
+    t.start()
+
+    def finish():
+        t.join(max(0.0, began + MARKET_DATA_DEADLINE_S - time.monotonic()))
+        if t.is_alive():
+            return ({}, {s: f"the market cap fetch did not answer within {MARKET_DATA_DEADLINE_S:.0f}s"
+                         for s in symbols}), time.monotonic() - began, f"{len(symbols)} symbols: TIMED OUT"
+        if "error" in box:
+            e = box["error"]
+            why = price_history.redact_message(f"the market cap fetch failed ({type(e).__name__}: {e})")
+            return ({}, {s: why for s in symbols}), box["seconds"], f"{len(symbols)} symbols: FAILED"
+        caps, missing = box["value"]
+        note = (f"{len(symbols)} symbols: {calls['market_cap_cache_hits']} cache hits, "
+                f"{calls['fmp_quote_calls']} FMP calls, {len(missing)} missing")
+        return (caps, missing), box["seconds"], note
+
+    return finish
+
+
+def _load(account_id: Optional[int], now: datetime, timing,
+          progress: Optional[Callable[[str], None]] = None) -> HeatmapData:
+    say = progress or (lambda text: None)
+    calls: Dict[str, int] = {"positions": 0, "feed_price_calls": 0, "history_symbols": 0, "history_cache_hits": 0,
+                             "history_failed": 0, "history_timed_out": 0, "history_topped_up": 0, "fmp_quote_calls": 0,
+                             "market_cap_cache_hits": 0, "split_calendar_reads": 0, "split_memo_hits": 0,
+                             "split_timed_out": 0, "history_busy": 0}
+    say("Reading open positions...")
     with _step(timing, "calendar"):
         warm_calendar(now)                     # the session tables are built here, never on the event loop
     with _step(timing, "db") as entry:
@@ -536,49 +777,88 @@ def _load(account_id: Optional[int], now: datetime, timing) -> HeatmapData:
         lots = lots_from_rows(txs, orders_of, expert_names, account_of)
         entry.note = f"{len(lots)} open transactions"
     equity = [l for l in lots if not l.is_option]
-    symbols = sorted({l.symbol for l in equity})
-    prices, price_missing, symbols_by_account, broker_qty = _prices(equity, calls, timing)
+    accounts = _accounts_in_scope(account_id)
+    say(f"Reading the broker positions ({len(accounts)} account{'s' if len(accounts) != 1 else ''})...")
+    raw_by_account: Dict[int, set] = defaultdict(set)      # the spellings the platform stored, per account
+    for tx in txs:
+        if tx.asset_class != AssetClass.OPTION and tx.id in account_of and isinstance(tx.symbol, str):
+            raw_by_account[account_of[tx.id]].add(tx.symbol.strip().upper())
+    read = _brokers(equity, accounts, raw_by_account, calls, timing)
+    symbols_by_account = read.symbols_by_account
+    # every symbol a broker holds, and every one the platform has open (a failed broker read keeps the platform's)
+    symbols = sorted({l.symbol for l in equity} | {s for book in read.broker_qty.values() for s in book})
 
-    market_data: Dict[str, Tuple] = {}
-
-    def side_reads():
-        market_data["caps"] = _bounded(fetch_market_caps, symbols, "market cap fetch", calls)
-        market_data["splits"] = _bounded(fetch_split_days, symbols, "split calendar", calls)
-
-    side = threading.Thread(target=side_reads, daemon=True, name="heatmap-market-data")
-    side.start()                               # in parallel with the history reads
-    with _step(timing, "history", f"{len(symbols)} symbols"):
-        closes, closes_missing = _closes(symbols_by_account, history_start(now), now, calls)
-    with _step(timing, "market caps + splits"):
-        side.join(2 * MARKET_DATA_DEADLINE_S + 1)
-    caps, caps_missing = market_data.get("caps") or ({}, {s: "the market cap fetch did not finish" for s in symbols})
-    splits, splits_missing = market_data.get("splits") or (
-        {}, {s: "the split calendar did not finish" for s in symbols})
+    finish_caps = _market_caps_in_background(symbols, calls) if symbols else None
+    with _step(timing, "history") as entry:
+        needed = sorted({reference_session(tf, now) for tf in TIMEFRAMES})
+        closes, closes_missing = _closes(symbols_by_account, needed, now, calls, say)
+        entry.note = (f"{len(symbols)} symbols: {calls['history_cache_hits']} cache hits, "
+                      f"{calls['history_symbols']} read from disk, {calls['history_topped_up']} topped up, "
+                      f"{calls['history_failed']} failed, {calls['history_timed_out']} timed out")
+    # AFTER the history: the FMP history provider's daily refresh has just put most split calendars in the memo.
+    say(f"Checking splits: 0 of {len(symbols)} symbols")
+    with _step(timing, "splits") as entry:
+        splits, splits_missing = fetch_split_days(symbols, calls=calls, progress=say) if symbols else ({}, {})
+        entry.note = (f"{len(symbols)} symbols: {calls['split_memo_hits']} memo hits, "
+                      f"{calls['split_calendar_reads']} read, "
+                      f"{len(splits_missing) - calls['split_timed_out']} failed, "
+                      f"{calls['split_timed_out']} timed out")
+    if finish_caps is not None:
+        say("Reading market caps...")
+        (caps, caps_missing), seconds, note = finish_caps()
+        _add(timing, "market caps (parallel)", seconds, note)
+    else:
+        caps, caps_missing = {}, {}
     with _step(timing, "labels"):
-        labels = get_labels_by_symbol(symbols) if symbols else {}
-    market = MarketInputs(prices=prices, price_missing=price_missing, closes=closes, closes_missing=closes_missing,
+        labels = _labels(symbols, {s for spellings in raw_by_account.values() for s in spellings})
+    say("Drawing...")
+    market = MarketInputs(prices=read.prices, price_missing=read.missing, closes=closes, closes_missing=closes_missing,
                           market_caps=caps, market_caps_missing=caps_missing, labels=labels, splits=splits,
-                          splits_missing=splits_missing, broker_qty=broker_qty)
+                          splits_missing=splits_missing, broker_qty=read.broker_qty, broker_failed=read.broker_failed,
+                          broker_option_rows=read.option_rows)
     return HeatmapData(lots=lots, market=market, calls=calls)
+
+
+def _labels(symbols: List[str], spellings: Iterable[str]) -> Dict[str, List[str]]:
+    """Instrument labels by CANONICAL symbol: the Instrument rows are looked up in every spelling (a label saved under
+    ``BRK.B`` belongs to ``BRK-B``)."""
+    if not symbols:
+        return {}
+    found = get_labels_by_symbol(sorted(set(symbols) | set(spellings)))
+    out: Dict[str, List[str]] = {}
+    for spelled, names in found.items():
+        c = _canonical(spelled)
+        out[c] = sorted(set(out.get(c, [])) | set(names))
+    return out
+
+
+def _add(timing, name, seconds, note=None):
+    from .load_timing import add
+    add(timing, name, seconds, note)
 
 
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: Dict[Optional[int], Future] = {}
 
 
-def load_heatmap_data(account_id: Optional[int], now: datetime, *, timing=None) -> HeatmapData:
+def load_heatmap_data(account_id: Optional[int], now: datetime, *, timing=None,
+                      progress: Optional[Callable[[str], None]] = None) -> HeatmapData:
     """Everything one heatmap load needs, for the header's account (``None`` = all accounts), at ``now`` (tz-aware).
-    Worker thread only. A load of a scope that is already loading (another browser tab) waits for that one."""
+    Worker thread only. A load of a scope that is already loading (another browser tab) waits for that one.
+    ``progress(text)`` is called from worker threads with what the load is doing ("Reading daily history: 40 of 125
+    symbols"); it must only store the text."""
     with _INFLIGHT_LOCK:
         running = _INFLIGHT.get(account_id)
         owner = running is None
         if owner:
             running = _INFLIGHT[account_id] = Future()
     if not owner:
+        if progress is not None:
+            progress("Waiting for the load another browser tab started...")
         with _step(timing, "shared in-flight load"):
             return running.result()
     try:
-        data = _load(account_id, now, timing)
+        data = _load(account_id, now, timing, progress)
         running.set_result(data)
         return data
     except BaseException as e:

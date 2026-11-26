@@ -34,12 +34,14 @@ def lot(symbol="AAPL", qty=10.0, direction="long", expert="Alpha-1", fills=(), t
 
 
 def market(prices=None, closes=None, caps=None, labels=None, price_missing=None, closes_missing=None,
-           caps_missing=None, splits=None, splits_missing=None, broker_qty=None):
+           caps_missing=None, splits=None, splits_missing=None, broker_qty=None, broker_failed=None,
+           broker_option_rows=None):
     return MarketInputs(prices=prices or {}, price_missing=price_missing or {},
                         closes=closes or {}, closes_missing=closes_missing or {},
                         market_caps=caps or {}, market_caps_missing=caps_missing or {},
                         labels=labels or {}, splits=splits or {}, splits_missing=splits_missing or {},
-                        broker_qty=broker_qty or {})
+                        broker_qty=broker_qty or {}, broker_failed=broker_failed or {},
+                        broker_option_rows=broker_option_rows or {})
 
 
 def state(timeframe="today", metric="price", size="exposure", experts=(), labels=()):
@@ -557,8 +559,9 @@ def test_a_naive_moment_is_refused():
 
 # ---- I5: platform transactions vs the broker's book ---------------------------------------------------------
 
-def test_caption_says_tiles_are_platform_positions():
-    assert "opened through the platform" in hm.caption(hm.build_view([lot()], market(), state(), TUE_OPEN))
+def test_caption_says_tiles_are_what_the_broker_holds():
+    text = hm.caption(hm.build_view([lot()], market(broker_qty={1: {"AAPL": 10.0}}), state(), TUE_OPEN))
+    assert "held at the broker" in text and "expert split from the platform's records" in text
 
 
 def test_platform_and_broker_quantities_that_differ_are_listed():
@@ -597,3 +600,183 @@ def test_dropped_filters_are_named():
     stored = {"experts": ["Gone-9", "Alpha-1"], "labels": ["gone"]}
     assert hm.dropped_filters(stored, ["Alpha-1"], ["tech"]) == (["Gone-9"], ["gone"])
     assert hm.dropped_filters(None, [], []) == ([], [])
+
+
+# ---- the broker's position is the truth ------------------------------------------------------------------------
+# The owner's live case: AAOI is 10.6809 shares at the broker, the platform's transactions hold 1.38986.
+
+AAOI_BROKER, AAOI_PLATFORM = 10.6809, 1.38986
+
+
+def _aaoi(**extra):
+    lots = [lot("AAOI", qty=AAOI_PLATFORM, expert="Alpha-1", account=2,
+                fills=[fill("BUY", AAOI_PLATFORM, 30.0, date(2026, 10, 1))])]
+    m = market(prices={"AAOI": 38.0, "GDXY": 15.0}, closes={"AAOI": {"2026-11-23": 36.0}},
+               broker_qty={2: {"AAOI": AAOI_BROKER, "GDXY": 20.6593}}, **extra)
+    return lots, m
+
+
+def test_all_experts_tile_uses_the_brokers_quantity():
+    lots, m = _aaoi()
+    t = tile_of(hm.build_view(lots, m, state(size="exposure"), TUE_OPEN), "AAOI")
+    assert t.quantity == pytest.approx(AAOI_BROKER)
+    assert t.market_value == pytest.approx(AAOI_BROKER * 38.0)
+    assert NO_EXPERT in t.experts and "Alpha-1" in t.experts
+
+
+def test_no_expert_is_the_brokers_quantity_minus_the_experts_share():
+    lots, m = _aaoi()
+    t = tile_of(hm.build_view(lots, m, state(experts=[NO_EXPERT]), TUE_OPEN), "AAOI")
+    assert t.quantity == pytest.approx(AAOI_BROKER - AAOI_PLATFORM)
+
+
+def test_a_named_expert_keeps_its_platform_quantity():
+    lots, m = _aaoi()
+    t = tile_of(hm.build_view(lots, m, state(experts=["Alpha-1"]), TUE_OPEN), "AAOI")
+    assert t.quantity == pytest.approx(AAOI_PLATFORM)
+
+
+def test_a_symbol_only_the_broker_holds_gets_a_tile_and_belongs_to_no_expert():
+    lots, m = _aaoi()
+    assert tile_of(hm.build_view(lots, m, state(), TUE_OPEN), "GDXY").quantity == pytest.approx(20.6593)
+    assert [t.symbol for t in hm.build_view(lots, m, state(experts=["Alpha-1"]), TUE_OPEN).tiles] == ["AAOI"]
+    assert "GDXY" in [t.symbol for t in hm.build_view(lots, m, state(experts=[NO_EXPERT]), TUE_OPEN).tiles]
+    assert hm.available_experts(lots, m) == ["Alpha-1", NO_EXPERT]
+    assert hm.available_labels(lots, {}, m) == [UNLABELED]
+
+
+def test_a_symbol_open_on_the_platform_but_not_held_at_the_broker_gets_no_tile_and_is_listed():
+    lots = [lot("XYZ", qty=5.0, account=2)]
+    view = hm.build_view(lots, market(prices={"XYZ": 1.0}, broker_qty={2: {}}), state(), TUE_OPEN)
+    assert view.tiles == []
+    assert any(sym == "XYZ" and "open on the platform" in why and "not held at the broker" in why
+               for sym, why in view.issues)
+
+
+def test_experts_records_exceeding_the_broker_are_listed_and_never_clamped():
+    lots = [lot("AAOI", qty=8.0, expert="Alpha-1", account=2)]
+    m = market(prices={"AAOI": 10.0}, broker_qty={2: {"AAOI": 5.0}})
+    whole = hm.build_view(lots, m, state(), TUE_OPEN)
+    assert tile_of(whole, "AAOI").quantity == pytest.approx(5.0)
+    assert any("experts' records exceed the broker's position (platform 8, broker 5)" in why
+               for _s, why in whole.issues)
+    assert hm.build_view(lots, m, state(experts=[NO_EXPERT]), TUE_OPEN).tiles == []
+    assert tile_of(hm.build_view(lots, m, state(experts=["Alpha-1"]), TUE_OPEN), "AAOI").quantity == 8.0
+
+
+def test_a_failed_positions_read_falls_back_to_platform_quantities_and_says_so():
+    lots, _m = _aaoi()
+    m = market(prices={"AAOI": 38.0}, broker_failed={2: "account 2 timed out"})
+    view = hm.build_view(lots, m, state(), TUE_OPEN)
+    assert tile_of(view, "AAOI").quantity == pytest.approx(AAOI_PLATFORM)
+    assert "account 2" in hm.caption(view) and "platform's transaction quantities" in hm.caption(view)
+
+
+def test_option_rows_in_the_broker_book_are_excluded_and_counted():
+    lots, m = _aaoi(broker_option_rows={2: 3})
+    view = hm.build_view(lots, m, state(), TUE_OPEN)
+    assert view.options_excluded == 3 and "3 option positions excluded" in hm.caption(view)
+
+
+def test_the_label_filter_applies_to_broker_only_symbols():
+    lots, _m = _aaoi()
+    m = market(prices={"AAOI": 38.0, "GDXY": 15.0}, broker_qty={2: {"AAOI": AAOI_BROKER, "GDXY": 20.6593}},
+               labels={"AAOI": ["tech"], "GDXY": ["gold"]})
+    assert [t.symbol for t in hm.build_view(lots, m, state(labels=["gold"]), TUE_OPEN).tiles] == ["GDXY"]
+
+
+def test_pnl_is_never_taken_from_anything_but_the_platforms_fills():
+    # the broker bought 4 this week that the platform never saw: its records cover 1 of the broker's 10 -> n/a
+    m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-20": 100.0}}, broker_qty={2: {"AAOI": 10.0}})
+    lots = [lot("AAOI", qty=1.0, account=2, fills=[fill("BUY", 1.0, 90.0, date(2026, 10, 1))])]
+    view = hm.build_view(lots, m, state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("platform records cover 1 of the broker's 10 shares" in why for _s, why in view.issues)
+    assert not hasattr(hm, "BrokerFill")
+
+
+def test_pnl_needs_the_platform_to_cover_the_brokers_position():
+    lots, m = _aaoi()
+    view = hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("platform records cover 1.38986 of the broker's 10.6809 shares" in why for _s, why in view.issues)
+
+
+def test_pnl_uses_the_platform_fills_when_they_cover_the_brokers_position():
+    lots = [lot("AAOI", qty=10.0, account=2, fills=[fill("BUY", 10.0, 90.0, date(2026, 10, 1))])]
+    m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-23": 100.0}}, broker_qty={2: {"AAOI": 10.0}})
+    assert tile_of(hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN), "AAOI").pnl_amount == pytest.approx(100.0)
+
+
+def test_coverage_holds_within_the_tolerance_and_fails_beyond_it():
+    def view_for(platform_qty):
+        lots = [lot("AAOI", qty=platform_qty, account=2, fills=[fill("BUY", platform_qty, 90.0, date(2026, 10, 1))])]
+        m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-23": 100.0}}, broker_qty={2: {"AAOI": 10.0}})
+        return hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN)
+    assert tile_of(view_for(10.0005), "AAOI").pnl_amount is not None          # 0.005% off: fractional rounding
+    off = view_for(10.01)                                                       # 0.1% off: another fill exists
+    assert tile_of(off, "AAOI").pnl_amount is None
+    assert any("platform records cover 10.01 of the broker's 10 shares" in why for _s, why in off.issues)
+
+
+def test_with_an_expert_filter_pnl_stays_on_that_experts_platform_fills():
+    lots = [lot("AAOI", qty=2.0, expert="Alpha-1", account=2, fills=[fill("BUY", 2.0, 90.0, date(2026, 10, 1))])]
+    m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-23": 100.0}}, broker_qty={2: {"AAOI": 10.0}})
+    t = tile_of(hm.build_view(lots, m, state("today", "pnl", experts=["Alpha-1"]), TUE_OPEN), "AAOI")
+    assert t.pnl_amount == pytest.approx(20.0)
+
+
+# ---- review fixes: orphans, mixed accounts, signs, dust, splits, caption ------------------------------------
+
+def test_a_transaction_with_no_account_is_never_added_to_a_symbol_a_broker_holds():
+    lots = [lot("AAOI", qty=3.0, account=None, tx=7)]
+    m = market(prices={"AAOI": 10.0}, broker_qty={2: {"AAOI": 10.0}})
+    view = hm.build_view(lots, m, state(), TUE_OPEN)
+    assert tile_of(view, "AAOI").quantity == pytest.approx(10.0)
+    assert ("AAOI", "transaction 7 has no account: not counted") in view.issues
+
+
+def test_a_long_in_a_failed_account_and_a_short_in_a_read_account_are_not_double_counted():
+    lots = [lot("XOM", qty=10.0, account=1, tx=1), lot("XOM", qty=5.0, direction="short", account=2, tx=2)]
+    m = market(prices={"XOM": 100.0}, broker_qty={2: {"XOM": -5.0}}, broker_failed={1: "account 1 timed out"})
+    view = hm.build_view(lots, m, state(size="exposure"), TUE_OPEN)
+    t = tile_of(view, "XOM")
+    assert t.quantity == pytest.approx(5.0)                  # +10 (account 1, platform) - 5 (account 2, broker)
+    assert t.market_value == pytest.approx(1500.0)           # gross: 15 shares
+    assert "Account 1" in hm.caption(view) and "Account 2" not in hm.caption(view)
+
+
+def test_the_no_expert_remainder_of_a_short_keeps_its_sign():
+    lots = [lot("TSLA", qty=3.0, direction="short", expert="Alpha-1", account=2, tx=1),
+            lot("TSLA", qty=2.0, direction="short", expert="Beta-2", account=2, tx=2)]
+    m = market(prices={"TSLA": 100.0}, broker_qty={2: {"TSLA": -10.0}})
+    assert tile_of(hm.build_view(lots, m, state(experts=[NO_EXPERT]), TUE_OPEN), "TSLA").quantity == pytest.approx(-5.0)
+    assert tile_of(hm.build_view(lots, m, state(experts=["Alpha-1"]), TUE_OPEN), "TSLA").quantity == pytest.approx(-3.0)
+    whole = hm.build_view(lots, m, state(), TUE_OPEN)
+    assert tile_of(whole, "TSLA").quantity == pytest.approx(-10.0)
+    assert not any("exceed" in why for _s, why in whole.issues)
+
+
+def test_a_dust_position_gets_no_tile():
+    m = market(prices={"AAOI": 10.0, "DUST": 0.01, "TINY": 50.0},
+               broker_qty={2: {"AAOI": 10.0, "DUST": 0.5, "TINY": 1e-7}})
+    view = hm.build_view([], m, state(), TUE_OPEN)
+    assert [t.symbol for t in view.tiles] == ["AAOI"]           # DUST worth half a cent, TINY 1e-7 shares
+
+
+def test_an_unknown_split_calendar_makes_pnl_na_for_a_period_longer_than_a_session():
+    lots = [lot("AAOI", qty=10.0, account=2, fills=[fill("BUY", 10.0, 90.0, date(2026, 10, 1))])]
+    m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-20": 100.0, "2026-11-23": 105.0}},
+               broker_qty={2: {"AAOI": 10.0}}, splits_missing={"AAOI": "FMP down"})
+    week = hm.build_view(lots, m, state("week", "pnl"), TUE_OPEN)
+    assert tile_of(week, "AAOI").pnl_amount is None
+    assert any("split calendar" in why and "My P/L" in why for _s, why in week.issues)
+    assert tile_of(hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN), "AAOI").pnl_amount is not None
+    price = hm.build_view(lots, m, state("week", "price"), TUE_OPEN)
+    assert tile_of(price, "AAOI").color_pct is not None
+    assert ("AAOI", "not checked for splits: FMP down") in price.issues
+
+
+def test_the_pnl_caption_says_dividends_and_fees_are_not_counted():
+    view = hm.build_view([lot()], market(prices={"AAPL": 1.0}), state(metric="pnl"), TUE_OPEN)
+    assert "dividends and fees" in hm.caption(view)
