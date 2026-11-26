@@ -432,14 +432,24 @@ class CoverProtectionMixin:
         the suspended lots must STAY suspended: lots are kept oldest first until their size
         covers the pledge, the rest are re-armed. UNKNOWN pledge keeps everything suspended.
         A lot already being written (fresh ``releasing``) is left to its writer.
+
+        ``only_txn_ids`` (a failed call's abort): only those lots are changed, but the pledge is
+        still the ACCOUNT's. The symbol's OTHER suspended lots are counted against it first,
+        exactly as the full pass counts them, and the named lots stay suspended only for what
+        they leave uncovered. Counted alone, a lot whose call was rejected read as the cover of
+        another lot's open call: it kept no stop and was staged ``pledged``.
         """
+        named = None if only_txn_ids is None else set(only_txn_ids)
         marked: Dict[str, List[Transaction]] = {}
         for txn in self._open_equity_transactions():
             if suspension_marker(txn) is None:
                 continue
-            if only_txn_ids is not None and txn.id not in only_txn_ids:
-                continue
             marked.setdefault(txn.symbol, []).append(txn)
+        if named is not None:
+            # the other lots first (oldest first), then the named ones: the sort is stable
+            marked = {symbol: sorted(txns, key=lambda t: t.id in named)
+                      for symbol, txns in marked.items()
+                      if any(t.id in named for t in txns)}
 
         rearmed = 0
         for symbol, txns in sorted(marked.items()):
@@ -460,11 +470,17 @@ class CoverProtectionMixin:
             for txn in txns:
                 marker = suspension_marker(txn)
                 open_qty = abs(txn.get_current_open_qty())
-                if marker.get("stage") == STAGE_RELEASING and not include_fresh_releasing \
+                acted_on = named is None or txn.id in named
+                if marker.get("stage") == STAGE_RELEASING \
+                        and not (include_fresh_releasing and acted_on) \
                         and self._releasing_is_fresh(marker):
                     kept += open_qty
                     logger.info(f"[Account {self.id}] {symbol} transaction {txn.id}: a covered "
                                 f"call is being written against it; leaving it to the writer")
+                    continue
+                if not acted_on:
+                    if kept < pledged:
+                        kept += open_qty     # it covers part of the pledge; not changed here
                     continue
                 if kept < pledged:
                     kept += open_qty

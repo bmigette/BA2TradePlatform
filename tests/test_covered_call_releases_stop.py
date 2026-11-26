@@ -365,6 +365,60 @@ class TestAFailedCallRestagesTheStop:
         assert not cp.is_protection_suspended(get_instance(Transaction, txn.id)), (
             "a failed re-arm must not keep blocking the safety net")
 
+    def test_a_failed_call_on_a_second_lot_restages_that_lot_beside_an_open_call(self, world):
+        """Two 100-share lots; the first is pledged to an open call. A second call suspends the
+        second lot and is rejected. The open call's 100 pledged shares are covered by the
+        first lot, so the second lot must get its stop back at once -- not be counted as the
+        cover of a call that was never written."""
+        acct, broker, restaged = world
+        broker.held = 200
+        first, _ = _equity_with_stop(acct, broker, broker_id="stop-a")
+        second, _ = _equity_with_stop(acct, broker, broker_id="stop-b")
+        assert _write_call(acct) is not None
+        assert _marker(first.id)["stage"] == cp.STAGE_PLEDGED
+        broker.reject_call = RuntimeError("APIError: option trading not enabled")
+
+        assert _write_call(acct) is None
+
+        assert "cancel:stop-b" in broker.calls
+        assert _marker(second.id) is None, "the lot of the rejected call is still suspended"
+        assert [(o.transaction_id, o.stop_price) for o in restaged] == [(second.id, 140.0)]
+        assert [o.id for o in _working_protection(second.id)] == [restaged[0].id]
+        assert _marker(first.id)["stage"] == cp.STAGE_PLEDGED
+
+    def test_a_failed_call_on_an_older_lot_restages_it_beside_a_newer_pledged_lot(self, world):
+        """The same, with the pledged lot the NEWER one: oldest-first keeping must not hand
+        the open call's pledge to the older lot whose own call was rejected."""
+        acct, broker, restaged = world
+        broker.held = 200
+        older, older_leg = _equity_with_stop(acct, broker, broker_id="stop-a")
+        # The older lot has no working stop when the first call is written (its shares are
+        # held for a manual order then), so that call pledges the newer lot; the older lot
+        # gets its stop afterwards.
+        row = get_instance(TradingOrder, older_leg.id)
+        row.status = OrderStatus.CANCELED
+        update_instance(row)
+        broker.resting.pop("stop-a")
+        broker.seed("manual", 100)
+        newer, _ = _equity_with_stop(acct, broker, broker_id="stop-b")
+        assert _write_call(acct) is not None
+        broker.resting.pop("manual")
+        assert _marker(newer.id)["stage"] == cp.STAGE_PLEDGED and _marker(older.id) is None
+        create_trading_order(
+            account_id=acct.id, symbol="AAPL", quantity=100.0, side=OrderDirection.SELL,
+            order_type=OrderType.SELL_STOP, status=OrderStatus.NEW, stop_price=140.0,
+            transaction_id=older.id, broker_order_id="stop-c",
+            comment=TransactionHelper.tpsl_comment("SL", acct.id, older.id, older_leg.id))
+        broker.seed("stop-c", 100.0)
+        broker.reject_call = RuntimeError("APIError: option trading not enabled")
+
+        assert _write_call(acct) is None
+
+        assert "cancel:stop-c" in broker.calls
+        assert _marker(older.id) is None, "the lot of the rejected call is still suspended"
+        assert [(o.transaction_id, o.stop_price) for o in restaged] == [(older.id, 140.0)]
+        assert _marker(newer.id)["stage"] == cp.STAGE_PLEDGED
+
 
 # ===========================================================================================
 # 3. while the call is open
