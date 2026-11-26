@@ -74,10 +74,10 @@ def test_apply_reports_a_refusal_and_a_raise(acct):
     acct.returns["adjust_tp"] = False
     r = svc.apply_tp_sl(account, txn, 130.0, 90.0, source="manual")
     assert not r.success and r.message == "Failed to update Take Profit" and r.error is None
-    acct.raises["adjust_tp"] = RuntimeError("boom")
+    acct.raises["adjust_tp_sl"] = RuntimeError("boom")   # after a failed call both levels are sent again
     txn, account = svc.tp_sl_context(t.id)
     r = svc.apply_tp_sl(account, txn, 140.0, 90.0, source="manual")
-    assert not r.success and r.message == "Error updating TP: boom" and isinstance(r.error, RuntimeError)
+    assert not r.success and r.message == "Error updating TP/SL: boom" and isinstance(r.error, RuntimeError)
 
 
 def test_apply_unchanged_calls_nothing(acct):
@@ -221,13 +221,88 @@ def test_set_tp_sl_maps_broker_failures(acct):
     with pytest.raises(BrokerRefused):
         svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)
     acct.returns.clear()
-    acct.raises["adjust_tp"] = ConnectionError("down")
+    acct.raises["adjust_tp_sl"] = ConnectionError("down")     # after a failed call both levels are sent again
     with pytest.raises(BrokerUnreachable) as e:
         svc.set_tp_sl(t.id, take_profit=135.0, stop_loss=None, lock=False, dry_run=False)
     assert "ConnectionError" in e.value.message and "down" not in e.value.message
-    acct.raises["adjust_tp"] = KeyError("defect")
+    acct.raises["adjust_tp_sl"] = KeyError("defect")
     with pytest.raises(KeyError):
         svc.set_tp_sl(t.id, take_profit=140.0, stop_loss=None, lock=False, dry_run=False)
+
+
+@pytest.mark.parametrize("failure", ["refused", "unreachable"])
+def test_set_tp_sl_retried_after_a_broker_failure_reaches_the_broker_again(acct, failure):
+    """The values are stored before the broker call and STAY stored when it fails: they are the source of truth,
+    and the only stop of an account that holds no broker legs. The retry of the same request used to read as
+    "unchanged" and return changed=false without contacting the broker, so the new level was never placed."""
+    t = _txn()
+    if failure == "refused":
+        acct.returns["adjust_tp"] = False
+        expected = BrokerRefused
+    else:
+        acct.raises["adjust_tp"] = ConnectionError("down")
+        expected = BrokerUnreachable
+    with pytest.raises(expected):
+        svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)
+    stored = get_instance(Transaction, t.id)
+    assert (stored.take_profit, stored.stop_loss) == (130.0, 90.0)
+
+    acct.returns.clear()
+    acct.raises.clear()
+    preview = svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=True)
+    assert preview["changed"] is True and preview["action"] == "adjust_tp_sl"
+    out = svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)
+
+    # the account is asked again, with BOTH stored levels: what the failed call left at the broker is unknown
+    assert acct.calls == [("adjust_tp", t.id, 130.0, "api"), ("adjust_tp_sl", t.id, 130.0, 90.0, "api")]
+    assert out["changed"] is True
+
+    again = svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)
+    assert again["changed"] is False and len(acct.calls) == 2, "in sync again: an unchanged request calls nothing"
+
+
+def test_a_failed_change_followed_by_another_change_sends_both_levels(acct):
+    """The stop moved while the take-profit of the failed call never reached the broker: both go out."""
+    t = _txn()
+    acct.returns["adjust_tp"] = False
+    with pytest.raises(BrokerRefused):
+        svc.set_tp_sl(t.id, take_profit=130.0, stop_loss=None, lock=False, dry_run=False)
+
+    acct.returns.clear()
+    svc.set_tp_sl(t.id, take_profit=None, stop_loss=85.0, lock=False, dry_run=False)
+
+    assert acct.calls[-1] == ("adjust_tp_sl", t.id, 130.0, 85.0, "api")
+
+
+def test_an_account_that_cannot_hold_legs_keeps_the_stored_levels_and_is_not_asked_again(acct):
+    """TastyTrade raises NotImplementedError from every adjust call: the stored level IS the protection there.
+    It stays stored, and the same request repeated is unchanged (nothing to send, nothing failed to arrive)."""
+    t = _txn()
+    acct.raises["adjust_sl"] = NotImplementedError("this broker cannot place a protective stop leg")
+    txn, account = svc.tp_sl_context(t.id)
+    first = svc.apply_tp_sl(account, txn, 120.0, 85.0, source="manual")
+    assert not first.success and isinstance(first.error, NotImplementedError)
+    assert get_instance(Transaction, t.id).stop_loss == 85.0
+
+    txn, account = svc.tp_sl_context(t.id)
+    second = svc.apply_tp_sl(account, txn, 120.0, 85.0, source="manual")
+
+    assert second.step is None and second.success
+    assert acct.calls == [("adjust_sl", t.id, 85.0, "manual")]
+
+
+def test_apply_retried_after_a_refusal_calls_the_account_again(acct):
+    """The Live Trades dialog shares the path."""
+    t = _txn()
+    acct.returns["adjust_tp"] = False
+    txn, account = svc.tp_sl_context(t.id)
+    assert not svc.apply_tp_sl(account, txn, 130.0, 90.0, source="manual").success
+    assert get_instance(Transaction, t.id).take_profit == 130.0
+
+    acct.returns.clear()
+    txn, account = svc.tp_sl_context(t.id)
+    assert svc.apply_tp_sl(account, txn, 130.0, 90.0, source="manual").success
+    assert acct.calls == [("adjust_tp", t.id, 130.0, "manual"), ("adjust_tp_sl", t.id, 130.0, 90.0, "manual")]
 
 
 def test_set_tp_sl_waits_for_the_expert_lock(acct, monkeypatch):

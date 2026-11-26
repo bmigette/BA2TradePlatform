@@ -231,12 +231,48 @@ def plan_batch_tp(account, txn: Transaction, tp_percent: float) -> BatchTpPlan:
     return BatchTpPlan(target, None)
 
 
+#: ``Transaction.meta_data`` key: the stored TP/SL was written, and the account call that should have made the
+#: broker side match it returned False or raised. Cleared by the next account call that succeeds.
+TPSL_SYNC_FAILED_KEY = "tpsl_account_sync_failed"
+
+
+def account_sync_failed(txn: Transaction) -> bool:
+    """True while the transaction's stored TP/SL is known NOT to have reached the account."""
+    meta = txn.meta_data
+    return isinstance(meta, dict) and bool(meta.get(TPSL_SYNC_FAILED_KEY))
+
+
+def _record_account_sync(transaction_id: int, *, failed: bool) -> None:
+    """Set or clear ``TPSL_SYNC_FAILED_KEY``. Never raises: it runs after the account call, whose own outcome
+    (a refusal, a broker error) is what the caller must still report."""
+    try:
+        with get_db() as session:
+            txn = require_row(session, Transaction, transaction_id, "transaction")
+            meta = dict(txn.meta_data) if isinstance(txn.meta_data, dict) else {}
+            if failed == bool(meta.get(TPSL_SYNC_FAILED_KEY)):
+                return
+            if failed:
+                meta[TPSL_SYNC_FAILED_KEY] = True
+            else:
+                del meta[TPSL_SYNC_FAILED_KEY]
+            txn.meta_data = meta
+            update_instance(txn, session)
+    except Exception as e:
+        logger.error(f"Transaction {transaction_id}: could not record that its TP/SL account call "
+                     f"{'failed' if failed else 'succeeded'} ({e}); a repeat of the same TP/SL request may "
+                     f"{'not be resent' if failed else 'be sent once more'}", exc_info=True)
+
+
 def plan_tp_sl(txn: Transaction, tp_value: Optional[float], sl_value: Optional[float]) -> Optional[TpSlStep]:
     """Pure: the account call that makes the broker side match the requested TP/SL, or None when neither side
     changed. ``tp_value`` / ``sl_value`` are the REQUESTED state (None = no leg); "changed" is compared against the
-    transaction's stored values, deletions included. The wording is the dialog's."""
-    tp_changed = tp_value != txn.take_profit
-    sl_changed = sl_value != txn.stop_loss
+    transaction's stored values, deletions included. The wording is the dialog's.
+
+    While the last change is stored but its account call failed (``account_sync_failed``), BOTH sides count as
+    changed: the stored values say nothing about what the account holds, so the resulting state is sent whole."""
+    resend = account_sync_failed(txn)
+    tp_changed = resend or tp_value != txn.take_profit
+    sl_changed = resend or sl_value != txn.stop_loss
     if tp_changed and sl_changed:
         if tp_value and sl_value:
             return TpSlStep("adjust_tp_sl", tp_value, sl_value, f"TP/SL updated to ${tp_value:.2f}/${sl_value:.2f}",
@@ -299,7 +335,9 @@ def apply_tp_sl(account, txn: Transaction, tp_price: Optional[float], sl_price: 
     """Make the transaction's TP/SL ``tp_price`` / ``sl_price`` (falsy = no leg), exactly as the Live Trades dialog
     does when the quantity is not edited: persist the transaction values first (they are the source of truth),
     then ask the account to sync its orders. A raised account call is logged and returned in ``error``; it is not
-    re-raised (the page notifies it, the API maps it).
+    re-raised (the page notifies it, the API maps it). The values stay stored when the account call fails; the
+    failure is recorded on the transaction, and the next request (the same one repeated included) sends the whole
+    resulting TP/SL again instead of reading as "unchanged".
 
     Takes the transaction's lock (so an API write and a page edit serialize) and re-reads the transaction under it,
     so "changed" is judged against the stored values, not a stale copy. ``Conflict`` when the lock stays busy."""
@@ -331,7 +369,12 @@ def _apply_tp_sl_locked(account, txn: Transaction, tp_price: Optional[float], sl
             success = account.adjust_sl(txn, step.stop_loss, source=source)
     except Exception as e:
         logger.error(f"{step.error}{e}", exc_info=True)
+        # NotImplementedError = this account holds no protective legs at all (TastyTrade): the stored level IS
+        # the protection and nothing failed to arrive, so the same request repeated stays "unchanged".
+        if not isinstance(e, NotImplementedError):
+            _record_account_sync(txn.id, failed=True)
         return TpSlResult(step, False, f"{step.error}{e}", e)
+    _record_account_sync(txn.id, failed=not success)
     return TpSlResult(step, bool(success), step.ok if success else step.failed, None)
 
 

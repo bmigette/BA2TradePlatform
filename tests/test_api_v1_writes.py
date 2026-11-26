@@ -110,7 +110,7 @@ def test_tp_sl_conflict_not_found_and_broker_codes(acct, client):
     r = client.post(f"/transactions/{t.id}/tp-sl", json={"take_profit": 130.0})
     assert r.status_code == 502 and r.json()["error"] == "broker_refused"
     acct.returns.clear()
-    acct.raises["adjust_tp"] = ConnectionError("secret-host")
+    acct.raises["adjust_tp_sl"] = ConnectionError("secret-host")   # after a failed call both levels are sent again
     r = client.post(f"/transactions/{t.id}/tp-sl", json={"take_profit": 135.0})
     assert r.status_code == 503 and r.json()["error"] == "broker_unreachable" and "secret-host" not in r.text
 
