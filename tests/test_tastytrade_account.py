@@ -610,6 +610,104 @@ def test_realized_day_gain_is_never_added_to_pl_day():
 
 
 # ---------------------------------------------------------------------------
+# The position's PRICE is the broker's QUOTE mark (/market-data/by-type), not the positions endpoint's
+# ``mark_price``, which is a raw bid/ask midpoint. Live account, 2026-11-26 (market closed): HUMN bid 23.00 /
+# ask 36.62 -> positions mark 29.81, quote mark 24.71; the Live View showed +20.64% and +$39.90 on a flat day.
+# ---------------------------------------------------------------------------
+
+def _quote(symbol, mark=None, last=None, close=None, bid=None, ask=None, mid=None):
+    def dec(v):
+        return None if v is None else Decimal(v)
+    return SimpleNamespace(symbol=symbol, mark=dec(mark), last=dec(last), close=dec(close), bid=dec(bid),
+                           ask=dec(ask), mid=dec(mid))
+
+
+def _quotes(monkeypatch, rows=None, error=None):
+    """Patch the SDK's bulk quote read; returns the list of symbol batches it was asked for."""
+    asked = []
+
+    async def fake(session, equities=None, **kwargs):
+        asked.append(list(equities or []))
+        if error is not None:
+            raise error
+        return [r for r in (rows or []) if r.symbol in (equities or [])]
+
+    monkeypatch.setattr("tastytrade.market_data.get_market_data_by_type", fake)
+    return asked
+
+
+def test_a_held_equity_is_priced_at_the_quote_mark_not_the_positions_midpoint(monkeypatch):
+    _quotes(monkeypatch, [_quote("HUMN", mark="24.71", last="24.71", close="24.71", bid="23.0", ask="36.62",
+                                 mid="29.81")])
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="HUMN", quantity="7.8241", average_open_price="27.77", close_price="24.71",
+                     mark_price="29.81"), "24.71")])
+
+    p = acct.get_positions()[0]
+
+    assert p.current_price == pytest.approx(24.71)
+    assert p.market_value == pytest.approx(24.71 * 7.8241)
+    assert p.unrealized_pl == pytest.approx((24.71 - 27.77) * 7.8241)
+    assert p.change_today == pytest.approx(0.0) and p.unrealized_intraday_pl == pytest.approx(0.0)
+
+
+def test_one_bulk_quote_read_covers_every_held_equity_and_nothing_else(monkeypatch):
+    asked = _quotes(monkeypatch, [_quote("AAPL", mark="151"), _quote("MSFT", mark="402")])
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL"), _tt_position(symbol="MSFT"),
+        _tt_position(symbol="FLAT", quantity="0"),
+        _tt_position(symbol="AAPL  260918C00150000", multiplier=100, instrument_type=TTInstrumentType.EQUITY_OPTION)])
+
+    prices = {p.symbol: p.current_price for p in acct.get_positions()}
+
+    assert asked == [["AAPL", "MSFT"]]
+    assert prices == {"AAPL": 151.0, "MSFT": 402.0}
+
+
+def test_a_flat_account_reads_no_quotes(monkeypatch):
+    asked = _quotes(monkeypatch)
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    assert acct.get_positions() == [] and asked == []
+
+
+def test_a_quote_without_a_mark_uses_its_last_trade_then_its_close(monkeypatch):
+    _quotes(monkeypatch, [_quote("AAPL", last="149.5", close="150"), _quote("MSFT", close="400")])
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_tt_position(symbol="AAPL"),
+                                                          _tt_position(symbol="MSFT")])
+
+    prices = {p.symbol: p.current_price for p in acct.get_positions()}
+
+    assert prices == {"AAPL": 149.5, "MSFT": 400.0}
+
+
+def test_a_failed_quote_read_keeps_the_positions_own_mark(monkeypatch):
+    _quotes(monkeypatch, error=RuntimeError("quote service down"))
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155")])
+
+    p = acct.get_positions()[0]
+
+    assert p.current_price == pytest.approx(155.0)      # the book is still readable; the log names the fallback
+
+
+def test_a_symbol_the_quote_read_left_out_keeps_the_positions_own_mark(monkeypatch):
+    _quotes(monkeypatch, [_quote("AAPL", mark="151")])
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL"), _tt_position(symbol="ODD", mark_price="12.5", close_price="12")])
+
+    prices = {p.symbol: p.current_price for p in acct.get_positions()}
+
+    assert prices == {"AAPL": 151.0, "ODD": 12.5}
+
+
+# ---------------------------------------------------------------------------
 # Pagination: the SDK only walks every page when page_offset is None
 # (tastytrade/session.py:389-419). Omitting it truncates silently.
 # ---------------------------------------------------------------------------

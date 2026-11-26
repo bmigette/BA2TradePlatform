@@ -727,6 +727,15 @@ class TastyTradeAccount(AccountInterface):
                 f"{self._describe_broker_error(e, 'the position fetch')}", exc_info=True)
             return None
 
+        # THE PRICE is the broker's QUOTE mark, read once for the whole book. The positions endpoint's own
+        # ``mark_price`` is a raw bid/ask MIDPOINT: with a wide or stale quote (thin ETFs, any closed market)
+        # it is not a price anyone can trade at -- live account, 2026-11-26: HUMN bid 23.00 / ask 36.62 gave
+        # 29.81 against a quote mark and last trade of 24.71, and every open-P/L view showed +20% on a flat day.
+        held_equities = [pos.symbol for pos in tt_positions
+                         if pos.instrument_type == TTInstrumentType.EQUITY and float(pos.quantity) != 0]
+        quote_marks = self._held_quote_marks(held_equities)
+        unquoted = []
+
         positions = []
         skipped_non_equity = 0
         for pos in tt_positions:
@@ -741,14 +750,19 @@ class TastyTradeAccount(AccountInterface):
             multiplier = int(pos.multiplier) if pos.multiplier else 1
             avg_price = float(pos.average_open_price)
             close_price = float(pos.close_price) if pos.close_price is not None else None
-            # mark_price is per-share (`mark` is the whole position); fall back to the
-            # previous close, then to the entry price. Never a fabricated constant.
-            if pos.mark_price is not None:
-                current = float(pos.mark_price)
-            elif close_price is not None:
-                current = close_price
+            # The quote mark; without one (the quote read failed or left the symbol out) the position's own
+            # per-share mark, then the previous close, then the entry price. Never a fabricated constant.
+            quoted = quote_marks.get(pos.symbol)
+            if quoted is not None:
+                current = quoted
             else:
-                current = avg_price
+                unquoted.append(pos.symbol)
+                if pos.mark_price is not None:
+                    current = float(pos.mark_price)
+                elif close_price is not None:
+                    current = close_price
+                else:
+                    current = avg_price
 
             # DIRECTION. TastyTrade publishes ``quantity`` as an ABSOLUTE number and the direction in
             # ``quantity_direction`` ("Long" / "Short"). The platform's Position contract (Alpaca's, and
@@ -817,10 +831,31 @@ class TastyTradeAccount(AccountInterface):
                 unrealized_plpc=unrealized_plpc,
             ))
 
+        if unquoted:
+            logger.warning(
+                f"[Account {self.id}] {len(unquoted)} of {len(positions)} position(s) have no quote mark and "
+                f"are priced from the positions endpoint's bid/ask midpoint (or their close): "
+                f"{', '.join(unquoted[:8])}{' ...' if len(unquoted) > 8 else ''}")
         logger.debug(
             f"[Account {self.id}] Retrieved {len(positions)} equity positions from "
             f"TastyTrade ({skipped_non_equity} non-equity rows skipped)")
         return positions
+
+    def _held_quote_marks(self, symbols: List[str]) -> Dict[str, float]:
+        """``{symbol: quote mark}`` for the held equities, from ONE bulk quote read per 100 symbols (the same
+        read and ladder as ``get_instrument_current_price(..., 'mark')``: mark, then last trade, then close;
+        never cached, so a polling view sees each read). A symbol with no usable quote is left out; a failed
+        read returns what it got (possibly nothing) and never fails the positions read."""
+        wanted = list(dict.fromkeys(symbols))
+        if not wanted:
+            return {}
+        try:
+            got = self._get_instrument_current_price_impl(wanted, 'mark') or {}
+        except Exception as e:  # noqa: BLE001 -- deliberate: the book stays readable on the positions' own marks
+            logger.warning(f"[Account {self.id}] quote read for {len(wanted)} held position(s) failed: "
+                           f"{self._describe_broker_error(e, 'the position quote fetch')}")
+            return {}
+        return {symbol: price for symbol, price in got.items() if price is not None and price > 0}
 
     def get_broker_floating_pl(self) -> Optional[float]:
         """TastyTrade's OWN open P/L on the equity book: its equity value minus cost basis.
