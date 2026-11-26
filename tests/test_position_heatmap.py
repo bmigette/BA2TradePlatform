@@ -5,7 +5,7 @@ No NiceGUI, no DB, no network: everything here is plain data in, plain data out.
 platform's own offline schedule (``ba2_common.core.market_calendar``)."""
 import json
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -35,13 +35,14 @@ def lot(symbol="AAPL", qty=10.0, direction="long", expert="Alpha-1", fills=(), t
 
 def market(prices=None, closes=None, caps=None, labels=None, price_missing=None, closes_missing=None,
            caps_missing=None, splits=None, splits_missing=None, broker_qty=None, broker_failed=None,
-           broker_option_rows=None):
+           broker_option_rows=None, broker_history=None, platform_orders=None):
     return MarketInputs(prices=prices or {}, price_missing=price_missing or {},
                         closes=closes or {}, closes_missing=closes_missing or {},
                         market_caps=caps or {}, market_caps_missing=caps_missing or {},
                         labels=labels or {}, splits=splits or {}, splits_missing=splits_missing or {},
                         broker_qty=broker_qty or {}, broker_failed=broker_failed or {},
-                        broker_option_rows=broker_option_rows or {})
+                        broker_option_rows=broker_option_rows or {},
+                        broker_history=broker_history or {}, platform_orders=platform_orders or {})
 
 
 def state(timeframe="today", metric="price", size="exposure", experts=(), labels=()):
@@ -780,3 +781,280 @@ def test_an_unknown_split_calendar_makes_pnl_na_for_a_period_longer_than_a_sessi
 def test_the_pnl_caption_says_dividends_and_fees_are_not_counted():
     view = hm.build_view([lot()], market(prices={"AAPL": 1.0}), state(metric="pnl"), TUE_OPEN)
     assert "dividends and fees" in hm.caption(view)
+
+
+# ---- "My P/L" from the broker's transaction history (TastyTrade) -----------------------------------------------
+# Tuesday 2026-11-24, 10:00 ET. Reference closes: today = Mon 11-23 16:00 ET (21:00 UTC), week = Fri 11-20 21:00 UTC.
+from ba2_trade_platform.ui.utils.position_heatmap import BrokerHistory, ShareMove  # noqa: E402
+
+YEAR_START = utc(2025, 12, 31, 5)          # midnight New York, 2025-12-31: the read's first day
+
+
+def move(qty, price, when, kind="trade", symbol="AAOI", detail=""):
+    return ShareMove(symbol=symbol, quantity=qty, price=price, executed_at=when, kind=kind, detail=detail)
+
+
+def history(*moves, covers_from=YEAR_START, positions_at=TUE_OPEN, failure=None, account=2):
+    return {account: BrokerHistory(moves=tuple(moves), covers_from=covers_from, positions_at=positions_at,
+                                   failure=failure)}
+
+
+def _broker_market(hist, qty=10.0, closes=None, prices=None):
+    return market(prices=prices or {"AAOI": 110.0}, broker_qty={2: {"AAOI": qty}}, broker_history=hist,
+                  closes=closes or {"AAOI": {"2026-11-20": 100.0, "2026-11-23": 100.0, "2026-10-30": 90.0}})
+
+
+def test_broker_history_pnl_counts_a_buy_and_a_partial_sell_inside_the_period():
+    hist = history(move(4.0, 95.0, utc(2026, 11, 23, 15)), move(-1.0, 105.0, utc(2026, 11, 23, 16)))
+    view = hm.build_view([], _broker_market(hist), state("week", "pnl"), TUE_OPEN)
+    t = tile_of(view, "AAOI")
+    # start 10 - 3 = 7 ; 10*110 - 7*100 - 4*95 + 1*105 = 125 ; at risk 700 + 380
+    assert t.pnl_amount == pytest.approx(125.0)
+    assert t.pnl_pct == pytest.approx(125.0 / 1080.0 * 100)
+    assert t.pnl_source == "the broker's transaction history"
+    assert "from the broker's transaction history" in hm.tooltip_html(t, view)
+
+
+def test_the_period_starts_at_the_reference_sessions_close_not_at_midnight():
+    after_close = history(move(2.0, 105.0, utc(2026, 11, 23, 21, 30)))       # 16:30 New York on the reference day
+    before_close = history(move(2.0, 105.0, utc(2026, 11, 23, 20, 30)))      # 15:30 New York: still the old period
+    inside = tile_of(hm.build_view([], _broker_market(after_close), state("today", "pnl"), TUE_OPEN), "AAOI")
+    outside = tile_of(hm.build_view([], _broker_market(before_close), state("today", "pnl"), TUE_OPEN), "AAOI")
+    assert inside.pnl_amount == pytest.approx(10 * 110 - 8 * 100 - 2 * 105)
+    assert outside.pnl_amount == pytest.approx(10 * 110 - 10 * 100)
+
+
+def test_a_transfer_inside_the_period_makes_pnl_na_and_says_so():
+    hist = history(move(5.0, None, utc(2026, 11, 23, 15), kind="transfer", detail="Receive Deliver / ACAT"))
+    view = hm.build_view([], _broker_market(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("transfer" in why and "Receive Deliver / ACAT" in why for _s, why in view.issues)
+
+
+def test_a_trade_without_a_price_inside_the_period_makes_pnl_na():
+    view = hm.build_view([], _broker_market(history(move(1.0, None, utc(2026, 11, 23, 15)))),
+                         state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("no price" in why for _s, why in view.issues)
+
+
+def test_a_history_that_starts_after_the_period_start_makes_pnl_na():
+    hist = history(covers_from=utc(2026, 11, 1, 4))
+    view = hm.build_view([], _broker_market(hist), state("month", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("does not reach back to the period start" in why for _s, why in view.issues)
+    assert tile_of(hm.build_view([], _broker_market(hist), state("week", "pnl"), TUE_OPEN), "AAOI").pnl_amount \
+        == pytest.approx(10 * 110 - 10 * 100)
+
+
+def test_a_movement_newer_than_the_positions_read_makes_pnl_na_reload():
+    hist = history(move(1.0, 109.0, TUE_OPEN))                    # filled as the positions were being read
+    view = hm.build_view([], _broker_market(hist), state("today", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("position changing right now, reload" in why for _s, why in view.issues)
+
+
+def test_a_failed_history_read_makes_pnl_na_with_the_failure():
+    view = hm.build_view([], _broker_market(history(failure="the transaction history read timed out")),
+                         state("today", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("timed out" in why for _s, why in view.issues)
+
+
+def test_a_start_quantity_on_the_other_side_is_refused():
+    hist = history(move(5.0, 100.0, utc(2026, 11, 23, 15)))          # holds 2 now, bought 5: was short 3?
+    view = hm.build_view([], _broker_market(hist, qty=2.0), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+    assert any("other side" in why for _s, why in view.issues)
+
+
+def test_the_aaoi_shape_gets_a_number_from_the_brokers_history():
+    # pre-existing shares bought long before the read window; the allocator sold 2 (no platform transaction) and
+    # bought 1.38986 (its one transaction) this week. The platform covers 1.38986 of 10.6809.
+    lots = [lot("AAOI", qty=AAOI_PLATFORM, expert=NO_EXPERT, account=2,
+                fills=[fill("BUY", AAOI_PLATFORM, 30.0, date(2026, 11, 23))])]
+    hist = history(move(-2.0, 35.0, utc(2026, 11, 23, 15)), move(AAOI_PLATFORM, 30.0, utc(2026, 11, 23, 15, 5)))
+    m = _broker_market(hist, qty=AAOI_BROKER, prices={"AAOI": 38.0},
+                       closes={"AAOI": {"2026-11-20": 36.0, "2026-10-30": 33.0}})
+    for timeframe, ref in (("week", 36.0), ("month", 33.0)):
+        t = tile_of(hm.build_view(lots, m, state(timeframe, "pnl"), TUE_OPEN), "AAOI")
+        start = AAOI_BROKER - (AAOI_PLATFORM - 2.0)
+        assert t.pnl_amount == pytest.approx(AAOI_BROKER * 38.0 - start * ref - AAOI_PLATFORM * 30.0 + 2 * 35.0)
+    no_expert = tile_of(hm.build_view(lots, m, state("week", "pnl", experts=[NO_EXPERT]), TUE_OPEN), "AAOI")
+    assert no_expert.pnl_source == "the broker's transaction history"
+
+
+def test_named_experts_stay_on_platform_fills_and_their_presence_keeps_no_expert_on_coverage():
+    lots = [lot("AAOI", qty=2.0, expert="Alpha-1", account=2, fills=[fill("BUY", 2.0, 90.0, date(2026, 10, 1))])]
+    hist = history(move(1.0, 105.0, utc(2026, 11, 23, 22)))
+    m = _broker_market(hist)
+    named = tile_of(hm.build_view(lots, m, state("today", "pnl", experts=["Alpha-1"]), TUE_OPEN), "AAOI")
+    assert named.pnl_amount == pytest.approx(2 * 110 - 2 * 100) and named.pnl_source == "the platform's fills"
+    rest = hm.build_view(lots, m, state("today", "pnl", experts=[NO_EXPERT]), TUE_OPEN)
+    assert tile_of(rest, "AAOI").pnl_amount is None
+    assert any("platform records cover 0 of the No-expert 8 shares" in why for _s, why in rest.issues)
+    whole = tile_of(hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN), "AAOI")
+    assert whole.pnl_source == "the broker's transaction history"
+
+
+def test_an_account_without_a_broker_history_keeps_the_platform_coverage_rule():
+    lots = [lot("AAOI", qty=10.0, account=2, fills=[fill("BUY", 10.0, 90.0, date(2026, 10, 1))])]
+    m = market(prices={"AAOI": 110.0}, closes={"AAOI": {"2026-11-23": 100.0}}, broker_qty={2: {"AAOI": 10.0}})
+    t = tile_of(hm.build_view(lots, m, state("today", "pnl"), TUE_OPEN), "AAOI")
+    assert t.pnl_amount == pytest.approx(100.0) and t.pnl_source == "the platform's fills"
+
+
+# ---- review fixes: the invariant, platform fills, where a refusal lands, reversals ---------------------------------
+from ba2_trade_platform.ui.utils.position_heatmap import PlatformOrder  # noqa: E402
+
+
+def _hist(*moves, covers_from=YEAR_START):
+    return {2: BrokerHistory(moves=tuple(moves), covers_from=covers_from, positions_at=TUE_OPEN)}
+
+
+def _m(rid, qty, price, when, kind="trade", symbol="AAOI", underlying=None, reverses=None, detail="Trade / x"):
+    return ShareMove(symbol=symbol, quantity=qty, price=price, executed_at=when, kind=kind, detail=detail, id=rid,
+                     underlying=underlying, reverses_id=reverses)
+
+
+def _two_symbols(hist, qty=12.0, orders=None):
+    return market(prices={"AAOI": 110.0, "GDXY": 15.0}, broker_qty={2: {"AAOI": qty, "GDXY": 20.0}},
+                  closes={"AAOI": {"2026-11-20": 100.0}, "GDXY": {"2026-11-20": 14.0}}, broker_history=hist,
+                  platform_orders=orders or {})
+
+
+OLD = utc(2026, 10, 1)
+INSIDE = utc(2026, 11, 23, 15)
+
+
+def test_a_platform_fill_missing_from_the_broker_history_refuses_pnl():
+    order = {2: [PlatformOrder(symbol="AAOI", side="BUY", quantity=1.38986, created_at=utc(2026, 11, 23, 14, 59))]}
+    missing = hm.build_view([], _two_symbols(_hist(), orders=order), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(missing, "AAOI").pnl_amount is None
+    assert ("AAOI", "a platform fill is not in the broker history yet") in missing.issues
+    matched = _hist(_m(7, 1.38986, 30.0, INSIDE))
+    view = hm.build_view([], _two_symbols(matched, qty=12.0, orders=order), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is not None
+
+
+def test_an_unknown_instrument_row_refuses_its_underlyings_tile_only():
+    hist = _hist(_m(8, 1.0, None, INSIDE, kind="other", symbol="AAOI  261218C00040000", underlying="AAOI",
+                    detail="unrecognised transaction row (Receive Deliver / Journal)"))
+    view = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None and tile_of(view, "GDXY").pnl_amount is not None
+
+
+def test_a_row_no_tile_can_hold_refuses_every_tile_of_the_account():
+    hist = _hist(_m(9, 3.0, None, INSIDE, kind="other", symbol="ZZZ", detail="unrecognised transaction row (x)"))
+    view = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None and tile_of(view, "GDXY").pnl_amount is None
+    assert not any(sym == "ZZZ" for sym, _why in view.issues)
+
+
+def test_a_corporate_action_refuses_every_tile_for_the_periods_containing_it():
+    hist = _hist(_m(10, 10.0, None, utc(2026, 11, 2, 15), kind="split", symbol="OLDCO",
+                    detail="a corporate action (Receive Deliver / Symbol Change)"))
+    month = hm.build_view([], _two_symbols(hist), state("month", "pnl"), TUE_OPEN)
+    assert tile_of(month, "AAOI").pnl_amount is None and tile_of(month, "GDXY").pnl_amount is None
+    week = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(week, "AAOI").pnl_amount is not None
+
+
+def test_a_reversal_refuses_the_symbol_for_periods_containing_either_row():
+    hist = _hist(_m(3, 2.0, 100.0, utc(2026, 11, 10, 15)), _m(5, -2.0, 100.0, OLD, reverses=3))
+    assert tile_of(hm.build_view([], _two_symbols(hist), state("month", "pnl"), TUE_OPEN), "AAOI").pnl_amount is None
+    assert tile_of(hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN), "AAOI").pnl_amount \
+        is not None
+
+
+def test_a_platform_order_older_than_the_proven_coverage_is_not_cross_checked():
+    order = {2: [PlatformOrder(symbol="AAOI", side="BUY", quantity=1.0, created_at=utc(2026, 11, 19, 15))]}
+    hist = _hist(covers_from=utc(2026, 11, 20, 0))
+    t = tile_of(hm.build_view([], _two_symbols(hist, orders=order), state("week", "pnl"), TUE_OPEN), "AAOI")
+    assert t.pnl_amount is not None
+
+
+def test_the_pnl_caption_names_the_known_delay_of_the_brokers_history():
+    view = hm.build_view([], _two_symbols(_hist()), state("week", "pnl"), TUE_OPEN)
+    assert "a trade placed directly at the broker can take a few minutes to reach the broker's history" \
+        in hm.caption(view)
+    plain = hm.build_view([lot()], market(prices={"AAPL": 1.0}), state(metric="pnl"), TUE_OPEN)
+    assert "few minutes" not in hm.caption(plain)
+
+
+# ---- option assignment / exercise, equity offering, warrant: refuse the held tile only ----------------------------
+
+ASSIGN_WHY = "an option assignment or exercise in the period: the share delivery cannot be verified"
+
+
+def _tile_only(rid, when, symbol="AAOI  261218C00040000", underlying="AAOI", detail=ASSIGN_WHY):
+    return _m(rid, 100.0, None, when, kind="tile_only", symbol=symbol, underlying=underlying, detail=detail)
+
+
+@pytest.mark.parametrize("label", ["assignment", "exercise"])
+def test_an_option_assignment_or_exercise_refuses_its_held_underlying_for_the_period(label):
+    hist = _hist(_tile_only(20, INSIDE))
+    week = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(week, "AAOI").pnl_amount is None and tile_of(week, "GDXY").pnl_amount is not None
+    assert any(sym == "AAOI" and ASSIGN_WHY in why for sym, why in week.issues)
+    before = _hist(_tile_only(20, utc(2026, 11, 2, 15)))                   # before the week: the week stands
+    assert tile_of(hm.build_view([], _two_symbols(before), state("week", "pnl"), TUE_OPEN), "AAOI").pnl_amount \
+        is not None
+
+
+def test_an_assignment_on_an_underlying_not_held_refuses_nothing():
+    hist = _hist(_tile_only(21, INSIDE, symbol="ZZZ  261218P00010000", underlying="ZZZ"))
+    view = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is not None and tile_of(view, "GDXY").pnl_amount is not None
+
+
+def test_an_equity_offering_row_on_a_held_symbol_refuses_that_tile():
+    why = "an Equity Offering row in the period (Receive Deliver / Allocate): its effect on the shares cannot be verified"
+    hist = _hist(_tile_only(22, INSIDE, symbol="GDXY", underlying=None, detail=why))
+    view = hm.build_view([], _two_symbols(hist), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "GDXY").pnl_amount is None and tile_of(view, "AAOI").pnl_amount is not None
+    assert any(sym == "GDXY" and "Equity Offering" in w for sym, w in view.issues)
+
+
+# ---- recent platform fills matched one by one --------------------------------------------------------------------
+
+RECENT_WHY = "a recent platform fill is not in the broker history yet, reload"
+
+
+def _mixed(*recent_moves, recent_age_min=5, recent_qty=1.0):
+    """An older platform buy and a recent one; ONE older broker buy of 2 shares covers both in the aggregate."""
+    orders = {2: [PlatformOrder(symbol="AAOI", side="BUY", quantity=1.0, created_at=utc(2026, 11, 23, 14, 59)),
+                  PlatformOrder(symbol="AAOI", side="BUY", quantity=recent_qty,
+                                created_at=TUE_OPEN - timedelta(minutes=recent_age_min))]}
+    hist = _hist(_m(30, 2.0, 30.0, INSIDE), *recent_moves)
+    return hm.build_view([], _two_symbols(hist, orders=orders), state("week", "pnl"), TUE_OPEN)
+
+
+def test_a_recent_platform_fill_without_its_own_broker_row_is_n_a_although_the_aggregate_passes():
+    view = _mixed()
+    assert tile_of(view, "AAOI").pnl_amount is None and tile_of(view, "GDXY").pnl_amount is not None
+    assert ("AAOI", RECENT_WHY) in view.issues
+
+
+def test_a_recent_platform_fill_with_its_broker_row_has_a_number():
+    view = _mixed(_m(31, 1.0, 31.0, TUE_OPEN - timedelta(minutes=4)))
+    assert tile_of(view, "AAOI").pnl_amount is not None
+
+
+def test_a_recent_order_filled_in_two_broker_executions_is_matched():
+    view = _mixed(_m(31, 0.5, 31.0, TUE_OPEN - timedelta(minutes=4)),
+                  _m(32, 0.5, 31.1, TUE_OPEN - timedelta(minutes=3)))
+    assert tile_of(view, "AAOI").pnl_amount is not None
+
+
+def test_each_broker_row_matches_one_recent_order_only():
+    orders = {2: [PlatformOrder(symbol="AAOI", side="BUY", quantity=1.0, created_at=utc(2026, 11, 23, 14, 59)),
+                  PlatformOrder(symbol="AAOI", side="BUY", quantity=1.0, created_at=TUE_OPEN - timedelta(minutes=6)),
+                  PlatformOrder(symbol="AAOI", side="BUY", quantity=1.0, created_at=TUE_OPEN - timedelta(minutes=5))]}
+    hist = _hist(_m(30, 3.0, 30.0, INSIDE), _m(31, 1.0, 31.0, TUE_OPEN - timedelta(minutes=4)))   # aggregate passes
+    view = hm.build_view([], _two_symbols(hist, orders=orders), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(view, "AAOI").pnl_amount is None
+
+
+def test_an_order_older_than_thirty_minutes_is_not_matched_one_by_one():
+    assert tile_of(_mixed(recent_age_min=40), "AAOI").pnl_amount is not None

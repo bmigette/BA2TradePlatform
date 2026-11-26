@@ -12,7 +12,8 @@ TWO tables:
 
 * ``account_growth_snapshot``: per ``(account_id, dataset)``. ``dataset`` is ``"growth"`` (the four
   broker datasets the growth tab draws from, written together after a refresh in which all four were
-  good) or ``"dividends"`` (the latest dividend rows, read by the allocator page). ``payload`` is the
+  good), ``"dividends"`` (the latest dividend rows, read by the allocator page) or ``"share_movements"`` (the
+  heatmap's stored broker share movements, ``services.broker_share_history``). ``payload`` is the
   codec's output (``services.growth_snapshot``); a row whose ``schema_version`` is not
   ``GROWTH_SNAPSHOT_SCHEMA_VERSION`` is treated as absent.
 * ``symbol_dividend_history``: per symbol, the RAW FMP ``stock_dividend`` payload (parsed at read time,
@@ -37,6 +38,9 @@ GROWTH_SNAPSHOT_SCHEMA_VERSION = 1
 
 DATASET_GROWTH = "growth"
 DATASET_DIVIDENDS = "dividends"
+#: An account's broker SHARE MOVEMENTS (the Overview heatmap's "My P/L"; ``services.broker_share_history``): the
+#: classified transaction rows with their broker ids, plus the sync metadata. A value of ``dataset``, not a table.
+DATASET_SHARE_MOVEMENTS = "share_movements"
 
 
 class AccountGrowthSnapshot(SQLModel, table=True):
@@ -44,7 +48,7 @@ class AccountGrowthSnapshot(SQLModel, table=True):
     __tablename__ = "account_growth_snapshot"
 
     account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", primary_key=True)
-    dataset: str = Field(primary_key=True, description="'growth' | 'dividends' (plain str)")
+    dataset: str = Field(primary_key=True, description="'growth' | 'dividends' | 'share_movements' (plain str)")
     fetched_at: DateTime = Field(description="UTC: when the broker rows were fetched")
     payload: Any = Field(sa_column=Column(JSON, nullable=False), description="The codec's encoded rows")
     schema_version: int = Field(description="GROWTH_SNAPSHOT_SCHEMA_VERSION at write time")

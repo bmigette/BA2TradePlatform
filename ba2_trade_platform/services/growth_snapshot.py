@@ -25,7 +25,8 @@ from sqlmodel import select
 
 from ..core.db import get_db
 from ..core.growth_snapshot_models import (
-    DATASET_DIVIDENDS, DATASET_GROWTH, GROWTH_SNAPSHOT_SCHEMA_VERSION, AccountGrowthSnapshot, SymbolDividendHistory)
+    DATASET_DIVIDENDS, DATASET_GROWTH, DATASET_SHARE_MOVEMENTS, GROWTH_SNAPSHOT_SCHEMA_VERSION, AccountGrowthSnapshot,
+    SymbolDividendHistory)
 from ..core.models import Position
 from ..core.types import OrderDirection
 from ..logger import logger
@@ -367,6 +368,62 @@ def load_dividends(account_id: int) -> Optional[StoredDividends]:
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Stored dividends of account {account_id} could not be decoded "
                        f"({type(e).__name__}: {e}); fetching from the broker instead")
+        return None
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# broker share movements (the Overview heatmap's "My P/L" from the broker's own history)
+# --------------------------------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StoredShareMovements:
+    """One account's stored broker share movements (``services.broker_share_history`` decides what they mean).
+
+    ``rows``: the classified transaction rows, each with its broker ``id``. ``covered_from``: the instant from which
+    the store PROVABLY holds every share movement (from a complete full read). ``synced_at`` / ``full_read_at``:
+    when the last sync / the last FULL read finished."""
+    rows: List[Dict[str, Any]]
+    covered_from: datetime
+    synced_at: datetime
+    full_read_at: datetime
+
+
+#: The share-movement payload's own layout version (inside the payload: the table's schema_version is shared).
+#: 4: rows classified by instrument (option assignments / exercises, equity offerings and warrants kept as
+#: tile refusals; cash Money Movement rows not kept), no per-symbol baselines; a store of another format is
+#: ignored and read again in full.
+SHARE_MOVEMENTS_FORMAT = 4
+
+
+def save_share_movements(account_id: int, store: StoredShareMovements) -> None:
+    """Store the account's ``"share_movements"`` dataset (RAISES on a value the codec refuses or a database error;
+    the caller counts it as a failed sync). Everything is encoded before anything is written."""
+    times = {name: _check_utc(getattr(store, name)) for name in ("covered_from", "synced_at", "full_read_at")}
+    payload = {"format": SHARE_MOVEMENTS_FORMAT, "rows": encode_rows(store.rows),
+               **{name: value.isoformat() for name, value in times.items()}}
+    with get_db() as session:
+        _upsert(session, account_id, DATASET_SHARE_MOVEMENTS, payload, times["synced_at"])
+        session.commit()
+
+
+def load_share_movements(account_id: int) -> Optional[StoredShareMovements]:
+    """The account's stored share movements, or None (absent, or unreadable / another format: logged at WARNING).
+    Never raises."""
+    hit = _read(account_id, DATASET_SHARE_MOVEMENTS)
+    if hit is None:
+        return None
+    payload, _fetched_at = hit
+    try:
+        if type(payload) is not dict or payload.get("format") != SHARE_MOVEMENTS_FORMAT:
+            raise ValueError("not a share-movement payload of this format")
+        return StoredShareMovements(
+            rows=decode_rows(payload["rows"]),
+            covered_from=_as_utc(datetime.fromisoformat(payload["covered_from"])),
+            synced_at=_as_utc(datetime.fromisoformat(payload["synced_at"])),
+            full_read_at=_as_utc(datetime.fromisoformat(payload["full_read_at"])))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Stored share movements of account {account_id} could not be decoded "
+                       f"({type(e).__name__}: {e}); reading them from the broker instead")
         return None
 
 

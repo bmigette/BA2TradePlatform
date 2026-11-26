@@ -42,11 +42,26 @@ add up to its open quantity, or its P/L is n/a.
 A split dated inside the period makes BOTH metrics n/a: the history is split-adjusted as of its fetch while broker
 prices and the platform's fills are as traded, and nothing here can prove the two are on one basis.
 
-WHOSE FILLS. "My P/L" is computed from the PLATFORM's fills only, for every account type, and only when the platform's
-records cover the broker's whole position for that symbol and account (within ``COVER_TOLERANCE``); otherwise it is
-n/a: "platform records cover X of the broker's Y shares". The broker's own trade history is deliberately not used:
-its depth and completeness differ per broker and cannot be verified here, and a missing execution would silently
-move the start quantity. With an expert filter "My P/L" uses that expert's platform fills, and "No expert" uses the
+WHOSE FILLS. For an account whose broker's own transaction history is stored (``broker_history``: TastyTrade,
+``services.broker_share_history``), the broker's WHOLE position (all experts, or "No expert" when no named expert
+holds the symbol) is measured from that history: the period starts at the reference session's CLOSE
+(``regular_session_close_utc``), a share movement after it is inside; start quantity = broker quantity now - the
+signed movements inside. Only an ``Equity`` row can change a tile (``TastyTradeAccount.classify_transaction``): an
+equity trade or a reinvested dividend is COUNTED, rows of other instruments are ignored, every other equity row is a
+REFUSAL row -- except an option assignment / exercise and an Equity Offering / Warrant row, which refuse only the
+tile of their underlying / symbol when it is held (kind ``tile_only``: nothing when it is not). "My P/L" is n/a (with which reason) when: the history could not be read / is still loading / its sync
+did not start after the positions read; it does not provably reach back to the period start (coverage is per
+period: Today / This week stay computable when the year is not covered); a refusal row falls inside the period --
+on the tile of its symbol or underlying, or on EVERY tile of the account when it is a corporate action or maps to no
+held symbol; a transaction that was reversed, or reverses another, falls inside the period; a movement inside has no
+price; a movement is newer than the positions read (minus ``RACE_MARGIN_S``: "position changing right now,
+reload"); the platform has a fill for the symbol that no broker row matches (``platform_fill_missing``, a
+BEST-EFFORT check), or a platform order created in the 30 minutes before the positions read has no broker rows of
+its own (``recent_fill_missing``: "a recent platform fill is not in the broker history yet, reload"); or the start quantity lands on the other side. KNOWN AND ACCEPTED: a trade placed directly at
+the broker can take a few minutes to reach the broker's history (the caption says so). Every other position is
+computed from the PLATFORM's fills, and only when the platform's records cover the broker's whole position for that
+symbol and account (within ``COVER_TOLERANCE``); otherwise it is n/a: "platform records cover X of the broker's Y
+shares". Each tile's tooltip names its source. With an expert filter "My P/L" uses that expert's platform fills, and "No expert" uses the
 platform's no-expert records only when they cover its whole remainder. Dividends and fees are not counted. When a
 symbol's split calendar could not be read, its "My P/L" for a period longer than one session is n/a.
 
@@ -63,11 +78,12 @@ import html
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ba2_common.core.market_calendar import (
     NY_TZ, is_regular_session, next_regular_session, nyse_regular_sessions, prior_regular_session,
+    regular_session_close_utc,
 )
 
 # --------------------------------------------------------------------------------------------------------------
@@ -145,6 +161,44 @@ class Lot:
 
 
 @dataclass(frozen=True)
+class ShareMove:
+    """One change of an equity position's quantity in the broker's own transaction history: ``quantity`` signed
+    (+ in, - out), ``price`` per share (None = the row has no trade price), ``executed_at`` tz-aware UTC, ``kind``
+    trade (counted) | split (refuses the account) | other (refuses its tile, or the account when it maps to no held
+    symbol) | tile_only (refuses its held tile only, nothing when none is held)."""
+    symbol: str
+    quantity: float
+    price: Optional[float]
+    executed_at: Optional[datetime]
+    kind: str
+    detail: str = ""
+    #: the broker's transaction id, the option's underlying (a refusal row lands there), the id this row reverses
+    id: Optional[int] = None
+    underlying: Optional[str] = None
+    reverses_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class PlatformOrder:
+    """A platform order of the account that filled (``quantity`` = its filled quantity), ``side`` 'BUY' | 'SELL',
+    ``created_at`` tz-aware: the broker history must show it (cross-check only)."""
+    symbol: str
+    side: str
+    quantity: float
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class BrokerHistory:
+    """An account's share movements since ``covers_from`` (tz-aware; None = unknown), read AFTER its positions read,
+    which finished at ``positions_at``; ``failure`` = why the read is unusable."""
+    moves: Tuple[ShareMove, ...] = ()
+    covers_from: Optional[datetime] = None
+    positions_at: Optional[datetime] = None
+    failure: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class MarketInputs:
     """Per-symbol data the loader gathered. A symbol absent from a value map is unknown; its ``*_missing`` entry
     (when present) says why. ``broker_qty`` holds ``{account: {symbol: signed qty}}`` for the accounts whose broker
@@ -163,6 +217,10 @@ class MarketInputs:
     broker_failed: Mapping[int, str] = field(default_factory=dict)
     #: account -> option rows in its broker positions (excluded, counted)
     broker_option_rows: Mapping[int, int] = field(default_factory=dict)
+    #: account -> its broker transaction history (only accounts that have one: TastyTrade)
+    broker_history: Mapping[int, BrokerHistory] = field(default_factory=dict)
+    #: account -> the platform's filled orders (cross-checked against the broker history)
+    platform_orders: Mapping[int, Sequence[PlatformOrder]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,6 +250,8 @@ class Tile:
     experts: Tuple[str, ...]
     labels: Tuple[str, ...]
     label_text: str = ""
+    #: where "My P/L" comes from: "the broker's transaction history" / "the platform's fills" (or both)
+    pnl_source: Optional[str] = None
 
 
 @dataclass
@@ -208,6 +268,8 @@ class HeatmapView:
     quantity_mismatches: List[Tuple[str, int, float, float]] = field(default_factory=list)
     #: per-account notes for the caption (a broker book that could not be read)
     broker_notes: List[str] = field(default_factory=list)
+    #: whether any account's "My P/L" is measured from the broker's transaction history
+    broker_history_used: bool = False
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -335,6 +397,23 @@ COVER_TOLERANCE = 1e-4
 #: A position under this many shares, or worth under this many dollars, is dust: no tile.
 DUST_QTY = 1e-6
 DUST_VALUE = 0.01
+#: A broker movement this close to (or after) the positions read means the position is changing as it is read.
+RACE_MARGIN_S = 60.0
+#: The loader reads the platform's filled orders from this long before the earliest boundary (the pure check then
+#: keeps only those created inside the history's proven coverage).
+ORDER_LOOKBACK_S = 3 * 24 * 3600.0
+#: A platform order created this long before the positions read must have its OWN broker row(s) ...
+RECENT_ORDER_S = 30 * 60.0
+#: ... executed from this long before its creation to this long after the positions read.
+RECENT_MATCH_SKEW_S = 10 * 60.0
+RECENT_FILL_MISSING = "a recent platform fill is not in the broker history yet, reload"
+BROKER_HISTORY_DELAY_NOTE = ("My P/L from the broker's transaction history: a trade placed directly at the broker can "
+                             "take a few minutes to reach the broker's history.")
+#: A broker row may be timestamped this long before the platform order it fills was created (clock skew).
+ORDER_SKEW_S = 300.0
+PLATFORM_FILL_MISSING = "a platform fill is not in the broker history yet"
+SOURCE_BROKER = "the broker's transaction history"
+SOURCE_PLATFORM = "the platform's fills"
 
 
 def _signed_qty(lot: Lot) -> float:
@@ -452,15 +531,157 @@ class _Part:
     lots: Tuple[Lot, ...] = ()
     experts: Tuple[str, ...] = ()
     whose: str = "the broker's"
+    #: the broker's WHOLE position on this account (all experts, or a "No expert" remainder no named expert shares)
+    whole: bool = False
 
 
-def _part_pnl(symbol: str, part: _Part, market: MarketInputs, price: float, ref: Optional[float], start: date):
+def _maps_to(move: ShareMove, symbol: str) -> bool:
+    return move.symbol == symbol or move.underlying == symbol
+
+
+def _when(moment: Optional[datetime]) -> str:
+    return "an unknown date" if moment is None else moment.astimezone(NY_TZ).date().isoformat()
+
+
+def platform_fill_missing(symbol: str, orders: Sequence[PlatformOrder], moves: Sequence[ShareMove],
+                          since: datetime) -> bool:
+    """Whether the platform has a FILLED order of ``symbol`` created at or after ``since`` (the history's proven
+    coverage start) that the broker rows ``moves`` do not account for (same side, enough quantity in total, not
+    before the order was created minus ``ORDER_SKEW_S``).
+
+    A BEST-EFFORT cross-check, NOT a proof: it only knows the platform's own orders (a trade placed directly at the
+    broker is invisible to it), matches by side and total quantity rather than order by order, and dates an order
+    by its creation (no fill time is stored)."""
+    mine = [m for m in moves if _maps_to(m, symbol)]
+    relevant = [o for o in orders if o.symbol == symbol and o.created_at >= since]
+    for side, sign in (("BUY", 1.0), ("SELL", -1.0)):
+        placed = [o for o in relevant if o.side == side]
+        want = sum(o.quantity for o in placed)
+        if want <= _EPS:
+            continue
+        earliest = min(o.created_at for o in placed)
+        have = sum(abs(m.quantity) for m in mine if m.kind == "trade" and _finite(m.quantity) is not None
+                   and m.quantity * sign > 0 and m.executed_at is not None
+                   and (earliest - m.executed_at).total_seconds() <= ORDER_SKEW_S)
+        if have + _tol(want) < want:
+            return True
+    return False
+
+
+def recent_fill_missing(symbol: str, orders: Sequence[PlatformOrder], moves: Sequence[ShareMove],
+                        positions_at: Optional[datetime]) -> bool:
+    """Whether a platform order of ``symbol`` created within ``RECENT_ORDER_S`` before ``positions_at`` lacks its
+    OWN broker trade rows: same sign, executed from its creation - ``RECENT_MATCH_SKEW_S`` to ``positions_at`` +
+    ``RECENT_MATCH_SKEW_S``, adding up to its filled quantity within tolerance; each broker row serves ONE order
+    (oldest order first, rows in time order). No fill time is stored, so "recent" is dated by the order's creation
+    (an order created earlier that filled in the last 30 minutes is left to the aggregate check). Applies on top
+    of ``platform_fill_missing``, which an older broker buy can satisfy for a missing recent fill."""
+    if positions_at is None:
+        return False
+    recent = sorted((o for o in orders if o.symbol == symbol
+                     and 0 <= (positions_at - o.created_at).total_seconds() <= RECENT_ORDER_S),
+                    key=lambda o: o.created_at)
+    trades = sorted((m for m in moves if _maps_to(m, symbol) and m.kind == "trade" and m.executed_at is not None
+                     and _finite(m.quantity) is not None), key=lambda m: m.executed_at)
+    used: set = set()
+    for o in recent:
+        sign = 1.0 if o.side == "BUY" else -1.0
+        lo = o.created_at - timedelta(seconds=RECENT_MATCH_SKEW_S)
+        hi = positions_at + timedelta(seconds=RECENT_MATCH_SKEW_S)
+        got = 0.0
+        for i, m in enumerate(trades):
+            if i in used or m.quantity * sign <= 0 or not lo <= m.executed_at <= hi:
+                continue
+            if got >= o.quantity - _tol(o.quantity):
+                break
+            used.add(i)
+            got += abs(m.quantity)
+        if abs(got - o.quantity) > _tol(o.quantity):
+            return True
+    return False
+
+
+def _history_pnl(symbol: str, q_now: float, history: BrokerHistory, price: float, ref: Optional[float],
+                 boundary: datetime, held: Iterable[str], orders: Sequence[PlatformOrder]):
+    """P/L of the broker's whole position from the broker's own share movements (see the module docstring)."""
+    if history.failure:
+        return None, None, (history.failure if history.failure.startswith("broker history still loading")
+                            else f"the broker's transaction history could not be read ({history.failure})")
+    if history.covers_from is None or history.covers_from > boundary:
+        return None, None, (f"the broker's transaction history does not reach back to the period start "
+                            f"({boundary.astimezone(NY_TZ):%Y-%m-%d %H:%M} New York)")
+    held = set(held)
+
+    def in_period(m: ShareMove) -> bool:
+        return m.executed_at is None or m.executed_at > boundary
+
+    for m in history.moves:                                   # rows that refuse EVERY tile of the account
+        unheld = m.kind not in ("trade", "tile_only") and m.symbol not in held and m.underlying not in held
+        if (m.kind == "split" or unheld) and in_period(m):
+            return None, None, f"{m.detail} on {_when(m.executed_at)} in this account inside the period"
+    mine = [m for m in history.moves if _maps_to(m, symbol)]
+    if any(m.executed_at is None for m in mine):
+        return None, None, "a broker transaction row of this symbol has no time (unrecognised transaction row)"
+    by_id = {m.id: m for m in history.moves if m.id is not None}
+    for m in history.moves:
+        if m.reverses_id is None:
+            continue
+        target = by_id.get(m.reverses_id)
+        if not (_maps_to(m, symbol) or (target is not None and _maps_to(target, symbol))):
+            continue
+        if in_period(m) or target is None or in_period(target):
+            return None, None, f"a reversed broker transaction ({m.detail}) touches the period"
+    inside = sorted((m for m in mine if m.executed_at > boundary), key=lambda m: m.executed_at)
+    if history.positions_at is not None and any(
+            (history.positions_at - m.executed_at).total_seconds() < RACE_MARGIN_S for m in inside):
+        return None, None, "position changing right now, reload"
+    for m in inside:
+        if m.kind == "tile_only":
+            return None, None, f"{m.detail} (on {_when(m.executed_at)})"
+        if m.kind != "trade":
+            return None, None, (f"a {m.kind} ({m.detail}) on {_when(m.executed_at)} inside the period: the broker's "
+                                f"history cannot price it")
+        if _positive(m.price) is None or _finite(m.quantity) is None:
+            return None, None, f"a broker trade ({m.detail}) on {_when(m.executed_at)} inside the period has no price"
+    if platform_fill_missing(symbol, orders, mine, history.covers_from):
+        return None, None, PLATFORM_FILL_MISSING
+    if recent_fill_missing(symbol, orders, mine, history.positions_at):
+        return None, None, RECENT_FILL_MISSING
+    q_start = q_now - sum(m.quantity for m in inside)
+    if abs(q_start) <= _tol(q_now):
+        q_start = 0.0
+    if q_start * q_now < 0:
+        return None, None, (f"the broker's history puts the position on the other side at the period start "
+                            f"({q_start:g} shares)")
+    if q_start and ref is None:
+        return None, None, _NO_REFERENCE
+    start_value = q_start * ref if q_start else 0.0
+    buys = sum(m.quantity * m.price for m in inside if m.quantity > 0)
+    sells = sum(-m.quantity * m.price for m in inside if m.quantity < 0)
+    opening = buys if q_now > 0 else sells
+    return q_now * price - start_value - buys + sells, abs(start_value) + opening, None
+
+
+def _part_pnl(symbol: str, part: _Part, market: MarketInputs, price: float, ref: Optional[float], start: date,
+              boundary: datetime, held: Mapping[Optional[int], set]):
+    """``(pnl, denominator, reason, source)`` of one part."""
     if part.mode == "lots":
-        return _lots_pnl(part.lots, price, ref, start)
+        return _lots_pnl(part.lots, price, ref, start) + (SOURCE_PLATFORM,)
+    if part.whole and part.account_id in market.broker_history:
+        acct = part.account_id
+        return _history_pnl(symbol, part.qty, market.broker_history[acct], price, ref, boundary,
+                            held.get(acct, set()), market.platform_orders.get(acct, ())) + (SOURCE_BROKER,)
     mine = sum(_signed_qty(l) for l in part.lots)
     if abs(mine - part.qty) > _tol(part.qty):
-        return None, None, f"platform records cover {abs(mine):g} of {part.whose} {abs(part.qty):g} shares"
-    return _lots_pnl(part.lots, price, ref, start)
+        return (None, None, f"platform records cover {abs(mine):g} of {part.whose} {abs(part.qty):g} shares",
+                SOURCE_PLATFORM)
+    return _lots_pnl(part.lots, price, ref, start) + (SOURCE_PLATFORM,)
+
+
+def _source_of(part: _Part, market: MarketInputs, symbol: str) -> str:
+    if not (part.whole and part.account_id in market.broker_history):
+        return SOURCE_PLATFORM
+    return SOURCE_BROKER
 
 
 def _quantity_mismatches(lots: Sequence[Lot], broker_qty: Mapping[int, Mapping[str, float]]
@@ -531,7 +752,7 @@ def _holdings(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState):
                 experts = tuple(sorted({l.expert for l in named}))
                 if not exceed and abs(remainder) > _tol(b):
                     experts += (NO_EXPERT,)
-                parts.setdefault(sym, []).append(_Part(acct, b, "cover", tuple(sym_lots), experts))
+                parts.setdefault(sym, []).append(_Part(acct, b, "cover", tuple(sym_lots), experts, whole=True))
                 continue
             chosen = [l for l in named if l.expert in state.experts]
             if exceed and (chosen or NO_EXPERT in state.experts):
@@ -542,7 +763,7 @@ def _holdings(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState):
             if NO_EXPERT in state.experts and not exceed:
                 if abs(remainder) > _tol(b):
                     parts.setdefault(sym, []).append(_Part(acct, remainder, "cover", tuple(unnamed), (NO_EXPERT,),
-                                                           "the No-expert"))
+                                                           "the No-expert", whole=abs(expert_q) <= _EPS))
                 elif unnamed and not held:
                     issues.append((sym, not_held_why))
 
@@ -575,18 +796,23 @@ def build_view(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState, n
     view = HeatmapView(state=state, period_start=start, reference_session=ref_day, clamp=CLAMP_PCT[state.timeframe],
                        today_status=today_status(now)[0])
     view.quantity_mismatches = _quantity_mismatches(lots, market.broker_qty)
+    view.broker_history_used = bool(market.broker_history)
     view.broker_notes = [f"Account {a}: the broker's positions could not be read ({why}); its tiles use the "
                          f"platform's transaction quantities." for a, why in sorted(market.broker_failed.items())]
     parts, issues, view.options_excluded = _holdings(lots, market, state)
 
     today = _split_moment(now)[0]
+    held: Dict[Optional[int], set] = {a: {s for s, q in book.items() if _finite(q)}
+                                      for a, book in market.broker_qty.items()}
+    for l in lots:
+        held.setdefault(l.account_id, set()).add(l.symbol)
     for symbol in sorted(parts):
         gross = sum(abs(p.qty) for p in parts[symbol])
         price = _positive(market.prices.get(symbol))
         if gross < DUST_QTY or (price is not None and gross * price < DUST_VALUE):
             issues.append((symbol, f"dust position ({gross:g} shares): not drawn"))
             continue
-        tile, tile_issues = _tile(symbol, parts[symbol], market, state, start, ref_day, today)
+        tile, tile_issues = _tile(symbol, parts[symbol], market, state, start, ref_day, today, held)
         view.tiles.append(tile)
         issues.extend((symbol, why) for why in tile_issues)
 
@@ -600,7 +826,7 @@ def build_view(lots: Sequence[Lot], market: MarketInputs, state: HeatmapState, n
 
 
 def _tile(symbol: str, parts: List[_Part], market: MarketInputs, state: HeatmapState, start: date,
-          ref_day: date, today: date) -> Tuple[Tile, List[str]]:
+          ref_day: date, today: date, held: Mapping[Optional[int], set]) -> Tuple[Tile, List[str]]:
     issues: List[str] = []
     price = _positive(market.prices.get(symbol))
     ref = _positive((market.closes.get(symbol) or {}).get(ref_day.isoformat()))
@@ -630,8 +856,9 @@ def _tile(symbol: str, parts: List[_Part], market: MarketInputs, state: HeatmapS
         pass
     elif price is not None:
         total, denom = 0.0, 0.0
+        boundary = regular_session_close_utc(ref_day)
         for part in parts:
-            amount, base, why = _part_pnl(symbol, part, market, price, ref, start)
+            amount, base, why, _source = _part_pnl(symbol, part, market, price, ref, start, boundary, held)
             if why is not None:
                 pnl_issue = ref_issue if why == _NO_REFERENCE else why
                 total = None
@@ -677,6 +904,8 @@ def _tile(symbol: str, parts: List[_Part], market: MarketInputs, state: HeatmapS
                 market_cap=mcap, price_change_pct=change, pnl_amount=pnl, pnl_pct=pnl_pct, color_pct=color_pct,
                 size=size, size_known=size_known, experts=experts, labels=_symbol_labels(market.labels, symbol))
     tile.label_text = f"{symbol}\n{_pct(color_pct)}"
+    sources = sorted({_source_of(p, market, symbol) for p in parts})
+    tile.pnl_source = " and ".join(sources) if sources else None
     return tile, list(dict.fromkeys(issues))
 
 
@@ -830,7 +1059,8 @@ def tooltip_html(tile: Tile, view: HeatmapView) -> str:
         f"Quantity: {tile.quantity:g}" + (" (short)" if tile.quantity < 0 else ""),
         f"Price: {_price(tile.reference_close)} (close {ref}) &rarr; {_price(tile.current_price)}",
         f"Price change: {_pct(tile.price_change_pct)}",
-        f"My P/L ({e(TIMEFRAMES[view.state.timeframe].lower())}): {pnl}",
+        f"My P/L ({e(TIMEFRAMES[view.state.timeframe].lower())}): {pnl}"
+        + (f" - from {html.escape(tile.pnl_source, quote=False)}" if tile.pnl_source else ""),
         f"Experts: {e(', '.join(tile.experts))}",
         f"Labels: {e(', '.join(tile.labels))}",
     ]
@@ -897,6 +1127,8 @@ def caption(view: HeatmapView) -> str:
              f"{view.reference_session.isoformat()}. Red <= -{view.clamp:g}%, green >= +{view.clamp:g}%."]
     if s.metric == "pnl":
         parts.append("My P/L does not count dividends and fees.")
+        if view.broker_history_used:
+            parts.append(BROKER_HISTORY_DELAY_NOTE)
     if s.timeframe == "today":
         parts.append(_today_sentence(view))
     parts.extend(view.broker_notes)

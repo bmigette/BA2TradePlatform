@@ -1,7 +1,7 @@
 import json
 import asyncio
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -65,6 +65,158 @@ class _ZeroQuantityAfterRounding(Exception):
     its own type precisely so it can be caught BEFORE the broad
     ``except Exception -> _handle_order_submit_error`` that owns real broker faults.
     """
+
+
+
+
+# ---------------------------------------------------------------------------
+# SHARE MOVEMENTS (the Overview heatmap's "My P/L" from the broker's own history)
+#
+# One RAW row of TastyTrade's ``/accounts/<n>/transactions`` (https://developer.tastytrade.com/reference/transactions/;
+# values are strings, ``id`` / ``reverses-id`` numbers) -> a share movement, a refusal, or None (ignored). Parsed from
+# the JSON on purpose: tastytrade 12.4.1's ``Transaction`` model rejects documented values (action ``Allocate``,
+# instrument ``Event Contract``), which would fail the whole read for one row.
+#
+# CASH FIRST: a ``Money Movement`` row with no quantity (missing, empty or zero) moves cash only -- a cash dividend,
+# interest, a fee, a withholding, a deposit -- and is IGNORED whatever its instrument type, symbol or sub-type (a
+# dividend ETF pays every month: refusing these would make every month / year n/a). A ``Money Movement`` WITH a
+# non-zero quantity falls through to the rules below.
+#
+# THE RULE IS THE INSTRUMENT: a tile is an EQUITY position and only an ``Equity`` row can change it.
+#   (a) a row of a KNOWN non-Equity instrument (``_NON_EQUITY_INSTRUMENTS``) is IGNORED whatever its transaction type,
+#       with two exceptions that can move shares without a provable ``Equity`` row (kind ``tile_only``: they refuse
+#       the tile of their symbol / underlying when one is held, and nothing when none is -- never the whole account):
+#       an ``Equity Option`` ASSIGNMENT or EXERCISE (sub-type / description containing "assign" or "exercis", or any
+#       ``Receive Deliver`` that is not recognisably an expiration, "expir"; one without an underlying symbol is
+#       ``other``, which refuses the whole account), and any ``Equity Offering`` or ``Warrant`` row. Option TRADES and
+#       EXPIRATIONS stay ignored;
+#   (b) an ``Equity`` row is a MOVEMENT when it is a ``Trade`` with a recognised action (Buy / Buy to Open / Buy to
+#       Close = +, Sell / Sell to Open / Sell to Close = -) or a reinvested dividend (``Trade`` or ``Receive Deliver``
+#       with sub-type ``Dividend``, no action or a buy action = +), with a positive quantity, a positive price, a
+#       timezone and no ``reverses-id``;
+#   (c) ANY OTHER ``Equity`` row (a Receive Deliver that is not a reinvested dividend, ``Allocate``, no price, zero
+#       quantity, a ``reverses-id``, anything unrecognised) is a REFUSAL of its symbol (kind ``other``); a row whose
+#       sub-type or description marks a split, symbol change, merger or spin-off refuses the whole account (``split``);
+#   (d) a row with a MISSING or ``Unknown`` instrument is ignored only when it carries no symbol, no underlying symbol
+#       and no quantity (plain cash: interest, fees, deposits, cash dividends); otherwise it is a REFUSAL of its symbol /
+#       underlying (the heatmap refuses the whole account when that maps to no tile). An instrument type the reference
+#       does not list is refused the same way.
+# ---------------------------------------------------------------------------
+
+_NON_EQUITY_INSTRUMENTS = frozenset({"Bond", "Cryptocurrency", "Currency Pair", "Event Contract",
+                                     "Fixed Income Security", "Future", "Future Option", "Index", "Liquidity Pool"})
+#: Instruments whose every row refuses the held tile of its symbol / underlying (rule (a)'s exceptions).
+_TILE_REFUSING_INSTRUMENTS = frozenset({"Equity Offering", "Warrant"})
+OPTION_DELIVERY_REASON = "an option assignment or exercise in the period: the share delivery cannot be verified"
+_SHARE_ACTIONS = {"Buy": 1.0, "Buy to Open": 1.0, "Buy to Close": 1.0,
+                  "Sell": -1.0, "Sell to Open": -1.0, "Sell to Close": -1.0}
+_CORPORATE_ACTION_WORDS = ("split", "symbol change", "merger", "spin", "reorganization", "name change")
+#: Rows asked per page (the server may answer with fewer: its ``pagination`` block says how many).
+SHARE_HISTORY_PER_PAGE = 250
+#: Pages read at most; more = an incomplete read (``ShareHistoryPageCap``).
+SHARE_HISTORY_MAX_PAGES = 40
+#: One page request may take this long (not the adapter's generic 180 s); the event loop is the trading code's.
+SHARE_HISTORY_PAGE_TIMEOUT_S = 10.0
+
+
+class ShareHistoryIncomplete(ValueError):
+    """The share-movement read could not PROVE it read every row of the requested range."""
+    heatmap_kind = "incomplete"
+
+
+class ShareHistoryPageCap(ShareHistoryIncomplete):
+    """The history did not end within ``SHARE_HISTORY_MAX_PAGES`` pages."""
+    heatmap_kind = "page_cap"
+
+
+class ShareHistoryStopped(TimeoutError):
+    """The caller's stop flag ended the read between two pages."""
+    heatmap_kind = "stopped"
+
+
+class ShareHistoryReadFailed(RuntimeError):
+    """A page request failed (``heatmap_kind`` ``page_timeout`` when it ran out of time). The message carries no
+    account number."""
+    heatmap_kind = "failed"
+
+
+def _text(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _number(value) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def _instant(value) -> Optional[datetime]:
+    """A tz-aware UTC instant from the API's ISO string, or None (missing, unparsable, no timezone)."""
+    from datetime import timezone as _tz
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.astimezone(_tz.utc) if moment.tzinfo is not None and moment.utcoffset() is not None else None
+
+
+def classify_transaction(item: Dict) -> Optional[Dict]:
+    """``None`` for an ignored row, else ``{id, symbol, underlying, quantity (signed | None), price | None,
+    executed_at (UTC | None), kind (trade | split | other | tile_only), detail, transaction_type, sub_type,
+    instrument_type,
+    action, reverses_id}`` -- the rule is in the block comment above."""
+    instrument = _text(item.get("instrument-type"))
+    if instrument in _NON_EQUITY_INSTRUMENTS:
+        return None
+    ttype, sub = _text(item.get("transaction-type")), _text(item.get("transaction-sub-type"))
+    action, description = _text(item.get("action")), _text(item.get("description")) or ""
+    symbol, underlying = _text(item.get("symbol")), _text(item.get("underlying-symbol"))
+    qty, price = _number(item.get("quantity")), _number(item.get("price"))
+    rid, reverses = item.get("id"), item.get("reverses-id")
+    executed = _instant(item.get("executed-at"))
+    if ttype == "Money Movement" and not qty:
+        return None                                       # cash only (see CASH FIRST above)
+    if instrument in (None, "Unknown") and not symbol and not underlying and not qty:
+        return None                                       # plain cash: interest, fees, deposits, cash dividends
+    detail = f"{ttype or '?'} / {sub or '?'}"
+    out = {"id": rid if isinstance(rid, int) and not isinstance(rid, bool) else None, "symbol": symbol,
+           "underlying": underlying, "quantity": qty, "price": price if price and price > 0 else None,
+           "executed_at": executed, "kind": "other", "detail": f"unrecognised transaction row ({detail})",
+           "transaction_type": ttype, "sub_type": sub, "instrument_type": instrument, "action": action,
+           "reverses_id": reverses if isinstance(reverses, int) and not isinstance(reverses, bool) else None}
+    marks = f"{sub or ''} {description}".lower()
+    if instrument == "Equity Option":
+        delivery = ("assign" in marks or "exercis" in marks
+                    or (ttype == "Receive Deliver" and "expir" not in marks))
+        if not delivery:
+            return None                                    # an option trade or an expiration
+        if not underlying:
+            return dict(out, detail=f"an option assignment or exercise without an underlying symbol ({detail})")
+        return dict(out, kind="tile_only", price=None, detail=OPTION_DELIVERY_REASON)
+    if instrument in _TILE_REFUSING_INSTRUMENTS:
+        return dict(out, kind="tile_only", price=None,
+                    detail=f"an {instrument} row in the period ({detail}): its effect on the shares cannot be verified")
+    if any(word in marks for word in _CORPORATE_ACTION_WORDS):
+        return dict(out, kind="split", price=None, detail=f"a corporate action ({detail})")
+    if instrument != "Equity":
+        return out                                         # (d) and instrument types the reference does not list
+    clean = (executed is not None and qty is not None and qty > 0 and out["price"] is not None
+             and out["reverses_id"] is None)
+    if clean and ttype == "Trade" and sub != "Dividend" and action in _SHARE_ACTIONS:
+        return dict(out, quantity=_SHARE_ACTIONS[action] * qty, kind="trade", detail=detail)
+    if clean and ttype in ("Trade", "Receive Deliver") and sub == "Dividend" and (
+            action is None or _SHARE_ACTIONS.get(action) == 1.0):
+        return dict(out, quantity=qty, kind="trade", detail=f"{detail} (reinvested dividend)")
+    return out
 
 
 class TastyTradeAccount(AccountInterface):
@@ -3454,6 +3606,97 @@ class TastyTradeAccount(AccountInterface):
             logger.error(f"[Account {self.id}] Error fetching balance history: "
                 f"{self._describe_broker_error(e, 'the balance-history fetch')}", exc_info=True)
             return []
+
+    async def _transactions_page(self, params: Dict) -> Tuple[List, Any]:
+        """ONE page of ``/accounts/<n>/transactions`` through the session's OWN authenticated client and base URL --
+        what the SDK's ``Session._paginate`` does (``tastytrade/session.py:403``), minus the model parsing and minus
+        throwing the server's ``pagination`` block away. Returns the RAW items."""
+        from tastytrade.utils import validate_response
+        await self._session.refresh()
+        response = await self._session._client.get(f"/accounts/{self._account.account_number}/transactions",
+                                                   params=params)
+        validate_response(response)
+        body = response.json()
+        return body["data"]["items"], body.get("pagination")
+
+    def _masked(self, text: str) -> str:
+        number = _text(getattr(self._account, "account_number", None))
+        return text.replace(number, "***") if number else text
+
+    def read_share_movements(self, start_date: date, *, stop: Optional[threading.Event] = None,
+                             per_page: int = SHARE_HISTORY_PER_PAGE,
+                             max_pages: int = SHARE_HISTORY_MAX_PAGES) -> Dict:
+        """Every share movement / refusal row (``classify_transaction``) the server holds from ``start_date`` on,
+        oldest first, with COMPLETENESS PROVEN by the server's own ``pagination`` block (keys ``page-offset``,
+        ``total-pages``, ``total-items``, ``current-item-count``): every page reports the page-offset asked for and
+        its own item count, total-pages / total-items never change during the read, the last page read is the one
+        where page-offset + 1 >= total-pages, and the rows read equal total-items (an empty history only when
+        total-items is 0). A repeated or missing transaction id, or rows not in time order, also mean an incomplete
+        read. Raises ``ShareHistoryIncomplete`` (``ShareHistoryPageCap`` past ``max_pages``), ``ShareHistoryStopped``
+        when ``stop`` is set before a page, ``ShareHistoryReadFailed`` for a failed request (its message masked).
+
+        Requests are SEQUENTIAL (one page at a time, on the account's own event loop, which the trading code shares)
+        and each is bounded by ``SHARE_HISTORY_PAGE_TIMEOUT_S``: after a stop at most the one page already sent can
+        still complete. A SEPARATE read on purpose: ``get_filled_trades`` keeps its own behaviour for its callers.
+
+        Returns ``{"rows": [...], "pages": n, "total_items": n, "requested_from": start_date}``."""
+        self._require_session()
+        rows: List[Dict] = []
+        seen: set = set()
+        last_time = None
+        totals = None
+        read = 0
+        page = 0
+        while True:
+            if stop is not None and stop.is_set():
+                raise ShareHistoryStopped(f"[Account {self.id}] the share-movement read was stopped after {page} "
+                                          f"pages")
+            if page >= max_pages:
+                raise ShareHistoryPageCap(f"[Account {self.id}] the transaction history did not end within "
+                                          f"{max_pages} pages")
+            params = {"per-page": per_page, "page-offset": page, "sort": "Asc", "start-date": start_date.isoformat()}
+            try:
+                items, pagination = self._run_async(self._transactions_page(params),
+                                                    timeout=SHARE_HISTORY_PAGE_TIMEOUT_S)
+            except Exception as e:  # noqa: BLE001 -- re-raised without the account number
+                failure = ShareHistoryReadFailed(self._masked(f"page {page}: {type(e).__name__}: {e}"))
+                if isinstance(e, TimeoutError):
+                    failure.heatmap_kind = "page_timeout"
+                raise failure from None
+            if not isinstance(pagination, dict) or not isinstance(items, list):
+                raise ShareHistoryIncomplete(f"[Account {self.id}] page {page} came without a pagination block")
+            got = tuple(pagination.get(k) for k in ("page-offset", "total-pages", "total-items"))
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in got):
+                raise ShareHistoryIncomplete(f"[Account {self.id}] page {page}: unusable pagination block {got}")
+            offset, total_pages, total_items = got
+            count = pagination.get("current-item-count")
+            if offset != page or (count is not None and count != len(items)):
+                raise ShareHistoryIncomplete(f"[Account {self.id}] asked for page {page}, the server answered page "
+                                             f"{offset} with {count} of {len(items)} items")
+            if totals is None:
+                totals = (total_pages, total_items)
+            elif totals != (total_pages, total_items):
+                raise ShareHistoryIncomplete(f"[Account {self.id}] the history changed while it was read")
+            for raw in items:
+                rid = raw.get("id") if isinstance(raw, dict) else None
+                if not isinstance(rid, int) or isinstance(rid, bool) or rid in seen:
+                    raise ShareHistoryIncomplete(f"[Account {self.id}] a transaction id is missing or repeated")
+                seen.add(rid)
+                when = _instant(raw.get("executed-at"))
+                if when is not None:
+                    if last_time is not None and when < last_time:
+                        raise ShareHistoryIncomplete(f"[Account {self.id}] the rows are not in time order")
+                    last_time = when
+                moved = classify_transaction(raw)
+                if moved is not None:
+                    rows.append(moved)
+            read += len(items)
+            if page + 1 >= total_pages:
+                break
+            page += 1
+        if read != totals[1]:
+            raise ShareHistoryIncomplete(f"[Account {self.id}] read {read} rows, the server holds {totals[1]}")
+        return {"rows": rows, "pages": page + 1, "total_items": totals[1], "requested_from": start_date}
 
     def _filled_trades_impl(self, symbol, start_date, end_date):
         params = {

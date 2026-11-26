@@ -27,7 +27,10 @@ TastyTrade session marks that account "timed out"); the history reads share ``HI
 run in their own thread WHILE the history is read; the split calendar is read AFTER it (the history refresh fills the
 same memo), at most ``price_history.MAX_CONCURRENT`` requests at a time ON THE HISTORY PATH'S SHARED download
 slots, and keeps every calendar that arrived within
-``MARKET_DATA_DEADLINE_S`` (only the rest are "not checked"). The tab adds an overall bound on top.
+``MARKET_DATA_DEADLINE_S`` (only the rest are "not checked"). The broker's transaction history (TastyTrade) and the
+platform's filled orders it is cross-checked with run in their own thread from the end of the positions reads, WHILE
+the tile inputs are read, and are joined last with what is left of ``broker_share_history.WAIT_S`` (never extending
+the load); anything failing there makes only that account's "My P/L" n/a. The tab adds an overall bound on top.
 
 TIMING. One ``[PERF:page:load] Heatmap(...)`` line per load: every step with its own wall time (the parallel market
 caps included) and counts -- symbols read / cache or memo hits / failed / timed out -- so one line explains a slow
@@ -45,9 +48,10 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlmodel import and_, or_, select
 
@@ -59,11 +63,13 @@ from ..core.models import ExpertInstance, TradingOrder, Transaction
 from ..core.types import AssetClass, OrderDirection, OrderStatus, OrderType
 from ..core.utils import get_account_instance_from_id, get_labels_by_symbol
 from ..logger import logger
-from ..ui.utils.position_heatmap import (NO_EXPERT, TIMEFRAMES, Fill, Lot, MarketInputs, reference_session,
-                                        warm_calendar)
+from ..ui.utils.position_heatmap import (NO_EXPERT, ORDER_LOOKBACK_S, TIMEFRAMES, BrokerHistory, Fill, Lot,
+                                        MarketInputs, PlatformOrder, reference_session,
+                                        regular_session_close_utc, warm_calendar)
+from . import broker_share_history as bsh
 from . import price_history
 from .errors import PriceSourceUnreachable
-from ._positions_cache import read_positions, share_positions
+from ._positions_cache import POSITIONS_TTL_S, read_positions, share_positions
 from .account_scope import account_transaction_ids
 from .accounts import broker_read
 from .open_pnl import PRICED_STATUSES, _account_of
@@ -101,8 +107,7 @@ def _canonical(raw) -> str:
     (``ba2_providers.screener.symbol_universe.canonical_symbol``, ``BRK.B`` -> ``BRK-B``) -- the spelling of FMP and of
     the Alpaca history store. Alpaca and IBKR (``ibkr_mapping.from_ib_symbol``) report a share class with a dot,
     TastyTrade passes its own symbol through (a slash, ``BRK/B``): the slash is read as the dot first."""
-    from ba2_providers.screener.symbol_universe import canonical_symbol
-    return canonical_symbol(raw.replace("/", ".")) if isinstance(raw, str) else ""
+    return bsh.canonical_symbol(raw)
 
 
 def _positive(value) -> Optional[float]:
@@ -375,6 +380,7 @@ def clear_caches() -> None:
         _CLOSES.clear()
     with _INFLIGHT_LOCK:
         _INFLIGHT.clear()
+    bsh.clear()
 
 
 def _history_source(account_id: int) -> str:
@@ -589,7 +595,7 @@ def _account_work(account_id: int, raw_symbols: List[str], calls: Dict[str, int]
     if account is None:
         why = f"account {account_id} cannot be instantiated"
         return {"prices": {}, "missing": {_canonical(s): why for s in raw_symbols}, "book": None, "option_rows": 0,
-                "failure": why}
+                "failure": why, "account": None, "positions_at": None, "positions_seq": None}
     with lock:
         calls["positions"] += 1
     failure = None
@@ -600,6 +606,8 @@ def _account_work(account_id: int, raw_symbols: List[str], calls: Dict[str, int]
             logger.warning(f"Heatmap: account {account_id} positions read failed ({type(e).__name__}); "
                            f"pricing from the account price feed")
             positions, failure = None, f"the positions read failed ({type(e).__name__})"
+    positions_at = datetime.now(timezone.utc)
+    positions_seq = bsh.next_seq()          # AFTER the read: a history sync started later is newer than these positions
     if positions is None:
         failure = failure or "the positions read returned nothing"
         logger.warning(f"Heatmap: account {account_id}: {failure}; pricing from the account price feed")
@@ -625,7 +633,116 @@ def _account_work(account_id: int, raw_symbols: List[str], calls: Dict[str, int]
         if c not in prices and c not in missing:
             missing[c] = f"account {account_id} returned no usable price"
     return {"prices": prices, "missing": missing, "book": book if positions is not None else None,
-            "option_rows": option_rows, "failure": failure}
+            "option_rows": option_rows, "failure": failure, "account": account, "positions_at": positions_at,
+            "positions_seq": positions_seq}
+
+
+# --------------------------------------------------------------------------------------------------------------
+# the broker's transaction history (TastyTrade: ``get_share_movements``)
+# --------------------------------------------------------------------------------------------------------------
+
+def _has_share_history(account) -> bool:
+    """Whether the account type offers the share-movement read (TastyTrade). Asked of the CLASS: a broker object is
+    asked for nothing but its positions and that read."""
+    return callable(getattr(type(account), "read_share_movements", None))
+
+
+def _platform_orders(accounts: Sequence[int], since: datetime) -> Dict[int, List[PlatformOrder]]:
+    """The platform's FILLED equity orders of ``accounts`` created since ``since`` (any transaction, or none: the
+    allocator's sells of pre-existing shares have no transaction) -- the broker history must show them."""
+    if not accounts:
+        return {}
+    executed, terminal = OrderStatus.get_executed_statuses(), OrderStatus.get_terminal_statuses()
+    out: Dict[int, List[PlatformOrder]] = defaultdict(list)
+    with get_db() as session:
+        rows = session.exec(select(TradingOrder).where(TradingOrder.account_id.in_(list(accounts)))
+                            .where(TradingOrder.created_at >= since.replace(tzinfo=None))).all()
+        for o in rows:
+            if o.asset_class == AssetClass.OPTION or not o.filled_qty or not o.filled_qty > 0:
+                continue
+            if o.status not in executed and o.status not in terminal:
+                continue
+            created = _aware(o.created_at)
+            symbol = _canonical(o.symbol)
+            if created is None or not symbol:
+                continue
+            out[o.account_id].append(PlatformOrder(symbol=symbol, side="BUY" if o.side == OrderDirection.BUY else
+                                                   "SELL", quantity=float(o.filled_qty), created_at=created))
+    return dict(out)
+
+
+def _histories_in_background(read: "_BrokerRead", first_day: date, since: datetime, calls: Dict[str, int]):
+    """Start the history path in its own thread: the platform's filled orders, then for every account with the
+    share-movement read whose positions were read a stored-copy sync that STARTED after those positions
+    (``broker_share_history.request_sync``), each waited for until ``broker_share_history.WAIT_S`` after the positions
+    read. It runs WHILE the tile inputs are read and can never fail them: every exception in it becomes that account's
+    ``BrokerHistory(failure=...)`` ("My P/L" n/a), the quantities and prices stand regardless.
+
+    Returns ``finish()``: ``(histories, platform orders, wall seconds, note)``, waiting only for what is left of the
+    WAIT_S window (nothing, when the tile inputs took longer)."""
+    accounts = sorted(read.share_accounts)
+    began = time.monotonic()
+    deadline = began + bsh.WAIT_S
+    lock = threading.Lock()
+    box: Dict[str, Any] = {"histories": {}, "orders": {}, "seconds": None}
+
+    def put(aid, history):
+        with lock:
+            box["histories"].setdefault(aid, history)
+
+    def fail_all(why):
+        for aid in accounts:
+            put(aid, BrokerHistory(positions_at=read.share_accounts[aid][1], failure=why))
+
+    def run():
+        try:
+            orders = _platform_orders(accounts, since)
+        except Exception as e:  # noqa: BLE001 -- the cross-check cannot run: "My P/L" n/a, the tiles stand
+            why = bsh.redacted(f"the platform's orders could not be read ({type(e).__name__}: {e})")
+            logger.warning(f"Heatmap: {why}")
+            fail_all(why)
+            box["seconds"] = time.monotonic() - began
+            return
+        with lock:
+            box["orders"] = orders
+        futures = {}
+        for aid in accounts:
+            account, positions_at, positions_seq = read.share_accounts[aid]
+            try:
+                futures[aid] = bsh.request_sync(aid, account, first_day, positions_seq)
+                with lock:
+                    calls["history_syncs"] += 1
+            except Exception as e:  # noqa: BLE001 -- this account's "My P/L" n/a
+                why = bsh.redacted(f"the broker history sync could not start ({type(e).__name__}: {e})", account)
+                logger.warning(f"Heatmap: account {aid}: {why}")
+                put(aid, BrokerHistory(positions_at=positions_at, failure=why))
+        for aid, future in futures.items():
+            account, positions_at, _seq = read.share_accounts[aid]
+            try:
+                store, why = bsh.wait_for_store(future, deadline - time.monotonic())
+                put(aid, BrokerHistory(positions_at=positions_at, failure=why) if store is None
+                    else bsh.history_from_store(store, positions_at))
+            except Exception as e:  # noqa: BLE001 -- a stored row the code cannot read: this account's n/a
+                why = bsh.redacted(f"the stored broker history could not be used ({type(e).__name__}: {e})", account)
+                logger.warning(f"Heatmap: account {aid}: {why}")
+                put(aid, BrokerHistory(positions_at=positions_at, failure=why))
+        box["seconds"] = time.monotonic() - began
+
+    t = threading.Thread(target=run, daemon=True, name="heatmap-share-history")
+    t.start()
+
+    def finish():
+        t.join(max(0.0, deadline - time.monotonic()))
+        with lock:
+            histories, orders = dict(box["histories"]), dict(box["orders"])
+        for aid in accounts:                       # not answered within the window: still loading
+            histories.setdefault(aid, BrokerHistory(positions_at=read.share_accounts[aid][1],
+                                                    failure=bsh.STILL_LOADING))
+        ready = sum(1 for h in histories.values() if h.failure is None)
+        seconds = box["seconds"] if box["seconds"] is not None else time.monotonic() - began
+        return histories, orders, seconds, f"{len(accounts)} accounts: {ready} ready, {len(accounts) - ready} not ready"
+
+    return finish
 
 
 @dataclass
@@ -636,12 +753,16 @@ class _BrokerRead:
     broker_qty: Dict[int, Dict[str, float]] = field(default_factory=dict)
     broker_failed: Dict[int, str] = field(default_factory=dict)
     option_rows: Dict[int, int] = field(default_factory=dict)
+    #: accounts with the share-movement read whose positions were read: (the account, when its positions were read,
+    #: the ``broker_share_history.next_seq`` taken right after that read)
+    share_accounts: Dict[int, Tuple[Any, datetime, int]] = field(default_factory=dict)
 
 
 def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int, set], calls: Dict[str, int],
              timing) -> _BrokerRead:
     """Every account in scope -- also one with no platform rows -- in parallel, each under ``BROKER_DEADLINE_S``: ONE
-    positions read (+ the feed for symbols the broker does not hold). Nothing else is asked of a broker."""
+    positions read (+ the feed for symbols the broker does not hold). The share-movement history is NOT read here:
+    it is the stored copy's own sync (``_histories_in_background``), after these positions."""
     by_account: Dict[int, set] = defaultdict(set)
     orphan: set = set()
     for a in accounts:
@@ -657,9 +778,13 @@ def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int,
 
     def run(aid, raw):
         try:
-            results[aid] = _account_work(aid, raw, calls, lock)
+            res = _account_work(aid, raw, calls, lock)
+            res["share_history"] = res["book"] is not None and _has_share_history(res["account"])
+            with lock:
+                results[aid] = res
         except BaseException as e:  # noqa: BLE001 -- reported per account below
-            failures[aid] = e
+            with lock:
+                failures[aid] = e
 
     out = _BrokerRead()
     with _step(timing, "broker") as entry:
@@ -674,15 +799,16 @@ def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int,
         with lock:
             entry.note = (f"{len(by_account)} accounts: {calls['positions']} positions read, "
                           f"{calls['feed_price_calls']} feed calls, {late} timed out")
+            results = dict(results)
     for aid in sorted(by_account):
         symbols = sorted(by_account[aid])
         out.symbols_by_account[aid] = symbols
-        if threads[aid].is_alive() or (aid not in results and aid not in failures):
+        if aid not in results and aid not in failures:
             why = f"account {aid} timed out (no answer within {BROKER_DEADLINE_S:.0f}s)"
             out.broker_failed[aid] = why
             out.missing.update({s: why for s in symbols if s not in out.prices})
             continue
-        if aid in failures:
+        if aid not in results:
             e = failures[aid]
             logger.warning(f"Heatmap: account {aid} could not be priced: {type(e).__name__}: {e}")
             why = f"account {aid} could not be read ({type(e).__name__})"
@@ -690,6 +816,8 @@ def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int,
             out.missing.update({s: why for s in symbols if s not in out.prices})
             continue
         res = results[aid]
+        if res["share_history"]:
+            out.share_accounts[aid] = (res["account"], res["positions_at"], res["positions_seq"])
         if res["book"] is None:
             out.broker_failed[aid] = res["failure"]
         else:
@@ -768,7 +896,7 @@ def _load(account_id: Optional[int], now: datetime, timing,
     calls: Dict[str, int] = {"positions": 0, "feed_price_calls": 0, "history_symbols": 0, "history_cache_hits": 0,
                              "history_failed": 0, "history_timed_out": 0, "history_topped_up": 0, "fmp_quote_calls": 0,
                              "market_cap_cache_hits": 0, "split_calendar_reads": 0, "split_memo_hits": 0,
-                             "split_timed_out": 0, "history_busy": 0}
+                             "split_timed_out": 0, "history_busy": 0, "history_syncs": 0}
     say("Reading open positions...")
     with _step(timing, "calendar"):
         warm_calendar(now)                     # the session tables are built here, never on the event loop
@@ -783,7 +911,10 @@ def _load(account_id: Optional[int], now: datetime, timing,
     for tx in txs:
         if tx.asset_class != AssetClass.OPTION and tx.id in account_of and isinstance(tx.symbol, str):
             raw_by_account[account_of[tx.id]].add(tx.symbol.strip().upper())
+    first_day = min(reference_session(tf, now) for tf in TIMEFRAMES)     # the earliest reference session
     read = _brokers(equity, accounts, raw_by_account, calls, timing)
+    since = regular_session_close_utc(first_day) - timedelta(seconds=ORDER_LOOKBACK_S)
+    finish_histories = _histories_in_background(read, first_day, since, calls) if read.share_accounts else None
     symbols_by_account = read.symbols_by_account
     # every symbol a broker holds, and every one the platform has open (a failed broker read keeps the platform's)
     symbols = sorted({l.symbol for l in equity} | {s for book in read.broker_qty.values() for s in book})
@@ -811,11 +942,17 @@ def _load(account_id: Optional[int], now: datetime, timing,
         caps, caps_missing = {}, {}
     with _step(timing, "labels"):
         labels = _labels(symbols, {s for spellings in raw_by_account.values() for s in spellings})
+    if finish_histories is not None:
+        say("Reading the broker's transaction history...")
+        histories, orders, seconds, note = finish_histories()
+        _add(timing, "share history (parallel)", seconds, note)
+    else:
+        histories, orders = {}, {}
     say("Drawing...")
     market = MarketInputs(prices=read.prices, price_missing=read.missing, closes=closes, closes_missing=closes_missing,
                           market_caps=caps, market_caps_missing=caps_missing, labels=labels, splits=splits,
                           splits_missing=splits_missing, broker_qty=read.broker_qty, broker_failed=read.broker_failed,
-                          broker_option_rows=read.option_rows)
+                          broker_option_rows=read.option_rows, broker_history=histories, platform_orders=orders)
     return HeatmapData(lots=lots, market=market, calls=calls)
 
 
