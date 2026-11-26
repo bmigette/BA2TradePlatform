@@ -100,6 +100,19 @@ def _quote_rows(payload) -> list:
     raise FMPError(f"FMP quote returned an unexpected {type(payload).__name__} payload")
 
 
+def to_fmp_symbol(symbol: str) -> str:
+    """The FMP spelling of a broker symbol (``BRK.B`` -> ``BRK-B``)."""
+    return _to_fmp(symbol)
+
+
+def fetch_fmp_quote_rows(api_key: str, fmp_symbols: List[str], *, quote_fn: Optional[Callable] = None) -> list:
+    """The raw ``/quote`` rows for at most ``FMP_QUOTE_BATCH`` FMP-spelled symbols: ONE request through this
+    module's request path (backoff + the global FMP gate). An FMP error payload raises ``FMPError``. For readers of
+    a quote field other than the price (the Overview heatmap's market caps); prices go through
+    :func:`fetch_fmp_last_prices`, which also checks staleness."""
+    return _quote_rows((quote_fn or _fmp_http_quote)(api_key, list(fmp_symbols)))
+
+
 def _oldest_acceptable(now: datetime) -> datetime:
     """The earliest quote time that is still current at ``now`` (see module docstring)."""
     local_day = now.astimezone(NY_TZ).date()

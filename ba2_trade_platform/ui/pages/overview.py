@@ -54,6 +54,7 @@ from ..utils.overview_label_scope import (
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
+from ..components.PositionHeatmapTab import PositionHeatmapTab
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.account_scope import scope_transactions_to_account
 from ...services import stats as stats_service
@@ -7700,6 +7701,7 @@ def content() -> None:
     tab_config = [
         ('overview', 'Overview'),
         ('account', 'Account Overview'),
+        ('heatmap', 'Heatmap'),
         ('account_growth', 'Account Growth'),
         ('performance', 'Performance'),
         ('llmusage', 'LLM Usage')
@@ -7719,6 +7721,8 @@ def content() -> None:
             tab_containers['overview'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['account']):
             tab_containers['account'] = ui.column().classes('w-full')
+        with ui.tab_panel(tab_objects['heatmap']):
+            tab_containers['heatmap'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['account_growth']):
             tab_containers['account_growth'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['performance']):
@@ -7735,6 +7739,8 @@ def content() -> None:
                         OverviewTab(tabs_ref=tabs)
                     elif tab_name == 'account':
                         AccountOverviewTab()
+                    elif tab_name == 'heatmap':
+                        PositionHeatmapTab()
                     elif tab_name == 'account_growth':
                         AccountGrowthTab()
                     elif tab_name == 'performance':
@@ -7767,6 +7773,7 @@ def content() -> None:
                 const labelToName = {
                     'Overview': 'overview',
                     'Account Overview': 'account',
+                    'Heatmap': 'heatmap',
                     'Account Growth': 'account_growth',
                     'Performance': 'performance',
                     'LLM Usage': 'llmusage'
