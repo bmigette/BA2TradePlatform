@@ -536,6 +536,80 @@ def test_get_positions_intraday_pl_is_mark_minus_close_not_realized_day_gain():
 
 
 # ---------------------------------------------------------------------------
+# P/L Day: measured from the position's own DAY BASIS (average_daily_market_close_price): the previous
+# close for shares held overnight, the fill price for shares opened today. The instrument's own day
+# change (lastday_price / change_today) stays measured from the previous close.
+# ---------------------------------------------------------------------------
+
+def _with_day_basis(pos, value):
+    pos.average_daily_market_close_price = None if value is None else Decimal(value)
+    return pos
+
+
+def test_the_installed_sdk_carries_the_day_basis_field():
+    from tastytrade.account import CurrentPosition
+    assert "average_daily_market_close_price" in CurrentPosition.model_fields
+
+
+def test_shares_bought_today_measure_pl_day_from_their_fill_price():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155"), "152")])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_intraday_pl == pytest.approx(30.0)            # (155 - 152) x 10
+    assert p.unrealized_intraday_plpc == pytest.approx(30.0 / 1520.0)
+    # the INSTRUMENT's day is unchanged: previous close and its move
+    assert p.lastday_price == pytest.approx(150.0)
+    assert p.change_today == pytest.approx(5.0 / 150.0)
+
+
+def test_a_short_opened_today_measures_pl_day_from_its_fill_price():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="AAPL", quantity="10", direction="Short", close_price="150",
+                     mark_price="155"), "152")])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_intraday_pl == pytest.approx(-30.0)           # rose 3 from the fill on 10 short
+    assert p.unrealized_intraday_plpc == pytest.approx(-30.0 / 1520.0)
+
+
+def test_a_day_basis_equal_to_the_close_is_the_overnight_figure():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155"), "150")])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_intraday_pl == pytest.approx(50.0)
+    assert p.unrealized_intraday_plpc == pytest.approx(50.0 / 1500.0)
+
+
+@pytest.mark.parametrize("basis", [None, "0", "-1"])
+def test_a_missing_or_unusable_day_basis_keeps_the_previous_close(basis):
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155"), basis)])
+
+    p = acct.get_positions()[0]
+
+    assert p.unrealized_intraday_pl == pytest.approx(50.0)            # (155 - 150) x 10
+    assert p.unrealized_intraday_plpc == pytest.approx(50.0 / 1500.0)
+
+
+def test_realized_day_gain_is_never_added_to_pl_day():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_with_day_basis(
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155",
+                     realized_day_gain="500"), "152")])
+
+    assert acct.get_positions()[0].unrealized_intraday_pl == pytest.approx(30.0)
+
+
+# ---------------------------------------------------------------------------
 # Pagination: the SDK only walks every page when page_offset is None
 # (tastytrade/session.py:389-419). Omitting it truncates silently.
 # ---------------------------------------------------------------------------

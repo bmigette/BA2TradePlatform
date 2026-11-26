@@ -110,3 +110,45 @@ def test_the_stocks_tab_lists_no_option_transaction(monkeypatch):
 
     assert [r['symbol'] for r in rows] == ['AAPL'] and total == 1
     assert totals_seen == [['AAPL']], "the totals strip must not sum an option row either"
+
+
+# --------------------------------------------------------------------------- the third tab: Live View
+
+def test_the_page_adds_live_view_as_a_third_tab_beside_the_asset_class_tabs():
+    from ba2_trade_platform.ui.pages.live_trades import PAGE_TABS
+    from ba2_trade_platform.ui.utils.live_positions import LIVE_VIEW_ICON, LIVE_VIEW_TAB
+    assert PAGE_TABS == ('Stocks', 'Options', 'Live View')
+    assert PAGE_TABS[0] == ASSET_CLASS_TABS[0][0]           # Stocks stays first, therefore the default
+    assert LIVE_VIEW_TAB == 'Live View' and LIVE_VIEW_ICON == 'monitor_heart'
+
+
+def _render_calls():
+    import ast
+    import inspect
+    import textwrap
+    from ba2_trade_platform.ui.pages.live_trades import LiveTradesTab
+    fn = ast.parse(textwrap.dedent(inspect.getsource(LiveTradesTab.render))).body[0]
+    first_await = min(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Await))
+    calls = {}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call):
+            name = (n.func.id if isinstance(n.func, ast.Name)
+                    else n.func.attr if isinstance(n.func, ast.Attribute) else None)
+            calls.setdefault(name, []).append(n.lineno)
+    return first_await, calls
+
+
+def test_the_live_view_styles_and_the_remembered_tab_are_read_before_the_first_await():
+    """NiceGUI drops CSS added after a page's first await; storage is read in the UI context, before it too."""
+    first_await, calls = _render_calls()
+    assert min(calls['install_live_view_styles']) < first_await
+    assert min(calls['read_stored']) < first_await
+    assert all(line < first_await for line in calls['add'])          # CSS_ONCE.add(...) of the page sheet
+
+
+def test_the_page_remembers_the_selected_tab_and_builds_the_live_view():
+    import inspect
+    from ba2_trade_platform.ui.pages import live_trades
+    src = inspect.getsource(live_trades.LiveTradesTab)
+    assert 'LivePositionsTab(' in src and 'LIVE_VIEW_ICON' in src
+    assert 'write_choices(' in src and 'tab=' in src

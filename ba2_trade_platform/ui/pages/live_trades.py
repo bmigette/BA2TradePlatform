@@ -27,6 +27,10 @@ from ..components.account_scope import scope_transactions_to_account
 from ..utils.perf_logger import PerfLogger
 from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 from ..components.refresh_button import refresh_button
+from ..components.LivePositionsTab import (
+    LivePositionsTab, install_live_view_styles, page_storage_key, read_stored, write_choices,
+)
+from ..utils.live_positions import LIVE_VIEW_ICON, LIVE_VIEW_TAB, resolve_state
 from ..utils.responsive import (
     CssOnce, GENERIC_PHONE_CSS, GRID_PHONE_CSS, PIN_TAG_PREFIX, PRIMARY_ACTION_CLASS,
     PinnedColumn, grid_phone_class, phone_media, scroll_table_phone_css, tag_quasar_columns,
@@ -95,6 +99,10 @@ ASSET_CLASS_TABS: tuple = (
     ('Stocks', AssetClass.EQUITY, 'show_chart'),
     ('Options', AssetClass.OPTION, 'donut_large'),
 )
+
+#: Every tab of the page, in order: the asset-class tabs, then the broker's positions ("Live View", not an asset
+#: class: ``ui.components.LivePositionsTab``). The page reopens on the tab last used (``app.storage.user``).
+PAGE_TABS: tuple = tuple(label for label, _asset, _icon in ASSET_CLASS_TABS) + (LIVE_VIEW_TAB,)
 
 #: How close to a bracket leg counts as "about to hit it", as a fraction of the leg's price.
 PRICE_NEAR_LEG_FRACTION = 0.05
@@ -173,15 +181,23 @@ class LiveTradesTab:
         expert_options, expert_map = self._get_expert_options()
         self.expert_id_map = expert_map
 
+        # BEFORE the first await: NiceGUI drops CSS added later, and storage needs the UI context.
         CSS_ONCE.add(ui.context.client, 'live-trades-page', live_trades_page_phone_css(), ui.add_css)
+        install_live_view_styles()
+        self._page_key = page_storage_key()
+        opened_on = resolve_state(read_stored(self._page_key), list(PAGE_TABS)).tab
+        self.live_view_tab = None
         with ui.card().classes('w-full lt-page-card'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Live Trades').classes('text-h6')
 
             with ui.tabs().classes('w-full') as _tabs:
                 _tab_refs = [ui.tab(label, icon=icon) for label, _asset, icon in ASSET_CLASS_TABS]
+                _tab_refs.append(ui.tab(LIVE_VIEW_TAB, icon=LIVE_VIEW_ICON))
+            self._selected_tab = opened_on
+            _tabs.on_value_change(self._on_page_tab_change)
 
-            with ui.tab_panels(_tabs, value=_tab_refs[0]).classes('w-full'):
+            with ui.tab_panels(_tabs, value=_tab_refs[PAGE_TABS.index(opened_on)]).classes('w-full'):
                 # STOCKS (first and default): the existing view, byte for byte.
                 with ui.tab_panel(_tab_refs[0]):
                     self._render_equity_filter_row(expert_options)
@@ -202,8 +218,24 @@ class LiveTradesTab:
                         on_view_recommendation=self._handle_view_recommendation,
                     )
                     await self.option_tab.render()
-        
+
+                # LIVE VIEW: the BROKER's positions, refreshed in place while this tab is the selected one.
+                with ui.tab_panel(_tab_refs[2]):
+                    self.live_view_tab = LivePositionsTab(
+                        is_active=lambda: self._selected_tab == LIVE_VIEW_TAB)
+
         render_timer.stop("filters_rendered")
+
+    def _on_page_tab_change(self, e) -> None:
+        """Remember the tab (the page reopens on it) and wake the Live View when it is shown."""
+        value = e.value
+        name = value if isinstance(value, str) else value._props.get('name')
+        if name not in PAGE_TABS:
+            return
+        self._selected_tab = name
+        write_choices(self._page_key, tab=name)
+        if name == LIVE_VIEW_TAB and self.live_view_tab is not None:
+            self.live_view_tab.on_shown()
 
     def _render_equity_filter_row(self, expert_options) -> None:
         """The STOCKS tab's filter row and batch controls (unchanged from the single-tab page).

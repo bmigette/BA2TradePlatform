@@ -71,12 +71,12 @@ from . import price_history
 from .errors import PriceSourceUnreachable
 from ._positions_cache import POSITIONS_TTL_S, read_positions, share_positions
 from .account_scope import account_transaction_ids
+from .account_fanout import BROKER_DEADLINE_S, FAILED as FANOUT_FAILED, OK as FANOUT_OK, accounts_in_scope, fan_out
 from .accounts import broker_read
 from .open_pnl import PRICED_STATUSES, _account_of
 from .position_prices import broker_position_prices_from, held_position_prices
 
-#: One account's positions read + price-feed call.
-BROKER_DEADLINE_S = 15.0
+# BROKER_DEADLINE_S (account_fanout): one account's positions read + price-feed call.
 #: Every account's history reads together.
 HISTORY_BUDGET_S = 45.0
 #: The market caps, and separately the split calendars.
@@ -773,33 +773,20 @@ def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int,
         else:
             orphan.add(l.symbol)
     lock = threading.Lock()
-    results: Dict[int, Dict] = {}
-    failures: Dict[int, BaseException] = {}
 
-    def run(aid, raw):
-        try:
-            res = _account_work(aid, raw, calls, lock)
-            res["share_history"] = res["book"] is not None and _has_share_history(res["account"])
-            with lock:
-                results[aid] = res
-        except BaseException as e:  # noqa: BLE001 -- reported per account below
-            with lock:
-                failures[aid] = e
+    def run(aid):
+        res = _account_work(aid, sorted(raw_by_account.get(aid) or ()), calls, lock)
+        res["share_history"] = res["book"] is not None and _has_share_history(res["account"])
+        return res
 
     out = _BrokerRead()
     with _step(timing, "broker") as entry:
-        threads = {aid: threading.Thread(target=run, args=(aid, sorted(raw_by_account.get(aid) or ())), daemon=True,
-                                         name=f"heatmap-acct{aid}") for aid in by_account}
-        for t in threads.values():
-            t.start()
-        ends = time.monotonic() + BROKER_DEADLINE_S
-        for t in threads.values():
-            t.join(max(0.0, ends - time.monotonic()))
-        late = sum(1 for t in threads.values() if t.is_alive())
+        outcomes, still_running = fan_out(list(by_account), run, BROKER_DEADLINE_S, "heatmap-acct")
+        results: Dict[int, Dict] = {aid: o.value for aid, o in outcomes.items() if o.status == FANOUT_OK}
+        failures: Dict[int, BaseException] = {aid: o.error for aid, o in outcomes.items() if o.status == FANOUT_FAILED}
         with lock:
             entry.note = (f"{len(by_account)} accounts: {calls['positions']} positions read, "
-                          f"{calls['feed_price_calls']} feed calls, {late} timed out")
-            results = dict(results)
+                          f"{calls['feed_price_calls']} feed calls, {len(still_running)} timed out")
     for aid in sorted(by_account):
         symbols = sorted(by_account[aid])
         out.symbols_by_account[aid] = symbols
@@ -835,17 +822,8 @@ def _brokers(lots: List[Lot], accounts: Sequence[int], raw_by_account: Dict[int,
     return out
 
 
-def _accounts_in_scope(account_id: Optional[int]) -> List[int]:
-    """The header's account, or (``None`` = All) every ``AccountDefinition`` -- the rule the app already uses for
-    "which accounts are live": the scheduled account refresh (``TradeManager.refresh_accounts``, every 5 minutes)
-    instantiates and refreshes every account definition, and the Overview's other "All" tabs read them all. There is
-    no enabled / active flag on an account. The accounts are read in parallel, so a dead one bounds the load at
-    ``BROKER_DEADLINE_S``; it does not add to it."""
-    if account_id is not None:
-        return [account_id]
-    from ..core.models import AccountDefinition
-    with get_db() as session:
-        return sorted(session.exec(select(AccountDefinition.id)).all())
+#: The header's account, or every account (``account_fanout.accounts_in_scope``: shared with the Live View).
+_accounts_in_scope = accounts_in_scope
 
 
 def _step(timing, name, note=None):

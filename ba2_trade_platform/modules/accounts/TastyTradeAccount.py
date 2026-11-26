@@ -778,14 +778,21 @@ class TastyTradeAccount(AccountInterface):
             unrealized_pl = market_val - cost_basis
             unrealized_plpc = (unrealized_pl / abs(cost_basis)) if cost_basis else 0.0
 
-            # INTRADAY = move since the previous close, on the position still OPEN.
-            # (`realized_day_gain` is CLOSED-out P&L for the day -- a different number,
-            # and what this used to report.)
+            # The INSTRUMENT's day: its move since the previous close.
             lastday_price = close_price if close_price is not None else current
             change_today = ((current - lastday_price) / lastday_price) if lastday_price else 0.0
-            intraday_pl = (current - lastday_price) * signed_qty * multiplier
-            lastday_value = lastday_price * abs_qty * multiplier
-            intraday_plpc = (intraday_pl / lastday_value) if lastday_value else 0.0
+            # The POSITION's day (P/L Day), on the position still OPEN, measured from its day basis:
+            # ``average_daily_market_close_price`` is the previous close for shares held overnight and the
+            # fill price for shares opened today (so a buy at 152 after a 150 close is not credited the 2).
+            # Absent / non-positive -> the previous close, as before. (`realized_day_gain` is CLOSED-out
+            # P&L for the day -- a different number, and never added here.)
+            raw_day_basis = getattr(pos, "average_daily_market_close_price", None)
+            day_basis = float(raw_day_basis) if raw_day_basis is not None else None
+            if day_basis is None or not day_basis > 0:
+                day_basis = lastday_price
+            intraday_pl = (current - day_basis) * signed_qty * multiplier
+            day_basis_value = day_basis * abs_qty * multiplier
+            intraday_plpc = (intraday_pl / day_basis_value) if day_basis_value else 0.0
 
             side = OrderDirection.BUY if sign > 0 else OrderDirection.SELL
 
