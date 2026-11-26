@@ -391,8 +391,8 @@ class StoredShareMovements:
 #: The share-movement payload's own layout version (inside the payload: the table's schema_version is shared).
 #: 4: rows classified by instrument (option assignments / exercises, equity offerings and warrants kept as
 #: tile refusals; cash Money Movement rows not kept), no per-symbol baselines; a store of another format is
-#: ignored and read again in full.
-SHARE_MOVEMENTS_FORMAT = 4
+#: ignored and read again in full. 5: a plain share split of a named symbol is a tile refusal, not an account one.
+SHARE_MOVEMENTS_FORMAT = 5
 
 
 def save_share_movements(account_id: int, store: StoredShareMovements) -> None:

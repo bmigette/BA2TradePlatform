@@ -48,8 +48,8 @@ holds the symbol) is measured from that history: the period starts at the refere
 (``regular_session_close_utc``), a share movement after it is inside; start quantity = broker quantity now - the
 signed movements inside. Only an ``Equity`` row can change a tile (``TastyTradeAccount.classify_transaction``): an
 equity trade or a reinvested dividend is COUNTED, rows of other instruments are ignored, every other equity row is a
-REFUSAL row -- except an option assignment / exercise and an Equity Offering / Warrant row, which refuse only the
-tile of their underlying / symbol when it is held (kind ``tile_only``: nothing when it is not). "My P/L" is n/a (with which reason) when: the history could not be read / is still loading / its sync
+REFUSAL row -- except an option assignment / exercise, an Equity Offering / Warrant row and a plain share split of a
+named symbol, which refuse only the tile of their underlying / symbol when it is held (kind ``tile_only``: nothing when it is not). "My P/L" is n/a (with which reason) when: the history could not be read / is still loading / its sync
 did not start after the positions read; it does not provably reach back to the period start (coverage is per
 period: Today / This week stay computable when the year is not covered); a refusal row falls inside the period --
 on the tile of its symbol or underlying, or on EVERY tile of the account when it is a corporate action or maps to no

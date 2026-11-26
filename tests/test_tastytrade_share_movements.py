@@ -123,10 +123,32 @@ def test_a_reversal_keeps_what_it_reverses():
     assert classify_transaction(item(rid=9, reverses=4))["reverses_id"] == 4
 
 
-@pytest.mark.parametrize("sub,description", [("Forward Split", ""), ("Symbol Change", ""),
-                                             ("Receive Deliver", "Spin-off of NEWCO"), ("Merger", "")])
+@pytest.mark.parametrize("sub,description", [("Symbol Change", ""), ("Receive Deliver", "Spin-off of NEWCO"),
+                                             ("Merger", ""), ("Stock Split", ""),
+                                             ("Forward Split", "Forward split and symbol change to NEWCO"),
+                                             ("Reverse Split", "Reverse split, merger into NEWCO")])
 def test_a_corporate_action_refuses_the_whole_account(sub, description):
     m = classify_transaction(item(ttype="Receive Deliver", sub=sub, action=None, price=None, description=description))
+    assert m["kind"] == "split"
+
+
+@pytest.mark.parametrize("sub", ["Forward Split", "Reverse Split"])
+def test_a_share_split_of_a_named_equity_refuses_its_own_tile_only(sub):
+    # the two rows the broker writes for a 3-for-1 split (prod, SOXX 2026-11-05): old shares out, new shares in
+    out = classify_transaction(item(rid=5, ttype="Receive Deliver", sub=sub, symbol="SOXX", underlying="SOXX",
+                                    action="Sell to Close", quantity="0.10908", price=None,
+                                    description="Forward split: Close 0.10908 SOXX"))
+    new = classify_transaction(item(rid=6, ttype="Receive Deliver", sub=sub, symbol="SOXX", underlying="SOXX",
+                                    action="Buy to Open", quantity="0.32724", price=None,
+                                    description="Forward split: Open 0.32724 SOXX"))
+    for m in (out, new):
+        assert (m["kind"], m["symbol"], m["price"]) == ("tile_only", "SOXX", None)
+        assert "share split" in m["detail"] and sub in m["detail"]
+
+
+def test_a_share_split_row_without_a_symbol_refuses_the_whole_account():
+    m = classify_transaction(item(ttype="Receive Deliver", sub="Forward Split", symbol=None, underlying=None,
+                                  action=None, price=None, description=""))
     assert m["kind"] == "split"
 
 

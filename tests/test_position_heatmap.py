@@ -960,6 +960,29 @@ def test_a_corporate_action_refuses_every_tile_for_the_periods_containing_it():
     assert tile_of(week, "AAOI").pnl_amount is not None
 
 
+def test_a_share_split_of_one_symbol_leaves_the_other_tiles_measured():
+    # prod 2026-11-26: a SOXX 3-for-1 on 2026-11-05 made every tile of the account n/a for the month and the year
+    rows = [_m(11, -4.0, None, utc(2026, 11, 5, 13), kind="tile_only", symbol="GDXY",
+               detail="a share split of this symbol (Receive Deliver / Forward Split): the broker's history cannot "
+                      "price it"),
+            _m(12, 12.0, None, utc(2026, 11, 5, 13), kind="tile_only", symbol="GDXY",
+               detail="a share split of this symbol (Receive Deliver / Forward Split): the broker's history cannot "
+                      "price it")]
+    def both(hist):
+        return market(prices={"AAOI": 110.0, "GDXY": 15.0}, broker_qty={2: {"AAOI": 12.0, "GDXY": 20.0}},
+                      closes={"AAOI": {"2026-10-30": 95.0, "2026-11-20": 100.0},
+                              "GDXY": {"2026-10-30": 13.0, "2026-11-20": 14.0}}, broker_history=hist)
+
+    month = hm.build_view([], both(_hist(*rows)), state("month", "pnl"), TUE_OPEN)
+    assert tile_of(month, "GDXY").pnl_amount is None and tile_of(month, "AAOI").pnl_amount is not None
+    assert any(sym == "GDXY" and "share split" in why for sym, why in month.issues)
+    week = hm.build_view([], both(_hist(*rows)), state("week", "pnl"), TUE_OPEN)
+    assert tile_of(week, "GDXY").pnl_amount is not None
+    gone = [_m(13, 9.0, None, utc(2026, 11, 5, 13), kind="tile_only", symbol="SOLD", detail="a share split")]
+    sold = hm.build_view([], both(_hist(*gone)), state("month", "pnl"), TUE_OPEN)
+    assert tile_of(sold, "AAOI").pnl_amount is not None and tile_of(sold, "GDXY").pnl_amount is not None
+
+
 def test_a_reversal_refuses_the_symbol_for_periods_containing_either_row():
     hist = _hist(_m(3, 2.0, 100.0, utc(2026, 11, 10, 15)), _m(5, -2.0, 100.0, OLD, reverses=3))
     assert tile_of(hm.build_view([], _two_symbols(hist), state("month", "pnl"), TUE_OPEN), "AAOI").pnl_amount is None

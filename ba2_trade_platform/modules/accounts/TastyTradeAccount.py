@@ -96,7 +96,10 @@ class _ZeroQuantityAfterRounding(Exception):
 #       timezone and no ``reverses-id``;
 #   (c) ANY OTHER ``Equity`` row (a Receive Deliver that is not a reinvested dividend, ``Allocate``, no price, zero
 #       quantity, a ``reverses-id``, anything unrecognised) is a REFUSAL of its symbol (kind ``other``); a row whose
-#       sub-type or description marks a split, symbol change, merger or spin-off refuses the whole account (``split``);
+#       sub-type or description marks a split, symbol change, merger or spin-off refuses the whole account (``split``)
+#       -- except a plain SHARE SPLIT of a named symbol (sub-type ``Forward Split`` / ``Reverse Split``, nothing in
+#       the row marking another corporate action), which changes that one symbol's share count and refuses only its
+#       tile (``tile_only``; seen on the live account: SOXX 3-for-1, 2026-11-05, one row out and one row in);
 #   (d) a row with a MISSING or ``Unknown`` instrument is ignored only when it carries no symbol, no underlying symbol
 #       and no quantity (plain cash: interest, fees, deposits, cash dividends); otherwise it is a REFUSAL of its symbol /
 #       underlying (the heatmap refuses the whole account when that maps to no tile). An instrument type the reference
@@ -111,6 +114,8 @@ OPTION_DELIVERY_REASON = "an option assignment or exercise in the period: the sh
 _SHARE_ACTIONS = {"Buy": 1.0, "Buy to Open": 1.0, "Buy to Close": 1.0,
                   "Sell": -1.0, "Sell to Open": -1.0, "Sell to Close": -1.0}
 _CORPORATE_ACTION_WORDS = ("split", "symbol change", "merger", "spin", "reorganization", "name change")
+#: Sub-types of a plain share split: the row names the one symbol whose share count changed (rule (c)).
+_SHARE_SPLIT_SUB_TYPES = frozenset({"Forward Split", "Reverse Split"})
 #: Rows asked per page (the server may answer with fewer: its ``pagination`` block says how many).
 SHARE_HISTORY_PER_PAGE = 250
 #: Pages read at most; more = an incomplete read (``ShareHistoryPageCap``).
@@ -205,6 +210,10 @@ def classify_transaction(item: Dict) -> Optional[Dict]:
     if instrument in _TILE_REFUSING_INSTRUMENTS:
         return dict(out, kind="tile_only", price=None,
                     detail=f"an {instrument} row in the period ({detail}): its effect on the shares cannot be verified")
+    if (instrument == "Equity" and symbol and sub in _SHARE_SPLIT_SUB_TYPES
+            and not any(word in marks for word in _CORPORATE_ACTION_WORDS if word != "split")):
+        return dict(out, kind="tile_only", price=None,
+                    detail=f"a share split of this symbol ({detail}): the broker's history cannot price it")
     if any(word in marks for word in _CORPORATE_ACTION_WORDS):
         return dict(out, kind="split", price=None, detail=f"a corporate action ({detail})")
     if instrument != "Equity":
