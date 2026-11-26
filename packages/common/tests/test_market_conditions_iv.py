@@ -361,6 +361,8 @@ def test_the_decision_scope_logs_one_summary_per_refusal_kind(monkeypatch, caplo
         def _evidence(self, symbol, session):
             return self._refusal(symbol, session, "alpha_vantage_api_key is not set", "no_key")
 
+    # ba2_common's logger does not propagate (propagate=False): let caplog see it here.
+    monkeypatch.setattr(logging.getLogger("ba2_common"), "propagate", True)
     reader = _NoKey(IV_PROFILE)
     saved = TC.get_market_condition_context_resolver()
     TC.set_market_condition_context_resolver(live.LiveMarketConditionResolver(IV_PROFILE, reader=reader))

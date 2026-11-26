@@ -139,7 +139,9 @@ def test_the_default_http_timeout_is_short():
 
 
 # --------------------------------------------------------------------------- item 5: one summary per reason
-def test_refusals_are_summarised_once_per_reason_per_pass(world, pass_token, caplog):
+def test_refusals_are_summarised_once_per_reason_per_pass(world, pass_token, caplog, monkeypatch):
+    # ba2_common's logger does not propagate (propagate=False): let caplog see it here.
+    monkeypatch.setattr(logging.getLogger("ba2_common"), "propagate", True)
     root, _ = world
     live, _ = _live_reader(root, key=None)
     with caplog.at_level(logging.WARNING):
@@ -453,6 +455,8 @@ def test_two_concurrent_passes_keep_their_own_refusals_and_summaries(world, monk
     other's refusal memo or flushes the other's summary."""
     from ba2_common.core import market_condition_live as live
 
+    # ba2_common's logger does not propagate (propagate=False): let caplog see it here.
+    monkeypatch.setattr(logging.getLogger("ba2_common"), "propagate", True)
     root, _ = world
     budget = _Grant(ok=False)
     reader, _ = _live_reader(root, budget=budget)
