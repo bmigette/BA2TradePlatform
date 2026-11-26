@@ -2077,6 +2077,20 @@ class TradeManager:
                 failed.append(leg.id)
         return failed
 
+    def _reask_cancels_behind_add(self, account, order) -> None:
+        """Ask the broker again to cancel the protection that still holds the shares of
+        ``order``, an exit staged behind an add (``PROTECTION_AFTER_ADD_KEY``) and chained on
+        a cancel. A cancel the broker refused at the add's fill is asked again here, every
+        pass, until it is accepted: the order the exit waits on included, or the exit never
+        reaches its trigger. Called while the exit waits on that order (it is still working)
+        and when the qty gate defers it (its cancel landed, another one did not)."""
+        failed = self._request_cancels(account, self._live_protection_behind(order))
+        if failed:
+            self.logger.error(
+                f"Replacement order {order.id} ({order.symbol}) cannot go in: the broker "
+                f"did not accept the cancel of protective order(s) {failed}, which still "
+                f"hold its shares; asked again at the next refresh")
+
     def _rechain_behind_entry_legs(self, account, dependent_order, parent_order_id) -> bool:
         """Chain an exit that fires on its ENTRY's fill behind the cancellation of that entry's
         own live OTO/bracket legs (the wash-trade escape path), and cancel those legs.
@@ -2153,7 +2167,8 @@ class TradeManager:
         waits on a FILL is left alone -- FactorRanker's remainder leg is sized across every
         transaction of the symbol. Equity only (a MARKET close is sized by
         ``_size_staged_full_close``); an unmeasurable position (an executed order with no
-        ``filled_qty``) changes nothing.
+        ``filled_qty``) changes nothing -- except on a CLOSED transaction, whose order is
+        cancelled all the same, with an ERROR.
         """
         from ba2_common.core.TransactionHelper import TransactionHelper
         from ba2_common.core.trade_store import orders_where
@@ -2173,19 +2188,28 @@ class TradeManager:
         # A protective exit sells a long and buys back a short.
         position_side = (OrderDirection.BUY if order.side == OrderDirection.SELL
                          else OrderDirection.SELL)
+        closed = txn.status == TransactionStatus.CLOSED
         try:
             position = TransactionHelper.post_fill_position_quantity(
                 txn, position_side, txn_orders)
         except ValueError as e:
-            self.logger.debug(f"Staged protection {order.id} ({order.symbol}) keeps its size: {e}")
-            return "kept"
+            if not closed:
+                self.logger.debug(
+                    f"Staged protection {order.id} ({order.symbol}) keeps its size: {e}")
+                return "kept"
+            # CLOSED wins over an unmeasurable position: the order is cancelled below.
+            # Loud: what the broker still holds for it cannot be told from its rows.
+            self.logger.error(
+                f"Transaction {txn.id} ({order.symbol}) is CLOSED and its order rows could not "
+                f"be measured ({e}): staged protective order {order.id} is NOT sent. Check the "
+                f"broker position: shares left there are managed by nothing.")
+            position = None
         working = (OrderStatus.get_unfilled_statuses() | OrderStatus.get_unsent_statuses()
                    | {OrderStatus.PARTIALLY_FILLED})
         in_flight = [o.id for o in txn_orders
                      if o.status in working and not TransactionHelper.is_resting_protection(o)]
         staged = float(order.quantity or 0.0)
-        closed = txn.status == TransactionStatus.CLOSED
-        if closed and position > 1e-9:
+        if closed and position is not None and position > 1e-9:
             # Loud: the platform's books and its own order rows disagree. Shares may be
             # stranded at the broker, and no order of a closed transaction will manage them.
             self.logger.error(
@@ -2259,7 +2283,20 @@ class TradeManager:
                 self.logger.warning(
                     f"{what}: the position keeps its previous protection (order {kept.id}, "
                     f"TP={kept.limit_price} SL={kept.stop_price}), and the transaction's "
-                    f"levels are set back to it.")
+                    f"levels it holds are set back to it.")
+                # A one-sided order leaves the transaction's OTHER level unverified: the add
+                # may have stamped it, or it was there before (nothing records the pre-add
+                # levels). Deleting it on a guess could drop an approved stop or take-profit,
+                # so it is kept and reported: the next TP/SL adjustment places it.
+                unverified = [f"{name}={level}" for name, level, held in (
+                    ("TP", txn.take_profit, kept.limit_price),
+                    ("SL", txn.stop_loss, kept.stop_price)) if level and not held]
+                if unverified:
+                    self.logger.error(
+                        f"{what}: transaction {txn.id} still records {', '.join(unverified)}, "
+                        f"which no working order holds (order {kept.id} is one-sided). It may "
+                        f"have been staged by the add that died: it is NOT removed -- check "
+                        f"it, the next TP/SL adjustment places it at the broker.")
                 return
             if add_died and working:
                 self.logger.error(
@@ -2511,6 +2548,7 @@ class TradeManager:
             status_updates = {}  # Map of order_id -> new_status
             waiting_by_id = {}   # every row this pass read, to re-protect marked exits it ends
             dead_reduces = {}    # protective order id -> (reducing parent id, its status): see below
+            reask_after_add = []  # exits behind an add still waiting on a cancel: see below
             # True if the SL-rebase or TP-floor-recheck blocks below wrote a Transaction field
             # (txn.stop_loss / txn.take_profit). Those updates live only in this Phase-1 session
             # and are otherwise silently lost on close: order.limit_price/stop_price mutations
@@ -2857,6 +2895,11 @@ class TradeManager:
                                 dead_reduces[dependent_order.id] = (parent_order_id, current_status)
                         else:
                             # action == "wait": parent still in flight (incl. PARTIALLY_FILLED) — keep waiting
+                            if after_add and _as_order_status(trigger_status) == OrderStatus.CANCELED:
+                                # Chained on a protective order whose cancel may have been
+                                # refused: that order stays working and this exit never
+                                # triggers unless the cancel is asked again (below).
+                                reask_after_add.append(dependent_order)
                             self.logger.debug(
                                 f"Dependent order {dependent_order.id} waiting: parent {parent_order_id} "
                                 f"status {current_status} has not reached trigger {trigger_status}"
@@ -2890,7 +2933,25 @@ class TradeManager:
                     self._settle_protection_after_dead_add(waiting_by_id[order_id])
                 if order_id in dead_reduces:
                     self._reprotect_after_dead_reduce(waiting_by_id[order_id], *dead_reduces[order_id])
-            
+
+            # An exit behind an add, still waiting on the cancel of a protective order: a
+            # cancel the broker refused is asked again (one already PENDING_CANCEL is skipped).
+            for dependent_order in reask_after_add:
+                try:
+                    account = self._account_of(dependent_order)
+                    if account is None:
+                        self.logger.error(
+                            f"Replacement order {dependent_order.id} ({dependent_order.symbol}): "
+                            f"its account provider cannot be resolved, so the cancels it waits "
+                            f"on are NOT asked again and it is not submitted")
+                        continue
+                    self._reask_cancels_behind_add(account, dependent_order)
+                except Exception as e:  # noqa: BLE001 -- one order must not stop the pass
+                    self.logger.error(
+                        f"Could not ask again for the cancels replacement order "
+                        f"{dependent_order.id} ({dependent_order.symbol}) waits on: {e}; it is "
+                        f"not submitted and the old protection keeps working", exc_info=True)
+
             # PHASE 2: Process all order submissions OUTSIDE of session context
             submitted_count = 0
             for dependent_order, parent_order_id in orders_to_submit:
@@ -3020,14 +3081,7 @@ class TradeManager:
                         # Behind an add, a cancel the broker refused at the fill (or protection
                         # that appeared since) keeps the shares held: ask again, every pass.
                         if is_protection_after_add(dependent_order):
-                            still_held = self._live_protection_behind(dependent_order)
-                            failed = self._request_cancels(account, still_held)
-                            if failed:
-                                self.logger.error(
-                                    f"Replacement order {dependent_order.id} "
-                                    f"({dependent_order.symbol}) cannot go in: the broker did "
-                                    f"not accept the cancel of protective order(s) {failed}, "
-                                    f"which still hold its shares")
+                            self._reask_cancels_behind_add(account, dependent_order)
                         self.logger.info(
                             f"Deferring replacement order {dependent_order.id} "
                             f"({dependent_order.symbol}): broker available qty {available_qty} < "

@@ -301,6 +301,37 @@ def test_a_cancel_the_broker_refused_is_asked_again(monkeypatch):
     assert world.submits == [(staged_id, 15.0)]
 
 
+def test_a_refused_cancel_of_the_order_the_replacement_waits_on_is_asked_again(monkeypatch):
+    """The replacement waits on the CANCELED of one order. When the broker refuses exactly
+    that cancel, the order stays working and the replacement never reaches its trigger: the
+    cancel must be asked again at the next refresh, or the replacement waits for ever."""
+    definition = create_account_definition()
+    txn, _entry, old = _held_long(definition)
+    add, leg = _complex_add(definition, txn)
+    world = _World(monkeypatch, definition)
+    _step_4b(world, txn)
+    staged_id = _staged(txn).id
+    _set(add, OrderStatus.FILLED, filled_qty=5.0, open_price=101.0)
+    _set(leg, OrderStatus.NEW)
+    chained_on = max(old.id, leg.id)                # the newest leg, as the chain picks it
+    world.refuse_cancel = {chained_on}
+    world.sweep()
+    assert _staged(txn).depends_on_order == chained_on
+    assert _status(get_instance(TradingOrder, chained_on)) == OrderStatus.NEW
+
+    world.refuse_cancel, world.cancels = set(), []
+    world.sweep()                                   # it is still working: ask again
+
+    assert world.cancels == [chained_on]
+    assert world.submits == []
+    other = old if chained_on == leg.id else leg
+    _set(get_instance(TradingOrder, chained_on), OrderStatus.CANCELED)
+    _set(other, OrderStatus.CANCELED)
+    world.available = 15.0
+    world.sweep()
+    assert world.submits == [(staged_id, 15.0)]
+
+
 def test_the_replacement_is_not_grown_for_a_second_buy_still_in_flight(monkeypatch):
     """15 are held; a further buy of 3 is working. A stop for 18 could never go in."""
     definition = create_account_definition()
@@ -413,6 +444,31 @@ def test_a_dead_add_leaves_the_old_stop_working_and_restores_the_level(monkeypat
     # The stop at the broker is the old one: the transaction says so again.
     assert get_instance(Transaction, txn.id).stop_loss == OLD_SL
     assert any(str(add.id) in m and "keeps" in m for m in rec.warning_msgs), rec.warning_msgs
+
+
+def test_a_dead_add_that_staged_a_take_profit_no_order_holds_reports_it(monkeypatch):
+    """The position rests a plain stop only; the add stamped a stop AND a take-profit. When the
+    add dies the stop comes back, but nothing records whether the take-profit the transaction
+    now carries is the add's or older, so it is not deleted: it is reported, loudly."""
+    definition = create_account_definition()
+    txn, _entry, old = _held_long(definition)
+    add, leg = _complex_add(definition, txn)
+    world = _World(monkeypatch, definition)
+    t = get_instance(Transaction, txn.id)
+    t.take_profit, t.stop_loss = 120.0, NEW_SL        # step 4b with both levels
+    update_instance(t)
+    assert world.acct.adjust_tp_sl(get_instance(Transaction, txn.id), 120.0, NEW_SL,
+                                   source="initial_setup") is True
+
+    _set(add, OrderStatus.CANCELED, filled_qty=0.0)
+    _set(leg, OrderStatus.CANCELED)
+    rec = world.sweep()
+
+    after = get_instance(Transaction, txn.id)
+    assert after.stop_loss == OLD_SL
+    assert after.take_profit == 120.0, "a take-profit was deleted on a guess"
+    assert any(str(txn.id) in m and "TP=120" in m and str(old.id) in m
+               for m in rec.error_msgs), rec.error_msgs
 
 
 def test_a_dead_add_on_a_position_without_a_stop_gets_one_for_what_it_holds(monkeypatch):
@@ -552,3 +608,42 @@ def test_a_replacement_for_a_closed_transaction_is_never_sent_whatever_its_fills
 
     assert world.submits == [], "an order went out for a transaction that is CLOSED"
     assert get_instance(TradingOrder, stuck.id).status == OrderStatus.CANCELED
+
+
+def _unmeasurable_long(definition, txn_status):
+    """A long whose entry row is FILLED with no ``filled_qty``: its size cannot be measured."""
+    txn, entry, old = _held_long(definition, stop_status=OrderStatus.CANCELED,
+                                 txn_status=txn_status)
+    row = get_instance(TradingOrder, entry.id)
+    row.filled_qty = None
+    update_instance(row)
+    return txn, old
+
+
+def test_a_replacement_for_a_closed_transaction_whose_rows_cannot_be_measured_is_never_sent(
+        monkeypatch):
+    """The CLOSED rule holds before anything is measured: an executed row without its fill
+    quantity used to return "kept" first, and the stale stop then went out."""
+    definition = create_account_definition()
+    txn, old = _unmeasurable_long(definition, TransactionStatus.CLOSED)
+    stuck = _stuck_replacement(definition, txn, old, qty=10.0)
+    world = _World(monkeypatch, definition, available=1_000.0)
+
+    rec = world.sweep()
+
+    assert world.submits == [], "an order went out for a transaction that is CLOSED"
+    assert get_instance(TradingOrder, stuck.id).status == OrderStatus.CANCELED
+    assert any(str(txn.id) in m and "CLOSED" in m and "could not be measured" in m
+               for m in rec.error_msgs), rec.error_msgs
+
+
+def test_a_replacement_for_an_open_transaction_whose_rows_cannot_be_measured_keeps_its_size(
+        monkeypatch):
+    definition = create_account_definition()
+    txn, old = _unmeasurable_long(definition, TransactionStatus.OPENED)
+    stuck = _stuck_replacement(definition, txn, old, qty=10.0)
+    world = _World(monkeypatch, definition, available=10.0)
+
+    world.sweep()
+
+    assert world.submits == [(stuck.id, 10.0)]
